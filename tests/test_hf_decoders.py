@@ -1669,6 +1669,54 @@ def test_a_qwen_config_without_a_window_bound_windows_the_layers_transformers_wi
     assert windows.count("sliding_attention") == 4
 
 
+@pytest.mark.parametrize("fixture", ["qwen2-tiny", "qwen3-tiny"])
+def test_a_qwen_configs_layers_are_its_transformers_class_layers_without_importing_it(fixture):
+    """Dew reads a Qwen config's layer kinds by its own rule (`native_layer_types`, ledger 2746), the
+    rule its transformers class builds them by, over every way a config states its window: on or off,
+    a window stated, null or left to the class, a first windowed layer stated or left to it."""
+    from transformers import AutoConfig
+
+    from dew.interop import decoder_parts
+
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    base = {name: value for name, value in config.items()
+            if name not in ("layer_types", "max_window_layers", "use_sliding_window", "sliding_window")}
+    for windowed in (False, True):
+        for window in ({}, {"sliding_window": None}, {"sliding_window": 8}):
+            for first in ({}, {"max_window_layers": 2}, {"max_window_layers": 30}):
+                stated = {**base, "num_hidden_layers": 32, "use_sliding_window": windowed, **window, **first}
+                expected = AutoConfig.for_model(stated["model_type"], **{
+                    name: value for name, value in stated.items() if name != "model_type"}).layer_types
+                read = decoder_parts.native_layer_types(stated, set(), stated["model_type"])
+                assert read == tuple(expected), (windowed, window, first)
+
+
+@pytest.mark.parametrize("name", ["tie_word_embeddings", "attention_bias", "use_sliding_window"])
+def test_a_qwen_config_stating_a_flag_as_a_string_is_refused(name):
+    """A Qwen3 config's flags are booleans, as its class types them: one stated as the string "false"
+    is refused, where reading its truth would take it as true (review of ledger 2746)."""
+    config = json.loads((FIXTURES / "qwen3-tiny" / "config.json").read_text())
+    stated = {key: value for key, value in config.items() if key != "layer_types"}
+    with pytest.raises(ValueError):
+        translate_config({**stated, name: "false"})
+
+
+def test_an_export_of_a_qwen_model_imports_no_transformers(tmp_path):
+    """`PretrainedDecoder.from_model` writes a Dew Qwen model's config from Dew's own rules, so an export
+    imports no transformers, whose import alone takes most of the call's time (ledger 2746)."""
+    script = (
+        "import sys\n"
+        "from dew.interop import Pretrained, PretrainedDecoder\n"
+        f"loaded = Pretrained.load({str(FIXTURES / 'qwen3-tiny')!r}, dtype='float32')\n"
+        "before = {name for name in sys.modules if name.split('.')[0] == 'transformers'}\n"
+        f"PretrainedDecoder.from_model(loaded.model, loaded.variables).save({str(tmp_path / 'export')!r})\n"
+        "after = {name for name in sys.modules if name.split('.')[0] == 'transformers'}\n"
+        "assert after <= before, sorted(after - before)[:3]\n")
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert done.returncode == 0, done.stderr[-2000:]
+
+
 def test_a_config_of_a_type_transformers_lacks_reads_its_layers_by_its_familys_convention():
     """Dream (no transformers class) reads by Qwen2's convention, whose class takes a null head_dim
     as Dream's own config does: the record is the one without it."""

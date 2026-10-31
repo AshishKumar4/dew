@@ -148,7 +148,7 @@ run the files whose behaviour changed with it (`NEWEST_FILES`). `pythons` prints
 tools/armada/install.sh, and `pythons --check` holds .python-version and the environment's smoke
 (.armada.json) to them."""
 NEWEST_FILES = (
-    # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (326e40fd5).
+    # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (ec3c5fb54).
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
     "tests/test_records.py", "tests/test_record_keys.py", "tests/test_linen_records.py",
     "tests/test_run_records.py",
@@ -156,12 +156,12 @@ NEWEST_FILES = (
     "tests/test_config_cli.py", "tests/test_tpu_cli.py",
     # Serialization.
     "tests/test_pickle_sources.py",
-    # Data loading: providers without TensorFlow (54a52a57d, 1a276e6a5, d3cc21fe6) and a
-    # fetcher pool under 3.14's forkserver start (c9dbce717).
+    # Data loading: providers without TensorFlow (5cec9cc9d, ee7fa9ee0, 20294b686) and a
+    # fetcher pool under 3.14's forkserver start (1b8a67804).
     "tests/test_data.py", "tests/test_providers.py", "tests/test_hf_data.py", "tests/test_data_mixtures.py",
     "tests/test_online_loader.py",
-    # Threads at interpreter exit, which 3.14 ends differently (13a271177, d00ed72cd), and the
-    # compilation cache's codec (23f5adffe).
+    # Threads at interpreter exit, which 3.14 ends differently (e8fececd5, 72caf7ed6), and the
+    # compilation cache's codec (931d6f2e1).
     "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
     "tests/test_instrumentation.py",
 )

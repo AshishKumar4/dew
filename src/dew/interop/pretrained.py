@@ -31,7 +31,7 @@ from dew import _records
 from dew._model_types import QWEN35_TYPES
 from dew.batch import Variables
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.source import SourceSchedule
+from dew.diffusion.schedules.source import SourceGrid, SourceSchedule
 from dew.distributed.placement import Layout, MeshSpec, RefinesLayout
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.images import TextToImage
@@ -64,7 +64,7 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
-from dew.interop.saved_sources import is_saved_run, released_run
+from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -87,6 +87,8 @@ if TYPE_CHECKING:
     from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
+    from dew.sampling.guidance import Guidance
+    from dew.sampling.solvers.common import Solver
 
 
 def _refined(layout: Layout | None, model: RefinesLayout | None) -> Layout | None:
@@ -482,8 +484,7 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
-        name_or_dir = released_run(name_or_dir, step=step, ema=ema, weights=weights, mesh=mesh,
-                                   layout=layout)
+        name_or_dir = released_run(name_or_dir, step=step, ema=ema, mesh=mesh, layout=layout)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -903,6 +904,26 @@ class PretrainedPipeline(Pretrained):
     def pipeline(self):
         return self.text_to_image()
 
+    @property
+    def solver(self) -> Solver:
+        """The native solver its scheduler file names (`SourceSchedule.solver`)."""
+        return self.schedule.solver
+
+    @property
+    def steps(self) -> int:
+        """The step count its call samples with by default (`SourceTask.steps`)."""
+        return self.task.steps
+
+    @property
+    def guidance(self) -> Guidance | None:
+        """The guidance its call samples with by default (`SourceTask.guidance`)."""
+        return self.task.guidance
+
+    @property
+    def grid(self) -> SourceGrid:
+        """The sampling grid its call prepares (`SourceTask.grid`)."""
+        return self.task.grid
+
     def text_to_image(self) -> TextToImage:
         """Build the pipeline as a sampling task with its published policy.
 
@@ -910,9 +931,9 @@ class PretrainedPipeline(Pretrained):
         `[N, frames, height, width, 3]`.
         """
         return self.formed(TextToImage(
-            self.model, self.process, self.inputs, self.variables, self.autoencoder, grid=self.task.grid,
-            final_denoise=False, solver=self.schedule.solver, steps=self.task.steps,
-            guidance=self.task.guidance, finish=self.finish))
+            self.model, self.process, self.inputs, self.variables, self.autoencoder, grid=self.grid,
+            final_denoise=False, solver=self.solver, steps=self.steps, guidance=self.guidance,
+            finish=self.finish))
 
     @property
     def _adaptable(self) -> Mapping[str, WeightLayout]:
@@ -1017,8 +1038,10 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           text: bool = True, text_only: bool = False,
                           prediction_depths: int | None = None,
                           modeling_overrides: Mapping[str, object] | None = None,
-                          step: int | str | None = None, ema: bool | None = None) -> PretrainedPipeline:
-    """A published diffusion pipeline, to train from its own weights.
+                          step: int | str | None = None,
+                          ema: bool | None = None) -> PretrainedPipeline | RunPipeline:
+    """A published diffusion pipeline, to train from its own weights, or a saved Dew diffusion run
+    (`RunPipeline`), its checkpoint at `step` with `ema` (`pinned_run`).
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
     its own, or a video pipeline's (frames, height, width): the geometry its
@@ -1041,16 +1064,21 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `text_only`, `prediction_depths` and `modeling_overrides` read as
     `Pretrained.load`'s do: a pipeline has no wrapper's language model for
     `text_only` to take, its components hold no prediction depths, so any
-    count keeps them all, and none reads overrides, which are refused. A saved Dew run, which Dew
-    writes no diffusion release of, is refused, as a step or EMA choice beside a release is.
+    count keeps them all, and none reads overrides, which are refused.
+
+    A saved run is no published pipeline: Dew writes no diffusers layout of one, so it loads as the parts
+    and policy of the task its run built (`pipeline_of_run`), which a `DiffusionObjective` trains as it
+    trains a pipeline. A step or EMA choice beside a pipeline is refused, as it selects nothing.
     """
-    if is_saved_run(checkpoint) or step is not None or ema is not None:
-        raise ValueError(f"{checkpoint}: a diffusion run starts from a published pipeline; Dew writes no "
-                         "diffusion release of a saved run to start from, so resume the run under its "
-                         "name (--trainer.resume) or serve it (TextToImage.from_run)")
+    run = pinned_run(checkpoint, step=step, ema=ema)
     _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
+    if run is not None:
+        stored = None if param_dtype == AUTO else param_dtype
+        return pipeline_of_run(run, checkpoint, dtype=dtype, param_dtype=stored, revision=revision,
+                               attention_impl=attention_impl, size=size, variables=variables, mesh=mesh,
+                               layout=layout, text=text, ema=ema)
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")

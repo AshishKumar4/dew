@@ -23,6 +23,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from .moe import ExpertLinear, Router, expert_compute_dtype, expert_dispatch, expert_projection
 from .precision import at_least_fp32, float32_einsum
+from .sharding import logical_axes
 
 if TYPE_CHECKING:
     from .backbones.decoder_block import Mixture
@@ -51,6 +52,11 @@ VALUE_EXPERT_AXES = ('exp', 'embed', 'kv')
 """The stacked value kernels' axes: an expert, the hidden width, and the key/value heads' width."""
 
 
+@logical_axes({
+    # The stacked expert kernels of the values, named under `experts` (an attention holds them there),
+    # their expert dimension sharded as a routed MLP's experts are, their outputs as a value projection's.
+    ("experts", "v_proj"): VALUE_EXPERT_AXES,
+})
 class RoutedValues(nn.Module):
     """`spec`'s value experts over hidden states `[..., in_features]`: each token's `top_k` chosen
     projections to `features`, each through a SiLU, summed under the router's weights in fp32, run as

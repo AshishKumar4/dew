@@ -150,7 +150,7 @@ def _fixture(name: str) -> dict[str, Any]:
 def _nemotron_h_moe() -> dict[str, Any]:
     """The fp32 MoE row declares K-order judgment in its zoo entry.
 
-    At f7f85cef1b8c83a85c74ed93be22928c3d400801 its sequence4 gradient was
+    At 3071de9ee86370e857aee93b6834e3587bf8b645 its sequence4 gradient was
     0.720 of the K-order bound over 52 exact residual orders, and expert4
     was 0.596. Float64 invariance drift was at most 1.121e-14; no expert
     gate_proj exists. The two-layout Colab CPU job took 172 seconds. This

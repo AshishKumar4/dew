@@ -8,7 +8,7 @@ const bundle = await build({ entryPoints: [fileURLToPath(new URL('../src/contain
 const { health, kept, ending } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
 test('a health probe a restoring container holds open gives up within five seconds', { timeout: 10_000 }, async () => {
-	// The 7ca258a09 and 9235af7f3 generations' smokes waited on such a request past their alarms.
+	// The bd1e50f06 and 3bdb2c23f generations' smokes waited on such a request past their alarms.
 	const container = { running: true, getTcpPort: () => ({ fetch: (url, init) => new Promise((_, reject) => {
 		init?.signal?.addEventListener('abort', () => reject(init.signal.reason));
 	}) }) };

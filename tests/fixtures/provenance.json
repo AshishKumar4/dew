@@ -407,11 +407,11 @@
   },
   "decoder-default-dropout-float64.jaxexport": {
    "generator": "dew",
-   "note": "The same pre-dropout CPU forward and gradient graph at 42ddfc1, exported in float64 over the weights widened (tools/generate_decoder_dropout_fixture.py --dtype float64): the float32 export's float64 truth for check 1."
+   "note": "The same pre-dropout CPU forward and gradient graph at 6103703, exported in float64 over the weights widened (tools/generate_decoder_dropout_fixture.py --dtype float64): the float32 export's float64 truth for check 1."
   },
   "decoder-default-dropout.jaxexport": {
    "generator": "dew",
-   "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 42ddfc1 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
+   "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 6103703 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
   },
   "decoding/penalties.npz": {
    "tool": "tools/vllm_penalty_reference.py",
@@ -2977,6 +2977,28 @@
     ],
     "note": "DreamerV3's simple image encoder and decoder at the 1M size (depth 4, units 64, five-tap convolutions, block-diagonal deterministic input in 8 blocks) run by tools/dreamerv3_worker.py conv on the CPU over each seed's drawn weights, 64x64 RGB images, deterministic states and one-hot categoricals, in float32 and, the code's compute dtype and every module's float32 set to float64, in float64; kept as its evidence and its truth's sketch."
   },
+  "maxtext/gpt3.npz": {
+   "tool": "tools/maxtext_reference.py",
+   "sources": [
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "0.2.5",
+     "runs": "maxtext"
+    }
+   ],
+   "note": "MaxText's GPT-3 (decoder_block gpt3, model gpt3-52k at two layers, a vocabulary and position table of 64) run by tools/maxtext_worker.py gpt3 on the CPU over each seed's drawn weights and eight tokens, in float32 and, its validated config's dtypes set to float64 and its bfloat16 read of the tied table and its RMSNorm's float32 carried in float64 (float64_casts), in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
+  },
+  "maxtext/engram.npz": {
+   "tool": "tools/maxtext_reference.py",
+   "sources": [
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "0.2.5",
+     "runs": "maxtext"
+    }
+   ],
+   "note": "MaxText's Engram layer (maxtext/layers/engram.py: two heads for each of the 2- and 3-gram orders over prime buckets 11, 13, 17 and 19, two streams 8 wide, a conv of four taps three apart) run by tools/maxtext_worker.py engram on the CPU over each seed's drawn weights, streams and buckets, the caller's residual added, in float32 and, its validated config's dtypes set to float64, in float64; kept as its evidence and its truth's sketch."
+  },
   "mdlm/continuation.npz": {
    "tool": "tools/mdlm_sampling_reference.py",
    "sources": [{"repo": "kuleshov-group/mdlm", "version": "c112c526d193436838c98d81455ee51f90309470", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.0", "runs": "torch"}],
@@ -4188,7 +4210,7 @@
    ]
   },
   {
-   "from": "AshishKumar4/dew@18511496038f9ca14652272a8081c698b244b580",
+   "from": "AshishKumar4/dew@ab9e7635af21d1994774cc0546b7e3fcf11f8433",
    "what": "the random weights and probe ids tools/hf_reference.py's write_diffusion_tiny drew there; tools/remote_code_reference.py computes the released code's logits from them",
    "files": [
     "hf/dream-tiny/input_ids.npy",

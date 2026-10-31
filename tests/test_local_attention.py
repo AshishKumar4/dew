@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
-from model_support import model_draw
+from model_support import model_draw, stepped_outputs
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -381,8 +381,9 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
     `origin` (a continuation, a canvas) cuts them as its whole pass does,
     not at its cache slots, whether each row gives its places or the rows
     share one vector of them, and whether the cache keeps its keys in rows
-    or in a pool of pages: the decode is on par with the whole pass over
-    drawn models and tokens (check 1)."""
+    or in a pool of pages: the decode is on par with the whole passes, each
+    step's at the width it reads (`stepped_outputs`), over drawn models and
+    tokens (check 1)."""
     model = chunked_model(5).with_kv_cache(layout)
     shape = (2, 13)
     positions = jnp.arange(13) + origin if shared else jnp.broadcast_to(jnp.arange(13) + origin, shape)
@@ -404,7 +405,13 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
     def whole(model):
         return jax.jit(lambda variables, tokens: model.apply(variables, tokens, positions=positions)[:, 3:])
 
-    assert_as_exact(decoded, whole(model), model_draw(model, shape, 64),
+    forward = jax.jit(lambda variables, tokens, places: model.apply(variables, tokens, positions=places))
+
+    def passes(variables, tokens):
+        return stepped_outputs(
+            lambda length: forward(variables, tokens[:, :length], positions[..., :length]), 13, 4)[:, 3:]
+
+    assert_as_exact(decoded, passes, model_draw(model, shape, 64),
                     f"{layout} {shared} {origin} chunked decode", seeds=SEEDS['decode'],
                     truth_fn=whole(model.clone(dtype=jnp.float64)))
 
