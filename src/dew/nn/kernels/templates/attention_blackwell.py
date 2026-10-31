@@ -33,7 +33,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, mosaic_sm100
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
-from dew.nn.kernels.templates.mosaic_sm100 import ROW, STORED, TCGEN05, TMEM
+from dew.nn.kernels.templates.mosaic_sm100 import STORED, TCGEN05, TMEM
 
 CHUNK = 32
 """The output accumulator's columns the softmax rescales at a time."""
@@ -213,9 +213,9 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     out_ref, maxima_ref, over_ref = outs
     rows, block_k = TCGEN05.rows, tiles.block_k
     value_width = scratch.acc_tmem.shape[1]
-    # A step's tile `PART` columns at a time.
-    q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, PART), 0, layout=TMEM)
-    columns = plgpu.broadcasted_iota(jnp.int32, (rows, PART), 1, layout=TMEM)
+    # A step's tile `PART` columns at a time, their places' layouts inferred from the logits they meet.
+    q_pos = block.first + lax.broadcasted_iota(jnp.int32, (rows, PART), 0)
+    columns = lax.broadcasted_iota(jnp.int32, (rows, PART), 1)
     parts = block_k // PART
 
     def logits(read, index, part, masked):
@@ -258,8 +258,8 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     if spec.form == "causal" or padded:
         # The blocks every query of the block sees whole, below its diagonal and before padding.
         whole = jnp.maximum(jnp.minimum(lax.div(block.first, block_k), blocks - padded), 0)
-    start = (plgpu.layout_cast(jnp.full((rows,), -jnp.inf, jnp.float32), ROW),
-             plgpu.layout_cast(jnp.zeros((rows,), jnp.float32), ROW))
+    # Its layouts inferred from the walk's carry.
+    start = (jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.float32))
     def walked(index, carry):
         # A block the query block walks, masked from its first that some query sees in part.
         return lax.cond(index < block.steps, lambda carry: step(index, carry, masked=index >= whole),
