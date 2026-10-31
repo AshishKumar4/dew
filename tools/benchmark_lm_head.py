@@ -259,19 +259,20 @@ def measure(variant: Variant, shape: Shape) -> dict[str, object]:
     stats = device.memory_stats()
     before = stats.get("peak_bytes_in_use") if stats else None
 
-    forward = program(lambda states, table: function(states, table, targets, variant))
+    # The targets are an argument: `program` keeps each function it compiled.
+    forward = program(lambda states, table, targets: function(states, table, targets, variant))
     both = program(
         jax.value_and_grad(
-            lambda states, table: function(states, table, targets, variant),
+            lambda states, table, targets: function(states, table, targets, variant),
             argnums=(0, 1),
             has_aux=True,
         )
     )
     start = time.perf_counter()
-    forward_executable = forward.executable(hidden, embedding)
-    both_executable = both.executable(hidden, embedding)
+    forward_executable = forward.executable(hidden, embedding, targets)
+    both_executable = both.executable(hidden, embedding, targets)
     compile_seconds = time.perf_counter() - start
-    args = (hidden, embedding)
+    args = (hidden, embedding, targets)
     forward_ms = timed(forward_executable, args, shape.repeats)
     both_ms = timed(both_executable, args, shape.repeats)
     (loss, accuracy), (d_states, d_table) = jax.block_until_ready(

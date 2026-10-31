@@ -155,6 +155,48 @@ def test_a_run_set_to_a_policy_off_the_ladder_is_told_no_rung_below_it(monkeypat
     assert off.plan["derived"] == [] and off.plan["remat"] == "save_qkv_proj"
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_run_over_two_devices_that_sets_its_remat_is_told_the_rung_its_derivation_fits(
+        monkeypatch, tmp_path, caplog):
+    """A run sharded over two devices (fsdp 2, as the two-GPU run that raised row 2536) that sets
+    full recomputation reads its derivation per device, each its share of the batch and the state
+    (`candidate_footprint`), and with room for every rung is told the base rung fits, where its search
+    compiles at its own alone; the derivation's climb compiles nothing, so it says it compiles nothing
+    (train 333's review: rows 2615, 2616)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "two"))
+    free(monkeypatch, LIMIT)
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
+                              max_seq_len=256, remat=REMAT_POLICIES["full"])
+    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
+                      mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        compiled(trainer)
+    derived = trainer.plan["derived"]
+    assert compiles.count == 1 and trainer.plan["remat"] == "full"
+    assert derived and derived[0]["remat"] is None and derived[-1]["label"] == "fits"
+    assert not [record for record in caplog.records if "compiling it again" in record.getMessage()]
+    assert [record for record in caplog.records if "recomputes less" in record.getMessage()]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_run_over_a_tensor_axis_that_sets_its_remat_hears_its_derivation_cannot_judge_it(
+        monkeypatch, tmp_path, caplog):
+    """A run over a tensor axis of two that sets full recomputation, whose footprint the derivation reads
+    per device only over data and fsdp axes, hears once that its derivation cannot judge its layout,
+    rather than nothing, and compiles at its own rung alone (row 2721; 2615 stays open for such layouts)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "tensor"))
+    free(monkeypatch, LIMIT)
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
+                              max_seq_len=256, remat=REMAT_POLICIES["full"])
+    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
+                      mesh=MeshSpec(tensor=2).build(jax.devices()[:2]))
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        compiled(trainer)
+    assert compiles.count == 1 and trainer.plan["remat"] == "full"
+    assert trainer.plan["derived"][-1]["label"] == "unknown"
+    assert len([record for record in caplog.records if record.name == "dew.training.planning"]) == 1
+
+
 def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monkeypatch, tmp_path, caplog):
     """Every compile's plan record holds the headroom the derivation judged beside the one the compile
     measured, and each compile whose fit the derivation judged otherwise is told as a model miss, the
