@@ -1,7 +1,7 @@
 """Write a saved run of each run kind at this checkout, for tests/test_saved_runs.py to read at every
 later main (row 2282).
 
-Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/test_run_options.py's `KINDS`, its data
+Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/run_kinds.py's `KINDS`, its data
 as there, synthetic tickets, the repo's tiny image records and token files, the tiny Laya fixture, an LM
 run over a tiny multimodal source, and each serialized variant beside them) trains two steps from Python,
 or to its examples clock's bound, its own trainer otherwise, and keeps its last checkpoint; what
@@ -91,7 +91,7 @@ def evidence(run, state, directory: Path) -> dict:
     plan = compiled["plan"] or {}
     tasked = objectives[run.objective.name].saved_task is not None
     return {"step": int(state.step), "compute": run.compute_dtype(),
-            "products": computed(directory) if tasked else None,
+            "products": computed(directory)["products"] if tasked else None,
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),

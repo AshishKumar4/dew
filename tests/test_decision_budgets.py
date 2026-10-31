@@ -423,8 +423,8 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     """The run's task, served whole (`Decide.scoring(whole=True)`), admits a request of 77 or 151 intents
     as it lays it out whole, its usage reporting no cut, and counts it admitted; the same task under
     Laya's declared budgets, served whole, refuses it under `cut`, counted in the server's own counters
-    (`WireScoring.counts`), and answers a short request whose instructions those budgets cut with the cut
-    in its usage where it is not served whole."""
+    (`WireScoring.counts`) with the tokens its cut would have removed (`refused_cut`), and answers a short
+    request whose instructions those budgets cut with the cut in its usage where it is not served whole."""
     objective, _, _ = _run(backbone, count).prepare().train("x")
     task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
                   objective.specials)
@@ -437,6 +437,7 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     with pytest.raises(Refused) as refused:
         strict.admit(body)
     assert refused.value.reason == "cut" and strict.counts.rejected == {"cut": 1}
+    before = strict.counts.refused_cut["instructions"]
     worded = Noul("Does the customer " + "really and truly " * 120 + "need a new card?")
     short = {"state": "my card is lost", "questions": {"holds": worded.wire()}}
     with pytest.raises(Refused) as whole:
@@ -446,6 +447,8 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     [row] = [row.encoded for row in lenient.admit(short).rows]
     assert set(row.cuts) == {"instructions"} and lenient.counts.cut_rows == {"instructions": 1}
     assert lenient.counts.cut_removed == {"instructions": row.instructions_cut}
+    # The cut the whole server refused counts beside its refusal, as a run's data counters count it.
+    assert strict.counts.refused_cut["instructions"] - before == row.instructions_cut
 
 
 def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
@@ -453,7 +456,7 @@ def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
     question budget, which its config states, and Laya's option budget, which its config leaves unstated
     and Laya's code fixes at 48 tokens (`LAYA_BUDGETS`), so the release reads as Laya reads it; a budget
     the run states is the run's."""
-    from test_run_options import TINY_LAYA, decision
+    from run_kinds import TINY_LAYA, decision
 
     run = decision(tmp_path, drawn=False)
     assert run.pretrained == str(TINY_LAYA)

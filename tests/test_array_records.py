@@ -1,6 +1,7 @@
 """ArrayRecord shard readers: how many each source and the process hold open, their mirrors, and
 reads in flight through eviction and close."""
 
+import hashlib
 import os
 import pickle
 import threading
@@ -243,23 +244,32 @@ def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecor
         source.close()
 
 
+@pytest.mark.parametrize("declared", [False, True])
 @pytest.mark.parametrize("busy_oldest,retire", [(False, "eviction"), (True, "eviction"), (True, "close")])
 def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
-    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest, retire
+    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest, retire, declared
 ):
+    """A mirror with room for all shards but one serves them all, each shard's copy released as its
+    reader idles: shards read as their producer declared them (`Declared`, each checked in the mirror)
+    among them."""
     import grain.python as grain
 
     from dew.data.sources.records import ArrayRecords
+    from dew.data.storage import Declared
 
     root = Store(f"memory://bounded-record-mirror-{uuid4().hex}")
     shards = [root.child(f"{index}.array_record") for index in range(len(arrayrecord_paths))]
     for shard, path in zip(shards, arrayrecord_paths, strict=True):
         shard.write(Path(path).read_bytes())
     capacity = sum(Path(path).stat().st_size for path in arrayrecord_paths[:-1])
+    options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}}
     source = ArrayRecords(
         [shard.url for shard in shards],
-        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}},
+        options,
         counts=(8,) * len(shards),
+        declared=tuple(Declared(Store(shard.url, options), {
+            "bytes": len(shard.read()), "sha256": hashlib.sha256(shard.read()).hexdigest()})
+            for shard in shards) if declared else None,
     )
     entered, released = threading.Event(), threading.Event()
     underlying_read = grain.ArrayRecordDataSource.__getitem__
