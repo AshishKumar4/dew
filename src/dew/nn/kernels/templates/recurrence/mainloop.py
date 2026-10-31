@@ -806,9 +806,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
                                                  for key in map(functools.partial(block, "keys"),
                                                                 range(width // call.block))))
             system = algebra.keyed(product, gate, low, betas, *columns)
-            # The inverse less its unit diagonal, which `algebra.weighted` adds outside its product.
-            lower = (algebra.doubled(-system, _merging(merges, call))
-                     - jnp.where(_diagonal(CHUNK, family), 1.0, 0.0))
+            lower = algebra.solved(system, _merging(merges, call))
             if keeps:
                 held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             # The inverse staged once (the first set) for every block's product, a block staged in the
@@ -838,8 +836,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     held_tiles = _Held(phases=(
         [_f32(CHUNK, CHUNK)] * 2 + _fragments(call, (call.given, CHUNK, call.block), (call.given, CHUNK,
                                                                                          call.block)),
-        [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) * 2
-        + (_held(held, CHUNK, CHUNK) * 2 if held.parts > 1 else []),
+        _doubling_held(call),
         [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
         + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block))))
     out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width))
@@ -888,6 +885,14 @@ def _intra_held(call: _Call, block: int) -> _Held:
         + _fragments(call, (pairing, CHUNK, block), (pairing, CHUNK, block)),))
 
 
+def _doubling_held(call: _Call) -> list:
+    """A chunk's inverse by doubling as a thread holds it (`algebra.solved`): the inverse, its power and their
+    product beside the masks, an fp32 call's merges splitting the inverse and the power into their parts; the
+    system, staged negated for the merges, held no longer."""
+    return ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) * 2
+            + (_held(call.held, CHUNK, CHUNK) * 2 if call.held.parts > 1 else []))
+
+
 def _systems(call: _Call) -> _Operand:
     """The form `_intra` passes each chunk's keys' system to `_intra_solve` in: fp32, as fla's intra rows
     store their `Akk` for its solve."""
@@ -910,19 +915,16 @@ def _intra_solve(system, taken, call: _Call):
 
         def step(index, slots, carry, accumulators):
             del index
-            system = _tile(slots, "system", systems).value()
-            inverse = algebra.doubled(-system, _merging(tuple(staging), call))
-            held.store(out_ref, inverse - jnp.where(_diagonal(CHUNK, family), 1.0, 0.0), row, CHUNK,
-                       h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            lower = algebra.solved(_tile(slots, "system", systems).value(), _merging(tuple(staging), call))
+            held.store(out_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             return carry, accumulators
 
         _walk(streams, views, step, call)
 
-    # The doubling's inverse, power and product beside the masks (`_solved`'s second phase).
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2,))
     return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=_streamed(system=((CHUNK, CHUNK), systems)),
-                   stages=2, live=_taken(1), work=Work(_inverse_flops()), held=held_tiles,
+                   stages=2, live=_taken(1), work=Work(_inverse_flops()),
+                   held=_Held(phases=(_doubling_held(call),)),
                    staging=_merges(call), landing={"square": held.landing(CHUNK, CHUNK)}, persistent=True)(
         system, taken)
 
