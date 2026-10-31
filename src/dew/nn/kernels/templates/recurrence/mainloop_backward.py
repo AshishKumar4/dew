@@ -306,6 +306,40 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
         q, k, do, hi, lo, hi, lo, taken)
 
 
+def _reverse_held(call: _Call, bv: int, *, gates: bool) -> _Held:
+    """What `_reverse`'s consumer thread holds at value block `bv`: the memory's gradient carried, its key
+    slices in fp32, and the one it gives the chunk before as it is summed; a step's two fp32 tiles at once,
+    the corrected values' gradient beside the local one it adds or the decayed output's gradient read after
+    it (`algebra.reverse_carried`: the local one folds into it before the read forms), beside the output's
+    gradient, a memory slice as an operand, and the stored tiles' casts; where the walk `gates` the values,
+    the values beside the gradient for beta's sum."""
+    held, given = dataclasses.replace(call.held, rows=call.rows), call.given
+    return _Held(carried=[_f32(call.width, bv)] * 2, phases=(
+        [_f32(CHUNK, bv)] * (2 + gates) + _held(given, CHUNK, bv) * (1 + gates)
+        + _held(held, call.block, bv) + _held(call.memories, call.block, bv)
+        + _held(_value_grads(call), CHUNK, bv)
+        + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
+
+
+def _reverse_launched(call: _Call, batch: int, bv: int, walked_width: int, *, gates: bool) -> tuple:
+    """`_reverse`'s outputs' types, its walked streams and its final memories' streams, a program walking
+    `walked_width` value columns; where the walk `gates` the values, their stream and beta's sums."""
+    width, value_width, given = call.width, call.value_width, call.given
+    final = _Operand(batch * call.heads * width, 1, jnp.dtype(jnp.float32))
+    out_type = (call.memories.shape(value_width), _value_grads(call).shape(call.heads * value_width),
+                jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32),
+                *((jax.ShapeDtypeStruct((value_width // bv, call.heads, call.rows), jnp.float32),)
+                  if gates else ()))
+    blocks = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
+                       **({"w": ((CHUNK, width), dataclasses.replace(call.held, rows=call.rows))}
+                          if call.delta else {}),
+                       out=((CHUNK, walked_width), given), local=((CHUNK, walked_width), _value_grads(call)),
+                       **({"values": ((CHUNK, walked_width), given)} if gates else {}))
+    finals = _streamed(**{f"final{i}": ((call.block, walked_width), final)
+                          for i in range(width // call.block)})
+    return out_type, blocks, finals
+
+
 @_lowered_once
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, tiles: Tiles, *, scale: float):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
@@ -404,40 +438,22 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                                                   pl.ds(walked + role * bv, bv)], bv,
                        landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
-    out_type = (memories.shape(value_width), grads.shape(call.heads * value_width),
-                jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32),
-                *(() if not gates else (jax.ShapeDtypeStruct((value_width // bv, call.heads, call.rows),
-                                                              jnp.float32),)))
-    blocks = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
-                       **({"w": ((CHUNK, width), held)} if call.delta else {}),
-                       out=((CHUNK, walked_width), given), local=((CHUNK, walked_width), grads),
-                       **({"values": ((CHUNK, walked_width), given)} if gates else {}))
-    finals = _streamed(**{f"final{i}": ((call.block, walked_width), final) for i in range(slices)})
+    out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates)
     # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
     steps = chunks / sequences.shape[0]
     work = Work(2 * (2 + call.delta) * CHUNK * width * walked_width * steps, steps)
-    # The memory's gradient carried, its key slices in fp32, and the one it gives the chunk before as it is
-    # summed; a step's two fp32 tiles at once, the corrected values' gradient beside the local one it adds
-    # or the decayed output's gradient read after it (`algebra.reverse_carried`: the local one folds into it
-    # before the read forms), beside the output's gradient, a memory slice as an operand, and the stored
-    # tiles' casts; where the walk gates the values, the values beside the gradient for beta's sum.
-    held_tiles = _Held(carried=[_f32(width, bv)] * 2, phases=(
-        [_f32(CHUNK, bv)] * (2 + gates) + _held(given, CHUNK, bv) * (1 + gates)
-        + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(grads, CHUNK, bv)
-        + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
     final_landing, after = _final_landing(call, bv)
     return _kernel(program, call, out_type=out_type,
                    grid=(value_width // walked_width, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=2, work=work,
-                   held=held_tiles, consumers=walkers,
+                   held=_reverse_held(call, bv, gates=gates), consumers=walkers,
                    live=lambda refs: refs[8][lax.axis_index("sequences"), 1] > 0,
                    staging=(*_staging(held, (call.block, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
                    once=finals,
                    landing={**_memory_landing(call, bv), "corrected": grads.landing(CHUNK, bv),
                             **final_landing},
-                   # Without the delta rule the weights' place takes the keys, an operand no step reads.
-                   # Where the walk gates no values, the keys and the prefix take their places, operands no
-                   # step reads.
+                   # The keys take the place of weights without the delta rule, and the keys and the prefix
+                   # that of values a walk gates none of: operands no step reads.
                    after=after)(q, k, k if w is None else w, do, local, hi, lo, dht, sequences,
                                 k if v is None else v, hi if beta is None else beta)
 
