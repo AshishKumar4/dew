@@ -1409,11 +1409,6 @@ class SelectiveCase:
     family: str | None = None
     product: str = 'forward'
 
-    @property
-    def cell(self) -> tuple[str | None, str]:
-        """The call's cell, its device's instruction family and its product (`SELECTIVE_CELLS`)."""
-        return self.family, self.product
-
 
 SELECTIVE_CHUNK = 32
 """The tokens a chunk of the template's selective scan takes (`templates.recurrence.selective`)."""
@@ -1450,37 +1445,28 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('tokens', lambda case: case.length >= SELECTIVE_CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {SELECTIVE_CHUNK}: a decode "
                              "step's scan, the portable math's own steps", row=INHERENT, kind='handoff'),
+    Requirement('strided copies', lambda case: case.family != 'mma.sync',
+                "mma.sync's streams copy a channel block untiled by cp.async, which jax 0.12.0.1.post41 "
+                "addresses at the block's width, not its row's stride, reading the wrong rows "
+                "(cp-async-alone4-h100-3674febe1's unfixed run; the jax fork's fix ships in post42)",
+                row='ledger 1300'),
+    Requirement('qualified', lambda case: False,
+                "the template's selective scan sums at mamba_ssm's rounding, its bar mamba_ssm's own "
+                "recorded distance from float64 at the same inputs, which is not recorded yet; the "
+                "portable math's sums are compensated (row 1698)", row='ledger 2968', kind='measured'),
 )
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
-blocks of channels, at most `SELECTIVE_STATES` states, and a chunk's tokens at least (a decode step hands
-off to the portable math)."""
-
-_STRIDED_CP_ASYNC = ("mma.sync's streams copy a block untiled by cp.async, which jax 0.12.0.1.post40 "
-                     "addresses at the block's width, not its row's stride: a channel block of a wider "
-                     "row read the wrong rows (cp-async-alone4-h100-3674febe1, before the fix the jax fork "
-                     "ships in post42)")
-
-_UNGATED = ("the template's selective scan has no gate of its own yet: no per-shard lowering, no mixer "
-            "parity at the mixer's fp32 operands, no GPU cell, no stability regimes (row 2968)")
-
-SELECTIVE_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'forward'): ('xla', _STRIDED_CP_ASYNC),
-    ('mma.sync', 'training'): ('xla', _STRIDED_CP_ASYNC),
-    ('wgmma', 'forward'): ('xla', _UNGATED),
-    ('wgmma', 'training'): ('xla', _UNGATED),
-}
-"""The cells, each an instruction family and a product (`SelectiveCase.cell`), where the selective scan
-runs the portable math though the template takes the call, each with its reason: the selector runs
-the portable math on them (`Op.declared`)."""
+blocks of channels, at most `SELECTIVE_STATES` states, a chunk's tokens at least (a decode step hands off
+to the portable math), no untiled strided copies (an A100's, until post42), and its qualification against
+recorded mamba_ssm, which no call meets yet: only a call that names the template (`generation.chosen`)
+takes it."""
 
 SELECTIVE: Op[SelectiveCase] = Op('selective_scan', (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
-                                                     Kernel('xla', (), generic=True)),
-                                  declared=SELECTIVE_CELLS)
+                                                     Kernel('xla', (), generic=True)))
 """The selective scan's selector: the recurrence template's scan (`templates.recurrence.selective`) where
-it takes the call, off a declared cell (`SELECTIVE_CELLS`), else the portable math. On an H100 the
-template's forward took 0.759 ms at 8x2048x5120 against mamba_ssm's 1.322, its training step 19.79 ms
-against mamba_ssm's 7.21 (mamba1-two-h100-e3b43f7d6)."""
+it takes the call, else the portable math. On an H100 the template's training step took 6.82 ms at
+8x2048x5120 against mamba_ssm's 7.21 (mamba1-scan2-h100-ac0dc3a9b)."""
 
 
 def selective_kernel(x, A, B, *, product: str = 'forward', report: bool = True) -> str:

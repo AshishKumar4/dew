@@ -133,45 +133,24 @@ def test_a_mamba_layer_is_as_exact_under_the_template_interpreted(packed, held):
     the_layer_is_as_exact_under_the_template(packed, held)
 
 
-REGIMES = {
-    "decays near one": {"steps": 1e-3},
-    "decays near zero": {"steps": 1e3},
-    "saturated steps": {"steps": None},
-    "resets on chunk edges": {"resets": 32},
-    "a long sequence": {"length": 8192},
-}
-"""Where a scan's recurrence is hardest to hold, each as the draw it changes: steps a thousandth or a thousand
-times the draw's (every decay `exp(dt A)` near one, or near zero), steps saturated at 10 (None), documents
-starting at every chunk's first token (`resets` tokens apart), and a sequence of 8192 tokens."""
+def test_the_selector_takes_the_template_only_where_a_call_names_it():
+    """An H100's Mamba layer scan, whole blocks of Mamba's 16 states, goes to the portable math with the
+    template's qualification its refusal, against recorded mamba_ssm (row 2968), no measurement claimed; a
+    call naming the template (`generation.chosen`) takes it, and an A100's refuses it for its strided
+    copies whatever the call names."""
+    from dew.nn.kernels import recurrence_chunk
+    from dew.nn.kernels.selection import KernelRefused, select
 
+    def case(family):
+        return recurrence_chunk.SelectiveCase(
+            varying=False, dtype=jnp.dtype(jnp.float32), state_dtype=jnp.dtype(jnp.float32), length=2048,
+            channels=5120, states=16, family=family)
 
-def the_template_holds_a_regime(regime: str, shape: tuple, dtype=jnp.float32):
-    """The template's output and every input's gradient on par from float64 with the portable scan's over
-    check 1's fewest draws, in `regime` (`REGIMES`) at `shape`'s rows, tokens, channels and states."""
-    change = REGIMES[regime]
-    rows, length, channels, states = shape
-    length = change.get("length", length)
-    family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), dtype)
-    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
-    starts = None
-    if "resets" in change:
-        starts = jnp.zeros((rows, length), bool).at[:, ::change["resets"]].set(True)
+    route = select(recurrence_chunk.SELECTIVE, case("wgmma"))
+    assert route.kernel == "xla" and route.refusal is not None and route.refusal.code == "qualified"
+    with generation.chosen(selective_scan="mosaic_gpu"):
+        assert select(recurrence_chunk.SELECTIVE, case("wgmma")).kernel == "mosaic_gpu"
+        with pytest.raises(KernelRefused) as refused:
+            select(recurrence_chunk.SELECTIVE, case("mma.sync"))
+    assert [refusal.code for refusal in refused.value.refusals] == ["strided copies"]
 
-    def draws(seed):
-        (x, dt, a, b, c, skip), _, dy = draw(dtype, seed, rows, length, channels, states, packed=False)
-        if "steps" in change:
-            scaled = jnp.full_like(dt, 10.0) if change["steps"] is None else dt * change["steps"]
-            dt = scaled.astype(dtype)
-        return x, dt, a, b, c, skip, dy
-
-    assert_as_exact(jax.jit(with_gradients(scanned(template, starts))),
-                    jax.jit(with_gradients(scanned(portable, starts))), draws,
-                    f"the selective template, {regime}", seeds=FEWEST_SEEDS,
-                    truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
-
-
-@pytest.mark.parametrize("regime", ["decays near zero", "resets on chunk edges"])
-def test_the_template_holds_its_hardest_regimes_interpreted(regime):
-    """Two of the regimes interpreted, at the interpreted shape; every regime runs at Falcon Mamba 7B's widths
-    on a GPU (`tests/test_gpu_recurrence.py`)."""
-    the_template_holds_a_regime(regime, SHAPES["interpreted"])
