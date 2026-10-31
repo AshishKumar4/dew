@@ -141,10 +141,10 @@ and the data axis Explicit (`MeshSpec.explicit`) alone and beside fsdp."""
 
 def _fixture(name: str) -> dict[str, Any]:
     """The decoder config Dew builds from a model's Hugging Face config."""
-    from dew.interop.hf_decoders import translate_config
+    from dew.interop.hf_decoders import decoder_config, translate_config
 
     config = json.loads((REPO / "tests/fixtures/hf" / name / "config.json").read_text())
-    return dict(translate_config(config.get("text_config", config)))
+    return dict(translate_config(decoder_config(config)))
 
 
 def _nemotron_h_moe() -> dict[str, Any]:
