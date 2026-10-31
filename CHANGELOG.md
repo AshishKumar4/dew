@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A file an export's manifest or a source's `file_info` declares is never read as other bytes under
+  that declaration, which a run's identity holds: an export records the version its store published
+  each shard at (an S3 ETag, a GCS generation, a Hub commit), and each read of a range of it is held to
+  that version, refused (`dew.data.storage.Replaced`) where the store no longer holds it; a local or
+  in-memory file is checked against its digest as a read opens it; any other remote file, and an
+  ArrayRecord shard, which its reader opens by path, is read whole into Dew's mirror and checked there.
+  Declared Parquet on S3 or GCS reads through Dew's ranged reads rather than Arrow's own clients.
 - A streamed Hub split reads the files of the configuration it names, or of the default its card
   states, as `datasets` resolves its card's `configs` (`data_files` under `data_dir`), and its Parquet
   conversion reads that configuration's directory: naming none, where a card states several and marks
@@ -18,6 +25,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
 - A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
   places a MoVA model's stacked value experts on the expert axis.
+- A compilation cache directory a run names after its process first compiled (`prepare_process`,
+  `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
+  JAX kept the first directory.
 - A decision run's summary states each question budget with where it came from beside the window's
   (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
   states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
@@ -46,9 +56,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   algorithm; a run saved with `ns_precision` as a precision level loads with its algorithm. Opt-in beside
   it: `per_head` (head widths by parameter pattern) orthogonalizes each head's block alone, as Kimi K3;
   `ns_coeffs: "polar_express"` takes Polar Express's coefficients; `neuron_beta2` normalizes each output
-  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`.
+  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`, its coefficients
+  (`NEWTON_SCHULZ`) exported there alone.
 - An evaluation of a run on the examples clock records the examples it had consumed
-  (`evaluation/examples_consumed`) beside its step.
+  (`evaluation/examples_consumed`) beside its step; a cooldown branch's, scored at the step it branched
+  at, records the branch's own count under `cooldown/examples_consumed`.
+- An evaluation's counts are its split's: `evaluation/counts/<split>/coordinated_batches` and
+  `evaluation/counts/<split>/records`, so splits scored at one step each keep their own. A run that branches
+  into cooldowns refuses a split named as a branch's suite of another (`cooldown_<split>`).
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes

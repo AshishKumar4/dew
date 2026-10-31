@@ -2417,6 +2417,6 @@ class OptimConfig:
         return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
 
 
-__all__ = ["NEWTON_SCHULZ", "BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
+__all__ = ["BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
            "OneCycle", "OptimConfig", "ParamGroup", "Power", "PowerProfilesState", "PowerTail",
            "QKClipState", "ScheduleBase", "ScheduleSpec", "delta_gradient_descent", "scale_by_m3", "stepped"]

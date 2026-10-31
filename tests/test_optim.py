@@ -20,7 +20,14 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, equations
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_computes_the_oracle,
+    chain_roundings,
+    dot_precisions,
+    equations,
+)
 from sharded import collectives
 from test_nested_learning_optim import muon_orthogonalized, newton_schulz_reference
 
@@ -230,12 +237,19 @@ def test_muons_state_is_optaxs_tree_and_steps_its_moments_bit_for_bit():
     assert largest_difference(state, expected) == 0.0
 
 
+def iteration_products(update, *arguments) -> list:
+    """The precision, operand dtype and shapes of each of the Newton-Schulz products `update` traces
+    (`dot_precisions`): X X^T and A A, each over a stack of matrices' batch."""
+    return [(precision, dtype) for precision, dtype, shapes in dot_precisions(update, *arguments)
+            if all(len(shape) == 3 for shape in shapes)]
+
+
 @pytest.mark.parametrize("forms", ["fast", "accurate"])
 def test_muons_newton_schulz_multiplies_in_the_runs_numerics(forms):
     """Muon's Newton-Schulz reads the run's numerics (`generation.numerics`, `ns_operands`): the update a
     run's step traces under its policy multiplies, in the fast forms, bfloat16 operands, and in the
-    accurate preset (`--precision accurate`), float32 operands at IEEE float32 (HIGHEST), as its lowered
-    program's products state them."""
+    accurate preset (`--precision accurate`), float32 operands at IEEE float32 (HIGHEST), each product
+    stating its precision; the accurate forms at the default matmul precision state none."""
     params = decoder_params()
     solver = OPTIMIZER_MAP["muon"](LR)
     policies = ({"fast": Numerics()} if forms == "fast"
@@ -245,30 +259,26 @@ def test_muons_newton_schulz_multiplies_in_the_runs_numerics(forms):
         def update(grads, state, policy=policy):
             with run_precision(policy):
                 return solver.update(grads, state, params)
-        # The process's own default cleared, so what the products state is the policy's alone.
-        with jax.default_matmul_precision(None):
-            text = jax.jit(update).lower(fixed_gradients(params), solver.init(params)).as_text()
-        # The iteration's products, X X^T and A A, each over a stack of square operands' batch.
-        products = [line for line in text.splitlines() if "dot_general" in line and "batching_dims" in line]
-        assert products
-        found[name] = products
+        found[name] = iteration_products(update, fixed_gradients(params), solver.init(params))
+        assert found[name]
+    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
     if forms == "fast":
-        assert all("xbf16>" in line for line in found["fast"])
+        assert {dtype for _, dtype in found["fast"]} == {jnp.dtype(jnp.bfloat16)}
     else:
-        assert all("xf32>" in line and "HIGHEST" not in line for line in found["default"])
-        assert all("xf32>" in line and "HIGHEST" in line for line in found["highest"])
+        assert set(found["default"]) == {(None, jnp.dtype(jnp.float32))}
+        assert set(found["highest"]) == {(highest, jnp.dtype(jnp.float32))}
 
 
 @pytest.mark.parametrize("algorithm", ["BF16_BF16_F32", "TF32_TF32_F32", "F32_F32_F32"])
 def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algorithm):
     """A dot algorithm Muon states for its Newton-Schulz (`ns_precision`, a record's name of it) is its
-    iteration's products, whatever the run's numerics: its lowered products name the algorithm over its
+    iteration's products, whatever the run's numerics: each product states the algorithm over its
     operands' type (`ns_operands`), and it compiles; a platform that has not the algorithm refuses it in
     JAX's own words, as a CPU refuses TF32, with no fallback of Dew's."""
     params = decoder_params()
     solver = OptimConfig(optimizer="muon", learning_rate=LR,
                          optimizer_opts={"ns_precision": algorithm}).build(10)
-    operand = "bf16" if algorithm.startswith("BF16") else "f32"
+    operand = jnp.dtype(jnp.bfloat16 if algorithm.startswith("BF16") else jnp.float32)
 
     def update(grads, state):
         with run_precision(ACCURATE):
@@ -278,29 +288,23 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
         with pytest.raises(ValueError):
             jax.jit(update).lower(*arguments)
         return
-    lowered = jax.jit(update).lower(*arguments)
-    products = [line for line in lowered.as_text().splitlines()
-                if "dot_general" in line and "batching_dims" in line]
-    # The algorithm itself, its operands' and accumulation's types and its one primitive product.
-    # The algorithm's own precision type (TF32's tf32), apart from its operands' f32 storage.
-    precision = algorithm.split("_")[0].lower()
-    stated = (f"algorithm = <lhs_precision_type = {precision}, rhs_precision_type = {precision}, "
-              "accumulation_type = f32, lhs_component_count = 1, rhs_component_count = 1, "
-              "num_primitive_operations = 1,")
-    assert products and all(f"x{operand}>" in line and stated in line for line in products)
-    lowered.compile()
+    products = iteration_products(update, *arguments)
+    assert products and set(products) == {(jax.lax.DotAlgorithmPreset[algorithm], operand)}
+    jax.jit(update).lower(*arguments).compile()
 
 
 @pytest.mark.parametrize(("recorded", "forms", "stated"), [
     ("bfloat16", "fast", None), ("bfloat16", "accurate", "BF16_BF16_F32"),
+    ("bfloat16", "accurate attention", "BF16_BF16_F32"),
     ("tensorfloat32", "fast", "TF32_TF32_F32"), ("float32", "accurate", "F32_F32_F32")])
 def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(recorded, forms, stated,
                                                                              tmp_path):
     """A Muon run saved while its options named the Newton-Schulz precision by a matmul level loads with
     that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own in their
     fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
-    2753); tensorfloat32 and float32 their algorithms, whose Muon builds."""
-    from test_run_options import lm
+    2753), a run saved before its trainer held a precision policy accurate by its `attention_form`
+    among them; tensorfloat32 and float32 their algorithms, whose Muon builds."""
+    from run_kinds import lm
 
     from dew.config import RunConfig
     from dew.nn.precision import ACCURATE
@@ -310,6 +314,12 @@ def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(rec
     run = dataclasses.replace(run, trainer=trainer, optim=OptimConfig(
         optimizer="muon", learning_rate=LR, optimizer_opts={"ns_precision": recorded}))
     run.save(str(tmp_path / "saved"))
+    if forms == "accurate attention":
+        written = tmp_path / "saved" / "run.json"
+        record = json.loads(written.read_text())
+        trainer = {name: value for name, value in record["fields"]["trainer"].items() if name != "precision"}
+        record["fields"]["trainer"] = {**trainer, "attention_form": "accurate"}
+        written.write_text(json.dumps(record))
     loaded = RunConfig.load(str(tmp_path / "saved"))
     assert loaded.optim.optimizer_opts.get("ns_precision") == stated
     loaded.optim.build(10)

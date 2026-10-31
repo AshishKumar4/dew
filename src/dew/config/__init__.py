@@ -983,7 +983,12 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    record = earlier_newton_schulz(record)
+    return earlier_newton_schulz(earlier_trainer(record))
+
+
+def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record with its decision segments and its trainer's numerics in today's shapes
+    (`earlier_run`), its optimizer's as it was."""
     fields = record.get("fields")
     segments = fields.get("segments") if isinstance(fields, Mapping) else None
     if isinstance(fields, Mapping) and isinstance(segments, list):
@@ -1042,15 +1047,14 @@ def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def saved_forms(trainer: Mapping[str, object]) -> str:
-    """The forms a saved trainer's numerics name: its precision's, a preset's name or a `Numerics`
-    record, or before it held one its `attention_form`; the fast ones where it names none."""
+    """The forms a saved trainer's numerics name, in today's shapes (`earlier_trainer`): its precision's,
+    a preset's name or a `Numerics` record; the fast ones where it names none."""
     precision = trainer.get("precision")
     if isinstance(precision, str):
         return numerics_of(precision).forms
     if isinstance(precision, Mapping):
         return from_record(Numerics, precision).forms
-    form = trainer.get("attention_form")
-    return form if isinstance(form, str) else "fast"
+    return "fast"
 
 
 def earlier_compute(record: Mapping[str, object]) -> str:

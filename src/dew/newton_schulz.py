@@ -209,3 +209,7 @@ def orthogonalized_leaf(update: jax.Array, steps: int,
     orthogonal, _ = muon.update(update, muon.init(update))
     assert isinstance(orthogonal, jax.Array), "one array's update is an array"
     return orthogonal
+
+
+__all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "ns_operands", "orthogonalized",
+           "orthogonalized_leaf", "polar_express"]
