@@ -216,6 +216,7 @@ from dew.training.transaction import (
     compact_qk,
     loss_scale,
     outcome,
+    refuse_unpassed_progress,
     window_dropped,
     with_ema,
 )
@@ -934,9 +935,8 @@ class Trainer(Generic[Loss, Effects]):
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
                                split=split, record=self.record, fetch=fetch, examples=self._examples,
                                inspection=self.inspection if sampled else None).step()
-        if not isinstance(self.step, PassesProgress):
-            # A custom step need not run the objective's loss, which refuses a model it passes no progress.
-            self.objective._refuse_unpassed_progress()
+        # A custom step need not run the objective's loss, which passes a model the run's progress.
+        refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens, closes=None):
