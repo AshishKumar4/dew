@@ -166,7 +166,8 @@ def enable_compilation_cache(path: str):
         if moved:
             # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets
             # it, so the next compile settles it again, under the directory named first, so no compile
-            # between the two settles it on the old one (row 2836).
+            # between the two settles it on the old one (row 2836). A compile settling it as the reset
+            # runs is waited for (the fork's reset_cache, under JAX's own initialization lock).
             compilation_cache.reset_cache()
     # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
     # in the cache directory would name one directory for every jaxlib and write picks from a
