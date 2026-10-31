@@ -36,7 +36,7 @@ from jax.extend.mlir import ir
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Route
 from dew.nn.kernels.templates import report
-from dew.telemetry.instrumentation import custom_call_kind, sizes
+from dew.telemetry.instrumentation import call_weights, custom_call_kind, sizes
 
 _log = logging.getLogger(__name__)
 
@@ -94,10 +94,9 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
 
 
 def _calls_from_entry(functions: dict[str, ir.OpView]) -> dict[str, int]:
-    """How many times each of a module's `functions` runs a call of its entry (`main`), in the module's
-    order: each `func.call` site of a function that runs adds its own runs to its callee's. Functions
-    cannot recurse, so their calls form a DAG, read in topological order; one the entry cannot reach
-    runs none."""
+    """How many times each of a module's `functions` runs a call of its entry (`main`): each `func.call`
+    site of a function that runs adds its own runs to its callee's (`call_weights`, as `hlo_flops` weighs
+    an executable's computations); one the entry cannot reach runs none."""
     callees: dict[str, Counter[str]] = {name: Counter() for name in functions}
     for name, function in functions.items():
 
@@ -108,18 +107,9 @@ def _calls_from_entry(functions: dict[str, ir.OpView]) -> dict[str, int]:
 
         function.operation.walk(note, ir.WalkOrder.PRE_ORDER)
     assert "main" in functions, "a lowered program's entry is its module's main"
-    callers = Counter(callee for called in callees.values() for callee in called)
-    runs = dict.fromkeys(functions, 0)
-    runs["main"] = 1
-    ready = [name for name in functions if not callers[name]]
-    while ready:
-        name = ready.pop()
-        for callee, sites in callees[name].items():
-            runs[callee] += runs[name] * sites
-            callers[callee] -= 1
-            if not callers[callee]:
-                ready.append(callee)
-    return {name: times for name, times in runs.items() if times}
+    weights = call_weights({name: {callee: float(sites) for callee, sites in called.items()}
+                            for name, called in callees.items()}, "main")
+    return {name: int(times) for name, times in weights.items() if times}
 
 
 def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
