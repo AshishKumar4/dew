@@ -28,6 +28,7 @@ import httpx
 import jax
 import numpy as np
 import pytest
+from rl_support import Published
 
 from dew.interop.gateway import Gateway, calls
 from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
@@ -465,12 +466,6 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     from dew.objectives.rl.scheduler import task_ids
     from dew.training import Layout, Trainer
 
-    class Publisher:
-        version = 0
-
-        def load(self, variables, version):
-            self.version = version
-
     hanging = tmp_path / "once"
     hanging.mkdir()
     gateway, _ = fake_gateway(version=None)
@@ -480,7 +475,7 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     objective = GRPOObjective(model, seq_len=7)
     tasks, records = jax.device_count(), []
     scheduler = RolloutScheduler(
-        Asynchronous(source, Publisher(), objective, width=8, rows=2 * tasks, max_lag=0, ahead=0),
+        Asynchronous(source, Published(), objective, width=8, rows=2 * tasks, max_lag=0, ahead=0),
         tasks=lambda batch: [Task(task.id, {HARBOR_KEY: str(hanging)}) for task in task_ids(batch)],
         groups=2, log=records.append)
     data = scheduler.tasks(Loader(train=lambda partition: iter(

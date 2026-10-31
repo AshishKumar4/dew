@@ -70,10 +70,11 @@ jobs:
     - name: Install the armada CLI
       run: bun install --global "$ARMADA"
     # tools/check_gates, each on an armada container of its own in the commit's environment, all failures
-    # reported, so the job lasts as long as its slowest gate, not their sum on this runner's 4 vCPUs (Main,
-    # 2026-10-28: the lint job set trains' wall at 35-41 min). SLOP020's ratchet among them holds the tolerance
-    # inventory to main's at the merge-base (BASE) and to every parent in the history, which the container's
-    # checkout carries (.armada.json's history), and the site's model list and examples to the code.
+    # reported, so the job lasts as long as its slowest gate, not their sum on this runner's 4 vCPUs (the
+    # maintainer, 2026-10-28: the lint job set trains' wall at 35-41 min). SLOP020's ratchet among them holds
+    # the tolerance inventory to main's at the merge-base (BASE) and to every parent in the history, which the
+    # container's checkout carries (.armada.json's history), and the site's model list and examples to the
+    # code.
     - name: Every cheap gate (tools/check.sh), each on armada
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
@@ -158,6 +159,8 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+    # tools/armada/ci.py runs itself under the one Python every key is computed by (HASHED_BY), through uv.
+    - uses: astral-sh/setup-uv@v6
     - id: policy
       env:
         DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
@@ -242,6 +245,9 @@ jobs:
         # which it finds in the history.
         fetch-depth: 0
     - uses: oven-sh/setup-bun@v2
+    # The plan armada runs here (.armada.json's local plan) runs tools/armada/ci.py under the one Python every
+    # task keys its records by (HASHED_BY), through uv, so it finds the records the tasks wrote.
+    - uses: astral-sh/setup-uv@v6
     # Installed once, before the suite's and the gangs' clients start together: two bunx runs of one
     # package at once install it into one place, and one failed copying from bun's cache (train 37's
     # gangs: "ENOENT: failed copying files from cache to destination for package armada").
@@ -277,12 +283,13 @@ jobs:
         # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to
         # base/kernels, a base/<producer> promote and the background whole suite run at a lane's whole-suite priority
         # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
-        # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger). A train staged
-        # on the testing train's tip (ci/stage-*, its own concurrency group above) runs beside it, at 5: it publishes
-        # only after that train, so it takes what that train leaves (owner and Main, 2026-10-28). A push to main the
-        # queue did not grade (a direct push: a train's tip is proven and runs neither) is its tip's only test, and
-        # runs as a train's (Main, 2026-10-29: 34c949ee8's, at 0 on a full fleet, left a gang's fourth rank unplaced
-        # past its deadline).
+        # lane's targeted run (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease
+        # ledger). A train staged on the testing train's tip (ci/stage-*, its own concurrency group above)
+        # runs beside it, at 5: it publishes only after that train, so it takes what that train leaves (owner
+        # and the maintainer, 2026-10-28). A push to main the queue did not grade (a direct push: a train's
+        # tip is proven and runs neither) is its tip's only test, and runs as a train's (the maintainer,
+        # 2026-10-29: 34c949ee8's, at 0 on a full fleet, left a gang's fourth rank unplaced past its
+        # deadline).
         case "$GITHUB_REF_NAME" in
           ci/batch-*|ci/fix-*|main) priority=--priority=10 ;;
           ci/stage-*) priority=--priority=5 ;;
@@ -306,12 +313,14 @@ jobs:
         # most tests import, and the daily run, which proves the commit again with every file): 160,
         # or a background run's share.
         # A cold suite (the cache's policy off: a lock, JAX's build or the recorder changed) compiles everything
-        # anew, so its deadline is 5400 s (Main, 2026-10-28: train 254's cold suite left 780 tasks unstarted at 2,698 s).
+        # anew, so its deadline is 5400 s (the maintainer, 2026-10-28: train 254's cold suite left 780 tasks
+        # unstarted at 2,698 s).
         if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"
         elif [ "$DEW_TEST_CACHE" = off ]; then bound="--deadline=5400"
         else bound="--deadline=2700"; fi
         # A train staged on the testing train's tip runs on the pool its branch names (ci/stage-...-p<N>: its lease's
-        # suite share, the land queue's promote.sh), so it asks no more than it leased (Main, 2026-10-28).
+        # suite share, the land queue's promote.sh), so it asks no more than it leased (the maintainer,
+        # 2026-10-28).
         case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) bound="$bound --pool=${GITHUB_REF_NAME##*-p}" ;; esac
         # A commit the proven job found proved (a run that passed, or, on main, the land queue's proof of the tip it
         # graded green, red rows its regrade passed included) runs no suite again, whatever its stored verdict or the

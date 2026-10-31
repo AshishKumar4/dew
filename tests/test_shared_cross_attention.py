@@ -3,7 +3,10 @@ the layer reads the conditioning sequence with its own query, key, value and out
 norms, and joins the read through one tanh gate, the only weight the form adds."""
 
 import dataclasses
+import json
 import math
+import shutil
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -503,3 +506,57 @@ def test_an_attention_of_its_own_reads_a_context_through_its_own_projections(kin
         {**variables, "params": params}, ids, conditioning=conditioning)))(variables["params"])
     gates = [np.asarray(leaf) for path, leaf in flat_tree(gradients).items() if "alpha_" in path]
     assert len(gates) == 2 and all(np.isfinite(gate).all() and np.all(gate != 0) for gate in gates)
+
+
+HF = Path(__file__).parent / "fixtures" / "hf"
+
+
+def with_a_tokenizer(fixture: Path, release: Path) -> Path:
+    """`fixture`, a release that holds no tokenizer, at `release` with the tiny Qwen's: each tensor indexed
+    by token id (its token tables, a hash router's expert ids) widened to the tokenizer's vocabulary by
+    repeating its own rows, so every id the tokenizer gives reads one of the release's own."""
+    from safetensors.numpy import load_file, save_file
+
+    qwen = HF / "qwen38-dense-tiny"
+    config = json.loads((fixture / "config.json").read_text())
+    stored = config["vocab_size"]
+    vocabulary = json.loads((qwen / "config.json").read_text())["text_config"]["vocab_size"]
+    release.mkdir()
+    tensors = load_file(fixture / "model.safetensors")
+    save_file({name: np.concatenate([tensor, tensor[:vocabulary - stored]]) if tensor.shape[:1] == (stored,)
+               else tensor for name, tensor in tensors.items()}, release / "model.safetensors",
+              metadata={"format": "pt"})
+    (release / "config.json").write_text(json.dumps({**config, "vocab_size": vocabulary}))
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        shutil.copy(qwen / name, release / name)
+    return release
+
+
+@pytest.mark.parametrize("fixture", ["deepseek-v3-tiny", "deepseek-v4-tiny"])
+def test_a_decision_run_reads_its_context_through_a_deepseek_backbones_own_attention(tmp_path, fixture):
+    """A decision run in the shared form (`--context-form shared`) over a DeepSeek V3 release (MLA) and a
+    V4 one reads its rows' context, each question and its lettered options, through the context layer's
+    own attention behind the gate it adds (ledger 2678): parsed from the command line, it trains two
+    steps, its loss finite and the gate moved off zero, the context's signal reaching it."""
+    from test_decision_letters_context import LABELS, SEGMENTS, examples
+
+    from dew.data import Memory
+    from dew.decision import Segment, decisions
+    from dew.decision.config import DecisionRunConfig
+    from dew.registry import to_record
+
+    release = with_a_tokenizer(HF / fixture, tmp_path / "release")
+    rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
+    config = DecisionRunConfig.cli(
+        ["--pretrained", str(release), "--segments", json.dumps(to_record(SEGMENTS, tuple[Segment, ...])),
+         "--context-layers", "0", "--context-form", "shared", "head:letters", "--head.count", "4",
+         "--head.labels.names", *(LABELS.names or ()), "--head.labels.variants", *LABELS.variants,
+         "--head.labels.cue", LABELS.cue, "--trainer.name", "shared", "--trainer.checkpoint-dir",
+         str(tmp_path / "runs"), "--trainer.steps", "2", "--trainer.checkpoint-every", "None",
+         "--trainer.eval-every", "None", "--trainer.log-every", "1", "--trainer.multi-host", "False",
+         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
+        default=DecisionRunConfig(data=rows))
+    state = config.run()
+    gates = [np.asarray(leaf) for path, leaf in flat_tree(jax.device_get(state.variables["params"])).items()
+             if "alpha_cross_attn" in path]
+    assert gates and all(np.isfinite(gate).all() and np.any(gate != 0) for gate in gates)
