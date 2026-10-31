@@ -120,6 +120,17 @@ def test_a_chain_of_an_importable_iterator_is_recorded():
     assert next(reader)["text"] == "a b"
 
 
+def test_a_chain_recorded_while_an_iterators_identity_was_its_name_reads_back():
+    """A run recorded while an iterator's content version was its `name` reads its chain back with that
+    version its `identity` (`RENAMED_FIELDS`, row 3031), a mix's members' stores too."""
+    chain = mix([from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2")]).batch(1)
+    written = json.dumps(encode(chain))
+    earlier = json.loads(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert earlier != json.loads(written)
+    mixture = decode(earlier).source
+    assert [member.source.identity for member in mixture.pipelines] == ["rows@1", "rows@2"]
+
+
 def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():
     """A validation dataset read once: in its own batches, in the batches given where it states
     none, and refused where it states none and none is given."""

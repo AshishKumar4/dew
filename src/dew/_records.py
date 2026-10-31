@@ -210,22 +210,31 @@ means what today's, which has none, does. A saved run's records read without the
 saved data step's identity compares without them (`without_removed`). Carried to 1.0 (ledger 1552)."""
 
 
+RENAMED_FIELDS: Mapping[str, Mapping[str, str]] = {"dew.data.sources.iterator:Iterated": {"name": "identity"}}
+"""The fields a configuration renamed after runs were saved with them, by its class's import path, each
+earlier name by today's: an iterator's content version, `identity` as every opaque source names it (row
+3031). A saved run's records read them under today's names (`earlier_fields`). Carried to 1.0 (ledger
+1552)."""
+
+
 def earlier_fields(value: JSON) -> JSON:
     """`value`, a saved run's records of components (a decision layout's segments, in its run.json or its
-    checkpoint's task record), with each component's fields its class lost since (`REMOVED_FIELDS`) left
-    out: a component record names its class and holds its fields (`{"class": ..., "fields": ...}`),
-    wherever it nests. Its callers hand it components alone, never a record of data a row holds, which may
-    look like one."""
+    checkpoint's task record; a chain's store), with each component's fields its class lost since
+    (`REMOVED_FIELDS`) left out and those it renamed (`RENAMED_FIELDS`) under today's names: a component
+    record names its class and holds its fields (`{"class": ..., "fields": ...}`), wherever it nests. Its
+    callers hand it components alone, never a record of data a row holds, which may look like one."""
     if isinstance(value, list):
         return [earlier_fields(part) for part in value]
     if not isinstance(value, dict):
         return value
     held = {key: earlier_fields(part) for key, part in value.items()}
     named = held.get("class")
-    removed = REMOVED_FIELDS.get(named) if isinstance(named, str) else None
+    removed = REMOVED_FIELDS.get(named, frozenset()) if isinstance(named, str) else frozenset()
+    renamed = RENAMED_FIELDS.get(named, {}) if isinstance(named, str) else {}
     fields = held.get("fields")
-    if removed and isinstance(fields, dict):
-        held["fields"] = {name: field for name, field in fields.items() if name not in removed}
+    if (removed or renamed) and isinstance(fields, dict):
+        held["fields"] = {renamed.get(name, name): field for name, field in fields.items()
+                          if name not in removed}
     return held
 
 
