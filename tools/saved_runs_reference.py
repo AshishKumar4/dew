@@ -91,7 +91,7 @@ def evidence(run, state, directory: Path) -> dict:
     plan = compiled["plan"] or {}
     tasked = objectives[run.objective.name].saved_task is not None
     return {"step": int(state.step), "compute": run.compute_dtype(),
-            "products": computed(directory) if tasked else None,
+            "products": computed(directory)["products"] if tasked else None,
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
