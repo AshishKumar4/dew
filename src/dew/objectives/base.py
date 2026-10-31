@@ -846,12 +846,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         are."""
         return None
 
-    def watched_positions(self, batch: Batch) -> jax.Array | None:
-        """The `[rows, tokens]` positions of the model's input whose activations a watched module's summary
-        reads (`dew.nn.inspection.watching`): a language model's real tokens. None, the default, where
-        every position of an output is one, as an image's or an example's is."""
-        return None
-
     def row_tokens(self, batch: Batch) -> int | None:
         """The tokens each of `batch`'s rows holds, read from its shapes alone, so a placed batch
         answers without a wait: the most a row's `scored_tokens` counts, and what a device steps of
@@ -1206,8 +1200,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             loss = self.validation_loss(variables, batch, step)
         else:
             watched = step.watched
-            with (watching(watched.modules, histogram=watched.histogram,
-                           positions=self.watched_positions(batch)) if watched
+            with (watching(watched.modules, histogram=watched.histogram) if watched
                   else contextlib.nullcontext()):
                 loss = self.loss(variables, batch, step)
         if _has_aux(loss):

@@ -69,7 +69,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
-from dew.nn.inspection import INSPECTED
+from dew.nn.inspection import INSPECTED, watched_positions
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
@@ -834,8 +834,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
-        hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
-                                               layers, progress)
+        # A watched layer's summary reads the real queries alone (`_query_weights`), as prepared here.
+        with watched_positions(self._query_weights(prepared, bool) if watched else None):
+            hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
+                                                   layers, progress)
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
         qk = gathered.get("qk", {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
@@ -1029,12 +1031,6 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 f"{self.loss_role.name.lower()} targets, but the batch carries "
                 f"no {ROLES_KEY} column; train this objective on the chat data path")
         return xp.asarray(batch[ROLES_KEY])
-
-    def watched_positions(self, batch: Batch) -> jax.Array:
-        """Each real query, its token real and not the pad id (`_query_weights`), the positions a watched
-        layer's summary reads."""
-        raw = batch[TEXT_KEY]
-        return self._query_weights(raw if isinstance(raw, ModelInputs) else ModelInputs(raw), bool)
 
     def _query_weights(self, prepared: ModelInputs, dtype):
         """Mark every real query whose router statistics and indexer KL count.

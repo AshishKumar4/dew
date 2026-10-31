@@ -10,6 +10,7 @@ as the outer trace's values, never an inner transform's.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import fnmatch
 from collections.abc import Iterator, Mapping
@@ -59,16 +60,36 @@ SOWN = "__summary__"
 variable, so it never collides with a module's own (a DiT's `output` head)."""
 
 
+_POSITIONS: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("watched_positions",
+                                                                              default=None)
+
+
 @contextlib.contextmanager
-def watching(modules: tuple[str, ...], *, histogram: bool = False,
-             positions: jax.Array | None = None) -> Iterator[None]:
+def watched_positions(positions: jax.Array | None) -> Iterator[None]:
+    """Within the block, a watched module's summary of an output whose leading axes are `positions`'
+    reads its true entries alone: the `[rows, tokens]` real positions of the input the model runs on, a
+    scorer's as it prepared them (`dew.objectives.lm.TokenScorer.token_scores`) and a pipeline stage's
+    microbatch of them (`dew.nn.backbones.decoder_stack.run_pipeline`). None reads every position."""
+    token = _POSITIONS.set(positions)
+    try:
+        yield
+    finally:
+        _POSITIONS.reset(token)
+
+
+def current_positions() -> jax.Array | None:
+    """The positions a watched summary reads where the call runs (`watched_positions`), None for every."""
+    return _POSITIONS.get()
+
+
+@contextlib.contextmanager
+def watching(modules: tuple[str, ...], *, histogram: bool = False) -> Iterator[None]:
     """Within the block, each module whose class name or path (`layers_3/attn`) a glob of `modules` matches
     (`*Attention`, `MLP`, `layers_3/*`) sows its output's summary (`statistics`) into `INSPECTED` where
     its apply opened it, under `SOWN`, the latest call's where a module runs more than once. A module
-    whose output is no single array (a tuple, a cache) sows its first array's. `positions`, given, are the
-    `[rows, tokens]` positions a summary reads of an output whose leading axes are theirs (a language
-    model's real tokens, `Objective.watched_positions`); another output is summarized whole. Nothing is
-    sown where the apply opened no such collection, as a module sows nothing into a collection it cannot
+    whose output is no single array (a tuple, a cache) sows its first array's, over the positions a
+    caller names (`watched_positions`) where its leading axes are theirs, whole otherwise. Nothing is sown
+    where the apply opened no such collection, as a module sows nothing into a collection it cannot
     write."""
     def interceptor(next_fun, args, kwargs, context):
         output = next_fun(*args, **kwargs)
@@ -81,7 +102,7 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
             return output
         arrays = [leaf for leaf in jax.tree.leaves(output) if isinstance(leaf, jax.Array)]
         if arrays:
-            first = arrays[0]
+            first, positions = arrays[0], _POSITIONS.get()
             where = (positions if positions is not None and first.shape[:positions.ndim] == positions.shape
                      else None)
             module.sow(INSPECTED, SOWN, statistics(first, histogram=histogram, where=where),

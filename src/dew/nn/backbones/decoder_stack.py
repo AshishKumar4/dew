@@ -28,6 +28,7 @@ from dew.batch import merge
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 
 from ..hyper_connections import Carried
+from ..inspection import current_positions, watched_positions
 from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
@@ -936,7 +937,9 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
     micro = functools.partial(microbatched, count=count)
     x = micro(x, batch_axis)
     inputs = None if layered is None else jax.tree.map(lambda value: micro(value, 0), layered)
-    held = jax.tree.map(lambda value: micro(value, 0), rows)
+    # A watched summary's real positions are held by row, each stage reading its microbatch's
+    # (`watched_positions`).
+    held = jax.tree.map(lambda value: micro(value, 0), (rows, current_positions()))
     slots = count // stages
     state_io = _on_stage_axis(x.reshape((stages, slots, *x.shape[1:])))
     shift = _on_stage_axis(jnp.zeros((stages, *x.shape[1:]), x.dtype))
@@ -964,8 +967,9 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
         return _on_stage_axis(jax.vmap(
             lambda index: jax.lax.dynamic_index_in_dim(values, index, 0, keepdims=False))(ids))
 
-    def call_stage(stage, x, layered, rows):
-        with pipeline_stage():
+    def call_stage(stage, x, layered, held):
+        rows, positions = held
+        with pipeline_stage(), watched_positions(positions):
             return stage(x, layered, rows)
 
     def iteration(module, carry, step):
