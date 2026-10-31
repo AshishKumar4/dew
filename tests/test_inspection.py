@@ -816,3 +816,36 @@ def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, t
         summary = cotangent_statistics(leaf.reshape(-1, leaf.shape[-1])[0], histogram=False)
         assert all(np.isfinite(float(value)) for value in summary.values())
         assert float(summary["rms"]) == 0 and float(summary["zero_fraction"]) == 1
+
+
+def test_a_distribution_matching_student_updates_watched_cotangent_reaches_its_trained_call(windows, tmp_path):
+    """An rCM student update by distribution matching alone, whose simulation's every call but the last
+    runs under no gradient, summarizes the loss's cotangent at the student's watched modules from the call
+    that trains it, the simulation's last (row 2324 review): each student probe counts that call's
+    entries."""
+    from test_whole_validation import runnable
+
+    from dew.nn.inspection import Watched
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion.consistency import FAKE_SCORE
+    from dew.training.transaction import probed_loss
+
+    objective, batch = runnable("rcm", windows, tmp_path)
+    objective.consistency_weight = 0.0
+    variables = objective.init(jax.random.key(0))
+    numeric = {key: value for key, value in batch.items()
+               if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
+    held = {key: value for key, value in batch.items() if key not in numeric}
+    student = next(update for update in range(objective.tangent_warmup, objective.tangent_warmup + 64)
+                   if bool(objective._student(update)))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables,
+                committed=jnp.asarray(student), watched=Watched(("*Block*",), cotangents=True))
+
+    def probed(numeric):
+        stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step)
+        _, seed = jax.vjp(lambda stats: objective.reduce_loss(stats)[0], stats)
+        return back(seed(jnp.ones(()))[0])[1]
+
+    probes = jax.jit(probed)(numeric)
+    trained = jax.tree.leaves({name: tree for name, tree in probes.items() if name != FAKE_SCORE})
+    assert trained and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all() for leaf in trained)
