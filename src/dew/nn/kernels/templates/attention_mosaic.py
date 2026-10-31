@@ -394,14 +394,15 @@ general registers (P2R) until the selects that read them (`_anchor_registers`)."
 
 def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
     """The registers a queries-first backward step's anchor select holds (`at_anchor`, `algebra.grad_scores`)
-    beside its products, from the compares that form it to the selects that read it: its predicates packed
-    a bit an entry; a row pass's of them, a role's rows, pending, all but those its predicate registers
-    hold (`PREDICATE_REGISTERS`); and the places it compares, the keys' column vector and the anchor keys'
-    row vector, int32. The SASS of dQ under ALiBi at 64 x 64, width 64, on an A100: 32 `key != anchor`
-    compares a thread packed into one word, 25 saved by P2R, restored by ISETP and FSEL, beside S's and
-    dP's accumulators, none past them in the pullback's float tiles (43 words at its need, 200; the
-    accurate form's at 64 x 64 and width 128 on an H100 1, 24 and 18, its need 255; dQ at 128 x 64, width
-    64, under sinks 2, 27 and 20)."""
+    across the step, from the compares that form it to the selects that read it: its predicates packed a
+    bit an entry; a row pass's of them, a role's rows, pending, all but those its predicate registers hold
+    (`PREDICATE_REGISTERS`); and the places it compares, the keys' column vector and the anchor keys' row
+    vector, int32. The SASS of dQ under ALiBi at 64 x 64, width 64, on an A100: 32 `key != anchor`
+    compares a thread packed into one word, 25 saved by P2R, restored by ISETP and FSEL, 43 words at its
+    need (200); the accurate form's at 64 x 64 and width 128 on an H100 1, 24 and 18, its need 255; dQ at
+    128 x 64, width 64, under sinks 2, 27 and 20. Priced beside every phase: beside its products alone, the
+    accurate form's dQ under a temperature took 64 x 64 at width 64, where it spills 232 bytes
+    (ET-PINBWD), its hook's slopes live across the select."""
     entries = block_q * block_k // resources.THREADS
     pending = max(0, family.role_rows * block_k // resources.THREADS - PREDICATE_REGISTERS)
     places = family.column_registers(block_k, jnp.int32) + family.row_registers(block_q, jnp.int32)
@@ -560,10 +561,9 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     products = [(block_q, block_k, jnp.float32)] * 2 + [(block_q, block_k, jnp.int8)] + held
     pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes
     if dq:
-        # dQ's anchor select priced as its SASS holds it, beside its products (`_anchor_registers`); its
-        # hook's parameters and gradients beside its pullback, not its products: they stream in and out of
-        # its entries (dQ under a tile bias at 64 x 64, width 128: S's and dP's accumulators the only float
-        # tiles at its peak).
+        # dQ's anchor select priced as its SASS holds it (`_anchor_registers`); its hook's parameters and
+        # gradients beside its pullback, not its products: they stream in and out of its entries (dQ under
+        # a tile bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
         anchor = _anchor_registers(family, block_q, block_k)
         products = products[:2]
         pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
@@ -573,9 +573,8 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
         # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
-        phases = max(resources.live_registers(family, carried, products) + anchor,
-                     resources.live_registers(family, carried, pullback, cotangents))
-        return phases + rows + vectors
+        phases = resources.live_registers(family, carried, products, pullback, cotangents)
+        return phases + anchor + rows + vectors
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
         # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
