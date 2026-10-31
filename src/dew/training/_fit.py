@@ -39,6 +39,7 @@ from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
+from dew.training.diloco import regrouped
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS
@@ -532,9 +533,15 @@ def restored(state: TrainState, resume: int, examples: int | None) -> TrainState
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
     """A state supplied to a fit, which reads its data afresh: its clock of examples at none consumed
     where the run is on that clock (`examples`), none on another, and its schedules in the form the run's
-    own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`)."""
-    return dataclasses.replace(initial, consumed=None if examples is None else jnp.zeros((), jnp.int32),
-                               opt_state=reclocked(initial.opt_state, made),
+    own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`), a DiLoCo run's in each group's
+    inner state, its outer optimizer's as it is."""
+    consumed = None if examples is None else jnp.zeros((), jnp.int32)
+    if initial.inner is not None:
+        return dataclasses.replace(initial, consumed=consumed, inner=regrouped(
+            initial.inner, lambda own: dataclasses.replace(own, opt_state=reclocked(own.opt_state, made),
+                                                           deferred=waiting(made) if own.deferred is None
+                                                           else own.deferred)))
+    return dataclasses.replace(initial, consumed=consumed, opt_state=reclocked(initial.opt_state, made),
                                deferred=waiting(made) if initial.deferred is None else initial.deferred)
 
 

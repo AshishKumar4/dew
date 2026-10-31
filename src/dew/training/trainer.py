@@ -139,7 +139,7 @@ from dew.training._fit import (
 from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
-from dew.training.diloco import DiLoCo, grouped, rated, rates_set
+from dew.training.diloco import DiLoCo, grouped, rated, rates_set, window_of, windowed, with_window
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -445,7 +445,7 @@ class Trainer(Generic[Loss, Effects]):
             key=run_key,
             consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
-        return state if self.diloco is None else self.diloco.started(state, self.device_mesh)
+        return state if not self.diloco else self.diloco.started(state, self.device_mesh, self.layout.host)
 
     @property
     def key(self) -> jax.Array:
@@ -647,7 +647,7 @@ class Trainer(Generic[Loss, Effects]):
         step = (None if checkpoints is None
                 else agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume)))
         if checkpoints is not None and step is not None:
-            abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(step))
+            abstract = with_window(abstract, checkpoints.accumulation_template(step))
         shardings, _ = self._validated(abstract)
         return Start(initializer, key, abstract, through, step, shardings)
 
@@ -739,15 +739,12 @@ class Trainer(Generic[Loss, Effects]):
         """Put the objective at the rung a newly met shape starts from, and
         return the rung a resumed checkpoint recorded for this shape, or None.
 
-        Each shape fits on its own. A run bucketed by length meets a long
-        bucket that climbs, and when that rung stayed, every later, shorter
-        bucket compiled at it too, though it fitted with less recomputation
-        (in one real mix, six shapes ran at 'minimal' that fitted with none,
-        15% slower a token). So each new shape starts where the first compile
-        found the objective, its configured remat and head or the rung its
-        checkpoint trained on, and climbs only as far as it must. A shape the
-        checkpoint names climbs to that shape's own rung, so a resumed run
-        compiles each shape as the run it continues did."""
+        Each shape fits on its own. A run bucketed by length meets a long bucket that climbs, and when that
+        rung stayed, every later, shorter bucket compiled at it too, though it fitted with less recomputation
+        (in one real mix, six shapes ran at 'minimal' that fitted with none, 15% slower a token). So each new
+        shape starts where the first compile found the objective, its configured remat and head or the rung
+        its checkpoint trained on, and climbs only as far as it must. A shape the checkpoint names climbs to
+        that shape's own rung, so a resumed run compiles each shape as the run it continues did."""
         if self._base_rung is None:
             self._base_rung = (tuple(entry.module for entry in self.objective.program_key()),
                                head_tile_of(self.objective), self._xla_defaults, self._rung())
@@ -824,8 +821,8 @@ class Trainer(Generic[Loss, Effects]):
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
                                  shape_only=False):
-        """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in,
-        empty; unchanged under a window of one, a custom step or a held one that replays such batches
+        """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty;
+        unchanged under a window of one, a custom step or a held one that replays such batches
         (`Accumulation.replays`): a ramp's stage begins with a window (`Ramp.stages`)."""
         if window == 1 or self.step is not None:
             return state
@@ -1032,12 +1029,12 @@ class Trainer(Generic[Loss, Effects]):
                                         out_shardings=candidate.shardings.compute,
                                         compiler_options=compiler_options(*self.objective.towers()) or None)
                     current = dataclasses.replace(current, compute=narrowing(current.variables))
-                if (window > 1 and self.step is None and (current.accumulation is None or (
-                        (self._ramp or self._stage_starts)
-                        and not current.accumulation.replays(candidate.prepared.accumulation)))):
+                held, staged = window_of(current), self._ramp or self._stage_starts
+                if window > 1 and self.step is None and (
+                        held is None or (staged and not held.replays(window_of(candidate.prepared)))):
                     # The window, and with it the split, is the state's from here on.
-                    current = dataclasses.replace(self._initialize_accumulation(
-                        current, candidate.micro, candidate.shapes, window=window),
+                    current = dataclasses.replace(windowed(lambda state, rows: self._initialize_accumulation(
+                        state, rows, candidate.shapes, window=window), current, candidate.micro),
                         window_size=jnp.asarray(window, jnp.int32))
                     # The moving state alone: the frozen tree stays the arrays the run holds.
                     moving, frozen = apart(current)
@@ -1162,14 +1159,16 @@ class Trainer(Generic[Loss, Effects]):
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, split: int,
                   narrow: bool | None = None):
-        """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
-        with the accumulation of an update's window, `split` microbatches a step, and the copies the step
-        builds, as it traces them over microbatches of `batch`'s shapes, none where `narrow` is off."""
+        """The loss's shapes (None under a custom step), the narrow copies and the state's shapes with the
+        accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
+        the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
+        `narrow` is off."""
         window = split * self.accumulation
         shapes = None if self.step is not None else self._loss_shape(state, batch, window, split)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
-        prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
+        prepared = windowed(lambda state, batch: self._initialize_accumulation(
+            state, batch, shapes, window=window, shape_only=True), state, batch)
         # DiLoCo's groups read their own parameters, which no narrow copy shadows.
         copies = (narrow_copies(self.objective, state, batch, self._model_batch, window=window, split=split,
                                 composed=self.step is None and not self.dynamic_scale)
