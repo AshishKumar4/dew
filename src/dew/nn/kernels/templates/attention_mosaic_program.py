@@ -360,8 +360,11 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
 
 def varying_slopes(hooks: Hooks | None) -> int:
     """The tiles a backward step's score-hook pullback forms that vary with its inputs (`algebra.scored`):
-    its output and each slope along an input it differentiates but a constant one (a hook linear in an input
-    slopes 1 along it, which folds away); traced, never run, on a tile. None without a hook."""
+    its output and its slope along each input it differentiates, the logits and each floating parameter,
+    but a constant one (a hook linear in an input slopes 1 along it, which ptxas holds no tile of: the
+    fast dQ under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled where four slopes priced
+    258); traced, never run, on a tile, each slope along its own input alone, or where the hook takes no
+    forward derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
     if hooks is None or not callable(hooks.score_mod):
         return 0
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
@@ -373,19 +376,35 @@ def _varying_slopes(score_mod, params: tuple) -> int:
     """`varying_slopes` of `score_mod` under parameters of `params`' kinds and dtypes."""
     tile = (TILE_SIDES[0], TILE_SIDES[0])
     positions, logits = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.float32)
-
-    def scored(s, q_pos, k_pos, *values):
-        out, slopes = algebra.scored(score_mod, s, q_pos, k_pos, values, slopes=True)
-        assert slopes is not None
-        return out, *slopes
-
     values = [_entries(kind, dtype, tile) for kind, dtype in params]
-    jaxpr = jax.make_jaxpr(scored)(logits, positions, positions, *values).jaxpr
+
+    def slope(place: int, s, q_pos, k_pos, *values):
+        # The hook's derivative along its input `place` (0 the logits, else that parameter) alone.
+        inputs = [s, *values]
+
+        def along(x):
+            taken = [*inputs[:place], x, *inputs[place + 1:]]
+            return score_mod(taken[0], q_pos, k_pos, *taken[1:])
+        return jax.jvp(along, (inputs[place],), (jnp.ones_like(inputs[place]),))[1]
+
+    count = int(_varies(score_mod, logits, positions, positions, *values))
+    for place in (0, *(1 + index for index in floating_params(values))):
+        try:
+            count += _varies(functools.partial(slope, place), logits, positions, positions, *values)
+        except TypeError:
+            # A `jax.custom_vjp` hook takes no forward derivative: its slope counted.
+            count += 1
+    return count
+
+
+def _varies(function: Callable, *arguments: jax.ShapeDtypeStruct) -> bool:
+    """Whether `function`'s output, traced at `arguments`, depends on any of them."""
+    jaxpr = jax.make_jaxpr(function)(*arguments).jaxpr
     varying = set(jaxpr.invars)
     for eqn in jaxpr.eqns:
         if any(not isinstance(var, jax_core.Literal) and var in varying for var in eqn.invars):
             varying.update(eqn.outvars)
-    return sum(not isinstance(var, jax_core.Literal) and var in varying for var in jaxpr.outvars)
+    return any(not isinstance(var, jax_core.Literal) and var in varying for var in jaxpr.outvars)
 
 
 def transposable(hooks: Hooks) -> bool:
