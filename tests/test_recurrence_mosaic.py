@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
     FORMED,
@@ -521,6 +522,7 @@ RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kd
 key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
 
 
+@lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
     at a variant: a kernel's name compiled under both launches (`report.launching`) is gated on each
