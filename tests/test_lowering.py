@@ -166,12 +166,26 @@ def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_
     assert (flops.hardware, flops.unsized) == (sum(entry["flops"] for entry in templated), unstated)
 
 
+@pytest.mark.parametrize(("start", "bound", "step", "bits", "signed", "trips"), [
+    (0, 12, 1, 32, True, 12), (0, 12, 5, 32, True, 3), (4, 2, 1, 32, True, 0), (0, 12, 0, 32, True, math.inf),
+    (0, 127, 1, 8, True, 127), (0, 128, 1, 8, True, math.inf), (0, 128, 1, 8, False, 128),
+    (250, 260, 3, 8, False, math.inf)])
+def test_a_counted_loops_trips_are_one_rule_for_an_executable_and_a_lowered_program(start, bound, step, bits,
+                                                                                    signed, trips):
+    """The trips of a loop counting an integer from `start` by `step` below `bound`, by the one rule both an
+    executable's loop and a lowered program's are read by (`instrumentation.counted_trips`, row 2945): the
+    ceiling of the span over the step, none for a bound below the start, and infinite for a step that is not
+    positive or a last step its counter's type cannot hold (signed or not), which a wrapped counter need
+    never reach."""
+    from dew.telemetry.instrumentation import counted_trips
+
+    assert counted_trips(start, bound, step, bits, signed=signed) == trips
+
+
 def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
     """A function's runs from the entry (`instrumentation.call_weights`) take nothing from a call that runs
     none: one in a loop of no trips inside a function of unknown runs (a loop of no static count around
     it), so a kernel the entry also calls once runs once, known, not unknown (row 2933's review)."""
-    import math
-
     from dew.telemetry.instrumentation import call_weights
 
     weights = call_weights({"main": {"f": math.inf, "k": 1.0}, "f": {"k": 0.0}, "k": {}}, "main")
