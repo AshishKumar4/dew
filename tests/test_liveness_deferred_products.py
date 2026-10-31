@@ -27,9 +27,10 @@ TYPES = "(" + ", ".join(["vector<1xf32>"] * 8 + ["i64", "i64"] + ["i32"] * 5) + 
 SHAPES = [(2, 6), (3, 4), (1, 12)]
 
 
-def module_text(batches: int, products: int) -> str:
+def module_text(batches: int, products: int, chained: bool = False) -> str:
     """A Mosaic-shaped module: one warpgroup's `gpu.launch` of a loop over 4 steps carrying `batches` [64, 16]
-    state tiles."""
+    state tiles; where `chained`, each product's left operand's address read from the product before it (its
+    first word, as attention's P is read from S), so none is issued before the one it reads."""
     out, count = [], [0]
 
     def name(prefix):
@@ -57,7 +58,7 @@ def module_text(batches: int, products: int) -> str:
     out.append(f"      %final:{words} = scf.for %i = %c0 to %c4 step %c1 iter_args({iters}) -> ({types}) {{")
     updated = []
     for batch in range(batches):
-        total = None
+        total, read = None, "%da"
         for _ in range(products):
             acc = ["%zero"] * 8
             out.append(
@@ -68,7 +69,7 @@ def module_text(batches: int, products: int) -> str:
                 result = name("r")
                 out.append(
                     f"        {result} = llvm.inline_asm has_side_effects asm_dialect = att {ASM} "
-                    f"{', '.join(acc)}, %da, %db, %one, %one, %one, %one, %one : {TYPES} -> {STRUCT}"
+                    f"{', '.join(acc)}, {read}, %db, %one, %one, %one, %one, %one : {TYPES} -> {STRUCT}"
                 )
                 acc = []
                 for k in range(8):
@@ -83,6 +84,12 @@ def module_text(batches: int, products: int) -> str:
                 "        llvm.inline_asm has_side_effects asm_dialect = att "
                 '"wgmma.wait_group.sync.aligned 0;\\0A", "" : () -> ()'
             )
+            if chained:
+                word, scalar, wide = name("w"), name("f"), name("a")
+                out.append(f"        {word} = vector.extract {acc[0]}[0] : f32 from vector<1xf32>")
+                out.append(f"        {scalar} = arith.fptosi {word} : f32 to i64")
+                out.append(f"        {wide} = arith.addi %da, {scalar} : i64")
+                read = wide
             if total is None:
                 total = acc
             else:
@@ -186,11 +193,11 @@ def ptx_text(batches: int, products: int) -> str:
     return header + "\n".join(lines) + "\n\tret;\n}\n"
 
 
-def _peak(batches: int, products: int) -> int:
+def _peak(batches: int, products: int, chained: bool = False) -> int:
     with jax_mlir.make_ir_context() as context:
         kernel_liveness.mosaic_gpu_dialect.register_dialect(context)
         context.allow_unregistered_dialects = True
-        module = mlir_ir.Module.parse(module_text(batches, products))
+        module = mlir_ir.Module.parse(module_text(batches, products, chained=chained))
         kernel_liveness.passmanager.PassManager.parse(kernel_liveness.CANONICAL).run(module.operation)
         divergent = kernel_liveness.divergent_values(module)
         totals = []
@@ -223,3 +230,51 @@ def test_the_pass_counts_the_registers_ptxas_allocates_for_independent_products(
     batch's at its fold into its carried tile and count one batch's."""
     used, _, _ = kernel_compile._ptxas(ptx_text(batches, products), "sm90", cap=None)
     assert 8 * (batches * products + batches) <= _peak(batches, products) <= used
+
+
+def test_the_pass_holds_a_product_that_reads_another_apart_from_it():
+    """A chain of twelve products, each reading the product before it (its left operand's address from that
+    product's first word, as attention's P reads S): none is issued before the one it reads, so the pass holds
+    a product's accumulators to its own run alone (`kernel_liveness._Pass._define_all`), about a product's
+    beside the batch's sum and carried tile, where holding every product of the body to its last counted all
+    twelve's 96 words (row 3154)."""
+    independent, chained = _peak(1, 12), _peak(1, 12, chained=True)
+    assert chained <= independent - 8 * 10, (chained, independent)
+
+
+def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
+    """The H100's fused key and value backward of a causal attention 128 wide (the attention resource gate's
+    case, tests/test_attention_mosaic.py), whose products read each other (S, then P, then the value and key
+    products): the pass's registers a thread (its lowered model) no more than ptxas's least spill-free cap.
+    Holding every product of its body to its last read 307 against ptxas's 247 (row 3154)."""
+    import jax
+    import jax.numpy as jnp
+    import test_attention_mosaic as attention
+    from fla_gdn_support import KernelCase
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention as template, attention_mosaic
+
+    queries, width = 512, 128
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
+    residuals = attention._residuals(query.shape)
+
+    def backward(query, key, value, dout, residuals):
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                          accurate=False)
+        return grads.query, grads.key, grads.value
+
+    op, ba, config = attention._gated_backward("sm90", width, False, "none")
+    with generation.assumed("sm90"):
+        models = attention._backward_models(op, ba, config)
+        shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
+        (record,) = kernel_compile.compile_mosaic_kernels(
+            [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)], "sm90")
+    read = {kernel["kernel"]: kernel.get("need") for kernel in record["kernels"]}
+    lowered = record.get("lowered_models", {})
+    checked = [(name, model["registers"], read[name]) for name, model in lowered.items()
+               if name in read and read[name] is not None]
+    assert checked, (sorted(lowered), read)
+    assert all(registers <= need for _, registers, need in checked), checked

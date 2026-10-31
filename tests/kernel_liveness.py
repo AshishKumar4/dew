@@ -424,9 +424,14 @@ class _Pass:
         self.compiler = compiler
         self.launches: list[Peak] = []
         self.mma_words = 0
-        # Each block's warpgroup products' accumulator atoms: ptxas issues every product of a
-        # straight-line region before it reads any accumulator (`uses`).
+        # Each run of a block's warpgroup products' accumulator atoms, by the run's key: ptxas issues every
+        # product of a run before it reads any of their accumulators (`uses`, `_define_all`).
         self.products: dict = collections.defaultdict(set)
+        # Each product's run (by its first result), each value's products of its block it reads through
+        # (`_define_all`), and each block's open run: its key and its products.
+        self.run: dict = {}
+        self.reads: dict = {}
+        self.open: dict = {}
 
     def _streamed(self, op, name: str) -> bool:
         if not _elementwise(op, name):
@@ -635,11 +640,11 @@ class _Pass:
         for operand in op.operands:
             into.update(a for a in self.atoms.of.get(operand, ()) if a is not None)
         if _product(op):
-            # ptxas issues every warpgroup product of a straight-line region before it reads any of their
-            # accumulators, so each is live to the region's last product: the recurrence's states launch
-            # holds its twelve products' 96 words at its peak, which the program order kills six at a time
-            # (its 202 registers a thread against 117 counted).
-            into.update(self.products[op.parent])
+            # ptxas issues every warpgroup product of a run before it reads any of their accumulators, so
+            # each is live to its run's last product: the recurrence's states launch holds its twelve
+            # products' 96 words at its peak, which the program order kills six at a time (its 202
+            # registers a thread against 117 counted).
+            into.update(self.products[self.run[op.results[0]]])
         for nested_region in op.regions:
             for block in nested_region.blocks:
                 for inner in block.operations:
@@ -726,12 +731,26 @@ class _Pass:
         return peak
 
     def _define_all(self, op):
+        """`op` defined (`define`), a product placed in its run: a block's products in order, a run closing
+        where a product reads, through any ops between, a product of the run's (attention's S, then P, then
+        PV: one can't be issued before the one it reads), so only independent products' accumulators are
+        held to their run's last (row 3154)."""
         if op.results and op.results[0] in self.atoms.of:
             return
         self.define(op)
+        upstream = set().union(*(self.reads.get(operand, ()) for operand in op.operands))
         if _product(op):
-            self.products[op.parent].update(a for value in op.results for a in self.atoms.of.get(value, ())
-                                            if a is not None)
+            key, members = self.open.get(op.parent, (None, set()))
+            if key is None or upstream & members:
+                key, members = (op.parent, op.results[0]), set()
+            members.add(op.results[0])
+            self.open[op.parent] = (key, members)
+            self.run[op.results[0]] = key
+            self.products[key].update(a for value in op.results for a in self.atoms.of.get(value, ())
+                                      if a is not None)
+            upstream.add(op.results[0])
+        for value in op.results:
+            self.reads[value] = frozenset(upstream)
 
 
 def _product(op) -> bool:
