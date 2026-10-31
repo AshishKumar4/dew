@@ -39,6 +39,7 @@ from dew.nn.kv_cache import (
     leaf_name,
     with_rounding_keys,
 )
+from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
 from dew.sampling import decoding
@@ -194,8 +195,9 @@ class Dense:
     continuing: bool = False
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
-                  admission: Admission) -> tuple[DecoderState, jax.Array]:
-        """The resident carry with the admitted prompts prefilled into their rows.
+                  admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
+        """The resident carry with the admitted prompts prefilled into their rows, at the run's
+        `progress` (`Server.progress`).
 
         The prompts run over a fresh cache at their own bucket width, so the
         prefill's attention reads only the prompt's keys, not the resident
@@ -204,8 +206,9 @@ class Dense:
         """
         narrow = cache_sized(model, admission.prompts.tokens.shape[1])
         fresh, real = prefill_state(narrow, params, admission.prompts,
-                                    decode_ops(narrow, params, pad_id, None),
-                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)))
+                                    decode_ops(narrow, params, pad_id, None, progress),
+                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)),
+                                    progress=progress)
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
@@ -226,8 +229,9 @@ class Paged:
     continuing: bool = False
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
-                  admission: Admission) -> tuple[DecoderState, jax.Array]:
-        """The resident carry with each admitted row's next prompt piece in the pool.
+                  admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
+        """The resident carry with each admitted row's next prompt piece in the pool, at the run's
+        `progress`.
 
         The piece runs over the shared pool with the page table and cursor the
         host supplies per row, so it reads earlier pieces and shared prefix
@@ -256,8 +260,9 @@ class Paged:
             return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - 1)), held, fresh)
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
-        fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
-                                    cache=cache)
+        fresh, real = prefill_state(model, params, admission.prompts,
+                                    decode_ops(model, params, pad_id, None, progress), cache=cache,
+                                    progress=progress)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
@@ -274,8 +279,10 @@ Placement = Dense | Paged
 
 def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
               admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-              stopping: decoding.Finishing, grammar: Grammar | None) -> tuple[Slots, Draws]:
-    """One iteration: admit, feed every drawing row its last draw, then every active row draws.
+              stopping: decoding.Finishing, grammar: Grammar | None,
+              progress: Progress = END) -> tuple[Slots, Draws]:
+    """One iteration: admit, feed every drawing row its last draw, then every active row draws, every
+    forward at the run's `progress` (`Server.progress`).
 
     This is `strategies._sample_rows`'s step over rows that carry their own
     budget, so a row that stops or spends its budget goes inactive while the
@@ -293,16 +300,16 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         real = jnp.any(real_slots(admission.prompts.token_fields, admission.prompts.tokens.shape), axis=1)
         state = _seated(state, state.decoder, real, admission, placement.groups)
     elif admission is not None:
-        state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission), admission,
-                        placement.groups)
+        state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission, progress),
+                        admission, placement.groups)
     capacity = state.tokens.shape[1] // 2
     fed = state.active & (state.step > 0)
     last = jnp.take_along_axis(state.tokens, (capacity + state.step - 1)[:, None], axis=1)[:, 0]
     if mixed:
         assert admission is not None
-        decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission)
+        decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission, progress)
     else:
-        ops = decode_ops(model, params, pad_id, None)
+        ops = decode_ops(model, params, pad_id, None, progress)
         decoder = ops.advance(state.decoder, last, fed)
     if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
@@ -325,7 +332,8 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
 
 
 def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Placement, decoder: DecoderState,
-                last: jax.Array, fed: jax.Array, admission: Admission) -> DecoderState:
+                last: jax.Array, fed: jax.Array, admission: Admission, progress: Progress = END
+                ) -> DecoderState:
     """The admitting step's forward over every token it runs: each slot's
     last draw where it feeds, then the admitted prompt pieces, left-padded,
     in one row (`dew.nn.inputs.Admitted`). The projections read their
@@ -347,7 +355,7 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
                           tables=admission.tables if isinstance(placement, Paged) else None,
                           continuing=placement.continuing),
         mutable=["cache"],
-        method="states_and_logits_at")
+        method="states_and_logits_at", **progressed(model, progress))
     held = jnp.where(fed[:, None], logits[0, :rows], decoder.logits)
     seated = jnp.where(admission.final, admission.slots, rows)
     return dataclasses.replace(decoder, cache=updated["cache"],
@@ -397,9 +405,11 @@ def joined(resident: Slots, carried: Slots) -> Slots:
 def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
              resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-             stopping: decoding.Finishing, grammar: Grammar | None
+             stopping: decoding.Finishing, grammar: Grammar | None, progress: Progress
              ) -> tuple[checkify.Error, tuple[Slots, Slots, Draws]]:
-    """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value.
+    """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value,
+    at the run's `progress`, an input like the weights, so a server serves each version it loads at its
+    own without a compile of its own.
 
     The first iteration takes the admission, the draws come back stacked
     `[steps, slots]`, and the host throws the error when it reads them, one
@@ -415,7 +425,7 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
     def advanced(state: Slots, admission: Admission | None) -> tuple[checkify.Error, tuple[Slots, Draws]]:
         return checkify.checkify(
             lambda state, admission: _advanced(model, params, pad_id, placement, state, admission, transforms,
-                                               stopping, grammar),
+                                               stopping, grammar, progress),
             errors=checkify.user_checks)(state, admission)
 
     error, (state, draws) = advanced(joined(resident, carried), admission)
@@ -491,7 +501,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     the measurements.
     """
     return OuterProgram(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
-                   in_shardings=(None, resident, carried, rows, None, None, None),
+                   in_shardings=(None, resident, carried, rows, None, None, None, None),
                    out_shardings=(None, (resident, carried, None)),
                    compiler_options=None if options is None else dict(options))
 
@@ -499,7 +509,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
 def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
                       state: Slots, shardings: Slots, rows: NamedSharding | None,
                       transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-                      grammar: Grammar | None) -> tuple[Formats, Step | None]:
+                      grammar: Grammar | None, progress: Progress) -> tuple[Formats, Step | None]:
     """Choose the memory layout the resident state keeps, by asking XLA for it, and the decode-only
     step that chose it where it takes the state in that layout.
 
@@ -522,7 +532,7 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
 
     program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
     arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
-                 grammar)
+                 grammar, progress)
     tune(lambda: program.lower(*arguments))
     compiled = program.compiled(*arguments)
     formats = joined(*compiled.output_formats[1][:2])
@@ -556,8 +566,8 @@ def _reusable(compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
         return None
 
     def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
-             grammar):
-        return compiled(params, resident, carried, admission, transforms, stopping, grammar)
+             grammar, progress):
+        return compiled(params, resident, carried, admission, transforms, stopping, grammar, progress)
     return step
 
 
@@ -629,14 +639,14 @@ def dispatched(program: OuterProgram) -> Step:
     executables: dict[Hashable, jax.stages.Compiled] = {}
 
     def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
-             grammar):
+             grammar, progress):
         size = None if admission is None else tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(admission))
         executable = executables.get(size)
         if executable is None:
             executable = executables[size] = program.executable(
                 model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
-                grammar)
-        return executable(params, resident, carried, admission, transforms, stopping, grammar)
+                grammar, progress)
+        return executable(params, resident, carried, admission, transforms, stopping, grammar, progress)
     return step
 
 

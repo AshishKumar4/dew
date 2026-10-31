@@ -102,8 +102,8 @@ class ValueHead(nn.Module):
 class _Policy:
     task: EpisodeInference
 
-    def bind(self, variables: Variables, /) -> EpisodeInference:
-        return self.task.bind(part(variables, "policy"))
+    def bind(self, variables: Variables, /, progress: Progress | None = None) -> EpisodeInference:
+        return self.task.bind(part(variables, "policy"), progress)
 
     def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
                  *, key: jax.Array, sampling: Sampling) -> Generation:
