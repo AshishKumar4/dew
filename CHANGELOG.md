@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A run refuses an optimizer that holds its updates back over calls (`optax.MultiSteps`,
+  `optax.apply_every`, alone or in a chain), whose held calls it counted as updates, moving its EMA,
+  post-step effects and committed tokens; accumulate with `Trainer(accumulation=k)`.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
