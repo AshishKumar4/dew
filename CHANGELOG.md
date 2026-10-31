@@ -52,6 +52,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`.
 - An evaluation of a run on the examples clock records the examples it had consumed
   (`evaluation/examples_consumed`) beside its step.
+- A compilation cache directory a run names after its process first compiled (`prepare_process`,
+  `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
+  JAX kept the first directory.
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
