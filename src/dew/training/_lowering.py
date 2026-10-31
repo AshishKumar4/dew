@@ -57,6 +57,8 @@ class KernelCall:
     ir: bytes
     config: str
     flops: float | None
+    launch: str | None = None
+    """A Mosaic GPU kernel's launch (`report.named`'s digest), which its name carried."""
 
 
 @dataclass(frozen=True)
@@ -158,8 +160,11 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
                   if "cost_estimate_json" in config else {})
         hashed = ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16]
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
+        named = _named_kernel(operation.location)
+        launch = None if named is None else report.LAUNCH_SUFFIX.search(named)
         return KernelCall(kind, _kernel_name(operation.location) or hashed,
-                          ir.StringAttr(config["module"]).value_bytes, hashed, stated.get("flops"))
+                          ir.StringAttr(config["module"]).value_bytes, hashed, stated.get("flops"),
+                          launch.group(1) if launch else None)
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
@@ -168,15 +173,20 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
 
 
 def _kernel_name(location: ir.Location) -> str | None:
-    """A Mosaic GPU call's kernel name: its location's name stack (`_named`) ends `<kernel>/mpmd_map`; None
-    where its location carries no name."""
+    """A Mosaic GPU call's kernel name (`_named_kernel`) less the launch it carries (`report.named`), so a
+    kernel reads as itself in every call; None where its location carries no name."""
+    named = _named_kernel(location)
+    return None if named is None else report.LAUNCH_SUFFIX.sub("", named)
+
+
+def _named_kernel(location: ir.Location) -> str | None:
+    """A Mosaic GPU call's kernel as Mosaic names it: its location's name stack (`_named`) ends
+    `<kernel>/mpmd_map`; None where its location carries no name."""
     named = _named(location)
     if named is None:
         return None
     stack = named.split("/")
-    # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
-    kernel = stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
-    return report.LAUNCH_SUFFIX.sub("", kernel)
+    return stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
 
 
 def _named(location: ir.Location) -> str | None:

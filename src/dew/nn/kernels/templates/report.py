@@ -1,12 +1,12 @@
 """Mosaic GPU's own compile reports, what the templates' resource models are checked against: ptxas's
 registers a thread and spilled bytes, and Mosaic's resource estimate (the shared bytes and tensor memory
-columns a kernel asks for), written for each kernel Mosaic compiles while they are on (`reported`), at XLA's
-compile of the program around it, with a device or a compile-only one (`dew.training.ahead`'s
-`compile_only_gpus`). The CPU suite's compile gate reads them (tests/kernel_compile.py), and so does a run's
-compile (`compiled`, owner 10-29, bible §6): a launch whose kernel spills is refused (`refused`) and its
-program lowered once more, where the launch's derivation takes the next config by its own rule, each such
-refusal a model miss (`misses`). Each kernel's name carries the launch that traced it (`named`), so its
-reports name the launch and its config."""
+columns a kernel asks for), written for each kernel Mosaic compiles into the process's reports directory
+(`DIRECTORY`), at XLA's compile of the program around it, with a device or a compile-only one
+(`dew.training.ahead`'s `compile_only_gpus`). The CPU suite's compile gate reads them
+(tests/kernel_compile.py), and so does a run's compile (`compiled`, owner 10-29, bible §6): a launch whose
+kernel spills is refused (`refused`) and its program lowered once more, where the launch's derivation
+takes the next config by its own rule, each such refusal a model miss (`misses`). Each kernel's name
+carries the launch that traced it (`named`), so its reports name the launch and its config."""
 
 import contextlib
 import contextvars
@@ -30,9 +30,9 @@ from dew.nn.kernels import generation
 
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
 """The settings that turn Mosaic GPU's reports on, written under `MOSAIC_GPU_DUMP_TO`."""
-DUMPING = threading.RLock()
-"""Held while the reports are on (`reported`): the settings are the process's environment, so one scope at
-a time sets and restores them."""
+OWNED = "DEW_MOSAIC_REPORTS"
+"""The variable naming the reports directory a Dew process set (`DIRECTORY`): a child process inherits its
+parent's environment and takes a directory of its own."""
 REGISTERS = re.compile(r"Used (\d+) registers")
 SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 SHARED = re.compile(r"smem_scratch_bytes=(\d+)")
@@ -48,6 +48,32 @@ LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 """The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
 
 _log = logging.getLogger("dew.kernels")
+
+
+def _reports_directory() -> tuple[Path | None, tempfile.TemporaryDirectory | None]:
+    """Where this process's Mosaic GPU compiles write their reports, set once at import and never changed.
+    Mosaic reads the settings in every compile, whichever thread runs it, so a scope that set and restored
+    them around one compile handed its directory to other threads' compiles and removed it under them (a
+    task's scoring, its pass shapes compiled at once: 'Directory not empty', row 2790), and setting the
+    environment beside another thread's read of it is undefined. A user's own `MOSAIC_GPU_DUMP_TO` is kept
+    and read, none of its files removed; one that prints the reports (`-`) or hands them to a test
+    harness (`sponge`) leaves none to read."""
+    given = os.environ.get("MOSAIC_GPU_DUMP_TO")
+    if given is not None and given != os.environ.get(OWNED):
+        if given in ("-", "sponge"):
+            return None, None
+        for name, value in DUMPS.items():
+            os.environ.setdefault(name, value)
+        return Path(given), None
+    # A compile still running as the process exits may write into it while it is removed.
+    scratch = tempfile.TemporaryDirectory(prefix="dew-mosaic-reports-", ignore_cleanup_errors=True)
+    os.environ.update(DUMPS, MOSAIC_GPU_DUMP_TO=scratch.name, **{OWNED: scratch.name})
+    return Path(scratch.name), scratch
+
+
+DIRECTORY, _SCRATCH = _reports_directory()
+"""The process's reports directory (`_reports_directory`), None where its compiles' reports are not files,
+and the scratch directory Dew owns there."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -308,12 +334,11 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
                        ) -> tuple[jax.stages.Compiled, list["Report"]]:
     from dew.training._lowering import kernel_calls
 
-    if not any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered)):
-        return lowered.compile(options), []
-    with tempfile.TemporaryDirectory() as directory:
-        with reported(directory):
-            executable = lowered.compile(options)
-        spilling = [found for found in reports(directory) if found.spilled]
+    kernels = {(call.name, call.launch) for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"}
+    executable = lowered.compile(options)
+    if not kernels:
+        return executable, []
+    spilling = [found for found in collected(kernels) if found.spilled]
     if jax.config.jax_compilation_cache_dir:
         spilling = _artifact_spills(executable, spilling)
     return executable, spilling
@@ -377,23 +402,57 @@ class Report:
                 f"(limit {tmem_limit}), {self.spilled} bytes spilled")
 
 
-@contextlib.contextmanager
-def reported(directory: str, *, ptx: bool = False):
-    """Mosaic GPU's reports on, into `directory`, for the compiles in the block, each kernel's PTX too where
-    `ptx` asks (the compile gate's register need), under `DUMPING` from before the settings are read to
-    after they are restored."""
-    with DUMPING:
-        dumps = {**DUMPS, **({"MOSAIC_GPU_DUMP_PTX": "1"} if ptx else {})}
-        before = {name: os.environ.get(name) for name in (*dumps, "MOSAIC_GPU_DUMP_TO")}
-        os.environ.update(dumps, MOSAIC_GPU_DUMP_TO=directory)
-        try:
-            yield
-        finally:
-            for name, value in before.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
+@dataclasses.dataclass
+class _Collected:
+    """The reports this process's compiles wrote (`collected`), by kernel (`Report.kernel` and
+    `Report.launch`), and each compile's files read (their stem)."""
+    kernels: dict[tuple[str, str | None], Report] = dataclasses.field(default_factory=dict)
+    read: set[str] = dataclasses.field(default_factory=set)
+
+
+_COLLECTED = _Collected()
+
+
+def collected(kernels) -> list[Report]:
+    """The reports of `kernels` (each its name and launch, as a program's calls name them,
+    `_lowering.KernelCall`) the process's compiles wrote (`DIRECTORY`), each kernel's compiles merged: one
+    launch is one kernel whichever compile of it reported (a program calling it at several layers compiles
+    it once a call; another thread's program may have compiled it first, Mosaic compiling a module once a
+    process). Another program's compiles are left to it. A compile is read once its ptxas report is whole,
+    then removed from Dew's own directory."""
+    if DIRECTORY is None:
+        return []
+    wanted = set(kernels)
+    with _GUARD:
+        for stem, found in _compiles(DIRECTORY).items():
+            name = KERNEL_COUNTER.sub("", stem)
+            launch = LAUNCH_SUFFIX.search(name)
+            key = (LAUNCH_SUFFIX.sub("", name), launch.group(1) if launch else None)
+            if stem in _COLLECTED.read or key not in wanted:
+                continue
+            report = _report(name, found, None)
+            if report.registers is None:
+                # Its compile is still writing it: another thread's, of the same kernel.
+                continue
+            _COLLECTED.read.add(stem)
+            known = _COLLECTED.kernels.get(key)
+            _COLLECTED.kernels[key] = report if known is None else _merged(known, report)
+            if _SCRATCH is not None:
+                for path in found.values():
+                    path.unlink()
+        return [_COLLECTED.kernels[key] for key in sorted(wanted, key=repr) if key in _COLLECTED.kernels]
+
+
+def _merged(first: Report, second: Report) -> Report:
+    """Two compiles' reports of one kernel as one: the most each states."""
+    def most(a: int | None, b: int | None) -> int | None:
+        return b if a is None else a if b is None else max(a, b)
+
+    return dataclasses.replace(
+        first, shared=most(first.shared, second.shared), tmem=most(first.tmem, second.tmem),
+        registers=most(first.registers, second.registers), spilled=most(first.spilled, second.spilled),
+        unread=tuple(field for field in first.unread if field in second.unread),
+        module=first.module or second.module)
 
 
 def kernel_name(stem: str) -> str:
@@ -402,33 +461,56 @@ def kernel_name(stem: str) -> str:
     return LAUNCH_SUFFIX.sub("", KERNEL_COUNTER.sub("", stem))
 
 
-def reports(directory: str) -> list[Report]:
-    """Each kernel's `Report` in `directory`, its reports and module dump paired by the kernel's name less the
-    counter Mosaic appends (`KERNEL_COUNTER`); the compiles a directory holds name each kernel once."""
-    by_kernel: dict[str, dict[str, Path]] = {}
+def _compiles(directory: Path) -> dict[str, dict[str, Path]]:
+    """Each compile's report files in `directory` by kind, by the basename Mosaic gives one compile of a
+    module (the kernel's name and a counter, `KERNEL_COUNTER`)."""
+    compiles: dict[str, dict[str, Path]] = {}
     for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas"),
                          ("module", ".after_layout_inference.txt")):
-        for path in Path(directory).glob(f"*{suffix}"):
-            found = by_kernel.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
-            # Paired by name: compiles that name a kernel twice would pair the wrong reports.
-            assert kind not in found, f"{path.name} and {found[kind].name} compiled under one name"
-            found[kind] = path
+        for path in directory.glob(f"*{suffix}"):
+            compiles.setdefault(path.name.removesuffix(suffix), {})[kind] = path
+    return compiles
+
+
+def _report(name: str, found: dict[str, Path], module: str | None) -> Report:
+    """The `Report` of a compile of the kernel `name` from its files `found` (`_compiles`), its module's
+    digest `module` where its own dump is absent."""
+    text = found["resources"].read_text() if "resources" in found else ""
+    log = found["ptxas"].read_text() if "ptxas" in found else ""
+    shared, tmem = SHARED.search(text), TENSOR_MEMORY.search(text)
+    registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
+    unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
+                                             ("registers", registers), ("spills", spills)) if not read)
+    if "module" in found:
+        module = hashlib.sha256(DUMP_NAME.sub("", found["module"].read_text()).encode()).hexdigest()
+    launch = LAUNCH_SUFFIX.search(name)
+    return Report(LAUNCH_SUFFIX.sub("", name), int(shared.group(1)) if shared else None,
+                  sum(map(int, tmem.groups())) if tmem else None, max(map(int, registers), default=None),
+                  max((int(stores) + int(loads) for stores, loads in spills), default=None), unread, module,
+                  launch.group(1) if launch else None)
+
+
+def reports(directory: str) -> list[Report]:
+    """Each kernel compile's `Report` in `directory` (`_compiles`): a program holding several calls of one
+    launch (a model's repeated layers) compiles that kernel once a call, each compile a report of its own
+    under the one name. A compile whose own module dump is absent takes its name's module where every dump
+    of that name is one module."""
+    compiles = _compiles(Path(directory))
+    digests = {stem: hashlib.sha256(DUMP_NAME.sub("", found["module"].read_text()).encode()).hexdigest()
+               for stem, found in compiles.items() if "module" in found}
+    modules: dict[str, set[str]] = {}
+    for stem, digest in digests.items():
+        modules.setdefault(KERNEL_COUNTER.sub("", stem), set()).add(digest)
     found_reports = []
-    for name, found in sorted(by_kernel.items()):
-        text = found["resources"].read_text() if "resources" in found else ""
-        log = found["ptxas"].read_text() if "ptxas" in found else ""
-        shared, tmem = SHARED.search(text), TENSOR_MEMORY.search(text)
-        registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
-        unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
-                                                 ("registers", registers), ("spills", spills)) if not read)
-        module = found.get("module")
-        launch = LAUNCH_SUFFIX.search(name)
-        found_reports.append(Report(
-            LAUNCH_SUFFIX.sub("", name), int(shared.group(1)) if shared else None,
-            sum(map(int, tmem.groups())) if tmem else None, max(map(int, registers), default=None),
-            max((int(stores) + int(loads) for stores, loads in spills), default=None), unread,
-            hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest() if module else None,
-            launch.group(1) if launch else None))
+    for stem, found in sorted(compiles.items()):
+        name = KERNEL_COUNTER.sub("", stem)
+        if "module" in found and len(found) == 1 and any(
+                other != stem and KERNEL_COUNTER.sub("", other) == name and len(paired) > 1
+                for other, paired in compiles.items()):
+            # A lowering's dump whose compile dumped under another counter: that compile's module.
+            continue
+        named = modules.get(name, set())
+        found_reports.append(_report(name, found, next(iter(named)) if len(named) == 1 else None))
     return found_reports
 
 

@@ -9,6 +9,7 @@ included. A host without the plugin fails here rather than skip. A GPU's tests a
 everything else.
 """
 
+import contextlib
 import dataclasses
 import functools
 import importlib.util
@@ -18,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import compile_evidence
@@ -147,6 +149,29 @@ def mosaic_kernels(directory: str) -> list[dict]:
     return [dataclasses.asdict(found) for found in report.reports(directory)]
 
 
+_REPORTING = threading.Lock()
+"""Held while the gate's own reports are on (`reported`)."""
+
+
+@contextlib.contextmanager
+def reported(directory: str):
+    """Mosaic GPU's reports, each kernel's PTX among them (its register need, `register_need`), into
+    `directory` for the compiles in the block, the process's own settings (`report.DIRECTORY`) back after:
+    the gate compiles one case at a time in its process."""
+    names = (*report.DUMPS, "MOSAIC_GPU_DUMP_PTX", "MOSAIC_GPU_DUMP_TO")
+    with _REPORTING:
+        before = {name: os.environ.get(name) for name in names}
+        os.environ.update(report.DUMPS, MOSAIC_GPU_DUMP_PTX="1", MOSAIC_GPU_DUMP_TO=directory)
+        try:
+            yield
+        finally:
+            for name, value in before.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
 OWN_PROCESS = "DEW_MOSAIC_RECORDS"
 """Where a test re-run in a process of its own (`compile_mosaic_kernels`) writes its records."""
 
@@ -161,7 +186,7 @@ assembled for sm90). Production compiles for one GPU a process; the gates compil
 def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
-    own reports on (`report.reported`): its name, the generation's shared-memory and tensor-memory limits
+    own reports on (`reported`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
     or the error. In a process that compiled Mosaic kernels for another capability (`_BINARY_CAPABILITY`)
     the calling test runs again in a process of its own, and these are its records there."""
@@ -393,7 +418,7 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                         "limit": gpu_target(generation).shared_limit,
                         "models": {name: model.record() for name, model in models.items()}}
         with (tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory,
-              report.reported(directory, ptx=True)):
+              reported(directory)):
             _compiled(case, generation, record)
             lowered_models = _lowered_models(record, mosaic_kernels(directory), generation, models)
             needs = _needs(directory, generation, {**models, **lowered_models})
