@@ -5,6 +5,7 @@ reason."""
 import dataclasses
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import grain.python as grain
 import numpy as np
@@ -120,27 +121,22 @@ def test_a_chain_of_an_importable_iterator_is_recorded():
     assert next(reader)["text"] == "a b"
 
 
-def test_a_chain_recorded_while_an_iterators_identity_was_its_name_reads_back():
-    """A run recorded while an iterator's content version was its `name` reads its chain back with that
-    version its `identity` (`RENAMED_FIELDS`, row 3031), a mix's members' stores too."""
-    chain = mix([from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2")]).batch(1)
-    written = json.dumps(encode(chain))
-    earlier = json.loads(written.replace('"identity": "rows@', '"name": "rows@'))
-    assert earlier != json.loads(written)
-    mixture = decode(earlier).source
-    assert [member.source.identity for member in mixture.pipelines] == ["rows@1", "rows@2"]
-
-
-def test_a_concatenation_recorded_while_its_iterators_identities_were_their_names_reads_back():
-    """An iterator an earlier record names by `name` within another store's record, a concatenation's
-    part, reads with that version its `identity` too: wherever the record builds it (row 3031)."""
+def test_a_run_recorded_while_its_iterators_identities_were_their_names_reads_its_chains_back(tmp_path):
+    """A run recorded while an iterator's content version was its `name` loads its chains with that version
+    its `identity` (`dew.config.earlier_chains`, row 3031), wherever a chain holds the iterator: a mix's
+    member, a concatenation's part, in its data and its validation."""
+    from dew.config import RunConfig
     from dew.data.sources import Concatenate
 
-    chain = Concatenate((from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2"))).batch(1)
-    written = json.dumps(encode(chain))
-    earlier = json.loads(written.replace('"identity": "rows@', '"name": "rows@'))
-    assert earlier != json.loads(written)
-    assert [part.identity for part in decode(earlier).source.sources] == ["rows@1", "rows@2"]
+    mixed = mix([from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2")]).batch(1)
+    joined = Concatenate((from_iter(_rows, identity="rows@3"), from_iter(_rows, identity="rows@4"))).batch(1)
+    path = Path(RunConfig(data=mixed, validation={"val": joined}).save(str(tmp_path / "run")))
+    written = path.read_text()
+    path.write_text(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert path.read_text() != written
+    loaded = RunConfig.load(str(path))
+    assert [member.source.identity for member in loaded.data.source.pipelines] == ["rows@1", "rows@2"]
+    assert [part.identity for part in loaded.validation["val"].source.sources] == ["rows@3", "rows@4"]
 
 
 def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():

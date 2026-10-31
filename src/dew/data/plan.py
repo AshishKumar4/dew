@@ -397,20 +397,25 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
-def earlier_lengths(previous: Mapping[str, object], saved: Sequence[object], current: Sequence[object],
-                    derived: Mapping[str, str]) -> Mapping[str, object]:
-    """`previous`, a saved plan's derived order, with today's lengths (`derived`'s) of each source a Dew
-    before row 3028 stated none for (`_unstated_lengths`), where the plan names the source as today's does
-    (`saved` and `current`, its manifest's sources then and now, numbered as its derived facts number
-    them), so its documents are the ones that Dew read (`TokenFiles._read_alike`). Carried to 1.0 (ledger
-    1552)."""
-    held = dict(previous)
-    for index, (store, today) in enumerate(zip(saved, current, strict=False)):
+def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
+    """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
+    position's one translation, where a reader's `set_state` decodes it. Its derived order holds today's
+    lengths (`plan`'s) of each source a Dew before row 3028 stated none for (`_unstated_lengths`), where the
+    plan names the source as today's does, so its documents are the ones that Dew read
+    (`TokenFiles._read_alike`); the saved and current manifests' sources are numbered as their derived
+    facts number them. Carried to 1.0 (ledger 1552)."""
+    saved_sources = record(record(saved.get("manifest", {}), "saved data manifest").get("source", {}),
+                           "saved data source").get("sources")
+    sources = record(plan.manifest.semantic().get("source", {}), "data source").get("sources")
+    if not isinstance(saved_sources, list) or not isinstance(sources, list):
+        return saved
+    held = dict(record(saved.get("derived", {}), "saved derived order"))
+    for index, (store, today) in enumerate(zip(saved_sources, sources, strict=False)):
         name = f"{index}/lengths"
-        if (name not in held and name in derived and store == today and isinstance(today, Mapping)
+        if (name not in held and name in plan.derived and store == today and isinstance(today, Mapping)
                 and _unstated_lengths(today)):
-            held[name] = derived[name]
-    return held
+            held[name] = plan.derived[name]
+    return {**saved, "derived": held}
 
 
 def _unstated_lengths(source: Mapping[str, object]) -> bool:
@@ -572,12 +577,7 @@ class Plan:
         grown = grown_limits(saved_order, unplaced(current["order"])) if edited is None else frozenset()
         if grown is None:
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
-        saved_sources = record(record(saved.get("manifest", {}), "saved data manifest").get("source", {}),
-                               "saved data source").get("sources")
-        sources = record(self.manifest.semantic().get("source", {}), "data source").get("sources")
-        previous = earlier_lengths(record(saved.get("derived", {}), "saved derived order"),
-                                   saved_sources if isinstance(saved_sources, list) else [],
-                                   sources if isinstance(sources, list) else [], self.derived)
+        previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")

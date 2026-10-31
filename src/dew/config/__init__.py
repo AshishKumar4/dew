@@ -975,11 +975,45 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
-    (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`).
+    (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
+    chain's store under the fields its class renamed since, by today's names (`earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return earlier_profile(earlier_newton_schulz(earlier_trainer(record)))
+    return earlier_chains(earlier_profile(earlier_newton_schulz(earlier_trainer(record))))
+
+
+RENAMED_FIELDS: Mapping[str, Mapping[str, str]] = {"dew.data.sources.iterator:Iterated": {"name": "identity"}}
+"""The fields a store's class renamed after runs recorded chains with them, by its import path, each earlier
+name by today's: an iterator's content version, `identity` as every opaque source names it (row 3031)."""
+
+
+def earlier_chains(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose chains (`_CHAINS`) hold a store under fields its class renamed since
+    (`RENAMED_FIELDS`), with them under today's names, wherever a chain holds it (a mix's member, a
+    concatenation's part). A recorded chain holds no row data shaped like a class record (a Memory of such
+    rows is not recorded), so every class record in it is a component's. Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping) or not any(name in fields for name in _CHAINS):
+        return record
+    return {**record, "fields": {name: _renamed(value) if name in _CHAINS else value
+                                 for name, value in fields.items()}}
+
+
+def _renamed(value: object) -> object:
+    """`value`, a chain's record or a part of one, with each class record's renamed fields (`RENAMED_FIELDS`)
+    under today's names."""
+    if isinstance(value, list):
+        return [_renamed(part) for part in value]
+    if not isinstance(value, Mapping):
+        return value
+    held = {key: _renamed(part) for key, part in value.items()}
+    named = held.get("class")
+    renamed = RENAMED_FIELDS.get(named, {}) if isinstance(named, str) else {}
+    fields = held.get("fields")
+    if renamed and isinstance(fields, Mapping):
+        held["fields"] = {renamed.get(name, name): field for name, field in fields.items()}
+    return held
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:

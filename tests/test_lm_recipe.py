@@ -18,6 +18,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile, held, iterate
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset, Pipeline
+from dew.data.plan import earlier_plan
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective
@@ -900,11 +901,12 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_th
     if eos is None or not resumes:
         saved["derived"].pop("0/lengths")
     assert plan.check(plan.record()) == ()
+    # As a reader's `set_state` reads it: translated once (`earlier_plan`), then checked.
     if resumes:
-        assert plan.check(saved) == ()
+        assert plan.check(earlier_plan(saved, plan)) == ()
     else:
         with pytest.raises(ValueError):
-            plan.check(saved)
+            plan.check(earlier_plan(saved, plan))
 
 
 def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fields_own(tmp_path):
