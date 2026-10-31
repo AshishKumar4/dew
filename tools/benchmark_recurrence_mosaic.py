@@ -34,6 +34,7 @@ from benchmark_recurrence import SHAPES, operands
 from jax.experimental.mosaic.gpu import profiler
 
 from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels.options import program
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, recomputing
 
 DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
@@ -99,7 +100,7 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
     timed = trained if training else forward
     timed.__name__ = f"{'trained' if training else 'forward'}_{arm}"
     with generation.chosen(gated_delta_rule=NAMED[arm]):
-        return jax.jit(timed).lower(*args).compile(), args
+        return program(timed).executable(*args), args
 
 
 def rows(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = False,
@@ -137,15 +138,15 @@ def profiled(name: str, arms: list[str], dtype, warmup: int, repeats: int, train
     from dew.telemetry.profile import Profiler, program_kernels
 
     compiled = {arm: compiled_arm(name, arm, dtype, training) for arm in arms}
-    for program, args in compiled.values():
+    for executable, args in compiled.values():
         for _ in range(warmup):
-            jax.block_until_ready(program(*args))
+            jax.block_until_ready(executable(*args))
     profiler = Profiler(directory)
     with profiler:
-        for arm, (program, args) in compiled.items():
+        for arm, (executable, args) in compiled.items():
             with profiler.region(arm):
                 for _ in range(repeats):
-                    jax.block_until_ready(program(*args))
+                    jax.block_until_ready(executable(*args))
     passed = 'trained' if training else 'forward'
     capture = profiler.captures[-1]
     kernels = program_kernels(capture, [f"{passed}_{arm}" for arm in arms])
