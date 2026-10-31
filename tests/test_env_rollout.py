@@ -266,6 +266,44 @@ class HostWalks:
         return self.x[:, None].copy()
 
 
+class ShardedWalks(HostWalks):
+    """`HostWalks` answering its observations as device arrays laid out over a one-device mesh's data axis, as
+    a simulator holding its batch on a mesh answers them."""
+
+    def __init__(self, count: int, length: int):
+        super().__init__(count, length)
+        mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("data",))
+        self.layout = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+
+    def reset(self, seed: int):
+        return jax.device_put(super().reset(seed), self.layout)
+
+    def step(self, action):
+        following = super().step(action)
+        return TimeStep(jax.device_put(following.observation, self.layout), following.reward,
+                        following.terminated, following.truncated)
+
+    def restart(self, mask):
+        return jax.device_put(super().restart(mask), self.layout)
+
+
+def test_a_simulator_answering_arrays_laid_out_over_a_mesh_rolls_out_as_one_answering_numpy():
+    """A simulator answering arrays laid out over a mesh's data axis rolls out, its policy's key placed whole
+    where its observations are: it records what the same walks answered as NumPy arrays record, the
+    observations, actions, rewards and flags bit for bit."""
+    from dew.rl.simulator import simulator_rollout, simulator_start
+
+    recorded = []
+    for simulator in (HostWalks(5, 3), ShardedWalks(5, 3)):
+        carry = simulator_start(simulator, jax.random.key(4))
+        recorded.append(simulator_rollout(simulator, pushes, None, carry, 11)[1])
+    plain, sharded = recorded
+    for name in ("observation", "action"):
+        np.testing.assert_array_equal(getattr(sharded, name), getattr(plain, name))
+    for name in ("observation", "reward", "terminated", "truncated"):
+        np.testing.assert_array_equal(getattr(sharded.following, name), getattr(plain.following, name))
+
+
 def heads_home(params, observation, key, memory):
     """A policy pushing each point a step toward the origin, its key unread."""
     return -0.5 * jnp.sign(observation), {"seen": observation}, None

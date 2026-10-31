@@ -21,6 +21,7 @@ from typing import Protocol, overload, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 from typing_extensions import CapsuleType
 
 from dew.rl.env import (
@@ -128,12 +129,16 @@ def simulator_rollout(simulator: Stepped, policy: Policy, params: Params, carry:
     `[steps, ...]`, as `env_rollout` records them; the carry's state is the simulator's own, held by it,
     so the carry holds None there. With `reset`, an episode that ended restarts before the next step,
     its transition keeping the observation it ended at, which takes a `Simulator`; one that restarts its
-    episodes itself (`DrivenSimulator`) passes False. The policy acts on the device the simulator's
-    arrays are on, its `params` and `carry` put there (a no-op where they already are)."""
+    episodes itself (`DrivenSimulator`) passes False. The policy acts where the simulator's arrays are, its
+    `params` and the carry's key and memory put there whole (a no-op where they already are), replicated
+    over a mesh the observations are laid out on, the observations keeping their layout."""
     restarting = simulator if isinstance(simulator, Simulator) else None
     if reset and restarting is None:
         raise TypeError("a rollout that restarts ended episodes needs a Simulator, which restarts them")
-    params, carry = jax.device_put((params, carry), jax.tree.leaves(carry.observation)[0].sharding)
+    held = jax.tree.leaves(carry.observation)[0].sharding
+    whole = NamedSharding(held.mesh, PartitionSpec()) if isinstance(held, NamedSharding) else held
+    params, key, memory = jax.device_put((params, carry.key, carry.memory), whole)
+    carry = Carry(carry.state, carry.observation, key, memory)
     recorded = []
     for _ in range(steps):
         action, extras, memory, key = _acted(policy, params, carry)
