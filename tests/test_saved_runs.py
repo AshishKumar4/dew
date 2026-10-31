@@ -28,6 +28,7 @@ from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
 from dew.inference.tasks import SavedRun
 from dew.registry import objectives
+from dew.training import LocalTracker
 
 CORPUS = Path(__file__).with_name("fixtures") / "saved_runs"
 SAVED = [(recorded.name, kind) for recorded in sorted(CORPUS.iterdir()) if recorded.is_dir()
@@ -145,8 +146,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     resumed = max(index for index, row in enumerate(records) if row["type"] == "FitStarted")
     started = records[resumed]["value"]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
-    scalars = (run / "tracking" / "scalars.jsonl").read_text().splitlines()
-    stepped = [json.loads(line)["step"] for line in scalars]
+    stepped = [step for step, _ in LocalTracker(run / "tracking").scalars()]
     assert max(stepped) > last if clocked else max(stepped) == last + 1
     if seen is not None:
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from dew._coordination import agreed
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.records import ProfileWindow as ProfileWindowRecord, Record
+from dew.telemetry.records import ProfileTraced, Record
 from dew.training.tracker import LocalTracker
 
 if TYPE_CHECKING:
@@ -34,22 +34,20 @@ class ProfileWindow:
     A fit under JAX's AutoPGLE, which profiles programs in sessions of its own,
     refuses a window (`PGLE_CAPTURE`).
 
-    The capture's options are the window's: host events at `host_tracer_level`,
-    Python calls at `python_tracer_level` (0, none: the Python tracer slows
-    Python-heavy host work several times over), and on GPU at most
-    `activity_cap` CUDA activity events (`dew.telemetry.profile.capture_options`).
+    The capture records what `capture` asks (`dew.telemetry.profile.CaptureOptions`): by default
+    host events at level 2, no Python calls (the Python tracer slows Python-heavy host work several
+    times over), and on GPU at most its `activity_cap` CUDA activity events.
 
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
-    reports the window it wrote as the `ProfileWindow` record of
+    reports the window it wrote as the `ProfileTraced` record of
     `dew.telemetry.records`.
     """
     directory: str
     steps: int
     warmup: int = 2
-    host_tracer_level: int = 2
-    python_tracer_level: int = 0
-    activity_cap: int = telemetry_profile.ACTIVITY_CAP
+    capture: telemetry_profile.CaptureOptions = dataclasses.field(
+        default_factory=telemetry_profile.CaptureOptions)
 
 
 def pgle_runs() -> int:
@@ -96,9 +94,7 @@ def owned_capture(window: ProfileWindow | None) -> "Profiler | None":
         if pgle_runs():
             raise ValueError(PGLE_CAPTURE)
         telemetry_profile.require_profile_support()
-        return telemetry_profile.Profiler(window.directory, options=telemetry_profile.capture_options(
-            host_tracer_level=window.host_tracer_level, python_tracer_level=window.python_tracer_level,
-            activity_cap=window.activity_cap))
+        return telemetry_profile.Profiler(window.directory, options=window.capture.profile_options())
 
     return agreed("profiling window setup", own_window)
 
@@ -162,7 +158,7 @@ def reported_window(report: Callable[[Record, int], None], note: Callable[[str],
         return error
     traced, step = profiled
     try:
-        report(ProfileWindowRecord(window.directory, traced), step)
+        report(ProfileTraced(window.directory, traced), step)
         wrote = f"Wrote profile for {traced} steps to {window.directory}"
         agreed("profile announcement", lambda: note(wrote))
     except BaseException as failure:

@@ -8,6 +8,7 @@ no instrumentation hooks.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import json
 import logging
@@ -104,31 +105,39 @@ def missing_tracks(events: dict[str, int], devices: int, cap: int | None) -> lis
     return reasons
 
 
-def capture_options(*, host_tracer_level: int = 2, python_tracer_level: int = 0,
-                    activity_cap: int = ACTIVITY_CAP) -> jax.profiler.ProfileOptions:
-    """The options a Dew capture starts with, for any JAX trace that should read like one: by default host
-    events at level 2, no Python tracer, and on GPU at most `activity_cap` CUDA activity events.
+@dataclasses.dataclass(frozen=True)
+class CaptureOptions:
+    """What a Dew capture records, for any JAX trace that should read like one (`profile_options`): host
+    events at `host_tracer_level`, Python calls at `python_tracer_level`, and on GPU at most
+    `activity_cap` CUDA activity events.
 
-    Host events at level 2 and the compiled HLO, and no Python tracer: it
-    records every Python and C call, which slows Python-heavy host work
-    several times over (a server's 512-row settle loop took 0.85 ms a step
-    traced against 0.18 ms untraced), so the trace would show host time,
+    By default host events at level 2 and the compiled HLO, and no Python
+    tracer: it records every Python and C call, which slows Python-heavy host
+    work several times over (a server's 512-row settle loop took 0.85 ms a
+    step traced against 0.18 ms untraced), so the trace would show host time,
     and the device idle behind it, that the run never spends. On TPU the
     trace also carries compute and sync events.
     """
-    options = jax.profiler.ProfileOptions()
-    options.host_tracer_level = host_tracer_level
-    options.python_tracer_level = python_tracer_level
-    # Exporting every live executable's HLO cost 0.95 s and 3.4 MB for a
-    # 4-layer decoder's fit that had evaluated and sampled first (RTX 4080).
-    # 400 unrelated compiled programs made a CPU capture of small work take
-    # 15 s and 75 MB.
-    options.enable_hlo_proto = True
-    if jax.default_backend() == "tpu":
-        options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
-    elif jax.default_backend() == "gpu":
-        options.advanced_configuration = {"gpu_max_activity_api_events": activity_cap}
-    return options
+
+    host_tracer_level: int = 2
+    python_tracer_level: int = 0
+    activity_cap: int = ACTIVITY_CAP
+
+    def profile_options(self) -> jax.profiler.ProfileOptions:
+        """JAX's options for a capture of these (`jax.profiler.start_trace`'s `profiler_options`)."""
+        options = jax.profiler.ProfileOptions()
+        options.host_tracer_level = self.host_tracer_level
+        options.python_tracer_level = self.python_tracer_level
+        # Exporting every live executable's HLO cost 0.95 s and 3.4 MB for a
+        # 4-layer decoder's fit that had evaluated and sampled first (RTX 4080).
+        # 400 unrelated compiled programs made a CPU capture of small work take
+        # 15 s and 75 MB.
+        options.enable_hlo_proto = True
+        if jax.default_backend() == "tpu":
+            options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
+        elif jax.default_backend() == "gpu":
+            options.advanced_configuration = {"gpu_max_activity_api_events": self.activity_cap}
+        return options
 
 
 def active_profile() -> Profiler | None:
@@ -273,6 +282,11 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
     elif attributed == 0:
         metadata["op_attribution"] = COMMAND_BUFFERS
         _logger.warning("Profile %s: %s", directory, COMMAND_BUFFERS)
+    _manifest(directory, metadata, failures)
+
+
+def _manifest(directory: Path, metadata: dict[str, JSON], failures: list[Exception]) -> None:
+    """Write `directory`'s manifest, naming every file it holds, and raise the export's `failures`."""
     written: list[JSON] = [str(path.relative_to(directory))
                            for path in sorted(directory.rglob("*")) if path.is_file()]
     metadata["artifacts"] = written
@@ -315,12 +329,19 @@ class Profiler:
     `XLA_FLAGS=--xla_gpu_enable_command_buffer=`; time runs without that
     flag, since launching kernels one by one costs time. Where hlo_stats has
     no column naming the ops, `op_attribution` records that it could not tell.
+
+    A capture whose reader reads its trace alone (`dew.telemetry.trace`), as a
+    benchmark's device timeline or XLA's profile-guided latency estimates do,
+    takes `reports=False`: it needs no XProf, and its stop writes its manifest
+    alone, not the reports, whose conversion takes minutes for a training
+    window's capture (row 2017).
     """
 
     def __init__(self, directory: str | os.PathLike[str] | None = None, *,
-                 options: jax.profiler.ProfileOptions | None = None) -> None:
+                 options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None:
         self._directory = None if directory is None else Path(directory)
         self._options = options
+        self._reports = reports
         self._capture: Path | None = None
         self._converter: _Converter | None = None
         self._metadata: dict[str, JSON] = {}
@@ -364,9 +385,9 @@ class Profiler:
             self._phase = "starting"
         owned_start = False
         try:
-            converter = require_profile_support()
+            converter = require_profile_support() if self._reports else None
             backend = jax.default_backend()
-            options = capture_options() if self._options is None else self._options
+            options = CaptureOptions().profile_options() if self._options is None else self._options
             _drain()
             if self._directory is None:
                 self._directory = Path(tempfile.mkdtemp(prefix="dew-profile-"))
@@ -376,7 +397,8 @@ class Profiler:
             root.mkdir(parents=True, exist_ok=True)
             capture = Path(tempfile.mkdtemp(prefix="capture-", dir=root))
             metadata: dict[str, JSON] = {
-                "versions": {name: version(name) for name in ("jax", "jaxlib", "xprof")},
+                "versions": {name: version(name)
+                             for name in ("jax", "jaxlib", *(("xprof",) if self._reports else ()))},
                 "backend": backend, "devices": [str(device) for device in jax.local_devices()],
                 "device_kinds": [device.device_kind for device in jax.local_devices()],
                 "process_index": rank, "process_count": count,
@@ -444,12 +466,13 @@ class Profiler:
                 self._capture = None
                 self._converter = None
                 self._metadata = {}
-        assert capture is not None and converter is not None
+        assert capture is not None
         self._captures.append(capture)
         metadata["body_status"] = body
         if self._temporary:
             _logger.info("Profile saved under %s", self._directory)
-        if wait or failures:
+        # A capture without reports writes its manifest alone, at once.
+        if wait or failures or converter is None:
             _export(capture, converter, metadata, failures)
             return
         # A fresh interpreter of the exporter alone, never the caller's program again: the conversion reads
@@ -495,16 +518,21 @@ def exported(directory: str | os.PathLike[str] | None = None) -> None:
         raise RuntimeError("Profile export failed for " + ", ".join(failed))
 
 
-def _export(capture: Path, converter: _Converter, metadata: dict[str, JSON],
+def _export(capture: Path, converter: _Converter | None, metadata: dict[str, JSON],
             failures: list[BaseException]) -> None:
-    """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports and its
-    manifest (`_reports`), raising every failure of the stop (`failures`) and of the export together."""
+    """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports where
+    it has a `converter` and its manifest (`_reports`, `_manifest`), raising every failure of the stop
+    (`failures`) and of the export together."""
     reasons = [] if failures else held_back(capture, metadata)
     metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
     metadata["capture_errors"] = [str(error) for error in failures]
     metadata["capture_reasons"] = [*reasons]
     try:
-        _reports(capture, converter, metadata)
+        if converter is None:
+            metadata["reports"] = []
+            _manifest(capture, metadata, [])
+        else:
+            _reports(capture, converter, metadata)
     except BaseException as error:
         failures.append(error)
     if failures:
