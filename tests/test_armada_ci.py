@@ -1736,6 +1736,37 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
 
 
+SCRIPT = str(ROOT / "tools/armada/ci.py")
+
+
+def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: str) -> dict[str, str]:
+    """Test files `names` that import src/shapes.py (`module` its text), each weighing about a task, run
+    green by tools/armada/ci.py as a script, as one 3.12 task against the shared test cache, in a checkout
+    whose .armada.json pins its tasks to this host's class: the environment a plan of theirs runs in, which
+    names the cache and its tokens."""
+    interpreter(root, "3.12")
+    held = ci.cpu_class().split("-")
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
+    (root / ".armada.json").write_text(json.dumps(config))
+    (root / "src").mkdir()
+    (root / "src/shapes.py").write_text(module)
+    written(root, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
+                                      f"def test_{name}():\n    assert area(2) == 2\n" for name in names})
+    (root / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_{name}.py::test_{name}": 250.0 for name in names}))
+    (root / ".verdict").mkdir()
+    url, _, _ = cache_worker
+    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
+           "DEW_XLA_CACHE_READ_TOKEN": "token"}
+    verdict = root / ".verdict/verdict.json"
+    tests = "--tests=" + " ".join(f"tests/test_{name}.py" for name in names)
+    subprocess.run([sys.executable, SCRIPT, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
+                   cwd=root, env=env, check=True)
+    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0] * len(names)
+    return env
+
+
 def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_green(
         ci, tmp_path, cache_worker):
     """The plan and a task each run tools/armada/ci.py as a script under whatever Python runs it where it runs
@@ -1743,25 +1774,10 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     green under one Python, a plan run by another keeps, in one task (2026-10-30: plans under 3.14 and 3.12
     found none of the 3.13 tasks' records fresh, as each Python compiles a module's units to its own digests,
     and every file took a task of its own)."""
-    interpreter(tmp_path, "3.12")
-    held = ci.cpu_class().split("-")
-    config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
-    (tmp_path / ".armada.json").write_text(json.dumps(config))
     # A module whose units each Python compiles to its own digests: a documented, annotated function.
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src/shapes.py").write_text(
-        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n    return width * height\n')
-    written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
-                                          f"def test_{name}():\n    assert area(2) == 2\n"
-                       for name in ("a", "b")})
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_{name}.py::test_{name}": 250.0 for name in ("a", "b")}))
-    (tmp_path / ".verdict").mkdir()
-    url, _, _ = cache_worker
-    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
-           "DEW_XLA_CACHE_READ_TOKEN": "token"}
-    script = str(ROOT / "tools/armada/ci.py")
+    env = ran_by_script(ci, tmp_path, cache_worker, ("a", "b"),
+                        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n'
+                        '    return width * height\n')
 
     def version(python: str) -> str:
         return subprocess.run([python, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True,
@@ -1772,13 +1788,8 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     other = next(python for python in (*(str(ROOT / f".venv-{each}/bin/python") for each in ci.PYTHONS),
                                        shutil.which("python3") or "")
                  if Path(python).is_file() and version(python) != version(sys.executable))
-    verdict = tmp_path / ".verdict/verdict.json"
-    tests = "--tests=tests/test_a.py tests/test_b.py"
-    subprocess.run([sys.executable, script, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
-                   cwd=tmp_path, env=env, check=True)
-    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0]
     timings = tmp_path / "timings.json"
-    planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
+    planned = subprocess.run([other, SCRIPT, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
                              env=env, capture_output=True, text=True, check=True).stdout
     entries = [entry for entry in json.loads(planned)["include"] if entry["python"] == "3.12"]
     assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
@@ -1790,34 +1801,15 @@ def test_a_plan_reads_each_input_once_however_many_rows_ran_it(ci, tmp_path, cac
     executed is read once, as the plan runs in CI, under the Python its keys are hashed by (2026-10-31:
     train 368's plan read each of a row's ~3,000 inputs again for each of 1,682 rows, 9.5 minutes before its
     first task)."""
-    interpreter(tmp_path, "3.12")
-    held = ci.cpu_class().split("-")
-    config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
-    (tmp_path / ".armada.json").write_text(json.dumps(config))
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src/shapes.py").write_text("def area(width, height=1):\n    return width * height\n")
     names = ("a", "b", "c")
-    written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
-                                          f"def test_{name}():\n    assert area(2) == 2\n" for name in names})
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_{name}.py::test_{name}": 50.0 for name in names}))
-    (tmp_path / ".verdict").mkdir()
-    url, _, _ = cache_worker
-    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
-           "DEW_XLA_CACHE_READ_TOKEN": "token"}
-    script = str(ROOT / "tools/armada/ci.py")
-    verdict = tmp_path / ".verdict/verdict.json"
-    tests = "--tests=" + " ".join(f"tests/test_{name}.py" for name in names)
-    subprocess.run([sys.executable, script, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
-                   cwd=tmp_path, env=env, check=True)
-    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0, 0]
+    env = ran_by_script(ci, tmp_path, cache_worker, names,
+                        "def area(width, height=1):\n    return width * height\n")
     # The plan as CI's runs it, under the Python its keys are hashed by, each file it opens counted.
     opened = tmp_path / ".verdict/opened.json"
-    counted = (f"import json, runpy, sys\nopened = []\n"
+    counted = ("import json, runpy, sys\nopened = []\n"
                "sys.addaudithook(lambda event, args: event == 'open' and opened.append(str(args[0])))\n"
-               f"sys.argv = [{script!r}, 'plan', '--target=300', '--timings={tmp_path / 'timings.json'}']\n"
-               f"try:\n    runpy.run_path({script!r}, run_name='__main__')\n"
+               f"sys.argv = [{SCRIPT!r}, 'plan', '--target=300', '--timings={tmp_path / 'timings.json'}']\n"
+               f"try:\n    runpy.run_path({SCRIPT!r}, run_name='__main__')\n"
                f"finally:\n    open({str(opened)!r}, 'w').write(json.dumps(opened))\n")
     planned = subprocess.run(["uv", "run", "--no-project", "--python", ci.HASHED_BY, "python", "-c", counted],
                              cwd=tmp_path, env=env, capture_output=True, text=True)
