@@ -12,6 +12,7 @@ everything else.
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import importlib.util
 import json
 import os
@@ -36,6 +37,84 @@ from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
+
+REGISTERS = re.compile(r"Used (\d+) registers")
+SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
+SHARED = re.compile(r"smem_scratch_bytes=(\d+)")
+TENSOR_MEMORY = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
+KERNEL_COUNTER = re.compile(r"_\d+$")
+"""The counter Mosaic GPU appends to a kernel's name in its reports' file names, which JAX 0.12 numbers
+apart for a kernel's two reports."""
+DUMP_NAME = re.compile(r'mosaic_gpu\.dump_basename = "[^"]*"')
+"""The one attribute of Mosaic's module dump that names the dump (its counter) rather than the module."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Report:
+    """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
+    (Mosaic's resource estimate), its registers a thread and its spilled bytes (ptxas's, the most over the
+    kernel's functions), what the reports left `unread`: either report without the other, or a field
+    neither states, is no evidence the kernel is within its resources; and its `module`, the digest of
+    Mosaic's module after layout inference less its dump's name, which two compiles of one module share:
+    Mosaic compiles a module once a process, so a later compile of it reports no ptxas run of its own; and
+    the digest of the launch that traced it (`launching`), which its name carried, or None."""
+    kernel: str
+    shared: int | None
+    tmem: int | None
+    registers: int | None
+    spilled: int | None
+    unread: tuple[str, ...] = ()
+    module: str | None = None
+    launch: str | None = None
+
+    def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
+        """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
+        columns without spilling registers, or None where it is."""
+        if self.unread:
+            return f"its reports state no {', '.join(self.unread)}"
+        if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
+                and self.tmem <= tmem_limit and self.spilled == 0):
+            return None
+        return (f"{self.shared} shared bytes (limit {shared_limit}), {self.tmem} tensor memory columns "
+                f"(limit {tmem_limit}), {self.spilled} bytes spilled")
+
+
+def kernel_name(stem: str) -> str:
+    """A kernel's name from a report file's stem: less Mosaic's counter (`KERNEL_COUNTER`) and the launch
+    its name carried (`report.LAUNCH_SUFFIX`)."""
+    return report.LAUNCH_SUFFIX.sub("", KERNEL_COUNTER.sub("", stem))
+
+
+def reports(directory: str) -> list[Report]:
+    """Each kernel's `Report` in `directory`, its reports and module dump paired by the kernel's name less the
+    counter Mosaic appends (`KERNEL_COUNTER`); the compiles a directory holds name each kernel once."""
+    by_kernel: dict[str, dict[str, Path]] = {}
+    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas"),
+                         ("module", ".after_layout_inference.txt")):
+        for path in Path(directory).glob(f"*{suffix}"):
+            found = by_kernel.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
+            # Paired by name: compiles that name a kernel twice would pair the wrong reports.
+            assert kind not in found, f"{path.name} and {found[kind].name} compiled under one name"
+            found[kind] = path
+    found_reports = []
+    for name, found in sorted(by_kernel.items()):
+        text = found["resources"].read_text() if "resources" in found else ""
+        log = found["ptxas"].read_text() if "ptxas" in found else ""
+        shared, tmem = SHARED.search(text), TENSOR_MEMORY.search(text)
+        registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
+        unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
+                                                 ("registers", registers), ("spills", spills)) if not read)
+        module = found.get("module")
+        launch = report.LAUNCH_SUFFIX.search(name)
+        found_reports.append(Report(
+            report.LAUNCH_SUFFIX.sub("", name), int(shared.group(1)) if shared else None,
+            sum(map(int, tmem.groups())) if tmem else None, max(map(int, registers), default=None),
+            max((int(stores) + int(loads) for stores, loads in spills), default=None), unread,
+            hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest() if module else None,
+            launch.group(1) if launch else None))
+    return found_reports
+
+
 
 KERNEL = re.compile(r"kCustomKernel \[[^\]]*\] (\S+) .*? shared_memory: (\d+) bytes")
 """A custom kernel's line in XLA's thunk sequence, with its name and the shared bytes it launches with: a
@@ -144,9 +223,9 @@ def _compiled(case, generation: str, record: dict) -> tuple[list[str], dict[str,
 
 
 def mosaic_kernels(directory: str) -> list[dict]:
-    """Each Mosaic GPU kernel's report in `directory` (`report.reports`), as a record a test's process of its
+    """Each Mosaic GPU kernel's report in `directory` (`reports`), as a record a test's process of its
     own writes back as JSON (`compile_mosaic_kernels`)."""
-    return [dataclasses.asdict(found) for found in report.reports(directory)]
+    return [dataclasses.asdict(found) for found in reports(directory)]
 
 
 _REPORTING = threading.Lock()
@@ -293,8 +372,8 @@ def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = N
         ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", *relocating, source.name, "-o", os.devnull],
                              capture_output=True, text=True, check=False)
     text = ran.stdout + ran.stderr
-    used = [int(count) for count in report.REGISTERS.findall(text)]
-    spilled = [int(stores) + int(loads) for stores, loads in report.SPILLS.findall(text)]
+    used = [int(count) for count in REGISTERS.findall(text)]
+    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
     return max(used, default=0), max(spilled, default=0), ran.returncode == 0
 
 
@@ -389,7 +468,7 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
         registers, spilled, took = _ptxas(path.read_text(), generation, cap=None)
         if not took:
             raise RuntimeError(f"ptxas does not compile {path.name} for {generation}")
-        found[report.kernel_name(path.name.removesuffix(".ptx"))] = {
+        found[kernel_name(path.name.removesuffix(".ptx"))] = {
             "registers": registers, "spilled": spilled, "ptxas": "the GPU's compile of its PTX"}
     return found
 
@@ -397,10 +476,10 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
 def _needs(directory: str, generation: str,
            models: dict[str, resources.RegisterModel] | None = None) -> dict[str, int | dict | None]:
     """Each kernel's register need (`register_need`) from the PTX Mosaic dumped into `directory`, by the
-    kernel's name less Mosaic's counter and its launch (`report.kernel_name`)."""
+    kernel's name less Mosaic's counter and its launch (`kernel_name`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
-        name = report.kernel_name(path.name.removesuffix(".ptx"))
+        name = kernel_name(path.name.removesuffix(".ptx"))
         model = (models or {}).get(name)
         found[name] = (register_decisions(path.read_text(), generation, model) if model is not None
                        else register_need(path.read_text(), generation))
@@ -499,14 +578,14 @@ def mosaic_failures(found: list[dict]) -> list[str]:
 
 
 def compiled_kernels(record: dict) -> set[str]:
-    """The names of the kernels `record` compiled, as its models name them (`report.Report.kernel`)."""
+    """The names of the kernels `record` compiled, as its models name them (`Report.kernel`)."""
     return {_report(kernel).kernel for kernel in record.get("kernels", ())}
 
 
-def _report(kernel: dict) -> report.Report:
-    stated = {field.name: kernel[field.name] for field in dataclasses.fields(report.Report)
+def _report(kernel: dict) -> Report:
+    stated = {field.name: kernel[field.name] for field in dataclasses.fields(Report)
               if field.name in kernel}
-    return report.Report(**{**stated, "unread": tuple(kernel["unread"])})
+    return Report(**{**stated, "unread": tuple(kernel["unread"])})
 
 
 def _register_evidence(record: dict) -> list[dict]:
@@ -532,7 +611,7 @@ def _register_evidence(record: dict) -> list[dict]:
     return rows
 
 
-def _evidence(record: dict, kernel: "report.Report", model: resources.RegisterModel,
+def _evidence(record: dict, kernel: "Report", model: resources.RegisterModel,
               need: int | dict | None, *,
               measured_model: resources.RegisterModel | None = None) -> compile_evidence.Evidence:
     """A modelled kernel's evidence: the model's registers and the decision they give against ptxas's need

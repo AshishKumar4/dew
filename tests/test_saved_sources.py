@@ -7,7 +7,7 @@ import dataclasses
 import jax
 import numpy as np
 import pytest
-from test_run_options import decision, diffusion, trained
+from run_kinds import decision, diffusion, trained
 
 from dew.batch import FROZEN
 from dew.config import ObjectiveConfig, SourceOptions

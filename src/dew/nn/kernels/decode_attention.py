@@ -54,7 +54,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import capped, kernel_dot, prescaled
+from .templates.attention import Capped, kernel_dot, prescaled
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -135,7 +135,7 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
-                           score_mod=None if softcap is None else functools.partial(capped, softcap),
+                           score_mod=None if softcap is None else Capped(softcap),
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
                            headroom=algebra.headroom(dtype), initial=sinks,
                            compensated=algebra.compensates(dtype), prescale=power)

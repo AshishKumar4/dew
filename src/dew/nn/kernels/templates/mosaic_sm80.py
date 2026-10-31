@@ -362,7 +362,8 @@ class Mma(mosaic.Family):
         pass
 
     def held(self, ref):
-        return plgpu.load(ref, layout=self.lhs, optimized=False)
+        # A resident operand stays in shared memory between products, not beside every loop carry.
+        return ref
 
     def _left(self, lhs):
         """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's
