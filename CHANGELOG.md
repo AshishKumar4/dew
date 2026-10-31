@@ -35,6 +35,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
     pillars and props (`tools/fpv_assets.py`, CC0 textures).
   - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
     DreamerV3 agent on the camera alone.
+## 0.2.0
+
+The first release on Dew's own package index, `pip install dewml --extra-index-url
+https://pypi.dewml.dev/simple`, beside Dew's JAX build, which PyPI does not hold. PyPI's `dewml` is a
+pointer from now on: its 0.1.1 installs nothing and names the index.
+
 - The fit search's derived first candidate counts what its gradient program holds at its peak, as JAX
   lowers it and the GPU's fusion keeps its values (a one-device `shard_map` inline, a Pallas kernel its
   outputs alone, a `platform_dependent` the platform's branch), and the GEMM workspace XLA gives each
