@@ -105,6 +105,14 @@ def configured(environ: Mapping[str, str]) -> dict[str, str]:
     return lane
 
 
+def outside_suite(environ: Mapping[str, str]) -> dict[str, str]:
+    """`environ` as a user's process on one CPU device sees it: without every setting `configure_lane` gives
+    the suite (its simulated devices and their threads, its matmul precision, its wide CPU arithmetic), JAX
+    on the CPU, for a page, an example or a tool a test runs as a reader would (ledgers 2510, 2736)."""
+    suite = configured({})
+    return {**{name: value for name, value in environ.items() if name not in suite}, "JAX_PLATFORMS": "cpu"}
+
+
 def _local_gpus(environ: MutableMapping[str, str]) -> int:
     """The GPUs this process will see, counted before any backend opens."""
     visible = environ.get("CUDA_VISIBLE_DEVICES")
