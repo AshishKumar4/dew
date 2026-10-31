@@ -159,7 +159,7 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
-STACKED = 16
+STACKED = 32
 """The examples each draw of the trainer's gradient stacks (`stacked`), each its own weights and batch: a
 norm's scale or a layer's scalar sums its gradient over every token, one value an example, whose error
 is one Gaussian a draw, its log squared error spread pi / sqrt(2) wide, so two arms' ratio of it is a

@@ -493,11 +493,11 @@ WINDOW_GRADIENT_SEEDS = 8
 failed 24 of 24)."""
 
 
-WINDOW_STACKED = 8
+WINDOW_STACKED = 16
 """The draws of windows each draw of their gradients stacks (`stacked_windows`): an embedding row or a
 level's column a draw's few windows touch is hit by a token or two, its error one Gaussian or two a draw,
 heavy-tailed past the pooled interval's reach (ledger 2469: 6.5 at `embed_tokens` and `continuum.up`).
-Stacked, a draw holds 8 draws' windows, paired window by window (`assert_as_exact`'s `examples`), each
+Stacked, a draw holds 16 draws' windows, paired window by window (`assert_as_exact`'s `examples`), each
 window's geometry its own."""
 
 
