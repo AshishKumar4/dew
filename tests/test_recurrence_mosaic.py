@@ -682,14 +682,15 @@ seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three 
 
 
 
-def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None = None) -> list:
+def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
     1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
     documents, and the gated delta rule's 16-bit training pass, at the template's derived tiles and, one row's
     forward, at each of their variants; beside them the tiles the derivation takes where every register held
     (`Template._held`) and refused for registers alone, and the fast backward its launches' registers refuse,
     so a model over ptxas's need fails as one under it does. Each case's plan by its label into `plans`
-    (`mainloop_backward.planned`), each call the template refuses into `refused`."""
+    (`mainloop_backward.planned`), each call the template refuses into `refused`, and the launches a case's
+    model refuses by its label into `apart` where they are held apart (`apart_failures`)."""
     from fla_gdn_support import KernelCase
 
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
@@ -764,6 +765,15 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
         label = (f"{name} {jnp.dtype(dtype).name} {'training' if training else 'forward'}"
                  f"{' packed' if packed else ''} {kind}{tiles}")
         plans[label] = template.MOSAIC._launches(bound, tiles, facts, backward=training)
+        unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
+        with generation.assumed(facts):
+            held = not training or kind != 'two roles ' or mainloop_backward.backward_holds(
+                *args, tiles=tiles, family=family, shared=shared, starts=starts, **unwide)
+        if not held:
+            # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`,
+            # as at the derived tiles): the launches its model refuses held apart (`apart_failures`).
+            apart[label] = {launch.name for launch in plans[label]
+                            if launch.registers > _model(launch, family).budget}
 
         def call():
             given = list(args)
@@ -794,12 +804,46 @@ def planned_failures(found: list, plans: dict) -> list[str]:
     from which the tiles are derived): the recurrence's shared-memory model, beside the register model the
     shared gate holds to ptxas (`kernel_compile.mosaic_failures`)."""
     def planned(record: dict, kernel: dict) -> int:
-        return max((launch.shared for launch in plans[record['name']]
-                    if kernel['kernel'].startswith(launch.name)), default=0)
+        # A kernel's launches the longest names that begin its own: `recurrence_intra_solve` is no
+        # `recurrence_intra`.
+        named = [launch for launch in plans[record['name']] if kernel['kernel'].startswith(launch.name)]
+        longest = max((len(launch.name) for launch in named), default=0)
+        return max((launch.shared for launch in named if len(launch.name) == longest), default=0)
 
     return [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes past its plan's "
             f"{planned(record, kernel)}" for record in found for kernel in record.get('kernels', ())
             if kernel['shared'] is not None and not kernel['shared'] <= planned(record, kernel)]
+
+
+def apart_failures(found: list, apart: dict) -> list[str]:
+    """Each compiled case's launches held apart (`apart`, the names its model refuses by its label): every
+    launch its model admits as a required case's (`kernel_compile.mosaic_failures`: spill-free, every report
+    read), and every one it refuses free to spill, its model's decision beside ptxas's in the record's
+    register evidence, advisory where ptxas holds it spill-free (as `mosaic_failures` keeps a spill-free
+    disagreement)."""
+    from kernel_compile import _register_evidence, mosaic_failures
+
+    failed = []
+    for record in found:
+        refused = {kernel["kernel"] for kernel in record.get("kernels", ()) for name in apart[record["name"]]
+                   if kernel["kernel"] == name or kernel["kernel"].startswith(f"{name}__")}
+        admitted = [kernel for kernel in record.get("kernels", ()) if kernel["kernel"] not in refused]
+        failed += mosaic_failures([{**record, "kernels": admitted}])
+        record["evidence"] = _register_evidence(record)
+    return failed
+
+
+def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
+    """`planned_failures` holds `recurrence_intra_solve` to its own launch's shared memory, not to the larger
+    plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
+    import types
+
+    plans = {"case": [types.SimpleNamespace(name="recurrence_intra", shared=200_000),
+                      types.SimpleNamespace(name="recurrence_intra_solve", shared=65_568)]}
+    found = [{"name": "case", "kernels": [{"kernel": "recurrence_intra_solve", "shared": 100_000},
+                                          {"kernel": "recurrence_intra", "shared": 150_000}]}]
+    failed = planned_failures(found, plans)
+    assert [failure.split(":")[0] for failure in failed] == ["case recurrence_intra_solve"]
 
 
 def _gated(target: str, group: tuple):
@@ -832,12 +876,15 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
             pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
     from kernel_compile import compile_mosaic_kernels, failures, mosaic_failures
 
-    plans, refused = {}, []
-    cases = compiled_cases(target, plans, refused, only=group)
+    plans, refused, apart = {}, [], {}
+    cases = compiled_cases(target, plans, refused, apart, only=group)
     found = compile_mosaic_kernels(cases, target)
-    # Every case compiles and reports; a refused tile's spill is the model's refusal, a required one's fails.
+    # Every case compiles and reports; a refused tile's spill is the model's refusal, a required one's fails,
+    # and a case whose launches are held apart fails as either does, launch by launch.
     failed = failures(found) + planned_failures(found, plans)
-    failed += mosaic_failures([record for case, record in zip(cases, found, strict=True) if case.required])
+    failed += mosaic_failures([record for case, record in zip(cases, found, strict=True)
+                               if case.required and case.name not in apart])
+    failed += apart_failures([record for record in found if record["name"] in apart], apart)
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     assert not failed, "\n".join(failed)

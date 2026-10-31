@@ -23,7 +23,7 @@ from dew.diffusion.presets import Flow
 from dew.optim import ScheduleSpec
 from dew.registry import import_path, record_argument
 from dew.sampling import Heun
-from dew.training import MeshSpec
+from dew.training import LocalTracker, MeshSpec
 
 pytestmark = pytest.mark.mesh
 
@@ -83,6 +83,30 @@ def test_a_chains_settings_are_set_together():
     moved = DiffusionRunConfig(data=flowers).assigned(["data.images.size=128",
                                                         "data.images.staging_size=128"])
     assert moved.data.facts()["fields"]["image"] == [128, 128, 3]
+
+
+def test_an_image_size_override_derives_the_flow_shift_and_the_edm_space_afresh():
+    """A Flow run's resolution shift counts the tokens of the images it trains on, derived where it builds
+    its process (`DiffusionRunConfig.derived_preset`), so moving the images' size on the command line
+    (`data.images.size`) moves the shift with it, where a count derived once at construction kept the old
+    size's (row 3026): 256-pixel images are 256 tokens and 512-pixel ones 1024, mu 0.5 and about 0.63. A
+    token count the preset states holds at any size, and the run records the preset as given. An EDM run's
+    sigma space follows its autoencoder alike."""
+    from dew.data import presets
+    from dew.data.sources import source
+    from dew.diffusion.presets import EDM, ResolutionShift
+
+    flowers = source("tfds://oxford_flowers102").pipe(presets.images, 256, batch=8)
+    run = DiffusionRunConfig(data=flowers, preset=Flow(resolution_shift=ResolutionShift()))
+    moved = run.assigned(["data.images.size=512"])
+    assert run.derived_preset().resolution_shift.tokens == 256
+    assert moved.derived_preset().resolution_shift.tokens == 1024
+    assert moved.derived_preset().resolution_shift.shift() == ResolutionShift(tokens=1024).shift()
+    assert moved.preset.resolution_shift.tokens is None
+    stated = DiffusionRunConfig(data=flowers, preset=Flow(resolution_shift=ResolutionShift(tokens=64)))
+    assert stated.assigned(["data.images.size=512"]).derived_preset().resolution_shift.tokens == 64
+    edm = DiffusionRunConfig(data=flowers, preset=EDM())
+    assert edm.derived_preset().regime == "pixel" and edm.preset.regime is None
 
 
 def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
@@ -159,9 +183,9 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
 
 
 def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
-    """`dew profile --host-tracer-level 1 --python-tracer-level 1` captures with those options: the window
-    owns them (`ProfileWindow`), the command only maps its flags onto it, and the capture's manifest records
-    what it ran with (row 1894)."""
+    """`dew profile --host-tracer-level 1 --python-tracer-level 1` captures with those options: the capture's
+    options own them (`CaptureOptions`, the window's `capture`), the command only maps its flags onto them,
+    and the capture's manifest records what it ran with (rows 1894, 2932)."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
 
@@ -345,10 +369,39 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
                               eval_every=1, checkpoint_every=None))
     trained = run.prepare().train("jepa-loss")
     assert int(trained.updates) == 1
-    reports = [json.loads(line)["scalars"] for line in
-               (tmp_path / "jepa-loss" / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    reports = [values for _, values in LocalTracker(tmp_path / "jepa-loss" / "tracking").scalars()]
     assert any("val/loss" in report and np.isfinite(report["val/loss"]) for report in reports)
     assert not any("probe" in name for report in reports for name in report)
+
+
+@pytest.mark.parametrize("precision", ["bf16-mixed", "16-mixed"])
+def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the_dtype(precision):
+    """A JEPA run whose encoder record states no dtype computes in the dtype its numerics derive
+    (`numerics_fields`: bfloat16 for bf16-mixed, float16 for 16-mixed), and its predictor computes in that
+    dtype and with that attention kernel too, as its configuration promises: read off the built encoder,
+    where its record states none (row 3027, a predictor left at float32 beside a bfloat16 encoder). Its
+    own width and depth stay the predictor's."""
+    import jax.numpy as jnp
+
+    from dew.config import TrainerConfig
+    from dew.data import TFDS, presets
+    from dew.nn.precision import numerics_of
+    from dew.registry import ModelConfig
+
+    root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    run = JepaRunConfig(
+        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                           "num_heads": 2, "mlp_ratio": 2, "attention_impl": "xla"}),
+        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        data=TFDS("dew_images", path=str(root), split="all").pipe(presets.images, 16, batch=8),
+        trainer=TrainerConfig(precision=numerics_of(precision), steps=1))
+    objective = run.build_run().objective
+    expected = {"bf16-mixed": jnp.bfloat16, "16-mixed": jnp.float16}[precision]
+    assert jnp.dtype(objective.encoder.dtype) == jnp.dtype(expected)
+    assert jnp.dtype(objective.predictor.dtype) == jnp.dtype(expected)
+    assert objective.predictor.attention_impl == objective.encoder.attention_impl == "xla"
+    assert (objective.predictor.num_layers, objective.predictor.predictor_features) == (1, 8)
+    assert objective.predictor.emb_features == objective.encoder.emb_features == 16
 
 
 def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_updates(tmp_path):

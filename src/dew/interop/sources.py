@@ -16,7 +16,7 @@ import functools
 import json
 import logging
 import os
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -39,6 +39,9 @@ from dew.interop.safetensors_io import (
 from dew.interop.unread import Unread, unread
 
 if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+    from transformers.core_model_loading import WeightConverter
+
     from dew.interop.decoder_parts import SourceCode
 
 
@@ -461,3 +464,48 @@ class StoredWeights:
 
         return LazyTensors({name: spec for name, (_, spec) in held.items()},
                            lambda name: read(held[name][0])[name])
+
+
+@dataclass(frozen=True)
+class LoadName:
+    """A stored tensor's name as its model's transformers load names it (`load_names`): `name`; the name
+    its renamings alone give (`renamed`, an expert's own before the converter merges it); and its
+    `converter`, the `WeightConverter` that merges it into another tensor, which `pattern` of the
+    converter's sources matched, or None where it is renamed alone."""
+    name: str
+    renamed: str
+    converter: WeightConverter | None
+    pattern: str | None
+
+
+def load_names(model: PreTrainedModel) -> Callable[[str], LoadName] | None:
+    """The name `model`'s transformers load gives each stored key (`convert_and_load_state_dict_in_model`,
+    by the conversion mapping it keeps for the model, `get_model_conversion_mapping`): every renaming,
+    then at most one converter, the base model's prefix added or dropped as the model holds the name,
+    and the stored name itself where only it is held. None where a renaming renames a key by whether
+    another is stored (`GroupWeightRename`), which no read of one name tells: the caller leaves such a
+    checkpoint to transformers' own load."""
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import (
+        GroupWeightRename,
+        WeightConverter,
+        WeightRenaming,
+        rename_source_key,
+    )
+
+    transforms = get_model_conversion_mapping(model)
+    if any(isinstance(transform, GroupWeightRename) for transform in transforms):
+        return None
+    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    held, prefix = model.state_dict(), model.base_model_prefix
+
+    def loaded(stored: str) -> LoadName:
+        name, pattern = rename_source_key(stored, renamings, converters, prefix, held)
+        if name not in held and stored in held:
+            name, pattern = rename_source_key(stored, [], [], prefix, held)
+        converter = None if pattern is None else next(
+            converter for converter in converters if pattern in converter.source_patterns)
+        return LoadName(name, rename_source_key(stored, renamings, [])[0], converter, pattern)
+
+    return loaded

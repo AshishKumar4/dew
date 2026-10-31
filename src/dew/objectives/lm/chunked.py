@@ -41,7 +41,6 @@ from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
@@ -53,7 +52,7 @@ from dew.nn.categorical import (
     segment_log_partition,
     target_loss,
 )
-from dew.nn.kernels.generation import linear_tangent
+from dew.nn.kernels.generation import linear_tangent, tangent_zero
 from dew.nn.precision import (
     added_to,
     at_least_fp32,
@@ -561,9 +560,9 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
 
 
 def _no_cotangent(index):
-    """An integer operand's cotangent, float0's zero (None for an absent one): `linear_tangent` reads a
+    """An integer operand's cotangent (`tangent_zero`), None for an absent one: `linear_tangent` reads a
     backward's cotangents leaf for leaf against its operands."""
-    return None if index is None else np.zeros(jnp.shape(index), jax.dtypes.float0)
+    return None if index is None else tangent_zero(index)
 
 
 def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_first, d_partition,
@@ -950,7 +949,7 @@ def _fused_bwd(z_loss, cap, chunk, precision, predict, temperature, excluded, sa
     hidden, table, labels, weights, _ = operands
     scale = cotangents[0]
     return ((scale * d_states).astype(hidden.dtype), (scale * d_table).astype(table.dtype),
-            _no_cotangent(labels), jnp.zeros_like(weights),
+            _no_cotangent(labels), tangent_zero(weights),
             jax.tree.map(lambda gradient: scale * gradient, d_columns))
 
 

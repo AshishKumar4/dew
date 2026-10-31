@@ -78,7 +78,7 @@ def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, co
     rows = cotangent.astype(table.dtype)
     placed = explicit_spec(ids)
     # The ids are integers: their cotangent is float0's zero, as the lookup's own pullback gives it.
-    untouched = np.zeros(ids.shape, jax.dtypes.float0)
+    untouched = jax.custom_derivatives.zero_from_primal(ids)
     if placed is None:
         return jnp.zeros_like(table).at[ids].add(rows), untouched
     # Each device scatters its own rows and the sums are added across the axis.

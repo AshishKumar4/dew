@@ -9,6 +9,9 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 - The portable backward as a GPU compiles it, and the SSD port's forward and gradient, finite and on par
   under every regime (test_recurrence_stability).
 - The short conv's kernels as exact as XLA's conv at the training shapes (test_short_conv).
+- Mamba's selective scan on the template under the fast forms as exact as recorded mamba_ssm in each
+  recorded case, and a Mamba layer under the template's choice, packed and from a held state, as exact as
+  under the portable scan, on an H100 (test_selective_template; an A100's after post42).
 - Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
   FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
@@ -28,12 +31,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import selective_support
 import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
+import test_selective_template as selective_template
 import test_short_conv as short_conv
 from delta_rule_support import fused_step
 from gpu_flow import Cell, run_cells, when
@@ -261,6 +266,14 @@ def test_the_recurrences_run_on_this_gpu():
           for regime in stability.REGIMES),
         Cell("the SSD on the template under the fast forms is as exact as mamba_ssm",
              mamba_ssd.the_template_is_as_exact_as_mamba_ssm),
+        *(Cell(f"the selective scan on the template under the fast forms is as exact as mamba_ssm: {case}",
+               functools.partial(selective_template.the_template_is_as_exact_as_mamba_ssm, case), "sm90")
+          for case in selective_support.SEEDED_CASES),
+        *(Cell(f"a Mamba layer is as exact under the template: packed {packed}"
+               f"{f', a held state {held}' if held else ''}",
+               functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held),
+               "sm90")
+          for packed, held in ((False, None), (True, None), (False, "through the template"))),
         *(Cell(f"the SSD port's gradient is as exact as the recurrence's: {regime}",
                functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime))
           for regime in stability.REGIMES),
