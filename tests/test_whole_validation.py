@@ -44,7 +44,7 @@ TOKEN_ACCURACY = FIXTURES / "token_accuracy"
 RECORDS = 9
 """The split: a batch and one record, so on two processes one share runs out
 a batch before the other's and covers it with a copy of its last."""
-ROLLOUT = {"grpo", "ppo", "flow_grpo"}
+ROLLOUT = {"grpo", "ppo", "flow_grpo", "diffusion_nft"}
 """Trained on rollouts: a validation split holds prompts, which their loss does not read."""
 
 
