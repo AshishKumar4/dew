@@ -248,8 +248,11 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                     a, a * read, carried[0, n], exchanged, reverse=True, exclusive=True, interpret=interpret)
                 cotangent = read + after
                 through = cotangent * before * a
-                summed = block_scan.summed(through * dts, exchanged, interpret=interpret)
-                carried[1, n] = carried[1, n] + summed
+                # The rate's gradient so far read before the sum's barriers, so no thread reads another's
+                # write of it: read after, an A100's threads added the block's sum twice over (1.6e-2 of
+                # dA from float64 against the rest's 4e-7, mamba1-scan-a100-7d3152837).
+                so_far = carried[1, n]
+                carried[1, n] = so_far + block_scan.summed(through * dts, exchanged, interpret=interpret)
                 added(db_ref.at[row, n, span], cotangent * dts * xs)
                 added(dc_ref.at[row, n, span], dys * (a * before + written))
                 # `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times it, in the rate `dt ln(2)`.
