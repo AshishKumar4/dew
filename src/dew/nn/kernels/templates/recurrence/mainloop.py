@@ -194,6 +194,10 @@ class _Operand:
             return x.astype(self.dtype)
         return jnp.concatenate(product.formed(x.astype(jnp.float32), self.parts), 0)
 
+    def joined(self, x):
+        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`split`'s inverse)."""
+        return x.astype(jnp.float32).reshape(self.parts, -1, x.shape[-1]).sum(0)
+
 
 @dataclasses.dataclass(frozen=True)
 class _Call:

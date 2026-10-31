@@ -219,15 +219,17 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
         """A value head's gradient `[B, T, HV, Dk]` summed onto its key head's."""
         return x.reshape(*x.shape[:2], heads // call.group, call.group, width).sum(3)[..., :run.key_width]
 
-    # The launches' gradients in the operands' dtype (fla's), summed in fp32.
-    dq, dk, dv = (x.astype(jnp.float32) for x in (dq, dk, dv))
+    # The launches' gradients in the operands' dtype (fla's), summed in fp32, the held operand's parts joined.
+    dq, dk = (x.astype(jnp.float32) for x in (dq, dk))
+    dv = call.held.joined(dv) if delta else dv.astype(jnp.float32)
+    dk_w = None if dk_w is None else call.held.joined(dk_w)
     key_heads = heads // call.group
     def key_headed(x):
         """`[R, H * Dk]`, a key head's, laid back as `[B, T, H, Dk]`."""
         return run.unlaid(x.reshape(rows, key_heads, width))[..., :run.key_width]
 
     dq = key_headed(dq)
-    dk = key_headed(dk) + (0.0 if dk_w is None else keyed(headed(dk_w.astype(jnp.float32), width)))
+    dk = key_headed(dk) + (0.0 if dk_w is None else keyed(headed(dk_w, width)))
     dv = headed(dv, columns)[..., :run.value_width]
     dh0 = dh0.reshape(batch, heads, width, columns)[:, :, :run.key_width, :run.value_width]
     if starts is not None:
