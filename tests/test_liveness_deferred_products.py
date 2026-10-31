@@ -266,7 +266,8 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
                                           accurate=False)
         return grads.query, grads.key, grads.value
 
-    op, ba, config = attention._gated_backward("sm90", width, False, "none")
+    accurate = False
+    op, ba, config = attention._gated_backward("sm90", width, accurate, "none")
     with generation.assumed("sm90"):
         models = attention._backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)

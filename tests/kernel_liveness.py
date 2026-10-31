@@ -644,7 +644,8 @@ class _Pass:
             # each is live to its run's last product: the recurrence's states launch holds its twelve
             # products' 96 words at its peak, which the program order kills six at a time (its 202
             # registers a thread against 117 counted).
-            into.update(self.products[self.run[op.results[0]]])
+            # A nested block's products are placed when its own block is walked (`block`).
+            into.update(self.products.get(self.run.get(op.results[0]), ()))
         for nested_region in op.regions:
             for block in nested_region.blocks:
                 for inner in block.operations:
