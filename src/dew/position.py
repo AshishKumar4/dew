@@ -71,7 +71,11 @@ class Global:
 
 def encode(place: Global) -> bytes:
     """`place` as the bytes a checkpoint stores for it."""
-    return json.dumps({ENVELOPE: dataclasses.asdict(place)}).encode()
+    held = dataclasses.asdict(place)
+    if place.tokens is None:
+        # A position read from before positions held stage tokens records none, as it was written.
+        del held["tokens"]
+    return json.dumps({ENVELOPE: held}).encode()
 
 
 def decode(position: bytes) -> Global | None:
