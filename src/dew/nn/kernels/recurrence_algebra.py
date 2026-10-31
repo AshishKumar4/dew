@@ -661,6 +661,14 @@ def doubled(a, issue: Issue):
     return inverse
 
 
+def solved(system, issue: Issue):
+    """`(I + A)^-1 - I` `[C, C]` of a chunk's strictly lower system `A`: `doubled`'s inverse of `-A`, its unit
+    diagonal taken off after the last level, as `weighted` takes it (it adds the diagonal outside its
+    product)."""
+    rows, cols = _grid(system.shape)
+    return doubled(-system, issue) - jnp.where(rows == cols, 1.0, 0.0)
+
+
 def inverted(blocks: dict, issue: Issue, *, neighbours_first: bool = False) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` from `A`'s strictly lower blocks `blocks`
     (the diagonal ones strictly lower themselves): forward substitution inverts each diagonal block
@@ -1003,6 +1011,12 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
+    """The write gate's gradient on a tile of values gated, `u = v beta`, from `u_grad`, fp32: the values'
+    own, `du beta`, and beta's, `sum(v du)` over the tile's columns."""
+    return u_grad * beta[:, None], jnp.sum(u_grad * values, axis=1)
+
+
 def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, beta, dtype, issue: Issue, *,
                     emit: Callable[[str, int, jax.Array], None]) -> jax.Array:
     """The WY representation's backward under a decay a head, its values' part: each value block's gradient
@@ -1012,8 +1026,9 @@ def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, bet
     for j in range(blocks):
         u_grad = u_grads(j).value().astype(jnp.float32)
         d_scaled = u_grad + issue("inverse_t", lower.T, u_grad.astype(dtype))
-        emit("values", j, d_scaled * beta[:, None])
-        d_betas.append(jnp.sum(d_scaled * values(j).value().astype(jnp.float32), axis=1))
+        d_values, d_beta = gated_values_back(d_scaled, values(j).value().astype(jnp.float32), beta)
+        emit("values", j, d_values)
+        d_betas.append(d_beta)
     return _summed(d_betas)
 
 
