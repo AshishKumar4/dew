@@ -138,13 +138,6 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
-CONFIG_CELLS = [(dtype, shape) for dtype in ("bfloat16", "float32")
-                for shape, case in support.COMPILED_SHAPES.items()
-                if not (dtype == "float32" and case["width"] > support.fla_gdn.WIDEST)]
-"""Each dtype beside each declared shape it compiles at: an fp32 call takes no keys past `fla_gdn.WIDEST`
-(`support.kernel_cases`)."""
-
-
 @functools.cache
 def _config_cases(target: str) -> dict:
     """Each declared config's case at each declared shape `target` runs it at (`support.kernel_cases`), by
@@ -152,9 +145,9 @@ def _config_cases(target: str) -> dict:
     return {case.name: case for case in support.kernel_cases(target)}
 
 
-CONFIG_TESTS = [(target, name) for target in ("sm80", "sm89", "sm120") for name in _config_cases(target)
-                if name.split("/")[4] in {shape for _, shape in CONFIG_CELLS}]
-"""A test each declared config at each declared shape and dtype it compiles at (`CONFIG_CELLS`)."""
+CONFIG_TESTS = [(target, name) for target in ("sm80", "sm89", "sm120") for name in _config_cases(target)]
+"""A test each declared config at each declared shape and dtype it compiles at (`support.kernel_cases`, an
+fp32 call's keys no wider than `fla_gdn.WIDEST`)."""
 
 
 @pytest.mark.parametrize(("target", "name"), CONFIG_TESTS)
