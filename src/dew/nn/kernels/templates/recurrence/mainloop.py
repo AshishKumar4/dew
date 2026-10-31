@@ -2176,7 +2176,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
     """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held, after, leaving [blocks, HV, R], memory
     [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
     (fla's dqkwg's memory products, `algebra.memory_gradients`, given the scores' gradient `ds` `[R, HV * C]`
-    as `call.held`, `_scores_back`'s), a program a key head's and a step each value head it serves, the
+    in `_score_grads`' form, `_scores_back`'s), a program a key head's and a step each value head it serves, the
     queries' and keys' summed over them in fp32 where they leave (each program's own tiles: a register
     carry across the steps spilled), as the port's sum; the decay's range terms over the block's key
     columns, each token's (`algebra.memory_gradients`' `(after, leaving)`, which `gradients` sums over their
@@ -2185,6 +2185,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
     enters and its leaving memory's gradient (`call.memories`)."""
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
+    grads = _score_grads(call)
     blocks, group = value_width // call.block, call.group
 
     def program(q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
@@ -2197,7 +2198,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
         views = _query_key_views(call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row,
                                  key_columns=key_columns, first=first, chunk=n, block=c)
         # Step `i` the group's `i`-th value head's scores' gradient.
-        views |= _views(lambda i: (0, i), ds=held.views(ds_ref, row, CHUNK, first * CHUNK, group * CHUNK))
+        views |= _views(lambda i: (0, i), ds=grads.views(ds_ref, row, CHUNK, first * CHUNK, group * CHUNK))
 
         def step(index, slots, carry, accumulators):
             h = first + index
@@ -2225,7 +2226,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
                 functools.partial(column, "value_grads", held) if call.delta else None,
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
-                blocks, _tile(slots, "ds", held), gate, low, ending, ending_low, None, scale, issue,
+                blocks, _tile(slots, "ds", grads), gate, low, ending, ending_low, None, scale, issue,
                 emit=stored)
             after_ref.at[c, h, span][...] = after
             leaving_ref.at[c, h, span][...] = leaving
@@ -2249,7 +2250,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                       values=((CHUNK, value_width), held), out=((CHUNK, value_width), given),
                       **({"value_grads": ((CHUNK, value_width), held)} if call.delta else {}),
                       entered=((call.block, value_width), memories),
-                      leaving=((call.block, value_width), memories), ds=((CHUNK, CHUNK), held))
+                      leaving=((call.block, value_width), memories), ds=((CHUNK, CHUNK), grads))
     keyed_out = jax.ShapeDtypeStruct((call.rows, call.heads // group * width), jnp.float32)
     terms = jax.ShapeDtypeStruct((width // call.block, call.heads, call.rows), jnp.float32)
     out_type = (keyed_out, keyed_out, held.shape(call.heads * width), terms, terms,
@@ -2268,14 +2269,25 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken)
 
 
+def _score_grads(call: _Call) -> _Operand:
+    """The form the scores' gradient passes from `_scores_back` to `_query_key` in: the held operand's for
+    the delta rule (fla's dqkwg rounds it so); without it two bf16 parts, its fp32 to 16 bits past bf16, as
+    mamba_ssm keeps it (`_chunk_scan_bwd_dcb`'s `dCB` cast to its fp32 `CB`): rounded to bf16, the keys'
+    and queries' gradients it sums into put rows 38 and 276 times their size from float64 against mamba_ssm's
+    0.077 and 0.056 (Nemotron-H's SSD, ssd-head-cell-h100-6fd860704)."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    return held if call.delta else _Operand(call.rows, 2, jnp.dtype(jnp.float32))
+
+
 @_lowered_once
 def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: float):
-    """`(ds [R, HV * C] as call.held, decay [HV, R] fp32)`: each chunk and value head's scores' gradient and
-    the decay's gradient from its pair terms (`algebra.scores_gradient`, `algebra.summed_pairs`), fla's
-    dqkwg's part the memory's products do not take, a program a chunk and value head (persistent): apart
+    """`(ds [R, HV * C] in `_score_grads`' form, decay [HV, R] fp32)`: each chunk and value head's scores'
+    gradient and the decay's gradient from its pair terms (`algebra.scores_gradient`,
+    `algebra.summed_pairs`), fla's dqkwg's part the memory's products do not take, a program a chunk and value head (persistent): apart
     from `_query_key`, each launch's tiles a thread's registers hold (one launch spilled 1.5 KB a thread on
     an H100's, SE bwd-probe at a49c8da50)."""
     width, value_width, family = call.width, call.value_width, call.family
+    grads = _score_grads(call)
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
     blocks = value_width // call.block
 
@@ -2309,7 +2321,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
                 width // call.block, functools.partial(column, "values", held),
                 functools.partial(column, "out", given), blocks, gate, low, scale, held.dtype, Issuer(call),
                 laid=laid)
-            held.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            grads.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, columns)
             return carry, accumulators
 
@@ -2318,17 +2330,17 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
     tiles = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
                       values=((CHUNK, value_width), held), out=((CHUNK, value_width), given))
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
-    out_type = (held.shape(call.heads * CHUNK), jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
+    out_type = (grads.shape(call.heads * CHUNK), jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     # The scores' gradient, the scores and the pairs' sums.
     work = Work(2 * CHUNK * CHUNK * (value_width + width + CHUNK), exponentials=CHUNK * CHUNK)
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
     # the pairs' sum's product: four fp32 tiles at once, the decays taken before the scores' product
     # (`algebra.scores_gradient`); five stated an A100's 280 registers where ptxas needed 240.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 4 + _held(held, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 4 + _held(grads, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(8), work=work,
-                   held=held_tiles, staging=_summing(call), landing={"square": held.landing(CHUNK, CHUNK)},
+                   held=held_tiles, staging=_summing(call), landing={"square": grads.landing(CHUNK, CHUNK)},
                    persistent=True)(q, k, corrected, do, hi, lo, hi, lo, taken)
 
 
