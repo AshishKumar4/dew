@@ -11,18 +11,19 @@ import functools
 import jax
 import jax.numpy as jnp
 import pytest
+from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import chunk_on, token_by_token
+from reference_error import with_gradients
+from test_recurrence_chunk import chunk_on
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
-    SEEDS,
     SHAPES,
     draw,
     geometry,
     interpreted,
     on_the_mainloop,
+    recorded_site,
     refuses_its_gradient,
     template_call,
 )
@@ -85,7 +86,7 @@ ledger 2127), which the whole suite runs (`timed`)."""
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
-    backward (`mainloop_backward.gradients`, fla's DAG) against the fla port's, whose numbers it runs, from
+    backward (`mainloop_backward.gradients`, fla's DAG) against recorded fla-core's (`fla_sites`), from
     the forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under
     a checkpoint saving the delta rule's names kept by them. A call the template refuses is checked refused
     and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take,
@@ -110,7 +111,6 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
 
         return traced
 
-    truth = with_gradients(restarted(functools.partial(token_by_token, hooks), case))
     on = on_the_mainloop(hooks, case, dtype)
     if on is None:
         return
@@ -119,8 +119,24 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     if not trained(sample, hooks):
         refuses_its_gradient(compiled(on), *draws(0))
         return
-    assert_as_exact(compiled(on), compiled(functools.partial(chunk_on, 'fla', hooks)), draws,
-                    f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+    recomputed, saved = REMATS[remat]
+
+    def rule(given: Chunk):
+        run = functools.partial(on, **bound)
+        if saved is not None:
+            run = jax.checkpoint(run, policy=RematPolicy(save=saved).checkpoint_policy())
+        return run(given)
+
+    def under(run):
+        def traced(*arguments):
+            with recomputing(recomputed):
+                return run(*arguments)
+
+        return traced
+
+    the_template_is_as_exact_as_fla(rule, recorded_site(case, dtype),
+                                    label=f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}',
+                                    under=under)
 
 
 WALK_GRID = [('one sequence', 'forward'), ('one sequence', 'training')]
@@ -134,11 +150,11 @@ WALKS = interpreted(WALK_GRID, INTERPRETED_WALKS)
 def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     """The states and reverse launches with two value blocks of a sequence and head a program, one a
     consumer role (`Tiles.walkers`, warpgroup MMA's bundle, which the derivation gives a call whose walks
-    fill more than a wave), on par from float64 with the fla port's forward, or forward and gradient, over
-    the case's draws (check 1, truth the recurrence a token at a time's): each role's columns, staging and
-    stores its own. Off a GPU interpreted; a GPU that runs no Hopper kernels (an A100) skips it."""
+    fill more than a wave), on par from float64 with recorded fla-core's forward, or forward and gradient
+    (`fla_sites`), over the case's draws (check 1, truth the recurrence a token at a time's): each role's
+    columns, staging and stores its own. Off a GPU interpreted; a GPU that runs no Hopper kernels (an A100)
+    skips it."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
-    shape = {**geometry(case), 'value_width': 64}
     tiles = mainloop.Tiles(32, 1, walkers=2)
 
     def walked(given: Chunk):
@@ -146,15 +162,11 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
                            tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
                            family=bundles.of('sm90', jnp.bfloat16))
 
-    reference = functools.partial(chunk_on, 'fla', hooks)
-    truth = functools.partial(token_by_token, hooks)
+    site = f"walk/{'cpu' if mainloop.family_of() is None else 'gpu'}"
     if product == 'forward':
-        assert_as_exact(jax.jit(walked), jax.jit(reference), functools.partial(draw, jnp.bfloat16, **shape),
-                        f'a two-role walk, {case}', seeds=SEEDS, truth_fn=jax.jit(truth))
+        the_template_is_as_exact_as_fla(walked, site, ('out', 'final'), f'a two-role walk, {case}')
         return
-    draws = functools.partial(drawn, jnp.bfloat16, **shape)
-    assert_as_exact(with_gradients(walked), with_gradients(reference), draws,
-                    f'a two-role walk\'s gradient, {case}', seeds=SEEDS, truth_fn=with_gradients(truth))
+    the_template_is_as_exact_as_fla(walked, site, label=f'a two-role walk\'s gradient, {case}')
 
 
 def test_the_fast_backward_trains_a_bf16_rated_scan_alone():

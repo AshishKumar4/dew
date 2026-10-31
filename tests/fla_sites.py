@@ -139,11 +139,11 @@ def sites() -> dict[str, Site]:
 
 def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,
                                     leaves: tuple[str, ...] = LEAVES, label: str | None = None,
-                                    under: Callable = jax.jit) -> None:
+                                    under: Callable = lambda run: run) -> None:
     """`rule` (a chunked call, `chunk_on`'s) on par from float64 with recorded fla-core at `site`'s declared
     seeds (check 1), its leaves those of `leaves`, the truth the recurrence a token at a time in float64,
-    which the recorder held to fla's own reference at every seed; `under` how check 1 compiles `rule`'s
-    arm (`jax.jit`)."""
+    which the recorder held to fla's own reference at every seed; `under` wrapping Dew's arm, which check 1
+    compiles."""
     from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
     from test_recurrence_chunk import token_by_token
 

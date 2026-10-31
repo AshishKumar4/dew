@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
@@ -111,6 +112,12 @@ def geometry(case: str) -> dict:
     """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed off a GPU of a family a bundle
     claims (`geometry_on`)."""
     return geometry_on(case, interpreted=mainloop.family_of() is None)
+
+
+def recorded_site(case: str, dtype) -> str:
+    """Case `case`'s site of recorded fla-core in `dtype` at this machine's geometry (`fla_sites`)."""
+    label = {jnp.dtype(value): name for name, value in DTYPES.items()}[jnp.dtype(dtype)]
+    return f"mosaic/{case}/{label}/{'cpu' if mainloop.family_of() is None else 'gpu'}"
 
 
 def geometry_on(case: str, interpreted: bool) -> dict:
@@ -249,22 +256,28 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
 def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     """The mainloop's output and final memory on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time in float64): the gated delta rule with a decay a head or
-    a key dimension (Kimi delta attention's), its queries scaled by `Dk^-1/2`. An fp32 call's reference is the
-    recurrence a token at a time in fp32; a 16-bit call's is the fla port in the call's dtype
-    (`recurrence_chunk.fla_rule`), whose numbers it runs: the values between launches rounded to bf16 put the
-    final memory 1e-3 from float64, which the fp32 recurrence holds to 6e-8. A call the template refuses
-    is checked refused and its arithmetic on the mainloop's rule (`on_the_mainloop`)."""
+    a key dimension (Kimi delta attention's), its queries scaled by `Dk^-1/2`. An fp32 call's reference
+    under the accurate forms is the recurrence a token at a time in fp32, and under the fast forms, as a
+    16-bit call's, recorded fla-core in the call's dtype (`fla_sites`), whose numbers it runs: the values
+    between launches rounded to bf16 put the final memory 1e-3 from float64, which the fp32 recurrence holds
+    to 6e-8. A call the template refuses is checked refused and its arithmetic on the mainloop's rule
+    (`on_the_mainloop`)."""
     per_key = SHAPES[case].get('per_key')
     hooks = recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
                              floor=FLOOR if per_key else None, write_bound=1.0)
     on = on_the_mainloop(hooks, case, dtype)
     if on is None:
         return
-    dew = jax.jit(on)
-    truth = jax.jit(functools.partial(token_by_token, hooks))
-    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk_on, 'fla', hooks))
-    assert_as_exact(dew, reference, functools.partial(draw, dtype, **geometry(case)),
-                    f'the mosaic forward, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+    label = f'the mosaic forward, {case} in {jnp.dtype(dtype).name}'
+    if dtype == jnp.float32:
+        truth = jax.jit(functools.partial(token_by_token, hooks))
+        assert_as_exact(jax.jit(on), truth, functools.partial(draw, dtype, **geometry(case)), label,
+                        seeds=SEEDS, truth_fn=truth)
+        fast = getattr(on, '__wrapped__', None)
+        if fast is None:
+            return
+        on, label = fast, f'{label} under the fast forms'
+    the_template_is_as_exact_as_fla(on, recorded_site(case, dtype), ('out', 'final'), label)
 
 
 UNSEEN = generation.GpuTarget("sm87", "NVIDIA Jetson AGX Orin", 163 * 1024, multiprocessors=16,
@@ -317,12 +330,15 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
                            family=bundles.of('sm80', jnp.bfloat16))
 
     truth = jax.jit(functools.partial(token_by_token, hooks))
-    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk_on, 'fla', hooks))
     # Each variant: its value block and stages change which program computes a value column.
     for tiles in variants:
-        assert_as_exact(jax.jit(functools.partial(dew, tiles=tiles)), reference,
-                        functools.partial(draw, dtype, **geometry(case)),
-                        f'the mosaic forward on an unseen GPU at {tiles}, in {jnp.dtype(dtype).name}',
+        label = f'the mosaic forward on an unseen GPU at {tiles}, in {jnp.dtype(dtype).name}'
+        if dtype != jnp.float32:
+            the_template_is_as_exact_as_fla(functools.partial(dew, tiles=tiles), recorded_site(case, dtype),
+                                            ('out', 'final'), label)
+            continue
+        assert_as_exact(jax.jit(functools.partial(dew, tiles=tiles)), truth,
+                        functools.partial(draw, dtype, **geometry(case)), label,
                         seeds=SEEDS, truth_fn=truth)
 
 

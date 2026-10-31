@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""The fixture tests hold the recurrence template's gated delta rule to: fla-core's own `chunk_gated_delta_rule`
-and `chunk_kda` (its Triton kernels) on a CUDA GPU, forward and every gradient, at each site
-tests/fla_sites.py names, over the tests' own seeded draws.
+"""The fixture tests hold the recurrence template's gated delta rule to: fla-core's own
+`chunk_gated_delta_rule` and `chunk_kda` (its Triton kernels) on a CUDA GPU, forward and every gradient, at
+each site tests/fla_sites.py names, over the tests' own seeded draws.
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> [site prefix]
 
@@ -18,6 +18,7 @@ unless a document starts it. The oracle is fla's own reference, `naive_recurrent
 which widens their fp32 casts), held at every seed to Dew's float64 token recurrence.
 """
 
+import itertools
 import os
 import sys
 from pathlib import Path
@@ -36,8 +37,8 @@ def sequences(arrays) -> list[tuple[int, int, int, bool]]:
     starts = arrays.get("starts", np.zeros((rows, length), bool))
     found = []
     for row in range(rows):
-        cuts = sorted({0, *np.flatnonzero(starts[row]).tolist()}) + [length]
-        for start, end in zip(cuts, cuts[1:], strict=False):
+        cuts = [*sorted({0, *np.flatnonzero(starts[row]).tolist()}), length]
+        for start, end in itertools.pairwise(cuts):
             found.append((row, start, end, start == 0 and not starts[row, 0]))
     return found
 
@@ -89,7 +90,8 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
     grads = torch.autograd.grad((out, final), tuple(inputs[name] for name in GRADIENTS),
                                 (tensors["dy"].to(out.dtype), tensors["dfinal"].to(final.dtype)),
                                 allow_unused=True)
-    found = dict(zip(("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0"), (out, final, *grads), strict=True))
+    found = dict(zip(("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0"), (out, final, *grads),
+                     strict=True))
     return {name: (np.zeros(arrays[name[1:]].shape) if value is None else
                    value.detach().to(torch.float64).cpu().numpy())
             for name, value in found.items()}
@@ -118,7 +120,8 @@ def serve() -> None:
             arrays = dict(stored)
         rule = chunk_kda if kda else chunk_gated_delta_rule
         np.savez(f"{path}.reference.npz", **run(arrays, kda=kda, scale=float(scale), rule=rule,
-                                                dtype=getattr(torch, dtype), device="cuda", per_sequence=False))
+                                                dtype=getattr(torch, dtype), device="cuda",
+                                                per_sequence=False))
         with float64():
             naive = naive_recurrent_kda if kda else naive_recurrent_gated_delta_rule
             np.savez(f"{path}.truth.npz", **run(arrays, kda=kda, scale=float(scale), rule=naive,
@@ -176,8 +179,10 @@ def write_seeded(worker, prefix: str = "") -> None:
     stored["provenance"] = provenance(
         f"fla-core {version}", f"fla-core {version}", device.strip(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python>",
-        truth="fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch float64",
-        cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced chain_roundings")
+        truth="fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch "
+              "float64",
+        cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
+                    "chain_roundings")
     written = save(FIXTURE, stored, reference=f"fla-core {version}", license="MIT")
     print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
 
