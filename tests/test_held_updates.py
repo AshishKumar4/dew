@@ -117,6 +117,22 @@ def test_a_run_resumed_inside_a_held_window_lands_where_the_whole_run_does(tmp_p
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
+@pytest.mark.parametrize("split", [1, 2])
+def test_a_held_optimizers_inputs_each_draw_once_however_the_trainer_reads_them(split):
+    """Under an optimizer that holds updates back, each input it takes (a window of the trainer's own
+    accumulation, read in one or two parts) draws once, its slots and parts alike, and the next input
+    draws afresh."""
+    tracker = RecordingTracker()
+    # Batches of two rows a device, which two parts each read one of.
+    wide = 2 * jax.device_count()
+    make_trainer(objective=Drawing(), optimizer=held_optimizer("multi_steps"), tracker=tracker,
+                 accumulation=2, split=split).fit(dataset(lambda: Counting(wide), batch=wide), steps=8,
+                                                  log_every=1)
+    draws = [scalars["train/draw"] for _, scalars in tracker.scalars if "train/draw" in scalars]
+    assert len(draws) == 8 and all(draws[index] == draws[index + 1] for index in range(0, 8, 2))
+    assert len(set(draws)) == 4
+
+
 def test_an_input_the_optimizer_skips_trains_nothing_and_commits_no_tokens():
     """`optax.MultiSteps` with a skip predicate discards the inputs it skips: they move no weight, no
     average and no update count, and their tokens wait for no update, as its state says by moving
