@@ -1945,7 +1945,7 @@ class Trainer(Generic[Loss, Effects]):
             suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
             self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
                              dataclasses.replace(cooled, step=step_at), shardings, {},
-                             examples=self._consumed(interval))
+                             examples=self._consumed(interval, counted))
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
         for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
@@ -2122,10 +2122,11 @@ class Trainer(Generic[Loss, Effects]):
             for split, suite in plan.suites.items():
                 admit_split(self.objective, suite.data, self.device_mesh, split)
 
-    def _consumed(self, interval: Interval) -> int | None:
-        """The examples a run on the examples clock had consumed, as its host counted them
-        (`Interval.consumed`), the count its log records; None for a run counted in steps."""
-        return None if self._examples is None else interval.consumed
+    def _consumed(self, *intervals: Interval) -> int | None:
+        """The examples a run on the examples clock had consumed, as its host counted them over `intervals`
+        (`Interval.consumed`: the run's, and a cooldown branch's beyond it), the count its log records;
+        None for a run counted in steps."""
+        return None if self._examples is None else sum(interval.consumed for interval in intervals)
 
     def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                     training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
