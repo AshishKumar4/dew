@@ -28,6 +28,10 @@ from dew.data.storage import (
 )
 
 
+class Unmirrored(ValueError):
+    """An object Dew's mirror has no room to hold beside the files its readers hold open (`mirrored`)."""
+
+
 class Replaced(OSError):
     """An object read where its producer published it, which holds other bytes than it published:
     replaced or removed since, whose records a read would take under the identity of the ones it
@@ -101,7 +105,7 @@ def mirrored(store: Store, size: int | None = None, digest: str | None = None) -
         raise Replaced(f"{store.url} holds other bytes than the {size} its producer declared") from error
     if not isinstance(opened, io.BufferedReader) or not isinstance(opened.name, str):
         opened.close()
-        raise ValueError(f"{store.url} is read from Dew's mirror, which has no room for it beside the files "
+        raise Unmirrored(f"{store.url} is read from Dew's mirror, which has no room for it beside the files "
                          "its readers hold open (as many as Loading's read threads a source)")
     return opened
 
@@ -110,12 +114,19 @@ def checked_open(fs: AbstractFileSystem, path: str, size: int, digest: str) -> B
     """The local or in-memory file at `path`, open, holding the `size` bytes of `digest`, refused
     (`Replaced`) where it holds others: a local file opened first and its open file's metadata matched to
     the metadata its digest was taken (or kept, `content_version`) at, so the bytes checked are the bytes
-    it reads; an in-memory one read whole and checked."""
+    it reads (`_checked_local`); an in-memory one read whole and checked."""
     if not local(fs):
         payload = fs.cat_file(path)
         if hashlib.sha256(payload).hexdigest() != digest:
             raise Replaced(f"{path} holds other bytes than the {size} its producer declared")
         return io.BytesIO(payload)
+    return _checked_local(fs, path, size, digest)[0]
+
+
+def _checked_local(fs: AbstractFileSystem, path: str, size: int,
+                   digest: str) -> tuple[BinaryIO, tuple[int, int]]:
+    """The local file at `path`, open and checked as `checked_open` checks it, and the size and modification
+    time its open file held as it was checked."""
     opened = fs.open(os.path.realpath(path), "rb")
     try:
         held = os.fstat(opened.fileno())
@@ -128,7 +139,7 @@ def checked_open(fs: AbstractFileSystem, path: str, size: int, digest: str) -> B
     except BaseException:
         opened.close()
         raise
-    return opened
+    return opened, (held.st_size, held.st_mtime_ns)
 
 
 class Declared:
@@ -234,12 +245,14 @@ class Held:
 
     def __init__(self, declared: Declared):
         self.declared = declared
-        fs, _ = declared.store.resolve()
-        self.file = None if declared.stored is not None or declared.pinned else declared.open()
-        self.checked = None
-        if self.file is not None and local(fs):
-            held = os.fstat(self.file.fileno())
-            self.checked = held.st_size, held.st_mtime_ns
+        fs, path = declared.store.resolve()
+        self.file, self.checked = None, None
+        if declared.stored is not None or declared.pinned:
+            return
+        if local(fs) and declared.digest is not None:
+            self.file, self.checked = _checked_local(fs, path, declared.size, declared.digest)
+        else:
+            self.file = declared.open()
 
     def __getitem__(self, span: slice) -> bytes:
         start, end = int(span.start), int(span.stop)
@@ -251,12 +264,21 @@ class Held:
             return readable.fs.cat_file(readable.path, start=start, end=end)
         if isinstance(self.file, io.BytesIO):
             return bytes(self.file.getbuffer()[start:end])
-        if self.checked is not None:
-            held = os.fstat(self.file.fileno())
-            if (held.st_size, held.st_mtime_ns) != self.checked:
-                raise Replaced(f"{declared.store.url} was rewritten since it was checked against the "
-                               f"{declared.size} bytes its producer declared")
-        return os.pread(self.file.fileno(), end - start, start)
+        self._unchanged()
+        payload = os.pread(self.file.fileno(), end - start, start)
+        # Rewritten in place during the read, the bytes it read are not the ones checked.
+        self._unchanged()
+        return payload
+
+    def _unchanged(self) -> None:
+        """Refuse (`Replaced`) a local file held rewritten in place since it was checked: its open file's
+        size or modification time no longer the ones it held as it was checked."""
+        if self.checked is None or self.file is None:
+            return
+        held = os.fstat(self.file.fileno())
+        if (held.st_size, held.st_mtime_ns) != self.checked:
+            raise Replaced(f"{self.declared.store.url} was rewritten since it was checked against the "
+                           f"{self.declared.size} bytes its producer declared")
 
     def close(self) -> None:
         if self.file is not None:

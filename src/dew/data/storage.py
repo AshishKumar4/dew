@@ -771,7 +771,6 @@ class Store:
         return outcome.oid
 
 
-@functools.cache
 def _hub_commit(fs: HfFileSystem, path: str) -> tuple[str, str]:
     """The commit the revision of `path`, a Hub repository's file, names now, and the file's path at it."""
     resolved = fs.resolve_path(path)
@@ -786,6 +785,7 @@ def _hub_commit(fs: HfFileSystem, path: str) -> tuple[str, str]:
     return version, f"{resolved.repo_type}s/{resolved.repo_id}@{version}/{resolved.path_in_repo}"
 
 
+@functools.cache
 def _registered() -> None:
     """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else storage.toml in Dew's
     configuration directory, `dew.cache.dew_config_dir`) with fsspec, once, as the first store

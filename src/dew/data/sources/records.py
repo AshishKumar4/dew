@@ -15,7 +15,7 @@ import grain.python as grain
 
 from dew.batch import Batch
 from dew.data.dataset import Loading, Ranges
-from dew.data.declared import Declared, mirrored
+from dew.data.declared import Declared, Unmirrored, mirrored
 from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode
@@ -96,7 +96,7 @@ class ShardReaders[K, P, V]:
                     idle = next(held for held, opened in self._opened.items() if not opened.reads)
                     self._opened.pop(idle).reader.close()
                     ShardReaders._idled(-1)
-                self._opened[key] = _OpenedShard(self.open(key))
+                self._opened[key] = _OpenedShard(self._admitted(key))
             self._opened.move_to_end(key)
             opened_shard = self._opened[key]
             if not opening and not opened_shard.reads:
@@ -119,6 +119,18 @@ class ShardReaders[K, P, V]:
                     self._lock.notify_all()
             if over:
                 ShardReaders._trim()
+
+    def _admitted(self, key: K) -> ShardReader[P, V]:
+        """Shard `key`'s reader, opened under the lock: where Dew's mirror has no room for the copy it
+        reads (`Unmirrored`), this source's idle readers let go of theirs and it opens again; its busy
+        readers keep theirs, and a mirror without room beside them refuses."""
+        try:
+            return self.open(key)
+        except Unmirrored:
+            for idle in [held for held, opened in self._opened.items() if not opened.reads]:
+                self._opened.pop(idle).reader.close()
+                ShardReaders._idled(-1)
+            return self.open(key)
 
     @classmethod
     def _trim(cls) -> None:

@@ -1040,11 +1040,13 @@ class _ArrowFragment:
                 fragment, source = self.source.fragments[self.index], self.source
                 held = (source._arrow_files[2][fragment.path],) if source._versioned else ()
                 with source._versions_held(held):
-                    self.__dict__["_table"] = fragment.to_table(
+                    table = fragment.to_table(
                         schema=self.source.arrow.schema,
                         columns=list(self.source.columns) if self.source.columns is not None else None,
                         filter=self.source.where,
                     )
+                # Kept once its file is found at its version after the read too.
+                self.__dict__["_table"] = table
             return self.__dict__["_table"]
 
     def __len__(self) -> int:
