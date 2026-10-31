@@ -155,7 +155,8 @@ class Evaluation:
     @property
     def scalars(self) -> dict[str, float]:
         """Return the metric values, plus the split's counts if a batch was scored
-        (`evaluation/<split>/records`, each split's its own at a step that scores several), and on the
+        (`evaluation/counts/<split>/records`, each split's its own at a step that scores several, apart
+        from every summary's, `Summary.SPLIT`), and on the
         examples clock the examples the run had consumed (`EXAMPLES_SCALAR`), a cooldown branch's under its
         own name (`COOLDOWN_EXAMPLES`)."""
         named = COOLDOWN_EXAMPLES if self.cooldown else EXAMPLES_SCALAR
@@ -163,8 +164,8 @@ class Evaluation:
         if not self.coordinated_batches:
             return {**self.scores, **clocked}
         return {**self.scores,
-                f"evaluation/{self.split}/coordinated_batches": float(self.coordinated_batches),
-                f"evaluation/{self.split}/records": float(self.records), **clocked}
+                f"evaluation/counts/{self.split}/coordinated_batches": float(self.coordinated_batches),
+                f"evaluation/counts/{self.split}/records": float(self.records), **clocked}
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,
