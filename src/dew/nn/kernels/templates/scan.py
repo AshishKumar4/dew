@@ -39,25 +39,67 @@ def scratch() -> plgpu.SMEM:
 
 
 def linear_scan(decays: jax.Array, writes: jax.Array, carried: jax.Array, exchanged, *,
-                reverse: bool = False, interpret: bool = False) -> tuple[jax.Array, jax.Array]:
+                reverse: bool = False, exclusive: bool = False,
+                interpret: bool = False) -> tuple[jax.Array, jax.Array]:
     """`(states, last)`: each position's state of the recurrence `h_t = a_t h_{t-1} + b_t` over `decays`
     `a` and `writes` `b`, fp32 `[T]` in `blocked(T)`'s layout, from `carried`, the state before the first
     position, fp32 `[T]` each element the same; `last`, the state past the block, in `carried`'s form.
-    `reverse` runs from the last position, `h_t = a_t h_{t+1} + b_t`. `exchanged` is `scratch()`'s, which
-    the warpgroup's threads meet on (a barrier) before and after they read it."""
+    `reverse` runs from the last position, `h_t = a_t h_{t+1} + b_t`; `exclusive` gives each position the
+    state before it in the scan's order (`h_{t-1}`, or `h_{t+1}` reversed) rather than its own. `exchanged`
+    is `scratch()`'s, which the warpgroup's threads meet on (a barrier) before and after they read it."""
     if interpret:
-        return _interpreted(decays, writes, carried, reverse)
+        return _interpreted(decays, writes, carried, reverse, exclusive)
     positions = decays.shape[0]
     layout, splat = blocked(positions), plgpu.Layout.WG_SPLAT((positions,))
     scanned: Callable[..., tuple[jax.Array, jax.Array]] = plgpu.inline_mgpu(
         arg_types=(layout, layout, splat, plgpu.RefType()),
         return_type=(plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32), layout=layout),
                      plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32), layout=splat)),
-    )(lambda ctx, a, b, h, ref: _scanned(a, b, h, ref, reverse))
+    )(lambda ctx, a, b, h, ref: _scanned(a, b, h, ref, reverse, exclusive))
     return scanned(decays, writes, carried, exchanged)
 
 
-def _interpreted(decays, writes, carried, reverse: bool):
+def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Array:
+    """The sum of `values`, fp32 `[T]` in `blocked(T)`'s layout, as `[T]` each element the same: a thread's
+    positions in its registers, its warp's by shuffles, the four warps' through `exchanged`
+    (`scratch()`'s)."""
+    positions = values.shape[0]
+    if interpret:
+        return jnp.full_like(values, values.sum())
+    splat = plgpu.Layout.WG_SPLAT((positions,))
+    total: Callable[..., jax.Array] = plgpu.inline_mgpu(
+        arg_types=(blocked(positions), plgpu.RefType()),
+        return_type=plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32), layout=splat),
+    )(lambda ctx, x, ref: _summed(x, ref))
+    return total(values, exchanged)
+
+
+def _summed(x: fa.FragmentedArray, exchanged):
+    """`summed` in Mosaic GPU's terms."""
+    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+    [vec] = x.registers.flat
+    count = ir.VectorType(vec.type).shape[0]
+    total = vector.extract(vec, [], [0])
+    for i in range(1, count):
+        total = arith.addf(total, vector.extract(vec, [], [i]))
+    for distance in (16, 8, 4, 2, 1):
+        total = arith.addf(total, utils.shfl_bfly(total, distance))
+    thread = arith.remui(utils.thread_idx(), arith.constant(i32, THREADS))
+    warp = arith.index_cast(index, arith.divui(thread, arith.constant(i32, WARP)))
+    utils.warpgroup_barrier()
+    with utils.when(arith.cmpi(arith.CmpIPredicate.eq, arith.remui(thread, arith.constant(i32, WARP)),
+                               arith.constant(i32, 0))):
+        memref.store(total, exchanged, [arith.constant(index, 0), warp])
+    utils.warpgroup_barrier()
+    total = memref.load(exchanged, [arith.constant(index, 0), arith.constant(index, 0)])
+    for w in range(1, THREADS // WARP):
+        column = [arith.constant(index, 0), arith.constant(index, w)]
+        total = arith.addf(total, memref.load(exchanged, column))
+    utils.warpgroup_barrier()
+    return fa.FragmentedArray.splat(total, x.shape, fa.WGSplatFragLayout(x.shape))
+
+
+def _interpreted(decays, writes, carried, reverse: bool, exclusive: bool):
     """`linear_scan`'s states by XLA's associative scan."""
     def combined(first, then):
         return first[0] * then[0], then[0] * first[1] + then[1]
@@ -65,6 +107,10 @@ def _interpreted(decays, writes, carried, reverse: bool):
     a, b = lax.associative_scan(combined, (decays, writes), reverse=reverse)
     states = a * carried + b
     last = jnp.full_like(carried, states[0] if reverse else states[-1])
+    if exclusive:
+        # Each position's state the one before it in the scan's order, the carried state's at its first.
+        states = (jnp.concatenate([states[1:], carried[:1]]) if reverse
+                  else jnp.concatenate([carried[:1], states[:-1]]))
     return states, last
 
 
@@ -84,7 +130,7 @@ def _shuffled(pair, distance: int, reverse: bool):
 
 
 def _scanned(a: fa.FragmentedArray, b: fa.FragmentedArray, carried: fa.FragmentedArray, exchanged,
-             reverse: bool):
+             reverse: bool, exclusive: bool):
     """`linear_scan` in Mosaic GPU's terms: a thread's positions in its registers, its warp's by shuffles,
     the warpgroup's warps through `exchanged`."""
     f32, i32, index = ir.F32Type.get(), ir.IntegerType.get_signless(32), ir.IndexType.get()
@@ -97,11 +143,12 @@ def _scanned(a: fa.FragmentedArray, b: fa.FragmentedArray, carried: fa.Fragmente
     def element(vec, i):
         return vector.extract(vec, [], [i])
 
-    # The thread's own positions, each pair the scan of the thread's so far.
+    # The thread's own positions, each pair the scan of the thread's so far, through it or before it.
     running, pairs = (one, zero), {}
     for i in order:
-        running = _pair(running, (element(a_vector, i), element(b_vector, i)))
-        pairs[i] = running
+        through = _pair(running, (element(a_vector, i), element(b_vector, i)))
+        pairs[i] = running if exclusive else through
+        running = through
     # The warp's threads before this one: an inclusive scan of the threads' aggregates by shuffles.
     thread = arith.remui(utils.thread_idx(), arith.constant(i32, THREADS))
     lane = arith.remui(thread, arith.constant(i32, WARP))
