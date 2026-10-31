@@ -554,6 +554,26 @@ def _read_router(view: PartView, *, normalized: bool | None) -> Mapping[str, obj
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': norm}}
 
 
+def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
+    """HY-3's router: sigmoid scores in float32, chosen by score plus the block's correction bias,
+    weighted by score renormalized over the chosen and times `router_scaling_factor` (DeepSeek V3's)."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
+                     'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
+
+
+def _read_shared_moe(view: PartView) -> Mapping[str, object]:
+    """HY-3's MoE: the routed experts beside always-on shared ones (`shared_experts`, an MLP read as
+    `shared`), summed; its float32 sum of two values of the compute dtype rounds as their sum there does
+    (`enable_moe_fp32_combine`), so it reads no field."""
+    return {}
+
+
+def _read_shared_mlp(view: PartView) -> Mapping[str, object]:
+    """A routed block's shared experts: Llama's MLP, its width the block's (`Mixture.shared_features`)."""
+    width = int(view.gate_proj.out_features)
+    return {'mlp': gated_activation(view.act_fn), _LAYER: {'shared_features': width}}
+
+
 def _read_experts(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), _LAYER: {'expert_features': int(view.intermediate_dim)}}
 
@@ -609,6 +629,10 @@ class KnownPart:
     """Whether every method of the known class is compared, its constructor's included: a part whose
     buffers its constructor computes (a rotary's frequencies), which the forward reads and the reader
     takes from the config."""
+    state: Mapping[str, str] = field(default_factory=dict)
+    """The state a checkpoint stores beside its parameters (a router's correction bias, a buffer), by the
+    known class's names, onto its canonical name under the part (HY-3's MoE holds the bias its router
+    reads, which Dew keeps in the router, `gate.e_score_correction_bias`)."""
 
     def known(self) -> type:
         module, _, qualname = self.location.partition(':')
@@ -625,6 +649,7 @@ _QWEN2 = 'transformers.models.qwen2.modeling_qwen2'
 _GRANITE = 'transformers.models.granite.modeling_granite'
 _SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
 _OLMO2 = 'transformers.models.olmo2.modeling_olmo2'
+_HY_V3 = 'transformers.models.hy_v3.modeling_hy_v3'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -639,6 +664,9 @@ KNOWN: tuple[KnownPart, ...] = (
          _read_causal_lm),
     KnownPart('causal_lm', f'{_GRANITE}:GraniteForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
               _read_scaled_causal_lm),
+    KnownPart('causal_lm', f'{_HY_V3}:HYV3ForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_causal_lm),
+    KnownPart('model', f'{_HY_V3}:HYV3Model', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_LLAMA}:LlamaModel', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_GRANITE}:GraniteModel', _MODEL_CHILDREN, _read_scaled_model),
     KnownPart('model', f'{_MIXTRAL}:MixtralModel', _MODEL_CHILDREN, _read_windowed_model),
@@ -655,6 +683,8 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_SMOLLM3}:SmolLM3Attention', _ATTENTION_CHILDREN, _read_nope_attention),
+    KnownPart('attention', f'{_HY_V3}:HYV3Attention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
     KnownPart('attention', f'{_OLMO2}:Olmo2Attention',
               {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)},
               _read_projection_qk_norm_attention),
@@ -666,6 +696,12 @@ KNOWN: tuple[KnownPart, ...] = (
          _read_mixtral_moe),
     KnownPart('moe', f'{_QWEN3_MOE}:Qwen3MoeSparseMoeBlock', {'gate': ('router',), 'experts': ('experts',)},
          _read_nothing),
+    KnownPart('moe', f'{_HY_V3}:HYV3MoE',
+              {'gate': ('router',), 'experts': ('experts',), 'shared_experts': ('shared',)}, _read_shared_moe,
+              state={'e_score_correction_bias': 'gate.e_score_correction_bias'}),
+    KnownPart('shared', f'{_LLAMA}:LlamaMLP',
+              dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)), _read_shared_mlp),
+    KnownPart('router', f'{_HY_V3}:HYV3TopKRouter', {}, _read_sigmoid_router, ('weight',)),
     KnownPart('router', f'{_MIXTRAL}:MixtralTopKRouter', {}, lambda view: _read_router(view, normalized=True),
          ('weight',)),
     KnownPart('router', f'{_QWEN3_MOE}:Qwen3MoeTopKRouter', {},
@@ -802,8 +838,10 @@ class _Assembler:
         expected = {view.name(name): name for name in part.parameters}
         if held - set(expected):
             raise Ambiguous(f"{path} holds parameters {sorted(held - set(expected))} its code does not read")
-        if held:
-            self.names[path] = (canonical, {name: expected[name] for name in held})
+        stored = {view.name(name): known for name, known in part.state.items()
+                  if view.name(name) in dict(module.named_buffers(recurse=False))}
+        if held or stored:
+            self.names[path] = (canonical, {**{name: expected[name] for name in held}, **stored})
         children = dict(module.named_children())
         claimed = set()
         for known, child_roles in part.children.items():
@@ -839,11 +877,15 @@ def assemble(model: PreTrainedModel) -> Assembly:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
         width = _records.integer(mixture['expert_features'], 'expert_features')
+        # A router's scores, scaling and correction bias and a block's shared experts, where its parts
+        # state them (DeepSeek's routing, HY-3's).
+        stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features')
+                  if key in mixture}
         fields['mixture'] = native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
             top_k=_records.integer(mixture['top_k'], 'top_k'),
             norm_topk_prob=bool(mixture['norm_topk_prob']), expert_features=width,
-            layers=None if len(routed) == fields['num_layers'] else tuple(routed))
+            layers=None if len(routed) == fields['num_layers'] else tuple(routed), **stated)
         fields.setdefault('mlp_features', width)
     for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps',
                      'rope_theta'):
