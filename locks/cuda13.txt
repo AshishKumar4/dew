@@ -1148,6 +1148,7 @@ proto-plus==1.29.0
     #   google-cloud-storage-control
 protobuf==6.33.6
     # via
+    #   dewml (pyproject.toml)
     #   databricks-sdk
     #   google-api-core
     #   google-cloud-storage-control
