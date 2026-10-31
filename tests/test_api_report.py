@@ -77,3 +77,39 @@ def test_a_commands_arguments_are_as_it_declares_them():
     assert load("api_report").arguments(Command) == [
         "  run: str  [Positional]", "  count: int | None = None  [aliases=('-n',)]  [metavar='N']",
         "  set: tuple[str, ...] = ()  [UseAppendAction]"]
+
+
+def test_a_signature_is_written_alike_on_every_python():
+    """A union, `Optional` or `|`, and a generic over one print alike on 3.12 and 3.14 (`annotation`), in a
+    signature as in a field: the report is one file every declared Python reads the same."""
+    import typing
+
+    optional = typing.Optional  # the spelling 3.12 prints a union with None in
+
+    def old(first, second=None):
+        return None
+
+    old.__annotations__ = {"first": optional[int], "second": optional[dict[str, optional[float]]],
+                           "return": optional[list[int]]}
+
+    def new(first: int | None, second: dict[str, float | None] | None = None) -> list[int] | None:
+        return None
+
+    report = load("api_report")
+    assert report.signature(old) == report.signature(new) == (
+        "(first: int | None, second: dict[str, float | None] | None = None) -> list[int] | None")
+
+
+def test_a_lambda_default_factory_is_shown_by_its_source_and_never_run():
+    """A field whose default a lambda builds shows that lambda's source, which says what it builds, where a
+    name would hide it; the lambda is not run (one may read the checkout)."""
+    import dataclasses
+
+    ran = []
+
+    @dataclasses.dataclass
+    class Built:
+        sizes: list = dataclasses.field(default_factory=lambda: ran.append(1) or [2, 3])
+
+    assert load("api_report").fields(Built) == ["sizes: list = (lambda: ran.append(1) or [2, 3])()"]
+    assert not ran

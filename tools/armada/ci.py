@@ -153,8 +153,9 @@ NEWEST_FILES = (
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
     "tests/test_records.py", "tests/test_record_keys.py", "tests/test_linen_records.py",
     "tests/test_run_records.py",
-    # The command line, through tyro's reading of those annotations.
-    "tests/test_config_cli.py", "tests/test_tpu_cli.py",
+    # The command line, through tyro's reading of those annotations, and the API report's reading of every
+    # public signature (3082: a union printed `Optional[X]` on 3.12 and `X | None` on 3.14).
+    "tests/test_config_cli.py", "tests/test_tpu_cli.py", "tests/test_api_report.py",
     # Serialization.
     "tests/test_pickle_sources.py",
     # Data loading: providers without TensorFlow (5cec9cc9d, ee7fa9ee0, 20294b686) and a

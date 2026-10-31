@@ -20,6 +20,7 @@ seams (.thresh/thresh.cue) both see.
     python tools/api_report.py --write   # write it to docs/api/report.txtar
 """
 import argparse
+import ast
 import dataclasses
 import functools
 import importlib
@@ -59,27 +60,52 @@ def metadata(item) -> str:
 
 
 def annotation(value) -> str:
-    """A type annotation as written: a string annotation as is, a union as `A | B`, an `Annotated` type with
-    its metadata by their types (a parser's spec holds callables, whose names are no contract), else its
-    formatted form."""
+    """A type annotation as written: a string annotation as is; a union as `A | B` and a generic by its
+    origin and its arguments, each written so, on every Python (3.12 prints `Optional[X]` where 3.14 prints
+    `X | None`); an `Annotated` type with its metadata by their markers or types (a parser's spec holds
+    callables, whose names are no contract); else its formatted form."""
     if isinstance(value, str):
         return value
-    if value is type(None):
+    if value is None or value is type(None):
         return "None"
-    origin = typing.get_origin(value)
+    if value is Ellipsis:
+        return "..."
+    if isinstance(value, (list, tuple)):
+        return f"[{', '.join(map(annotation, value))}]"
+    origin, arguments = typing.get_origin(value), typing.get_args(value)
     if origin is typing.Annotated:
         return f"Annotated[{annotation(value.__origin__)}, {', '.join(map(metadata, value.__metadata__))}]"
     if origin in (typing.Union, types.UnionType):
-        return " | ".join(annotation(member) for member in typing.get_args(value))
+        return " | ".join(map(annotation, arguments))
+    if origin is typing.Literal:
+        return f"Literal[{', '.join(map(repr, arguments))}]"
+    if origin is not None and arguments:
+        return f"{ADDRESS.sub('', inspect.formatannotation(origin))}[{', '.join(map(annotation, arguments))}]"
     return ADDRESS.sub("", inspect.formatannotation(value))
 
 
+class Written(str):
+    """An annotation as `annotation` writes it, which a signature prints as it is."""
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
 def signature(obj) -> str:
-    """`obj`'s signature, defaults without addresses; "(...)" where it has none to read."""
+    """`obj`'s signature, each annotation as `annotation` writes it and defaults without addresses; "(...)"
+    where it has none to read."""
     try:
-        return ADDRESS.sub("", str(inspect.signature(obj)))
+        read = inspect.signature(obj)
     except (TypeError, ValueError):
         return "(...)"
+    empty = inspect.Parameter.empty
+    parameters = [parameter if parameter.annotation is empty
+                  else parameter.replace(annotation=Written(annotation(parameter.annotation)))
+                  for parameter in read.parameters.values()]
+    returned = read.return_annotation
+    read = read.replace(parameters=parameters, return_annotation=returned if returned is empty
+                        else Written(annotation(returned)))
+    return ADDRESS.sub("", str(read))
 
 
 def default(field) -> str:
@@ -88,8 +114,28 @@ def default(field) -> str:
     if field.default is not dataclasses.MISSING:
         return f" = {shown(field.default)}"
     if field.default_factory is not dataclasses.MISSING:
-        return f" = {shown(field.default_factory)}()"
+        return f" = {factory(field.default_factory)}()"
     return ""
+
+
+def factory(made) -> str:
+    """A default factory as a report shows it: a lambda by its source, which says what it builds without
+    running it, where its defining line holds that one lambda; anything else by its qualified name."""
+    code = getattr(made, "__code__", None)
+    if code is None or code.co_name != "<lambda>":
+        return shown(made)
+    try:
+        tree = parsed(inspect.getsourcefile(made))
+    except (OSError, TypeError, SyntaxError):
+        return shown(made)
+    found = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Lambda) and node.lineno == code.co_firstlineno]
+    return f"({ast.unparse(found[0])})" if len(found) == 1 else shown(made)
+
+
+@functools.cache
+def parsed(path: str) -> ast.Module:
+    return ast.parse(Path(path).read_text())
 
 
 def fields(cls) -> list[str]:
