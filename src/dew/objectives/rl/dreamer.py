@@ -702,8 +702,9 @@ class DreamerRollout:
         if self.prefill < self.length:
             raise ValueError("the prefill must hold at least one window")
         self._driven = DrivenSimulator(self.env) if isinstance(self.env, Simulator) else Driven(self.env)
-        self._acted = jax.jit(self._steps, static_argnames=("steps", "random"))
-        self._recorded = jax.jit(self._kept)
+        # The replay is written in place, its buffer donated to the step that writes it.
+        self._acted = jax.jit(self._steps, static_argnames=("steps", "random"), donate_argnames=("replay",))
+        self._recorded = jax.jit(self._kept, donate_argnames=("replay",))
         self._sample = jax.jit(lambda replay, key: replay.sample(key, self.batch, self.length))
 
     @property
