@@ -534,6 +534,15 @@ class Tgmm(_Triton):
                                exact_sums=exact_sums), None
 
 
+KERNEL_GRADIENT_SCALARS = 40
+"""The registers a kernel gradient's consumer thread holds beside its prologue's rewrite of its rows' stage,
+pending their census (row 3117, which derives them from the launch's liveness and deletes this):
+`mosaic.Family.held_registers`' 40, wgmma's count before base/kernels f6498da7d0 lowered it to 4 from a census
+of the plain and hooked forwards alone (HELD-CENSUS3); priced at 4, the exact normed kernel gradient at
+256 x 64 x 64, three stages, two warpgroups, derived and spilled 32 bytes (base/kernels c4db4e10a,
+test_kernel_configs' sm90 compile gate)."""
+
+
 class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`) on their instruction family's bundle
     (Hopper's warpgroup MMA, Ampere's mma.sync), one 16-bit dtype, their one tile generated from the
@@ -591,7 +600,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             words = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
                       // 4 // resources.THREADS)
             staged = max(0, words - family.held_registers)
-        phases = [staged, self._prologue_registers(ba, config), self._epilogue_registers(ba, config, stored)]
+        # A prologue's rewrite holds a kernel gradient's scalars where they pass its family's held count,
+        # pending their census (`KERNEL_GRADIENT_SCALARS`).
+        prologue = self._prologue_registers(ba, config)
+        if prologue and self.STAGED_ROWS:
+            prologue += max(0, KERNEL_GRADIENT_SCALARS - family.held_registers)
+        phases = [staged, prologue, self._epilogue_registers(ba, config, stored)]
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`).
         plain += accumulator if ba.arguments.get('paired') is not None else 0
         if ba.arguments.get('exact_sums'):

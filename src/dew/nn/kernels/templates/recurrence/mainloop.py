@@ -1083,7 +1083,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
                    held=_intra_held(call, keys), staging=staging, landing=landing, persistent=True,
                    # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
-                   swizzles={name: min(keys * jnp.dtype(dtype).itemsize, mosaic.SWIZZLE_BYTES)
+                   swizzles={name: mosaic.widest_swizzle(dtype, keys)
                              for name, (_, dtype) in blocks.items()})(
         q, k, hi, lo, beta, taken)
 
@@ -1217,8 +1217,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                             **({"keyed": held.landing(CHUNK, keyed)} if call.per_key else {})},
                    persistent=True,
                    # A key block's streams staged at its row: a tile slices only whole swizzle rows.
-                   swizzles={f"{name}{p}": min(keyed * jnp.dtype(operand.stored).itemsize,
-                                                mosaic.SWIZZLE_BYTES)
+                   swizzles={f"{name}{p}": mosaic.widest_swizzle(operand.stored, keyed)
                              for name, (_, operand) in given.items() if name in ("keys", "gates", "lows")
                              for p in range(operand.parts)})(
         k, v, k if a is None else a, hi, lo, beta, taken)
@@ -1706,11 +1705,15 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
         *(() if skip is None else (skip.astype(jnp.float32),)))
 
 
+@jax.jit
 def prefix(g):
     """The decay's prefix within each chunk, compensated, in base 2: `g` `[..., C, H]` (natural log) to `(hi,
     lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,
     `precision.two_product`, plus its product with the rounding's remainder) summed compensated
-    (`precision.compensated_add`), so a difference of two positions is as precise as its own range."""
+    (`precision.compensated_add`), so a difference of two positions is as precise as its own range. One
+    program JAX traces once for `g`'s type: its exact sums traced afresh, each layer's forward, its kept
+    forward in the backward and its gradient's preparation each paid them, 226 s of Qwen3.5-4B's 1208 s
+    ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
     scale = np.float32(LOG2_E)
     scaled, error = precision.two_product(g, jnp.full_like(g, scale), bit_split=True)
     error = error + g * float(np.float32(LOG2_E - float(scale)))
