@@ -384,6 +384,18 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     return step, vectors
 
 
+def _hook_slopes(block_q: int, block_k: int, params: tuple, *, hooked: bool) -> list:
+    """The tiles a backward step's score hook's pullback forms beside its output cotangents' product
+    (`algebra.scored`, before `pulled` takes them into its cotangents): the hook's output and its slope along
+    each input it differentiates, the logits and each floating parameter, fp32 `[bq, bk]` each; none without
+    a hook (`hooked`). dQ under a temperature at 128 x 64, width 64, spilled 4316 bytes, its SASS's spills
+    their float chains (FMUL, FADD, FSEL), the products' and dQ's accumulators live beside them."""
+    if not hooked:
+        return []
+    floating = sum(jnp.issubdtype(dtype, jnp.floating) for _, dtype in params)
+    return [(block_q, block_k, jnp.float32)] * (2 + floating)
+
+
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = ()) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
@@ -509,7 +521,8 @@ first (`_backward_registers`)."""
 
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
-                        accurate: bool, dq: bool, split: bool = False, params: tuple = ()) -> int:
+                        accurate: bool, dq: bool, split: bool = False, params: tuple = (),
+                        hooked: bool = False) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
     consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums) and its per-query rows,
     beside a step's logits and output cotangents' products fp32, then its score cotangents fp32 and one part
@@ -523,10 +536,13 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     int tiles, `_coords`, a byte an entry), from its logits' mask to its cotangents' (ptxas: the fused
     launch at 128 x 64 and width 64 spills 60 bytes, its model 252 without them; 64 x 64 at width 128 holds
     255 unspilled, 242); a keys-first step's places are vectors broadcast at each use. A score hook's
-    parameters and their gradients the launch forms are live beside its products (`_hook_live`)."""
+    parameters and their gradients the launch forms are live beside its products (`_hook_live`), and its
+    pullback's output and slopes beside its output cotangents' product once the logits' is spent
+    (`_hook_slopes`, a hook's step's own phase)."""
     block_q, block_k = config.block_q, config.block_k
-    hooked, vectors = _hook_live(family, block_q, block_k, params, grads="queries" if dq else "keys")
-    products = [(block_q, block_k, jnp.float32)] * 2 + [(block_q, block_k, jnp.int8)] + hooked
+    held, vectors = _hook_live(family, block_q, block_k, params, grads="queries" if dq else "keys")
+    products = [(block_q, block_k, jnp.float32)] * 2 + [(block_q, block_k, jnp.int8)] + held
+    pullback = products[1:] + _hook_slopes(block_q, block_k, params, hooked=hooked)
     if dq:
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
@@ -534,7 +550,7 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
         # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
-        return resources.live_registers(family, carried, products, cotangents) + rows + vectors
+        return resources.live_registers(family, carried, products, pullback, cotangents) + rows + vectors
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
         # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
@@ -554,13 +570,14 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         dq_tile = [(block_q, width, jnp.float32)]
         return resources.live_registers(family, carried, products, dq_tile) + statistics
     queries = block_q // config.consumers if split else block_q
-    hooked, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
-    step = [(queries, block_k, jnp.float32)] * 2 + hooked
+    held, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
+    step = [(queries, block_k, jnp.float32)] * 2 + held
+    pullback = step[1:] + _hook_slopes(queries, block_k, params, hooked=hooked)
     # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`); a fused
     # launch's dQ tile of its share `[queries, D]` fp32 beside its score cotangents.
     statistics = DKV_STATISTICS * family.column_registers(queries, jnp.float32)
     added = [[step[0], (queries, width, jnp.float32)]] if config.fused else []
-    return resources.live_registers(family, carried, step, *added) + statistics + vectors
+    return resources.live_registers(family, carried, step, pullback, *added) + statistics + vectors
 
 
 @dataclasses.dataclass(frozen=True)
@@ -759,7 +776,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             params = tuple(zip(self.score_kinds, (param.dtype for param in ba.arguments["score_params"]),
                                strict=True))
             counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
-                                              accurate=self.accurate, dq=dq, split=split, params=params))
+                                              accurate=self.accurate, dq=dq, split=split, params=params,
+                                              hooked=self.score_mod is not None))
         return counts[0], counts[1]
 
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
