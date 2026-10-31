@@ -1662,13 +1662,16 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
     complete (its whole row, or every group of its cut) takes the times they observed where its record is
     stale (`stale`); a file with a red or missing row keeps its entries, as does a file the verdict did not
-    run, and a file the checkout no longer has loses them. A reused row (the test cache) carries the times
-    of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else writes the
-    record."""
+    run, and one the checkout has changed since the verdict's commit, whose rows observed tests it may no
+    longer hold (2026-10-31: train 370's fold replaced a head's 66 renamed test ids with main's old ones); a
+    file the checkout no longer has loses them. A reused row (the test cache) carries the times of the run
+    that recorded it. Each train folds main's CI so (the land queue), and nothing else writes the record."""
+    changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
+                                 capture_output=True, text=True).stdout.split())
     rows: dict[str, list[dict]] = {}
     for row_ in verdict["rows"]:
         python, name, split_ = parsed_row(row_["name"])
-        if python == PYTHONS[0] and split_ != COLLECT and Path(name).is_file():
+        if python == PYTHONS[0] and split_ != COLLECT and Path(name).is_file() and name not in changed:
             rows.setdefault(name, []).append(row_)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
