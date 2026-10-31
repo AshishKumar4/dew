@@ -450,14 +450,6 @@ class _Carried:
     product: Callable[..., jax.Array] = dataclasses.field(compare=False)
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
-class _Same:
-    """A function compared and hashed by its identity alone, whatever equality it states (dataclass
-    equality off, so `object`'s identity holds)."""
-
-    function: Callable[..., jax.Array]
-
-
 type _Argument = (tuple[_Argument, ...] | bool | int | float | str | enum.Enum | np.dtype | jax.Array
                  | np.ndarray | Callable[..., jax.Array] | None)
 """An argument a product's partial binds: a statement's value (`_STATED_VALUES`), or an array or a
@@ -496,7 +488,9 @@ def _stated(product: Callable[..., jax.Array]) -> Hashable | None:
     named = [(name, value(argument)) for name, argument in sorted(keywords.items())]
     if any(entry is None for entry in held) or any(entry is None for _, entry in named):
         return None
-    return (_Same(function), tuple(held), tuple(named))
+    # The function itself: one its module holds under its name is a function or a jitted one, each equal
+    # to itself alone.
+    return (function, tuple(held), tuple(named))
 
 
 @functools.lru_cache(maxsize=1024)
