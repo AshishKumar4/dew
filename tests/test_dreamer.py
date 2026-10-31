@@ -208,9 +208,8 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     ratio, its actor and critic learning in imagination beside it, predicts the replay's observations
     and rewards better than it did at the start, on the same replayed windows: with the block GRU's
     dynamics or TransDreamer's, over the walk's position, the walks simulated on the host, or its
-    pixels, the pixels' agent predicting the
-    privileged position it never reads better too. Its policy's return is the acceptance run's to judge,
-    on a task at the steps the paper reports."""
+    pixels, the pixels' agent predicting the privileged position it never reads better too. Its policy's
+    return is the acceptance run's to judge, on a task at the steps the paper reports."""
     from dew.data.dataset import Loader
     from dew.objectives.base import Step
     from dew.training import Trainer
@@ -282,6 +281,33 @@ def demonstrations(count: int, length: int, seed: int) -> list[dict]:
             reward = -(x - 1) ** 2
         episodes.append({name: np.asarray(value, np.float32) for name, value in rows.items()})
     return episodes
+
+
+def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
+    """A Dreamer rollout started from a replay of recorded steps takes no random prefill: after 12 updates
+    at a train ratio of 32 over windows of 16 in batches of 8, its environments have taken exactly the
+    steps those updates owe, written after the recorded ones."""
+    from dew.data.dataset import Loader
+    from dew.rl.replay import ReplayBuffer
+    from dew.training import Trainer
+
+    env = Batched(TimeLimit(Target(), episode_length=20), 4)
+    objective = DreamerV3Objective(tiny())
+    def still(params, observed, key, memory):
+        return jnp.zeros((4, 1)), {}, None
+
+    driven = Driven(env)
+    _, recorded = env_rollout(driven, still, None, start(driven, jax.random.key(1)), 40, reset=False)
+    stream = {**recorded.observation, "action": recorded.action}
+    seeded = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), 400).add(stream)
+    rollout = DreamerRollout(objective, env, batch=8, length=16, train_ratio=32.0, prefill=0, replay=seeded)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
+    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
+                  records=8, batch=8)
+    trainer.fit(data, steps=12, log_every=12)
+    owed = -(-12 * 8 * 16 // 32)
+    assert rollout.environment_steps == 4 * -(-owed // 4)
+    assert int(rollout._replay.filled) == 40 + rollout.environment_steps // 4
 
 
 def test_a_demonstration_replay_holds_each_episode_in_the_agents_convention():
