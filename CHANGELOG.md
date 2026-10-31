@@ -10,6 +10,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   conversion reads that configuration's directory: naming none, where a card states several and marks
   no default, is refused, as is naming one it does not state, where every configuration's split of
   that name was read before.
+- MaxText's GPT-3 builds as a decoder: `scale_offset` on a `'layer'` norm stores its weight as its
+  offset from one (`dew.nn.norms.OffsetLayerNorm`), beside learned positions, biased attention and MLP
+  and tied logits; MaxText's Engram layer, from its bucket ids, is the PLE layer a decoder builds with
+  biased projections (`Engram.ple_bias`). Each is held to MaxText 0.2.5's run
+  (`tests/test_maxtext_gpt3.py`, `tests/test_maxtext_engram.py`). MaxText's hashing of tokens to buckets
+  is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
+- A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
+  places a MoVA model's stacked value experts on the expert axis.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
