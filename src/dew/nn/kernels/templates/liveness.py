@@ -263,7 +263,8 @@ def divergent_values(module) -> set:
                                                         inner.operation.operands, strict=True):
                         mark((argument, result), (value, *trip))
         elif name == 'scf.while':
-            _while_divergence(op, *blocks, mark)
+            before, after = blocks
+            _while_divergence(op, before, after, mark)
         elif blocks:
             for block in blocks:
                 mark(block.arguments, op.operands)
