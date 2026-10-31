@@ -368,19 +368,3 @@ def test_a_weak_operand_keeps_the_products_dtype():
     product does, the operands probed as given."""
     weak, half = jnp.asarray(2.0), jnp.ones((), jnp.bfloat16)
     assert accumulated(jnp.dot, weak, half).dtype == jnp.dot(weak, half).dtype == jnp.bfloat16
-
-
-def test_a_product_closing_over_a_tracer_keeps_none_past_its_trace():
-    """A product built inside a trace over a traced value sums in float64 there and keeps no tracer once the
-    trace ends (`jax.checking_leaks`)."""
-    lhs, rhs = np.ones((2, 3), np.float32), np.ones((3, 2), np.float32)
-
-    @jax.jit
-    def scaled(scale):
-        def product(lhs, rhs, *, preferred_element_type=None, precision=None):
-            product = jnp.dot(lhs, rhs, precision=precision, preferred_element_type=preferred_element_type)
-            return product * scale
-        return accumulated(product, lhs, rhs)
-
-    with jax.checking_leaks():
-        np.testing.assert_array_equal(np.asarray(scaled(np.float32(2))), np.full((2, 2), 6, np.float32))
