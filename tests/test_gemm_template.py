@@ -264,8 +264,8 @@ matrix's blocks (the interpreter runs the pair's two programs, each loading the 
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone, a pair's (whose second row
     tile of a pair past its group's rows stores none of them) or one its first consumer feeds (its rings
-    reused across the program's tiles), interpreted, at the hooks its register model prices (an epilogue's
-    column or row scale: `grouped_matmul._priced`): each consumer multiplies its half of the stage's rows
+    reused across the program's tiles), interpreted, at an epilogue's column or row scale: each
+    consumer multiplies its half of the stage's rows
     and computes their epilogue, as exact as the plain program from float64 truth. An fp32 output's sums are
     the default precision's, which the launches take (exact sums are the kernel gradient's alone)."""
     spec = CASES[case]
@@ -1312,8 +1312,8 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
 
 @runs("sm90")
 def test_a_cooperative_tiles_gradients_hold_check_1():
-    """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s reverse mode at a bias, a hook the register
-    model prices (`grouped_matmul._priced`) whose cotangent passes through it 16-bit, so every reverse
+    """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s reverse mode at a bias, a hook whose
+    cotangent passes through it 16-bit, so every reverse
     product is a Mosaic launch: the input gradient through the cooperative transposed launch, the kernel
     gradient through the cooperative kernel gradient, each consumer its depth half, against JAX's
     derivative of the plain program (eagerly: `test_the_templates_gradients_hold_check_1`)."""
@@ -1752,8 +1752,7 @@ def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name
                                                     (None, jnp.float32)], ids=["sm90", "XLA"])
 def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generation_name, out):
     """A paired product without an epilogue, each matrix's product an output of its own, on the route the
-    selector takes (two outputs are no Mosaic launch until the register model prices them,
-    `grouped_matmul._priced`): in bf16 on an sm90, and in XLA's program in fp32, whose fp32 cotangents its
+    selector takes: in bf16 on an sm90, and in XLA's program in fp32, whose fp32 cotangents its
     reverse mode keeps wide; its values and every gradient (the rows', both matrices') as exact as the
     unfused program's from float64 truth. The gradients run eagerly, as the Mosaic interpreters' ordered
     callbacks need."""

@@ -27,9 +27,10 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
-from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits, visibility_mask
+from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits
+from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
-from dew.nn.documents import CrossDocuments, document_mask
+from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, cross_attention_flops, projection_flops
 from dew.nn.inputs import (
     PLAIN_CALL,
@@ -45,7 +46,7 @@ from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from dew.nn.mixers.attention import CONTEXT_LOGITS, call_visibility, dense_visibility, group_fields
+from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import (
     at_least_fp32,
@@ -599,13 +600,7 @@ class MultiHeadLatentAttention(nn.Module):
         read its block leaves out) and, where given, each query reading its own document's keys alone
         (`queries` `[B, S]`, `segments` `[B, C]`), unmasked by causality, then its output gate and
         projection (`_output`); a latent attention anneals nothing over a run (`progress`)."""
-        if self._qk_open():
-            # The read's logits through the layer's own projections, which its own call's maxima take in
-            # beside its own sequence's (`_attend`), so the QK-Clip bounds both.
-            documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
-            seen = visibility_mask(query.shape[1], key.shape[-3], causal=False, sliding_window=None,
-                                   segment_ids=documents, key_value_seq_lengths=lengths)
-            self.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
+        sow_context_logits(self, query, key, lengths, queries, segments)
         # A row without context reads its first slot, so its softmax stays finite (`CausalSelfAttention`).
         attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
@@ -896,10 +891,9 @@ class MultiHeadLatentAttention(nn.Module):
         # caller opened the collection. Under a sparse selection the mask
         # holds the selected keys, so the maximum is over those.
         if self._qk_open():
-            found = max_attention_logits(query, key, causal=causal, mask=mask, bias=bias)
-            if self.has_variable("qk", CONTEXT_LOGITS):
-                # A context this call read through the same projections first (`attend_context`).
-                found = jnp.maximum(found, self.get_variable("qk", CONTEXT_LOGITS)[-1])
+            # Beside a context this call read through the same projections first (`attend_context`).
+            found = with_context_logits(self, max_attention_logits(query, key, causal=causal, mask=mask,
+                                                                   bias=bias))
             self.sow("qk", "max_logits", found)
             self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(

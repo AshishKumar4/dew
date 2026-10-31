@@ -118,6 +118,11 @@ class Summary:
                                  f"score ({sorted(declared | ({'loss'} if loss else set()))})")
 
 
+EXAMPLES_SCALAR = "evaluation/examples_consumed"
+"""The scalar an evaluation of a run on the examples clock records the examples it had consumed under,
+the coordinate the run's own clock places it at (`Evaluation.examples`)."""
+
+
 @dataclass(frozen=True)
 class Evaluation:
     """The result of one evaluation, with its previews kept on process 0.
@@ -127,8 +132,9 @@ class Evaluation:
     `coordinated_batches` is the number of batches every process scored, and
     `records` the number of real rows in them, which covers every record of the
     split once. `elapsed_seconds` is process 0's wall time, including closing the
-    batch iterator. The metric accumulators and the validation batches are not
-    kept.
+    batch iterator. `examples` is the source examples the run had consumed when it
+    evaluated, on the examples clock, its own coordinate there; None on another. The
+    metric accumulators and the validation batches are not kept.
     """
 
     step: int
@@ -139,15 +145,18 @@ class Evaluation:
     event_key: tuple[int, ...]
     elapsed_seconds: float
     previews: tuple[Artifact, ...]
+    examples: int | None = None
 
     @property
     def scalars(self) -> dict[str, float]:
-        """Return the metric values, plus the evaluation/* counts if a batch was scored."""
+        """Return the metric values, plus the evaluation/* counts if a batch was scored, and on the
+        examples clock the examples the run had consumed (`EXAMPLES_SCALAR`)."""
+        clocked = {} if self.examples is None else {EXAMPLES_SCALAR: float(self.examples)}
         if not self.coordinated_batches:
-            return dict(self.scores)
+            return {**self.scores, **clocked}
         return {**self.scores,
                 "evaluation/coordinated_batches": float(self.coordinated_batches),
-                "evaluation/records": float(self.records)}
+                "evaluation/records": float(self.records), **clocked}
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,

@@ -1313,7 +1313,7 @@ class Checkpoints:
 
     def pinned(self, step: int | str | None = None) -> int:
         """The exact step `step` selects: itself, the best by a ranking, or, for
-        None, the latest committed now, which a later save does not move."""
+        None or `latest`, the latest committed now, which a later save does not move."""
         step = self.resolve(step)
         step = self.latest if step is None else step
         if step is None:
@@ -1321,8 +1321,8 @@ class Checkpoints:
         return step
 
     def resolve(self, step: int | str | None) -> int | None:
-        if not isinstance(step, str):
-            return step
+        if not isinstance(step, str) or step == 'latest':
+            return self.latest if step == 'latest' else step
         if step != 'best' and not step.startswith('best:'):
             raise ValueError(f"unknown checkpoint selector {step!r}")
         best = self._best_step(None if step == 'best' else step.removeprefix('best:'))
