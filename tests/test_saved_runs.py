@@ -195,11 +195,13 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
     of the module that runs them in the task's tree, whichever method or class runs them: a helper
     method's product is its owner's, a shared scope's its sharer's, two siblings' apart, two roots of one
     class applied over two branches of the tree apart, a renamed class's the same; and a projection whose
-    dtype moves moves alone. Two branches alike in every leaf, which no root's reading tells apart, are
-    refused."""
+    dtype moves moves alone, and a branch whose trunk is held frozen, read from two collections, its own.
+    Two branches alike in every leaf, which no root's reading tells apart, are refused."""
     import jax.numpy as jnp
     from flax import linen as nn
     from saved_run_products import products, scoping
+
+    from dew.batch import freeze, part, thaw
 
     class Pair(nn.Module):
         right: jnp.dtype
@@ -233,11 +235,15 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
 
     x = jnp.ones((2, 4), jnp.float32)
 
-    def read(roots: dict[str, nn.Module]) -> dict[str, list[str]]:
+    def read(roots: dict[str, nn.Module], frozen: bool = False) -> dict[str, list[str]]:
         tree = {"params": {name: root.init(jax.random.key(0), x)["params"] for name, root in roots.items()}}
+        if frozen:
+            # Each root's right projection held frozen, as a run's frozen trunk is (`dew.batch.freeze`).
+            tree = freeze(tree, lambda path: "right" not in path)
 
         def request(tree, x):
-            return sum(root.apply({"params": tree["params"][name]}, x) for name, root in roots.items())
+            # Each root reads its trunk whole (`thaw`), as a run's model reads its frozen trunk.
+            return sum(root.apply(thaw(part(tree, name)), x) for name, root in roots.items())
 
         with nn.intercept_methods(scoping(tree)):
             lowered = jax.jit(request).lower(tree, x)
@@ -251,3 +257,6 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
         "second/right": ["bfloat16"]}
     with pytest.raises(ValueError):
         read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16)})
+    # A branch read from two collections, its trunk held frozen, is the branch its root reads.
+    assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}, frozen=True) == read(
+        {"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)})
