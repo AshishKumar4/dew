@@ -46,7 +46,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   algorithm; a run saved with `ns_precision` as a precision level loads with its algorithm. Opt-in beside
   it: `per_head` (head widths by parameter pattern) orthogonalizes each head's block alone, as Kimi K3;
   `ns_coeffs: "polar_express"` takes Polar Express's coefficients; `neuron_beta2` normalizes each output
-  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`.
+  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`, its coefficients
+  (`NEWTON_SCHULZ`) exported there alone.
 - An evaluation of a run on the examples clock records the examples it had consumed
   (`evaluation/examples_consumed`) beside its step; a cooldown branch's, scored at the step it branched
   at, records the branch's own count under `cooldown/examples_consumed`.
