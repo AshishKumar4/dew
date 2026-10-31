@@ -64,7 +64,7 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
-from dew.interop.saved_sources import pinned_run, released_run, samples_images
+from dew.interop.saved_sources import RunPipeline, pinned_run, released_run, run_pipeline
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -1039,9 +1039,9 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           prediction_depths: int | None = None,
                           modeling_overrides: Mapping[str, object] | None = None,
                           step: int | str | None = None,
-                          ema: bool | None = None) -> PretrainedPipeline | TextToImage:
-    """A published diffusion pipeline, to train from its own weights, or a saved Dew diffusion run's own
-    sampling task (`TextToImage.from_saved`), its checkpoint at `step` with `ema` (`pinned_run`).
+                          ema: bool | None = None) -> PretrainedPipeline | RunPipeline:
+    """A published diffusion pipeline, to train from its own weights, or a saved Dew diffusion run
+    (`RunPipeline`), its checkpoint at `step` with `ema` (`pinned_run`).
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
     its own, or a video pipeline's (frames, height, width): the geometry its
@@ -1066,18 +1066,19 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `text_only` to take, its components hold no prediction depths, so any
     count keeps them all, and none reads overrides, which are refused.
 
-    A saved run is no published pipeline: Dew writes no diffusers layout of one, so it loads as the task
-    its run built (`_saved_task`), which a `DiffusionObjective` trains as it trains a pipeline. A step
-    or EMA choice beside a pipeline is refused, as it selects nothing.
+    A saved run is no published pipeline: Dew writes no diffusers layout of one, so it loads as the parts
+    and policy of the task its run built (`run_pipeline`), which a `DiffusionObjective` trains as it
+    trains a pipeline. A step or EMA choice beside a pipeline is refused, as it selects nothing.
     """
     run = pinned_run(checkpoint, step=step, ema=ema)
     _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
     if run is not None:
-        return _saved_task(run, checkpoint, dtype=dtype, param_dtype=param_dtype, revision=revision,
-                           attention_impl=attention_impl, size=size, variables=variables, mesh=mesh,
-                           layout=layout, text=text, ema=ema)
+        stored = None if param_dtype == AUTO else param_dtype
+        return run_pipeline(run, checkpoint, dtype=dtype, param_dtype=stored, revision=revision,
+                            attention_impl=attention_impl, size=size, variables=variables, mesh=mesh,
+                            layout=layout, text=text, ema=ema)
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")
@@ -1094,44 +1095,6 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or its "
                          "config.json names the model it is")
     return _published(loaded, checkpoint, selected=False)
-
-
-def _saved_task(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str, revision: str | None,
-                attention_impl: AttentionImpl, size: tuple[int, ...] | None, variables: Variables | None,
-                mesh: MeshSpec | Mesh | None, layout: Layout | None, text: bool,
-                ema: bool | None) -> TextToImage:
-    """The diffusion run `run` as `load_diffusion_source` loads it: its own task (`TextToImage.from_saved`),
-    computing in `dtype`, its weights restored stored in `param_dtype` (as saved where `auto`) where
-    `mesh` and `layout` place them, or bound from supplied `variables`, its denoiser attending through
-    `attention_impl` where its class takes a kernel, and its sample at `size` in its own channels.
-
-    A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
-    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none."""
-    if not samples_images(run):
-        raise ValueError(f"{checkpoint} is a {run.objective.__name__} run, which Pretrained.load reads; a "
-                         "diffusion run starts from a published pipeline or a saved diffusion run")
-    if revision is not None:
-        raise ValueError(f"{checkpoint} is a saved run's directory, which has no revision {revision!r}")
-    if not text:
-        raise ValueError(f"{checkpoint} is a saved run, whose tree restores its text encoder with its "
-                         "denoiser; text=False skips none of it")
-    task = TextToImage.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
-                                  param_dtype=None if param_dtype == AUTO else param_dtype,
-                                  variables=variables)
-    model = task.model
-    if "attention_impl" in {field.name for field in dataclasses.fields(model)}:
-        model = model.clone(attention_impl=attention_impl)
-    elif attention_impl != "auto":
-        raise ValueError(f"{type(model).__name__} takes no attention_impl: the attention its record states "
-                         "is its run's")
-    inputs = task.inputs
-    if size is not None:
-        sample = inputs.sample
-        if len(size) != len(sample.shape) - 1:
-            raise ValueError(f"{checkpoint} samples {sample.key} of shape {sample.shape}, which size {size} "
-                             "does not shape")
-        inputs = replace(inputs, sample=replace(sample, shape=(*size, sample.shape[-1])))
-    return replace(task, model=model, inputs=inputs)
 
 
 def _published[K: Pretrained](loaded: K, name_or_dir: str | Path, *, selected: bool) -> K:

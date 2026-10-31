@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
 
     from dew.distributed.placement import Layout, MeshSpec
-    from dew.lora import LoRA
     from dew.objectives.diffusion import DiffusionObjective
     from dew.quantization import Quantization
 
@@ -201,15 +200,6 @@ class TextToImage(SavedRunTask, InItsForm):
         """Return this task with `variables` as its weights, its encoders' included: each call
         encodes its prompts and its blank with the towers it holds."""
         return replace(self, variables=variables)
-
-    def adapt(self, lora: LoRA, *, key: int | jax.Array) -> TextToImage:
-        """Return this task with `lora` attached to its denoiser and its factors drawn (`LoRA.apply`),
-        as `Pretrained.adapt` adapts a pipeline: its variables hold the factors under `params` and the
-        denoiser's weights under `frozen`, so an objective over it trains the factors alone, and since B
-        starts at zero it samples what this task does. The model records its adapter, which a run of it
-        saves (`from_run`)."""
-        adapter = lora.apply(self.model, self.variables, key=key)
-        return replace(self, model=adapter.model, variables=adapter.variables)
 
     def quantized(self, spec: Quantization) -> TextToImage:
         """Return this task with its denoiser's weights quantized as `spec` says.

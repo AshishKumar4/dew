@@ -8,8 +8,8 @@ run's checkpoint at the step its selection pins. `dew export` writes that checkp
 release (`released_run`): every loader takes a source by its directory, so the run's load options
 (its compute and storage dtypes, its mesh, its source options, an adapter) apply to it as to any
 release, and its first weights are the export's. Dew writes no release of a diffusion run
-(`samples_images`), and a diffusion run starts from the run's own sampling task instead
-(`load_diffusion_source`).
+(`samples_images`), and a diffusion run starts from the parts and policy of the run's own sampling
+task instead (`run_pipeline`).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import Field, replace
+from dataclasses import Field, dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
@@ -31,9 +31,19 @@ from dew.checkpoints import RUN_FILE
 from dew.files import staged
 
 if TYPE_CHECKING:
+    from flax import linen as nn
+
     from dew.batch import Variables
+    from dew.diffusion.process import Process
+    from dew.diffusion.schedules.source import SourceGrid
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
+    from dew.inputs import InputSpec
+    from dew.lora import LoRA
+    from dew.nn.attention import AttentionImpl
+    from dew.nn.autoencoders import AutoEncoder
+    from dew.sampling.guidance import Guidance
+    from dew.sampling.solvers.common import Solver
 
 
 @runtime_checkable
@@ -130,11 +140,86 @@ def pinned_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: b
 
 def samples_images(run: SavedRun) -> bool:
     """Whether `run` is a diffusion run, its task a `TextToImage`: Dew writes no release of one, and a run
-    starts from its own task (`load_diffusion_source`)."""
+    starts from its task's parts (`run_pipeline`)."""
     from dew.inference.images import TextToImage
 
     task = run.objective.saved_task
     return task is not None and issubclass(task, TextToImage)
+
+
+@dataclass(frozen=True)
+class RunPipeline:
+    """A saved diffusion run as the source a diffusion run starts from (`run_pipeline`): its sampling
+    task's denoiser `model`, `variables`, `process`, `inputs` and `autoencoder`, and the `solver`,
+    `steps`, `guidance` and `grid` it samples by, which a `DiffusionObjective` trains as it trains a
+    published pipeline (`PipelineSource`). Its variables are held as given, so an adapter's split of
+    them stays split for training, where a task reads a split tree whole."""
+
+    model: nn.Module
+    variables: Variables
+    process: Process
+    inputs: InputSpec
+    autoencoder: AutoEncoder | None
+    solver: Solver
+    steps: int
+    guidance: Guidance | None
+    grid: SourceGrid | None
+
+    def adapt(self, lora: LoRA, *, key: int | jax.Array) -> RunPipeline:
+        """This source with `lora` attached to its denoiser and its factors drawn (`LoRA.apply`), as
+        `Pretrained.adapt` adapts a pipeline: the factors under `params` and the denoiser's weights under
+        `frozen`, so an objective over it trains the factors alone, and since B starts at zero it computes
+        what this source does."""
+        adapter = lora.apply(self.model, self.variables, key=key)
+        return replace(self, model=adapter.model, variables=adapter.variables)
+
+
+def run_pipeline(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str | None,
+                 revision: str | None, attention_impl: AttentionImpl, size: tuple[int, ...] | None,
+                 variables: Variables | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+                 text: bool, ema: bool | None) -> RunPipeline:
+    """The diffusion run `run` (`checkpoint`) as a diffusion run starts from it: its own task's parts and
+    policy (`TextToImage.from_saved`), computing in `dtype`, its weights restored stored in `param_dtype`
+    (as saved where None) where `mesh` and `layout` place them, or bound from supplied `variables`, its
+    denoiser attending through `attention_impl` where its class takes a kernel, and its sample at `size`
+    in its own channels.
+
+    A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
+    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none."""
+    from dew._records import record
+    from dew.diffusion.schedules.source import SourceGrid
+    from dew.inference.images import ImageSettings, TextToImage
+    from dew.inference.tasks import saved_settings
+    from dew.registry import from_record
+
+    if not samples_images(run):
+        raise ValueError(f"{checkpoint} is a {run.objective.__name__} run, which Pretrained.load reads; a "
+                         "diffusion run starts from a published pipeline or a saved diffusion run")
+    if revision is not None:
+        raise ValueError(f"{checkpoint} is a saved run's directory, which has no revision {revision!r}")
+    if not text:
+        raise ValueError(f"{checkpoint} is a saved run, whose tree restores its text encoder with its "
+                         "denoiser; text=False skips none of it")
+    task = TextToImage.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
+                                  param_dtype=param_dtype, variables=variables)
+    model = task.model
+    if "attention_impl" in {field.name for field in fields(model)}:
+        model = model.clone(attention_impl=attention_impl)
+    elif attention_impl != "auto":
+        raise ValueError(f"{type(model).__name__} takes no attention_impl: the attention its record states "
+                         "is its run's")
+    inputs = task.inputs
+    if size is not None:
+        sample = inputs.sample
+        if len(size) != len(sample.shape) - 1:
+            raise ValueError(f"{checkpoint} samples {sample.key} of shape {sample.shape}, which size {size} "
+                             "does not shape")
+        inputs = replace(inputs, sample=replace(sample, shape=(*size, sample.shape[-1])))
+    # The grid as its record states it, the one `from_saved` built the task's from.
+    stated = saved_settings(run.record, ImageSettings).grid
+    grid = None if stated is None else from_record(SourceGrid, record(stated, "grid"))
+    return RunPipeline(model, task.variables, task.process, inputs, task.autoencoder, task.solver,
+                       task.steps, task.guidance, grid)
 
 
 def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,
