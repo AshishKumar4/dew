@@ -4,6 +4,6 @@
  "path": "recordings/ea54ec3176820a5d99564fc72086ed1c311a5b779db63416debe3437f10d3668.npz",
  "reference": "mamba_ssm 2.3.2.post1",
  "repo": "dewml/fixtures",
- "revision": null,
+ "revision": "19329cb5e2b9c0e89eceffb730932c83c567c305",
  "sha256": "ea54ec3176820a5d99564fc72086ed1c311a5b779db63416debe3437f10d3668"
 }
