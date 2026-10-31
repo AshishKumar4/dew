@@ -325,3 +325,52 @@ def test_a_hoisted_index_chain_longer_than_ptxas_recomputes_is_held_across_its_l
         found[masked] = (kernel["spilled"], peak)
     assert found[False][0] == 0 < found[True][0]
     assert found[False][1] <= 255 < found[True][1]
+
+
+_TIED_SCALAR = """
+  module {
+    func.func @kernel(%x: f32) -> f32 {
+      %zero = arith.constant 0.0 : f32
+      %acc = "llvm.inline_asm"(%zero) {asm_string = "mov.f32 $0, $1;", constraints = "=f,0"} : (f32) -> f32
+      %y = arith.addf %acc, %x : f32
+      return %y : f32
+    }
+  }
+"""
+
+_TIED_STRUCT = """
+  module {
+    func.func @kernel(%x: f32) -> f32 {
+      %zero = arith.constant 0.0 : f32
+      %undefined = llvm.mlir.undef : !llvm.struct<(f32, f32, f32, f32)>
+      %a0 = llvm.insertvalue %zero, %undefined[0] : !llvm.struct<(f32, f32, f32, f32)>
+      %a1 = llvm.insertvalue %zero, %a0[1] : !llvm.struct<(f32, f32, f32, f32)>
+      %a2 = llvm.insertvalue %zero, %a1[2] : !llvm.struct<(f32, f32, f32, f32)>
+      %a3 = llvm.insertvalue %zero, %a2[3] : !llvm.struct<(f32, f32, f32, f32)>
+      %c0 = llvm.extractvalue %a3[0] : !llvm.struct<(f32, f32, f32, f32)>
+      %c1 = llvm.extractvalue %a3[1] : !llvm.struct<(f32, f32, f32, f32)>
+      %c2 = llvm.extractvalue %a3[2] : !llvm.struct<(f32, f32, f32, f32)>
+      %c3 = llvm.extractvalue %a3[3] : !llvm.struct<(f32, f32, f32, f32)>
+      %acc = "llvm.inline_asm"(%c0, %c1, %c2, %c3) {asm_string = "mov.f32 $0, $4;",
+          constraints = "=f,=f,=f,=f,0,1,2,3"} : (f32, f32, f32, f32) -> !llvm.struct<(f32, f32, f32, f32)>
+      %r0 = llvm.extractvalue %acc[0] : !llvm.struct<(f32, f32, f32, f32)>
+      %r1 = llvm.extractvalue %acc[1] : !llvm.struct<(f32, f32, f32, f32)>
+      %r2 = llvm.extractvalue %acc[2] : !llvm.struct<(f32, f32, f32, f32)>
+      %r3 = llvm.extractvalue %acc[3] : !llvm.struct<(f32, f32, f32, f32)>
+      %s0 = arith.addf %r0, %x : f32
+      %s1 = arith.addf %r1, %s0 : f32
+      %s2 = arith.addf %r2, %s1 : f32
+      %s3 = arith.addf %r3, %s2 : f32
+      return %s3 : f32
+    }
+  }
+"""
+
+
+@pytest.mark.parametrize(("body", "words"), [(_TIED_SCALAR, 1), (_TIED_STRUCT, 4)], ids=["scalar", "struct"])
+def test_an_accumulator_started_from_zeros_takes_its_registers(body, words):
+    """An assembly whose outputs are tied to zeros (a warpgroup product into a fresh accumulator: `use_acc`
+    false), read beside another live value: its result words and that value are live together. The pass gave
+    the result its inputs' registers, which zeros have none of, so the sm90 dQ launch's two zero-started
+    products, 128 words in flight, read as none while ptxas spilled them."""
+    assert analyzed(body).total >= words + 1
