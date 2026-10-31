@@ -172,6 +172,7 @@ from dew.training.memory import (
     climb_to,
     first_run,
     head_tile_of,
+    judges,
     local_devices,
     memory_record,
     recompute_record,
@@ -1149,8 +1150,9 @@ class Trainer(Generic[Loss, Effects]):
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
             lowered, launches = lower() if lowering else None, launches or "[]"
-        footprint = None if self.step is not None or mesh is not None else candidate_footprint(
-            self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
+        footprint = None if self.step is not None or mesh is not None or not judges(self.device_mesh) \
+            else candidate_footprint(self.objective, self._model_shapes(micro), split * self.accumulation,
+                                     prepared, held)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)

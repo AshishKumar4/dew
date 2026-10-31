@@ -278,7 +278,7 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
     # `capacity` it is stated to, the step's arguments in it as they would be.
     memory = [device_memory(device, capacity, stats.argument_size_in_bytes - built) for device in devices]
-    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+    if not stated(memory):
         return None
     beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
     return min(placeable(m, unclaimed(d, m)) - beside
@@ -313,12 +313,24 @@ def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | No
     if footprint.residuals is None:
         return None
     memory = [device_memory(device, capacity, sum(footprint.resident.values()) - built) for device in devices]
-    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+    if not stated(memory):
         return None
     temporaries = footprint.residuals + footprint.gradients
     return min(placeable(m, unclaimed(d, m)) - footprint.held
                - temporaries * (2 if strands_temporaries(d.platform, m) else 1)
                for d, m in zip(devices, memory, strict=True))
+
+
+def stated(memory: Sequence[Mapping[str, int]]) -> bool:
+    """Whether every device's `memory` (`device_memory`) states its limit and its use, which a fit check
+    reads; a CPU's states none, so no step's headroom on it is known ahead of its run."""
+    return all('bytes_limit' in m and 'bytes_in_use' in m for m in memory)
+
+
+def judges(mesh: Mesh) -> bool:
+    """Whether this process's devices of `mesh` state the memory a derived footprint is judged against
+    (`derived_headroom`): where they do not, the planner derives none, its walk ending 'unknown'."""
+    return stated([device_memory(device) for device in local_devices(mesh)])
 
 
 def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
