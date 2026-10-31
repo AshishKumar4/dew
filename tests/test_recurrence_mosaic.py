@@ -815,21 +815,18 @@ def planned_failures(found: list, plans: dict) -> list[str]:
 def apart_failures(found: list, apart: dict) -> list[str]:
     """Each compiled case's launches held apart (`apart`, the names its model refuses by its label): every
     launch its model admits as a required case's (`kernel_compile.mosaic_failures`: spill-free, every report
-    read), and every one it refuses agreeing with ptxas, at its roles' budget or spilling past it."""
-    from kernel_compile import mosaic_failures
+    read), and every one it refuses free to spill, its model's decision beside ptxas's in the record's
+    register evidence, advisory where ptxas holds it spill-free (as `mosaic_failures` keeps a spill-free
+    disagreement)."""
+    from kernel_compile import _register_evidence, mosaic_failures
 
     failed = []
     for record in found:
-        kernels = record.get("kernels", ())
-        refused = {kernel["kernel"]: name for kernel in kernels for name in apart[record["name"]]
+        refused = {kernel["kernel"] for kernel in record.get("kernels", ()) for name in apart[record["name"]]
                    if kernel["kernel"] == name or kernel["kernel"].startswith(f"{name}__")}
-        admitted = [kernel for kernel in kernels if kernel["kernel"] not in refused]
+        admitted = [kernel for kernel in record.get("kernels", ()) if kernel["kernel"] not in refused]
         failed += mosaic_failures([{**record, "kernels": admitted}])
-        for kernel in (k for k in kernels if k["kernel"] in refused):
-            budget = record["models"][refused[kernel["kernel"]]]["budget"]
-            if not kernel["spilled"] and (kernel["registers"] is None or kernel["registers"] < budget):
-                failed.append(f"{record['name']} {kernel['kernel']}: its model refuses it, and ptxas holds "
-                              f"it spill-free in {kernel['registers']} registers, under its budget {budget}")
+        record["evidence"] = _register_evidence(record)
     return failed
 
 
