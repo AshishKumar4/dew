@@ -65,12 +65,14 @@ class ObjectInfo(TypedDict):
     sha256: str
 
 
-def object_info(payload: bytes | io.BufferedReader) -> ObjectInfo:
+def object_info(payload: bytes | BinaryIO) -> ObjectInfo:
     """The size and SHA-256 of `payload`, bytes, or a file read from its start in bounded chunks."""
     if isinstance(payload, bytes):
         return {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
     payload.seek(0)
-    digest = hashlib.file_digest(payload, "sha256")
+    digest = hashlib.sha256()
+    while chunk := payload.read(2**20):
+        digest.update(chunk)
     size = payload.tell()
     payload.seek(0)
     return {"bytes": size, "sha256": digest.hexdigest()}
@@ -396,6 +398,13 @@ def pinned_by_url(fs: AbstractFileSystem, path: str) -> bool:
     return revision is not None and REGEX_COMMIT_HASH.fullmatch(revision) is not None
 
 
+def backing(fs: AbstractFileSystem) -> AbstractFileSystem:
+    """The store `fs` reads from, through any transport cache over it."""
+    while isinstance(fs, CachingFileSystem):
+        fs = fs.fs
+    return fs
+
+
 def local(fs: AbstractFileSystem) -> bool:
     """Whether `fs` is this host's own disk, whose paths are where it mounted a file."""
     return isinstance(fs, LocalFileSystem)
@@ -513,11 +522,10 @@ class Store:
         return Store(self.url.rstrip("/") + "/" + path, self.storage_options, self.retention)
 
     def describe(self) -> Mapping[str, object]:
-        fs, _ = self.resolve()
-        while isinstance(fs, CachingFileSystem):
-            fs = fs.fs
+        fs = backing(self.resolve()[0])
         # A local path is where this host mounted the data, not how it is reached.
-        settings = {"protocol": fs.protocol} if local(fs) else {"url": self.url, "protocol": fs.protocol}
+        settings: dict[str, object] = (
+            {"protocol": fs.protocol} if local(fs) else {"url": self.url, "protocol": fs.protocol})
         if isinstance(fs, S3FileSystem):
             settings.update(
                 endpoint=fs.client_kwargs.get("endpoint_url") or fs.endpoint_url,
@@ -609,8 +617,7 @@ class Store:
 
     def _backend(self) -> tuple[AbstractFileSystem, str, str]:
         fs, path = self.resolve()
-        while isinstance(fs, CachingFileSystem):
-            fs = fs.fs
+        fs = backing(fs)
         if issubclass(type(fs), ConditionalWrites):
             return fs, path, "conditional"
         if local(fs):

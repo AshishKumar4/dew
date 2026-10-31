@@ -46,6 +46,7 @@ from dew.decision.layout import (
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.renderer import Unit
+from dew.decision.rows import option_width
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -399,9 +400,11 @@ class DecisionRunConfig(DecoderRunConfig):
                   if isinstance(dataset, Dataset) else None for dataset in datasets]
         if any(value is None for value in stated):
             return None
-        widest = max(integer(value, "slots.options") for value in stated)
-        added = number(self.objective.fields.get("none_of_the_above") or 0.0, "none_of_the_above") > 0
-        return widest + int(added)
+        widest = {"options": max(integer(value, "slots.options") for value in stated)}
+        fields = self.objective.fields
+        rate = number(fields.get("none_of_the_above") or 0.0, "none_of_the_above")
+        fewest = integer(fields.get("none_of_the_above_options") or 0, "none_of_the_above_options")
+        return option_width(widest, rate, fewest)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """The task's own held-out suite (`default_metrics`), where the data holds held-out rows."""
