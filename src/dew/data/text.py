@@ -811,8 +811,11 @@ def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "t
     from dew.data.compile import iterate
     from dew.data.sinks import export
 
-    vocabulary = tokenizer_for(tokenizer)
-    documents = dataset.map(Tokenize(tokenizer, field, eos))
+    # One step, so the manifest describes the resolution of the tokenizer that encoded the rows
+    # (`Tokenize.vocabulary`, ledger 3014).
+    step = Tokenize(tokenizer, field, eos)
+    documents = dataset.map(step)
+    vocabulary = step.vocabulary
     metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
                 "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None}
     return export(iterate(documents, read=read, provision=provision), url, format="array_record",
