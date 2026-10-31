@@ -299,11 +299,15 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
 """The forms every family's GEMM launches emit: each product and output dtype they take."""
 
-HOOKED_FORMS = ("kernel gradient exact fp32", "scaled forward", "row scaled forward", "paired swiglu forward")
-"""The hooked and exactly summed forms whose register need the family's model prices (`Family.counts_hooks`,
-`grouped_matmul._priced`): epilogues over side vectors (a column or row scale), a paired product's SwiGLU
-over its two accumulators, and the running sum. A prologue, an epilogue's side tile and a second output are
-not yet priced; their calls take another launch."""
+HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
+                "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
+                "cast forward", "gated forward", "gated kernel gradient", "residual forward",
+                "two bf16 outputs forward", "scaled forward", "row scaled forward", "paired swiglu forward",
+                "paired forward")
+"""The hooked and exactly summed forms a family whose model counts what they hold emits
+(`Family.counts_hooks`): prologues (a norm, a cast, SwiGLU's gate tile), epilogues over side vectors and a
+side tile, a second output, a paired product, and the running sum, each priced by what it materializes
+(`grouped_matmul._Mosaic.registers`)."""
 
 
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
