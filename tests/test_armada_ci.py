@@ -1963,15 +1963,17 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
     Linux starts a process with, and every kept row is reused (2026-10-31: main de315f9a05's kept rows were
     one task, whose 149,515-byte argument started none)."""
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
-    # Files named as long as a file system allows, enough that their kept rows pass the bound together.
-    names = [f"tests/test_{index:03d}{'x' * 240}.py" for index in range(240)]
-    written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n" for index, name in enumerate(names)})
+    # Files of long names (beside a fetched fixture's manifest name, within a file system's 255 bytes), enough
+    # that their kept rows' tokens and names pass what a process starts with together.
+    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(300)]
+    written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n"
+                       for index, name in enumerate(names)})
     durations = tmp_path / "tests/test_durations.json"
     durations.write_text(json.dumps({**json.loads(durations.read_text()),
                                      **{f"{name}::test_{index}": 1.0 for index, name in enumerate(names)}}))
     assert all(row["exitCode"] == 0 for row in armada_task(ci, monkeypatch, verdict, target=100_000.0))
     entries = [entry for entry in ci.plan(100_000.0, {}) if entry["python"] == "3.12"]
-    every = sorted(f"3.12:{name}" for name in [*names, "tests/test_a.py", "tests/test_b.py", "tests/test_c.py"])
+    every = sorted(f"3.12:{name}" for name in [*names, *(f"tests/test_{letter}.py" for letter in "abc")])
     assert sorted(row for entry in entries for row in entry["rows"]) == every
     assert all(ci.KEPT_AT in token for entry in entries for token in entry["tests"].split())
     assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 131_071
