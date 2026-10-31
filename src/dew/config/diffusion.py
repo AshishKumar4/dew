@@ -236,7 +236,7 @@ class DiffusionRunConfig(RunConfig):
             latent = self.autoencoder is not None or self.pretrained is not None
             return dataclasses.replace(preset, regime="latent" if latent else "pixel")
         shift = preset.resolution_shift if isinstance(preset, Flow) else None
-        if shift is not None and shift.tokens is None and self.data is not None:
+        if isinstance(preset, Flow) and shift is not None and shift.tokens is None and self.data is not None:
             height, width = self.sample_field().shape[-3:-1]
             return dataclasses.replace(preset, resolution_shift=shift.at(height, width))
         return preset
@@ -282,8 +282,8 @@ class DiffusionRunConfig(RunConfig):
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
         model = self.model.build(**fields)
-        if isinstance(model, IntervalModel) and self.preset is not None:
-            built = self.derived_preset()()
+        if isinstance(model, IntervalModel) and (preset := self.derived_preset()) is not None:
+            built = preset()
             fields["interval"] = isinstance(built, Process) and built.interval
         if (issubclass(objectives[self.objective.name], MeanFlowObjective) and isinstance(model, TimeScaled)
                 and "time_scale" not in self.model.fields):
