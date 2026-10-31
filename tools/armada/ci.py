@@ -665,9 +665,11 @@ with past 131,071 bytes (MAX_ARG_STRLEN); half of that, for the entry's other fi
 de315f9a05's kept rows were one task, whose 149,515-byte argument started none)."""
 
 
-def kept_tasks(python: str, found: Mapping[tuple[str, str], str], target: float) -> list[list[tuple[str, str]]]:
-    """The rows `found` kept (`reusable`), in tasks of at most the target's lookups, a lookup a row in seconds,
-    so no kept task outlasts the rest of the run, and at most `KEPT_BYTES` of their tokens and names."""
+def kept_tasks(python: str, found: Mapping[tuple[str, str], str],
+               target: float) -> list[list[tuple[str, str]]]:
+    """The rows `found` kept (`reusable`), in tasks of at most the target's lookups, a lookup a row in
+    seconds, so no kept task outlasts the rest of the run, and at most `KEPT_BYTES` of their tokens and
+    names."""
     tasks: list[list[tuple[str, str]]] = []
     held: list[tuple[str, str]] = []
     size = 0

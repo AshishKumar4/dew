@@ -1971,7 +1971,7 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
                                      **{f"{name}::test_{index}": 1.0 for index, name in enumerate(names)}}))
     assert all(row["exitCode"] == 0 for row in armada_task(ci, monkeypatch, verdict, target=100_000.0))
     entries = [entry for entry in ci.plan(100_000.0, {}) if entry["python"] == "3.12"]
-    every = sorted(f"3.12:{name}" for name in [*names, "tests/test_a.py", "tests/test_b.py", "tests/test_c.py"])
+    every = sorted(f"3.12:{name}" for name in [*names, *(f"tests/test_{letter}.py" for letter in "abc")])
     assert sorted(row for entry in entries for row in entry["rows"]) == every
     assert all(ci.KEPT_AT in token for entry in entries for token in entry["tests"].split())
     assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 131_071
