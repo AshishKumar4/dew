@@ -611,9 +611,10 @@ def checked_streak(streak: int, step: int, display: TrainingDisplay) -> None:
 
 
 def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None, devices: int, *,
-               waited: float = 0.0, compiling: float = 0.0,
-               training_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
-    """Compute the interval's rates from the records it read and its FLOPs, on a mesh of `devices`.
+               waited: float = 0.0, compiling: float = 0.0, training_flops: float | None = None,
+               tokens: float | None = None, peak: float | None = None) -> dict[str, float]:
+    """Compute the interval's rates from the records it read and its FLOPs, on a mesh of `devices`, each
+    device's dense `peak` its kind's bf16 peak by default (`model_flops_utilization`).
 
     The FLOPs are the ones the compiler measured for each step's own
     shape; `flops` is None when a shape's measurement was unavailable.
@@ -661,7 +662,7 @@ def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None
         scalars["train/tokens_per_s"] = float(tokens) / stepping
     if work is not None:
         per_device = float(work) / devices
-        utilization = model_flops_utilization(per_device / steps, step_time)
+        utilization = model_flops_utilization(per_device / steps, step_time, peak)
         if utilization is not None:
             scalars["train/mfu"] = utilization
-    return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time)}
+    return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time, peak)}

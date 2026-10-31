@@ -1498,7 +1498,7 @@ def test_a_cooldown_branchs_scoring_artifacts_keep_apart_from_the_runs_at_its_st
     from dew.training.cooldown import Cooldowns
 
     train = from_grain(grain.MapDataset.source(list(held_tokens()) * 4), "indexed-tokens").batch(16)
-    held = from_iter(held_tokens, name="streamed-tokens").batch(8).read("streamed").workers(0)
+    held = from_iter(held_tokens, identity="streamed-tokens").batch(8).read("streamed").workers(0)
     model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
                               max_seq_len=8, attention_impl="xla")
     objective = LMObjective(model, seq_len=4)
