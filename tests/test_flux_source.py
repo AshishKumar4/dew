@@ -323,7 +323,7 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
 
     # The unconditional branch of a guided call carries each row's scalar, so
     # it is the plain call with the empty caption at that row's own guidance.
-    process, _ = loaded.task.grid(4)
+    process, _ = loaded.grid(4)
     empty = {"text": "", "negative": True}
     denoise = process.denoiser(loaded.model, variables, {"conditioning": given},
                               {"conditioning": encoder.encode(

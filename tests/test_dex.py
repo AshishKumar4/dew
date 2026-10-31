@@ -233,10 +233,11 @@ def test_an_export_folds_the_operands_a_layer_multiplies_in():
                  DEX_COLLECTION: {"self_attn": {"dex_heads": np.asarray([1], np.int32),
                                                 "dex_lambda_init": np.float32(0.2)}}}
     rows = slice(width, 2 * width)
-    in_bf16 = dew.nn.dex.folded(variables, jnp.bfloat16)["params"]["self_attn"]["o_proj"]["kernel"]
+    in_bf16 = np.asarray(
+        dew.nn.dex.folded(variables, jnp.bfloat16)["params"]["self_attn"]["o_proj"]["kernel"])
     np.testing.assert_array_equal(in_bf16[rows], np.zeros((width, 4), np.float32))
     np.testing.assert_array_equal(in_bf16[:width], kernel[:width])
-    in_float32 = dew.nn.dex.folded(variables, None)["params"]["self_attn"]["o_proj"]["kernel"]
+    in_float32 = np.asarray(dew.nn.dex.folded(variables, None)["params"]["self_attn"]["o_proj"]["kernel"])
     np.testing.assert_array_equal(in_float32[rows], (-(2 ** -9) * kernel[rows]).astype(np.float32))
 
 
