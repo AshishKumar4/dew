@@ -43,6 +43,7 @@ def split_files(paths: Sequence[str], split: str, config: Mapping[str, object] |
     patterns read. A pattern that names the listing by a URL of its root (`roots`) reads it there; one
     that names a file elsewhere leaves the split none of the listing's."""
     from datasets.data_files import DataFilesList, get_data_patterns, sanitize_patterns
+    from datasets.utils.file_utils import is_relative_path
     from fsspec.implementations.memory import MemoryFileSystem
 
     if not paths:
@@ -61,10 +62,13 @@ def split_files(paths: Sequence[str], split: str, config: Mapping[str, object] |
         files = stated.get("data_files")
         found = sanitize_patterns(files) if isinstance(files, (str, list, dict)) else get_data_patterns(base)
         patterns = next((list(each) for name, each in found.items() if str(name) == split), [])
-        if any("://" in pattern and not pattern.startswith(tuple(roots)) for pattern in patterns):
+        listing = f"memory://{root}/"
+        located = [next((listing + pattern.removeprefix(url) for url in roots if pattern.startswith(url)),
+                        pattern) for pattern in patterns]
+        # A pattern of files elsewhere (a URL or an absolute path, as `datasets` tells them apart:
+        # `is_relative_path`) names none of the listing's, which it would read from where it names.
+        if any(not (pattern.startswith(listing) or is_relative_path(pattern)) for pattern in located):
             return []
-        located = [next((f"memory://{root}/" + pattern.removeprefix(url) for url in roots
-                         if pattern.startswith(url)), pattern) for pattern in patterns]
         resolved = set(DataFilesList.from_patterns(located, base_path=base))
     except FileNotFoundError:
         resolved = set()
@@ -77,7 +81,8 @@ def conversion_layout(paths: Sequence[str]) -> bool:
     """Whether a commit's listing is laid out as the Hub's Parquet conversion lays its files out
     (refs/convert/parquet): no card, and each file but its `.gitattributes` a Parquet shard in a
     directory of its split in a directory of its configuration (`<config>/<split>/<shard>.parquet`,
-    `partial-<split>` for a split converted in part: https://huggingface.co/docs/dataset-viewer/parquet)."""
+    `partial-<split>` for a split converted in part: https://huggingface.co/docs/dataset-viewer/parquet).
+    A repository's own files may be laid out so too; only the conversion's ref says which commit is it."""
     files = [path for path in paths if path != ".gitattributes"]
     return bool(files) and all(path.count("/") == 2 and path.endswith(".parquet") for path in files)
 
@@ -167,23 +172,28 @@ class Hub(Dataset):
 
     @cached_property
     def _selection(self) -> tuple[str, tuple[str, ...], Format] | None:
-        from huggingface_hub import HfApi
-
         revision = self.commit
-        paths, format = self._selected(revision)
+        # A commit laid out as the conversion is one where the conversion's ref names it.
+        paths, format = self._selected(revision, converted=conversion_layout(self._listed(revision))
+                                       and self._conversion(revision) == revision)
         if not paths and self.revision is None:
-
-            def converted() -> str | None:
-                converts = HfApi().list_repo_refs(self.repo, repo_type="dataset").converts
-                return next((ref.target_commit for ref in converts if ref.ref == "refs/convert/parquet"),
-                            None)
-
             # The conversion of the default branch's commit, which the commit's answer pins.
-            conversion = hub_answer(("dataset conversion", self.repo, revision), converted).value
+            conversion = self._conversion(revision)
             if conversion is not None and conversion != revision:
                 revision = conversion
                 paths, format = self._selected(revision, converted=True)
         return (revision, tuple(sorted(paths)), format) if paths else None
+
+    def _conversion(self, revision: str) -> str | None:
+        """The commit the repo's Parquet conversion stands at (refs/convert/parquet), as the Hub
+        answered where the repo stood at `revision`, None where it has none."""
+        from huggingface_hub import HfApi
+
+        def converted() -> str | None:
+            converts = HfApi().list_repo_refs(self.repo, repo_type="dataset").converts
+            return next((ref.target_commit for ref in converts if ref.ref == "refs/convert/parquet"), None)
+
+        return hub_answer(("dataset conversion", self.repo, revision), converted).value
 
     @cached_property
     def files(self) -> Files:
@@ -290,18 +300,17 @@ class Hub(Dataset):
         where the card states them, else its sharded names, its split keywords in file and directory
         names, `dev` for `validation` among them, a lone file as `train`). A commit whose card states no
         configuration holds the default one alone, and none of another name, which its Parquet
-        conversion may hold. The conversion (`converted`, or a commit laid out as one: `conversion_layout`)
-        holds each configuration's splits in a directory of its name, its configurations those of the
-        card of the commit it converts, else its directories."""
+        conversion may hold. The conversion (`converted`) holds each configuration's splits in a
+        directory of its name (`conversion_layout`), its configurations those of the card of the commit
+        it converts, else its directories."""
         listed = self._listed(revision)
-        configs = self._configurations(revision)
-        if converted or (not configs and conversion_layout(listed)):
-            configs = (self._configurations(self.commit) if converted else {}) or {
+        if converted:
+            configs = self._configurations(self.commit) or {
                 path.split("/", 1)[0]: {} for path in listed if "/" in path}
             directory = self._configuration(configs) + "/"
             paths = [directory + path for path in split_files(
                 [path.removeprefix(directory) for path in listed if path.startswith(directory)], self.split)]
-        elif configs:
+        elif configs := self._configurations(revision):
             roots = (f"hf://datasets/{self.repo}@{revision}/", f"hf://datasets/{self.repo}/")
             paths = split_files(listed, self.split, configs[self._configuration(configs)], roots)
         else:
