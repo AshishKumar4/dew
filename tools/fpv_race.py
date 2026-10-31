@@ -278,12 +278,18 @@ def demonstrations(simulator, objective, variables, steps: int, capacity: int):
     return ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), capacity).add(stream)
 
 
+def _written(path: Path, text: str) -> None:
+    """`text` at `path`, written whole beside it before it replaces what was there, so a run stopped at any
+    point leaves either file whole."""
+    path.with_name(path.name + ".part").write_text(text)
+    path.with_name(path.name + ".part").replace(path)
+
+
 def _committed(out: Path, progress: dict) -> dict:
     """`progress` made where a world run is (progress.json: its phase, that phase's updates, and the weight
     files of each phase it holds), written whole before it replaces the last, then every weight file it
     no longer names removed: a run stopped at any point goes on from one consistent generation."""
-    (out / "progress.json.part").write_text(json.dumps(progress))
-    (out / "progress.json.part").replace(out / "progress.json")
+    _written(out / "progress.json", json.dumps(progress))
     for stale in out.glob("*-[0-9]*.msgpack"):
         if stale.name not in (progress["pretrained"], progress["world"]):
             stale.unlink()
@@ -403,7 +409,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     report["cloned"] = judge(agent.act, pretrained_variables, agent.memory(drones), jax.random.key(7),
                              film=out / "cloned.npz")
     print(json.dumps(report), flush=True)
-    (out / "world.json").write_text(json.dumps(report, indent=1))
+    _written(out / "world.json", json.dumps(report, indent=1))
 
     online = progress["updates"] if progress["phase"] == "online" else 0
     if online:
@@ -426,11 +432,11 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
                  **judge(agent.act, state.variables, agent.memory(drones), jax.random.key(done))}
         report["online"].append(point)
         print(json.dumps(point), flush=True)
-        (out / "world.json").write_text(json.dumps(report, indent=1))
+        _written(out / "world.json", json.dumps(report, indent=1))
     (out / "world.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
     report["online_agent"] = judge(agent.act, state.variables, agent.memory(drones), jax.random.key(9),
                                    film=out / "video.npz")
-    (out / "world.json").write_text(json.dumps(report, indent=1))
+    _written(out / "world.json", json.dumps(report, indent=1))
     return report
 
 
