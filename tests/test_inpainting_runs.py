@@ -58,8 +58,9 @@ def pictures():
 
 
 def masked_images(batch: int = 8):
-    """The run's images at SIZE with a mask drawn for each (`RandomMask`)."""
-    return pictures().pipe(presets.images, SIZE, batch=batch, augment=image_steps.RandomMask())
+    """The run's captioned images at SIZE with a mask drawn for each (`RandomMask`)."""
+    return pictures().pipe(presets.images, SIZE, batch=batch, caption=image_steps.caption(),
+                           augment=image_steps.RandomMask())
 
 
 def precision() -> ModelConfig:
@@ -115,7 +116,8 @@ def test_an_inpainting_run_over_a_chain_without_masks_is_refused(inpainting):
     """An inpainting pipeline paints the region its mask marks: over images that carry no mask the run
     is refused as it builds."""
     run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
-                             data=pictures().pipe(presets.images, SIZE, batch=8), val_metrics=(),
+                             data=pictures().pipe(presets.images, SIZE, batch=8,
+                                                  caption=image_steps.caption()), val_metrics=(),
                              objective=RUNS["diffusion"][1]["objective"])
     with pytest.raises(ValueError):
         run.build()
