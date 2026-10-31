@@ -480,7 +480,7 @@ def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
 
 def test_the_factored_pairs_keep_a_pair_across_a_steep_sub_chunk():
     """A decay a key dimension's pairs (`algebra.key_decayed_pairs`, the intra launch's) on plain products,
-    each pair `r_i . (k_j exp2(g_i - g_j))` within fp32's resolution of the float64 sum, at a prefix steep in
+    each pair `r_i . (k_j exp2(g_i - g_j))` within fp32's resolution of its terms from the float64 sum, at a prefix steep in
     its first sub-chunk and shallow after (base 2: -1 at token 0, -7 a token to 15, -5 at 16, -1 a token on),
     within the declared floor: the pair of tokens 32 and 15, `2^-21`, whose lift from token 0's sub-chunk to
     token 32's, `2^-126`, is under `PAIR_FLOOR` alone, its key gated up by `2^105`."""
@@ -506,12 +506,13 @@ def test_the_factored_pairs_keep_a_pair_across_a_steep_sub_chunk():
         lambda c: jnp.asarray(rows, jnp.float32), lambda c: jnp.asarray(key, jnp.float32), 1,
         lambda c: (hi, lo), lambda s, c: (hi[s * algebra.SUB], lo[s * algebra.SUB]), summed,
         lambda name, value: lambda: value, chunk=chunk, strict=False)
-    decays = np.exp2(prefix[:, None, :] - prefix[None, :, :])
-    truth = np.tril((rows[:, None, :] * key[None, :, :] * decays).sum(-1))
-    held = np.abs(truth) > 2.0 ** -100
-    error = np.where(held, np.abs(np.asarray(total, np.float64) - truth) / np.where(held, np.abs(truth), 1.0), 0.0)
+    terms = rows[:, None, :] * key[None, :, :] * np.exp2(prefix[:, None, :] - prefix[None, :, :])
+    truth, size = np.tril(terms.sum(-1)), np.tril(np.abs(terms).sum(-1))
+    # Each pair's distance from float64 against its terms' size, which a cancelling dot's rounding scales.
+    held = size > 2.0 ** -100
+    error = np.where(held, np.abs(np.asarray(total, np.float64) - truth) / np.where(held, size, 1.0), 0.0)
     worst = np.unravel_index(np.argmax(error), error.shape)
-    assert error[worst] < 2.0 ** -18, f"pair {worst}: {error[worst]:.3g} from float64"
+    assert error[worst] < 2.0 ** -18, f"pair {worst}: {error[worst]:.3g} of its terms from float64"
 
 
 def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
