@@ -31,7 +31,7 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
-from dew._records import JSON, json_value, record, text
+from dew._records import JSON, integer, json_value, record, text
 from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention, evictable, read_pin
 from dew.files import write_atomically
@@ -39,6 +39,18 @@ from dew.files import write_atomically
 
 class PreconditionFailed(FileExistsError):
     """The object changed since the caller read its version."""
+
+
+class Replaced(OSError):
+    """An object read where its producer published it, which holds other bytes than it published:
+    replaced or removed since, whose records a read would take under the identity of the ones it
+    replaced."""
+
+
+STORED = {"s3": "etag", "gs": "generation", "gcs": "generation", "hf": "commit"}
+"""The version each remote store names an object it holds by (`Store.get_versioned`), which a read of a
+range of it can be held to (`Store.read_range`): an S3 object's ETag, a GCS object's generation, a Hub
+file's commit."""
 
 
 @runtime_checkable
@@ -404,6 +416,131 @@ class Versioned:
     version: str
 
 
+class Pinned(io.RawIOBase):
+    """An object's bytes at the version its producer published it, every read of them one request held
+    to it (`Store.read_range`): a file a reader seeks and reads in as it would the object's own."""
+
+    def __init__(self, store: Store, stored: Mapping[str, str], size: int):
+        super().__init__()
+        self.store, self.stored, self.size, self.position = store, stored, size, 0
+        self.name = store.url
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        self.position = max(0, {io.SEEK_SET: 0, io.SEEK_CUR: self.position, io.SEEK_END: self.size}[whence]
+                            + offset)
+        return self.position
+
+    def readinto(self, buffer) -> int:
+        count = min(len(buffer), self.size - self.position)
+        if count <= 0:
+            return 0
+        payload = self.store.read_range(self.position, self.position + count, self.stored)
+        buffer[:len(payload)] = payload
+        self.position += len(payload)
+        return len(payload)
+
+
+PINNED_BUFFER = 8 << 20
+"""The bytes a stream of a pinned object asks its store for at once (`Declared.open`)."""
+
+
+class Declared:
+    """The object at `store` read as its producer declared it (`declared`: its size and digest, and the
+    version its store published it at, `stored`), never as other bytes: a remote object published at a
+    version is read in ranges held to it (`Pinned`), refused (`Replaced`) where its store no longer holds
+    it so; a local or in-memory file is checked whole as each read opens it (a local file's digest kept
+    while its metadata does not change, `content_version`), and refused where it holds other bytes; any
+    other remote object, and one a reader reads by its path on this host, is read whole into Dew's mirror
+    and checked there once, which a mirror without room for it refuses."""
+
+    def __init__(self, store: Store, declared: Mapping[str, object]):
+        self.store = store
+        self.size = integer(declared["bytes"], "declared size")
+        self.digest = text(declared["sha256"], "declared digest")
+        stored = declared.get("stored")
+        _, _, scheme = store._backend()
+        self.stored = ({str(kind): str(version) for kind, version in stored.items()}
+                       if isinstance(stored, Mapping) and STORED.get(scheme) in stored else None)
+        self.lock = threading.Lock()
+
+    def __getstate__(self) -> Mapping[str, object]:
+        # A reader in another process checks or mirrors the object for itself.
+        return {"store": self.store, "size": self.size, "digest": self.digest, "stored": self.stored}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Declared) and (self.store.url, self.size, self.digest, self.stored) == (
+            other.store.url, other.size, other.digest, other.stored)
+
+    def __hash__(self) -> int:
+        return hash((self.store.url, self.digest))
+
+    def checked(self) -> tuple[AbstractFileSystem, str]:
+        """The local or in-memory file, checked now to hold the declared bytes, or its checked copy in
+        Dew's mirror where it is remote."""
+        fs, path = self.store.resolve()
+        if not (local(fs) or in_memory(fs)):
+            return LocalFileSystem(), self.mirrored.name
+        found = (content_version(fs, path, self.size) if local(fs)
+                 else hashlib.sha256(fs.cat_file(path)).hexdigest())
+        if found != self.digest:
+            raise Replaced(f"{self.store.url} holds other bytes than the {self.size} its producer "
+                           "declared")
+        return fs, path
+
+    @functools.cached_property
+    def mirrored(self) -> io.BufferedReader:
+        """The object's copy in Dew's mirror, checked against its digest as it downloads, held open so
+        the mirror keeps it while this reads it."""
+        mirror, mirrored = self.store.cached().resolve()
+        opened = mirror.open(mirrored, "rb", source_snapshot={"size": self.size, "sha256": self.digest})
+        if not isinstance(opened, io.BufferedReader) or not isinstance(opened.name, str):
+            opened.close()
+            raise ValueError(f"{self.store.url} is read whole into Dew's mirror to check it against its "
+                             f"declared digest, which has no room for its {self.size} bytes")
+        return opened
+
+    @functools.cached_property
+    def handle(self) -> BinaryIO:
+        """One file of the declared bytes, checked as it opens, which ranges are read from: a local
+        file replaced since it opened keeps the bytes it opened."""
+        fs, path = self.checked()
+        return fs.open(path, "rb")
+
+    def open(self) -> BinaryIO:
+        """A binary file of the declared bytes, a pinned object's read `PINNED_BUFFER` bytes at a time."""
+        if self.stored is not None:
+            return io.BufferedReader(Pinned(self.store, self.stored, self.size), buffer_size=PINNED_BUFFER)
+        fs, path = self.checked()
+        return fs.open(path, "rb")
+
+    def read_range(self, start: int, end: int) -> bytes:
+        """The declared bytes `start` to `end`, in one request where they are held to a version."""
+        if self.stored is not None:
+            return self.store.read_range(start, end, self.stored)
+        with self.lock:
+            self.handle.seek(start)
+            return self.handle.read(end - start)
+
+    def local_path(self) -> str:
+        """A path on this host's disk holding the declared bytes, checked: the file's own, or its copy in
+        Dew's mirror, which a reader that opens paths alone (ArrayRecord's) reads."""
+        fs, _ = self.store.resolve()
+        return self.checked()[1] if local(fs) else self.mirrored.name
+
+
 class Readable(NamedTuple):
     """Where an object's bytes are read (`Store.readable`): the filesystem,
     the object's path on it, and, where a copy is read (a Hub revision's
@@ -528,6 +665,71 @@ class Store:
         written = object_info(payload)
         matching(object_info(self.read()), written, self.url)
         return written
+
+    def published(self, payload: bytes) -> dict[str, JSON]:
+        """Write `payload` here where nothing is and read it back as written, as `verified` does: its
+        size and digest, and on a remote store the version it holds it at (`held_at`), to which a read
+        of it is held (`declared_reader`)."""
+        self.put_if_absent(payload)
+        return self.held_at(object_info(payload))
+
+    def held_at(self, written: ObjectInfo | None = None) -> dict[str, JSON]:
+        """This object's size and digest, read in one request with the version its store holds it at
+        (`get_versioned`, named by `STORED`, on a remote store), refused unless they are `written`'s
+        where given."""
+        held = self.get_versioned()
+        found = object_info(held.data)
+        if written is not None:
+            matching(found, written, self.url)
+        _, _, scheme = self._backend()
+        facts: dict[str, JSON] = {"bytes": found["bytes"], "sha256": found["sha256"]}
+        if scheme in STORED:
+            facts["stored"] = {STORED[scheme]: held.version}
+        return facts
+
+    def read_range(self, start: int, end: int, stored: Mapping[str, str]) -> bytes:
+        """Bytes `start` to `end` of this object as its store holds it at the version `stored` names
+        (`STORED`), in one request held to it, which raises `Replaced` where the store no longer holds
+        it there: an S3 range read on the object's ETag (`IfMatch`), a GCS one of its generation, a Hub
+        file's at its commit."""
+        fs, path, scheme = self._backend()
+        version = stored.get(STORED.get(scheme, ""))
+        if version is None:
+            raise ValueError(f"{self.url} names no version its store holds it at: {dict(stored)}")
+        if isinstance(fs, S3FileSystem):
+            from botocore.exceptions import ClientError
+            from fsspec.asyn import sync
+
+            loop = fs.loop
+            if loop is None:
+                raise ValueError("Dew storage needs synchronous S3 filesystem options")
+            bucket, key, _ = fs.split_path(path)
+            try:
+                response = fs.call_s3("get_object", Bucket=bucket, Key=key,
+                                      Range=f"bytes={start}-{end - 1}", IfMatch=version)
+            except OSError as error:
+                cause = error.__cause__
+                if isinstance(cause, ClientError) and cause.response.get(
+                        "ResponseMetadata", {}).get("HTTPStatusCode") == 412:
+                    raise Replaced(f"{self.url} is no longer the object published at ETag "
+                                   f"{version}") from error
+                raise
+
+            async def body() -> bytes:
+                async with response["Body"] as read:
+                    return await read.read()
+
+            return sync(loop, body)
+        if isinstance(fs, GCSFileSystem):
+            try:
+                return fs.cat_file(path, start=start, end=end, generation=version, concurrency=1)
+            except FileNotFoundError as error:
+                raise Replaced(f"{self.url} holds no generation {version}: replaced or removed") from error
+        resolved = fs.resolve_path(path) if isinstance(fs, HfFileSystem) else None
+        if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
+            raise ValueError(f"{self.url} is no repository file")
+        return fs.cat_file(f"{resolved.repo_type}s/{resolved.repo_id}@{version}/{resolved.path_in_repo}",
+                           start=start, end=end)
 
     def checked(self, committed: Mapping[str, object]) -> bytes:
         """This object's bytes, refused unless they are the size and digest `committed` states."""

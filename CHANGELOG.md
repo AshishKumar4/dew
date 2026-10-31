@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A file an export's manifest or a source's `file_info` declares is never read as other bytes under
+  that declaration, which a run's identity holds: an export records the version its store published
+  each shard at (an S3 ETag, a GCS generation, a Hub commit), and each read of a range of it is held to
+  that version, refused (`dew.data.storage.Replaced`) where the store no longer holds it; a local or
+  in-memory file is checked against its digest as a read opens it; any other remote file, and an
+  ArrayRecord shard, which its reader opens by path, is read whole into Dew's mirror and checked there.
+  Declared Parquet on S3 or GCS reads through Dew's ranged reads rather than Arrow's own clients.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
