@@ -316,13 +316,15 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
     started, stop = threading.Event(), threading.Event()
 
     def others():
-        rows = 512
+        # Launches of other rows, so other kernels, spilling as the reading compile's does.
+        rows = 4096
         with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
             while not stop.is_set():
+                rows += 64
                 forward, shapes = _spilling_forward(_Uncounted(), rows, devices)
+                lowered = jax.jit(forward).trace(*shapes).lower()
                 started.set()
-                jax.jit(forward).trace(*shapes).lower().compile()
-                rows += 8
+                lowered.compile()
 
     forward, shapes = _spilling_forward(_Uncounted(), 4096, devices)
     traced = []
