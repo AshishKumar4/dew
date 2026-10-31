@@ -39,19 +39,18 @@ def test_an_embedding_lookup_over_ids_split_on_an_explicit_axis_takes_every_orde
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
     mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
-    (table,) = normal_draw(3150, (64, 8))
-    (direction,) = normal_draw(3151, (64, 8))
+    whole, split = NamedSharding(mesh, P()), NamedSharding(mesh, P("data", None))
+    table, direction = (jax.device_put(jnp.asarray(drawn), whole)
+                        for (drawn,) in (normal_draw(3150, (64, 8)), normal_draw(3151, (64, 8))))
     with jax.set_mesh(mesh):
-        ids = jax.device_put(jnp.asarray(np.arange(16).reshape(4, 4) * 5 % 64, jnp.int32),
-                             NamedSharding(mesh, P("data", None)))
+        ids = jax.device_put(jnp.asarray(np.arange(16).reshape(4, 4) * 5 % 64, jnp.int32), split)
 
         def loss(table):
             return jnp.sum(table_rows(table, ids, table.dtype) ** 3)
 
         gradient = jax.grad(loss)
-        orders = (gradient(jnp.asarray(table)),
-                  jax.jvp(gradient, (jnp.asarray(table),), (jnp.asarray(direction),))[1],
-                  jax.grad(lambda table: jnp.vdot(gradient(table), jnp.asarray(direction)))(jnp.asarray(table)))
+        orders = (gradient(table), jax.jvp(gradient, (table,), (direction,))[1],
+                  jax.grad(lambda table: jnp.vdot(gradient(table), direction))(table))
     assert all(np.all(np.isfinite(np.asarray(order))) for order in orders)
 
 
