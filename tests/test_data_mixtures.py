@@ -709,6 +709,8 @@ def test_a_schedules_position_saved_before_it_held_stage_tokens_resumes_only_in_
     assert isinstance(opened, PhasedStream)
     past = unrecorded(opened.ending(stream.get_state()))
     assert position.read(early).tokens is None and position.read(past).tokens is None
+    # Saved again as it was read, it still records none.
+    assert position.read(position.encode(position.read(past))).tokens is None
     scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(early)
     with pytest.raises(ValueError):
         scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(past)
