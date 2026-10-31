@@ -43,6 +43,13 @@ class Wgmma(mosaic.RingFamily):
 
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
+    held_registers = 4
+    """A consumer thread's own state beside its tiles: its lane's coordinates in its fragment and the walk's
+    counters where they diverge. Descriptors, barriers and TMA coordinates are warp-uniform and live in the
+    uniform registers (ET-BATCH1's dK/dV SASS: HGMMA gdesc[UR16], SYNCS.PHASECHK [UR17], TMA [UR48], the
+    descriptor's UIADD3.64), so the scalars live at a walk's peak are 0 to 4 (HELD-CENSUS3, the corrected
+    liveness over the attention forward and every GEMM form, sm90). A store's staging and a hook's values
+    are the launches' own phases, not this."""
 
     def column_registers(self, columns: int, dtype) -> int:
         # The column layout repeats a vector over the warpgroup's four warps and eight lanes of each, so a
