@@ -48,7 +48,7 @@ from flax import serialization, traverse_util
 
 from dew.data.dataset import Loader
 
-AUXILIARY = (("state", 13, 512), ("gates", 24, 512), ("airframe", 6, 256), ("dynamics", 20, 256),
+AUXILIARY = (("state", 13, 512), ("gates", 24, 512), ("airframe", 6, 256), ("physics", 20, 256),
              ("obstacles", 12, 256))
 """The world model's auxiliary heads: each privileged view, its width and its head's units."""
 TRAINING = (("loop", 0.4), ("chain", 0.6))
@@ -415,7 +415,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
 
     scale = hz / 30
     length, imagination = round(64 * scale), round(15 * scale)
-    views = ("image", "state", "gates", "airframe", "dynamics", "obstacles", "passed", "finishing", "teacher")
+    views = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed", "finishing", "teacher")
     families = TRAINING if highlight else (("loop", 1.0),)
 
     def raced(families):
