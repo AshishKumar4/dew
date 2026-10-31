@@ -27,7 +27,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, resources
-from dew.nn.kernels.templates.mosaic import SWIZZLE, TILING, Ref
+from dew.nn.kernels.templates.mosaic import Ref
 
 ISSUE, READ = 0, 1
 """A program's warpgroups: the one issuing loads and products, and the one reading accumulators."""
@@ -99,8 +99,7 @@ TCGEN05 = Tcgen05()
 def swizzled(dtype, contraction: int) -> tuple:
     """A stage's transforms for an operand block of `dtype` contracting `contraction` elements a step: 8-row
     tiles of the widest swizzle its rows take, swizzled (tcgen05 reads its shared operands so)."""
-    swizzle = plgpu.find_swizzle(contraction * jnp.dtype(dtype).itemsize * 8)
-    return TILING((8, swizzle // jnp.dtype(dtype).itemsize)), SWIZZLE(swizzle)
+    return mosaic.swizzle_transforms(dtype, mosaic.widest_swizzle(dtype, contraction))
 
 
 @dataclasses.dataclass(frozen=True)

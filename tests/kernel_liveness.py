@@ -424,6 +424,9 @@ class _Pass:
         self.compiler = compiler
         self.launches: list[Peak] = []
         self.mma_words = 0
+        # Each block's warpgroup products' accumulator atoms: ptxas issues every product of a
+        # straight-line region before it reads any accumulator (`uses`).
+        self.products: dict = collections.defaultdict(set)
 
     def _streamed(self, op, name: str) -> bool:
         if not _elementwise(op, name):
@@ -631,6 +634,12 @@ class _Pass:
                 return
         for operand in op.operands:
             into.update(a for a in self.atoms.of.get(operand, ()) if a is not None)
+        if _product(op):
+            # ptxas issues every warpgroup product of a straight-line region before it reads any of their
+            # accumulators, so each is live to the region's last product: the recurrence's states launch
+            # holds its twelve products' 96 words at its peak, which the program order kills six at a time
+            # (its 202 registers a thread against 117 counted).
+            into.update(self.products[op.parent])
         for nested_region in op.regions:
             for block in nested_region.blocks:
                 for inner in block.operations:
@@ -720,6 +729,15 @@ class _Pass:
         if op.results and op.results[0] in self.atoms.of:
             return
         self.define(op)
+        if _product(op):
+            self.products[op.parent].update(a for value in op.results for a in self.atoms.of.get(value, ())
+                                            if a is not None)
+
+
+def _product(op) -> bool:
+    """Whether `op` issues a warpgroup MMA (`wgmma.mma_async` assembly)."""
+    return (op.name.removeprefix(PREFIX) == "llvm.inline_asm" and "asm_string" in op.attributes
+            and "wgmma.mma_async" in ir.StringAttr(op.attributes["asm_string"]).value)
 
 
 CANONICAL = "builtin.module(canonicalize,cse,loop-invariant-code-motion,canonicalize,cse)"
