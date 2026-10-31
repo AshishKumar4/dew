@@ -220,9 +220,10 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
                          else noise * 4.0)
         # DeepSeek's balancing bias is a buffer the checkpoint carries, and
         # the reference selects on it: nonzero, or the load path that reads
-        # it would agree with one that drops it.
+        # it would agree with one that drops it. LFM2-MoE's and AFMoE's hold
+        # it as `expert_bias`.
         for name, tensor in model.named_buffers():
-            if name.endswith("e_score_correction_bias"):
+            if name.endswith(("e_score_correction_bias", "expert_bias")):
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
