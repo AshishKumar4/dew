@@ -544,8 +544,8 @@ def training_measure(factory, objective, config: Worker) -> dict:
     import optax
 
     from dew.distributed.batches import DevicePrefetchIterator
-    from dew.telemetry.instrumentation import model_flops_utilization
-    from dew.telemetry.profile import capture_options
+    from dew.telemetry.instrumentation import NO_FLOPS
+    from dew.telemetry.profile import Profiler
     from dew.training import Trainer
 
     trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
@@ -570,9 +570,9 @@ def training_measure(factory, objective, config: Worker) -> dict:
                     segment_started = None
                 before = time.perf_counter()
                 compiled[key] = trainer.compile(state, batch)
-                flops[key] = None if trainer.step_flops is None else trainer.step_flops.hardware
+                flops[key] = trainer.step_flops
                 compiles.append({"signature": key, "seconds": time.perf_counter() - before,
-                                 "flops": flops[key]})
+                                 "flops": None if flops[key] is None else flops[key].hardware})
             before = time.perf_counter()
             # The step's commit telemetry (its sixth output) is not a signal this run reads.
             state, loss, _, finite, accepted = compiled[key](state, batch)[:5]
@@ -595,7 +595,8 @@ def training_measure(factory, objective, config: Worker) -> dict:
             # After the timed steps, so the trace's own overhead is not in them, as `benchmark_step`
             # traces. A shape first seen here compiles inside the window, and its idle counts.
             with tempfile.TemporaryDirectory() as directory:
-                with jax.profiler.trace(directory, profiler_options=capture_options()):
+                # The timeline reads the trace alone, so the capture writes no reports.
+                with Profiler(directory, reports=False) as capture:
                     for _ in range(timed.train_steps):
                         batch = next(reader)
                         counted.counts.get_nowait()
@@ -604,14 +605,15 @@ def training_measure(factory, objective, config: Worker) -> dict:
                             compiled[key] = trainer.compile(state, batch)
                         state = compiled[key](state, batch)[0]
                     jax.block_until_ready(state)
-                timeline = device_idle(directory)
+                (captured,) = capture.captures
+                timeline = device_idle(str(captured))
     resolved = jax.device_get(signals)
     if any(not bool(finite) or not bool(accepted) for _, finite, accepted in resolved):
         raise ValueError("the real small-model update was nonfinite or not accepted")
     seconds = completed_seconds
     padded = sum(row["padded_tokens"] for row in measured)
     hlo_flops = None if any(row["hlo_flops"] is None for row in measured) else sum(
-        row["hlo_flops"] for row in measured)
+        (row["hlo_flops"] for row in measured), NO_FLOPS)
     model_flops = None if any(row["model_flops"] is None for row in measured) else sum(
         row["model_flops"] for row in measured)
     return {"steps": len(measured), "data_wait_ms": statistics.mean(
@@ -625,11 +627,29 @@ def training_measure(factory, objective, config: Worker) -> dict:
             "compile_count": len(compiles), "compiles": compiles, "device_timeline": timeline,
             "losses": [float(resolved[row["signal_index"]][0]) for row in measured],
             "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
-            "model_mfu_bf16_peak": model_flops_utilization(model_flops, seconds),
-            "model_flops_scope": "objective.training_flops on real host lengths and layout; "
-                                 "custom image-mean model and frozen legacy API have no analytic count",
-            "hlo_utilization_bf16_peak": model_flops_utilization(hlo_flops, seconds),
+            **rated(seconds, len(measured), sum(row["rows"] for row in measured), hlo_flops, model_flops,
+                    trainer.device_mesh.devices.size)}
+
+
+def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float | None, devices: int, *,
+          peak: float | None = None) -> dict:
+    """A training window's `steps` steps of `rows` rows over `seconds`, their compiled work `hlo_flops`
+    (`StepFlops`, each device's) and the objective's `model_flops` (the whole mesh's), rated as the
+    trainer's interval rates its steps (`dew.training.interval.throughput`) on `devices` devices of dense
+    bf16 `peak` (the device's own by default): the objective's work over the whole mesh's peak, and the
+    compiled work a lower bound where a launch's went uncounted (`StepFlops.unsized`)."""
+    from dew.training.interval import throughput
+
+    rates = throughput(seconds, steps, rows, hlo_flops, devices, training_flops=model_flops, peak=peak)
+    bound = "_lower_bound" if hlo_flops is not None and hlo_flops.unsized else ""
+    return {"model_mfu_bf16_peak": rates.get("train/mfu"),
+            "model_flops_scope": "objective.training_flops on real host lengths and layout, over the mesh's "
+                                 "dense bf16 peak; custom image-mean model and frozen legacy API have no "
+                                 "analytic count",
+            "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
+            "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / steps,
             "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
+                                 "a lower bound where unsized_kernels_per_step is not zero; "
                                  "not an analytic real-token MFU"}
 
 

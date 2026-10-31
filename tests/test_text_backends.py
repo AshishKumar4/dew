@@ -29,9 +29,9 @@ def stored(backend: str, tmp_path: Path):
 
         from dew.data import from_hf
 
-        return from_hf(datasets.Dataset.from_list(rows), name="passages")
+        return from_hf(datasets.Dataset.from_list(rows), identity="passages")
     if backend == "grain":
-        return from_grain(grain.MapDataset.source(rows), name="passages")
+        return from_grain(grain.MapDataset.source(rows), identity="passages")
     from dew.data import TFDS
 
     # Prepared by tools/datasets/tfds_reference.py from the same passages.

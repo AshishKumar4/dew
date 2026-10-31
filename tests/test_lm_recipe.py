@@ -15,9 +15,9 @@ from tool_support import load
 import dew
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
-from dew.data.compile import compile, held
+from dew.data.compile import compile, held, iterate
 from dew.data.dataset import Loader
-from dew.data.pipeline import Dataset
+from dew.data.pipeline import Dataset, Pipeline
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective
@@ -871,20 +871,79 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
     assert int(config.run().step) == 1
 
 
-def test_packing_a_token_store_that_states_no_document_ends_refuses_as_it_is_read(tmp_path):
-    """A token store with neither a document index nor an EOS id reads as one document, whose pieces no
-    producer made, so its chain packed refuses as it is read, not as it is built: iterated, published
-    with its pack's plan, or packed by an objective (`ObjectiveData.pack`)."""
-    from dew.data.cache import Cache
-    from dew.data.compile import publish
-    from dew.data.pipeline import ObjectiveData, Pack
+@pytest.mark.parametrize(("documents", "eos", "resumes"), [
+    ([[1, 2, 3, 4, 5]], None, True),
+    ([[1, 2, 0], [3, 0], [4, 5, 0]], 0, True),
+    ([[1, 0, 2], [3, 4, 5]], 0, False),
+    ([[1, 2], [3, 4]], None, False),
+], ids=["one-record", "eos-closed", "eos-within", "records-without-eos"])
+def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_the_same_documents(
+        tmp_path, documents, eos, resumes):
+    """A Dew before row 3028 read a token store's documents by its EOS, or, stating none, its whole stream
+    as one, stating no lengths then. Where it read the documents today's reads, the producer's records
+    (one record with no EOS, or records each closed by the EOS alone), the store's fingerprint is as it
+    gave it and a plan it saved resumes; where it read others (an EOS within a record, records without
+    an EOS one stream to it), however many, the fingerprint says how today's reads them (`documents`), and
+    the plan, which counted those others, is refused."""
+    from dew.data import Memory
+    from dew.data.sinks import export
 
-    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
-    store = TokenFiles(tokens.train)
-    packed = store.pipe(presets.lm, None, seq_len=SEQ, batch=8)
-    with pytest.raises(ValueError):
-        next(iter(packed))
-    with pytest.raises(ValueError):
-        publish(store.pipe(presets.lm, None, seq_len=SEQ, batch=None), Cache(str(tmp_path / "cache")))
-    with pytest.raises(ValueError):
-        compile(store.batch(8), objective=ObjectiveData(pack=Pack(SEQ + 1)))
+    url = str(tmp_path / "tokens")
+    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": eos}
+    export(Memory([{"text": np.asarray(document, np.int32)} for document in documents]), url,
+           format="array_record", length_field="text", metadata=stated)
+    plan = compile(TokenFiles(url).batch(1), read="memory", loading=Loading(workers=0)).plan
+    saved = json.loads(json.dumps(plan.record()))
+    (fingerprint,) = saved["manifest"]["source"]["sources"]
+    assert fingerprint.pop("documents", None) == (None if resumes else "records")
+    # The lengths that Dew stated: none without an EOS; with one, its documents', today's where alike.
+    if eos is None or not resumes:
+        saved["derived"].pop("0/lengths")
+    assert plan.check(plan.record()) == ()
+    if resumes:
+        assert plan.check(saved) == ()
+    else:
+        with pytest.raises(ValueError):
+            plan.check(saved)
+
+
+def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fields_own(tmp_path):
+    """An export holding two token fields is read alike by a Dew before row 3028 in one and not the other:
+    each field's records closed by the EOS alone, or not. Each field's store says so, whichever is read
+    first, so neither takes the other's answer from Dew's cache."""
+    from dew.data import Memory
+    from dew.data.sinks import export
+
+    url = str(tmp_path / "tokens")
+    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": 0}
+    rows = [{"text": np.asarray([1, 0], np.int32), "ids": np.asarray([0, 1], np.int32)},
+            {"text": np.asarray([2, 0], np.int32), "ids": np.asarray([0, 2], np.int32)}]
+    export(Memory(rows), url, format="array_record", length_field="text", metadata=stated)
+    assert "documents" not in TokenFiles(url).fingerprint()
+    assert TokenFiles(url, field="ids").fingerprint()["documents"] == "records"
+
+
+@pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])
+def test_a_token_stores_documents_are_the_records_its_producer_wrote(tmp_path, eos):
+    """A token export's documents are the records its producer wrote, each where its length index ends it
+    (row 3028): with or without an EOS id, an EOS a document's own tokens spell within it splits nothing,
+    an empty record is no document, and an index of EOS positions a store holds beside them is not read.
+    Packed, the store reads its documents and refuses nothing, as the documents it exported read."""
+    from dew.data import Memory
+    from dew.data.sinks import export
+
+    documents = [[1, 2, 0, 3], [], [4, 5], [6, 7, 8, 9]]
+    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": eos}
+    url = str(tmp_path / "tokens")
+    export(Memory([{"text": np.asarray(document, np.int32)} for document in documents]), url,
+           format="array_record", length_field="text", metadata=stated, rows_per_shard=2)
+    # An index an earlier read derived from the tokens' EOS positions, where the first document's own EOS
+    # would split it.
+    (tmp_path / "tokens" / "train.documents.npy").write_bytes(b"")
+    store = TokenFiles(url).provision()
+    assert store.document_ends().tolist() == [4, 6, 10]
+    assert store.lengths().tolist() == [4, 2, 4]
+    read = iterate(Pipeline(store), read="indexed", loading=Loading(workers=0, threads=1, read_buffer=0))
+    assert [row["text"].tolist() for row in read] == [[1, 2, 0, 3], [4, 5], [6, 7, 8, 9]]
+    packed = store.pipe(presets.lm, None, seq_len=3, batch=2)
+    assert next(iter(packed))["text"].shape == (2, 4)

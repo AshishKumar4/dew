@@ -173,7 +173,8 @@ class CheckpointRequested:
 
 
 @dataclasses.dataclass(frozen=True)
-class ProfileWindow:
+class ProfileTraced:
+    """The directory a fit's profile window (`dew.training.ProfileWindow`) wrote and the steps it traced."""
     directory: str
     steps: int
 
@@ -223,7 +224,7 @@ class TrialFinished:
     value: float
 
 
-type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | ProfileWindow | FitEnded
+type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | ProfileTraced | FitEnded
                | TrialFinished)
 # A PEP 695 alias holds its union in `__value__`; `get_args` of the alias
 # itself is empty, and these are the classes `isinstance` is given.

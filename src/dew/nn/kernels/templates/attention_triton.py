@@ -12,7 +12,7 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 
 import dataclasses
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Literal, overload
 
 import jax
@@ -62,21 +62,17 @@ class Tiles:
     stages: int
 
 
-FORWARD_DEFAULT = Tiles(128, 64, 4, 2)
-"""The forward config first in its space, the launch's own where it fits (`Template.fitting`'s first,
-nothing ranked): within 6% of the fastest at Qwen3-8B, causal and full, on an A100 and an H100
-(ATT-ZERO3-a100 and ATT-ZERO4-h100, 2026-10-21), where the space's first config otherwise, 32 by 32, ran
-2-3 times it."""
+FORWARD_STEPS = tuple(Tiles(block_q, block_k, 4, 2) for block_q in (128, 64, 32) for block_k in (64, 32))
+"""The forward's tiles in the order its derivation steps down (`TritonForward.derived`): the first, 128 by
+64 in four warps two stages deep, within 6% of the fastest at Qwen3-8B, causal and full, on an A100 and
+an H100 (ATT-ZERO3-a100 and ATT-ZERO4-h100, 2026-10-21); then fewer queries, a block's registers living
+in its rows (a training walk's 128 by 64 holds 320 a thread, 10x the plain forward's time on an A100,
+where 64 by 64 holds 160 at 2.1x: TRAINTILES3-a100), then fewer keys, a stage's shared memory living in
+its keys."""
 
-SPACE = (FORWARD_DEFAULT, *(tiles for tiles in (Tiles(block_q, block_k, warps, stages)
-                                                for block_q in (32, 64, 128) for block_k in (32, 64, 128)
-                                                for warps in (4, 8) for stages in (2, 3))
-                            if tiles != FORWARD_DEFAULT))
-"""Every config the forward is proven over (tests/test_attention_triton.py pins each), its default
-first."""
-
-BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles in SPACE))
-"""The largest tile of `SPACE`, the block a call pads to (`padded_call`)."""
+BLOCK = max(max(tiles.block_q, tiles.block_k) for tiles in FORWARD_STEPS)
+"""The forward's largest tile, the block a call pads to (`padded_call`); the backward's tiles are within
+it (`BACKWARD_STEPS`)."""
 
 
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
@@ -92,15 +88,15 @@ def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
 
 def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
     """Why this mainloop takes no call over `spans` under `hooks`, or None: a call's runs, several key
-    intervals a query (`KeySpans`), which the frozen mainloop does not walk, the Mosaic and plain-JAX
+    intervals a query (`KeySpans`), which this mainloop does not walk, the Mosaic and plain-JAX
     mainloops do (ledger 956, `attention_route`); probability dropout (`Hooks.drop`), which it does not
     draw, the plain-JAX mainloop does (ledger row 1521)."""
     if spans.start.ndim == 3:
         return Refusal('spans', "the Triton mainloop walks one key interval a query; a call's runs take the "
                        "Mosaic or the plain-JAX mainloop")
     if hooks is not None and hooks.drop is not None:
-        return Refusal('dropout', "the Triton mainloop is frozen and takes no probability dropout (the route "
-                       "runs a dropping call on the reference path, ledger row 1521)")
+        return Refusal('dropout', "the Pallas-Triton mainloop takes no probability dropout (the route runs a "
+                       "dropping call on the reference path, ledger row 1521)")
     return None
 
 
@@ -360,8 +356,13 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: out, tuple(out))
         return (tuple(out) if residuals else out[0]), None
 
-    def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
-        return _dividing(SPACE, ba)
+    GENERATES = True
+
+    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
+        """The first of `FORWARD_STEPS` dividing the call's padded queries and keys that a program of the
+        device holds (`legal`: its shared memory and its threads' registers), stepping down from the
+        measured tile one budget at a time; None where none does."""
+        return _derived(self, FORWARD_STEPS, ba, target)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The shared memory Triton gives a program, in the operands' dtype: the key and value tiles of
@@ -396,10 +397,13 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         return _eligible(ba, target)
 
 
-def _dividing[T: (Tiles, BackwardTiles)](space: tuple[T, ...], ba: tokamax.BoundArguments) -> tuple[T, ...]:
-    """The configs of `space` whose tiles divide the launch's padded queries and keys."""
-    return dividing(space, (ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]),
-                    lambda tiles: (tiles.block_q, tiles.block_k))
+def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], steps: tuple[T, ...], ba: tokamax.BoundArguments,
+                                       target: generation.GpuTarget) -> T | None:
+    """The first of `steps` whose tiles divide the launch's padded queries and keys and which `launch`
+    holds on `target` (`legal`), None where none does."""
+    fitting = dividing(steps, (ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]),
+                       lambda tiles: (tiles.block_q, tiles.block_k))
+    return next((config for config in fitting if launch.legal(ba, config, target)), None)
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
@@ -687,16 +691,12 @@ class BackwardTiles:
     dkv_stages: int
 
 
-BACKWARD_DEFAULT = BackwardTiles(64, 64, 4, 2, 4, 2)
-"""The backward config first in its space, the launch's own where it fits: within 7% of the fastest
-joint config of both launches at a llama shape and at head width 64, causal, on an A100 and an H100
-(DPROF3-a100 and DPROF3-h100, 2026-10-21)."""
-
-BACKWARD_SPACE = (BACKWARD_DEFAULT, *(config for config in (
-    BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages, warps, stages)
-    for tiles in SPACE for warps in (4, 8) for stages in (2, 3)) if config != BACKWARD_DEFAULT))
-"""Every config of the backward: each of `SPACE`'s tiles for its dQ launch, with each warps and stages of
-its dK/dV launch, its default first."""
+BACKWARD_STEPS = tuple(BackwardTiles(block_q, block_k, 4, 2, 4, 2)
+                       for block_q in (64, 32) for block_k in (64, 32))
+"""The backward's tiles in the order its derivation steps down (`TritonBackward.derived`): the first, 64 by
+64 with each launch in four warps two stages deep, within 7% of the fastest joint config of both launches
+at a llama shape and at head width 64, causal, on an A100 and an H100 (DPROF3-a100 and DPROF3-h100,
+2026-10-21); then fewer queries, then fewer keys."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -740,8 +740,12 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
                               warps=config.dkv_warps, stages=config.dkv_stages, **shared)
         return (*dq_out, *dkv_out), None
 
-    def space(self, ba: tokamax.BoundArguments) -> Sequence[BackwardTiles]:
-        return _dividing(BACKWARD_SPACE, ba)
+    GENERATES = True
+
+    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
+        """The first of `BACKWARD_STEPS` dividing the call's padded queries and keys that a program of
+        either launch holds on the device (`legal`); None where none does."""
+        return _derived(self, BACKWARD_STEPS, ba, target)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:

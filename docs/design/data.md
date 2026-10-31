@@ -76,10 +76,10 @@ Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn` 
 | `Hub(repo, name=, split=, columns=, revision=)` | Hugging Face Hub datasets, streamed or prepared. `split=` is HF's own named split. | HF datasets, Hub Parquet shards |
 | `TFDS(name, split=)` | TensorFlow Datasets | TFDS ArrayRecord |
 | `Memory(records or columns)` | Arrays, lists of dicts, DataFrames | numpy, pyarrow |
-| `from_hf(dataset, name=)` | An existing `datasets.Dataset`, its `.map()`s already applied. An `IterableDataset` is named, with its version, since it has no content fingerprint; a shuffled one is refused, because HF drops its shuffle buffer on resume. | HF datasets |
+| `from_hf(dataset, identity=)` | An existing `datasets.Dataset`, its `.map()`s already applied. An `IterableDataset` takes its `identity`, its content version, since it has no content fingerprint; a shuffled one is refused, because HF drops its shuffle buffer on resume. | HF datasets |
 | `from_torch(dataset, identity=None)` | A map-style `torch.utils.data.Dataset` | PyTorch |
-| `from_grain(dataset, name=None)` | A Grain `MapDataset` or `IterDataset` | Grain |
-| `from_iter(factory, name=None, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
+| `from_grain(dataset, identity=None)` | A Grain `MapDataset` or `IterDataset` | Grain |
+| `from_iter(factory, identity=None, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
 | `from_iter(factory, replay=True)` | An iterator that reads the same records each time `factory()` opens it | replay to the count read, guarded by the last batch's digest |
 
 A torch, Grain or iterator source holds no content version of its own. Given `name=` (`identity=` for torch), its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: resuming its position takes `resume="non-exact"`, and a cache of it is refused.
@@ -309,7 +309,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
 - `images` and `clips` pass every other field through, stacked per batch: `label` becomes `[B]`, `caption` a list of `B` strings.
-- `lm` packs first-fit (`bins` rows open at once), best-fit or by concatenation (`pack=`), every cut through a document overlapping by one token so each next-token target stays whole; `pack=None` joins the documents into one stream of tokens and cuts it into windows `stride` apart instead, which carry no document coordinates; a token store's windows read its stream by index. `eos=None` ends a document with the tokenizer's EOS where it has one. A token store whose documents end nowhere (no document index, no EOS) is not packed, alone or among other sources, since its pieces would be no producer's documents; its stream still reads as windows.
+- `lm` packs first-fit (`bins` rows open at once), best-fit or by concatenation (`pack=`), every cut through a document overlapping by one token so each next-token target stays whole; `pack=None` joins the documents into one stream of tokens and cuts it into windows `stride` apart instead, which carry no document coordinates; a token store's windows read its stream by index. `eos=None` ends a document with the tokenizer's EOS where it has one. A token store's documents are the records its producer wrote, each where its length index ends it, an EOS its tokens spell within one or not, as the documents it exported were; an empty record is no document.
 - `text.train_tokenizer(ds, base, path, vocab_size=)` trains a tokenizer on a chain's text by `base`'s algorithm and saves it at `path`, which `lm`, `sft` and `text.tokenize` then read.
 - `sft` cuts a conversation longer than a row into pieces that keep every turn (`long="chunk"`), cuts it at its end (`"truncate"`) or drops and counts it (`"drop"`).
 - `prompts` keeps a longer prompt's last `max_prompt_len` tokens (`long="truncate"`) or drops and counts it (`"drop"`). Its reward fields are `reward_bytes` wide; left unset, a memory read measures the widest reward string each store holds, over the whole store below any holdout so every part pads alike, and a mixture reads at its widest store's. Another read needs it given, or stated by the store's metadata.

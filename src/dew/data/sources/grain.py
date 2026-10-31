@@ -18,26 +18,26 @@ from .base import Read, Shard, ShardManifest, unnamed
 class Grain(Dataset):
     """A Grain `MapDataset`, read by index or as one stream, or an
     `IterDataset`, read as one stream whose position Grain checkpoints. Grain
-    states no store of its own, so `name` declares its content version in a
+    states no store of its own, so `identity` declares its content version in a
     run's plan, a cache's key and its logs; with none, a run reads it and a
     resume needs `resume="non-exact"`, and no cache keys it (`Manifest.exact`)."""
 
     dataset: grain.MapDataset | grain.IterDataset
-    name: str | None = None
+    identity: str | None = None
     place: int = field(default_factory=unnamed, repr=False)
 
     def __post_init__(self) -> None:
-        if self.name == "":
-            raise ValueError("a Grain dataset's name declares its content version; give one, or none")
+        if self.identity == "":
+            raise ValueError("a Grain dataset's identity declares its content version; give one, or none")
 
     def label(self) -> str:
-        return self.name or "grain"
+        return self.identity or "grain"
 
     def describe(self) -> str:
-        return f"grain:{self.name}" if self.name is not None else f"grain:unnamed-{self.place}"
+        return f"grain:{self.identity}" if self.identity is not None else f"grain:unnamed-{self.place}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {"store": "grain", "identity_required": True, "identity": self.name, **self.metadata()}
+        return {"store": "grain", "identity_required": True, "identity": self.identity, **self.metadata()}
 
     def supports(self, read: Read) -> bool:
         return read == "streamed" or isinstance(self.dataset, grain.MapDataset)
@@ -67,6 +67,6 @@ class Grain(Dataset):
         return None
 
 
-def from_grain(dataset: grain.MapDataset | grain.IterDataset, name: str | None = None) -> Grain:
-    """`dataset` as a Dew dataset, under `name` where given (`Grain`)."""
-    return Grain(dataset, name)
+def from_grain(dataset: grain.MapDataset | grain.IterDataset, identity: str | None = None) -> Grain:
+    """`dataset` as a Dew dataset, its content version `identity` where given (`Grain`)."""
+    return Grain(dataset, identity)
