@@ -81,7 +81,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.inference.tasks import SavedRun
+    from dew.inference.tasks import SavedRun, TaskSettings
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
@@ -256,8 +256,13 @@ class Pretrained:
     (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     numerics: Numerics | None = None
     """The numerics the load was asked for (`load(precision=...)`), whose dtypes it computes and stores
-    in and whose products' precision and forms its tasks trace under (`formed`); None for its dtypes
-    alone."""
+    in and whose products' precision and forms its tasks trace under (`formed`), a saved run's those its
+    step trained in (`SavedRun.precision`); None for its dtypes alone."""
+    settings: TaskSettings | None = None
+    """A saved run's own task declaration (`from_saved`), which its tasks build from as the run's own
+    loader builds them (`TextGeneration.from_settings`: its prefix, policy and budget), where a source
+    read from its files builds them from its generation config, which an export writes as the
+    representation its format's readers read (ledger 3007)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -379,6 +384,9 @@ class Pretrained:
         if not isinstance(bundle, cls):
             raise TypeError(f"{run.directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
+        # The run's own declaration and numerics, which its tasks build under as the run's loader builds
+        # them, beside the generation config its export writes (ledger 3007).
+        bundle = replace(bundle, settings=task, numerics=run.precision)
         return bundle.bound(model, variables)
 
     def bound(self, model: nn.Module, variables: Variables) -> Self:
@@ -834,7 +842,12 @@ class PretrainedMaskedDecoder(Pretrained):
         sampler (`Unmask`), not its family's own recipe.
         """
         from dew.diffusion.discrete import MDLM
+        from dew.inference.tasks import MaskedSettings
 
+        if isinstance(self.settings, MaskedSettings):
+            # A saved run's own declaration, as its loader builds the task (ledger 3007).
+            return self.formed(MaskedGeneration.from_settings(self.model, self.variables, self.settings,
+                                                              self.text_processor))
         config, generation = self.config, self.generation_config
         mask_id = self.model.mask_token_id
         if mask_id is None:
@@ -868,8 +881,14 @@ class PretrainedBlockDecoder(Pretrained):
         return self.packed().block_generation()
 
     def block_generation(self) -> BlockGeneration:
-        """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
+        """Build the DiffusionGemma canvas task, with the source's sampler config as its default, a
+        saved run's its own declaration (`settings`)."""
+        from dew.inference.tasks import BlockSettings
         from dew.interop import diffusion_gemma
+
+        if isinstance(self.settings, BlockSettings):
+            return self.formed(BlockGeneration.from_settings(self.model, self.variables, self.settings,
+                                                             self.text_processor))
 
         return self.formed(BlockGeneration(
             self.model,
@@ -990,7 +1009,15 @@ class PretrainedFallback(Pretrained):
 
 
 def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGeneration:
-    """The text generation task a causal source describes (`PretrainedDecoder.text_generation`)."""
+    """The text generation task a causal source describes (`PretrainedDecoder.text_generation`): a saved
+    run's from its own declaration (`settings`), as the run's loader builds it, `sampling` replacing
+    its policy where given."""
+    from dew.inference.tasks import TextSettings
+
+    if isinstance(loaded.settings, TextSettings):
+        task = TextGeneration.from_settings(loaded.model, loaded.variables, loaded.settings,
+                                            loaded.text_processor)
+        return loaded.formed(task if sampling is None else replace(task, sampling=sampling))
     rows = return_sequences(loaded.config, loaded.generation_config)
     policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
                                                sampling)
