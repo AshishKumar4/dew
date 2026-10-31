@@ -29,10 +29,19 @@ class Affine64(nn.Module):
 class Regression64(Objective):
     """Squared error of a float64 affine map against `2 * x[:, :2]`; `noisy`, its inputs perturbed by the
     step's draw, so a step's key shows in its gradient; `scaled`, its error times a batch scalar;
-    `weighted`, its error a `Weighted` of one term, statistics a window replays rather than pools."""
+    `weighted`, its error a `Weighted` of one term, statistics a window replays rather than pools;
+    `rowwise`, its statistics each row's error and count, which add over a window and its own reduction
+    divides."""
 
-    def __init__(self, *, noisy: bool = False, scaled: bool = False, weighted: bool = False):
+    def __init__(self, *, noisy: bool = False, scaled: bool = False, weighted: bool = False,
+                 rowwise: bool = False):
         self.model, self.noisy, self.scaled, self.weighted = Affine64(), noisy, scaled, weighted
+        self.rowwise = rowwise
+
+    def reduce_loss(self, stats):
+        if self.rowwise:
+            return jnp.sum(stats[0]) / jnp.sum(stats[1]), jnp.asarray(a=True)
+        return super().reduce_loss(stats)
 
     def fresh_variables(self, key, held):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
@@ -42,6 +51,8 @@ class Regression64(Objective):
         if self.noisy:
             x = x + 0.1 * jax.random.normal(step.key, x.shape, x.dtype)
         squares = (self.model.apply(variables, x) - batch["y"]) ** 2
+        if self.rowwise:
+            return (jnp.mean(squares, axis=-1), jnp.ones(squares.shape[:1], squares.dtype)), Aux({})
         if self.weighted:
             term = Ratio(jnp.sum(squares), jnp.asarray(squares.size, squares.dtype))
             return Weighted((term,), (1.0,)), Aux({})
@@ -268,16 +279,17 @@ def test_a_supplied_diloco_state_trains_on_from_each_groups_own_state():
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_diloco_run_of_replayed_windows_trains_as_one_pooling_its_gradients():
-    """A loss whose statistics a window replays (`Weighted`) rather than pools, each group's window one
-    row a microbatch: the groups' windows allocate on their own devices, and with every inner update's
-    window of two steps the run trains as one whose loss pools them (row 876 review)."""
+@pytest.mark.parametrize("statistics", ["weighted", "rowwise"])
+def test_a_diloco_run_of_replayed_windows_trains_as_one_pooling_its_gradients(statistics):
+    """A loss whose statistics a window replays rather than pools, a `Weighted` or each row's error, each
+    group's window its own rows' (row 876 review): the groups' windows are shaped and allocated as one
+    group's, and with every inner update's window of two steps the run trains as one whose loss pools
+    them."""
     with jax.enable_x64(new_val=True):
-        def run(weighted: bool):
-            return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
-                           objective=Regression64(weighted=weighted), accumulation=2).fit(
-                dataset(), steps=4, log_every=1)
-        replayed, pooled = run(weighted=True), run(weighted=False)
+        def run(objective):
+            return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), objective=objective,
+                           accumulation=2).fit(dataset(), steps=4, log_every=1)
+        replayed, pooled = run(Regression64(**{statistics: True})), run(Regression64())
     # Each parameter sums its replica's rows' terms over 4 steps, and 2 replicas' means.
     assert_computes_the_oracle(params(replayed.variables["params"]), params(pooled.variables["params"]),
                                "a replaying DiLoCo run's outer parameters", roundings=4 * 4 * 2 + 4)
