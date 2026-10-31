@@ -291,7 +291,7 @@ jobs:
         # and the maintainer, 2026-10-28). A push to main the queue did not grade (a direct push: a train's
         # tip is proven and runs neither) is its tip's only test: it runs beside the trains in a concurrency
         # group of its own, never holding theirs, at a staged train's 5, so a train's jobs start first and it
-        # takes what they leave, above a lane's run (the maintainer, 2026-10-29: 34c949ee8's, at 0 on a full
+        # takes what they leave, above a lane's run (the maintainer, 2026-10-29: 4893fcdd3's, at 0 on a full
         # fleet, left a gang's fourth rank unplaced past its deadline; 2026-10-31: a direct push's run held
         # the trains' group, and a nine-head train's test job waited 14 minutes for it).
         case "$GITHUB_REF_NAME" in

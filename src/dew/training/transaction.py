@@ -422,7 +422,7 @@ class Transaction:
         """`state` for the commit, its host-resident fields (`fetch`) brought to the device past `gradient`:
         they pass an optimization barrier with it, so the device takes them only once it is ready. Where
         nothing rests on the host the state is the commit's as it is: with the barrier there too, a step
-        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at f001b108c)."""
+        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at ada6c5686)."""
         if self.fetch is None:
             return state
         resting = {field: getattr(state, field) for field in COMMIT_FIELDS}
