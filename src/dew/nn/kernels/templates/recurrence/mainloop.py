@@ -1487,8 +1487,12 @@ def _output_held(call: _Call, bv: int) -> _Held:
                   *products]
         return _Held(phases=(values, [_f32(CHUNK, call.block)] * 4))
     values = [_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv) + products
+    # A write gate on the keys' side scales the scores' columns (`chunk_scores`' `column_scale`): its vector
+    # across a thread's columns, 16 fragments on a 64-wide tile (the lowered liveness of Nemotron-H 4B's SSD
+    # output, ssd-evidence5 at 97a10a66b; row 2943).
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
               + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
+              + ([_f32(CHUNK, CHUNK // 2)] if call.gated_keys else [])
               + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
     if call.value_width // bv == 1:
         return _Held(phases=(values, scores))
