@@ -35,8 +35,6 @@ LOAD_WARP, MMA_WARP = 0, 1
 """The issuing warpgroup's warps: the TMA loads' and the products'."""
 TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 """A tile's register layout as tensor memory loads it natively (a thread a row)."""
-ROW = TMEM.reduce(1)
-"""A per-row vector's layout in `TMEM`."""
 STORED = plgpu.Layout.TCGEN05
 """An accumulator's register layout for an epilogue, the one a swizzled shared-memory tile takes."""
 WARPGROUPS = 2

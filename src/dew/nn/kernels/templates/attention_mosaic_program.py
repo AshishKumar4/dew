@@ -362,10 +362,10 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
         if not any(used):
             continue
         nested = list(jax_core.jaxprs_in_params(eqn.params))
-        called = [inner for name in ("jaxpr", "call_jaxpr") if (inner := eqn.params.get(name)) is not None]
-        inner = getattr(called[0], "jaxpr", called[0]) if called else None
-        if isinstance(inner, jax_core.Jaxpr) and len(inner.invars) == len(eqn.invars) and len(nested) == 1:
-            reads = _live_inputs(inner, used)
+        # A call (a jitted helper's `jaxpr`, a custom derivative's `call_jaxpr`): its jaxpr's inputs its own.
+        called = ("jaxpr" in eqn.params or "call_jaxpr" in eqn.params) and len(nested) == 1
+        if called and len(nested[0].invars) == len(eqn.invars):
+            reads = _live_inputs(nested[0], used)
         else:
             reads = [not nested] * len(eqn.invars)
         live.update(var for var, read in zip(eqn.invars, reads, strict=True)
