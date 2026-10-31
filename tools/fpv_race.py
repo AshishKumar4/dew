@@ -144,6 +144,26 @@ def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
             "finished": float((terminal & ~crashed).any(0).mean()), "steps": float((~ended).sum(0).mean())}
 
 
+def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: float) -> dict:
+    """`scored` of a teacher's greedy flight in a batched JAX race (`dew.rl.flight.FlightEnv`, its views the
+    teacher's and `passed`), the whole flight one jitted rollout (`dew.rl.env.env_rollout`)."""
+    from dew.rl.env import env_rollout, start
+
+    def rolled(params, key):
+        return env_rollout(env, objective.greedy, params, start(env, key), steps)[1].following
+
+    following = jax.device_get(jax.jit(rolled)(params, key))
+    last = following.terminated | following.truncated
+    ended = np.cumsum(last, 0) - last > 0
+    reward = np.where(ended, 0, following.reward)
+    passed = np.where(ended, 0, following.observation["passed"]).max(0)
+    terminal = following.terminated & ~ended
+    crashed = terminal & (following.reward < -crash_penalty / 2)
+    return {"return": float(reward.sum(0).mean()), "gates": float(passed.mean()),
+            "gates_max": int(passed.max()), "crashed": float(crashed.any(0).mean()),
+            "finished": float((terminal & ~crashed).any(0).mean()), "steps": float((~ended).sum(0).mean())}
+
+
 def teacher_policy(objective):
     """The teacher's greedy action from a driven step."""
     def greedy(params, observed, key, memory):
@@ -199,10 +219,9 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         families = TRAINING if level >= 0.3 else (("loop", 1.0),)
         return Batched(FlightEnv(racing_at(hz, families), ("teacher",), difficulty=level, ramp=level), drones)
 
-    def judged_at(level: float, families) -> object:
-        judged = race(1024, ("teacher", "passed"), hz=hz, families=families)
-        judged.difficulty = judged.ramp = level
-        return judged
+    def judged_at(level: float, families) -> Batched:
+        shown = ("teacher", "passed")
+        return Batched(FlightEnv(racing_at(hz, families), shown, difficulty=level, ramp=level), 1024)
 
     objective = teacher_objective()
     if warm is not None:
@@ -215,17 +234,16 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     report = {"drones": drones, "hz": hz, "warm": None if warm is None else str(warm), "curve": []}
     best, began, updates = (-1.0, -np.inf), time.perf_counter(), 0
     every = 10 * rollout.epochs * rollout.minibatches
-    horizon = round(20 * hz)
+    horizon, penalty = round(20 * hz), racing_at(hz).crash_penalty
     trained, held_out = judged_at(level, TRAINING), judged_at(level, HELD_OUT)
     while time.perf_counter() - began < seconds:
         state = trainer.fit(_idle(), steps=updates + every, log_every=every, state=state)
         updates += every
-        policy = teacher_policy(objective)
         point = {"updates": updates, "seconds": round(time.perf_counter() - began, 1),
                  "environment_steps": updates // (rollout.epochs * rollout.minibatches) * drones
                  * rollout.unroll_length, "level": level,
-                 **scored(trained, policy, state.variables, None, jax.random.key(1), horizon),
-                 "held_out": scored(held_out, policy, state.variables, None, jax.random.key(1), horizon)}
+                 **flown(trained, objective, state.variables, jax.random.key(1), horizon, penalty),
+                 "held_out": flown(held_out, objective, state.variables, jax.random.key(1), horizon, penalty)}
         report["curve"].append(point)
         print(json.dumps(point), flush=True)
         if (level, point["return"]) > best:
@@ -240,8 +258,8 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     variables = serialization.from_bytes(jax.device_get(state.variables), kept)
     final = judged_at(1.0, TRAINING), judged_at(1.0, HELD_OUT)
     names = ("trained", "held_out")
-    report["best"] = {"level": best[0], **{name: scored(judged, teacher_policy(objective), variables, None,
-                                                         jax.random.key(2), final[0].racing.max_steps)
+    report["best"] = {"level": best[0], **{name: flown(judged, objective, variables, jax.random.key(2),
+                                                        racing_at(hz).max_steps, penalty)
                                            for name, judged in zip(names, final, strict=True)}}
     (out / "teacher.json").write_text(json.dumps(report, indent=1))
     return report
