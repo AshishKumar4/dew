@@ -157,8 +157,7 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
                         kept = 1.0 if resets is None else 1.0 - resets[t, 0].astype(jnp.float32)
                         h = [jnp.exp2(step_ * rates[n]) * kept * h[n] + written * bs[t, n].astype(jnp.float32)
                              for n in range(states)]
-                        read = functools.reduce(jnp.add, [cs[t, n].astype(jnp.float32) * h[n]
-                                                          for n in range(states)])
+                        read = _pairwise([cs[t, n].astype(jnp.float32) * h[n] for n in range(states)])
                         out_smem[t, :] = (read + skip * value).astype(out_smem.dtype)
                         return h
 
@@ -188,6 +187,23 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
                              name="selective_scan")
     outs = launched(x, dt, b, c, parameters, state, resets)
     return (*outs, None) if not scan.entered else tuple(outs)
+
+
+def _pairwise(terms: list) -> jax.Array:
+    """`terms` summed as a balanced tree, its depth log2 of their count: summed in turn, the readout's 16
+    states put an fp32 scan's output 1.68 times the portable scan's distance from float64 where every decay
+    is near zero, its own write the whole state (the interpreted regime test)."""
+    while len(terms) > 1:
+        paired = [a + b for a, b in zip(terms[::2], terms[1::2], strict=False)]
+        terms = [*paired, *terms[len(terms) // 2 * 2:]]
+    return terms[0]
+
+
+PARTIALS = 32
+"""The buffers B's and C's gradients are added into across the channels, a channel's its index modulo
+them, then summed (XLA's reduction): each buffer adds a 32nd of the channels in turn, where one buffer's
+sequential adds put B's gradient 1.95 times the portable scan's distance from float64 with a document
+starting at every chunk (the interpreted regime test); the adds a buffer takes fewer, as contended."""
 
 
 POSITIONS_PER_THREAD = 16
@@ -272,8 +288,9 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 # dA from float64 against the rest's 4e-7, mamba1-scan-a100-7d3152837).
                 so_far = carried[1, n]
                 carried[1, n] = so_far + block_scan.summed(through * dts, exchanged, interpret=interpret)
-                added(db_ref.at[row, n, span], cotangent * dts * xs)
-                added(dc_ref.at[row, n, span], dys * (a * before + written))
+                partial = channel % PARTIALS
+                added(db_ref.at[partial, row, n, span], cotangent * dts * xs)
+                added(dc_ref.at[partial, row, n, span], dys * (a * before + written))
                 # `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times it, in the rate `dt ln(2)`.
                 return (dx + cotangent * bs * dts,
                         ddt + cotangent * bs * xs + through * (rate * math.log(2.0)))
@@ -303,9 +320,20 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                              name="selective_scan_backward",
                              scratch=(block_scan.scratch(), block_scan.exchange_scratch(positions),
                                       plgpu.SMEM((2, states), jnp.float32)))
-    db, dc = (jax.new_ref(jnp.zeros(b.shape, jnp.float32)) for _ in range(2))
-    dx, ddt, da, dd, dstate = launched(x, dt, b, c, parameters, entered, resets, dy, dfinal, db, dc)
-    return dx, ddt, jax.freeze(db), jax.freeze(dc), da, dd, dstate
+    def accumulated(refs):
+        """The launch's outputs written to `refs`, B's and C's gradients added to theirs from zero: state
+        the run discharges (`pl.run_state`), as a kernel's derivative inside a custom JVP
+        (`generation.linear_tangent`) can create no Ref of its own. A whole-array write of a launch's
+        output XLA folds to the output itself."""
+        db_ref, dc_ref, *outputs = refs
+        found = launched(x, dt, b, c, parameters, entered, resets, dy, dfinal, db_ref, dc_ref)
+        for ref, value in zip(outputs, found, strict=True):
+            ref[...] = value
+
+    zeros = (jnp.zeros((PARTIALS, *b.shape), jnp.float32),) * 2 + tuple(jnp.zeros(t.shape, t.dtype)
+                                                                      for t in out_type)
+    db, dc, dx, ddt, da, dd, dstate = pl.run_state(accumulated)(zeros)
+    return dx, ddt, db.sum(0), dc.sum(0), da, dd, dstate
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
