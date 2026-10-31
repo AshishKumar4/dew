@@ -1,5 +1,6 @@
 """Read-mode capabilities, range splits, partition discovery and shard resume."""
 
+import contextlib
 import dataclasses
 import hashlib
 import importlib.machinery
@@ -29,7 +30,7 @@ from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
-from dew.data.storage import Store
+from dew.data.storage import Replaced, Store
 
 
 def test_memory_columns_snapshot_changes_with_content():
@@ -440,6 +441,80 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
     assert actual == rows
     with pytest.raises(ValueError):
         Files(root, format="jsonl").records("memory")
+
+
+@contextlib.contextmanager
+def export_store(transport: str):
+    """An export root on `transport` and the storage options that reach it: fsspec's memory store, or a
+    bucket on a local S3 server."""
+    if transport == "memory":
+        yield f"memory://export-{uuid4().hex}", None
+        return
+    with moto_bucket("export") as (bucket, options):
+        yield f"s3://{bucket}/export", options
+
+
+@pytest.mark.parametrize("transport", ["memory", "s3"])
+@pytest.mark.parametrize("format", ["parquet", "array_record"])
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_a_shard_replaced_under_its_exports_manifest_is_refused_where_it_is_read(transport, format, read):
+    """A committed export's manifest states each shard's bytes and digest, which its source's identity
+    holds, as a saved run's plan does, and the version its store published it at (row 1871). A shard
+    rewritten under the manifest, its size kept or not, is never read under that identity, which does not
+    move, by a source whose identity was taken before the rewrite or a fresh one, as a resume reads it:
+    each read is refused, or reads the shard as it was published (from Dew's checked copy of it, where a
+    reader takes paths alone)."""
+    with export_store(transport) as (root, options):
+        export(Memory([{"id": index, "text": str(index)} for index in range(8)]), root, format=format,
+               rows_per_shard=4, storage_options=options)
+        taken = Files(root, format=format, storage_options=options)
+        identity = taken.fingerprint()
+
+        def rows(source):
+            if read == "streamed":
+                manifest = source.manifest()
+                return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
+            records = source.records("indexed")
+            return [records[index]["id"] for index in range(len(records))]
+
+        assert rows(taken) == list(range(8))
+        files = json.loads(Store(root + "/_dew_manifest.json", options).read())["files"]
+        shard = Store(root, options).child(files[0]["path"])
+        held = shard.read()
+        middle = len(held) // 2
+        for rewritten in (held[:middle] + bytes([held[middle] ^ 1]) + held[middle + 1:], held + b"\0"):
+            filesystem, path = shard.resolve()
+            filesystem.pipe_file(path, rewritten)
+            filesystem.invalidate_cache()
+            for source in (Files(root, format=format, storage_options=options), taken):
+                assert source.fingerprint() == identity
+                with contextlib.suppress(Replaced):
+                    assert rows(source) == list(range(8))
+
+
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_a_declared_line_file_replaced_under_its_facts_is_refused_where_it_is_read(read):
+    """A line file read under facts its publisher declared (`file_info`: its bytes and digest, no store's
+    version of it) is checked against them where a read opens it: rewritten, it is refused."""
+    root = Store(f"memory://declared-lines-{uuid4().hex}/rows.jsonl")
+    root.write(b'{"id":0}\n{"id":1}\n')
+    Files(root.url).provision()
+    index = root.url.removesuffix(".jsonl") + ".index.npy"
+    facts = {url: {"bytes": len(Store(url).read()), "sha256": hashlib.sha256(Store(url).read()).hexdigest()}
+             for url in (root.url, index)}
+
+    def rows():
+        source = Files((root.url,), format="jsonl", index=index, file_info=facts)
+        if read == "streamed":
+            manifest = source.manifest()
+            return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
+        records = source.records("indexed")
+        return [records[position]["id"] for position in range(len(records))]
+
+    assert rows() == [0, 1]
+    root.write(b'{"id":7}\n{"id":1}\n')
+    with pytest.raises(Replaced):
+        rows()
 
 
 def test_a_source_exports_the_records_its_pipeline_exports():
