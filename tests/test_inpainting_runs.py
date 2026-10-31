@@ -57,10 +57,11 @@ def pictures():
     return TFDS("dew_images", path=str(IMAGES), split="all")
 
 
-def masked_images(batch: int = 8):
-    """The run's captioned images at SIZE with a mask drawn for each (`RandomMask`)."""
+def masked_images(batch: int = 8, *, rejects: bool = True):
+    """The run's captioned images at SIZE with a mask drawn for each (`RandomMask`): a validation split's
+    keeps every image (`rejects=False`), so its masks are drawn by each record's own index."""
     return pictures().pipe(presets.images, SIZE, batch=batch, caption=image_steps.caption(),
-                           augment=image_steps.RandomMask())
+                           augment=image_steps.RandomMask(), rejects=rejects)
 
 
 def precision() -> ModelConfig:
@@ -204,7 +205,8 @@ def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpaintin
     the run is prepared, naming the step that draws them, where an evaluation would meet no mask."""
     _, fields = RUNS["diffusion"]
     run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
-                             data=masked_images(), validation=masked_images(), val_metrics=(), **fields)
+                             data=masked_images(), validation=masked_images(rejects=False), val_metrics=(),
+                             **fields)
     record = tmp_path / "record"
     run.save(str(record))
     runs = tmp_path / "runs"
