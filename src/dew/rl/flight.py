@@ -716,7 +716,7 @@ class FlightEnv:
     action_size = 4
 
     def __post_init__(self):
-        if not self.views or not set(self.views) <= set(VIEWS) - {"image"}:
+        if not self.views or not set(self.views) <= set(VIEWS[1:]):
             raise ValueError(f"a flight env shows some of the privileged views {VIEWS[1:]}, not {self.views}")
 
     def _observed(self, race: Race) -> dict[str, jax.Array]:

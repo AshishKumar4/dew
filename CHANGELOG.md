@@ -20,14 +20,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   - DiffusionNFT (`dew.objectives.rl.nft`).
   - `tools/rl_acceptance.py` runs these against their papers. `tutorials/12-world-models.ipynb` acts and
     imagines in one loop.
-- A first-person drone gate race (`dew.rl.flight`) with any flight simulator behind it:
-  - Progress-to-gate rewards, gates passed only through their openings, and frames and ground that are
+- A first-person drone gate race in JAX (`dew.rl.flight`), flown by a racing quadrotor's physics in JAX
+  (`dew.rl.quadrotor`: a 5-inch racer at 4.8 times its weight, first-order motors, a Betaflight-form rate
+  loop, rotor, body and vertical drag, ground effect, a LiPo pack's sag, disturbances and noise, each drawn
+  per episode):
+  - Progress-to-gate rewards, gates passed only through their openings, and frames, pillars and the ground
     solid along each physics step.
-  - Published racing layouts and random loops under a difficulty curriculum.
-  - Each drone's dynamics, latency and camera randomized.
-  - HyperDrone as its simulator (`dew.rl.hyperdrone`, the `hyperdrone` extra). This uses Dew's build of
-    HyperDrone, `hyperdrone==0.1.10.post1` from Dew's index, whose CUDA dynamics compile under thrust and
-    body-rate control.
+  - Courses of four families (published layouts, loops, Song's chained primitives with split-S and dives,
+    figure-eights) under a difficulty curriculum, the next gate lit for the camera.
+  - Each drone's physics, latency, camera and image randomized.
+  - HyperLux draws its cameras (`dew.rl.hyperlux`, the `hyperlux` extra) over textured grounds, skies,
+    pillars and props (`tools/fpv_assets.py`, CC0 textures).
   - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
     DreamerV3 agent on the camera alone.
 - A file an export's manifest or a source's `file_info` declares is never read as other bytes under

@@ -93,7 +93,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                                    "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.rl.env", "dew.rl.simulator", "dew.rl.flight", "dew.rl.hyperdrone",
+    ("Utilities", ["dew.rl", "dew.rl.env", "dew.rl.simulator", "dew.rl.quadrotor", "dew.rl.flight", "dew.rl.hyperlux",
                    "dew.rl.replay", "dew.rl.playground", "dew.rl.distributions",
                    "dew.artifacts", "dew.distributed", "dew.cache", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),

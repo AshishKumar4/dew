@@ -1,4 +1,4 @@
-"""HyperLux's camera outputs `dew.rl.hyperdrone` asks for."""
+"""HyperLux's camera outputs `dew.rl.hyperlux` asks for."""
 
 from collections.abc import Sequence
 

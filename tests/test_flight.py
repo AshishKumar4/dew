@@ -263,7 +263,7 @@ def one_gate(begin, end, pillar=(0.0, 0.0, 0.0, 0.0)):
     obstacles = np.zeros((OBSTACLES, 4))
     obstacles[0] = pillar
     course = dataclasses.replace(race.course, center=jnp.asarray(center), facing=jnp.zeros(GATES),
-                                 count=jnp.asarray(GATES), closed=jnp.asarray(data=True),
+                                 count=jnp.asarray(GATES), closed=jnp.ones((), bool),
                                  obstacles=jnp.asarray(obstacles))
     race = dataclasses.replace(race, course=course, index=jnp.asarray(0))
     return race, jnp.asarray(center[0] + np.asarray([begin, end]))

@@ -230,9 +230,8 @@ diffusers = ["diffusers>=0.34.0", "torch"]
 wan = ["ftfy"]
 # dew.rl.playground: MuJoCo Playground's MJX environments as Envs, its JAX implementation on any backend.
 playground = ["playground==0.2.0"]
-# dew.rl.hyperdrone: HyperDrone's L2F dynamics and HyperLux renderer as the gate race's flight simulator, Dew's
-# build of 0.1.10 (its CUDA dynamics under thrust and body rates compile), from Dew's index.
-hyperdrone = ["hyperdrone==0.1.10.post1"]
+# dew.rl.hyperlux: HyperLux's batch ray tracer drawing the gate race's cameras (an NVIDIA GPU with OptiX).
+hyperlux = ["hyperlux==0.1.10"]
 # GGUF files (Pretrained.load(..., gguf_file=)): llama.cpp's reader and block dequantizers.
 gguf = ["gguf==0.19.0"]
 # Official client transports and native request/result schemas; no model runtime.

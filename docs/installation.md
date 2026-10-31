@@ -102,7 +102,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 Dew requires `jax>=0.12.0.1.post40,<0.12.1`.
 <!-- END JAX requirement -->
 
-It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names. The index also serves Dew's builds of Qwix (the `quantization` extra) and HyperDrone (the `hyperdrone` extra, [AshishKumar4/hyperdrone](https://github.com/AshishKumar4/hyperdrone)). Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names. The index also serves Dew's build of Qwix (the `quantization` extra). Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
 - The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
@@ -164,7 +164,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `serve` | Starlette and uvicorn, for serving a decision model in Jev's wire format (`examples/serve_decisions.py`) |
 | `environments` | Agent environments and remote sandboxes for rollouts: OpenEnv and the Modal, E2B and Daytona SDKs |
 | `playground` | MuJoCo Playground's MJX environments as Dew environments (`dew.rl.playground`) |
-| `hyperdrone` | HyperDrone, Dew's build, as the gate race's flight simulator (`dew.rl.hyperdrone`), on an NVIDIA GPU with OptiX |
+| `hyperlux` | HyperLux's ray tracer drawing the gate race's cameras (`dew.rl.hyperlux`), on an NVIDIA GPU with OptiX |
 | `hpo` | Optuna, for `dew.config.sweep` |
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
