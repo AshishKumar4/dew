@@ -525,7 +525,7 @@ class Plan:
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
                 "data plan contains a step without stable identity or a store given no name "
-                "(from_grain(..., name=), from_iter(..., name=)); resume='non-exact' is required"
+                "(from_grain(..., identity=), from_iter(..., identity=)); resume='non-exact' is required"
             )
         edited = self._edited_members(saved)
         # A mix whose members changed is compared member by member (`_edited_members`): each kept

@@ -102,7 +102,7 @@ class Rows:
     pytest.param(lambda: _documents().map(lambda row: row), id="a lambda step"),
     pytest.param(lambda: Memory([{"image": np.zeros((2, 2), np.uint8)}]).batch(1), id="arrays in the store"),
     pytest.param(lambda: Memory([{"pair": (1, 2)}]).batch(1), id="a tuple read back a list"),
-    pytest.param(lambda: from_iter(Rows().opened, name="rows").batch(1), id="a bound method"),
+    pytest.param(lambda: from_iter(Rows().opened, identity="rows").batch(1), id="a bound method"),
     pytest.param(lambda: Memory([{"x": np.float64(1.5)}]).batch(1), id="a scalar JSON makes a float"),
 ])
 def test_a_chain_no_record_carries_whole_is_unrecorded_with_its_reason(unrecordable):
@@ -115,7 +115,7 @@ def test_a_chain_no_record_carries_whole_is_unrecorded_with_its_reason(unrecorda
 
 def test_a_chain_of_an_importable_iterator_is_recorded():
     """An iterator opened by a module-level function is recorded and read back."""
-    again = _read_back(from_iter(_rows, name="rows").batch(1))
+    again = _read_back(from_iter(_rows, identity="rows").batch(1))
     reader = iter(again)
     assert next(reader)["text"] == "a b"
 

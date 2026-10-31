@@ -601,7 +601,7 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
     manifest = _cache_key(source, prefix, read)
     if manifest is None:
         raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
-                         "state: name it (from_grain(..., name=), from_iter(..., name=), "
+                         "state: name it (from_grain(..., identity=), from_iter(..., identity=), "
                          "from_torch(..., identity=))")
     return manifest
 

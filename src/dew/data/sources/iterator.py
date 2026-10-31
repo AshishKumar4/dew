@@ -26,33 +26,33 @@ class Iterated(Dataset):
     Mosaic Streaming and Ray iterators each keep their own. `replay`
     declares instead that `factory()` reads the same records each time it
     opens, and a resume reads them again to its position (`Replayed`); a
-    stream with neither trains, and its resume is refused. `name` declares
+    stream with neither trains, and its resume is refused. `identity` declares
     its content version in a run's plan and its logs; with none, a resume
     needs `resume="non-exact"` (`Manifest.exact`)."""
 
     factory: Callable[[], Iterator[Batch]]
-    name: str | None = None
+    identity: str | None = None
     state: Callable[[Iterator[Batch]], Value] | None = None
     load_state: Callable[[Iterator[Batch], Value], None] | None = None
     replay: bool = False
     place: int = field(default_factory=unnamed, repr=False)
 
     def __post_init__(self) -> None:
-        if self.name == "":
-            raise ValueError("an iterator's name declares its content version; give one, or none")
+        if self.identity == "":
+            raise ValueError("an iterator's identity declares its content version; give one, or none")
         if (self.state is None) != (self.load_state is None):
             raise ValueError("from_iter takes state= and load_state= together")
         if self.replay and self.state is not None:
             raise ValueError("from_iter resumes through state= and load_state= or by replay=True, not both")
 
     def label(self) -> str:
-        return self.name or "iterator"
+        return self.identity or "iterator"
 
     def describe(self) -> str:
-        return f"iter:{self.name}" if self.name is not None else f"iter:unnamed-{self.place}"
+        return f"iter:{self.identity}" if self.identity is not None else f"iter:unnamed-{self.place}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {"store": "iterator", "identity_required": True, "identity": self.name}
+        return {"store": "iterator", "identity_required": True, "identity": self.identity}
 
     def supports(self, read: Read) -> bool:
         return read == "streamed"
@@ -154,11 +154,11 @@ class _StreamIterator[Rows: Iterator[Batch]](grain.DatasetIterator):
             super().close()
 
 
-def from_iter(factory: Callable[[], Iterator[Batch]], *, name: str | None = None,
+def from_iter(factory: Callable[[], Iterator[Batch]], *, identity: str | None = None,
               state: Callable[[Iterator[Batch]], Value] | None = None,
               load_state: Callable[[Iterator[Batch], Value], None] | None = None,
               replay: bool = False) -> Iterated:
-    """The records `factory()` iterates as a Dew dataset, under `name` where given, resumed
+    """The records `factory()` iterates as a Dew dataset, its content version `identity` where given, resumed
     through the iterator's own `state` and `load_state` where it has them,
     or by replay where it declares `replay` (`Iterated`)."""
-    return Iterated(factory, name, state, load_state, replay)
+    return Iterated(factory, identity, state, load_state, replay)

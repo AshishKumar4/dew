@@ -1494,7 +1494,7 @@ def test_foreign_sources_resume_only_their_declared_content_identity(kind, read,
         elif kind == "grain":
             source = from_grain(grain.MapDataset.source(rows), identity)
         else:
-            source = from_iter(lambda: iter(rows), name=identity, replay=True)
+            source = from_iter(lambda: iter(rows), identity=identity, replay=True)
         return compile(source.repeat().batch(4), read=read, resume=resume, loading=Loading(workers=0))
 
     original = dataset("tickets@1").train(DataPartition())
@@ -1552,7 +1552,7 @@ def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path
     # Without a native position, the stream resumes by replay, which it declares.
     options = ({"state": lambda it: it.file.tell(), "load_state": lambda it, saved: it.file.seek(saved)}
                if native_state else {"replay": True})
-    source = from_iter(Native, name="native-file@1", **options)
+    source = from_iter(Native, identity="native-file@1", **options)
     manifest = source.manifest()
     reader = iter(manifest.reader(manifest.shards[0]))
     try:
@@ -1596,7 +1596,7 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
         finalizers.append(finalized)
         return iterator
 
-    source = from_iter(factory, name="closing-generator@1").repeat().batch(2)
+    source = from_iter(factory, identity="closing-generator@1").repeat().batch(2)
     reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
                      ).train(DataPartition())
     try:
@@ -1627,7 +1627,7 @@ def test_from_iter_forwards_a_native_stop_request():
         def request_stop(self):
             stopped.append(True)
 
-    source = from_iter(Native, name="stoppable@1")
+    source = from_iter(Native, identity="stoppable@1")
     manifest = source.manifest()
     reader = iter(manifest.reader(manifest.shards[0]))
     try:
@@ -1696,7 +1696,7 @@ def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
         if kind == "grain":
             from_grain(grain.MapDataset.source(rows), "")
         else:
-            from_iter(lambda: iter(rows), name="")
+            from_iter(lambda: iter(rows), identity="")
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
@@ -2079,7 +2079,7 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
     from dew.data.sources.hf import from_hf
 
     indexed = from_grain(grain.MapDataset.source([{"id": index} for index in range(6)]), "indexed")
-    table = from_hf(Arrow.from_dict({"id": list(range(10, 16))}), name="table")
+    table = from_hf(Arrow.from_dict({"id": list(range(10, 16))}), identity="table")
     stream = grain.MapDataset.source([{"id": 20 + index} for index in range(6)]).to_iter_dataset()
     streamed = from_grain(stream, "streamed")
     loading = Loading(workers=0, threads=1, read_buffer=1)
