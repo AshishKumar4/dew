@@ -23,7 +23,7 @@ from dew.interop.families.gemma import (
     GEMMA4_UNIFIED_TEXT,
 )
 from dew.interop.families.glm import GLM4_MOE, GLM5_NEXT_TEXT, GLM_MOE_DSA
-from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ
+from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ, OPENAI_GPT
 from dew.interop.families.gpt_bigcode import GPT_BIGCODE
 from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
@@ -78,6 +78,8 @@ ENTRIES = (
     NEMOTRON_H,
     STARCODER2,
     GPT_NEOX,
+    # Its post-LN blocks over GPT-2's layers, with no final norm and no position offset (OPT-350m's has two).
+    OPENAI_GPT,
     OPT,
     GPT_BIGCODE,
     GPT2,
