@@ -392,6 +392,8 @@ def test_edm_draws_the_sigmas_of_the_space_it_denoises(rng, fields, mean, std):
 
 
 def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with(rng):
+    """A run derives its EDM preset's space where it builds its process (`derived_preset`): pixels without an
+    autoencoder, latents with one; sigmas the preset states win."""
     from dew.config.diffusion import DiffusionRunConfig
     from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 
@@ -400,7 +402,7 @@ def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_
         (DiffusionRunConfig(autoencoder=PretrainedAutoencoder()), -0.4, 1.0),
         (DiffusionRunConfig(preset=presets.EDM(P_mean=-0.8, P_std=0.7)), -0.8, 0.7),
     ):
-        schedule = config.preset().schedule
+        schedule = config.derived_preset()().schedule
         assert_follows(jnp.log(schedule.sigmas(schedule.sample_t(rng, 1 << 18))), stats.norm(mean, std))
 
 

@@ -51,7 +51,7 @@ PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
 over 64 and 256 keys, which walk two and eight."""
 
 INTERPRETED = jax.default_backend() == "cpu"
-"""Whether the frozen Triton mainloop runs interpreted, in a CPU process, or compiled, on a GPU: the A100's
+"""Whether the Pallas-Triton mainloop runs interpreted, in a CPU process, or compiled, on a GPU: the A100's
 default for every template call and the H100's for fp16 and the hooks Mosaic refuses, so the GPU tier
 proves on the compiled kernel what the interpreter covers."""
 
@@ -940,7 +940,7 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 
 
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
-"""The families whose frozen Triton default-form check runs on a GPU alone, compiled as its route runs it
+"""The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
 (tests/test_gpu_attention.py): 256 draws interpreted take past the CPU suite's 240 s target (218-257 s,
 row 1849)."""
 
@@ -951,7 +951,7 @@ row 1849)."""
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
     fp32's largest (`default_is_finite`): it guards its sums' headroom in either form, as the template's
-    production route runs it on an sm80 or later GPU. Frozen until its Mosaic mainloop replaces it, it
+    production route runs it on an sm80 or later GPU. It
     walks without the fold's reach (`algebra.walked`), so the fold's other divergences remain an open
     defect (ledger 1637)."""
     default_is_finite(family, "triton")

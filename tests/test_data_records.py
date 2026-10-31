@@ -102,7 +102,7 @@ class Rows:
     pytest.param(lambda: _documents().map(lambda row: row), id="a lambda step"),
     pytest.param(lambda: Memory([{"image": np.zeros((2, 2), np.uint8)}]).batch(1), id="arrays in the store"),
     pytest.param(lambda: Memory([{"pair": (1, 2)}]).batch(1), id="a tuple read back a list"),
-    pytest.param(lambda: from_iter(Rows().opened, name="rows").batch(1), id="a bound method"),
+    pytest.param(lambda: from_iter(Rows().opened, identity="rows").batch(1), id="a bound method"),
     pytest.param(lambda: Memory([{"x": np.float64(1.5)}]).batch(1), id="a scalar JSON makes a float"),
 ])
 def test_a_chain_no_record_carries_whole_is_unrecorded_with_its_reason(unrecordable):
@@ -115,9 +115,32 @@ def test_a_chain_no_record_carries_whole_is_unrecorded_with_its_reason(unrecorda
 
 def test_a_chain_of_an_importable_iterator_is_recorded():
     """An iterator opened by a module-level function is recorded and read back."""
-    again = _read_back(from_iter(_rows, name="rows").batch(1))
+    again = _read_back(from_iter(_rows, identity="rows").batch(1))
     reader = iter(again)
     assert next(reader)["text"] == "a b"
+
+
+def test_a_chain_recorded_while_an_iterators_identity_was_its_name_reads_back():
+    """A run recorded while an iterator's content version was its `name` reads its chain back with that
+    version its `identity` (`RENAMED_FIELDS`, row 3031), a mix's members' stores too."""
+    chain = mix([from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2")]).batch(1)
+    written = json.dumps(encode(chain))
+    earlier = json.loads(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert earlier != json.loads(written)
+    mixture = decode(earlier).source
+    assert [member.source.identity for member in mixture.pipelines] == ["rows@1", "rows@2"]
+
+
+def test_a_concatenation_recorded_while_its_iterators_identities_were_their_names_reads_back():
+    """An iterator an earlier record names by `name` within another store's record, a concatenation's
+    part, reads with that version its `identity` too: wherever the record builds it (row 3031)."""
+    from dew.data.sources import Concatenate
+
+    chain = Concatenate((from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2"))).batch(1)
+    written = json.dumps(encode(chain))
+    earlier = json.loads(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert earlier != json.loads(written)
+    assert [part.identity for part in decode(earlier).source.sources] == ["rows@1", "rows@2"]
 
 
 def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():

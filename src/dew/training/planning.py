@@ -17,7 +17,6 @@ import logging
 import tempfile
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import jax
@@ -38,7 +37,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
-from dew.telemetry.profile import active_profile, capture_options
+from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed, program_of
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
@@ -436,13 +435,15 @@ class Trials:
             current, held = apart(stepped)
             parts = planned.parts(mesh)
             with tempfile.TemporaryDirectory() as directory:
-                with jax.profiler.trace(directory, profiler_options=capture_options()):
+                # XLA reads the trace alone, so the capture writes no XProf reports.
+                with Profiler(directory, reports=False) as profiler:
                     for _ in range(runs):
                         for part in parts:
                             current, *_ = planned.executable(current, held, self.batch, part)
                         jax.block_until_ready(current)
-                (capture,) = Path(directory).glob("plugins/profile/*")
-                return get_profiled_instructions_proto(str(capture))
+                (capture,) = profiler.captures
+                (session,) = capture.glob("plugins/profile/*")
+                return get_profiled_instructions_proto(str(session))
 
         return self.run(profile)
 
@@ -493,15 +494,15 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch) -> dict[str, JSON]:
+def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
+            frontier: Sequence[Probe] | None = None) -> dict[str, JSON]:
     """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
     read before them (`FitSearch.derived`), and the kernels those compiles found spilling and the launch
     configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
-    (`StepCompiled`); planned ahead with its frontier, each rung above the plan that fits
-    (`FitSearch.frontier`). There is no alternative-policy timing or selection in the record."""
+    (`StepCompiled`); planned ahead with its `frontier`, each rung above the plan that fits at fewer
+    microbatches (`FitSearch.above`). There is no alternative-policy timing or selection in the record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
-    above: dict[str, JSON] = ({} if search.frontier is None
-                              else {"frontier": [probe.record() for probe in search.frontier]})
+    above: dict[str, JSON] = {} if frontier is None else {"frontier": [probe.record() for probe in frontier]}
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
             "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels,
             **above}
@@ -581,10 +582,6 @@ class FitSearch[LossT, EffectsT]:
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`) and each launch config they refused
     (`report.refused_launches`), none the registry held before it searched."""
-    frontier: list[Probe] | None = None
-    """With a list, past the admitted plan, each rung above it at its fewest microbatches that fit
-    (`above`): the plans a run's speed is chosen among offline (`dew.training.ahead.compile_ahead`), none of
-    which the run takes; None in a run, which compiles no rung but the one it takes."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
@@ -611,25 +608,28 @@ class FitSearch[LossT, EffectsT]:
         self.kernels = {"spills": spills, "refused": refused}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
-        found, probes = self.found(split), tuple(self.probes)
-        if self.frontier is not None:
-            self.above(candidates[:candidates.index(split) + 1])
-        return found, probes
+        return self.found(split), tuple(self.probes)
 
-    def above(self, candidates: Sequence[int]) -> None:
-        """Each rung above the objective's at the fewest of `candidates`, the admitted plan's splits and
-        fewer, that fit there, compiled and kept in `frontier`: a rung that fits at none of them recomputes
-        more at more microbatches than the plan, which no speed favours. A remat rung takes the run's own
-        head again (`recompute_more`), so it may need more microbatches than the tiled head below it, and
-        the search reads every rung to the ladder's end. The objective is left at the last."""
-        while self.onward(lambda: recompute_more(self.objective, self.base)):
+    def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
+        """Past the admitted plan at `split`, each rung above it that fits at fewer of `candidates` than every
+        plan before it, at the fewest that fit there, compiled: the plans a run's speed is chosen among
+        offline (`dew.training.ahead.compile_ahead`'s frontier). A rung at as many microbatches as one below
+        it recomputes more for none fewer, which no speed favours, so it is not compiled; a remat rung takes
+        the run's own head again (`recompute_more`), so a rung may fit at fewer than the one before it, and
+        the search reads the ladder to its end, or until a rung fits at the fewest. The objective is left
+        at the last rung read, the run's to restore."""
+        # A frontier rung that misses is no checkpoint's rung missing (`fits_here`).
+        self.resumed = None
+        fewer, found = list(candidates[:candidates.index(split)]), []
+        while fewer and self.onward(lambda: recompute_more(self.objective, self.base)):
             asked = len(self.probes)
-            fewest = planned(candidates, 0, self.fits_here, lambda: False,
+            fewest = planned(fewer, 0, self.fits_here, lambda: False,
                              lambda split: self.forecast.likely(self.rung(), split))
             if fewest is not None:
-                assert self.frontier is not None
-                self.frontier.append(next(probe for probe in self.probes[asked:] if probe.fits
-                                          and probe.split == fewest))
+                found.append(next(probe for probe in self.probes[asked:]
+                                  if probe.fits and probe.split == fewest))
+                fewer = fewer[:fewer.index(fewest)]
+        return tuple(found)
 
     def derived_start(self, split: int) -> None:
         """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's
