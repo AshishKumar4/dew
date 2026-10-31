@@ -73,9 +73,11 @@ def test_a_tensor_memory_launch_refuses_an_automatic_mesh_axis():
     def copy(source, output):
         output[...] = source[...]
 
+    launch = TCGEN05.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
+                            grid_names=("programs",), scratch=(), interpret=True)
+    # A launch is built once for every call of its facts; each call checks the mesh it runs in.
     with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError):
-        TCGEN05.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
-                       grid_names=("programs",), scratch=(), interpret=True)
+        launch(jnp.zeros((128,), jnp.float32))
 
 
 @dataclasses.dataclass(frozen=True, order=True)
