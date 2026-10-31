@@ -50,7 +50,7 @@ import jax.experimental.topologies as topologies
 import numpy as np
 from jax.experimental import serialize_executable
 
-from dew._records import JSON, listed, record
+from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
 from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_target, tpu
@@ -69,7 +69,10 @@ def target_config(generation: str, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
     (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
     multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
-    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
+    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code. From
+    Hopper on, its capability states the architecture-specific features (sm_90a, sm_100a, sm_120a), which
+    Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain sm_120 and refused its own
+    PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
     target, version = gpu_target(generation), capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
@@ -94,6 +97,7 @@ def target_config(generation: str, capacity: int | None = None) -> str:
   cuda_compute_capability {{
     major: {major}
     minor: {minor}
+    feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
   }}
   registers_per_core_limit: 65536
   registers_per_block_limit: 65536
@@ -388,11 +392,6 @@ class CompiledAhead(SystemExit):
             assert isinstance(probes, list)
             _log.info("planned on them in %.1f s, %d programs compiled, the plan %s", ahead.planned_seconds,
                       len(probes), json.dumps(ahead.plan))
-            for above in listed(record(ahead.plan, "plan").get("frontier", []), "frontier", read=record,
-                                what="frontier"):
-                _log.info("above it, fitting: %s x %s rows at remat %r, the head tile %s%s, %s bytes of "
-                          "temporaries", above["split"], above["rows"], above["remat"], above["head_tile"],
-                          " fused" if above["head_fused"] else "", above["temp"])
 
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
@@ -440,6 +439,10 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if capacity is not None and on_tpus:
         raise ValueError(f"a TPU topology states its own memory; compile it ahead for {generation} with no "
                          "capacity")
+    if frontier and capacity is None and not on_tpus:
+        raise ValueError("a frontier lists the rungs that fit the GPUs' memory, which compile-only GPUs "
+                         "do not state; name it (--trainer.compile-ahead.capacity-gib, compile_ahead's "
+                         "capacity)")
     if capacity is not None:
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity)

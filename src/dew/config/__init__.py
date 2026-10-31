@@ -89,6 +89,7 @@ from dew.registry import (
     wants_tuple,
 )
 from dew.state import TrainState
+from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
@@ -974,11 +975,11 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
-    (`earlier_newton_schulz`).
+    (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return earlier_newton_schulz(earlier_trainer(record))
+    return earlier_profile(earlier_newton_schulz(earlier_trainer(record)))
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1013,6 +1014,33 @@ def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
         source = fields.get("source")
         fields["source"] = {**(source if isinstance(source, Mapping) else {}), "param_dtype": stored}
     return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
+
+
+EARLIER_CAPTURE = ("host_tracer_level", "python_tracer_level", "activity_cap")
+"""The capture options a profile window held as its own fields until it held its capture's
+(`dew.training.ProfileWindow.capture`, row 2932)."""
+
+
+def earlier_profile(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose trainer's profile window states its capture's options as its own fields
+    (`EARLIER_CAPTURE`), with them its capture's, as it captured with them. A window that states its
+    capture beside them is as it was, its fields refused by name. Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
+    inner = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else None
+    window = inner.get("profile") if isinstance(inner, Mapping) else None
+    stated = window.get("fields", window) if isinstance(window, Mapping) else None
+    if (not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(inner, Mapping)
+            or not isinstance(window, Mapping) or not isinstance(stated, Mapping) or "capture" in stated
+            or not set(EARLIER_CAPTURE) & set(stated)):
+        return record
+    capture = {name: stated[name] for name in EARLIER_CAPTURE if name in stated}
+    stated = {**{name: value for name, value in stated.items() if name not in EARLIER_CAPTURE},
+              "capture": capture}
+    window = {**window, "fields": stated} if "fields" in window else stated
+    inner = {**inner, "profile": window}
+    trainer = {**trainer, "fields": inner} if "fields" in trainer else inner
+    return {**record, "fields": {**fields, "trainer": trainer}}
 
 
 EARLIER_NS_PRECISIONS = {"bfloat16": None, "tensorfloat32": "TF32_TF32_F32", "float32": "F32_F32_F32"}
@@ -1679,7 +1707,7 @@ class RunConfig:
         return dataclasses.replace(self, source=dataclasses.replace(self.source, step=step))
 
     def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
-                capture: ProfileWindow | None = None) -> ProfileReport | None:
+                capture: CaptureOptions | None = None) -> ProfileReport | None:
         """Train this run afresh under `directory` for `warmup` steps, then a window of `steps` more traced
         (`ProfileWindow`), and report where the window's steps spent their time (`ProfileReport`), written
         as `report.json` beside XProf's own reports. The warmup is whole windows, at least one, so the step
@@ -1690,10 +1718,10 @@ class RunConfig:
         summaries (a split its chain holds out scores after the window), its W&B sink, and a lowering, a
         compile ahead or a step compiled ahead for its own length, which the profile trains past.
         `directory` unset is profiles/<the run's name>/<the time it starts>, read once the process is
-        prepared, as `run` reads a run's name. The run's own directory is left as it is. `capture` gives the
-        capture's options (its `host_tracer_level`, `python_tracer_level` and `activity_cap`; its
-        directory and steps are the profile's). Raises ValueError for a directory that holds this run's
-        profile already. The report is process zero's, which logs the run; None on the others."""
+        prepared, as `run` reads a run's name. The run's own directory is left as it is. `capture` is what
+        the capture records (`CaptureOptions`), its own by default. Raises ValueError for a directory that
+        holds this run's profile already. The report is process zero's, which logs the run; None on the
+        others."""
         from dew.training import prepare_process, run_timestamp
 
         name = self.trainer.name or "profile"
@@ -1710,8 +1738,7 @@ class RunConfig:
             raise ValueError(f"{directory} holds a profile of {name} already; give the profile a directory "
                              "of its own")
         window = os.path.join(directory, "capture")
-        captured = dataclasses.replace(capture or ProfileWindow(window, steps), directory=window, steps=steps,
-                                       warmup=warmup)
+        captured = ProfileWindow(window, steps, warmup, capture or CaptureOptions())
         trainer = dataclasses.replace(trainer, checkpoint_dir=directory, profile=captured)
         profiled = dataclasses.replace(self, validation=None, val_metrics=None, val_every={},
                                        val_summaries=(), trainer=trainer)

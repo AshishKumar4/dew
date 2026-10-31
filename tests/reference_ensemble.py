@@ -3,16 +3,19 @@ a computation held over exact symmetries of its sums, against the worst admitted
 reference's ensemble (`assert_elements_as_exact`, `assert_leaves_as_exact_over_orders`), and a kernel
 held where it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`)."""
 
+import dataclasses
 
 import jax
 import numpy as np
 from reference_error import (
     FACTOR,
     ORDERS,
+    _given,
     assert_as_exact_over_orders,
     assert_rows_as_exact_over_orders,
     row_errors,
     widened,
+    without_ynn,
 )
 
 from dew.accuracy import distance, within
@@ -157,7 +160,8 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
     bundles = {"reference's parents": reference.replay(inputs), "dew's parents": dew.replay(inputs)}
     report = {}
     for name in names:
-        mine, theirs, true = dew.node(name), reference.node(name), truth.node(name)
+        mine, theirs = _compiled_alike(dew.node(name)), _compiled_alike(reference.node(name))
+        true = truth.node(name)
         assert type(mine.kind) is type(theirs.kind), f"{label} {name}: {mine.kind} against {theirs.kind}"
         for bundle, values in bundles.items():
             parents = {parent: values[parent] for parent in mine.parents}
@@ -170,6 +174,23 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
                     _node_draw(mine, theirs, true, parents, wide, mine.kind), where, rows=False)
     _assert_end_to_end(dew, reference, truth, inputs, orbit, label)
     return report
+
+
+def _compiled_alike(node):
+    """A node as the gate holds it on the CPU lane: its program and its members' compiled without YNNPACK's
+    fusions (`without_ynn`), as check 1 compiles two Dew paths (`_arms`), so two sides' sums round by one
+    kind of code on any host, whatever the site compiled them with (ledger 3048, 3113: a YNNPACK fusion's
+    float32-rounded products against a loop's contracted ones failed an equally exact sum on some hosts).
+    A program run as it is given (`as_given`), and every node off the CPU, as it is. The witness
+    (`Graph.fused`), the production path, keeps its own compile."""
+    if jax.default_backend() != "cpu":
+        return node
+
+    def alike(fn):
+        return fn if _given(fn) else without_ynn(fn)
+
+    return dataclasses.replace(node, fn=alike(node.fn),
+                               members={member: alike(fn) for member, fn in node.members.items()})
 
 
 def _node_draw(mine, theirs, true, parents, wide, kind):
