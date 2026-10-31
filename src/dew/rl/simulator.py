@@ -19,6 +19,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from dew.rl.env import Carry, Env, Observation, Params, Policy, TimeStep, Transition, driven_step, start
 
@@ -51,10 +52,17 @@ class Simulator(Protocol):
 
 
 def received(tree: Any) -> Any:  # noqa: ANN401
-    """A simulator's arrays as JAX arrays, through DLPack: on the device they are held on, without a
-    copy where the producer allows it, a host array as JAX takes host memory."""
-    return jax.tree.map(lambda leaf: leaf if isinstance(leaf, jax.Array) else jax.dlpack.from_dlpack(leaf),
-                        tree)
+    """A simulator's arrays as JAX arrays: a device array through DLPack, on the device it is held on and
+    without a copy where the producer allows it; a NumPy array copied to the default device, as a
+    learner reads it."""
+    def taken(leaf: Any) -> jax.Array:  # noqa: ANN401
+        if isinstance(leaf, jax.Array):
+            return leaf
+        if isinstance(leaf, np.ndarray | np.generic):
+            return jnp.asarray(leaf)
+        return jax.dlpack.from_dlpack(leaf)
+
+    return jax.tree.map(taken, tree)
 
 
 def chosen(mask: jax.Array, new: Any, old: Any) -> Any:  # noqa: ANN401

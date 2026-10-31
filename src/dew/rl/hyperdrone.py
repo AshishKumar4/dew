@@ -3,14 +3,18 @@ the `hyperdrone` extra, on an NVIDIA GPU with OptiX).
 
 HyperDrone's own environment holds one gate an instance and detects no collisions, so the race composes
 its two parts as its examples/drone_flythrough.py does: L2F's dynamics (`hyperdrone.dynamics.Sim`) under
-collective thrust and body rates with ideal actuation, and HyperLux's batch ray tracer drawing each
-drone's front camera over a ground and its own course's gates, placed on the device each frame. The
-course, reward and collisions are the race's, in JAX.
+collective thrust and body rates with ideal actuation, on the CPU (0.1.10's CUDA build of that control
+does not compile: ptxas meets a host-only operation; 4096 drones step 18,000 times a second on one
+core), and HyperLux's batch ray tracer drawing each drone's front camera over a ground and its own
+course's gates, placed on the device each frame. The course, reward and collisions are the race's, in
+JAX.
 
 The drone is L2F's `flightmare` quadrotor, the nearest it holds to a five-inch racer: 0.73 kg on arms
 of 0.17 m, its four rotors lifting 12.1 times its weight at full command (parameters/dynamics/
 flightmare.h), so it hovers at 0.083 of full thrust (`hover_throttle`, the race's `Racing.hover_throttle`)
-and its body rates are commanded up to `rate_limit`, FlyDreamer's 4 radians a second.
+and its body rates are commanded up to `rate_limit`, FlyDreamer's 4 radians a second. Ideal actuation
+reads its thrust-to-weight from its own parameters, which 0.1.10 derives from the default model whatever
+model is loaded, so it is set from the loaded model's rotors (`thrust_to_weight`).
 """
 
 from __future__ import annotations
@@ -29,6 +33,16 @@ SKY = (0.55, 0.7, 0.9)
 """The background's colour, linear RGB."""
 GATE, TARGET = (0.85, 0.85, 0.85), (0.95, 0.3, 0.1)
 """The colour of a gate, and of the gate a drone heads for."""
+
+
+def thrust_to_weight(model: dict) -> float:
+    """A loaded L2F model's full-command thrust over its weight (L2F's `ideal_rates`, multirotor.h), from
+    its parameters' `dynamics.dynamics`."""
+    command = model["action_limit"]["max"]
+    thrust = sum(direction[2] * (low + linear * command + square * command ** 2)
+                 for (low, linear, square), direction in zip(model["rotor_thrust_coefficients"],
+                                                             model["rotor_thrust_directions"], strict=True))
+    return float(thrust / (model["mass"] * np.linalg.norm(model["gravity"])))
 
 
 def _gate(opening: float, frame: float, color: tuple[float, float, float]) -> Any:  # noqa: ANN401
@@ -77,11 +91,13 @@ class HyperDroneFlight:
 
         self.count, self.gates, self.substeps = count, gates, substeps
         self.rate_limit, self.fov = rate_limit, fov
-        parameters = {"dynamics": {"dynamics": {"model": model}, "integration": {"dt": 1 / (hz * substeps)},
-                                   "ideal_rates": {"rate_limit": [rate_limit] * 3}}}
-        self.sim = dynamics.Sim(count, parameters=parameters, seed=seed, device="cuda", control="ctbr",
-                                actuation="ideal")
-        self.hover_throttle = 1 / self.sim.parameters["dynamics"]["ideal_rates"]["thrust_to_weight"]
+        shared = {"dynamics": {"model": model}, "integration": {"dt": 1 / (hz * substeps)}}
+        loaded = dynamics.Sim(1, parameters={"dynamics": shared}, control="ctbr", actuation="ideal")
+        ratio = thrust_to_weight(loaded.parameters["dynamics"]["dynamics"])
+        ideal = {"thrust_to_weight": ratio, "rate_limit": [rate_limit] * 3}
+        self.sim = dynamics.Sim(count, parameters={"dynamics": {**shared, "ideal_rates": ideal}}, seed=seed,
+                                control="ctbr", actuation="ideal")
+        self.hover_throttle = 1 / ratio
         scene = hyperlux.Scene()
         scene.add_object(_ground(extent, tile))
         scene.add_light(hyperlux.SceneLight.directional(direction=(0.3, 0.2, -1.0), color=(1.0, 1.0, 1.0)))
@@ -119,8 +135,8 @@ class HyperDroneFlight:
         return bases.reshape(-1, 12)
 
     def _state(self, name: str) -> jax.Array:
-        """The sim's `name` state of every drone, copied out of its borrowed buffer."""
-        return jnp.array(jax.dlpack.from_dlpack(self.sim.state_dlpack(name)))
+        """The sim's `name` state of every drone, on the default device."""
+        return jnp.asarray(self.sim.state[name])
 
     def _kinematics(self) -> Kinematics:
         return Kinematics(*(self._state(name) for name in ("position", "linear_velocity", "orientation",
@@ -138,7 +154,7 @@ class HyperDroneFlight:
 
     def step(self, commands: jax.Array) -> tuple[Kinematics, jax.Array, None]:
         normalized = jnp.concatenate([2 * commands[:, :1] - 1, commands[:, 1:] / self.rate_limit], -1)
-        normalized = jax.block_until_ready(jnp.clip(normalized, -1, 1).astype(jnp.float32))
+        normalized = np.asarray(jnp.clip(normalized, -1, 1), np.float32)
         path = [self._state("position")]
         for _ in range(self.substeps):
             self.sim.step(normalized)
@@ -151,11 +167,10 @@ class HyperDroneFlight:
         bases = jax.block_until_ready(self._bases(gates))
         self.renderer.set_pose(self._placements, hyperlux.Pose(bases))
         self.renderer.update()
-        self.renderer.set_cameras(self.sim.camera_bases_dlpack(fov=self.fov, aspect=self.renderer.aspect),
-                                  stream=self.sim.stream)
+        self.renderer.set_cameras(self.sim.camera_bases(fov=self.fov, aspect=self.renderer.aspect))
         self.renderer.render()
         blocks = [jax.dlpack.from_dlpack(block) for block in self.renderer.outputs[self._rgb].blocks]
         return jnp.concatenate(blocks)[:, 0, ..., :3]
 
 
-__all__ = ["HyperDroneFlight"]
+__all__ = ["HyperDroneFlight", "thrust_to_weight"]

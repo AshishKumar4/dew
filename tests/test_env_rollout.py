@@ -149,7 +149,7 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
     from dew.training import Trainer
 
     walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 64)
-    env = HostWalks(64, 8, limit=50.0) if simulated else walks
+    env = HostWalks(64, 8, limit=50.0, drawn=True) if simulated else walks
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
     rollout = ControlRollout(objective, env, unroll_length=8, epochs=2, minibatches=2)
     trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout)
@@ -179,16 +179,22 @@ class Settled(Walk):
 
 class HostWalks:
     """`Settled` walks cut after `length` steps, simulated on the host in NumPy as a simulator outside JAX
-    simulates them: it reads each action through DLPack, answers NumPy arrays, which JAX takes the same
-    way, and restarts the episodes it is told to."""
+    simulates them: it reads each action through DLPack, answers NumPy arrays, and restarts the episodes
+    it is told to. `drawn` walks start, as `Walk`'s do, at integers drawn from [-2, 2]."""
 
     action_size = 1
 
-    def __init__(self, count: int, length: int, limit: float = 4.0):
-        self.count, self.length, self.limit = count, length, limit
+    def __init__(self, count: int, length: int, limit: float = 4.0, *, drawn: bool = False):
+        self.count, self.length, self.limit, self.drawn = count, length, limit, drawn
+
+    def starts(self) -> np.ndarray:
+        if self.drawn:
+            return self.rng.integers(-2, 3, self.count).astype(np.float32)
+        return np.ones(self.count, np.float32)
 
     def reset(self, seed: int):
-        self.x, self.steps = np.ones(self.count, np.float32), np.zeros(self.count, np.int32)
+        self.rng = np.random.default_rng(seed)
+        self.x, self.steps = self.starts(), np.zeros(self.count, np.int32)
         return self.x[:, None].copy()
 
     def step(self, action):
@@ -200,7 +206,7 @@ class HostWalks:
 
     def restart(self, mask):
         mask = np.asarray(mask)
-        self.x = np.where(mask, np.float32(1), self.x).astype(np.float32)
+        self.x = np.where(mask, self.starts(), self.x).astype(np.float32)
         self.steps = np.where(mask, 0, self.steps)
         return self.x[:, None].copy()
 
