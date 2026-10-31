@@ -756,7 +756,10 @@ class Store:
             from aiohttp import ClientResponseError
 
             try:
-                return fs.cat_file(path, start=start, end=end, headers={"If-Match": version})
+                # Beside the headers the filesystem sends with every read (its storage options'), which
+                # a call's own headers would replace.
+                headers = {**dict(fs.kwargs.get("headers") or {}), "If-Match": version}
+                return fs.cat_file(path, start=start, end=end, headers=headers)
             except ClientResponseError as error:
                 if error.status == 412:
                     raise Replaced(f"{self.url} is no longer the object published at ETag "
