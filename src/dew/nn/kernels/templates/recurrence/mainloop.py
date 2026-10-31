@@ -2176,13 +2176,13 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
     """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held, after, leaving [blocks, HV, R], memory
     [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
     (fla's dqkwg's memory products, `algebra.memory_gradients`, given the scores' gradient `ds` `[R, HV * C]`
-    in `_score_grads`' form, `_scores_back`'s), a program a key head's and a step each value head it serves, the
-    queries' and keys' summed over them in fp32 where they leave (each program's own tiles: a register
-    carry across the steps spilled), as the port's sum; the decay's range terms over the block's key
-    columns, each token's (`algebra.memory_gradients`' `(after, leaving)`, which `gradients` sums over their
-    ranges: summed here, their `[C, C]` tiles spilled 376 bytes a thread on an H100's), and the block's rows
-    of `sum(S dS)`, the memory's decay's gradient across the chunk. `h` and `dh` the memories each chunk
-    enters and its leaving memory's gradient (`call.memories`)."""
+    in `_score_grads`' form, `_scores_back`'s), a program a key head's and a step each value head it serves,
+    the queries' and keys' summed over them in fp32 where they leave (each program's own tiles: a register
+    carry across the steps spilled), as the port's sum; the decay's range terms over the block's key columns,
+    each token's (`algebra.memory_gradients`' `(after, leaving)`, which `gradients` sums over their ranges:
+    summed here, their `[C, C]` tiles spilled 376 bytes a thread on an H100's), and the block's rows of `sum(S
+    dS)`, the memory's decay's gradient across the chunk. `h` and `dh` the memories each chunk enters and its
+    leaving memory's gradient (`call.memories`)."""
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     grads = _score_grads(call)
@@ -2282,10 +2282,10 @@ def _score_grads(call: _Call) -> _Operand:
 @_lowered_once
 def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: float):
     """`(ds [R, HV * C] in `_score_grads`' form, decay [HV, R] fp32)`: each chunk and value head's scores'
-    gradient and the decay's gradient from its pair terms (`algebra.scores_gradient`,
-    `algebra.summed_pairs`), fla's dqkwg's part the memory's products do not take, a program a chunk and value head (persistent): apart
-    from `_query_key`, each launch's tiles a thread's registers hold (one launch spilled 1.5 KB a thread on
-    an H100's, SE bwd-probe at a49c8da50)."""
+    gradient and the decay's gradient from its pair terms (`algebra.scores_gradient`, `algebra.summed_pairs`),
+    fla's dqkwg's part the memory's products do not take, a program a chunk and value head (persistent): apart
+    from `_query_key`, each launch's tiles a thread's registers hold (one launch spilled 1.5 KB a thread on an
+    H100's, SE bwd-probe at a49c8da50)."""
     width, value_width, family = call.width, call.value_width, call.family
     grads = _score_grads(call)
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
