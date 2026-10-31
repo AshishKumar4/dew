@@ -635,6 +635,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
     of 128', R9-gpu-a100): a step reads a side vector it does not copy from global memory instead."""
+    adds_vectors: bool = True
+    """Whether `added` takes a vector of fewer entries than a warpgroup's threads (TMA's reduction from shared
+    memory), where Mosaic GPU refuses atomic stores from a layout that replicates its entries across
+    threads (mma.sync's row and column layouts): a program writes such a sum to a place of its own
+    instead."""
     counts_hooks: bool = True
     """Whether its register model counts what a template's hooks and exact sums hold (side operands' tiles,
     a running sum), so a hooked or exactly summed call derives a tile that spills nothing; where not

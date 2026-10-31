@@ -170,6 +170,7 @@ class Mma(mosaic.Family):
         return max(self.fragment_depth(depth), min(depth, swizzle // itemsize))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
+    adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
     column_scratch = 0  # its column sums take its kernels' reduction scratch
 
