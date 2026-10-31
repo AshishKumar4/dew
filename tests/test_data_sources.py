@@ -1685,8 +1685,8 @@ def test_memory_reads_a_table_of_lists_bytes_and_nulls_as_records_hold_them(tabl
 
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
 def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
-    """A Grain or iterator source given an empty name declares no content version, which is no
-    name at all said otherwise: it is refused as it is made."""
+    """A Grain or iterator source given an empty identity declares no content version, which is no
+    identity at all said otherwise: it is refused as it is made."""
     import grain.python as grain
 
     from dew.data import from_grain, from_iter
