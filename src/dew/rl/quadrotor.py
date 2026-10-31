@@ -1,13 +1,17 @@
 """A racing quadrotor's physics in JAX, one drone at a time (`vmap` for a batch), every parameter drawn per
 episode for transfer from simulation.
 
-The drone is a rigid body under four rotors (Kaufmann, Bauersfeld and Scaramuzza, ICRA 2022, arXiv 2202.10796,
-Eq 1-3 and Table II: a 5-inch racer of 0.768 kg, inertia diag(2.5, 2.1, 4.3) g m^2, rotor thrust c_l w^2 with
-c_l = 1.563e-6 N s^2, and yaw torque c_d w^2 with c_d = 1.909e-8 N m s^2), its rotors at Flightmare's arm of
-0.17 m in an X (uzh-rpg/flightmare flightlib/configs/quadrotor_env.yaml), their order and spins L2F's (front
-right, rear right, rear left, front left; yaw torques -, +, -, +; rl_tools rl/environments/l2f/multirotor.h).
-At its nominal top speed of 2400 rad/s it lifts 4.8 times its weight (Swift's 4.1, Agilicious's 5.0; every
-published 5-inch build is 4 to 5).
+The drone is a five-inch FPV racer lifting about 12 times its weight, as Flightmare's and L2F's racer does
+(uzh-rpg/flightmare flightlib/configs/quadrotor_env.yaml and rl_tools rl/environments/l2f/parameters/dynamics/
+flightmare.h: 0.73 kg on arms of 0.17 m, its thrust map lifting 21.7 N a rotor at its top speed, 12.1 times
+its weight), a rigid body under four rotors as Kaufmann, Bauersfeld and Scaramuzza model one (ICRA 2022, arXiv
+2202.10796, Eq 1-3): its mass Flightmare's 0.73 kg; its inertia Kaufmann's measured 5-inch racer's (Table II,
+diag(2.5, 2.1, 4.3) g m^2 at 0.768 kg) at this mass, diag(2.38, 2.0, 4.09) g m^2; each rotor's thrust c_l w^2
+with Kaufmann's c_l = 1.563e-6 N s^2 (Flightmare's quadratic term 1.33e-6, SkyDreamer's 1.55e-6) and its yaw
+torque c_d w^2 with c_d = 1.909e-8 N m s^2; its rotors in an X, their order and spins L2F's (front right, rear
+right, rear left, front left; yaw torques -, +, -, +; rl/environments/l2f/multirotor.h). Its top speed, 3700
+rad/s, is the speed at which those rotors lift 11.95 times its weight; the randomization (mass, coefficients,
+top speed, and the battery's charge at the start) spans 8.4 to 13.3.
 
 Each rotor's speed follows its steady speed through a first-order lag (NeuroBEM 33 ms, Agilicious 39.1 ms,
 Ferede et al. arXiv 2504.21586 40 ms); its steady speed is its ESC duty times its top speed times the
@@ -22,7 +26,7 @@ The flight controller is Betaflight's in form (L2F's rate controller, rl/environ
 132-190), run every physics step: a PD loop on the body rates to angular accelerations, times the nominal
 inertia, then a mixer to each rotor's thrust with the commanded collective, then each rotor's duty from the
 nominal thrust map. Its gains, 100 per second and 2 (the derivative on the measured rate's change over a
-physics step of 1/240 s), give a 90% rise in 46 to 62 ms with at most 8% overshoot over the motor lags drawn
+physics step of 1/240 s), give a 90% rise in 54 to 62 ms with at most 8% overshoot over the motor lags drawn
 (a step response computed for this choice; no source publishes a racer's gains in these units).
 
 The air resists the body: rotor drag along the body's x and y, proportional to the rotors' summed speed and
@@ -69,15 +73,15 @@ class Quadrotor:
     `duty_noise` at most; the rate controller's `rate_gain` (1/s) and `rate_damping`; and the physics'
     `substeps` a control step."""
 
-    mass: float = 0.768
-    mass_spread: float = 0.2
-    inertia: tuple[float, float, float] = (2.5e-3, 2.1e-3, 4.3e-3)
+    mass: float = 0.73
+    mass_spread: float = 0.04
+    inertia: tuple[float, float, float] = (2.38e-3, 2.0e-3, 4.09e-3)
     inertia_spread: float = 0.3
     thrust_coefficient: float = 1.563e-6
     drag_coefficient: float = 1.909e-8
-    coefficient_spread: float = 0.15
-    top_speed: float = 2400.0
-    top_spread: float = 0.1
+    coefficient_spread: float = 0.02
+    top_speed: float = 3700.0
+    top_spread: float = 0.02
     idle_speed: float = 150.0
     motor_lag: tuple[float, float] = (0.02, 0.06)
     rotor_drag: float = 5.37e-5

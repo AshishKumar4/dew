@@ -15,16 +15,17 @@ from dew.rl.quadrotor import Body, Flight, Quadrotor, drawn_body, flown, hoverin
 QUADROTOR = Quadrotor()
 HZ = 60.0
 NOMINAL = {
-    "mass": 0.768, "mass_spread": 0.2, "inertia": (2.5e-3, 2.1e-3, 4.3e-3), "inertia_spread": 0.3,
-    "thrust_coefficient": 1.563e-6, "drag_coefficient": 1.909e-8, "coefficient_spread": 0.15,
-    "top_speed": 2400.0, "top_spread": 0.1, "motor_lag": (0.02, 0.06), "rotor_drag": 5.37e-5,
+    "mass": 0.73, "mass_spread": 0.04, "inertia": (2.38e-3, 2.0e-3, 4.09e-3), "inertia_spread": 0.3,
+    "thrust_coefficient": 1.563e-6, "drag_coefficient": 1.909e-8, "coefficient_spread": 0.02,
+    "top_speed": 3700.0, "top_spread": 0.02, "motor_lag": (0.02, 0.06), "rotor_drag": 5.37e-5,
     "quadratic_drag": (4.10e-3, 1.51e-2), "vertical_drag": 0.15, "drag_spread": 0.3,
     "ground_effect": (0.75, 1.0), "charged": (3.7, 4.2), "full_voltage": 4.2, "resistance": (0.003, 0.012),
     "bias_force": 2.0, "bias_moment": 2.0,
 }
 """The nominal racer and its parameters' randomization as `dew.rl.quadrotor`'s documentation gives them
-(Kaufmann et al.'s Table II racer, the drag, ground-effect, battery and disturbance figures it cites, and its
-own spreads and ranges), each under the name of the `Quadrotor` field it is."""
+(Flightmare's five-inch racer's mass and thrust-to-weight with Kaufmann et al.'s coefficients and inertia, the
+drag, ground-effect, battery and disturbance figures it cites, and its own spreads and ranges), each under the
+name of the `Quadrotor` field it is."""
 RETUNED = {
     "mass": 0.55, "mass_spread": 0.11, "inertia": (1.6e-3, 1.4e-3, 2.9e-3), "inertia_spread": 0.13,
     "thrust_coefficient": 1.2e-6, "drag_coefficient": 1.5e-8, "coefficient_spread": 0.17,
