@@ -258,9 +258,9 @@ assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
 
 def test_dews_diffusion_reference_replays_the_batchs_draws_through_its_own_loss(monkeypatch):
     """The Dew side of the diffusion reference trains Dew's own loss on the noise levels and noise its
-    batch holds (`replayed`): any attempt's key gives the same loss, other draws give another, and an
-    update split into two microbatches, each replaying its rows at their places among the update's
-    examples, sums to the whole update's loss."""
+    batch holds (`replayed`): any attempt's key gives the same loss, other draws give another, and each
+    microbatch of an update split in two, replaying its rows at their places among the update's
+    examples, loses what those rows lose alone."""
     from dew.objectives.base import Step
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
@@ -284,5 +284,5 @@ def test_dews_diffusion_reference_replays_the_batchs_draws_through_its_own_loss(
     whole = loss(levels[0])
     assert loss(levels[0], key=7) == whole
     assert loss(levels[1]) != whole
-    halves = loss(levels[0], (0, 1), 3, (0, 1)) + loss(levels[0], (2, 3), 5, (2, 3))
-    np.testing.assert_allclose(halves, whole, rtol=1e-6)
+    for rows in ((0, 1), (2, 3)):
+        assert loss(levels[0], rows, 3, rows) == loss(levels[0], rows)

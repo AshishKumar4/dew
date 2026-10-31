@@ -1116,8 +1116,7 @@ class Trainer(Generic[Loss, Effects]):
         lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
         (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`)."""
         micro = microbatch_shapes(batch, split)
-        shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation, narrow,
-                                                  split)
+        shapes, copies, prepared = self._prepared(state, micro, schedule, split, narrow)
         shardings = self.shardings(prepared)
         if mesh is not None:
             shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -1156,18 +1155,18 @@ class Trainer(Generic[Loss, Effects]):
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
                          lower.report() if lowering else KernelReport((), ()), footprint, sampled)
 
-    def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
-                  narrow: bool | None = None, split: int = 1):
+    def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, split: int,
+                  narrow: bool | None = None):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
-        with the accumulation of a `window` of microbatches and the copies the step builds, as the
-        step traces them over microbatches of `batch`'s shapes, none where `narrow` (the trainer's) is off."""
+        with the accumulation of an update's window, `split` microbatches a step, and the copies the step
+        builds, as it traces them over microbatches of `batch`'s shapes, none where `narrow` is off."""
+        window = split * self.accumulation
         shapes = None if self.step is not None else self._loss_shape(state, batch, window, split)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
-        composed = self.step is None and not self.dynamic_scale
-        copies = (narrow_copies(self.objective, state, batch, self._model_batch, composed=composed,
-                                window=window, split=split)
+        copies = (narrow_copies(self.objective, state, batch, self._model_batch, window=window, split=split,
+                                composed=self.step is None and not self.dynamic_scale)
                   if (self._narrow if narrow is None else narrow) else {})
         prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
             lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
@@ -1717,10 +1716,9 @@ class Trainer(Generic[Loss, Effects]):
         shapes (a marked batch, as the stream gives it) in `split` microbatches: `state` with the
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
-        device, _ = split_fields(batch)
+        micro = microbatch_shapes(split_fields(batch)[0], split)
         with self._traced_on(self.device_mesh) as schedule:
-            _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,
-                                         split * self.accumulation, narrow=False, split=split)
+            _, _, whole = self._prepared(state, micro, schedule, split, narrow=False)
         return self._validated(whole, capacity)[1]
 
     def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:

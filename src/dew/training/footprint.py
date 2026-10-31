@@ -505,7 +505,7 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
 
     def loss(variables, batch, microstep, key, step, ema, updates):
         # The step's first attempt of its first part, as the transaction reads it (`attempt_step`).
-        current = state.replace(microstep=microstep, key=key, step=step, updates=updates)
+        current = dataclasses.replace(state, microstep=microstep, key=key, step=step, updates=updates)
         return objective._loss(variables, batch, attempt_step(
             current, variables, ema, batch, split=split, slots=window, attempt=step * split, part=0,
             slot=microstep % window))

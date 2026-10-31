@@ -33,6 +33,8 @@ The gradients are the cast's on split meshes as partitioned for the CPU
 (tests/test_narrow.py); a multi-GPU run over NCCL has not been measured, so
 its first should compare a few steps against copies off.
 """
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 from jax.core import ShapedArray
@@ -167,7 +169,7 @@ def narrow_copies(objective, state, batch, model_batch, *, composed: bool, windo
         # As the trainer's loss shape traces it, the averaged weights the step hands the objective
         # included: a parameter read there is used twice.
         variables = {**rest, "params": params}
-        current = state.replace(microstep=microstep, key=key, step=step, updates=updates)
+        current = dataclasses.replace(state, microstep=microstep, key=key, step=step, updates=updates)
         read = model_batch(batch)
         return objective._loss(variables, read, attempt_step(
             current, variables, ema, read, split=split, slots=window, attempt=step * split, part=0,
