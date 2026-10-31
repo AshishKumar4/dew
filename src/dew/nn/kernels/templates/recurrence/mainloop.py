@@ -1918,12 +1918,13 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
 
 @_lowered_once
 def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
-    """`[R, HV * Dv]` as `call.held`: the corrected values' gradient from each chunk's own output
+    """`[R, HV * Dv]` in `_value_grads`' form: the corrected values' gradient from each chunk's own output
     (`algebra.local_gradient`, fla's chunk_bwd_dv_local), rounded as fla's, a program a chunk and value head
     (persistent): apart from the memory's reverse walk (`_reverse`), whose tiles beside these spilled 80
     bytes a thread on an H100's."""
     width, value_width, family = call.width, call.value_width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
+    grads = _value_grads(call)
 
     def program(q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
@@ -1954,7 +1955,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
             dv = algebra.local_gradient(
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
                 gate, low, _tile(slots, "out", given), scale, Issuer(call, {"local_dv": local}), laid=laid)
-            held.store(dv_ref, dv, row, CHUNK, h * value_width, value_width, family=family,
+            grads.store(dv_ref, dv, row, CHUNK, h * value_width, value_width, family=family,
                        smem=landing["row"])
             return carry, accumulators
 
@@ -1971,29 +1972,30 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     held_tiles = _Held(phases=(
         [_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK)
         + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
-        [*_held(held, CHUNK, CHUNK), _f32(CHUNK, value_width), *_held(held, CHUNK, value_width),
+        [*_held(held, CHUNK, CHUNK), _f32(CHUNK, value_width), *_held(grads, CHUNK, value_width),
          *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, value_width))]))
-    return _kernel(program, call, out_type=held.shape(call.heads * value_width),
+    return _kernel(program, call, out_type=grads.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
                    live=_taken(7), work=work, held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)),
-                   landing={"row": held.landing(CHUNK, value_width)}, persistent=True)(
+                   landing={"row": grads.landing(CHUNK, value_width)}, persistent=True)(
         q, k, do, hi, lo, hi, lo, taken)
 
 
 @_lowered_once
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Tiles, *, scale: float):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
-    chunk leaves as `call.memories`, the corrected values' gradient as `call.held` (their own output's,
-    `local`, `_local_back`'s, and the memory's, `algebra.reverse_carried`) and each row's initial memory's
-    gradient, fp32, each sequence's chunks from its last over a value block, the states launch's
-    (`tiles.block_v`; fla's dhu). `q`, `k`, `w`, `do` and `local` are laid as the forward's; `dht`
-    `[B * HV * Dk, Dv]` fp32 each row's final memory's gradient. A program walks `tiles.walkers` value blocks
-    of its sequence and head, one a consumer role, as the states launch does. Without the delta rule `w` is
-    None and the memory's gradient takes no `w^T dv` (`algebra.reverse_carried`)."""
+    chunk leaves as `call.memories`, the corrected values' gradient in `_value_grads`' form (their own
+    output's, `local`, `_local_back`'s, and the memory's, `algebra.reverse_carried`) and each row's initial
+    memory's gradient, fp32, each sequence's chunks from its last over a value block, the states launch's
+    (`tiles.block_v`; fla's dhu). `q`, `k`, `w`, `do` and `local` are laid as the forward's; `dht` `[B * HV *
+    Dk, Dv]` fp32 each row's final memory's gradient. A program walks `tiles.walkers` value blocks of its
+    sequence and head, one a consumer role, as the states launch does. Without the delta rule `w` is None and
+    the memory's gradient takes no `w^T dv` (`algebra.reverse_carried`)."""
     width, value_width, family = call.width, call.value_width, call.family
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
+    grads = _value_grads(call)
     batch = dht.shape[0] // (call.heads * width)
     final = _Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     chunks = call.chunks
@@ -2015,7 +2017,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                        keys=given.views(k_ref, 0, call.rows, key_columns, width),
                        **({"w": held.views(w_ref, 0, call.rows, h * width, width)} if call.delta else {}),
                        out=given.views(do_ref, 0, call.rows, h * value_width + walked, walked_width),
-                       local=held.views(local_ref, 0, call.rows, h * value_width + walked, walked_width))
+                       local=grads.views(local_ref, 0, call.rows, h * value_width + walked, walked_width))
         final_views = _views(**{f"final{i}": final.views(dht_ref, memory(row, i), call.block, walked,
                                                          walked_width) for i in range(slices)})
         walked_streams = family.opened(streams["walked"], views)
@@ -2047,7 +2049,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             out = _tile(slots, "out", given, columns=columns)
-            local = _tile(slots, "local", held, columns=columns).value().astype(jnp.float32)
+            local = _tile(slots, "local", grads, columns=columns).value().astype(jnp.float32)
             ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
             grad, dv = algebra.reverse_carried(
                 grad, functools.partial(block, "keys", given),
@@ -2055,8 +2057,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                 functools.partial(block, "queries", given), out.value(), local, gate, low, ending,
                 ending_low, scale, held.dtype, issue)
             before_store()
-            held.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + column, bv, family=family,
-                       smem=lands["corrected"], wait=False)
+            grads.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + column, bv, family=family,
+                        smem=lands["corrected"], wait=False)
             return grad, accumulators
 
         _sequence_walk(call, final, "final", (leaving, final_views), (walked_streams, views), step,
@@ -2065,11 +2067,11 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                                                   pl.ds(walked + role * bv, bv)], bv,
                        landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
-    out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
+    out_type = (memories.shape(value_width), grads.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
     blocks = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
                        **({"w": ((CHUNK, width), held)} if call.delta else {}),
-                       out=((CHUNK, walked_width), given), local=((CHUNK, walked_width), held))
+                       out=((CHUNK, walked_width), given), local=((CHUNK, walked_width), grads))
     finals = _streamed(**{f"final{i}": ((call.block, walked_width), final) for i in range(slices)})
     # The memory's carried gradient: three memory products a chunk.
     steps = chunks / sequences.shape[0]
@@ -2081,7 +2083,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
     # tiles' casts.
     held_tiles = _Held(carried=[_f32(width, bv)] * 2, phases=(
         [_f32(CHUNK, bv)] * 2 + _held(given, CHUNK, bv)
-        + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(held, CHUNK, bv)
+        + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(grads, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
     final_landing, after = _final_landing(call, bv)
     return _kernel(program, call, out_type=out_type,
@@ -2091,7 +2093,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                    live=lambda refs: refs[8][lax.axis_index("sequences"), 1] > 0,
                    staging=(*_staging(held, (call.block, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
                    once=finals,
-                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
+                   landing={**_memory_landing(call, bv), "corrected": grads.landing(CHUNK, bv),
                             **final_landing},
                    # Without the delta rule the weights' place takes the keys, an operand no step reads.
                    after=after)(q, k, k if w is None else w, do, local, hi, lo, dht, sequences)
@@ -2267,6 +2269,15 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                    landing={"weights": held.landing(CHUNK, call.block),
                             "sums": ((CHUNK, call.block), jnp.float32)})(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken)
+
+
+def _value_grads(call: _Call) -> _Operand:
+    """The form the corrected values' gradient `du` passes from `_local_back` through `_reverse` in: the held
+    operand's for the delta rule (fla rounds its `dv` so); without it fp32, as mamba_ssm accumulates `dx` and
+    sums `ddt` from it in fp32 (`_chunk_scan_chunk_state_bwd_dx`): rounded, a token's write gate's gradient
+    `sum(v du)` took the rounding of every `du` it sums."""
+    return dataclasses.replace(call.held, rows=call.rows) if call.delta else _Operand(call.rows, 1,
+                                                                                       jnp.dtype(jnp.float32))
 
 
 def _score_grads(call: _Call) -> _Operand:
