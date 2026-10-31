@@ -235,10 +235,13 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
     or where `accumulated` leaves a product its own sum, a CPU spreads a floating value by doubling
     (`_doubled`), so its transpose sums pairwise in the value's dtype, and an accelerator broadcasts
-    it, whose transpose JAX sums in the value's dtype."""
+    it, whose transpose JAX sums in the value's dtype. A value an Explicit axis places along an axis it
+    spreads over (never a bias, whose leading axes `biased` adds) is broadcast: neither form keeps that
+    placement on a dropped or doubled size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
-    if not axes:
+    placed = explicit_spec(value)
+    if not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes)):
         return jnp.broadcast_to(value, shape)
     if not _sums_in_float64(value):
         if not jnp.issubdtype(value.dtype, jnp.floating):

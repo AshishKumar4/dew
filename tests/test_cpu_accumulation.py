@@ -155,9 +155,10 @@ def test_a_bias_spread_over_a_sharded_axis_keeps_its_sharding():
 
 @pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
 def test_a_bias_spread_over_a_size_one_explicit_axis_keeps_its_placement(wide, monkeypatch):
-    """A bias `[1, 4]` placed on a size-one Explicit axis spreads to `[3, 4]` under jit, its placement
-    kept on the axis it doubles (`_doubled`, review of ledger 1698's bias sites), adds itself to
-    every position and takes its cotangents' sum."""
+    """A value `[1, 4]` placed on a size-one Explicit axis along the axis it spreads over takes the
+    broadcast to `[3, 4]` under jit, in either setting, where the doubling and the outer product would
+    each drop that placement (review of ledger 1698's bias sites): it adds itself to every position
+    and takes its cotangents' sum."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     from dew.nn.precision import spread
