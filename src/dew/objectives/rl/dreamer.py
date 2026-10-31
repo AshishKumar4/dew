@@ -36,6 +36,7 @@ from flax import linen as nn, struct
 
 from dew.batch import Batch, Variables, merge, under
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step
+from dew.objectives.rl.tssm import TSSM, Cache
 from dew.rl.distributions import (
     categorical_kl,
     onehot_sample,
@@ -171,6 +172,14 @@ class WorldModel(nn.Module):
 
     observation_size: int
     action_size: int
+    image: tuple[int, int, int] | None = None
+    """An image observation's shape `(H, W, C)`, uint8 pixels, its sides divisible by 16: encoded and
+    decoded by convolutions (`ConvEncoder`, `ConvDecoder`, `conv_depth` channels); None for a vector of
+    `observation_size`."""
+    conv_depth: int = 64
+    dynamics: TSSM | None = None
+    """TransDreamer's transformer dynamics (`dew.objectives.rl.tssm.TSSM`) in place of the block GRU,
+    its own posterior and prior; None for the GRU's (RSSM)."""
     deter: int = 512
     hidden: int = 64
     stoch: int = 32
@@ -183,7 +192,13 @@ class WorldModel(nn.Module):
     max_std: float = 1.0
 
     def setup(self) -> None:
-        self.encoder = _Layers(self.units, 3)
+        if self.image is None:
+            self.encoder = _Layers(self.units, 3)
+            self.decoder = _Layers(self.units, 3)
+            self.decoded = nn.Dense(self.observation_size, kernel_init=_init())
+        else:
+            self.encoder = ConvEncoder(self.conv_depth)
+            self.decoder = ConvDecoder(self.image, self.conv_depth, self.units, blocks=self.blocks)
         self.dynamics_in = [nn.Dense(self.hidden, kernel_init=_init()) for _ in range(3)]
         self.dynamics_norms = [nn.RMSNorm(epsilon=1e-4) for _ in range(3)]
         self.dynamics_hidden = _BlockLinear(self.deter, self.blocks)
@@ -193,8 +208,6 @@ class WorldModel(nn.Module):
         self.posterior_logits = nn.Dense(self.stoch * self.classes, kernel_init=_init())
         self.prior_layers = _Layers(self.hidden, 2)
         self.prior_logits = nn.Dense(self.stoch * self.classes, kernel_init=_init())
-        self.decoder = _Layers(self.units, 3)
-        self.decoded = nn.Dense(self.observation_size, kernel_init=_init())
         self.reward_layers = _Layers(self.units, 1)
         self.reward_logits = nn.Dense(self.bins, kernel_init=_init(0.0))
         self.continue_layers = _Layers(self.units, 1)
@@ -206,20 +219,33 @@ class WorldModel(nn.Module):
 
     def __call__(self, observation: jax.Array, action: jax.Array) -> jax.Array:
         """Every network once, for initialization: a step from a zero latent."""
-        deter, stoch = self.initial(observation.shape[:-1])
-        deter = self.core(deter, stoch, action)
-        stoch = self.categorical(self.posterior(deter, self.embed(observation)))
+        tokens = self.embed(observation)
+        deter, stoch = self.initial(action.shape[:-1])
+        if self.dynamics is None:
+            deter = self.core(deter, stoch, action)
+            stoch = self.categorical(self.posterior(deter, tokens))
+            prior = self.prior(deter)
+        else:
+            prior = self.dynamics(tokens[:, None], action[:, None], jnp.ones((action.shape[0], 1), bool))
         feature = self.feature(deter, stoch)
         mean, _ = self.policy(feature)
-        return (self.decode(feature).sum() + self.reward(feature).sum() + self.continue_(feature).sum()
-                + mean.sum() + self.value(feature).sum() + self.prior(deter).sum())
+        return (self.decode(deter, stoch).sum() + self.reward(feature).sum() + self.continue_(feature).sum()
+                + mean.sum() + self.value(feature).sum() + prior.sum())
+
+    @property
+    def observation_shape(self) -> tuple[int, ...]:
+        return (self.observation_size,) if self.image is None else self.image
 
     def initial(self, batch: tuple[int, ...]) -> tuple[jax.Array, jax.Array]:
+        if self.dynamics is not None:
+            held = self.dynamics
+            return jnp.zeros((*batch, held.width)), jnp.zeros((*batch, held.stoch, held.classes))
         return jnp.zeros((*batch, self.deter)), jnp.zeros((*batch, self.stoch, self.classes))
 
     def embed(self, observation: jax.Array) -> jax.Array:
-        """The encoder's tokens of an observation, symlogged first (rssm.py:218)."""
-        return self.encoder(symlog(observation))
+        """The encoder's tokens of an observation: a vector's symlogged first (rssm.py:218), an image's
+        pixels through the convolutions."""
+        return self.encoder(symlog(observation) if self.image is None else observation)
 
     def core(self, deter: jax.Array, stoch: jax.Array, action: jax.Array) -> jax.Array:
         """The block GRU's next deterministic state (rssm.py:135-158)."""
@@ -238,11 +264,16 @@ class WorldModel(nn.Module):
         return update * candidate + (1 - update) * deter
 
     def posterior(self, deter: jax.Array, tokens: jax.Array) -> jax.Array:
-        """The posterior's log-probabilities `[..., stoch, classes]` (rssm.py:75-92)."""
+        """The posterior's log-probabilities `[..., stoch, classes]` (rssm.py:75-92); the TSSM's reads
+        the tokens alone."""
+        if self.dynamics is not None:
+            return self.dynamics.posterior(tokens)
         logits = self.posterior_logits(self.posterior_layers(jnp.concatenate([deter, tokens], -1)))
         return unimix_log_probs(logits.reshape(*logits.shape[:-1], self.stoch, self.classes), self.unimix)
 
     def prior(self, deter: jax.Array) -> jax.Array:
+        if self.dynamics is not None:
+            return self.dynamics.prior(deter)
         logits = self.prior_logits(self.prior_layers(deter))
         return unimix_log_probs(logits.reshape(*logits.shape[:-1], self.stoch, self.classes), self.unimix)
 
@@ -253,8 +284,20 @@ class WorldModel(nn.Module):
     def feature(deter: jax.Array, stoch: jax.Array) -> jax.Array:
         return jnp.concatenate([deter, stoch.reshape(*stoch.shape[:-2], -1)], -1)
 
-    def decode(self, feature: jax.Array) -> jax.Array:
-        return self.decoded(self.decoder(feature))
+    def decode(self, deter: jax.Array, stoch: jax.Array) -> jax.Array:
+        """The observation decoded from a latent: a vector's symlogged values, an image's pixels in
+        [0, 1]."""
+        if self.image is None:
+            return self.decoded(self.decoder(self.feature(deter, stoch)))
+        return self.decoder(deter, stoch)
+
+    def reconstruction(self, deter: jax.Array, stoch: jax.Array, observation: jax.Array) -> jax.Array:
+        """The decoder's squared error, summed over the observation: against a vector's symlog, or an
+        image's pixels over 255 (rssm.py:345-355, outs.MSE summed over the image's axes)."""
+        decoded = self.decode(deter, stoch)
+        if self.image is None:
+            return jnp.sum(jnp.square(decoded - symlog(observation)), -1)
+        return jnp.sum(jnp.square(decoded - observation.astype(decoded.dtype) / 255), (-3, -2, -1))
 
     def reward(self, feature: jax.Array) -> jax.Array:
         return self.reward_logits(self.reward_layers(feature))
@@ -279,6 +322,11 @@ class Critic(nn.Module):
     @nn.compact
     def __call__(self, feature: jax.Array) -> jax.Array:
         return nn.Dense(self.bins, kernel_init=_init(0.0))(_Layers(self.units, 3)(feature))
+
+
+def _shifted(stoch: jax.Array) -> jax.Array:
+    """Each step's previous latent along a window's step axis `[B, T, ...]`, zero before the first."""
+    return jnp.concatenate([jnp.zeros_like(stoch[:, :1]), stoch[:, :-1]], 1)
 
 
 def normal_log_prob(action: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
@@ -312,6 +360,7 @@ class _Latent:
     deter: jax.Array
     stoch: jax.Array
     key: jax.Array
+    cache: Cache | None = None
 
 
 @struct.dataclass
@@ -329,8 +378,10 @@ class LatentEnv:
     def action_size(self) -> int:
         return self.model.action_size
 
-    def at(self, deter: jax.Array, stoch: jax.Array, key: jax.Array) -> tuple[_Latent, jax.Array]:
-        return _Latent(deter, stoch, key), WorldModel.feature(deter, stoch)
+    def at(self, deter: jax.Array, stoch: jax.Array, key: jax.Array,
+           cache: Cache | None = None) -> tuple[_Latent, jax.Array]:
+        """The latent imagination starts from, with the cache a TSSM's next step attends to."""
+        return _Latent(deter, stoch, key, cache), WorldModel.feature(deter, stoch)
 
     def reset(self, key: jax.Array) -> tuple[_Latent, TimeStep]:
         raise TypeError("an imagination starts from replayed latents (LatentEnv.at), never a reset")
@@ -338,12 +389,18 @@ class LatentEnv:
     def step(self, state: _Latent, action: jax.Array) -> tuple[_Latent, TimeStep]:
         key, latent = jax.random.split(state.key)
         model = self.model.bind(self.variables, rngs={"latent": latent})
-        deter = model.core(state.deter, state.stoch, action)
+        cache = state.cache
+        if model.dynamics is None:
+            deter = model.core(state.deter, state.stoch, action)
+        else:
+            never = jnp.zeros(action.shape[:-1], bool)
+            inputs = model.dynamics.inputs(state.stoch, action, never)
+            deter, cache = model.dynamics.step(inputs, never, cache)
         stoch = model.categorical(model.prior(deter))
         feature = WorldModel.feature(deter, stoch)
         reward = twohot_mean(model.reward(feature), self.bins)
         never = jnp.zeros(reward.shape, bool)
-        return _Latent(deter, stoch, key), TimeStep(feature, reward, never, never)
+        return _Latent(deter, stoch, key, cache), TimeStep(feature, reward, never, never)
 
 
 class DreamerV3Objective(Objective[Ratio]):
@@ -376,7 +433,9 @@ class DreamerV3Objective(Objective[Ratio]):
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         params_key, latent = jax.random.split(key)
-        inputs = jnp.zeros((1, self.model.observation_size)), jnp.zeros((1, self.model.action_size))
+        observation = jnp.zeros((1, *self.model.observation_shape),
+                                jnp.float32 if self.model.image is None else jnp.uint8)
+        inputs = observation, jnp.zeros((1, self.model.action_size))
         tree = self.model.init({"params": params_key, "latent": latent}, *inputs)
         # The returns' 5th and 95th percentiles, an EMA from zero (utils.py:16-72, debias off).
         return {**tree, "returns": {"low": jnp.zeros(()), "high": jnp.zeros(())}}
@@ -403,6 +462,14 @@ class DreamerV3Objective(Objective[Ratio]):
         its own of `T` keys split from `key`, as the code's scan seeds each step's sample
         (rssm.py:63-90)."""
         rows, length = first.shape
+        if self.model.dynamics is not None:
+            # TransDreamer: the window's posteriors at once, then the transformer over the latents and
+            # actions before each step.
+            model = self.model.bind(variables, rngs={"latent": key})
+            posterior = model.posterior(None, model.embed(observation))
+            stoch = model.categorical(posterior)
+            deter = model.dynamics.states(model.dynamics.inputs(_shifted(stoch), previous, first), first)
+            return deter, stoch, posterior
 
         def step(latent, inputs):
             deter, stoch = latent
@@ -423,18 +490,25 @@ class DreamerV3Objective(Objective[Ratio]):
         given the step's observation, then an action drawn from the policy, clipped to [-1, 1]."""
         latent, draw = jax.random.split(key)
         model = self.model.bind(variables, rngs={"latent": latent})
-        deter, stoch, previous = memory
-        deter, stoch, _ = self.observe(model, deter, stoch, observed["observation"], previous,
-                                       observed["first"])
+        held, stoch, previous = memory
+        if model.dynamics is None:
+            deter, stoch, _ = self.observe(model, held, stoch, observed["observation"], previous,
+                                           observed["first"])
+        else:
+            first = observed["first"]
+            deter, held = model.dynamics.step(model.dynamics.inputs(stoch, previous, first), first, held)
+            stoch = model.categorical(model.posterior(None, model.embed(observed["observation"])))
         mean, std = model.policy(WorldModel.feature(deter, stoch))
         action = jnp.clip(mean + std * jax.random.normal(draw, mean.shape), -1, 1)
-        return action, {}, (deter, stoch, action)
+        return action, {}, (deter if model.dynamics is None else held, stoch, action)
 
-    def memory(self, count: int) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """The agent's memory at the start: a zero latent and a zero previous action for each of
-        `count` environments."""
+    def memory(self, count: int) -> tuple[jax.Array | Cache, jax.Array, jax.Array]:
+        """The agent's memory at the start for each of `count` environments: a zero latent, or a TSSM's
+        empty cache of its `context` steps, and a zero previous latent and action."""
         deter, stoch = self.model.initial((count,))
-        return deter, stoch, jnp.zeros((count, self.model.action_size))
+        dynamics = self.model.dynamics
+        held = deter if dynamics is None else dynamics.empty_cache(count, dynamics.context)
+        return held, stoch, jnp.zeros((count, self.model.action_size))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         world_key, imagine_key = jax.random.split(step.key)
@@ -455,7 +529,7 @@ class DreamerV3Objective(Objective[Ratio]):
                                     self.free_nats),
             "representation": jnp.maximum(categorical_kl(posterior, jax.lax.stop_gradient(prior)).sum(-1),
                                           self.free_nats),
-            "decoder": jnp.sum(jnp.square(model.decode(feature) - symlog(observation)), -1),
+            "decoder": model.reconstruction(deter, stoch, observation),
             "reward": twohot_loss(model.reward(feature), reward, self.bins),
         }
         alive = (1 - terminal) * (1 - 1 / self.horizon)
@@ -467,7 +541,12 @@ class DreamerV3Objective(Objective[Ratio]):
         starts = jax.tree.map(lambda x: jax.lax.stop_gradient(x.reshape(rows * length, *x.shape[2:])),
                               (deter, stoch))
         latent_key, act_key, last_key = jax.random.split(imagine_key, 3)
-        state, begin = env.at(*starts, latent_key)
+        cache = None
+        if model.dynamics is not None:
+            # Each start's cache, the window's keys and values of its episode up to it.
+            inputs = model.dynamics.inputs(_shifted(stoch), previous, first)
+            cache = jax.lax.stop_gradient(model.dynamics.window_cache(inputs, first, self.imagination))
+        state, begin = env.at(*starts, latent_key, cache)
 
         def policy(params, feature, key, memory):
             mean, std = self.model.apply(params, feature, method=WorldModel.policy)

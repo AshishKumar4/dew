@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from flax import struct
 
 from dew.nn.rope import rotary_freqs, rotate
+from dew.rl.distributions import unimix_log_probs
 
 
 @struct.dataclass
@@ -88,6 +89,8 @@ class TSSM(nn.Module):
     heads: int = 8
     ffup: int = 4
     unimix: float = 0.01
+    context: int = 64
+    """The steps an acting cache holds (`empty_cache`), the windows' length it trained on."""
     dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
@@ -110,8 +113,7 @@ class TSSM(nn.Module):
 
     def _logits(self, x: jax.Array) -> jax.Array:
         """Log-probabilities `[..., stoch, classes]`, mixed with the uniform by `unimix`."""
-        probs = jax.nn.softmax(x.reshape(*x.shape[:-1], self.stoch, self.classes).astype(jnp.float32), -1)
-        return jnp.log((1 - self.unimix) * probs + self.unimix / self.classes)
+        return unimix_log_probs(x.reshape(*x.shape[:-1], self.stoch, self.classes), self.unimix)
 
     def posterior(self, tokens: jax.Array) -> jax.Array:
         """q(z_t | x_t): the latent's log-probabilities from an observation's tokens alone."""
@@ -167,8 +169,11 @@ class TSSM(nn.Module):
         return Cache(*(spread(held) for held in stacked), valid,
                      jnp.full(rows * length, length, jnp.int32), (positions + 1).reshape(-1))
 
+    @nn.nowrap
     def empty_cache(self, rows: int, size: int) -> Cache:
-        """A cache of `size` slots holding nothing, for acting from fresh episodes."""
+        """A cache of `size` slots holding nothing, for acting from fresh episodes (`context` slots).
+        Within an episode's first `size` steps acting reads what training's window does; past them the
+        cache holds the last `size` steps' keys, each computed over the context before it."""
         head = self.width // self.heads
         zeros = jnp.zeros((rows, self.layers, size, self.heads, head), self.dtype)
         return Cache(zeros, zeros, jnp.zeros((rows, size), bool), jnp.zeros(rows, jnp.int32),

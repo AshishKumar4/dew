@@ -8,10 +8,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from flax import struct
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
+from dew.objectives.rl.tssm import TSSM
 from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean
 from dew.rl.env import Batched, Carry, Driven, TimeLimit, TimeStep, env_rollout, start
 
@@ -100,9 +102,41 @@ def test_a_driver_records_an_episodes_last_observation_then_restarts():
     assert (rewards[first] == 0).all() and (rewards[~first] != 0).all()
 
 
-def tiny(observation_size=1, action_size=1):
+@struct.dataclass
+class Seen:
+    """`Target` seen as a 16-pixel-square image: a bright column where the point is on [-3, 3]."""
+
+    action_size: int = struct.field(pytree_node=False, default=1)
+
+    @staticmethod
+    def image(x):
+        column = jnp.clip(jnp.round((x + 3) / 6 * 15), 0, 15).astype(jnp.int32)
+        row = (jnp.arange(16) == column).astype(jnp.uint8) * 255
+        return jnp.broadcast_to(row[None, :, None], (16, 16, 1))
+
+    def reset(self, key):
+        x, step = Target().reset(key)
+        return x, step.replace(observation=self.image(x))
+
+    def step(self, x, action):
+        x, step = Target().step(x, action)
+        return x, step.replace(observation=self.image(x))
+
+
+def tiny(observation_size=1, action_size=1, **options):
     return WorldModel(observation_size, action_size, deter=16, hidden=8, stoch=4, classes=4, blocks=2,
-                      units=8)
+                      units=8, **options)
+
+
+def transformer():
+    return TSSM(action_size=1, stoch=4, classes=4, width=16, layers=1, heads=2, context=16)
+
+
+AGENTS = {"gru": (Target, lambda: tiny()), "transformer": (Target, lambda: tiny(dynamics=transformer())),
+          "transformer-pixels": (Seen, lambda: tiny(0, image=(16, 16, 1), conv_depth=2,
+                                                    dynamics=transformer()))}
+"""Each agent's environment and world model: the block GRU's and TransDreamer's dynamics over the walk's
+position, and TransDreamer's over the walk seen as pixels."""
 
 
 def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():
@@ -134,17 +168,20 @@ def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():
     np.testing.assert_array_equal(imagined.following.observation, stepped(state))
 
 
-def test_an_agent_learns_its_world_from_its_replay():
+@pytest.mark.parametrize("agent", AGENTS)
+def test_an_agent_learns_its_world_from_its_replay(agent):
     """A small DreamerV3 agent acting in batched target walks and trained from its replay at a fixed
     ratio, its actor and critic learning in imagination beside it, predicts the replay's observations
-    and rewards better than it did at the start, on the same replayed windows. Its policy's return is
-    the acceptance run's to judge, on a Playground task at the steps the paper reports."""
+    and rewards better than it did at the start, on the same replayed windows: with the block GRU's
+    dynamics or TransDreamer's, over the walk's position or its pixels. Its policy's return is the
+    acceptance run's to judge, on a task at the steps the paper reports."""
     from dew.data.dataset import Loader
     from dew.objectives.base import Step
     from dew.training import Trainer
 
-    env = Batched(TimeLimit(Target(), episode_length=20), 8)
-    objective = DreamerV3Objective(tiny())
+    walk, model = AGENTS[agent]
+    env = Batched(TimeLimit(walk(), episode_length=20), 8)
+    objective = DreamerV3Objective(model())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
     initial = jax.device_get(trainer.place()[0])
