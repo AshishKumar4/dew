@@ -609,6 +609,16 @@ class DreamerV3Objective(Objective[Ratio]):
         held = deter if dynamics is None else dynamics.empty_cache(count, dynamics.context)
         return AgentMemory(held, stoch, jnp.zeros((count, self.model.action_size)))
 
+    def model_flops(self, model: object, batch: Batch) -> float:
+        """One update's forward work on `batch` (the world model on its windows, the actor and critic in
+        imagination): its loss's traced matrix products and convolutions (`dew.nn.flops.traced_flops`), the
+        trainer's MFU three times it."""
+        from dew.nn.flops import traced_flops
+
+        variables = jax.eval_shape(self.init, jax.random.key(0))
+        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+        return traced_flops(lambda variables, batch: self.loss(variables, batch, step), variables, batch)
+
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         world_key, imagine_key = jax.random.split(step.key)
         model = self.model.bind(variables, rngs={"latent": world_key})

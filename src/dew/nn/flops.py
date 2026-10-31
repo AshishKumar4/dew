@@ -7,7 +7,7 @@ MFU. Rematerialization belongs only to the separate HLO hardware count.
 """
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 from flax import linen as nn
@@ -169,3 +169,46 @@ def ssd_flops(lengths: np.ndarray, heads: int, state: int, channels: int) -> flo
     decay/scaling is pointwise work, excluded like GDN's decay and gates.
     """
     return per_real_token(lengths, 4 * heads * state * channels)
+
+
+def traced_flops(function: Callable[..., object], *arguments: object) -> float:
+    """The forward work of `function` on `arguments` (arrays, or their `jax.ShapeDtypeStruct`s): two FLOPs a
+    multiply-add of every matrix product and convolution its traced program runs (`dot_general`,
+    `conv_general_dilated`), a scan's body times its length, a branch's the costliest of them, and every
+    nested program's (a jitted call's, a rematerialized one's, a custom derivative's primal). Pointwise work
+    is excluded, as the analytical counts exclude it. For a model whose work no closed form here counts (a
+    world model's loss with its imagination). A while loop's trips are unknown to a trace: refused."""
+    import jax
+
+    return _program_flops(jax.jit(function).trace(*arguments).jaxpr.jaxpr)
+
+
+def _program_flops(jaxpr: object) -> float:
+    """`traced_flops` of a jaxpr."""
+    total = 0.0
+    for equation in jaxpr.eqns:  # type: ignore[attr-defined]
+        name = equation.primitive.name
+        if name == "dot_general":
+            (contracted, _), _ = equation.params["dimension_numbers"]
+            left = equation.invars[0].aval.shape
+            products = math.prod(left[axis] for axis in contracted)
+            total += 2 * math.prod(equation.outvars[0].aval.shape) * products
+        elif name == "conv_general_dilated":
+            kernel = equation.invars[1].aval.shape
+            outputs = kernel[equation.params["dimension_numbers"].rhs_spec[0]]
+            total += 2 * math.prod(equation.outvars[0].aval.shape) * math.prod(kernel) / outputs
+        elif name == "scan":
+            total += equation.params["length"] * _program_flops(equation.params["jaxpr"].jaxpr)
+        elif name == "cond":
+            total += max(_program_flops(branch.jaxpr) for branch in equation.params["branches"])
+        elif name == "while":
+            raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
+        else:
+            for value in equation.params.values():
+                for program in value if isinstance(value, tuple | list) else (value,):
+                    # A closed program holds its jaxpr beside its constants; an open one is its equations.
+                    if hasattr(program, "consts") and hasattr(program, "jaxpr"):
+                        total += _program_flops(program.jaxpr)
+                    elif hasattr(program, "eqns"):
+                        total += _program_flops(program)
+    return total

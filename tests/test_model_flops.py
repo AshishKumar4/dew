@@ -43,6 +43,7 @@ from dew.nn.flops import (
     delta_flops,
     dense_training_flops,
     projection_flops,
+    traced_flops,
 )
 from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
@@ -75,6 +76,38 @@ LENGTHS = np.asarray([2, 5], np.int64)
 def decoder(**kwargs):
     return CausalTransformer(vocab_size=64, emb_features=8, num_heads=2, num_kv_heads=1,
                              head_dim=4, num_layers=3, mlp_features=16, **kwargs)
+
+
+def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
+    """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
+    matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
+    scan's body times its length, a branch's costliest arm, a gradient's backward products beside its
+    forward's; a while loop is refused."""
+    def shaped(*shape):
+        return jax.ShapeDtypeStruct(shape, jnp.float32)
+
+    assert traced_flops(lambda x, w: x @ w, shaped(2, 3, 5), shaped(5, 7)) == 2 * 2 * 3 * 5 * 7
+
+    def convolved(image, kernel):
+        return jax.lax.conv_general_dilated(image, kernel, (2, 2), "SAME",
+                                            dimension_numbers=("NHWC", "HWIO", "NHWC"))
+
+    outputs, taps = 2 * 5 * 5 * 8, 3 * 3 * 4
+    assert traced_flops(convolved, shaped(2, 10, 10, 4), shaped(3, 3, 4, 8)) == 2 * outputs * taps
+
+    def scanned(x, w):
+        return jax.lax.scan(lambda carry, _: (jnp.tanh(carry @ w), None), x, None, length=6)[0]
+
+    assert traced_flops(scanned, shaped(4, 5), shaped(5, 5)) == 6 * 2 * 4 * 5 * 5
+
+    def branched(x, w, v):
+        return jax.lax.cond(x.sum() > 0, lambda: x @ w @ v, lambda: x @ w)
+
+    assert traced_flops(branched, shaped(4, 5), shaped(5, 6), shaped(6, 3)) == 2 * 4 * 5 * 6 + 2 * 4 * 6 * 3
+    gradient = jax.grad(lambda w, x: jnp.sum(jax.nn.relu(x @ w)))
+    assert traced_flops(gradient, shaped(5, 7), shaped(3, 5)) == 2 * (2 * 3 * 5 * 7)
+    with pytest.raises(MissingFlopsCount):
+        traced_flops(lambda x: jax.lax.while_loop(lambda c: c.sum() < 9, lambda c: c @ c, x), shaped(2, 2))
 
 
 def test_integer_token_counts_carry_across_words_on_a_partitioned_batch():

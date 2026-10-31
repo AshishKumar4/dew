@@ -188,6 +188,15 @@ class ControlPPOObjective(Objective[Ratio]):
         after = jnp.where(ended > 0, following, onward)
         return rewards + self.discount * (1 - terminated) * after - values, targets
 
+    def model_flops(self, model: object, batch: Batch) -> float:
+        """One update's forward work on `batch` (the actor and critic on its sequences): its loss's traced
+        matrix products and convolutions (`dew.nn.flops.traced_flops`), the trainer's MFU three times it."""
+        from dew.nn.flops import traced_flops
+
+        variables = jax.eval_shape(self.init, jax.random.key(0))
+        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+        return traced_flops(lambda variables, batch: self.loss(variables, batch, step), variables, batch)
+
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         observation, following = self.seen(batch["observation"]), self.seen(batch["following"])
         model = self.model.bind(variables)
