@@ -453,78 +453,131 @@ PINNED_BUFFER = 8 << 20
 """The bytes a stream of a pinned object asks its store for at once (`Declared.open`)."""
 
 
+def stored_kind(fs: AbstractFileSystem) -> str | None:
+    """The version a remote store `fs` holds an object at and a read of it can be held to (`STORED`),
+    none for a store with none such."""
+    while isinstance(fs, CachingFileSystem):
+        fs = fs.fs
+    if isinstance(fs, S3FileSystem):
+        return STORED["s3"]
+    if isinstance(fs, GCSFileSystem):
+        return STORED["gs"]
+    return STORED["hf"] if isinstance(fs, HfFileSystem) else None
+
+
+def pinned_by_url(fs: AbstractFileSystem, path: str) -> bool:
+    """Whether the object at `path` is one version by its URL alone: a Hub repository's file at a full
+    commit, which no write moves."""
+    if not isinstance(fs, HfFileSystem):
+        return False
+    revision = parse_hf_uri(f"hf://{path}").revision
+    return revision is not None and REGEX_COMMIT_HASH.fullmatch(revision) is not None
+
+
+def checked_open(fs: AbstractFileSystem, path: str, size: int, digest: str) -> BinaryIO:
+    """The local or in-memory file at `path`, open, holding the `size` bytes of `digest`, refused
+    (`Replaced`) where it holds others: a local file opened first and its open file's metadata matched to
+    the metadata its digest was taken (or kept, `content_version`) at, so the bytes checked are the bytes
+    it reads; an in-memory one read whole and checked."""
+    if not local(fs):
+        payload = fs.cat_file(path)
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise Replaced(f"{path} holds other bytes than the {size} its producer declared")
+        return io.BytesIO(payload)
+    opened = fs.open(os.path.realpath(path), "rb")
+    try:
+        held = os.fstat(opened.fileno())
+        if held.st_size != size:
+            raise Replaced(f"{path} holds {held.st_size} bytes, not the {size} its producer declared")
+        found = content_version(fs, path, size)
+        _, _, modified, inode = _local_file_key(path, size)
+        if (held.st_size, held.st_mtime_ns, held.st_ino) != (size, modified, inode) or found != digest:
+            raise Replaced(f"{path} holds other bytes than the {size} its producer declared")
+    except BaseException:
+        opened.close()
+        raise
+    return opened
+
+
 class Declared:
-    """The object at `store` read as its producer declared it (`declared`: its size and digest, and the
-    version its store published it at, `stored`), never as other bytes: a remote object published at a
-    version is read in ranges held to it (`Pinned`), refused (`Replaced`) where its store no longer holds
-    it so; a local or in-memory file is checked whole as each read opens it (a local file's digest kept
-    while its metadata does not change, `content_version`), and refused where it holds other bytes; any
-    other remote object, and one a reader reads by its path on this host, is read whole into Dew's mirror
-    and checked there once, which a mirror without room for it refuses."""
+    """The object at `store` read as its producer declared it (`declared`: its size, and its digest or
+    the version its store published it at, `stored`), never as other bytes:
+    - a Hub file at a full commit, which its URL pins, is read as its URL names it;
+    - a remote object published at a version is read in ranges held to it (`Pinned`), refused
+      (`Replaced`) where its store no longer holds it there;
+    - a local or in-memory file is checked as each read opens it (`checked_open`);
+    - any other remote object it states a digest of, and one a reader reads by its path on this host, is
+      read whole into Dew's mirror and checked there, which a mirror without room for it refuses.
+    A declaration with neither a digest nor a version of a store's own is refused: nothing holds a read
+    of it to what it declares."""
 
     def __init__(self, store: Store, declared: Mapping[str, object]):
         self.store = store
+        fs, path = store.resolve()
         self.size = integer(declared["bytes"], "declared size")
-        self.digest = text(declared["sha256"], "declared digest")
+        digest = declared.get("sha256")
+        self.digest = None if digest is None else text(digest, "declared digest")
+        kind = stored_kind(fs)
         stored = declared.get("stored")
-        _, _, scheme = store._backend()
-        self.stored = ({str(kind): str(version) for kind, version in stored.items()}
-                       if isinstance(stored, Mapping) and STORED.get(scheme) in stored else None)
+        stored = dict(stored) if isinstance(stored, Mapping) else (
+            {"etag": declared["ETag"]} if kind == "etag" and "ETag" in declared else {})
+        self.stored = {kind: str(stored[kind])} if kind is not None and kind in stored else None
+        self.pinned = pinned_by_url(fs, path)
         self.lock = threading.Lock()
+        if not (self.pinned or self.stored or self.digest):
+            raise ValueError(f"{store.url} is declared with neither a digest nor its store's version of "
+                             "it, so no read of it can be held to the declaration: state its sha256")
 
     def __getstate__(self) -> Mapping[str, object]:
         # A reader in another process checks or mirrors the object for itself.
-        return {"store": self.store, "size": self.size, "digest": self.digest, "stored": self.stored}
+        return {key: value for key, value in self.__dict__.items() if key not in ("handle", "lock")}
 
     def __setstate__(self, state: Mapping[str, object]) -> None:
         self.__dict__.update(state)
         self.lock = threading.Lock()
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, Declared) and (self.store.url, self.size, self.digest, self.stored) == (
-            other.store.url, other.size, other.digest, other.stored)
+        return isinstance(other, Declared) and self._identity() == other._identity()
 
     def __hash__(self) -> int:
-        return hash((self.store.url, self.digest))
+        return hash(self._identity())
 
-    def checked(self) -> tuple[AbstractFileSystem, str]:
-        """The local or in-memory file, checked now to hold the declared bytes, or its checked copy in
-        Dew's mirror where it is remote."""
-        fs, path = self.store.resolve()
-        if not (local(fs) or in_memory(fs)):
-            return LocalFileSystem(), self.mirrored.name
-        found = (content_version(fs, path, self.size) if local(fs)
-                 else hashlib.sha256(fs.cat_file(path)).hexdigest())
-        if found != self.digest:
-            raise Replaced(f"{self.store.url} holds other bytes than the {self.size} its producer "
-                           "declared")
-        return fs, path
+    def _identity(self) -> tuple:
+        return self.store.url, self.size, self.digest, tuple(sorted((self.stored or {}).items()))
 
-    @functools.cached_property
     def mirrored(self) -> io.BufferedReader:
-        """The object's copy in Dew's mirror, checked against its digest as it downloads, held open so
-        the mirror keeps it while this reads it."""
+        """The object's copy in Dew's mirror, checked against its digest as it downloads, open: the
+        mirror keeps it while it is."""
         mirror, mirrored = self.store.cached().resolve()
-        opened = mirror.open(mirrored, "rb", source_snapshot={"size": self.size, "sha256": self.digest})
+        snapshot = None if self.digest is None else {"size": self.size, "sha256": self.digest}
+        opened = mirror.open(mirrored, "rb", source_snapshot=snapshot)
         if not isinstance(opened, io.BufferedReader) or not isinstance(opened.name, str):
             opened.close()
-            raise ValueError(f"{self.store.url} is read whole into Dew's mirror to check it against its "
-                             f"declared digest, which has no room for its {self.size} bytes")
+            raise ValueError(f"{self.store.url} is read whole into Dew's mirror to check it, which has no "
+                             f"room for its {self.size} bytes")
         return opened
-
-    @functools.cached_property
-    def handle(self) -> BinaryIO:
-        """One file of the declared bytes, checked as it opens, which ranges are read from: a local
-        file replaced since it opened keeps the bytes it opened."""
-        fs, path = self.checked()
-        return fs.open(path, "rb")
 
     def open(self) -> BinaryIO:
         """A binary file of the declared bytes, a pinned object's read `PINNED_BUFFER` bytes at a time."""
+        fs, path = self.store.resolve()
+        if self.pinned:
+            readable = self.store.readable()
+            return readable.fs.open(readable.path, "rb")
         if self.stored is not None:
             return io.BufferedReader(Pinned(self.store, self.stored, self.size), buffer_size=PINNED_BUFFER)
-        fs, path = self.checked()
-        return fs.open(path, "rb")
+        if self.digest is not None and (local(fs) or in_memory(fs)):
+            return checked_open(fs, path, self.size, self.digest)
+        return self.mirrored()
+
+    def unbuffered(self) -> Pinned | BinaryIO:
+        """A file of the declared bytes for a reader that plans its own reads (Arrow): a pinned object's
+        each read one request, any other as `open` gives it."""
+        return Pinned(self.store, self.stored, self.size) if self.stored is not None else self.open()
+
+    @functools.cached_property
+    def handle(self) -> BinaryIO:
+        """One file of the declared bytes, checked as it opens, which ranges are read from."""
+        return self.open()
 
     def read_range(self, start: int, end: int) -> bytes:
         """The declared bytes `start` to `end`, in one request where they are held to a version."""
@@ -534,11 +587,24 @@ class Declared:
             self.handle.seek(start)
             return self.handle.read(end - start)
 
-    def local_path(self) -> str:
-        """A path on this host's disk holding the declared bytes, checked: the file's own, or its copy in
-        Dew's mirror, which a reader that opens paths alone (ArrayRecord's) reads."""
-        fs, _ = self.store.resolve()
-        return self.checked()[1] if local(fs) else self.mirrored.name
+    def leased(self) -> tuple[str, BinaryIO]:
+        """A path on this host's disk to the declared bytes, for a reader that opens paths alone
+        (ArrayRecord's), and the open file that holds it so until it closes: a local file's own, checked
+        (by its open descriptor where the host names one, `/proc/self/fd`, so the path reads the file
+        checked), or its copy in Dew's mirror."""
+        fs, path = self.store.resolve()
+        if local(fs) and self.digest is not None:
+            opened = checked_open(fs, path, self.size, self.digest)
+            descriptor = f"/proc/self/fd/{opened.fileno()}"
+            return (descriptor if os.path.exists(descriptor) else path), opened
+        held = self.mirrored()
+        return held.name, held
+
+    def close(self) -> None:
+        """Close the file ranges were read from, which a later read opens and checks again."""
+        handle = self.__dict__.pop("handle", None)
+        if handle is not None:
+            handle.close()
 
 
 class Readable(NamedTuple):

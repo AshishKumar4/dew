@@ -224,9 +224,11 @@ class ArrayRecords:
         paths = []
         for url, declared in zip(self.urls, self.declared, strict=True):
             if declared is not None:
-                # ArrayRecord's reader opens paths alone, so a declared shard is read from a checked
-                # file on this host: its own, or its copy in Dew's mirror, a GCS one's too.
-                paths.append(declared.local_path())
+                # ArrayRecord's reader opens paths alone, so a declared shard is read from a checked file
+                # on this host: its own, or its copy in Dew's mirror, a GCS one's too, held while it reads.
+                path, held = declared.leased()
+                self._pins.append(held)
+                paths.append(path)
                 continue
             fs, path = Store(url, self.storage_options).resolve()
             if local(fs):

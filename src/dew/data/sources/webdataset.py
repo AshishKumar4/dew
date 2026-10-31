@@ -8,13 +8,15 @@ from contextlib import ExitStack
 
 import grain.python as grain
 
-from dew.data.storage import Store
+from dew.data.storage import Declared, Store
 
 
 class TarRows(grain.IterDataset):
-    def __init__(self, url: str, storage_options: Mapping[str, object] | None = None):
+    def __init__(self, url: str, storage_options: Mapping[str, object] | None = None,
+                 declared: Declared | None = None):
         super().__init__()
-        self.url, self.storage_options = url, storage_options
+        # The archive as its producer declared it where one did (`Declared`), else as its store holds it.
+        self.url, self.storage_options, self.declared = url, storage_options, declared
 
     def __iter__(self) -> grain.DatasetIterator:
         return _TarIterator(self)
@@ -26,9 +28,12 @@ class _TarIterator(grain.DatasetIterator):
         self.source = source
         self.position = 0
         self.pending: tuple[str, str, bytes] | None = None
-        fs, path = Store(source.url, source.storage_options).resolve()
         self.opened = ExitStack()
-        self.file = self.opened.enter_context(fs.open(path, "rb"))
+        if source.declared is not None:
+            self.file = self.opened.enter_context(source.declared.open())
+        else:
+            fs, path = Store(source.url, source.storage_options).resolve()
+            self.file = self.opened.enter_context(fs.open(path, "rb"))
         self.archive = self.opened.enter_context(tarfile.TarFile.open(fileobj=self.file, mode="r|*"))
         self.members = iter(self.archive)
 

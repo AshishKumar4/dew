@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import bz2
 import csv
-import gzip
 import hashlib
 import io
 import itertools
 import json
-import lzma
 import math
+import os
 import posixpath
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -188,8 +186,8 @@ def _fragment_rows(fragment) -> int:
 
 
 def _open_lines(opened: BinaryIO, path: str):
-    """The bytes of `opened`, the binary file at `path`, decompressed as its name says: gzip, bz2, xz or
-    lzma (Python's own readers, as fsspec's compression opens them) or zstd."""
+    """The bytes of `opened`, the binary file at `path`, decompressed as its name says, by fsspec's
+    reader of its compression (zstd's, a stream reader)."""
     compression = infer_compression(path.lower())
     if compression is None:
         return opened
@@ -197,13 +195,13 @@ def _open_lines(opened: BinaryIO, path: str):
         from zstandard import ZstdDecompressor
 
         return io.BufferedReader(ZstdDecompressor().stream_reader(opened))
-    if compression == "gzip":
-        return io.BufferedReader(gzip.GzipFile(fileobj=opened, mode="rb"))
-    if compression == "bz2":
-        return io.BufferedReader(bz2.BZ2File(opened, mode="rb"))
-    if compression in ("xz", "lzma"):
-        return io.BufferedReader(lzma.LZMAFile(opened, mode="rb"))
-    raise ValueError(f"{path} is compressed as {compression}, which Dew's line readers do not read")
+    from fsspec.compression import compr
+
+    # fsspec's registry of readers, which its own opens apply, the ones an application registers among them.
+    reader = next((each for name, each in compr.items() if name == compression), None)
+    if reader is None:
+        raise ValueError(f"{path} is compressed as {compression}, which fsspec has no reader of")
+    return reader(opened, mode="rb")
 
 
 class _DeclaredHandler(pafs.FSSpecHandler):
@@ -223,7 +221,13 @@ class _DeclaredHandler(pafs.FSSpecHandler):
     def open_input_file(self, path: str) -> pa.NativeFile:
         if path not in self.declared:
             return super().open_input_file(path)
-        return pa.PythonFile(self.declared[path].open(), mode="r")
+        # Each read one request: Arrow plans and coalesces its own.
+        opened = self.declared[path].unbuffered()
+        if local(self.fs) and os.path.exists(descriptor := f"/proc/self/fd/{opened.fileno()}"):
+            # A local file checked as it opened, read by Arrow's own reader of the descriptor checked.
+            with opened:
+                return pa.OSFile(descriptor)
+        return pa.PythonFile(opened, mode="r")
 
     def open_input_stream(self, path: str) -> pa.NativeFile:
         return self.open_input_file(path)
@@ -353,10 +357,8 @@ class Files(Dataset):
         """Each file its producer declared, read as declared (`Declared`): held to the version its
         store published it at, or checked against its digest, so a file replaced under its declaration
         is refused where it is read rather than read under it (row 1871)."""
-        # A file declared by no digest (a Hub file at a commit, which its URL pins) is read as its URL
-        # names it.
         return {url: Declared(Store(url, self.storage_options), facts)
-                for url, facts in self.declared.items() if "sha256" in facts}
+                for url, facts in self.declared.items()}
 
     def _opened(self, url: str) -> BinaryIO:
         """A binary file of `url`'s bytes: as its producer declared them where one did
@@ -616,8 +618,7 @@ class Files(Dataset):
         stores = [Store(url, self.storage_options).resolve() for url in self.paths]
         preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
         for url in self.paths:
-            fs, path = Store(url, self.storage_options).resolve()
-            with _open_lines(fs.open(path, "rb"), path) as file:
+            with _open_lines(self._opened(url), url) as file:
                 names = _header(file) if self.kind == "csv" else None
                 offsets = [(0, start, size) for _, start, size in _lines(self.kind, file, names)]
             encoded = io.BytesIO()
@@ -725,13 +726,9 @@ class Files(Dataset):
         if len({local(place.fs) for place in located}) > 1:
             located = [Readable(*store.resolve(), None) for store in stores]
         declared = {url: self._declared_objects[url] for url in self.paths if url in self._declared_objects}
-        if declared and all(local(place.fs) for place in located):
-            # Arrow reads this host's files itself, each declared one checked first.
-            for held in declared.values():
-                held.local_path()
-            filesystem = _arrow_filesystem(located[0].fs)
-        elif declared:
-            # Arrow's own clients hold no read to a version: the declared files are read through Dew's.
+        if declared:
+            # Arrow opens each declared file through Dew's reads of it, held to its version or checked
+            # as it opens; its own clients hold no read to a version.
             filesystem = pafs.PyFileSystem(_DeclaredHandler(located[0].fs, {
                 place.path: declared[url] for place, url in zip(located, self.paths, strict=True)
                 if url in declared}))
@@ -866,7 +863,7 @@ class Files(Dataset):
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
-            return TarRows(shard.uri, self.storage_options)
+            return TarRows(shard.uri, self.storage_options, self._declared_objects.get(shard.uri))
         if self.kind == "files":
             return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
         return _Lines(self, shard)
