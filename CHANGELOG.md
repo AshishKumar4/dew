@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A decision run's summary states each question budget with where it came from beside the window's
+  (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
+  states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
+  counts beside the delivered rows' (`Rejected.cut`).
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
