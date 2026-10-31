@@ -10,6 +10,9 @@ SSD, `recurrence_states` at Tiles(16, 3, None, 1): 96 of its 202 live registers 
 its need 200)."""
 
 
+import tempfile
+from pathlib import Path
+
 import kernel_compile
 import kernel_liveness
 import pytest
@@ -274,11 +277,13 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
         def case(models: dict):
             return KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)
 
-        # The pass's count beside the launch's model, and ptxas's least spill-free cap with no model asked
-        # (`kernel_compile.register_need`).
-        (record,), (needed,) = (kernel_compile.compile_mosaic_kernels([case(found)], "sm90")
-                                for found in (models, {}))
-    need = {kernel_compile._report(kernel).traced: kernel["need"] for kernel in needed["kernels"]}
+        # The pass's count (`lowered_models`, by launch), and each launch's PTX's least spill-free cap by
+        # ptxas (`kernel_compile.register_need`), compiled again into a directory this test reads.
+        (record,) = kernel_compile.compile_mosaic_kernels([case(models)], "sm90")
+        with tempfile.TemporaryDirectory() as directory:
+            kernel_compile._compiled(case(models), "sm90", {"name": "backward", "models": {}}, directory)
+            need = {path.stem: kernel_compile.register_need(path.read_text(), "sm90")
+                    for path in Path(directory).glob("*.ptx")}
     lowered = record.get("lowered_models", {})
     checked = [(name, model["registers"], need.get(name)) for name, model in lowered.items()]
     assert checked and all(found is not None for _, _, found in checked), (checked, sorted(need))
