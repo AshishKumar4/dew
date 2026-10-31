@@ -12,6 +12,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith, memref, nvvm, vector
@@ -57,6 +58,62 @@ def linear_scan(decays: jax.Array, writes: jax.Array, carried: jax.Array, exchan
                      plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.float32), layout=scalar)),
     )(lambda ctx, a, b, h, ref: _scanned(a, b, h, ref, reverse, exclusive))
     return scanned(decays, writes, carried, exchanged)
+
+
+BANKS = 32
+"""Shared memory's banks, a 4-byte word each (`cost.SHARED_BYTES_PER_CLOCK`'s 128 bytes a clock)."""
+
+
+def striped(positions: int) -> plgpu.Layout:
+    """The layout a block of `positions` takes across the threads: position `t + 128 i` thread `t`'s `i`-th,
+    a warp's threads adjacent at each step, as a coalesced global access takes them."""
+    return plgpu.Layout.WG_STRIDED((positions,), vec_size=1)
+
+
+def exchange_scratch(positions: int) -> plgpu.SMEM:
+    """The shared memory `to_striped` takes for a block of `positions`: a word each and one more each
+    `BANKS`, so no two threads of a warp store or load the same bank at once (cub's padded BlockExchange)."""
+    return plgpu.SMEM((positions + positions // BANKS,), jnp.float32)
+
+
+def to_striped(values: jax.Array, staged, *, interpret: bool = False) -> jax.Array:
+    """`values`, fp32 `[T]` in `blocked(T)`'s layout, in `striped(T)`'s through `staged`
+    (`exchange_scratch`): a thread's positions stored a word at a time, each `BANKS` words one more apart,
+    and read back across the threads; unpadded, a thread's 64 bytes stored at once conflicted on 70% of
+    an H100's shared stores (mamba1-scan-h100-7d3152837's ncu, 252M of 360M wavefronts)."""
+    if interpret:
+        return values
+    positions = values.shape[0]
+    moved: Callable[..., jax.Array] = plgpu.inline_mgpu(
+        arg_types=(blocked(positions), plgpu.RefType()),
+        return_type=plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32), layout=striped(positions)),
+    )(lambda ctx, x, ref: _to_striped(x, ref))
+    return moved(values, staged)
+
+
+def _to_striped(x: fa.FragmentedArray, staged):
+    """`to_striped` in Mosaic GPU's terms."""
+    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+    [vec] = x.registers.flat
+    count = ir.VectorType(vec.type).shape[0]
+    thread = arith.index_cast(index, arith.remui(utils.thread_idx(), arith.constant(i32, THREADS)))
+
+    def padded(position):
+        return arith.addi(position, arith.divui(position, arith.constant(index, BANKS)))
+
+    first = arith.muli(thread, arith.constant(index, count))
+    for i in range(count):
+        position = arith.addi(first, arith.constant(index, i))
+        memref.store(vector.extract(vec, [], [i]), staged, [padded(position)])
+    utils.warpgroup_barrier()
+    element = ir.VectorType.get((1,), ir.F32Type.get())
+    registers = []
+    for i in range(count):
+        position = arith.addi(thread, arith.constant(index, i * THREADS))
+        registers.append(vector.from_elements(element, [memref.load(staged, [padded(position)])]))
+    utils.warpgroup_barrier()
+    layout = fa.WGStridedFragLayout(shape=x.shape, vec_size=1)
+    return fa.FragmentedArray(_registers=np.array(registers, dtype=object), _layout=layout, _is_signed=None)
 
 
 def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Array:

@@ -21,7 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import mosaic, scan as block_scan
+from dew.nn.kernels.templates import cost, mosaic, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
 LOG2E = math.log2(math.e)
@@ -176,16 +176,31 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     return (*outs, None) if not scan.entered else tuple(outs)
 
 
-BLOCK_POSITIONS = 2048
-"""The tokens a backward block takes, 16 a thread of its warpgroup (`block_scan.blocked`): mamba_ssm's
-selective scan backward's chunk (kNThreads 128, kNItems 16, selective_scan_bwd_kernel.cuh)."""
+RESIDENT = 3
+"""The backward's programs a multiprocessor holds, a warpgroup each: twelve warps to hide a block's scans'
+shuffles and barriers, as mamba_ssm's backward launches at least three of its 128 threads (kMinBlocks,
+selective_scan_bwd_kernel.cuh:52). At two, an H100's warps were 12% active (mamba1-scan-h100-7d3152837)."""
+
+LIVE_ARRAYS = 15
+"""The fp32 values a backward thread holds a position at its peak: its tokens' operands and gradients'
+sums carried through the states, and a state's operands and its scans': 254 registers at 16 positions a
+thread on an H100's compile, 255 on an A100's (scanbwd2-ptxas-* at 7d3152837)."""
 
 
-def block_positions(length: int) -> int:
-    """The tokens a backward block of a scan `length` tokens long takes: `BLOCK_POSITIONS` where the length
-    is long enough, else the fewest whole tokens a thread covering it (the length padded to the threads)."""
+def positions_per_thread(family: mosaic.Family) -> int:
+    """The tokens a backward thread takes: the most, a power of two to mamba_ssm's 16 (kNItems), whose
+    values (`LIVE_ARRAYS` a token) and control (`resources.CONTROL_REGISTERS`) fit a thread's share of the
+    multiprocessor's registers at `RESIDENT` programs, in the family's allocation steps."""
+    share = cost.REGISTERS // (block_scan.THREADS * RESIDENT) // family.register_step * family.register_step
+    return max(count for count in (1, 2, 4, 8, 16)
+               if resources.CONTROL_REGISTERS + LIVE_ARRAYS * count <= share)
+
+
+def block_positions(length: int, family: mosaic.Family) -> int:
+    """The tokens a backward block of a scan `length` tokens long takes: its threads' (`positions_per_thread`)
+    where the length is long enough, else the fewest whole tokens a thread covering it."""
     threads = block_scan.THREADS
-    return min(BLOCK_POSITIONS, -(-length // threads) * threads)
+    return min(threads * positions_per_thread(family), -(-length // threads) * threads)
 
 
 def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
@@ -205,11 +220,10 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped)."""
     rows, channels, length = x.shape
-    states, positions = b.shape[1], block_positions(length)
+    states, positions = b.shape[1], block_positions(length, scan.family)
     blocks, per = length // positions, positions // scan.chunk
     interpret = scan.interpret
     layout = block_scan.blocked(positions)
-    striped = plgpu.Layout.WG_STRIDED((positions,), vec_size=1)
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, entered_ref, resets_ref, dy_ref, dfinal_ref,
               db_ref, dc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried):
@@ -219,12 +233,12 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
             return plgpu.load(ref, layout=layout, optimized=False).astype(jnp.float32)
 
         def added(ref, value):
-            """`value` added to `ref` atomically, across the threads (`striped`)."""
+            """`value` added to `ref` atomically, across the threads (`block_scan.to_striped`), a warp's adds
+            adjacent."""
             if interpret:
                 ref[...] = ref[...] + value
                 return
-            staged[...] = value
-            plgpu.atomic_add(ref, plgpu.load(staged, layout=striped, optimized=False), optimized=False)
+            plgpu.atomic_add(ref, block_scan.to_striped(value, staged), optimized=False)
 
         def block(i, d_skip):
             k = blocks - 1 - i
@@ -282,7 +296,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, channels), grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
                              name="selective_scan_backward",
-                             scratch=(block_scan.scratch(), plgpu.SMEM((positions,), jnp.float32),
+                             scratch=(block_scan.scratch(), block_scan.exchange_scratch(positions),
                                       plgpu.SMEM((2, states), jnp.float32)))
     db, dc = (jax.new_ref(jnp.zeros(b.shape, jnp.float32)) for _ in range(2))
     dx, ddt, da, dd, dstate = launched(x, dt, b, c, parameters, entered, resets, dy, dfinal, db, dc)
@@ -332,7 +346,7 @@ def _scan_forward(x, dt, A, B, C, D, entering, resets, scan: Scan):
 def _scan_backward(scan: Scan, residuals, grads):
     x, dt, A, B, C, D, entered, resets = residuals
     dy, dfinal = grads
-    positions = block_positions(scan.length)
+    positions = block_positions(scan.length, scan.family)
     padded = -(-scan.length // positions) * positions
 
     def leading(t):
