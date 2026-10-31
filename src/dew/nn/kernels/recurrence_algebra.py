@@ -934,8 +934,9 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     they are, in the operands' dtype): over the value blocks `j`, `dq = do S^T`, `dk = v dS^T` and
     `dw = -dv S^T` for the corrected values `values(j)`, the output's gradient `out_grads(j)`, the corrected
     values' own `value_grads(j)` and the memories the chunk entered and left `entered(c, j)`, `leaving(c, j)`
-    (key block `c`), then the gates and `dq += ds k`, `dk += ds^T q`, each key block's to `emit('dq' | 'dk'
-    | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
+    (key block `c`), then the gates and `dq += ds k`, `dk += ds^T q` (none where `ds` is None: a caller
+    summing the scores' gradient over value heads first takes them once), each key block's to `emit('dq' |
+    'dk' | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
     `leaving` `[C]` each token's write into the memory the chunk leaves. `memory_decay` is the decay's
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
     summing key blocks apart adds it once). Without the delta rule (`value_grads` None) there are no weights
@@ -948,11 +949,11 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
         dq = _summed(issue("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks))
         dq = dq * row_decay * scale
         after.append(jnp.sum(dq * queries(c).value().astype(jnp.float32), axis=1))
-        emit("dq", c, dq + issue("scores_dq", ds, keys(c)))
+        emit("dq", c, dq if ds is None else dq + issue("scores_dq", ds, keys(c)))
         dk = _summed(issue("memory_dk", values(j), leaving(c, j).T) for j in range(blocks))
         dk = dk * leaving_decay if row_scale is None else dk * (leaving_decay * row_scale[:, None])
         leaving_terms.append(jnp.sum(dk * keys(c).value().astype(jnp.float32), axis=1))
-        emit("dk", c, dk + issue("scores_dq", Transposed(ds), queries(c)))
+        emit("dk", c, dk if ds is None else dk + issue("scores_dq", Transposed(ds), queries(c)))
         if value_grads is not None:
             emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T)
                                    for j in range(blocks)))

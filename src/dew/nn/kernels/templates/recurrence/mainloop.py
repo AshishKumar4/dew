@@ -713,24 +713,30 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     return launched
 
 
-def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callable | None = None):
+def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callable | None = None,
+          segments: tuple = ()):
     """The program's roles over its `steps` steps (one by default): the family's loads of `views` (`_views`)
     into `streams` (its allocations) and its walk of `step`, which stores what the program computes. Where a
     `prologue` is given, the consumer runs it before its walk waits on the streams' first tiles and its
     step takes what it returns (`step(index, slots, carry, accumulators, loaded)`): its own loads from
-    global memory (a chunk's prefix and write gates) in flight beside the streams', not after them."""
+    global memory (a chunk's prefix and write gates) in flight beside the streams', not after them. Where
+    `segments` `(step, lo, hi)` are given (a launch's own, not a persistent one's), they walk the steps in
+    place of `step`, a step of its own for some of them."""
     family = call.family
     given = _WALKED.get()
     if given is not None:
         # A persistent launch's tile: its kernel walks it (`_kernel`'s `persistent`).
+        assert not segments, "a persistent launch's tile walks one step"
         given.append((views, step, prologue, steps))
         return
     streams = family.opened(streams["walked"], views)
 
     def consumer(wg):
-        walked = step if prologue is None else functools.partial(step, loaded=prologue())
+        loaded = None if prologue is None else prologue()
+        walked = tuple((each if loaded is None else functools.partial(each, loaded=loaded), lo, hi)
+                       for each, lo, hi in (segments or ((step, 0, steps),)))
         # The streams a producer loads, or on a layout without one the consumer's own feed of them.
-        family.walk(family.fed(streams, views, 0, steps, wg), ((walked, 0, steps),), (), (), call.interpret)
+        family.walk(family.fed(streams, views, 0, steps, wg), walked, (), (), call.interpret)
 
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
 
