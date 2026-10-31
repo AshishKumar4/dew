@@ -135,7 +135,8 @@ def discrete_consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Arra
 
 
 def backward_simulation(student: Callable[[jax.Array, jax.Array], jax.Array], x_T, times, noises,
-                        live: jax.Array | None = None) -> jax.Array:
+                        live: jax.Array | None = None,
+                        trained: Callable[[jax.Array, jax.Array], jax.Array] | None = None) -> jax.Array:
     """Return the student's few-step sample from `x_T`, starting at t = pi/2 (rCM's `backward_simulation`).
 
     At each time in `times`, capped per row at the time before it, the clean
@@ -143,7 +144,8 @@ def backward_simulation(student: Callable[[jax.Array, jax.Array], jax.Array], x_
     clean prediction is the sample, and only it keeps its gradient.
     `student(x, t)` returns the student's x_0. `live` marks the steps that
     run; the other steps leave the state and the time unchanged, so a traced
-    step count can run over a fixed number of draws.
+    step count can run over a fixed number of draws. `trained`, given, is the
+    student for that last prediction, the one call a gradient flows through.
     """
     current = jnp.full(x_T.shape[:1], math.pi / 2, jnp.float32)
     x = x_T
@@ -154,7 +156,7 @@ def backward_simulation(student: Callable[[jax.Array, jax.Array], jax.Array], x_
         renoised = expand(jnp.cos(following), clean) * clean + expand(jnp.sin(following), clean) * noise
         x = jnp.where(active, renoised, x)
         current = following
-    return student(x, current)
+    return (student if trained is None else trained)(x, current)
 
 
 def distribution_matching_loss(generated, fake, teacher, scale: float) -> jax.Array:
@@ -370,16 +372,18 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
     def _generated(self, student_params, given, draws: _Draws, iteration,
                    recorded: list[Variables] | None = None) -> jax.Array:
         """The student's DMD2 sample: `max_simulation_steps` noisings drawn,
-        the first `steps - 1` walked, where steps cycles with `iteration`; its first call records what it
-        sows into `recorded` (`_network`)."""
+        the first `steps - 1` walked, where steps cycles with `iteration`; its last call, the one it trains,
+        records what it sows into `recorded` (`_network`)."""
         steps = iteration % self.max_simulation_steps + 1
         times = self._times(draws.simulation_times, self.critic_times)
         # Steps past the drawn count leave the time where it is: from t = 0
         # nothing is noised again.
         live = jnp.arange(self.max_simulation_steps - 1) < steps - 1
-        network = self._network(self.model, student_params, given, recorded)
+        network = self._network(self.model, student_params, given)
+        observed = self._network(self.model, student_params, given, recorded)
         return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], draws.start, times,
-                                   draws.simulation_noises, live)
+                                   draws.simulation_noises, live,
+                                   trained=lambda x, t: trig_prediction(observed, x, t)[0])
 
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
@@ -396,7 +400,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             student_params = self.model_variables(params)
             total = jnp.zeros((count,), jnp.float32)
             # The student's first trained call records what it sows (`_network`): the consistency loss's,
-            # or, for distribution matching alone, its simulation's.
+            # or, for distribution matching alone, its simulation's last, the one it trains.
             recorded: list[Variables] | None = [] if step.watched is not None else None
             scored: list[Variables] | None = [] if step.watched is not None else None
             if self.consistency_weight > 0 and self.consistency == "discrete":
@@ -426,8 +430,8 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             return total, self._phase_sown(recorded, scored)
 
         def critic_losses(params):
-            # The student's first call in a critic phase, its simulation's start, records what it sows, as
-            # does the fake score's, which trains.
+            # The student's simulation in a critic phase, under no gradient, records what its last call sows,
+            # as does the fake score's call, which trains.
             recorded: list[Variables] | None = [] if step.watched is not None else None
             scored: list[Variables] | None = [] if step.watched is not None else None
             generated = jax.lax.stop_gradient(self._generated(
