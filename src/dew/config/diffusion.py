@@ -56,6 +56,7 @@ from dew.sampling.solvers import EulerAncestral, Solver
 
 if TYPE_CHECKING:
 
+    from dew.data.pipeline import Dataset
     from dew.diffusion.presets import Preset
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
     from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
@@ -248,22 +249,26 @@ class DiffusionRunConfig(RunConfig):
         one whose size varies."""
         return media_field(self.chain(), "diffusion")
 
-    def mask_field(self, sample: Field, wanted: Field) -> Field:
+    def mask_field(self, sample: Field, wanted: Field, chain: Dataset | None = None,
+                   name: str = "the chain") -> Field:
         """The batch field an inpainting pipeline reads its mask from (`wanted`, the pipeline's own): the
-        chain's `wanted.key` at the samples' height and width, one channel, as `dew.data.images.RandomMask`
-        draws one or a dataset's own column decodes one. A chain that carries none is refused, naming
-        RandomMask: an inpainting pipeline paints the region its mask marks, and a plain image chain
-        marks none."""
-        fields = record(self.chain().facts()["fields"], "the chain's fields")
+        chain's `wanted.key` (the run's data, or `chain`, a validation split `name`) at the samples' height
+        and width, one channel, as `dew.data.images.RandomMask` draws one or a dataset's own column decodes
+        one. A chain that carries none is refused, naming RandomMask: an inpainting pipeline paints the
+        region its mask marks, and a plain image chain marks none."""
+        fields = record((self.chain() if chain is None else chain).facts()["fields"], f"{name}'s fields")
         shape = fields.get(wanted.key)
         expected = (*sample.shape[:-1], 1)
         if shape is None:
+            recipe = ("images(..., augment=RandomMask())" if chain is None else
+                      "images(..., augment=RandomMask(), rejects=False), whose random steps draw by each "
+                      "record's own index, which a dropped record would shift")
             raise ValueError(f"{self.pretrained} is an inpainting pipeline, which paints the region a mask "
-                             f"marks in each image; the chain carries no {wanted.key!r} field: draw one per "
-                             f"image with dew.data.images.RandomMask() (images(..., augment=RandomMask())), "
-                             f"or decode a dataset's own into {wanted.key!r}")
+                             f"marks in each image; {name} carries no {wanted.key!r} field: draw one per "
+                             f"image with dew.data.images.RandomMask() ({recipe}), or decode a dataset's "
+                             f"own into {wanted.key!r}")
         if not isinstance(shape, list | tuple) or tuple(shape) != expected:
-            raise ValueError(f"the chain's {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
+            raise ValueError(f"{name}'s {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
                              f"over {sample.key} of {sample.shape} reads a mask of {list(expected)}")
         return Field(wanted.key, expected)
 
@@ -402,6 +407,12 @@ class DiffusionRunConfig(RunConfig):
 
         run = self
         objective = run.build()
+        mask = objective.inputs.mask
+        if mask is not None and run.validation is not None:
+            # Each evaluation scores its splits through their masks, as the run trains through its own.
+            splits = run.validation if isinstance(run.validation, Mapping) else {"validation": run.validation}
+            for name, split in splits.items():
+                run.mask_field(objective.inputs.sample, mask, split, f"the {name!r} split")
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.validation_metrics(validates=bool(held))
