@@ -582,7 +582,7 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                for training in (False, True) for variant in (None, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
                # The rated scan's 16-bit call, its fast forms' launches; its fp32 forward's spill at an
-               # H100's derived tiles is row 2931's.
+               # H100's derived tiles is row 2939's.
                and not (name in RATED and dtype == jnp.float32)
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16)})
