@@ -42,7 +42,7 @@ import lint_scopes as scopes
 DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew", "dew.batch", "dew.mesh"]),
     ("Training", ["dew.training", "dew.training.budget", "dew.training.cooldown", "dew.state", "dew.optim",
-                  "dew.newton_schulz", "dew.training.quantization", "dew.training.runtime",
+                  "dew.laprop", "dew.newton_schulz", "dew.training.quantization", "dew.training.runtime",
                   "dew.distributed.placement", "dew.distributed.batches", "dew.averaging"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
                     "dew.objectives.routing",
@@ -52,7 +52,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                     "dew.objectives.diffusion.guidance_distillation",
                     "dew.objectives.jepa", "dew.objectives.supervised", "dew.objectives.residuals",
                     "dew.objectives.perturbation", "dew.objectives.rl",
-                    "dew.objectives.rl.flow",
+                    "dew.objectives.rl.flow", "dew.objectives.rl.nft", "dew.objectives.rl.control",
+                    "dew.objectives.rl.dreamer", "dew.objectives.rl.tssm", "dew.objectives.world_model",
                     "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.gateway",
                     "dew.interop.harness", "dew.interop.harbor", "dew.interop.openenv"]),
     ("Data", ["dew.data", "dew.data.presets", "dew.data.pipeline", "dew.data.holdout", "dew.data.compile",
@@ -92,7 +93,9 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                                    "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.distributed", "dew.cache", "dew.telemetry.profile",
+    ("Utilities", ["dew.rl", "dew.rl.env", "dew.rl.simulator", "dew.rl.quadrotor", "dew.rl.flight", "dew.rl.hyperlux",
+                   "dew.rl.replay", "dew.rl.playground", "dew.rl.distributions",
+                   "dew.artifacts", "dew.distributed", "dew.cache", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
