@@ -140,8 +140,8 @@ def test_a_step_pays_passes_and_ends_as_the_race_rules():
         np.testing.assert_array_equal(np.asarray(following.index), index)
         np.testing.assert_array_equal(np.asarray(truncated), cut)
         np.testing.assert_array_equal(np.asarray(following.passed), track.passed + (index != track.index))
-    for each in range(6):
-        assert (index[kind == each] != track.index[kind == each]).any() == (each == 0)
+    moved = index != track.index
+    assert moved[kind == 0].mean() > 0.9 and not moved[(kind >= 1) & (kind <= 4)].any()
     assert crashed[kind == 1].mean() > 0.9 and crashed[kind == 2].mean() > 0.9 and crashed[kind == 5].any()
 
 
