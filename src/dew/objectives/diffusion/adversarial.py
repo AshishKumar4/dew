@@ -35,6 +35,7 @@ from dew.inputs import InputSpec
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
+from dew.nn.inspection import INSPECTED
 from dew.nn.norms import l2_normalized
 from dew.nn.precision import accumulated, divided
 from dew.nn.protocols import Lacks
@@ -282,9 +283,11 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
+        # The student's call opens what the step sows (`Step.sown`), the forward the loss trains.
         student = self.process.denoiser(self.model, self.model_variables(variables), conditions,
-                                        schedule=schedule)
-        clean, _ = student(noisy, t)
+                                        schedule=schedule, opened=step.sown())
+        output, sown = student.raw_observed(noisy, t)
+        clean, _ = student.convert(noisy, t, output)
 
         mean, std = self.renoise_times
         level = jax.nn.sigmoid(mean + std * step.sample("renoise times", jax.random.normal, (),
@@ -330,11 +333,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
             metrics["distillation"] = jnp.mean(distillation)
             total = total + distillation
         updates = {SPECTRAL: jax.lax.stop_gradient(spectral)} if step.training else None
-        # The student's forward its denoiser runs (`Denoiser._raw`), at the step's own input, for its
-        # summaries.
-        c_in = self.process.prediction.get_input_scale(broadcast_rates(schedule, t, noisy))
-        inspected = self.watched_forward(step, self.model, self.model_variables(variables), noisy * c_in,
-                                         schedule.model_time(t), **conditions)
+        inspected = None if step.watched is None or sown is None else sown.get(INSPECTED, {})
         return self.row_mean(total, batch), Aux(metrics=metrics, variables=updates, inspected=inspected)
 
 

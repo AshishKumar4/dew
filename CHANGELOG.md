@@ -5,6 +5,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- The fit search's derived first candidate counts what its gradient program holds at its peak, as JAX
+  lowers it and the GPU's fusion keeps its values (a one-device `shard_map` inline, a Pallas kernel its
+  outputs alone, a `platform_dependent` the platform's branch), and the GEMM workspace XLA gives each
+  matmul (32 MiB from Hopper on, 4 MiB before; a compile-only GPU's 4 MiB, but a matmul fused with its
+  loop's slice). A program with a ragged product states its peak as a bound from below. Every compile's plan record carries `derived_headroom` beside its measured `headroom`, and a
+  compile the derivation judged otherwise logs a model miss.
+- An inspection's `every` counts windows of the run's accumulation steps; MeanFlow's and LADD's sampled
+  steps summarize the forward their loss trains, with no second forward. `dew inspect` views a run
+  whose objective names its input alone. `RunConfig.prepare()` returns a `Prepared` holding the run's
+  objective, data and what `train` takes beside them, with `train(name)` and `inspected(name)`.
+- A run on the examples clock resumed with a larger examples bound trains on to it.
 - A file an export's manifest or a source's `file_info` declares is never read as other bytes under
   that declaration, which a run's identity holds: an export records the version its store published
   each shard at (an S3 ETag, a GCS generation), and each read of a range of it is held to that version,
