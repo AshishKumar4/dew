@@ -177,13 +177,14 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
                                       **keywords: Arguments.kwargs) -> float:
     """The forward work of `function` on `arguments` (arrays, or their `jax.ShapeDtypeStruct`s): two FLOPs a
     multiply-add of every matrix product and convolution its traced program runs (`dot_general`,
-    `conv_general_dilated`), a scan's body times its length, a branch's the costliest of them, and every
-    nested program's (a jitted call's, a rematerialized one's, a custom derivative's primal). Pointwise work
-    is excluded, as the analytical counts exclude it. For a model whose work no closed form here counts (a
-    world model's loss with its imagination). The program is traced as for a CPU, where every product is
-    one the jaxpr shows (a GPU's kernels are custom calls, whose products it does not), and of a platform's
-    choice (`jax.lax.platform_dependent`) the accelerator's branch counts, the model's own products (a
-    CPU's sums them wide, `dew.nn.precision`). A while loop's trips are unknown to a trace: refused."""
+    `conv_general_dilated`), a scan's body times its length, a branch's the costliest of them, and the
+    program an operation calls (a jitted call's, a rematerialized one's, a custom derivative's primal).
+    Pointwise work is excluded, as the analytical counts exclude it. For a model whose work no closed form
+    here counts (a world model's loss with its imagination). The program is traced as for a CPU, where every
+    product is one the jaxpr shows (a GPU's kernels are custom calls, whose products it does not), and of a
+    platform's choice (`jax.lax.platform_dependent`) the accelerator's branch counts, the model's own
+    products (a CPU's sums them wide, `dew.nn.precision`). Refused, as a trace does not tell what runs: a
+    while loop's trips, and an operation holding several programs (a linear solve's)."""
     import jax
 
     from dew.nn.kernels.generation import assumed
@@ -219,10 +220,13 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
         elif name == "while":
             raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         else:
-            for value in equation.params.values():
-                for nested in value if isinstance(value, tuple | list) else (value,):
-                    if isinstance(nested, jaxpr_core.Jaxpr):
-                        total += _program_flops(nested)
+            nested = [program for value in equation.params.values()
+                      for program in (value if isinstance(value, tuple | list) else (value,))
+                      if isinstance(program, jaxpr_core.Jaxpr)]
+            if len(nested) > 1:
+                raise MissingFlopsCount(f"{name} holds {len(nested)} programs, which of them run a trace "
+                                        "does not tell")
+            total += sum(_program_flops(program) for program in nested)
     return total
 
 
