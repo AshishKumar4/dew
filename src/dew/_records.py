@@ -213,19 +213,8 @@ saved data step's identity compares without them (`without_removed`). Carried to
 RENAMED_FIELDS: Mapping[str, Mapping[str, str]] = {"dew.data.sources.iterator:Iterated": {"name": "identity"}}
 """The fields a configuration renamed after runs were saved with them, by its class's import path, each
 earlier name by today's: an iterator's content version, `identity` as every opaque source names it (row
-3031). A saved chain's store reads them under today's names (`renamed_fields`). Carried to 1.0 (ledger
-1552)."""
-
-
-def renamed_fields(written: Mapping[str, object]) -> Mapping[str, object]:
-    """`written`, a component's class record (`{"class": ..., "fields": ...}`), its fields its class renamed
-    since (`RENAMED_FIELDS`) under today's names; the fields' values as they are, whatever data they hold."""
-    named = written.get("class")
-    renamed = RENAMED_FIELDS.get(named, {}) if isinstance(named, str) else {}
-    fields = written.get("fields")
-    if not renamed or not isinstance(fields, Mapping):
-        return written
-    return {**written, "fields": {renamed.get(name, name): value for name, value in fields.items()}}
+3031). A record of one reads them under today's names wherever it is built from its fields
+(`dew.registry`). Carried to 1.0 (ledger 1552)."""
 
 
 def earlier_fields(value: JSON) -> JSON:

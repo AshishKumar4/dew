@@ -880,10 +880,11 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
 def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_the_same_documents(
         tmp_path, documents, eos, resumes):
     """A Dew before row 3028 read a token store's documents by its EOS, or, stating none, its whole stream
-    as one, and named the store by a fingerprint without its documents' reading. A plan it saved resumes
-    where it read the documents today's reads, the producer's records (`TokenFiles.earlier`): one record
-    with no EOS, or records each closed by the EOS alone. Where an EOS falls within a record, or records
-    without an EOS were one stream to it, it counted other documents in as many records, and is refused."""
+    as one, stating no lengths then. Where it read the documents today's reads, the producer's records
+    (one record with no EOS, or records each closed by the EOS alone), the store's fingerprint is as it
+    gave it and a plan it saved resumes; where it read others (an EOS within a record, records without
+    an EOS one stream to it), however many, the fingerprint says how today's reads them (`documents`), and
+    the plan, which counted those others, is refused."""
     from dew.data import Memory
     from dew.data.sinks import export
 
@@ -894,8 +895,10 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_th
     plan = compile(TokenFiles(url).batch(1), read="memory", loading=Loading(workers=0)).plan
     saved = json.loads(json.dumps(plan.record()))
     (fingerprint,) = saved["manifest"]["source"]["sources"]
-    assert fingerprint.pop("documents") == "records"
-    saved["derived"].pop("0/lengths")
+    assert fingerprint.pop("documents", None) == (None if resumes else "records")
+    # The lengths that Dew stated: none without an EOS; with one, its documents', today's where alike.
+    if eos is None or not resumes:
+        saved["derived"].pop("0/lengths")
     assert plan.check(plan.record()) == ()
     if resumes:
         assert plan.check(saved) == ()

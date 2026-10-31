@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
+from pathlib import Path
 
 import numpy as np
 
-from dew._records import json_value
+from dew._records import boolean, json_value, record
 from dew.batch import Batch
+from dew.cache import dew_cache_dir
 from dew.data.dataset import Ranges, Records
 from dew.data.declared import Declared
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, local
+from dew.files import write_atomically
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content
@@ -215,7 +220,9 @@ class TokenFiles(Dataset):
         """Tokens and metadata, by the export's committed manifest and the files it names, each by its
         content and place in the manifest, not the name its writer gave it (`export_content`), so two
         exports of the same documents agree: the documents are the producer's records, which its length
-        index states. The keys an export's fingerprint has always had (`_SPLIT`)."""
+        index states. The keys an export's fingerprint has always had (`_SPLIT`), and, where a Dew before
+        row 3028 read other documents of it (`_read_alike`), how its documents are read, so a plan that
+        Dew saved, which counted those, is not this store's."""
         store, _ = Store(self.url, self.storage_options).resolve()
         # A local store is named by its content, so hosts that mounted it at different paths agree.
         place = {} if local(store) else {"url": self.url}
@@ -231,25 +238,29 @@ class TokenFiles(Dataset):
             "index": None,
             "shard_rows": None,
             "producer": export_content(self.committed),
-            # Its documents read as its producer's records (row 3028), as no Dew before read them.
-            "documents": "records",
+            **({} if self._read_alike else {"documents": "records"}),
         }
 
-    def earlier(self, saved: object) -> bool:
-        """Whether `saved`, the fingerprint a plan an earlier Dew saved names this store by, names the
-        documents this store reads: the fingerprint it gave before a token store's documents were its
-        producer's records (`"documents"`, row 3028), where it read them as they are: stating an EOS, each
-        ended just past one or at the stream's end (`_earlier_ends`); stating none, the whole stream one.
-        Read once, on resuming such a plan. Carried to 1.0 (ledger 1552)."""
-        before = {name: value for name, value in self.fingerprint().items() if name != "documents"}
-        if saved != json_value(before, "token store fingerprint"):
-            return False
-        tokens = self.tokens
-        if tokens.eos_id is not None:
-            read = _earlier_ends(tokens)
-        else:
-            read = np.asarray([len(tokens)] if len(tokens) else [], np.int64)
-        return np.array_equal(read, self.document_ends())
+    @cached_property
+    def _read_alike(self) -> bool:
+        """Whether a Dew before row 3028, which read a token store's documents by its EOS, read this store's
+        as its producer's records: stating no EOS, one record holding every token; stating one, each record
+        ended by that EOS and holding no other (`_earlier_ends`), a scan of every token, kept in Dew's cache
+        under the export's content (`export_content`), which no write changes. Carried to 1.0 (ledger
+        1552)."""
+        tokens, ends = self.tokens, self.document_ends()
+        if tokens.eos_id is None:
+            return np.array_equal(ends, [len(tokens)] if len(tokens) else [])
+        content = json.dumps(json_value(export_content(self.committed), "token export"), sort_keys=True)
+        named = hashlib.sha256(content.encode()).hexdigest()
+        kept = Path(dew_cache_dir()) / "token-documents" / f"{named}.json"
+        if kept.exists():
+            held = record(json.loads(kept.read_text()), "token documents")
+            return boolean(held["read_alike"], "token documents read alike")
+        alike = bool(np.array_equal(_earlier_ends(tokens), ends))
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(kept, json.dumps({"read_alike": alike}))
+        return alike
 
     def supports(self, read: Read) -> bool:
         return True

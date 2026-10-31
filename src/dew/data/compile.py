@@ -133,7 +133,6 @@ from dew.data.pipeline import (
 from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import (
-    Earlier,
     Read,
     Rows,
     Source,
@@ -870,7 +869,6 @@ def _compiled(
         members=_member_manifests(train, build, host),
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
-        earlier=tuple(source.earlier if isinstance(source, Earlier) else None for source in sources),
     )
     tuned = build.tuned(train)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.

@@ -131,12 +131,16 @@ def test_a_chain_recorded_while_an_iterators_identity_was_its_name_reads_back():
     assert [member.source.identity for member in mixture.pipelines] == ["rows@1", "rows@2"]
 
 
-def test_a_memory_rows_data_shaped_like_an_earlier_iterator_reads_back_as_it_was():
-    """A store's renamed fields are read under today's names in its own record alone: a row a Memory holds
-    that is shaped like an iterator's earlier record is data, and reads back as written (row 3031)."""
-    payload = {"class": "dew.data.sources.iterator:Iterated", "fields": {"name": "rows@1"}}
-    again = _read_back(Memory([{"id": 0, "payload": payload}]).batch(1))
-    assert list(again.source.values["payload"]) == [payload]
+def test_a_concatenation_recorded_while_its_iterators_identities_were_their_names_reads_back():
+    """An iterator an earlier record names by `name` within another store's record, a concatenation's
+    part, reads with that version its `identity` too: wherever the record builds it (row 3031)."""
+    from dew.data.sources import Concatenate
+
+    chain = Concatenate((from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2"))).batch(1)
+    written = json.dumps(encode(chain))
+    earlier = json.loads(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert earlier != json.loads(written)
+    assert [part.identity for part in decode(earlier).source.sources] == ["rows@1", "rows@2"]
 
 
 def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():

@@ -66,7 +66,7 @@ import tyro
 from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
-from dew._records import JSON
+from dew._records import JSON, RENAMED_FIELDS
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -972,7 +972,11 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Ma
     own annotation. A field the record lacks takes its declared default; a
     field `member` does not declare, or a required one the record lacks,
     raises. A field marked `metadata={"record": False}` is a binding the
-    value picks up at runtime, not something a record carries."""
+    value picks up at runtime, not something a record carries. A field the
+    class renamed since runs were saved reads under today's name
+    (`dew._records.RENAMED_FIELDS`)."""
+    renamed = RENAMED_FIELDS.get(f"{member.__module__}:{member.__qualname__}", {})
+    fields = {renamed.get(name, name): value for name, value in fields.items()}
     declared = [f for f in dataclasses.fields(member) if _recorded(f)]
     names = sorted(f.name for f in declared)
     unknown = sorted(set(fields) - set(names))

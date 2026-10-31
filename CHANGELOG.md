@@ -8,7 +8,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A token export's documents are the records its producer wrote, by its length index, not its tokens'
   EOS: an EOS a document's own text spells splits nothing, an export without an EOS packs, an empty
   record is no document, and no `train.documents.npy` is written or read. A plan saved before resumes
-  where it read the same documents and is refused where it read others.
+  where it read the same documents; where it read others, the store's fingerprint says how its documents
+  are read now, and the plan is refused.
 - A diffusion run derives its preset's resolution shift and EDM space where it builds its process, so a
   `data.images.size` or autoencoder override derives them afresh. A JEPA run's predictor computes in its
   built encoder's dtype and attention kernel.
