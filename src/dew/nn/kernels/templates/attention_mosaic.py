@@ -577,7 +577,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
             # (`mosaic.swizzle_for`), its share of the columns whole swizzled rows (`attention_mosaic_coop`).
             share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
-            narrowest = mosaic.NARROWEST_SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+            narrowest = family.narrowest_columns(dtype)
             return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
                     and (config.block_k // config.consumers) % narrowest == 0
                     and share % family.column_unit(dtype) == 0)
