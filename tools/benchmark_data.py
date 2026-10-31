@@ -12,6 +12,7 @@ here are the knobs a run has:
     python tools/benchmark_data.py --steps 100 --data run.py
     python tools/benchmark_data.py matrix --output data-matrix.json --work matrix-work
     python tools/benchmark_data.py caching --workload bpe --read indexed --output caching.json
+    python tools/benchmark_data.py declared --output declared.json
 
 The matrix runs each arm, Dew's reader and plain Grain over the same steps, in
 a fresh interpreter over the same produced files.
@@ -1017,6 +1018,62 @@ def run_caching(config: Caching) -> None:
     print(json.dumps(result, default=str), flush=True)
 
 
+@dataclass(frozen=True)
+class DeclaredReads:
+    """A declared Parquet file on S3 (`url`, an object of a bucket Arrow's own client reads) read by each
+    route Dew can take for it (row 2886): Arrow's own client, the file's ETag read before and after
+    (`native`, `Files._versioned`), and Dew's reads held to the ETag, each Arrow read one request
+    (`held`, `_DeclaredHandler`), alternating, each `repeats` times; their medians and throughputs."""
+
+    url: str = ("s3://ookla-open-data/parquet/performance/type=fixed/year=2019/quarter=1/"
+                "2019-01-01_performance_fixed_tiles.parquet")
+    region: str = "us-west-2"
+    anonymous: bool = True
+    columns: tuple[str, ...] = ("avg_d_kbps", "avg_u_kbps", "tests")
+    repeats: int = 5
+    output: Path = Path("data-declared-reads.json")
+
+
+def run_declared_reads(config: DeclaredReads) -> None:
+    import pyarrow.fs as pafs
+    import pyarrow.parquet as pq
+
+    from dew.data.declared import Declared
+    from dew.data.sources.files import _arrow_filesystem, _DeclaredHandler
+    from dew.data.storage import Store
+
+    options = {"anon": config.anonymous, "client_kwargs": {"region_name": config.region}}
+    store = Store(config.url, options)
+    fs, path = store.resolve()
+    info = fs.info(path)
+    declared = Declared(store, {"bytes": info["size"], "ETag": info["ETag"]})
+    native = _arrow_filesystem(fs)
+    assert not isinstance(native, pafs.PyFileSystem), "Arrow's own client carries this store's settings"
+    held = pafs.PyFileSystem(_DeclaredHandler(fs, {path: declared}))
+
+    def read(filesystem, checked: bool) -> tuple[float, int]:
+        started = time.perf_counter()
+        if checked:
+            declared.still_held()
+        table = pq.read_table(path, columns=list(config.columns), filesystem=filesystem)
+        if checked:
+            declared.still_held()
+        return time.perf_counter() - started, table.nbytes
+
+    seconds: dict[str, list[float]] = {"native": [], "held": []}
+    decoded = 0
+    for _ in range(config.repeats):
+        for arm, filesystem, checked in (("native", native, True), ("held", held, False)):
+            took, decoded = read(filesystem, checked)
+            seconds[arm].append(took)
+    medians = {arm: statistics.median(times) for arm, times in seconds.items()}
+    result = {"schema": 1, "config": recorded(config), "object_bytes": info["size"], "decoded_bytes": decoded,
+              "seconds": seconds, "median_seconds": medians,
+              "native_speedup": medians["held"] / medians["native"]}
+    config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps({key: result[key] for key in ("median_seconds", "native_speedup", "decoded_bytes")}))
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["matrix"]:
         run_matrix(tyro.cli(Matrix, args=sys.argv[2:]))
@@ -1026,5 +1083,7 @@ if __name__ == "__main__":
         run_scaling(tyro.cli(Scaling, args=sys.argv[2:]))
     elif sys.argv[1:2] == ["caching"]:
         run_caching(tyro.cli(Caching, args=sys.argv[2:]))
+    elif sys.argv[1:2] == ["declared"]:
+        run_declared_reads(tyro.cli(DeclaredReads, args=sys.argv[2:]))
     else:
         main(benchmark(sys.argv[1:]))
