@@ -193,7 +193,7 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
 
     program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
     lowered = compiled(program, lowering or LOWERED.get(platform, platform))
-    return Peak(peak_bytes(lowered, platform, workspace), not bounded_below(program, platform))
+    return Peak(peak_bytes(lowered, platform, workspace), not bounded_below(lowered, platform))
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
@@ -243,9 +243,8 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
-            shared = sum(device_share(out) for out in sharing(frontier, last, index, equation) if out in made)
-            running = (made_bytes - shared + inner if equation.primitive.name in LOOPS
-                       else max(inner, made_bytes))
+            running = (looped(frontier, last, index, equation, made) + inner
+                       if equation.primitive.name in LOOPS else max(inner, made_bytes))
             most = max(most, live + running + operands + products)
         held.update(made)
         live += made_bytes
@@ -256,18 +255,39 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
 
 
 def carry(equation: jcore.JaxprEqn) -> list[tuple]:
-    """Each value the loop `equation` carries, as its initial value and the loop's result of it. XLA
-    keeps the two, the body's parameter of it and the body's returned value of it in one buffer
-    (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc), copying the initial value into
-    it where that is still read (copy insertion, xla/service/copy_insertion.cc)."""
+    """Each value the loop `equation` carries, as its initial value, the loop's result of it, and
+    whether its body changes it, returning another value than the parameter it took. XLA keeps the
+    initial value, the body's parameter and returned value of it and the loop's result in one buffer
+    (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc), copying the initial value into a
+    buffer of the loop's where it is an input or still read (copy insertion,
+    xla/service/copy_insertion.cc)."""
     if equation.primitive.name == "while":
         start = equation.params["cond_nconsts"] + equation.params["body_nconsts"]
-        return list(zip(equation.invars[start:], equation.outvars, strict=True))
+        body = equation.params["body_jaxpr"].jaxpr
+        taken = body.invars[equation.params["body_nconsts"]:]
+        changed = [returned is not took for returned, took in zip(body.outvars, taken, strict=True)]
+        return list(zip(equation.invars[start:], equation.outvars, changed, strict=True))
     if equation.primitive.name == "scan":
+        body = equation.params["jaxpr"].jaxpr
         _, started, _ = equation.params["ft_in"].update(equation.invars).unpack()
+        _, taken, _ = equation.params["ft_in"].update(body.invars).unpack()
         ended, _ = equation.params["ft_out"].update(equation.outvars).unpack()
-        return list(zip(started, ended, strict=True))
+        returned, _ = equation.params["ft_out"].update(body.outvars).unpack()
+        changed = [value is not took for value, took in zip(returned, taken, strict=True)]
+        return list(zip(started, ended, changed, strict=True))
     return []
+
+
+def looped(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprEqn, made: Sequence) -> int:
+    """The bytes the loop `equation`, the program's `index`th, holds of its own while it runs, its body's
+    aside: each result it makes (`made`) but a carry's, and each carried value its body changes, held in
+    a buffer of the loop's whether its result is read after or not, but where it is held in its
+    initial value's (`sharing`)."""
+    carried = carry(equation)
+    ends = {ended for _, ended, _ in carried}
+    shared = sharing(frontier, last, index, equation)
+    return (sum(device_share(out) for out in made if out not in ends)
+            + sum(device_share(ended) for _, ended, changed in carried if changed and ended not in shared))
 
 
 def returned_carry(equation: jcore.JaxprEqn, body: jcore.Jaxpr) -> frozenset:
@@ -284,16 +304,18 @@ def returned_carry(equation: jcore.JaxprEqn, body: jcore.Jaxpr) -> frozenset:
 def sharing(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprEqn) -> set:
     """The results of the loop `equation`, the program's `index`th, held in their initial value's buffer
     (`carry`): one the program computes, not an input or a literal, whose buffers the loop reads last,
-    or which a fused chain computes into a buffer for the loop to read; each initial value one
-    result's."""
-    found, taken = set(), set()
-    for start, ended in carry(equation):
-        if not computed(start) or start in frontier.inputs or start in taken:
+    or which a fused chain computes into a buffer for the loop to read; each buffer one result's, a
+    value and a view of it one buffer."""
+    found: set = set()
+    taken: set = set()
+    for start, ended, _ in carry(equation):
+        if not computed(start) or start in frontier.inputs:
             continue
-        kept = frontier.reading([start])
-        if frontier.made_for(start) or (kept and all(last[value] == index for value in kept)):
+        kept = {start} if frontier.made_for(start) else frontier.reading([start])
+        if kept and not kept & taken and (frontier.made_for(start) or all(last[value] == index
+                                                                           for value in kept)):
             found.add(ended)
-            taken.add(start)
+            taken |= kept
     return found
 
 
