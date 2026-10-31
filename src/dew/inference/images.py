@@ -721,7 +721,7 @@ def restored_tree(run: SavedRun, *, ema: bool | None, mesh: MeshSpec | Mesh | No
     (`SavedRun.variables`), each parameter root its record names (`_parameter_roots`) stored in
     `param_dtype` (as saved where None), restored where `mesh` and `layout` place it:
     what `TextToImage.from_saved` binds, and what a run that starts from `run` trains
-    (`dew.interop.saved_sources.run_pipeline`)."""
+    (`dew.interop.saved_sources.pipeline_of_run`)."""
     from dew._records import record as fields
     from dew.inference.tasks import saved_settings
 

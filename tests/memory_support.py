@@ -212,7 +212,7 @@ def applied(module: InContextMemory, call: MixerCall = PLAIN_CALL):
     return jax.jit(lambda x, params: module.apply(params, x, call))
 
 
-def stepped(module: nn.Module, segments: np.ndarray | None, prefill: int):
+def decode_passes(module: nn.Module, segments: np.ndarray | None, prefill: int):
     """`module`'s full passes over a draw's stream, packed as `segments` `[ROWS, S]` lays it (a plain call
     where None), at the shapes a decode of a `prefill`-token prefill computes them (`stepped_outputs`): the
     decode's reference arm."""

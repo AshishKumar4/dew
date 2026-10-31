@@ -64,7 +64,7 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
-from dew.interop.saved_sources import RunPipeline, pinned_run, released_run, run_pipeline
+from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -1067,7 +1067,7 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     count keeps them all, and none reads overrides, which are refused.
 
     A saved run is no published pipeline: Dew writes no diffusers layout of one, so it loads as the parts
-    and policy of the task its run built (`run_pipeline`), which a `DiffusionObjective` trains as it
+    and policy of the task its run built (`pipeline_of_run`), which a `DiffusionObjective` trains as it
     trains a pipeline. A step or EMA choice beside a pipeline is refused, as it selects nothing.
     """
     run = pinned_run(checkpoint, step=step, ema=ema)
@@ -1076,9 +1076,9 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         _no_language_model(checkpoint, "diffusion pipeline")
     if run is not None:
         stored = None if param_dtype == AUTO else param_dtype
-        return run_pipeline(run, checkpoint, dtype=dtype, param_dtype=stored, revision=revision,
-                            attention_impl=attention_impl, size=size, variables=variables, mesh=mesh,
-                            layout=layout, text=text, ema=ema)
+        return pipeline_of_run(run, checkpoint, dtype=dtype, param_dtype=stored, revision=revision,
+                               attention_impl=attention_impl, size=size, variables=variables, mesh=mesh,
+                               layout=layout, text=text, ema=ema)
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")

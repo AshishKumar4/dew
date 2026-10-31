@@ -19,12 +19,12 @@ from memory_support import (
     STEP,
     WIDTH,
     applied,
+    decode_passes,
     decoded,
     drawn,
     head_of,
     inner_sites,
     layer,
-    stepped,
     written,
 )
 from reference_error import as_given, assert_as_exact, widened
@@ -249,7 +249,7 @@ def test_a_cached_linear_memory_off_the_recurrence_continues_its_full_pass():
     """A linear memory whose heads' inputs a checkpoint's input quantization rounds runs its general path
     on every call, while its cache holds the recurrence's state: a prefill and a token-by-token decode
     through that cache read each token as the full passes do, each step's at the width it reads
-    (`stepped`), on par against its paper's update over the rounded inputs in float64 (check 1)."""
+    (`decode_passes`), on par against its paper's update over the rounded inputs in float64 (check 1)."""
     from dew.quantization import QUANTIZATION, InputQuantization, InputQuantizer
 
     module = layer("gated_linear_attention")
@@ -263,7 +263,7 @@ def test_a_cached_linear_memory_off_the_recurrence_continues_its_full_pass():
         return x, {**params, QUANTIZATION: scales}
 
     rounded = InputQuantizer.fp8(SCALE).qdq
-    assert_as_exact(decoded(quantized), stepped(quantized, None, 6), scaled,
+    assert_as_exact(decoded(quantized), decode_passes(quantized, None, 6), scaled,
                     "decoded quantized gated_linear_attention memory",
                     seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, inputs=rounded))

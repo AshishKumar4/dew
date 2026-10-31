@@ -9,7 +9,7 @@ release (`released_run`): every loader takes a source by its directory, so the r
 (its compute and storage dtypes, its mesh, its source options, an adapter) apply to it as to any
 release, and its first weights are the export's. Dew writes no release of a diffusion run
 (`samples_images`), and a diffusion run starts from the parts and policy of the run's own sampling
-task instead (`run_pipeline`).
+task instead (`pipeline_of_run`).
 """
 
 from __future__ import annotations
@@ -140,7 +140,7 @@ def pinned_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: b
 
 def samples_images(run: SavedRun) -> bool:
     """Whether `run` is a diffusion run, its task a `TextToImage`: Dew writes no release of one, and a run
-    starts from its task's parts (`run_pipeline`)."""
+    starts from its task's parts (`pipeline_of_run`)."""
     from dew.inference.images import TextToImage
 
     task = run.objective.saved_task
@@ -149,7 +149,7 @@ def samples_images(run: SavedRun) -> bool:
 
 @dataclass(frozen=True)
 class RunPipeline:
-    """A saved diffusion run as the source a diffusion run starts from (`run_pipeline`): its sampling
+    """A saved diffusion run as the source a diffusion run starts from (`pipeline_of_run`): its sampling
     task's denoiser `model`, `variables`, `process`, `inputs` and `autoencoder`, and the `solver`,
     `steps`, `guidance` and `grid` it samples by, which a `DiffusionObjective` trains as it trains a
     published pipeline (`PipelineSource`). Its variables are held as given, so an adapter's split of
@@ -174,10 +174,10 @@ class RunPipeline:
         return replace(self, model=adapter.model, variables=adapter.variables)
 
 
-def run_pipeline(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str | None,
-                 revision: str | None, attention_impl: AttentionImpl, size: tuple[int, ...] | None,
-                 variables: Variables | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
-                 text: bool, ema: bool | None) -> RunPipeline:
+def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str | None,
+                    revision: str | None, attention_impl: AttentionImpl, size: tuple[int, ...] | None,
+                    variables: Variables | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+                    text: bool, ema: bool | None) -> RunPipeline:
     """The diffusion run `run` (`checkpoint`) as a diffusion run starts from it: its own task's parts and
     policy (`TextToImage.from_saved`), computing in `dtype`, over its tree as its checkpoint holds it
     (`restored_tree`: an adapter's split of it kept, so its base stays frozen), stored in `param_dtype` (as
