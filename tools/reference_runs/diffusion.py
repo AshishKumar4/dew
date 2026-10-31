@@ -226,6 +226,26 @@ def flaxdiff_side(args, images, total, attention):
     return state, run, place, schedule, dict(trainer.mesh.shape), None, work
 
 
+def fixed_draws(counted, initial: dict, ema: float | None):
+    """The objective Dew's side trains: `counted`'s model, process and inputs over the `initial` tree, its
+    loss Dew's own (`DiffusionObjective.loss`), its two draws the batch's (`replayed`)."""
+    from dew.objectives.diffusion import DiffusionObjective
+
+    class FixedDraws(DiffusionObjective):
+        """Dew's `DiffusionObjective.loss`, its two draws the batch's (`replayed`)."""
+
+        def model_flops(self, model, batch):
+            """Fixed randomness changes no forward geometry from the counted objective."""
+            return counted.model_flops(model, batch)
+
+        def loss(self, variables, batch, step):
+            taped, images = replayed(step, batch)
+            return super().loss(variables, images, taped)
+
+    return FixedDraws(counted.model, counted.process, counted.inputs, ema_decay=ema, guidance=None,
+                      variables=initial)
+
+
 def counting_objective(shape: tuple[int, ...], dtype: str, attention: str):
     """The denoiser and image geometry shared by training and host-only counting."""
     from dew.diffusion.presets import EDM
@@ -243,19 +263,7 @@ def dew_side(args, images, total, attention):
     from work import measure
 
     from dew.distributed.batches import batch_shardings
-    from dew.objectives.diffusion import DiffusionObjective
     from dew.training import MeshSpec, Trainer
-
-    class FixedDraws(DiffusionObjective):
-        """Dew's `DiffusionObjective.loss`, its two draws the batch's (`replayed`)."""
-
-        def model_flops(self, model, batch):
-            """Fixed randomness changes no forward geometry from the counted objective."""
-            return counted.model_flops(model, batch)
-
-        def loss(self, variables, batch, step):
-            taped, images = replayed(step, batch)
-            return super().loss(variables, images, taped)
 
     counted = counting_objective(images.shape[1:], args.dtype, attention)
     model = counted.model
@@ -269,8 +277,7 @@ def dew_side(args, images, total, attention):
     constants = jax.tree.map(np.asarray, model.init(
         jax.random.key(0), jnp.zeros((1, *images.shape[1:])), jnp.zeros((1,)))["constants"])
     initial = {**load_tree(args.init), "constants": constants, "encoders": {}}
-    objective = FixedDraws(model, counted.process, counted.inputs,
-                           ema_decay=args.ema, guidance=None, variables=initial)
+    objective = fixed_draws(counted, initial, args.ema)
     optimizer, schedule = solver(args, total)
     devices = jax.device_count()
     mesh = MeshSpec(fsdp=devices) if args.mesh == "fsdp" else MeshSpec()
