@@ -10,6 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -66,8 +67,9 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     add_dq(q_first, family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
     return carry, (dk_acc, dv_acc)
 
+@tuning.lowered_once(("walk", "names"))
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
-                  walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
+                  walk: _Backward, names: tuple[str, str | None]) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fast form's one launch of a hookless call (`BackwardTiles.fused`), on the dQ launch's layout:
     each consumer's `block_k` keys of a query head resident, walked by the query tiles that see them,
     streamed with their output cotangents through a ring each, queries first (`_fused_step`), under the
@@ -148,7 +150,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     launch = family.kernel(
         entry, out_type=() if grouped else (gradient, gradient), grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
-        approx_math=walk.approx_math, name="attention_dkv_fused",
+        approx_math=walk.approx_math, name=names[0], kernel_name=names[1],
         # The model's products this launch owns (`stated`): dQ's, dK's, dV's and dP's; its `S` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
                     dout))
