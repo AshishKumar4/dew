@@ -427,8 +427,9 @@ class _Pass:
         # Each run of a block's warpgroup products' accumulator atoms, by the run's key: ptxas issues every
         # product of a run before it reads any of their accumulators (`uses`, `_define_all`).
         self.products: dict = collections.defaultdict(set)
-        # Each product's run (by its first result), each value's products of its block it reads through
-        # (`_define_all`), and each block's open run: its key and its products.
+        # Each product's run, each op's products of its block it reads through (`_define_all`), and each
+        # block's open run: its key and its products (ops by their operations, whose wrappers compare by the
+        # operation they wrap).
         self.run: dict = {}
         self.reads: dict = {}
         self.open: dict = {}
@@ -645,7 +646,7 @@ class _Pass:
             # products' 96 words at its peak, which the program order kills six at a time (its 202
             # registers a thread against 117 counted).
             # A nested block's products are placed when its own block is walked (`block`).
-            into.update(self.products.get(self.run.get(op.results[0]), ()))
+            into.update(self.products.get(self.run.get(op), ()))
         for nested_region in op.regions:
             for block in nested_region.blocks:
                 for inner in block.operations:
@@ -739,19 +740,28 @@ class _Pass:
         if op.results and op.results[0] in self.atoms.of:
             return
         self.define(op)
-        upstream = set().union(*(self.reads.get(operand, ()) for operand in op.operands))
+
+        def read(operands) -> set:
+            return set().union(*(self.reads.get(operand.owner, ()) for operand in operands
+                                 if not isinstance(operand.owner, ir.Block)))
+
+        upstream = read(op.operands)
         if _product(op):
+            # A product accumulating in place onto another's accumulators (a contraction's next K step) is
+            # the same accumulation: only its other operands (its left operand's registers, an address) can
+            # read a run-mate.
+            tied = _tied(op) or []
+            reads = read([operand for operand in op.operands if not any(operand == t for t in tied)])
             key, members = self.open.get(op.parent, (None, set()))
-            if key is None or upstream & members:
-                key, members = (op.parent, op.results[0]), set()
-            members.add(op.results[0])
+            if key is None or reads & members:
+                key, members = (op.parent, op), set()
+            members.add(op)
             self.open[op.parent] = (key, members)
-            self.run[op.results[0]] = key
+            self.run[op] = key
             self.products[key].update(a for value in op.results for a in self.atoms.of.get(value, ())
                                       if a is not None)
-            upstream.add(op.results[0])
-        for value in op.results:
-            self.reads[value] = frozenset(upstream)
+            upstream.add(op)
+        self.reads[op] = frozenset(upstream)
 
 
 def _product(op) -> bool:
