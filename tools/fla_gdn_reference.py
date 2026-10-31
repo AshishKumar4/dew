@@ -5,8 +5,8 @@ each site tests/fla_sites.py names, over the tests' own seeded draws.
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> [site prefix]
 
-on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the "fla"
-cohort, tools/reference_releases.py) running fla and its reference. What lands is
+on a GPU, Dew's environment recording and a second Python with torch, fla-core and tilelang (`--serve`, the
+"fla" cohort, tools/reference_releases.py) running fla and its reference. What lands is
 tests/fixtures/fla/gdn_seeded.npz, a summary recording (`record_case(..., summary=True)`): per site, seed and
 leaf, fla's distance from float64 at the site's inputs, which the test draws again (`Site.arrays`), and the
 truth's sketch, which Dew's float64 token recurrence is held to.
@@ -112,7 +112,10 @@ def serve() -> None:
     require("fla")
     from importlib.metadata import version
 
-    print(f"ready {version('fla-core')} {torch.cuda.get_device_name()}", flush=True)
+    # On Hopper fla-core 0.5.2 refuses its Triton backward under Triton below 3.7.1 (fla #640, wrong results
+    # in chunk_bwd_dqkwg) and takes tilelang's there: the cohort's torch 2.8.0 carries Triton 3.4.
+    found = f"fla-core-{version('fla-core')}+tilelang-{version('tilelang')}"
+    print(f"ready {found} {torch.cuda.get_device_name()}", flush=True)
     for line in sys.stdin:
         path, dtype, kind, scale = line.split()
         kda = kind == "kda"
@@ -177,13 +180,13 @@ def write_seeded(worker, prefix: str = "") -> None:
         stored.update(record_case(name, site.arrays, evaluate, portable, truth_proxy=exact_run,
                                   store_inputs=False, summary=True))
     stored["provenance"] = provenance(
-        f"fla-core {version}", f"fla-core {version}", device.strip(),
+        version, version, device.strip(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python>",
         truth="fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch "
               "float64",
         cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
                     "chain_roundings")
-    written = save(FIXTURE, stored, reference=f"fla-core {version}", license="MIT")
+    written = save(FIXTURE, stored, reference=version, license="MIT")
     print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
 
 
