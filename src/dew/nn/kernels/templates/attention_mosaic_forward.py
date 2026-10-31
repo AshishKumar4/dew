@@ -619,32 +619,28 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     kind = "peaks" if peaks else "training" if training else "forward"
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
-    # The hooks' functions and their parameters' kinds static, their arrays the programs' operands.
-    hook_arrays, hook_tree = jax.tree.flatten(hooks)
-    return _launched(query, key, value, (spans, hooked, guard, anchors), hook_arrays, hook_tree=(hook_tree,),
+    # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
+    return _launched(query, key, value, (spans, hooked, guard, anchors), jax.tree.leaves(hooks),
+                     hooks=jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), hooks),
                      spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
                      peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
                      counted=counted, finishes=finishes, target=generation.gpu_target(),
                      names=(name, report.named(name)))
 
 
-_HookTree = tuple[jax.tree_util.PyTreeDef]
-"""A launch's hooks' structure (`_launched`): their functions and their parameters' kinds, its arrays apart;
-`PyTreeDef` held in a tuple, as a type admits it (`options._Structure`)."""
-
-
-@tuning.lowered_once(("hook_tree", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
+@tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "names"))
-def _launched(query, key, value, read: tuple, hook_arrays: list, *, hook_tree: _HookTree,
+def _launched(query, key, value, read: tuple, hook_arrays: list, *, hooks: Hooks,
               spec: algebra.Forward, tiles: Tiles, family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               names: tuple[str, str | None]):
     """`_launch`'s kernel launched on its operands, the arrays its programs read beside them (`read`) and its
-    hooks' (`hook_arrays`, of the static `hook_tree`), lowered once for every call of its static facts
+    hooks' (`hook_arrays`, the static `hooks` holding their shapes and dtypes in their place, so its
+    functions are a key's and `tuning.holdable` reads them), lowered once for every call of its static facts
     and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
     `names` its name and the one its trace reports (`report.named`)."""
     del target
-    hooks: Hooks = jax.tree.unflatten(hook_tree[0], hook_arrays)
+    hooks = jax.tree.unflatten(jax.tree.structure(hooks), hook_arrays)
     leaves, treedef = jax.tree.flatten(read)
     name, kernel_name = names
     batch, queries, heads, width = query.shape
