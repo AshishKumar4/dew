@@ -573,47 +573,63 @@ def pinned_classes() -> list[str]:
             ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
-def reusable(python: str, names: list[str], common: str) -> dict[str, str]:
-    """The files of `names` whose whole row ran green on exactly these inputs (`common`, and each file's
-    own, `fresh`) on any class the tasks run on (`pinned_classes`), which a task of theirs could land on,
-    read at plan time with the cache's read token (`READ_TOKEN`): a task of their own would only look each
-    up and exit. Each with where its green run is kept (`green_key`'s class and key, `KEPT_AT`'s token), which
-    the plan hands the task that holds it, so no run of another commit replacing a file's last record
-    between plan and task can hide it (2026-10-30: a kept task found 23 of its 259 files and ran the rest).
-    None where the plan has no token or no class (the maintainer, 2026-10-28: a lane run with most files
-    unchanged booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
+def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tuple[str, str], str]:
+    """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
+    inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
+    task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
+    their own would only look each up and exit. A heavy file's groups are rows like any other, each looked up
+    by its own (2026-10-30: the plan looked up whole files alone, and a docs-only change's 1,034 green groups
+    of heavy files each booted a container to read its record). Each with where its green run is kept
+    (`green_key`'s class and key, `KEPT_AT`'s token), which the plan hands the task that holds it, so no run
+    of another commit replacing a row's last record between plan and task can hide it (2026-10-30: a kept
+    task found 23 of its 259 files and ran the rest). None where the plan has no token or no class (the
+    maintainer, 2026-10-28: a lane run with most files unchanged booted a container a task; 2026-10-29: the
+    suite pinned to 25/17 and 26/17)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
 
-    def hit(name: str) -> str | None:
+    def hit(each_row: tuple[str, str]) -> str | None:
+        name, group = each_row
         for each in held:
-            found = green_record(python, name, "", common, token, [each])
+            found = green_record(python, name, group, common, token, [each])
             # Kept only where its green run is kept by its key, as the task reads it.
-            if found is not None and recorded(green_key(python, row(python, name, ""), each, found["key"]),
+            if found is not None and recorded(green_key(python, row(python, name, group), each, found["key"]),
                                               token) is not None:
                 return f"{each}:{found['key']}"
         return None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        return {name: found for name, found in zip(names, pool.map(hit, names), strict=True) if found}
+        return {each: found for each, found in zip(rows, pool.map(hit, rows), strict=True) if found}
 
 
 KEPT_AT = "@"
-"""What joins a kept file's name to where its green run is kept in a plan entry's tests (`reusable`):
-`tests/test_a.py@<class>:<key>`, which the task reads (`kept_of`)."""
+"""What joins a kept row's file to where its green run is kept in a plan entry's tests (`reusable`):
+`tests/test_a.py@<class>:<key>`, or a group's, `tests/test_a.py#2/3@<class>:<key>`, which the task reads
+(`kept_of`)."""
+
+GROUP_AT = "#"
+"""What joins a kept row's file to its group in its token (`KEPT_AT`), as a row's name does (`row`)."""
 
 
-def kept_of(tests: list[str]) -> tuple[list[str], dict[str, tuple[str, str]]]:
-    """A task's `tests`, each a file's name, or a kept one's with where its green run is kept (`KEPT_AT`): the
-    names, and each kept one's class and key."""
+def kept_token(name: str, group: str, at: str) -> str:
+    """The token of file `name`'s row in `group` ("" for the whole file), kept where `at` says (`KEPT_AT`)."""
+    return f"{name}{GROUP_AT + group if group else ''}{KEPT_AT}{at}"
+
+
+def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
+    """A task's `tests`, each a file's name, or a kept row's token, its file's name with its group where it
+    has one and where its green run is kept (`KEPT_AT`): the files the task runs whole, those kept among
+    them, and each kept row's class and key by its file and group."""
     names, kept = [], {}
     for test in tests:
-        name, _, at = test.partition(KEPT_AT)
-        names.append(name)
+        at_row, _, at = test.partition(KEPT_AT)
+        name, _, group = at_row.partition(GROUP_AT)
+        if not group:
+            names.append(name)
         if at:
             held, _, key = at.partition(":")
-            kept[name] = (held, key)
+            kept[(name, group)] = (held, key)
     return names, kept
 
 
@@ -874,32 +890,40 @@ def plan(target: float, timings: dict) -> list[dict]:
         files = every if whole else [name for name in every if name in NEWEST_FILES]
         timings = borrowed(timings, python)
         timed = weights(files, timings, python)
-        found = reusable(python, [name for name, seconds in timed.items() if seconds is None
-                                  or seconds <= target], shared(python)) if cache == "on" else {}
-        kept = sorted(found)
-        timed = {name: seconds for name, seconds in timed.items() if name not in found}
-        # A lookup a file, in seconds: the task's weight is its container's start and those lookups.
-        tasks: list[tuple[list[str], str, float]] = [(kept, "", float(len(kept)))] if kept else []
-        tasks += [([name], "", target) for name, seconds in timed.items() if seconds is None]
+        # Each file's rows: a file heavier than the target runs as the groups it is cut into, each a row of
+        # its own; a file one group holds runs whole, alone, under its own row.
+        groups: dict[str, list[tuple[str, float]]] = {}
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
                 at, count = measured_cut(timings, python, name) or (seconds, 1)
                 cut = split(recorded.get(name, []), at, target, count)
-                # A file one group holds runs whole, alone, under its own row.
-                tasks += [([name], f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
-                          for group, weight in enumerate(cut, start=1)]
+                groups[name] = [(f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
+                                for group, weight in enumerate(cut, start=1)]
+        rows_of = [(name, "") for name in timed if name not in groups] + [
+            (name, group) for name, cut in groups.items() for group, _ in cut]
+        found = reusable(python, rows_of, shared(python)) if cache == "on" else {}
+        kept = sorted(found)
+        # A lookup a row, in seconds: the task's weight is its container's start and those lookups.
+        tasks: list[tuple[list[tuple[str, str]], float]] = [(kept, float(len(kept)))] if kept else []
+        tasks += [([(name, "")], target) for name, seconds in timed.items()
+                  if seconds is None and (name, "") not in found]
+        tasks += [([(name, group)], weight) for name, cut in groups.items() for group, weight in cut
+                  if (name, group) not in found]
         light = {name: seconds for name, seconds in timed.items()
-                 if seconds is not None and seconds <= target}
+                 if seconds is not None and name not in groups and (name, "") not in found}
         apart = {name for name in light if APART.search(Path(name).read_text())}
         for family in (sorted(set(light) - apart), sorted(apart)):
             count = max(math.ceil(sum(light[name] for name in family) / target), 1)
-            tasks += [(names, "", held) for held, names in packed({name: light[name] for name in family},
-                                                                  count) if names]
-        for index, (names, group, weight) in enumerate(tasks, start=1):
-            entries.append({"name": f"{python}-{index}", "python": python,
-                            "tests": " ".join(f"{name}{KEPT_AT}{found[name]}" if name in found else name
-                                              for name in names),
-                            "split": group, "rows": [row(python, name, group) for name in names],
+            tasks += [([(name, "") for name in names], held)
+                      for held, names in packed({name: light[name] for name in family}, count) if names]
+        for index, (held_rows, weight) in enumerate(tasks, start=1):
+            # A kept row says where its green run is kept, and its group where it has one (`kept_of`); a task
+            # of one file's group runs that group (`split`).
+            alone = held_rows[0][1] if len(held_rows) == 1 and held_rows[0] not in found else ""
+            tokens = [kept_token(name, group, found[(name, group)]) if (name, group) in found else name
+                      for name, group in held_rows]
+            entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(tokens),
+                            "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
                             "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache,
                             "whole": cells})
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
@@ -1037,11 +1061,35 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
     at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
     file goes there (`coverage_items`)."""
-    # Before any test writes under tests/, the inputs as the plan saw them; the files its plan kept read
-    # where it found their green runs (`kept_of`).
+    # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
+    # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
+    # their green run is not found there.
+    began = time.monotonic()
+    common = shared(python)
     names, kept = kept_of(tests)
-    return tested(python, names, split, out, deadline, cache, grace, shared(python), {}, coverage,
-                  whole=whole, release=release, kept=kept)
+    whole_files = {name: at for (name, group), at in kept.items() if not group}
+    code = tested(python, names, split, out, deadline, cache, grace, common, {}, coverage, whole=whole,
+                  release=release, kept=whole_files)
+    groups = [(name, group, at) for (name, group), at in kept.items() if group]
+    if not groups:
+        return code
+    rows = json.loads(out.read_text())["rows"]
+    for index, (name, group, at) in enumerate(groups, start=1):
+        left = deadline - (time.monotonic() - began)
+        if left <= 0:
+            # The task's deadline spent on the rows before it: this group is neither read nor run, and is red
+            # as a row its task's deadline cut off is (review).
+            rows.append({"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
+                         "output": f"{INTERRUPTED} of {deadline:.0f} s before this group was read or run",
+                         "tests": {}, "ynn_switched": [], "cells": {},
+                         "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
+            continue
+        part = out.with_name(f"{out.name}.{index}")
+        code = max(code, tested(python, [name], group, part, left, cache, grace, common, {}, coverage,
+                                whole=whole, release=release, kept={name: at}))
+        rows += json.loads(part.read_text())["rows"]
+    out.write_text(json.dumps({"rows": rows}))
+    return code
 
 
 def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
