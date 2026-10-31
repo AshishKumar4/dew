@@ -437,6 +437,7 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     with pytest.raises(Refused) as refused:
         strict.admit(body)
     assert refused.value.reason == "cut" and strict.counts.rejected == {"cut": 1}
+    before = strict.counts.refused_cut["instructions"]
     worded = Noul("Does the customer " + "really and truly " * 120 + "need a new card?")
     short = {"state": "my card is lost", "questions": {"holds": worded.wire()}}
     with pytest.raises(Refused) as whole:
@@ -447,7 +448,7 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     assert set(row.cuts) == {"instructions"} and lenient.counts.cut_rows == {"instructions": 1}
     assert lenient.counts.cut_removed == {"instructions": row.instructions_cut}
     # The cut the whole server refused counts beside its refusal, as a run's data counters count it.
-    assert strict.counts.refused_cut["instructions"] == row.instructions_cut
+    assert strict.counts.refused_cut["instructions"] - before == row.instructions_cut
 
 
 def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
