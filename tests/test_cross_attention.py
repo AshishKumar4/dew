@@ -150,7 +150,7 @@ def idefics_block(wide: bool):
 
 
 PAST_TARGET = {"idefics": {"bfloat16": 132}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2158):
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (ddee96234, ledger 2158):
 the bfloat16 block; every train computes and differentiates it in float32."""
 
 

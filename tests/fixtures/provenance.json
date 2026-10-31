@@ -407,11 +407,11 @@
   },
   "decoder-default-dropout-float64.jaxexport": {
    "generator": "dew",
-   "note": "The same pre-dropout CPU forward and gradient graph at 42ddfc1, exported in float64 over the weights widened (tools/generate_decoder_dropout_fixture.py --dtype float64): the float32 export's float64 truth for check 1."
+   "note": "The same pre-dropout CPU forward and gradient graph at 6103703, exported in float64 over the weights widened (tools/generate_decoder_dropout_fixture.py --dtype float64): the float32 export's float64 truth for check 1."
   },
   "decoder-default-dropout.jaxexport": {
    "generator": "dew",
-   "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 42ddfc1 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
+   "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 6103703 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
   },
   "decoding/penalties.npz": {
    "tool": "tools/vllm_penalty_reference.py",
@@ -4199,7 +4199,7 @@
    ]
   },
   {
-   "from": "AshishKumar4/dew@18511496038f9ca14652272a8081c698b244b580",
+   "from": "AshishKumar4/dew@ab9e7635af21d1994774cc0546b7e3fcf11f8433",
    "what": "the random weights and probe ids tools/hf_reference.py's write_diffusion_tiny drew there; tools/remote_code_reference.py computes the released code's logits from them",
    "files": [
     "hf/dream-tiny/input_ids.npy",
