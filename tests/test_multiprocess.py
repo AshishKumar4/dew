@@ -1598,11 +1598,11 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert len(preview) == 1 and preview[0] not in scoring
         assert report["results"]["preview_only"]["events"][0][0] == "preview"
         assert len(report["results"]["preview_only"]["events"]) == 1
-        assert report["results"]["preview_only"]["scores"]["evaluation/val/coordinated_batches"] == 1
-        assert report["results"]["preview_only"]["scores"]["evaluation/val/records"] == 8
+        assert report["results"]["preview_only"]["scores"]["evaluation/counts/val/coordinated_batches"] == 1
+        assert report["results"]["preview_only"]["scores"]["evaluation/counts/val/records"] == 8
         # Process 0 holds one batch and process 1 two: process 0 covers the
         # second with its first's rows marked repeats, so the pass reads all 12.
-        assert report["results"]["uneven"]["scores"]["evaluation/val/coordinated_batches"] == 2
+        assert report["results"]["uneven"]["scores"]["evaluation/counts/val/coordinated_batches"] == 2
         for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
             assert "error" in report["results"][phase], (phase, report)
             if phase != "construct":
@@ -1611,8 +1611,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert report["results"]["empty"] == {"scores": {}, "events": []}
         assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
         assert "no_consumer" not in report["closed"]
-        assert report["results"]["normal"]["scores"]["evaluation/val/records"] == 16
-        assert report["results"]["uneven"]["scores"]["evaluation/val/records"] == 12
+        assert report["results"]["normal"]["scores"]["evaluation/counts/val/records"] == 16
+        assert report["results"]["uneven"]["scores"]["evaluation/counts/val/records"] == 12
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []
@@ -1642,7 +1642,7 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
     assert reports[0]["measured"] == reports[1]["measured"]
     for report in reports:
         assert report["measured"]["val/count"] == 3
-        assert report["measured"]["evaluation/val/records"] == 3
+        assert report["measured"]["evaluation/counts/val/records"] == 3
         assert report["no_consumer"] == {}
 
 

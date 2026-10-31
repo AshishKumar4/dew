@@ -1064,27 +1064,32 @@ def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_cons
 
 def test_each_split_evaluated_at_a_step_records_its_own_counts():
     """Two splits of unequal size scored at one step each record the batches and records they read under
-    their own names (`evaluation/<split>/records`), so neither's count replaces the other's at that
-    step; a cooldown branch's suites, scored at the step it branched at, record theirs apart from the
-    run's own."""
+    their own names (`evaluation/counts/<split>/records`), so neither's count replaces the other's at
+    that step, nor a summary's named as a count is (`evaluation/summary/records`); a cooldown branch's
+    suites, scored at the step it branched at, record theirs apart from the run's own: no scalar takes
+    two values at one step."""
     from dew.training import Cooldowns
+    from dew.training.evaluation import Summary
 
     (x,) = clocked_records(0)
     small = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
     large = Pipeline(Memory({"x": x[:2 * BATCH]})).batch(BATCH)
     tracker = RecordingTracker()
+    summaries = [Summary(name, {"summary/loss": 1.0, "large/loss": 1.0}, "lower")
+                 for name in ("records", "coordinated_batches")]
     Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
-        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation={"small": small, "large": large},
-        eval_every="50%", cooldowns=Cooldowns(at=("50%",), length=2))
-    counted = collections.defaultdict(list)
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%", summaries=summaries,
+        validation={"summary": small, "large": large}, cooldowns=Cooldowns(at=("50%",), length=2))
+    logged = collections.defaultdict(list)
     for step, scalars in tracker.scalars:
         for name, value in scalars.items():
-            if name.endswith(("/records", "/coordinated_batches")):
-                counted[step, name].append(value)
-    assert counted and all(len(values) == 1 for values in counted.values())
-    found = {name: values[0] for (_, name), values in counted.items()}
-    assert found["evaluation/small/records"] == BATCH and found["evaluation/large/records"] == 2 * BATCH
-    assert found["evaluation/cooldown_large/coordinated_batches"] == 2
+            logged[step, name].append(value)
+    assert all(len(set(values)) == 1 for values in logged.values())
+    found = {name: values[0] for (_, name), values in logged.items()}
+    assert found["evaluation/counts/summary/records"] == BATCH
+    assert found["evaluation/counts/large/records"] == 2 * BATCH
+    assert found["evaluation/counts/cooldown_large/coordinated_batches"] == 2
+    assert "evaluation/summary/records" in found
 
 
 def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():

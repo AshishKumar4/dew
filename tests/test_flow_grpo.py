@@ -1052,7 +1052,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     # The metric's own sums, batch by batch in float64, merged in order, over its count.
     totals = [float(images.sum(dtype=np.float64)) for images in metric.images]
     assert logged["val/pixel_mean"] == sum(totals) / observed.size
-    assert logged["evaluation/val/records"] == count * 2
+    assert logged["evaluation/counts/val/records"] == count * 2
     previews = [value for _, value in tracker.artifacts if not isinstance(value, RECORD_TYPES)]
     assert previews[0].images.shape == (min(4, count), 4, 4, 1)
 
