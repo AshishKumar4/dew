@@ -57,10 +57,11 @@ def pictures():
     return TFDS("dew_images", path=str(IMAGES), split="all")
 
 
-def masked_images(batch: int = 8):
-    """The run's captioned images at SIZE with a mask drawn for each (`RandomMask`)."""
+def masked_images(batch: int = 8, *, rejects: bool = True):
+    """The run's captioned images at SIZE with a mask drawn for each (`RandomMask`): a validation split's
+    keeps every image (`rejects=False`), so its masks are drawn by each record's own index."""
     return pictures().pipe(presets.images, SIZE, batch=batch, caption=image_steps.caption(),
-                           augment=image_steps.RandomMask())
+                           augment=image_steps.RandomMask(), rejects=rejects)
 
 
 def precision() -> ModelConfig:
@@ -195,3 +196,33 @@ def test_an_inpainting_run_over_a_chain_without_masks_is_refused(inpainting):
                              objective=RUNS["diffusion"][1]["objective"])
     with pytest.raises(ValueError):
         run.build()
+
+
+def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpainting, tmp_path):
+    """An inpainting run's validation chain carries its images' masks as its training chain does
+    (`RandomMask`), and `dew train` scores the held-out loss through them at each evaluation, its
+    validation logged beside its training (ledger 2900). A validation chain without masks is refused as
+    the run is prepared, naming the step that draws them, where an evaluation would meet no mask."""
+    _, fields = RUNS["diffusion"]
+    run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
+                             data=masked_images(), validation=masked_images(rejects=False), val_metrics=(),
+                             **fields)
+    record = tmp_path / "record"
+    run.save(str(record))
+    runs = tmp_path / "runs"
+    settings = {"trainer.name": "validated", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
+                "trainer.log_every": "1", "trainer.eval_every": "1", "trainer.checkpoint_final": "False",
+                "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
+                "trainer.compilation_cache_dir": "None", "optim.learning_rate": "0.05"}
+    assert main(["train", str(record / "run.json"),
+                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
+    rows = (runs / "validated" / "tracking" / "scalars.jsonl").read_text().splitlines()
+    held_out = [value for row in rows for name, value in json.loads(row)["scalars"].items()
+                if name.startswith("val/") and name.endswith("loss")]
+    assert held_out and all(np.isfinite(held_out))
+
+    unmasked = dataclasses.replace(run, validation=pictures().pipe(presets.images, SIZE, batch=8,
+                                                                     caption=image_steps.caption()))
+    with pytest.raises(ValueError, match="RandomMask"):
+        unmasked.prepare()
+
