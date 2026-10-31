@@ -667,8 +667,12 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
             if accumulated is None:
                 grads.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             else:
-                # The key head's sum so far, in shared memory from step to step.
-                ds = jnp.where(index == 0, 0.0, family.tile_of(accumulated)) + ds
+                # The key head's sum so far, in shared memory from step to step, zero at its first.
+                @pl.when(index == 0)
+                def _():
+                    accumulated[...] = jnp.zeros(accumulated.shape, jnp.float32)
+
+                ds = family.tile_of(accumulated) + ds
                 accumulated[...] = ds
 
                 @pl.when(index == group - 1)
