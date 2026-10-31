@@ -21,6 +21,7 @@ import pytest
 from generation_support import lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
+    accurate,
     FORMED,
     HOOKS,
     SEEDS as HOOK_SEEDS,
@@ -207,7 +208,9 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     memory (an fp32 call's solve on an A100's block), whose arithmetic the CPU interprets."""
     (operands,) = draw(dtype, 0, **geometry(case))
     if taken(operands, hooks):
-        return functools.partial(chunk_on, 'mosaic_gpu', hooks)
+        on = functools.partial(chunk_on, 'mosaic_gpu', hooks)
+        # An fp32 call's bar the fp32 recurrence's: the accurate forms' three parts.
+        return accurate(on) if dtype == jnp.float32 else on
     with pytest.raises(REFUSED):
         jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), operands)
     family = mainloop.family_of() or mainloop.INTERPRETED
