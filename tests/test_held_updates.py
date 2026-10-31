@@ -11,6 +11,7 @@ from affine_run import FEATURES, Affine, Counting, dataset
 from recording import RecordingTracker
 from test_trainer import TokenRegression, make_trainer
 
+from dew.held_updates import phased
 from dew.objectives.base import Aux, Objective
 from dew.optim import power_profiles
 
@@ -116,21 +117,50 @@ def test_a_run_resumed_inside_a_held_window_lands_where_the_whole_run_does(tmp_p
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
-REFUSED = ["finite", "conditional", "skipping", "nested", "masked", "partitioned", "conditioned", "followed",
-           "decayed", "named_followed", "effects"]
+def test_an_input_the_optimizer_skips_trains_nothing_and_commits_no_tokens():
+    """`optax.MultiSteps` with a skip predicate discards the inputs it skips: they move no weight, no
+    average and no update count, and their tokens wait for no update, as its state says by moving
+    neither its mini-step nor its gradient step; one that skips none trains as `MultiSteps` alone does."""
+    def skipping(*, skip: bool):
+        def skipped(updates, gradient_step, params) -> tuple[jax.Array, tuple[()]]:
+            # Its diagnostics empty, as a predicate may return them.
+            return jnp.asarray(skip), ()
+
+        return optax.MultiSteps(optax.sgd(0.1), 2, should_skip_update_fn=skipped).gradient_transformation()
+
+    tracker = RecordingTracker()
+    trainer = make_trainer(objective=TokenRegression(), optimizer=skipping(skip=True), tracker=tracker)
+    first = trainer.initial_state()
+    start = [np.asarray(leaf) for leaf in jax.tree.leaves((first.variables, first.ema))]
+    state = trainer.fit(dataset(), steps=4, log_every=1)
+    assert int(state.updates) == 0 and np.asarray(state.deferred).tolist() == [0, 0]
+    assert all(np.array_equal(old, np.asarray(new)) for old, new in zip(
+        start, jax.tree.leaves((state.variables, state.ema)), strict=True))
+    assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [0] * 4
+    kept = make_trainer(objective=TokenRegression(), optimizer=skipping(skip=False)).fit(dataset(), steps=4)
+    plain = make_trainer(objective=TokenRegression(), optimizer=held_optimizer("multi_steps")).fit(
+        dataset(), steps=4)
+    for mine, theirs in zip(jax.tree.leaves(kept.variables), jax.tree.leaves(plain.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+REFUSED = ["finite", "conditional", "chained_mask", "same_phases", "nested", "masked", "partitioned",
+           "conditioned", "followed", "decayed", "named_followed", "effects"]
 
 
 @pytest.mark.parametrize("held", REFUSED)
 def test_an_optimizer_whose_held_updates_no_state_tells_is_refused_before_any_step(held):
     """An optimizer that holds updates back where its state does not say which call applied one is
     refused before any step, as is a power-function average over it: `optax.apply_if_finite`, which
-    applies a non-finite update past its limit unrecorded; `optax.conditionally_mask` over the whole
-    update, whose condition its state does not hold; `optax.MultiSteps` with a skip predicate, which
-    discards an input unrecorded; and a held update anywhere but over the whole update: within another,
+    applies a non-finite update past its limit unrecorded; `optax.conditionally_mask` anywhere but under
+    `phased`, which says each update trains one of the networks it alternates, as its state does not hold
+    its condition (alone, in a chain, or in a partition whose groups may all hold the same call); and a
+    held update anywhere but over the whole update: within another,
     under a mask, a partition or a condition, or before a later transform in a chain, which moves the
     weights on a held call whether it keeps state or not. So is an objective with post-step effects
     under a held optimizer, whose held calls' effects no update applies. An optimizer that applies every
-    update trains, the complementary phases of a partition's conditional masks among them."""
+    update trains, the complementary phases of a partition's conditional masks under `phased` among
+    them."""
     sgd = optax.sgd(0.1)
     multi = optax.MultiSteps(sgd, 2).gradient_transformation()
 
@@ -143,8 +173,9 @@ def test_an_optimizer_whose_held_updates_no_state_tells_is_refused_before_any_st
     optimizer = {
         "finite": optax.apply_if_finite(sgd, max_consecutive_errors=2),
         "conditional": optax.conditionally_mask(sgd, every_other),
-        "skipping": optax.MultiSteps(sgd, 2, should_skip_update_fn=optax.skip_not_finite)
-        .gradient_transformation(),
+        "chained_mask": optax.chain(optax.conditionally_mask(sgd, every_other), optax.identity()),
+        "same_phases": optax.partition({"a": optax.conditionally_mask(sgd, every_other),
+                                        "b": optax.conditionally_mask(sgd, every_other)}, labelled("a")),
         "nested": optax.MultiSteps(multi, 2).gradient_transformation(),
         "masked": optax.masked(multi, every),
         "partitioned": optax.partition({"held": multi, "every": sgd}, labelled("held")),
@@ -164,8 +195,10 @@ def test_an_optimizer_whose_held_updates_no_state_tells_is_refused_before_any_st
             lambda path, _: "student" if "kernel" in jax.tree_util.keystr(path) else "critic", params)
 
     # Two networks trained in turn, as a consistency objective's phases are: each call applies one's update.
-    phases = optax.partition({"student": optax.conditionally_mask(sgd, every_other),
-                              "critic": optax.conditionally_mask(sgd, lambda step, **_: ~every_other(step))},
-                             kernel_apart)
+    def critic(step, **_):
+        return ~every_other(step)
+
+    phases = phased(optax.partition({"student": optax.conditionally_mask(sgd, every_other),
+                                     "critic": optax.conditionally_mask(sgd, critic)}, kernel_apart))
     assert int(make_trainer(objective=Effected(), optimizer=phases).fit(dataset(), steps=2,
                                                                         log_every=1).updates) == 2
