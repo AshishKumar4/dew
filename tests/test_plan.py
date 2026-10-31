@@ -465,7 +465,8 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
     stalled = Stalled.under(tmp_path / "stalled", monkeypatch)
 
     class Releasing(RecordingTracker):
-        """The run's logs, the window's export released at the first a step makes while it waits."""
+        """The run's logs, the window's export released at the first log of a step after the window, once
+        the export waits: a log the run can make only while the export is held where it runs beside it."""
 
         def __init__(self):
             super().__init__()
@@ -473,7 +474,8 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
 
         def log(self, scalars, step):
             super().log(scalars, step)
-            if stalled.started and not (stalled.held / "release").exists():
+            if step > 4 and not self.stepped:
+                stalled.await_start()
                 self.stepped.append(step)
                 stalled.release()
 

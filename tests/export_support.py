@@ -4,6 +4,7 @@ sees what its caller does while the export is still running."""
 
 import dataclasses
 import os
+import time
 from pathlib import Path
 
 STALL = """
@@ -54,3 +55,11 @@ class Stalled:
 
     def release(self) -> None:
         (self.held / "release").touch()
+
+    def await_start(self) -> None:
+        """Return once an export has started and stalls, within `SECONDS`: its interpreter starts apart
+        from the caller, which may step past where it stopped the capture first."""
+        deadline = time.monotonic() + SECONDS
+        while not self.started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert self.started, f"no export started within {SECONDS} s"
