@@ -31,6 +31,7 @@ from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loader, P
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
 from dew.distributed.placement import MeshSpec, Placement
+from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig, reclocked
 from dew.state import TrainState
@@ -514,14 +515,18 @@ def credited(column: jax.Array | np.ndarray, examples: int) -> jax.Array | np.nd
                                                     [credit(shard) for shard in column.addressable_shards])
 
 
-def refuse_unclocked(state: TrainState, resume: int, examples: int | None) -> None:
-    """Refuse to resume a run on the examples clock (`examples`) from a checkpoint of a run on another
-    clock, which kept no examples consumed (`TrainState.consumed`) for its schedule to read on from."""
+def restored(state: TrainState, resume: int, examples: int | None) -> TrainState:
+    """`state`, restored from step `resume`'s checkpoint, as the run reads on from it. A run on the
+    examples clock (`examples`) refuses a checkpoint of a run on another clock, which kept no examples
+    consumed (`TrainState.consumed`) for its schedule to read on from. A checkpoint that kept no tokens
+    waiting for an update its optimizer holds back (`TrainState.deferred`), as one written before they
+    waited, holds none: each call's tokens were committed with it."""
     if examples is not None and state.consumed is None:
         raise ValueError(
             f"step {resume}'s checkpoint is of a run counted in steps or tokens, which kept no examples "
             "consumed, and this run reads its schedule off them: resume it on the clock it was written "
             "on, or start a fresh run from its weights")
+    return dataclasses.replace(state, deferred=waiting(state.opt_state)) if state.deferred is None else state
 
 
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
@@ -529,7 +534,8 @@ def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> T
     where the run is on that clock (`examples`), none on another, and its schedules in the form the run's
     own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`)."""
     return dataclasses.replace(initial, consumed=None if examples is None else jnp.zeros((), jnp.int32),
-                               opt_state=reclocked(initial.opt_state, made))
+                               opt_state=reclocked(initial.opt_state, made),
+                               deferred=waiting(made) if initial.deferred is None else initial.deferred)
 
 
 def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool) -> None:
