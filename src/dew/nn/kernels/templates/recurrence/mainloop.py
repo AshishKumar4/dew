@@ -574,7 +574,7 @@ def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, 
     deep hold as many programs as one, so a tile's loads go out under the last tile's work: a launch of
     one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
     thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d; an
-    A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-9d9083868);
+    A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
     any other a program a tile at its `stages`."""
     if stages is None:
         most = 2 if isinstance(call.family, mosaic.RingFamily) else 1
@@ -743,7 +743,7 @@ def _solving(call: _Call) -> mosaic.Family:
     a chunk at a time on their products' latency, one a multiprocessor beside a producer leaving its tensor
     cores idle: on an H100 PCIe the 27B gated delta net's took 0.235 ms on it against 0.356 beside a
     producer, Qwen3-Next's 0.156 against 0.240, where the states launch's walk took 0.187 beside a producer
-    against 0.202 to 0.243 without one (JS-fed5-h100-59b73910c). Interpreted, the interpreter's
+    against 0.202 to 0.243 without one (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's
     (`INTERPRETED`)."""
     if call.interpret:
         return call.family
@@ -842,7 +842,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
         out_type = (held.shape(call.heads * CHUNK), *out_type)
     # The inverse's application stages in the doubling's merge tiles where they are its form (an fp32 call's
     # bf16 parts, a block a chunk wide), done by then: apart, an fp32 call's launch took 242864 bytes of
-    # shared memory, past an H100's block (SE-family-h100-668504446).
+    # shared memory, past an H100's block (SE-family-h100-e0de17766).
     merging = _merges(call)
     reused = (held.parts > 1 and merging[0][0].dtype == held.stored and call.block == CHUNK)
     staging = merging if reused else (*merging, _staging(held, (CHUNK, CHUNK))[0],
