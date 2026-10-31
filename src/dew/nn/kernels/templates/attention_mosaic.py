@@ -366,8 +366,10 @@ def _products(family: mosaic.Family, dtype, *products) -> list:
     (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
     `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
     `beside` it holds at once (its output, a tile it reads in registers), a left operand in registers
-    (`register_lhs`: the weights, the score cotangents) no fragment of its own (mma.sync: ET-CENSUS80, the
-    product phase's ldmatrix fragments 162 of a 64 x 192 forward's 291 registers, uncounted)."""
+    (`register_lhs`: the weights, the score cotangents) no fragment of its own, a right one read as the
+    transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
+    stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
+    fragments 162 of its 291 registers at its peak, uncounted)."""
     if not family.operands_in_registers:
         return []
     return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
