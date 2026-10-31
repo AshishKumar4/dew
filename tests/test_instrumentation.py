@@ -28,6 +28,7 @@ from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
 from dew.training import Trainer
+from dew.training.interval import Interval
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -293,6 +294,48 @@ def test_fit_reports_throughput_to_the_tracker():
     assert len(ticks) == 3, "no throughput was logged"
     assert all(p["train/step_time_ms"] > 0 for p in ticks)
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
+
+
+class Pending(np.ndarray):
+    """A step's loss the test says is computed or not (`is_ready`), as one on the devices says."""
+
+    finished = False
+
+    def is_ready(self) -> bool:
+        return self.finished
+
+
+def test_a_log_its_reader_reads_late_ends_where_the_loop_saw_its_step_done():
+    """A log whose step had not finished at its take ends its interval where the loop first saw the step
+    done as it stepped (`Interval.seen`), not where a reader that runs late reads it: read after the loop
+    took the next log, whose step was done at its take, it leaves that next interval its own seconds and
+    rates, which a read's own clock would leave none (row 2786: a loaded process's last tick logged no
+    `train/step_time_ms`, and a test gated on each tick's waited on one that never came)."""
+    interval = Interval(last_log_time=time.time(), last_saved=None)
+    first, second = (np.asarray(1.0).view(Pending) for _ in range(2))
+
+    def take(step, loss):
+        return interval.take(step, loss, {}, np.asarray(a=True), (None, None), {}, {})
+
+    early = take(1, first)
+    first.finished = True
+    time.sleep(0.05)
+    interval.seen()
+    seen = time.time()
+    time.sleep(0.05)
+    second.finished = True
+    late = take(2, second)
+    time.sleep(0.05)
+    # The reader reads the first log only now, after the loop took the second.
+    _, _, done = early.read(None, None)
+    _, elapsed, _ = late.read(None, done)
+    assert done <= seen and elapsed >= 0.05
+    # A step the loop notes done after its log was read is noted for no log: nothing waits on it.
+    third = np.asarray(1.0).view(Pending)
+    take(3, third).read(None, done)
+    third.finished = True
+    interval.seen()
+    assert not interval.finished and not interval.watched
 
 
 class TickGatedTracker(RecordingTracker):
