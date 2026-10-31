@@ -558,7 +558,7 @@ class Plan:
         # A bound the order grew is its steps' limit too.
         changed = tuple(name for name in _changed(manifest, semantic)
                         if not (name == "steps" and _steps_grown(json_value(manifest[name], "saved steps"),
-                                                                 semantic[name], grown)))
+                                                                 json_value(semantic[name], "steps"), grown)))
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:
