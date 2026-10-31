@@ -275,15 +275,8 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     stats = executable.memory_analysis()
     if stats is None:
         return None
-    # A device that states no memory, one compiled for and absent (`compile_only_gpus`), holds the
-    # `capacity` it is stated to, the step's arguments in it as they would be.
-    memory = [device_memory(device, capacity, stats.argument_size_in_bytes - built) for device in devices]
-    if not stated(memory):
-        return None
-    beside = stats.output_size_in_bytes - stats.alias_size_in_bytes + held
-    return min(placeable(m, unclaimed(d, m)) - beside
-               - stats.temp_size_in_bytes * (2 if strands_temporaries(d.platform, m) else 1)
-               for d, m in zip(devices, memory, strict=True))
+    return admitted(devices, capacity, stats.argument_size_in_bytes - built,
+                    stats.output_size_in_bytes - stats.alias_size_in_bytes + held, stats.temp_size_in_bytes)
 
 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
@@ -313,11 +306,21 @@ def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | No
     (`dew.training.footprint`): a compile confirms, and a miss is the derivation's to fix."""
     if footprint.peak is None:
         return None
-    memory = [device_memory(device, capacity, sum(footprint.resident.values()) - built) for device in devices]
+    resident = sum(footprint.resident.values()) - built
+    return admitted(devices, capacity, resident, footprint.held, footprint.peak)
+
+
+def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int,
+             temporaries: int) -> int | None:
+    """The allocator's admission of a step, compiled (`step_headroom`) or derived (`derived_headroom`): the
+    bytes the tightest of `devices` has to spare once the step's `temporaries`, in one block, twice where
+    its allocator strands them (`stranding`), are placed beside `beside` more bytes, with `resident` bytes
+    in use already; None where a device states no memory. A device that states none, one compiled for and
+    absent (`compile_only_gpus`), holds the `capacity` it is stated to, `resident` in it as it would be."""
+    memory = [device_memory(device, capacity, resident) for device in devices]
     if not stated(memory):
         return None
-    return min(placeable(m, unclaimed(d, m)) - footprint.held
-               - footprint.peak * (2 if strands_temporaries(d.platform, m) else 1)
+    return min(placeable(m, unclaimed(d, m)) - beside - temporaries * stranding(d, m)
                for d, m in zip(devices, memory, strict=True))
 
 
@@ -333,6 +336,12 @@ def judged(device) -> bool:
     none attached (a compile-only GPU, `dew.training.ahead.compile_only_gpus`) against the capacity a plan
     states for it."""
     return device not in jax.local_devices() or stated([device_memory(device)])
+
+
+def stranding(device, memory: Mapping[str, int]) -> int:
+    """How many times its temporaries a step needs room for on `device`, its allocator stating `memory`:
+    2 where it can strand them (`strands_temporaries`), else 1."""
+    return 2 if strands_temporaries(device.platform, memory) else 1
 
 
 def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
@@ -443,8 +452,8 @@ def temporaries_factor(mesh: Mesh, capacity: int | None = None) -> int:
     """How many times its temporaries a step needs room for on this process's tightest device of
     `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return max((2 if (memory := device_memory(device, capacity))
-                and strands_temporaries(device.platform, memory) else 1) for device in local)
+    return max(stranding(device, memory) if (memory := device_memory(device, capacity)) else 1
+               for device in local)
 
 
 def fits_everywhere(headroom: int | None) -> bool:

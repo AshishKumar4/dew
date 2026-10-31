@@ -613,6 +613,26 @@ def test_each_dense_launch_lowers_once_however_many_layers_call_it():
     assert one > 0 and kernels(2) == one
 
 
+def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
+    """A GEMM at 4089 rows and one at 4096, which its Mosaic mainloop pads alike, lowered for an H100 in one
+    program: each launch's kernel carries its own launch's digest (`report.named`), as a spill refuses the
+    launch that compiled it. Their shared static configuration traced once under the first launch, and the
+    second's kernel was named for the first (row 2941)."""
+    from dew.training._lowering import kernel_calls
+
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+    shorter, longer = (jax.ShapeDtypeStruct((rows, 256), jnp.bfloat16) for rows in (4089, 4096))
+
+    def both(a, b, w):
+        return (template.gemm(a, w, None, out_dtype=jnp.bfloat16),
+                template.gemm(b, w, None, out_dtype=jnp.bfloat16))
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        lowered = jax.jit(both).trace(shorter, longer, weight).lower(lowering_platforms=("cuda",))
+    launches = [call.launch for call in kernel_calls(lowered) if call.name == "dew_gmm"]
+    assert len(launches) == 2 and None not in launches and len(set(launches)) == 2
+
+
 @pytest.mark.parametrize("policy", ["fp32_result_dot_general", "head_dot_general"])
 def test_a_head_keeps_its_own_products_fp32_result(policy):
     """A bf16 projection whose product states a policy of its own, a DiT's prediction head

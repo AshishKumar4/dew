@@ -99,7 +99,7 @@ def trajectory(source, prepared, given, null, process, times, key):
     path every caller starts from, and the conditions it walks under (`walked`)."""
     given, null = walked(prepared, given, null)
     denoise = process.denoiser(source.model, source.variables, given, null)
-    latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.schedule.solver, guidance=CFG(3.0),
+    latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.solver, guidance=CFG(3.0),
                      key=key, times=times, final_denoise=False)
     images = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], latents), -1, 1)
     if source.finish is not None:

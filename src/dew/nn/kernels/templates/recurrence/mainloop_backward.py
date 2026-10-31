@@ -61,11 +61,13 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
             floor: float | None = None, target: generation.GpuTarget | None = None,
-            rounded: bool = False) -> tuple[Launch, ...]:
+            rounded: bool = False, wide: bool = False) -> tuple[Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
     `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
     planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
-    (`_kernel`); with `backward`, the fast backward's too (`gradients`)."""
+    (`_kernel`); with `backward`, the fast backward's too (`gradients`). A `wide` call's output lands in
+    fp32 (`forward`'s): planned in the operands' dtype, the SSD's output launch asked 16 KB past its plan
+    (204800 bytes against 188544 on an H100's compile, the resource gate's)."""
     found: list[Launch] = []
 
     def run(q, k, v, g, beta, h0, starts):
@@ -73,7 +75,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
         try:
             out, final, (inverse, kept) = kept_forward(q, k, v, g, beta, h0, tiles=tiles, starts=starts,
                                                        max_segments=max_segments, delta=delta, family=family,
-                                                       floor=floor, rounded=rounded)
+                                                       floor=floor, rounded=rounded, wide=wide)
             if backward:
                 gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                           max_segments=max_segments, family=family, inverse=inverse, kept=kept, delta=delta,
@@ -97,11 +99,10 @@ def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> b
 
 def fast_backward_form(delta: bool, rounded: bool, dtype) -> bool:
     """Whether the fast backward takes a call's form (a decay a head in a 16-bit call besides): the delta
-    rule, fla's DAG at fla's rounding, or a bf16 `rounded` call without it under the run's fast forms, the
-    same DAG without the delta rule's at mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's
-    bf16 case; an fp16 call's, which no recording holds, the port's."""
-    fast = rounded and jnp.dtype(dtype) == jnp.bfloat16 and generation.numerics().forms == "fast"
-    return delta or fast
+    rule, fla's DAG at fla's rounding, or a bf16 `rounded` call without it (the SSD's under the run's fast
+    forms, its route's), the same DAG without the delta rule's at mamba_ssm's rounding (`_prepared`), held to
+    recorded mamba_ssm's bf16 case; an fp16 call's, which no recording holds, the port's."""
+    return delta or (rounded and jnp.dtype(dtype) == jnp.bfloat16)
 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, shared: int,
@@ -125,17 +126,17 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
               family: mosaic.Family | None = None, interpret: bool = False,
               inverse=None, kept=None, delta: bool = True, rounded: bool = False):
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
-    call, or of a `rounded` call without it under the run's fast forms (`fast_backward_form`): `(dq, dk,
-    dv, dg, dbeta, dh0)` for the output's and final memory's gradients `do`, `dfinal`, fla's
-    DAG (recomputing the forward's values, as fla does) through the algebra's backward tile functions:
-    `_local_back`, `_reverse`, `_scores_back`, `_query_key`, `_system_back`, `_values_back`, `_keys_back`,
-    the decay's gradient summed token by token
-    (`algebra.summed_back`) and the memory's decay's term added, a key head's value heads summed; the
-    forward's `inverse` and `kept` values where given (`kept_forward`'s) rather than computed again, its
-    states launch at the forward's `tiles` where they are not. Its rounding is fla's (mamba_ssm's without the
-    delta rule); the accurate backward is the portable math's token adjoint. Without the delta rule there is
-    no system: the corrected values are the values gated, `u = v beta`, whose gradient `du` (the reverse
-    walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no `w^T dv`."""
+    call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
+    `(dq, dk, dv, dg, dbeta, dh0)` for the output's and final memory's gradients `do`, `dfinal`, fla's DAG
+    (recomputing the forward's values, as fla does) through the algebra's backward tile functions:
+    `_local_back`, `_reverse`, `_scores_back`, `_query_key`, `_system_back`, `_values_back`, `_keys_back`, the
+    decay's gradient summed token by token (`algebra.summed_back`) and the memory's decay's term added, a key
+    head's value heads summed; the forward's `inverse` and `kept` values where given (`kept_forward`'s) rather
+    than computed again, its states launch at the forward's `tiles` where they are not. Its rounding is fla's
+    (mamba_ssm's without the delta rule); the accurate backward is the portable math's token adjoint. Without
+    the delta rule there is no system: the corrected values are the values gated, `u = v beta`, whose gradient
+    `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no
+    `w^T dv`."""
     if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v)):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms")

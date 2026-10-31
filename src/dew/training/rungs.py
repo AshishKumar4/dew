@@ -13,13 +13,11 @@ the second (78.4 ms, docs/performance.md).
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import importlib.metadata
 import json
 import os
 import re
-import sys
 import types
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -60,7 +58,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`'s name, the code that builds
-    them (`_code`), the step's `arguments` (each leaf's path, shape, dtype and
+    them (`dew.cache.package_digest`), the step's `arguments` (each leaf's path, shape, dtype and
     placement), the `splits` its plan chooses among (one where the run pins it),
     the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
@@ -81,24 +79,11 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     # A module's configuration as its repr reads it, a function field by its name: the address
     # Python prints beside one is this process's alone.
     configured = [re.sub(r' at 0x[0-9a-f]+', '', repr(module)) for module in modules]
-    program = repr([RECORD_VERSION, configured, named, _code(), leaves,
+    program = repr([RECORD_VERSION, configured, named, cache.package_digest(), leaves,
                     list(splits), dict(mesh.shape), target, trace_context(), jax.__version__,
                     importlib.metadata.version('jaxlib'), allocator])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(settings)}
-
-
-@functools.cache
-def _code() -> str:
-    """The digest of Dew's source files this process has imported: a plan
-    recorded by other code is decided again."""
-    digest = hashlib.sha256()
-    for name in sorted(module for module in sys.modules if module == 'dew' or module.startswith('dew.')):
-        path = vars(sys.modules[name]).get('__file__')
-        if path is not None and path.endswith('.py'):
-            digest.update(name.encode())
-            digest.update(Path(path).read_bytes())
-    return digest.hexdigest()
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
