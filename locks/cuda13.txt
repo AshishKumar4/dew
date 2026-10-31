@@ -19,6 +19,7 @@ absl-py==2.5.1
     #   xprof
 accelerate==1.15.0
     # via
+    #   dewml (pyproject.toml)
     #   lm-eval
     #   peft
 aiobotocore==3.9.2
