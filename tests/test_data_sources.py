@@ -1202,13 +1202,15 @@ def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monke
     )
     filesystem, _ = root.resolve()
     downloaded = []
-    get_file = filesystem.get_file
+    opened = filesystem.open
 
-    def download(remote, local, **kwargs):
-        downloaded.append(remote)
-        return get_file(remote, local, **kwargs)
+    def download(path, *args, **kwargs):
+        # A shard's bytes read whole into Dew's mirror, where its digest is checked.
+        if str(path).endswith(".array_record"):
+            downloaded.append(path)
+        return opened(path, *args, **kwargs)
 
-    monkeypatch.setattr(filesystem, "get_file", download)
+    monkeypatch.setattr(filesystem, "open", download)
     rows = Files(root.url, format="array_record").records("indexed")
     assert len(rows) == 12
     assert downloaded == []
