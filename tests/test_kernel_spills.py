@@ -391,3 +391,42 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
     assert read == [("dew_gmm", "0123456789", 168, 0, 1024), ("dew_tgmm", None, 255, 344, 1024)]
     with pytest.raises(ValueError):
         report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
+
+
+@lowers("sm90")
+def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
+    """A program of a Pallas-Triton kernel feeding a Mosaic GPU kernel, compiled for an H100:
+    `report.binaries` reads each once, the Triton kernel's cubin from its thunk's own binary and the Mosaic
+    kernel's from its kernel proto (a Mosaic thunk's binary is empty), each stating its registers."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu, triton as pltriton
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    def added(x_ref, y_ref, o_ref):
+        o_ref[...] = x_ref[...] + y_ref[...]
+
+    def copied(source, out, staged, barrier):
+        plgpu.copy_gmem_to_smem(source, staged, barrier.at[0])
+        plgpu.barrier_wait(barrier.at[0])
+        plgpu.copy_smem_to_gmem(staged, out)
+        plgpu.wait_smem_to_gmem(0)
+
+    shape = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    copy = plgpu.kernel(copied, out_type=shape, num_threads=1, thread_name="wg",
+                        scratch_types=[plgpu.SMEM((128, 128), jnp.float32), plgpu.Barrier(num_barriers=1)],
+                        name="dew_copied")
+
+    def program(x, y):
+        return copy(pl.pallas_call(added, out_shape=shape, grid=(1,), name="dew_added",
+                                   compiler_params=pltriton.CompilerParams(num_warps=4, num_stages=1))(x, y))
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    spec = jax.ShapeDtypeStruct((128, 128), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
+        compiled = jax.jit(program).trace(spec, spec).lower().compile()
+    found = sorted((found.kernel, found.registers > 0, found.frame) for found in report.binaries(compiled))
+    assert found == [("dew_added", True, 0), ("dew_copied", True, 0)]
