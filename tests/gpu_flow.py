@@ -61,43 +61,39 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
     global _depth
     _depth += 1
-    failed, skipped, passed = [], [], [0]
+    failed: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    passed = 0
     try:
-        _ran(cells, failed, skipped, passed)
+        for cell in cells:
+            if cell.generation is not None and not runnable(cell.generation):
+                skipped.append(cell.label)
+                continue
+            print(f"cell: {cell.label}", flush=True)
+            try:
+                cell.run()
+            except pytest.skip.Exception as skip:
+                print(f"cell skipped: {cell.label}: {skip.msg}", flush=True)
+                skipped.append(cell.label)
+            except (Exception, pytest.fail.Exception) as error:
+                # A cell's failure is any exception, pytest's own among them (`pytest.fail`, and a
+                # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
+                # the flow: kept with its label, and raised with every other cell's after the last.
+                failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
+            else:
+                passed += 1
     finally:
         # Counted however the flow ends, so a flow stopped early still reports what it ran.
         _depth -= 1
         if not _depth:
-            REPORTED.append({"passed": passed[0], "failed": len(failed), "skipped": len(skipped),
+            REPORTED.append({"passed": passed, "failed": len(failed), "skipped": len(skipped),
                              "device": _device()})
-    passed = passed[0]
     print(f"cells: {passed} passed, {len(failed)} failed, {len(skipped)} skipped on this device", flush=True)
     if failed:
         raise CellsFailed(failed)
     if not passed:
         pytest.skip(f"no cell runs on this device ({len(skipped)} skipped)")
     return skipped
-
-
-def _ran(cells: Iterable[Cell], failed: list[tuple[str, str]], skipped: list[str], passed: list[int]) -> None:
-    """Each cell run (`run_cells`), into `failed` (by label and report), `skipped` (labels) and `passed` (its
-    one count): a cell's failure is any exception, pytest's own failures among them (`pytest.fail`, and a
-    `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end the flow."""
-    for cell in cells:
-        if cell.generation is not None and not runnable(cell.generation):
-            skipped.append(cell.label)
-            continue
-        print(f"cell: {cell.label}", flush=True)
-        try:
-            cell.run()
-        except pytest.skip.Exception as skip:
-            print(f"cell skipped: {cell.label}: {skip.msg}", flush=True)
-            skipped.append(cell.label)
-        except (Exception, pytest.fail.Exception) as error:
-            # Kept with its label, and raised with every other cell's after the last.
-            failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
-        else:
-            passed[0] += 1
 
 
 def _skipped(marks, reason_of: str) -> Callable[[], None] | None:
