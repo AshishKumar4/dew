@@ -588,6 +588,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     WALKED = "block_q"
     accurate: bool = ACCURATE
     rounded: bool = True
+    score_slopes: int = 0
+    """The tiles its score hook's pullback forms that vary (`varying_slopes`), as its builder reads them off
+    the hook (`_backward_call`): a keyed launch's hook is its fingerprint, which keeps no trace of them."""
 
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,
              drop=None, *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
@@ -759,8 +762,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         splitting a slot's queries where it runs keys first on a layout whose consumers feed their rings
         (`split_queries`), not the fused launch queries first on that layout (`_fused_launch`)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
-        slopes = varying_slopes(Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"],
-                                                                self.score_kinds))))
         counts = []
         for tiles, dq in ((config, True), (config.dkv, False)):
             family = bundle_of(tiles, query.dtype)
@@ -770,7 +771,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                strict=True))
             counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
                                               accurate=self.accurate, dq=dq, split=split, params=params,
-                                              slopes=slopes))
+                                              slopes=self.score_slopes))
         return counts[0], counts[1]
 
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
@@ -835,6 +836,6 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                         form=spans.form, keys=spans.keys,
                         scale=logit_scale(query.shape[3], scale), natural=natural,
-                        accurate=accurate, rounded=rounded)
+                        accurate=accurate, rounded=rounded, score_slopes=varying_slopes(hooks))
     return op, (query, key, value, dout, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params), hooks.initial, residuals, hooks.drop)
