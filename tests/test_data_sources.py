@@ -29,10 +29,11 @@ from token_support import export_byte_tokens
 
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
+from dew.data.declared import Replaced
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
-from dew.data.storage import Replaced, Store
+from dew.data.storage import Store
 
 
 def test_memory_columns_snapshot_changes_with_content():
@@ -675,7 +676,7 @@ def test_declared_files_read_a_range_at_a_time_hold_no_mirror_copy_between_reads
     whose ETags the declaration does not state), read a range at a time as an offset index reads them,
     are each read whole into Dew's mirror and checked, and keep no copy open between reads: a mirror with
     room for one of them reads a range of each of several in turn, and again."""
-    from dew.data.storage import Declared
+    from dew.data.declared import Declared
 
     objects = {f"/part-{index}.jsonl": json.dumps({"id": index}).encode() + b"\n" for index in range(3)}
     with etagged_server(objects) as url:

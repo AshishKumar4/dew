@@ -11,8 +11,9 @@ import numpy as np
 
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
+from dew.data.declared import Declared
 from dew.data.pipeline import Dataset
-from dew.data.storage import Declared, Store, local
+from dew.data.storage import Store, local
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content

@@ -31,18 +31,10 @@ from s3fs import S3FileSystem
 from dew._records import integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
+from dew.data.declared import Declared
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
-from dew.data.storage import (
-    Declared,
-    Readable,
-    Store,
-    commit_export,
-    content_version,
-    in_memory,
-    local,
-    on_gcs,
-)
+from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex

@@ -15,7 +15,8 @@ import grain.python as grain
 
 from dew.batch import Batch
 from dew.data.dataset import Loading, Ranges
-from dew.data.storage import Declared, Store, local, on_gcs
+from dew.data.declared import Declared
+from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode
 
