@@ -42,9 +42,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
 
     from_run = started(source, "from_run", "--source.step", "latest")
     from_export = started(exported, "from_export")
-    for leaf, alike in zip(jax.tree.leaves(jax.device_get(from_run.variables)),
-                           jax.tree.leaves(jax.device_get(from_export.variables)), strict=True):
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike), strict=True)
+    leaves_alike(from_run.variables, from_export.variables)
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "from_run"))
     assert recorded.pretrained == str(source)
     assert recorded.source.step == SavedRun.pinned(str(source)).step
