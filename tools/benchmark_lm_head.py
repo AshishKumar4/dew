@@ -40,6 +40,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels.options import program
 from dew.nn.precision import added_to, running_sum, running_total
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns
@@ -258,8 +259,8 @@ def measure(variant: Variant, shape: Shape) -> dict[str, object]:
     stats = device.memory_stats()
     before = stats.get("peak_bytes_in_use") if stats else None
 
-    forward = jax.jit(lambda states, table: function(states, table, targets, variant))
-    both = jax.jit(
+    forward = program(lambda states, table: function(states, table, targets, variant))
+    both = program(
         jax.value_and_grad(
             lambda states, table: function(states, table, targets, variant),
             argnums=(0, 1),
@@ -267,8 +268,8 @@ def measure(variant: Variant, shape: Shape) -> dict[str, object]:
         )
     )
     start = time.perf_counter()
-    forward_executable = forward.lower(hidden, embedding).compile()
-    both_executable = both.lower(hidden, embedding).compile()
+    forward_executable = forward.executable(hidden, embedding)
+    both_executable = both.executable(hidden, embedding)
     compile_seconds = time.perf_counter() - start
     args = (hidden, embedding)
     forward_ms = timed(forward_executable, args, shape.repeats)
