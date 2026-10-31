@@ -179,6 +179,7 @@ class TSSM(nn.Module):
         itself; a step that starts an episode `first` attends to nothing cached. The step's keys and
         values are written at the cache's next slot, the oldest where it is full."""
         size = cache.valid.shape[1]
+        first = jnp.asarray(first, bool)
         valid = cache.valid & ~first[:, None]
         position = jnp.where(first, 0, cache.position)
         slot = cache.index % size
@@ -197,7 +198,7 @@ class TSSM(nn.Module):
 def _segments(first: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each step's episode within a window `[B, T]` (the window's first step starting one) and its
     position from that episode's first step in the window."""
-    starts = first.at[:, 0].set(True)
+    starts = jnp.asarray(first, bool).at[:, 0].set(True)
     segment = jnp.cumsum(starts, axis=1)
     index = jnp.arange(first.shape[1])
     began = jax.lax.cummax(jnp.where(starts, index, 0), axis=1)
