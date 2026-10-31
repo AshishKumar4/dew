@@ -144,16 +144,23 @@ CONFIG_CELLS = [(dtype, shape) for dtype in ("bfloat16", "float32")
 (`support.kernel_cases`)."""
 
 
+CONFIG_PARTS = 2
+"""The parts each declared shape's configs compile in apart, each within a test's 120 s: whole, an fp32
+shape's took up to 113.9 s (GATE-PARTS-12-DUR, sm80 at 9B)."""
+
+
+@pytest.mark.parametrize("part", range(CONFIG_PARTS))
 @pytest.mark.parametrize(("dtype", "shape"), CONFIG_CELLS)
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target, dtype, shape):
+def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target, dtype, shape,
+                                                                                  part):
     """Each declared config at each declared shape, of each dtype and shape apart (one test of a dtype's
-    every shape outlasted the suite's 240 s target, row 1849), lowered as on the GPU and compiled by XLA's
-    CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py): it compiles, to no more
-    shared memory than its GPU's block holds. A kernel that does not compile (a two-result inline asm, a
-    mixed-dtype dot) fails here and never reaches a GPU."""
+    every shape outlasted the suite's 240 s target, row 1849) and in parts (`CONFIG_PARTS`), lowered as on
+    the GPU and compiled by XLA's CUDA backend for a compile-only device on this CPU
+    (tests/kernel_compile.py): it compiles, to no more shared memory than its GPU's block holds. A kernel
+    that does not compile (a two-result inline asm, a mixed-dtype dot) fails here and never reaches a GPU."""
     cases = [case for case in support.kernel_cases(target, (dtype,)) if case.name.split("/")[4] == shape]
-    found = compile_kernels(cases, target)
+    found = compile_kernels(cases[part::CONFIG_PARTS], target)
     assert found, "the compile gate must not be vacuous"
     assert not failures(found), "\n".join(failures(found))
 
