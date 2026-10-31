@@ -1,12 +1,15 @@
 """First-person gate racing (`dew.rl.flight`), each rule held to a float64 NumPy transcription of it apart
 from Dew's code: a step's reward, passages, crashes, finishes and termination over drawn paths through,
 beside, alongside and around the gates and the pillars; the commands' throttle, rates and latency; the
-camera as HyperDrone builds it from a mounted frame, and its image's development; and the teacher's view
-of the next gates and the nearest pillars. Hand-built steps near a gate and a pillar hold the passing and
+camera as HyperDrone builds it from a mounted frame, and its image's development; the teacher's view
+of the next gates and the nearest pillars; and the courses of every family, their gates and pillars, over
+the draws their generators make. Hand-built steps near a gate and a pillar hold the passing and
 striking rules themselves; the courses keep their families' shapes; a drone left to hover flies and is not
 cut short; and a batch of races restarts only the drones it is told to."""
 
+import collections
 import dataclasses
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -387,21 +390,22 @@ def test_a_camera_is_hyperdrones_of_its_mounted_frame():
 
 
 def test_an_image_is_developed_as_its_camera_does():
-    """A drawn image developed by drawn cameras: exposure and white balance, then gamma, then read noise, the
-    result rounded to 8 bits, held to a float32 transcription: every pixel within one level of it."""
+    """A drawn image developed by drawn cameras in float64: exposure and white balance, then gamma, then read
+    noise, the result rounded to 8 bits, is the float64 transcription's rounded to 8 bits, level for level."""
     rng = np.random.default_rng([532, 8])
-    race = races(RACING, 4, 16)
     image = rng.integers(0, 256, (16, 12, 12, 3), np.uint8)
     keys = jax.random.split(jax.random.key(5), 16)
-    shown = np.asarray(jax.jit(jax.vmap(lambda race, image, key: developed(image, race.camera, key)))(
-        race, jnp.asarray(image), keys))
-    camera = jax.tree.map(np.asarray, race.camera)
-    for drone in range(16):
-        noise = np.asarray(jax.random.normal(keys[drone], (12, 12, 3)))
-        light = image[drone].astype(np.float32) / 255 * camera.exposure[drone] * camera.white_balance[drone]
-        light = np.clip(light, 0, 1) ** camera.gamma[drone] + camera.noise[drone] * noise
-        expected = np.round(np.clip(light, 0, 1) * 255)
-        assert np.abs(shown[drone].astype(np.float64) - expected).max() <= 1
+    with jax.enable_x64(new_val=True):
+        camera = races(RACING, 4, 16).camera
+        shown = np.asarray(jax.jit(jax.vmap(developed))(jnp.asarray(image), camera, keys))
+        camera = jax.tree.map(np.asarray, camera)
+        expected = []
+        for drone in range(16):
+            noise = np.asarray(jax.random.normal(keys[drone], (12, 12, 3)))
+            light = image[drone] / 255 * camera.exposure[drone] * camera.white_balance[drone]
+            light = np.clip(light, 0, 1) ** camera.gamma[drone] + camera.noise[drone] * noise
+            expected.append(np.round(np.clip(light, 0, 1) * 255))
+    np.testing.assert_array_equal(shown, np.stack(expected).astype(np.uint8))
 
 
 def test_the_teacher_sees_the_next_gates_and_nearest_pillars_from_its_body():
@@ -446,55 +450,219 @@ def test_the_teacher_sees_the_next_gates_and_nearest_pillars_from_its_body():
     np.testing.assert_array_equal(teacher[:, 37:INTERFACE], views["airframe"])
 
 
+LOW, HIGH, TOP = 1.0, 15.0, 20.0
+"""A chain's heights in metres: its gates stay between LOW and HIGH, a crowded one lifted up to TOP."""
+ACROSS, HEIGHT, LIFT = 3.0, 2.5, 3.0
+"""A gate crowds a later one within ACROSS metres across and HEIGHT in height, which climbs LIFT above it."""
+CLEARANCE = 3.0
+"""A pillar stands more than CLEARANCE metres and its radius from every gate."""
+PUBLISHED = [np.asarray(gates) - np.r_[np.asarray(gates)[:, :2].mean(0), 0.0] for gates in LAYOUTS.values()]
+"""The published layouts' gates, centred across (the mean of their x and y gone)."""
+COURSES = 4096
+EVERY_FAMILY = Racing(families=tuple((family, 1.0) for family in FAMILIES))
+"""A race drawing each family of courses as often as the others."""
+
+
+def course_draws(racing: Racing, key: jax.Array, segments: jax.Array) -> dict:
+    """Every draw `drawn_course` makes from `key`, by the keys it splits off in its order, named for what it
+    sets; the pillars' segments are drawn below `segments`, the segments between gates the course has."""
+    _, layout_key, loop_key, chain_key, eight_key, obstacle_key = jax.random.split(key, 6)
+
+    def uniform(key, low, high, shape=()):
+        return jax.random.uniform(key, shape, minval=low, maxval=high)
+
+    which_key, moved_key = jax.random.split(layout_key)
+    loop, chain, eight, pillars = (jax.random.split(each, count) for each, count in (
+        (loop_key, 7), (chain_key, 8), (eight_key, 5), (obstacle_key, 9)))
+    return {
+        "which": jax.random.choice(which_key, len(LAYOUTS), p=jnp.full(len(LAYOUTS), 1 / len(LAYOUTS))),
+        "moved": uniform(moved_key, -1.0, 1.0, (GATES, 3)),
+        "loop_count": jax.random.randint(loop[0], (), 6, 13),
+        "radii": uniform(loop[1], 12.0, 30.0, (2,)),
+        "along": uniform(loop[2], -0.25, 0.25, (GATES,)),
+        "across": uniform(loop[3], -0.1, 0.1, (GATES,)),
+        "height": uniform(loop[4], 0.0, 4.5, (GATES,)),
+        "turn": uniform(loop[5], 0.0, 2 * jnp.pi),
+        "forward": jax.random.bernoulli(loop[6]),
+        "chain_count": jax.random.randint(chain[0], (), 8, GATES + 1),
+        "turns": uniform(chain[1], -1.0, 1.0, (GATES,)),
+        "climbs": uniform(chain[2], -3.0, 3.0, (GATES,)),
+        "distances": uniform(chain[3], 7.0, 16.0, (GATES,)),
+        "primitive": uniform(chain[4], 0.0, 1.0, (GATES,)),
+        "plunge": uniform(chain[5], 2.5, 4.0, (GATES,)),
+        "steep": uniform(chain[6], 4.0, 7.0, (GATES,)),
+        "first": uniform(chain[7], 1.5, 4.0),
+        "eight_count": jax.random.randint(eight[0], (), 8, 13),
+        "width": uniform(eight[1], 12.0, 20.0),
+        "depth": uniform(eight[2], 6.0, 10.0),
+        "lift": uniform(eight[3], 2.5, 4.0),
+        "eight_turn": uniform(eight[4], 0.0, 2 * jnp.pi),
+        "segment": jax.random.randint(pillars[0], (OBSTACLES,), 0, jnp.maximum(segments, 1)),
+        "along_segment": uniform(pillars[1], 0.3, 0.7, (OBSTACLES,)),
+        "on_line": jax.random.uniform(pillars[2], (OBSTACLES,)) < racing.on_line,
+        "aside_line": uniform(pillars[3], -0.3, 0.3, (OBSTACLES,)),
+        "aside_beside": uniform(pillars[4], 1.5, 4.0, (OBSTACLES,)),
+        "side": uniform(pillars[5], -1.0, 1.0, (OBSTACLES,)),
+        "radius": uniform(pillars[6], 0.2, 0.6, (OBSTACLES,)),
+        "aspect": jax.random.randint(pillars[7], (OBSTACLES,), 0, len(ASPECTS)),
+        "share": uniform(pillars[8], 0.25, 1.0),
+    }
+
+
+def written_layout(racing: Racing, difficulty: float, draw: dict) -> np.ndarray:
+    """A layout course's gates: a published layout, each gate moved by its draw of the jitter times the
+    difficulty, held at least 0.75 m high."""
+    gates = PUBLISHED[draw["which"]]
+    reach = np.asarray([racing.jitter[0], racing.jitter[0], racing.jitter[1]])
+    center = gates + difficulty * draw["moved"][:len(gates)] * reach
+    center[:, 2] = np.maximum(center[:, 2], 0.75)
+    return center
+
+
+def written_loop(difficulty: float, draw: dict) -> np.ndarray:
+    """A loop's gates about an ellipse: each at its angle, moved along it and across it, 1.5 m up plus its
+    draw of 4.5 m times the difficulty, turned and flown the way its draw says."""
+    count = int(draw["loop_count"])
+    angle = (np.arange(count) + difficulty * draw["along"][:count]) * (2 * np.pi / count)
+    angle = (angle if draw["forward"] else -angle) + draw["turn"]
+    spread = 1 + difficulty * draw["across"][:count]
+    return np.stack([draw["radii"][0] * spread * np.cos(angle), draw["radii"][1] * spread * np.sin(angle),
+                     1.5 + difficulty * draw["height"][:count]], -1)
+
+
+def crowded(gates: np.ndarray, gate: int) -> np.ndarray:
+    """Which gates before `gate` crowd it: within ACROSS metres across and HEIGHT in height of it."""
+    offset = gates[:gate] - gates[gate]
+    return (np.hypot(offset[:, 0], offset[:, 1]) < ACROSS) & (np.abs(offset[:, 2]) < HEIGHT)
+
+
+def written_chain(difficulty: float, draw: dict, events: collections.Counter) -> np.ndarray:
+    """A chain's gates, each placed from the last as its draws say: a split-S (a metre behind it and 2.5 to
+    4 m below, where that stays up) or else 7 to 16 m on after a turn, with a dive or a climb; heights held
+    between LOW and HIGH; three passes lifting each gate crowded by earlier ones up to TOP; the chain
+    centred across by the mean of all its gates."""
+    count = int(draw["chain_count"])
+    gates, heading = [np.r_[0.0, 0.0, draw["first"]]], 0.0
+    for step in range(GATES - 1):
+        position = gates[-1]
+        turn = difficulty * draw["turns"][step] * np.pi / 2
+        climb = difficulty * draw["climbs"][step]
+        drop, primitive = draw["plunge"][step], draw["primitive"][step]
+        if primitive < difficulty / 4 and position[2] - drop >= LOW:
+            events["split"] += 1
+            ahead = position - np.r_[0.0, 0.0, drop] - np.r_[np.cos(heading), np.sin(heading), 0.0]
+            heading += np.pi
+        else:
+            dive = difficulty / 4 <= primitive < difficulty / 2
+            events["dive"] += dive
+            rise = draw["steep"][step] * np.sign(climb + 1e-6) if dive else climb
+            direction = heading + turn / 2
+            ahead = position + draw["distances"][step] * np.r_[np.cos(direction), np.sin(direction), 0.0]
+            ahead += np.r_[0.0, 0.0, rise]
+            heading += turn
+        ahead[2] = np.clip(ahead[2], LOW, HIGH)
+        gates.append(ahead)
+    gates = np.stack(gates)
+    for _ in range(3):
+        for gate in range(count):
+            crowding = crowded(gates, gate)
+            if crowding.any():
+                events["lifted"] += 1
+                gates[gate, 2] = min(gates[:gate][crowding, 2].max() + LIFT, TOP)
+    events["crowded"] += sum(crowded(gates, gate).any() for gate in range(count))
+    gates[:, :2] -= gates[:, :2].mean(0)
+    return gates[:count]
+
+
+def written_figure8(draw: dict) -> np.ndarray:
+    """A figure-eight's gates (Gerono's lemniscate) spanning its draws' width and depth, its lobes lifted
+    apart by its draw where they cross, turned."""
+    count = int(draw["eight_count"])
+    t = (np.arange(count) + 0.5) * (2 * np.pi / count)
+    x, y = draw["width"] * np.cos(t), draw["depth"] * np.sin(2 * t)
+    c, s = np.cos(draw["eight_turn"]), np.sin(draw["eight_turn"])
+    return np.stack([c * x - s * y, s * x + c * y, 3.0 + draw["lift"] * (0.5 + 0.5 * np.sin(t))], -1)
+
+
+def written_pillars(racing: Racing, difficulty: float, draw: dict, gates: np.ndarray,
+                    events: collections.Counter) -> np.ndarray:
+    """A course's pillars `[O, 4]` (x, y, radius, height): each at its draw's point along a segment between
+    gates, on the line or beside it, its height its radius times its draw's aspect; as many stand as the
+    difficulty and its draw allow, but for those within CLEARANCE and their radius of a gate."""
+    begin, end = gates[draw["segment"]], gates[(draw["segment"] + 1) % len(gates)]
+    point = begin + draw["along_segment"][:, None] * (end - begin)
+    heading = np.arctan2(end[:, 1] - begin[:, 1], end[:, 0] - begin[:, 0])
+    aside = np.where(draw["on_line"], draw["aside_line"], draw["aside_beside"] * np.sign(draw["side"]))
+    xy = point[:, :2] + aside[:, None] * np.stack([-np.sin(heading), np.cos(heading)], -1)
+    radius, height = draw["radius"], draw["radius"] * np.asarray(ASPECTS)[draw["aspect"]]
+    near = np.hypot(xy[:, None, 0] - gates[None, :, 0], xy[:, None, 1] - gates[None, :, 1]).min(-1)
+    allowed = np.arange(OBSTACLES) < np.floor(difficulty * racing.obstacles * draw["share"])
+    clear = near > CLEARANCE + radius
+    events["dropped"] += (allowed & ~clear).sum()
+    return np.c_[xy, np.where(allowed & clear, radius, 0.0), height]
+
+
+@pytest.mark.parametrize("difficulty", [0.0, 0.5, 1.0])
+def test_courses_are_their_families_generators_written_out(difficulty):
+    """4096 courses drawn at a difficulty from every family, in float64, each held to the generator of its
+    family written out over the draws it makes (a published layout moved by the jitter, a loop about an
+    ellipse, a chain of primitives whose crowded gates are lifted, a figure-eight, and pillars dropped near
+    a gate): every gate and standing pillar to float64 rounding, each count and which pillars stand
+    exactly; no gate of a chain crowded by an earlier one in the end; and, at a difficulty above none, a
+    split-S, a dive, a lifted gate and a dropped pillar each drawn among them."""
+    keys = jax.random.split(jax.random.key(6), COURSES)
+    with jax.enable_x64(new_val=True):
+        drawn = jax.jit(jax.vmap(lambda key: drawn_course(EVERY_FAMILY, key, jnp.asarray(difficulty))))
+        courses = jax.tree.map(np.asarray, drawn(keys))
+        segments = jnp.asarray(np.where(courses.closed, courses.count, courses.count - 1))
+        draws = jax.tree.map(np.asarray, jax.jit(jax.vmap(partial(course_draws, EVERY_FAMILY)))(
+            keys, segments))
+        roundings = chain_roundings(jax.make_jaxpr(drawn)(keys))
+    family = np.asarray(FAMILIES)[courses.family]
+    events = collections.Counter()
+    written = {"layout": partial(written_layout, EVERY_FAMILY, difficulty),
+               "loop": partial(written_loop, difficulty),
+               "chain": partial(written_chain, difficulty, events=events), "figure8": written_figure8}
+    each_draw = [{name: value[row] for name, value in draws.items()} for row in range(COURSES)]
+    gates = [written[name](draw) for name, draw in zip(family, each_draw, strict=True)]
+    np.testing.assert_array_equal(courses.count, [len(course) for course in gates])
+    pillars = np.stack([written_pillars(EVERY_FAMILY, difficulty, draw, course, events)
+                        for draw, course in zip(each_draw, gates, strict=True)])
+    for name in FAMILIES:
+        rows = np.flatnonzero(family == name)
+        shown = np.concatenate([courses.center[row, :courses.count[row]] for row in rows])
+        assert_computes_the_oracle(shown, np.concatenate([gates[row] for row in rows]),
+                                   f"a {name} course's gates", roundings=roundings)
+    stands = courses.obstacles[..., 2] > 0
+    np.testing.assert_array_equal(stands, pillars[..., 2] > 0)
+    assert not events["crowded"]
+    if difficulty:
+        assert_computes_the_oracle(courses.obstacles[stands], pillars[stands], "the pillars",
+                                   roundings=roundings)
+        assert all(events[name] for name in ("split", "dive", "lifted", "dropped"))
+    else:
+        assert not stands.any()
+
+
 @pytest.mark.parametrize("difficulty", [0.0, 0.5, 1.0])
 def test_courses_keep_their_families_shapes(difficulty):
-    """4096 courses drawn at a difficulty from every family: each layout course is a published layout
-    (centred across) moved by at most the jitter times the difficulty and held 0.75 m high; each loop closed,
-    6 to 12 gates; each chained track open, 8 to 16 gates, each 7 to 16 m on from the last (a split-S's 2.5
-    to 4 m below and a metre behind, at first) and between 1 and 20 m high, no two of its gates within 3 m
-    across and 2.5 m in height; each figure-eight closed, 8 to 12 gates; the gates of a loop or a
-    figure-eight at least 2 m apart; every pillar at least 3 m and its radius from every gate, its height its
-    radius times one of the aspects."""
-    racing = Racing(families=tuple((family, 1.0) for family in FAMILIES))
-    keys = jax.random.split(jax.random.key(6), 4096)
+    """4096 courses drawn at a difficulty from every family, in the dtype a race runs in: each loop and
+    figure-eight closed and each chain open; a layout course the size of a published layout, a loop 6 to 12
+    gates, a chain 8 to 16 and a figure-eight 8 to 12, every size in each range drawn; a chain's gates
+    between 1 and 20 m high; each pillar's height its radius times one of the aspects."""
+    keys = jax.random.split(jax.random.key(6), COURSES)
     courses = jax.tree.map(np.asarray, jax.jit(jax.vmap(
-        lambda key: drawn_course(racing, key, jnp.asarray(difficulty))))(keys))
-    layouts = {name: np.asarray(gates) - np.r_[np.asarray(gates)[:, :2].mean(0), 0.0]
-               for name, gates in LAYOUTS.items()}
-    reach = difficulty * np.r_[racing.jitter[0], racing.jitter[0], racing.jitter[1]] + 1e-4
-    floor = np.r_[-np.inf, -np.inf, 0.75]
-    seen = set()
-    for row in range(4096):
-        family = FAMILIES[courses.family[row]]
-        seen.add(family)
-        count = int(courses.count[row])
-        gates = courses.center[row, :count]
-        assert bool(courses.closed[row]) == (family != "chain")
-        if family == "layout":
-            assert any(len(layout) == count and np.all(np.abs(gates - np.maximum(layout, floor)) <= reach)
-                       for layout in layouts.values())
-        elif family == "loop":
-            assert 6 <= count <= 12
-        elif family == "figure8":
-            assert 8 <= count <= 12
-        else:
-            assert 8 <= count <= GATES and np.all((gates[:, 2] >= 1 - 1e-5) & (gates[:, 2] <= 20 + 1e-5))
-            steps = np.linalg.norm(np.diff(gates[:, :2], axis=0), axis=-1)
-            split = np.abs(steps - 1.0) < 1e-4
-            assert np.all(split | ((steps >= 7 - 1e-4) & (steps <= 16 + 1e-4)))
-            across = np.linalg.norm(gates[:, None, :2] - gates[None, :, :2], axis=-1)
-            height = np.abs(gates[:, None, 2] - gates[None, :, 2])
-            assert not np.any((across < 3.0) & (height < 2.5) & ~np.eye(count, dtype=bool))
-        if family in ("loop", "figure8"):
-            apart = np.linalg.norm(gates[:, None] - gates[None], axis=-1)
-            assert np.all(apart[~np.eye(count, dtype=bool)] > 2.0)
-        pillars = courses.obstacles[row][courses.obstacles[row, :, 2] > 0]
-        aspect = pillars[:, 3] / pillars[:, 2]
-        assert np.all(np.min(np.abs(aspect[:, None] - np.asarray(ASPECTS)[None]), -1) < 1e-4)
-        if len(pillars):
-            across = np.linalg.norm(pillars[:, None, :2] - gates[None, :, :2], axis=-1)
-            assert np.all(across > 3.0 + pillars[:, 2:3])
-    assert seen == set(FAMILIES)
+        lambda key: drawn_course(EVERY_FAMILY, key, jnp.asarray(difficulty))))(keys))
+    family = np.asarray(FAMILIES)[courses.family]
+    np.testing.assert_array_equal(courses.closed, family != "chain")
+    counts = {name: set(courses.count[family == name]) for name in FAMILIES}
+    assert counts == {"layout": {len(layout) for layout in PUBLISHED}, "loop": set(range(6, 13)),
+                      "chain": set(range(8, GATES + 1)), "figure8": set(range(8, 13))}
+    chained = np.concatenate([courses.center[row, :courses.count[row], 2]
+                              for row in np.flatnonzero(family == "chain")])
+    assert np.all((chained >= 1) & (chained <= 20))
+    standing = courses.obstacles[courses.obstacles[..., 2] > 0]
+    assert (standing[:, 3:] == standing[:, 2:3] * np.asarray(ASPECTS, standing.dtype)).any(-1).all()
 
 
 def test_a_hovering_drone_flies_and_is_cut_at_its_time():
