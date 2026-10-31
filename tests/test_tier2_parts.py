@@ -568,6 +568,28 @@ def test_an_lfm2_of_convolutions_alone_assembles():
     assert fields["layer_types"] == ("conv",) * 4 and (fields["num_heads"], fields["num_kv_heads"]) == (4, 2)
 
 
+def _aliased(first, second):
+    def compute(x):
+        return x if first is second else -x
+    return compute
+
+
+def test_closures_whose_containers_alias_apart_compute_apart():
+    """Two closures of one body over lists of equal items compute alike only where the lists alias alike
+    (`code_identity._paired`): one binding the same list twice returns its input, one binding two lists
+    negates it; and two kernel-decorated copies of a helper, each holding its own tuple of parameter
+    names and list of child names (LFM2-MoE's of LFM2's convolution), compute alike."""
+    from transformers.models.lfm2.modeling_lfm2 import Lfm2ShortConv
+    from transformers.models.lfm2_moe.modeling_lfm2_moe import Lfm2MoeShortConv
+
+    from dew.interop.code_identity import Renaming, matched_class, same_code
+
+    shared, apart = [], ([], [])
+    assert not same_code(_aliased(shared, shared), _aliased(*apart), Renaming("", ""))
+    assert same_code(_aliased(*apart), _aliased([], []), Renaming("", ""))
+    assert matched_class(Lfm2MoeShortConv, Lfm2ShortConv) is not None
+
+
 def test_a_biased_short_convolution_is_left_to_tier_3():
     """LFM2's biased convolution zeroes its padded slots before its input projection, so they still convolve
     their bias terms into the next real tokens' history, which Dew's held convolution keeps empty: tier 2

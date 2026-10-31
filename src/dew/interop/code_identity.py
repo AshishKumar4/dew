@@ -270,18 +270,31 @@ def _grad_modes() -> tuple[type, ...]:
     return (torch.no_grad, torch.enable_grad, torch.inference_mode, torch.set_grad_enabled)
 
 
+def _paired(ours: object, theirs: object, seen: set) -> bool:
+    """Whether a container `ours` binds may stand for the one `theirs` binds: neither is already paired
+    with another (`seen` holds each pair compared), so two names that bind one list on one side bind one
+    on the other, and a mutation through one name reaches the other alike."""
+    return not any((first == id(ours)) != (second == id(theirs)) for first, second in seen)
+
+
 def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], names: Iterable[tuple[str, str]],
                    renaming: Renaming, seen: set, *, unbound: bool = False) -> bool:
     """Whether each pair of `names` is bound alike in `ours` and `theirs`: the same object, functions of
     the same code (`same_code`; a module-level helper reads no `self`, so `renaming` holds no
     attributes), methods of the same function bound to instances alike, equal constants, tuples or
-    lists whose items are bound alike (a kernel decorator's parameter names and its kernelized class's
-    child names, which LFM2-MoE's copy of LFM2's convolution holds), or instances of one class whose own
-    state is alike (a decorator's context manager, `torch.no_grad()`). A name
+    lists whose items are bound alike and which alias as each other's do (`_paired`: a kernel
+    decorator's parameter names and its kernelized class's child names, which LFM2-MoE's copy of LFM2's
+    convolution holds), or instances of one class whose own state is alike (a decorator's context
+    manager, `torch.no_grad()`). A name
     neither binds is a NameError when it runs, not evidence of the same code, unless `unbound` (a name
     a nested scope binds, which reads its own)."""
     for our_name, their_name in names:
         a, b = ours.get(our_name, _MISSING), theirs.get(their_name, _MISSING)
+        if isinstance(a, tuple | list):
+            if not _paired(a, b, seen):
+                return False
+            if a is b:
+                seen.add((id(a), id(b)))
         if a is b and (a is not _MISSING or unbound):
             continue
         if isinstance(a, FunctionType) and isinstance(b, FunctionType):
@@ -297,6 +310,9 @@ def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], nam
             if a != b:
                 return False
         elif isinstance(a, tuple | list) and isinstance(b, tuple | list):
+            if (id(a), id(b)) in seen:
+                continue
+            seen.add((id(a), id(b)))
             if len(a) != len(b) or not _same_bindings(
                     {str(index): item for index, item in enumerate(a)},
                     {str(index): item for index, item in enumerate(b)},
