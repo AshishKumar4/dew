@@ -101,12 +101,19 @@ def site(dew, reference, drawn, rate: float, scale: float, window: int, label: s
     assert_as_exact(dew, literal, drawn, label, seeds=seeds, truth_fn=truth)
 
 
+@functools.cache
+def variable_shapes(model: CausalTransformer):
+    """`model`'s variables' shapes, traced once a model: a site's every draw reads them
+    (`drawn_variables`)."""
+    return jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
+
+
 def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 0.5):
     """`model`'s variables drawn at `scale` N(0, 1), its level's `up` among them, so the level moves
     the states from its first window."""
     rng = np.random.default_rng(seed)
-    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
-    return jax.tree.map(lambda leaf: (scale * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
+    return jax.tree.map(lambda leaf: (scale * rng.standard_normal(leaf.shape)).astype(np.float32),
+                        variable_shapes(model))
 
 
 def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,

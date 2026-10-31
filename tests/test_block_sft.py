@@ -102,10 +102,12 @@ def trainer_update(obj, batch, run_key, optimizer):
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
                 **example_fields(initial, 0, 1, batch))
     run = trainer.compile(jax.tree.map(jnp.copy, initial), batch)
+    # One program copies a tree, so an example's copies are one dispatch, not one a leaf.
+    copied = jax.jit(lambda tree: jax.tree.map(jnp.copy, tree))
 
     def stepped(values, rows=batch):
         # The step consumes its state: it steps copies.
-        state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.copy, values))
+        state = copied(initial).replace(variables=copied(values))
         state, *_ = run(state, rows)
         return state
 

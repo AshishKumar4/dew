@@ -224,14 +224,18 @@ def moved_weights(variables):
     """Check 1's `draw(seed)` over a trainer's `variables`: each trained leaf moved by the seed's draw,
     so zero-initialized layers take a gradient too."""
     host = jax.tree.map(np.asarray, variables)
+    leaves, tree = jax.tree.flatten(host["params"])
+
+    @jax.jit
+    def moved(key, leaves):
+        # Every leaf moved in one program, each by its own key of the seed's, in the tree's order.
+        keys = jax.random.split(key, len(leaves))
+        return [(leaf + 0.02 * jax.random.normal(each, leaf.shape)).astype(leaf.dtype)
+                for each, leaf in zip(keys, leaves, strict=True)]
 
     def draw(seed):
-        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(host["params"]))))
-
-        def moved_leaf(leaf):
-            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
-
-        return ({**host, "params": jax.tree.map(moved_leaf, host["params"])},)
+        params = jax.tree.unflatten(tree, [np.asarray(leaf) for leaf in moved(jax.random.key(seed), leaves)])
+        return ({**host, "params": params},)
 
     return draw
 
