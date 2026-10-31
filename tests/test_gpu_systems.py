@@ -22,16 +22,15 @@ import test_benchmark_step as benchmark_step
 import test_instrumentation as instrumentation
 import test_profile as profile
 import test_tuning as tuning
-from gpu_flow import Cell, run_cells
+from gpu_flow import Cell, isolated, run_cells
 
 pytestmark = pytest.mark.gpu(reason="each system's GPU reads: the tuner, CUPTI, the allocator, Triton")
 
 
 def test_a_runs_systems_read_this_gpu(tmp_path_factory):
-    """Every systems cell above on this GPU (`gpu_flow.run_cells`), each in a directory of its own, each
-    one's failure kept and all raised together."""
-    def in_own(check, name):
-        return lambda: check(tmp_path_factory.mktemp(name))
+    """Every systems cell above on this GPU (`gpu_flow.run_cells`), each run as the suite runs a test
+    (`gpu_flow.isolated`), each one's failure kept and all raised together."""
+    in_own = isolated(tmp_path_factory)
 
     run_cells([
         Cell("the tuner measures only on an explicit pass to itself, each launch once",
