@@ -21,6 +21,8 @@ import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
+from dew.nn.programs import platform_branch
+
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
 under default layouts)."""
@@ -102,9 +104,7 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
             traced = jax.make_jaxpr(run)(*(value.aval for value in equation.invars))
             body, consts = traced.jaxpr, traced.consts
         elif name == "cond" and params.get("branches_platforms") is not None:
-            kept = next(index for index, platforms in enumerate(params["branches_platforms"])
-                        if platforms is None or lowering in platforms)
-            branch = params["branches"][kept]
+            branch = params["branches"][platform_branch(params["branches_platforms"], lowering)]
             body, consts, reading = branch.jaxpr, branch.consts, operands[1:]
         if body is not None:
             inner, returned = inlined(compiled(body, lowering), reading, consts)
