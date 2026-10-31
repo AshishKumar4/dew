@@ -6,7 +6,7 @@ import json
 
 import pytest
 from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
-from tool_support import load
+from tool_support import REPO_ROOT, load
 
 
 @pytest.fixture
@@ -341,57 +341,39 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
     assert found == [f"3.12:{name}" for name in names]
 
 
-DIGEST = (
-    "import functools\nimport hashlib\nfrom pathlib import Path\n\n\n@functools.cache\n"
-    "def package_digest():\n    digest = hashlib.sha256()\n"
-    "    for path in sorted(Path(__file__).parent.rglob('*.py')):\n"
-    "        digest.update(path.name.encode() + path.read_bytes())\n    return digest.hexdigest()\n")
-"""`dew.cache.package_digest` as a scratch package's dew/cache.py holds it."""
+def digest_module() -> str:
+    """dew/cache.py's `package_digest` and what it names, as the scratch package's dew/cache.py: the function
+    itself, read from Dew's source, without the rest of the module's imports (jax among them)."""
+    import ast
+
+    source = (REPO_ROOT / "src" / "dew" / "cache.py").read_text()
+    held = [ast.get_source_segment(source, node, padded=True) for node in ast.parse(source).body
+            if (isinstance(node, ast.FunctionDef) and node.name == "package_digest")
+            or (isinstance(node, ast.Assign) and [target.id for target in node.targets] == ["VERSION_FILE"])]
+    decorated = "\n".join("@functools.cache\n" + part if part.startswith("def ") else part for part in held)
+    return "import functools\nimport hashlib\nfrom pathlib import Path\n\n\n" + decorated + "\n"
 
 
-def test_the_digest_of_dews_own_source_is_no_input_of_the_file_that_computed_it(ci, tmp_path, monkeypatch,
-                                                                                cache_worker):
-    """`dew.cache.package_digest` hashes every source file of the package only to name the record a cache
-    looks for (the rung cache's, a saved source's export): the files it reads are no input of the file that
-    called it, which would otherwise run again for an edit to any module of Dew (train 396 reused 0.0% of
-    its rows for one line of src/dew/__init__.py). What a file executes of those modules stays its input,
-    and so does a module's text it reads itself."""
-    sources = tmp_path / "src"
-    package = sources / "dew"
-    (package / "training").mkdir(parents=True)
-    for name in ("__init__.py", "training/__init__.py"):
-        (package / name).write_text("")
+def test_a_release_runs_none_of_the_files_that_digest_dews_source_again(ci, tmp_path, monkeypatch,
+                                                                         cache_worker):
+    """`dew.cache.package_digest` names the records Dew's caches look for (the rung cache's, a verified
+    mapping's, a saved source's export) by every source file of the package, so a file that calls it runs
+    again for any edit to Dew, which a cache hit may have hidden from it, but not for a release's version
+    (`dew._version`), which no code computes from: train 396 reused 1 of 2,279 rows for its version bump."""
+    package = tmp_path / "src" / "dew"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "_version.py").write_text('__version__ = "0.2.0"\n')
     (package / "spare.py").write_text("def spare():\n    return 1\n")
-    (package / "cache.py").write_text(DIGEST)
+    (package / "cache.py").write_text(digest_module())
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_digested.py": ON_SRC + "import dew.spare\nfrom dew.cache import package_digest as digest\n"
-                                     "def test_digested():\n    assert digest()\n",
-        "test_reader.py": ON_SRC + "import dew.spare\nfrom pathlib import Path\n"
-                                   "def test_reader():\n"
-                                   "    assert 'spare' in Path('src/dew/spare.py').read_text()\n"}, {})
-    assert reused() == [True, True]
+        "test_digested.py": ON_SRC + "from dew.cache import package_digest\n"
+                                     "def test_digested():\n    assert package_digest()\n"}, {})
+    assert reused() == [True]
+    (package / "_version.py").write_text('__version__ = "0.3.0"\n')
+    assert reused() == [True]
     (package / "spare.py").write_text("def spare():\n    return 2\n")
-    assert reused() == [True, False]
-    (package / "spare.py").write_text("def spare():\n    return 1\n")
-    assert reused() == [True, True]
-    # The digest's own code is what the file executed: an edit to it runs the file (and the files its process
-    # ran after it, which what it ran may serve) again.
-    (package / "cache.py").write_text(DIGEST.replace("hexdigest()", "hexdigest()[:8]"))
-    assert reused()[0] is False
-
-
-def test_each_source_digest_the_recorder_exempts_is_a_function_dew_still_holds():
-    """`followed.DIGESTS` names each function by its file and its name: one renamed or moved would leave its
-    reads the input of every file that calls it again (the 38% of a suite's rows that hash Dew's source), and
-    no run of the suite would show it."""
-    import importlib
-    import inspect
-    import os
-
-    followed = load("followed", "tools/armada")
-    for file, name in followed.DIGESTS:
-        held = getattr(importlib.import_module(file.removesuffix(".py").replace("/", ".")), name)
-        assert inspect.unwrap(held).__code__.co_filename.endswith(os.sep + file), (file, name)
+    assert reused() == [False]
 
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):

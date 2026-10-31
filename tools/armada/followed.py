@@ -139,39 +139,15 @@ def reads_backend(code: types.CodeType) -> bool:
     return decided[code]
 
 
-DIGESTS = (("dew/cache.py", "package_digest"),)
-"""The functions that hash Dew's own source files to name the record a cache looks for
-(`dew.cache.package_digest`: every file of the package, for the rung cache's and a saved source's records):
-what one reads is no input of the run that called it, whose outcome a digest never decides, and which would
-otherwise run again for an edit to any module of Dew (train 396: 0.0% of its rows reused, for one line of
-src/dew/__init__.py, 38% of them because they hashed it). What the run executes of those modules, and every
-read it makes itself, stay its inputs."""
-DIGEST_DEPTH = 8
-"""How far above a read a digest's function may be: pathlib's `read_bytes`, `open` and a listing between."""
-
-
-def digesting(frame: types.FrameType | None) -> bool:
-    """Whether `frame`, or one of the `DIGEST_DEPTH` frames calling it, runs a function of `DIGESTS`."""
-    for _ in range(DIGEST_DEPTH):
-        if frame is None:
-            return False
-        code = frame.f_code
-        if any(code.co_name == name and code.co_filename.endswith(os.sep + file) for file, name in DIGESTS):
-            return True
-        frame = frame.f_back
-    return False
-
-
 def read(event: str, args: tuple, root: str) -> str | None:
     """The checkout's file or directory, relative to `root`, that a read event names, or None: a file
     opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
     listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
     calls this; nor a module's source or bytecode the import system's loader reads to execute it, whose
     record is the code it ran (`code_unit`). An open relative to a directory descriptor is `opening`'s to
-    place. A read a source digest makes (`DIGESTS`) is none. The interpreter audits the main script's open
-    from no frame at all."""
+    place. The interpreter audits the main script's open from no frame at all."""
     path = args[0]
-    if isinstance(path, int) or digesting(sys._getframe(1).f_back):
+    if isinstance(path, int):
         return None
     if event == "open":
         mode, flags = args[1], args[2]
@@ -274,12 +250,6 @@ def listing_tool(name: str) -> bool:
             or f"{os.sep}importlib{os.sep}metadata{os.sep}" in name)
 
 
-def unrecorded(frame: types.FrameType) -> bool:
-    """Whether the probes code at `frame` makes are no input: a listing tool's (`listing_tool`) or a source
-    digest's (`DIGESTS`)."""
-    return listing_tool(frame.f_code.co_filename) or digesting(frame)
-
-
 def programs(event: str, args: tuple) -> list:
     """The programs a process start of `event` may run, by the paths its audit names: `subprocess`'s
     executable (its command's first word where it names none), `_posixsubprocess`'s candidates, and
@@ -338,8 +308,8 @@ def _this_python(program) -> bool:
 def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: str) -> Callable[..., object]:
     """`probe` (`PROBES`), which passes the path it is asked about to `recorded`, as `PROBED` and that path,
     before it answers: but a listing tool's (`listing_tool`), whose probes, as its listings, look for what
-    it then records as it runs, a source digest's (`DIGESTS`), and one a probe makes in answering (pathlib's
-    `is_dir` asks `stat`), whose caller's probe is already recorded."""
+    it then records as it runs, and one a probe makes in answering (pathlib's `is_dir` asks `stat`), whose
+    caller's probe is already recorded."""
 
     @functools.wraps(probe)
     def asked(path, *arguments, **keywords):
@@ -348,7 +318,7 @@ def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: 
         # A path relative to a directory descriptor (os.stat's dir_fd) is placed in the directory it names.
         at = keywords.get("dir_fd")
         base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
-        if not isinstance(path, int) and not unrecorded(sys._getframe(1)) and (
+        if not isinstance(path, int) and not listing_tool(sys._getframe(1).f_code.co_filename) and (
                 name := placed(os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))),
                                root)) is not None:
             recorded(PROBED + name)

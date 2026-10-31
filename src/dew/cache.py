@@ -30,15 +30,21 @@ def dew_cache_dir() -> str:
     )
 
 
+VERSION_FILE = "_version.py"
+"""The release's version (`dew._version`), which no code of Dew's computes from: no part of its
+implementation."""
+
+
 @functools.cache
 def package_digest() -> str:
-    """The digest of Dew's own implementation, every source file of `dew` by its path and contents: what a
-    cache of what Dew's code computed keys on, so that any change of that code computes it again. Read
-    once a process."""
+    """The digest of Dew's own implementation, every source file of `dew` by its path and contents, the
+    release's version (`VERSION_FILE`) not read: what a cache of what Dew's code computed keys on, so that any
+    change of that code computes it again and a release computes nothing again. Read once a process."""
     package = Path(__file__).parent
     digest = hashlib.sha256()
     for path in sorted(package.rglob("*.py")):
-        digest.update(str(path.relative_to(package)).encode() + b"\0" + path.read_bytes())
+        if path.relative_to(package) != Path(VERSION_FILE):
+            digest.update(str(path.relative_to(package)).encode() + b"\0" + path.read_bytes())
     return digest.hexdigest()
 
 
