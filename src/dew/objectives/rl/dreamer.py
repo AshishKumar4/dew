@@ -747,7 +747,7 @@ class DreamerRollout:
     replay: ReplayBuffer | None = None
     _live: _Live | None = field(default=None, init=False, repr=False)
     _taken: int = field(default=0, init=False, repr=False)
-    _ended: tuple[float, int] = field(default=(0.0, 0), init=False, repr=False)
+    _ended: tuple[jax.Array | float, jax.Array | int] = field(default=(0.0, 0), init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.replay is None and self.prefill < self.length:
@@ -768,7 +768,7 @@ class DreamerRollout:
 
     @property
     def metrics(self) -> Mapping[str, float]:
-        total, count = self._ended
+        total, count = float(self._ended[0]), int(self._ended[1])
         return {"episode_return": total / count if count else float("nan")}
 
     @property
@@ -850,17 +850,19 @@ class DreamerRollout:
 
     def sample(self, key: jax.Array) -> Batch:
         """`batch` windows of `length` steps drawn from the replay as an update draws them, on the device
-        the replay is held on."""
+        the replay is held on and left there: the update reads them where they are, and the host does not
+        wait for the device to fetch them (a FlyDreamer update's 56 MB of images went there and back)."""
         replay = self.held_replay
         if replay is None:
             raise ValueError("a rollout samples its replay once it has begun (its first call)")
         key = jax.device_put(key, jax.tree.leaves(replay.held)[0].sharding)
-        return jax.device_get(self._sample(replay, key))
+        return self._sample(replay, key)
 
     def _advanced(self, variables: Variables, live: _Live, steps: int, *, random: bool) -> _Live:
         live, total, count = self._roll(variables, live, steps=steps, random=random)
         self._taken += steps * live.returns.shape[0]
-        self._ended = (float(total), int(count))
+        # Read when the metrics are, so the host does not wait for each advance to finish.
+        self._ended = (total, count)
         return live
 
 
