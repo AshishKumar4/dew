@@ -8,6 +8,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A compilation cache directory a run names after its process first compiled (`prepare_process`,
   `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
   JAX kept the first directory.
+- A decision run's summary states each question budget with where it came from beside the window's
+  (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
+  states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
+  counts beside the delivered rows' (`Rejected.cut`).
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
