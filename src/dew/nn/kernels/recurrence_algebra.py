@@ -1011,6 +1011,12 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
+    """The write gate's gradient on a tile of values gated, `u = v beta`, from `u_grad`, fp32: the values'
+    own, `du beta`, and beta's, `sum(v du)` over the tile's columns."""
+    return u_grad * beta[:, None], jnp.sum(u_grad * values, axis=1)
+
+
 def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, beta, dtype, issue: Issue, *,
                     emit: Callable[[str, int, jax.Array], None]) -> jax.Array:
     """The WY representation's backward under a decay a head, its values' part: each value block's gradient
@@ -1020,8 +1026,9 @@ def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, bet
     for j in range(blocks):
         u_grad = u_grads(j).value().astype(jnp.float32)
         d_scaled = u_grad + issue("inverse_t", lower.T, u_grad.astype(dtype))
-        emit("values", j, d_scaled * beta[:, None])
-        d_betas.append(jnp.sum(d_scaled * values(j).value().astype(jnp.float32), axis=1))
+        d_values, d_beta = gated_values_back(d_scaled, values(j).value().astype(jnp.float32), beta)
+        emit("values", j, d_values)
+        d_betas.append(d_beta)
     return _summed(d_betas)
 
 

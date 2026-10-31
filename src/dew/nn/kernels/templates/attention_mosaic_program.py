@@ -39,7 +39,7 @@ QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
 feed their own rings (`mosaic_sm90.FED`). mma.sync's lowers and holds check 1 on an A100 (row 2078,
 ET-2078-A100CHECK3), but its natural, guarded and backward launches spill at every tile its model admits and
-no register fact yet decides them (the toolkit's sm80 matrix), so its calls take FA2 or the frozen Triton
+no register fact yet decides them (the toolkit's sm80 matrix), so its calls take FA2 or the Pallas-Triton
 mainloop by legality."""
 
 
@@ -779,7 +779,7 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
         # remainder by the tile's width, seven instructions at 192), chains LLVM hoists out of the walk and
         # ptxas holds across it (the held-term census: 45-127 such integers live at the peak, D64's 64 x 192
         # forward spilling 344 bytes, D128's training 64 x 64 72); a row's needs no remainder.
-        return lax.broadcast_in_dim(start + family.iota((shape[axis],), 0, columns=axis == 1), shape, (axis,))
+        return lax.broadcast_in_dim(start + family.iota((shape[axis],), 0), shape, (axis,))
 
     # Each one's places a vector broadcast where the step reads them (a row's keys first, a column's queries
     # first); a tile otherwise (Mosaic GPU keeps an unread vector's iota without its layout, which its

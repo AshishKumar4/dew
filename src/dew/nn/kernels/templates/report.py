@@ -47,6 +47,8 @@ MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
 SHARED_BYTES = 10
 """The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
+ELF = b"\x7fELF"
+"""A cubin's first bytes."""
 REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
 (EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
@@ -332,10 +334,11 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
 
 @dataclasses.dataclass(frozen=True)
 class Binary:
-    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name less the launch it
-    carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its stack frame's
-    bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and the dynamic
-    shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto states none."""
+    """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
+    the launch it carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its
+    stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and
+    the dynamic shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto
+    states none."""
     kernel: str
     launch: str | None
     registers: int
@@ -344,13 +347,15 @@ class Binary:
 
 
 def binaries(executable: jax.stages.Compiled) -> list[Binary]:
-    """Every Mosaic GPU kernel binary `executable` carries, read from its own serialized form: XLA keeps each
-    kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this compile ran ptxas for
-    it, another thread's program compiled it first (Mosaic compiles a module once a process), or the
-    executable was loaded from the persistent cache. Nothing is read from or written to the process's
-    environment or disk: a compile that set Mosaic's dump settings around itself handed its directory to
-    every other thread's compile and removed it under them ('Directory not empty', row 2790), and the
-    settings turn on every dump Mosaic has (row 2816)."""
+    """Every Mosaic GPU and Pallas-Triton kernel binary `executable` carries, read from its own serialized
+    form: XLA keeps a Mosaic kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this
+    compile ran ptxas for it, another thread's program compiled it first (Mosaic compiles a module once a
+    process), or the executable was loaded from the persistent cache, and a Pallas-Triton template
+    launch's on its thunk itself (its `binary`, which a Mosaic thunk leaves empty), its kernel naming its
+    launch. Nothing is read from or written to the process's environment or disk: a compile that set
+    Mosaic's dump settings around itself handed its directory to every other thread's compile and removed
+    it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has (row
+    2816)."""
     from jax._src.thunky import thunky
 
     found: list[Binary] = []
@@ -360,7 +365,14 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
 
         def visit(operation: ir.Operation) -> ir.WalkResult:
             if operation.name == "thunky.call_thunk_proto":
-                found.extend(thunk_kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes))
+                attributes = operation.attributes
+                found.extend(thunk_kernels(ir.StringAttr(attributes["thunk_proto"]).value_bytes))
+                elf = ir.StringAttr(attributes["binary"]).value_bytes if "binary" in attributes else b""
+                name = ir.StringAttr(attributes["kernel_name"]).value
+                # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins so too: a template
+                # launch's names its launch (`named`).
+                if elf[:4] == ELF and LAUNCH_SUFFIX.search(name):
+                    found.append(_binary(name, elf))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
@@ -391,7 +403,7 @@ def _kernels(message: bytes) -> tuple[list[Binary], int]:
         fields.setdefault(field.field_number, []).append(field.data)
     binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
-            and isinstance(binary[0], bytes) and binary[0][:4] == b"\x7fELF" and isinstance(name[0], bytes)):
+            and isinstance(binary[0], bytes) and binary[0][:4] == ELF and isinstance(name[0], bytes)):
         stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
         return [dataclasses.replace(_binary(name[0].decode(), binary[0]), shared=stated)], 0
     found, calls = [], 0
