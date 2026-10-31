@@ -907,7 +907,7 @@ def test_the_host_offload_benchmark_counts_each_parameter_in_the_memory_space_it
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
 
-def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows():
+def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows(tmp_path):
     """The benchmark's samples are the task's own walk and decode, read back as their real rows: a
     pixel-space model's too, which has no autoencoder, and its twelve prompts once on eight devices,
     which the walk pads to sixteen rows, so quality() scores twelve images against twelve prompts."""
@@ -937,8 +937,15 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
     scaled = TextToImage(Scaled(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
                          InputSpec(Field("image", (2, 2, 1))), {"params": {"scale": jnp.ones(())}}, steps=1,
                          guidance=None, solver=Euler())
-    row = tool.forward(scaled)
+    # The model's program's options reach the timed executable: an option `compiled_with` adds is one of
+    # them, and a bare jit dumps nothing (row 3062).
+    dumps = tmp_path / "dumps"
+    from dew.nn.kernels import options
+
+    with options.compiled_with({"xla_dump_to": str(dumps)}):
+        row = tool.forward(scaled)
     assert row["forward_ms"] > 0 and row["weights_mib"] >= 0
+    assert any(dumps.glob("*.txt"))
 
 
 # ---------------------------------------------------------------------------
