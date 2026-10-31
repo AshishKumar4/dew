@@ -1965,7 +1965,8 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     # Files named as long as a file system allows, enough that their kept rows pass the bound together.
     names = [f"tests/test_{index:03d}{'x' * 240}.py" for index in range(240)]
-    written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n" for index, name in enumerate(names)})
+    written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n"
+                       for index, name in enumerate(names)})
     durations = tmp_path / "tests/test_durations.json"
     durations.write_text(json.dumps({**json.loads(durations.read_text()),
                                      **{f"{name}::test_{index}": 1.0 for index, name in enumerate(names)}}))
