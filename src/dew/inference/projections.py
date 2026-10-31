@@ -23,7 +23,7 @@ splits back into its members each in the collection it was in.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TypeGuard
 
 import jax
@@ -31,10 +31,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.traverse_util import unflatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import SingleDeviceSharding
 
-from dew.batch import FROZEN, PACKED_FROZEN, Variables, merge, select, thaw
+from dew.batch import FROZEN, PACKED_FROZEN, Variables, merge, select, thaw, under
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.quantization import QUANTIZATION, Quantization, QuantizedClass
 
@@ -365,27 +365,23 @@ def inference_projections(model: nn.Module, variables: Variables) -> Variables:
 type _Path = tuple[str, ...]
 
 
-def _leaf_paths(variables: Variables, collection: str) -> frozenset[_Path]:
-    """The leaves of `variables`' `collection`, by path, as `dew.batch.select` takes them: anything
-    not a mapping is a leaf, a quantized kernel's arrays one."""
-    def walked(node: Variables | _Leaf, path: _Path) -> Iterator[_Path]:
-        if isinstance(node, Mapping):
-            for name, child in node.items():
-                yield from walked(child, (*path, str(name)))
-        else:
-            yield path
+def _paths(variables: Variables, collection: str) -> frozenset[_Path]:
+    """The paths of the leaves of `variables`' `collection` (`flatten_dict`), as `dew.batch.select`
+    takes them."""
+    return frozenset((collection, *path) for path in flatten_dict(variables.get(collection, {})))
 
-    return frozenset(walked(variables.get(collection, {}), (collection,)))
+
+def _flagged(variables: Variables) -> dict[_Path, np.ndarray]:
+    """The flags `variables` hold (`PACKED_FROZEN`) by their paths."""
+    return {(PACKED_FROZEN, *path): np.asarray(flags)
+            for path, flags in flatten_dict(variables.get(PACKED_FROZEN, {})).items()
+            if isinstance(flags, (np.ndarray, jax.Array))}
 
 
 def _frozen_leaves(variables: Variables) -> frozenset[_Path]:
     """The leaves `variables` hold frozen (`dew.batch.freeze`), each at the path `thaw` moves it to,
     `("params", ...)`."""
-    return frozenset(("params", *path[1:]) for path in _leaf_paths(variables, FROZEN))
-
-
-def _within(path: _Path, prefix: _Path) -> bool:
-    return path[:len(prefix)] == prefix
+    return frozenset(("params", *path[1:]) for path in _paths(variables, FROZEN))
 
 
 def _frozen_packed(frozen: frozenset[_Path], whole: Variables, groups: Sequence[ProjectionGroup]
@@ -397,15 +393,15 @@ def _frozen_packed(frozen: frozenset[_Path], whole: Variables, groups: Sequence[
     flags: dict[_Path, np.ndarray] = {}
     if not frozen:
         return frozen, flags
-    leaves = _leaf_paths(whole, "params")
+    leaves = _paths(whole, "params")
     for group in groups:
         base = ("params", *group.path)
-        members = [(*base, member) for member in group.members]
-        held = {path for path in frozen if any(_within(path, member) for member in members)}
+        members = [under(*base, member) for member in group.members]
+        held = {path for path in frozen if any(member(path) for member in members)}
         if not held:
             continue
         frozen -= held
-        within = {path for path in leaves if any(_within(path, member) for member in members)}
+        within = {path for path in leaves if any(member(path) for member in members)}
         if held == within:
             frozen |= {(*base, group.packed, *path[len(base) + 1:]) for path in held}
             continue
@@ -415,37 +411,31 @@ def _frozen_packed(frozen: frozenset[_Path], whole: Variables, groups: Sequence[
     return frozen, flags
 
 
-def _leaf(variables: Variables, path: _Path) -> np.ndarray:
-    node = variables
-    for name in path:
-        node = node[name]
-    return np.asarray(node)
-
-
 def _frozen_split(variables: Variables, groups: Sequence[ProjectionGroup]) -> frozenset[_Path]:
     """The leaves held frozen once `groups` of `variables` split (`_split`): a frozen packed leaf's
     members are frozen, and a trained one's are those its flags name (`PACKED_FROZEN`), the rest
     trained."""
     frozen = _frozen_leaves(variables)
-    flagged = _leaf_paths(variables, PACKED_FROZEN)
+    flagged = _flagged(variables)
     for group in groups:
         base = ("params", *group.path)
         packed = (*base, group.packed)
-        held = {path for path in frozen if _within(path, packed)}
+        held = {path for path in frozen if under(*packed)(path)}
         frozen = (frozen - held) | {(*base, member, *path[len(packed):])
                                     for path in held for member in group.members}
         marks = (PACKED_FROZEN, *group.path, group.packed)
-        for path in (path for path in flagged if _within(path, marks)):
-            frozen |= {(*base, member, *path[len(marks):])
-                       for member, was in zip(group.members, _leaf(variables, path), strict=True) if was}
+        for path, flags in flagged.items():
+            if under(*marks)(path):
+                frozen |= {(*base, member, *path[len(marks):])
+                           for member, was in zip(group.members, flags, strict=True) if was}
     return frozen
 
 
 def _flags(variables: Variables, groups: Sequence[ProjectionGroup] = ()) -> dict[_Path, np.ndarray]:
     """The flags `variables` hold (`PACKED_FROZEN`) but those of `groups`, which split."""
-    marks = [(PACKED_FROZEN, *group.path, group.packed) for group in groups]
-    return {path: _leaf(variables, path) for path in _leaf_paths(variables, PACKED_FROZEN)
-            if not any(_within(path, mark) for mark in marks)}
+    marks = [under(PACKED_FROZEN, *group.path, group.packed) for group in groups]
+    return {path: flags for path, flags in _flagged(variables).items()
+            if not any(mark(path) for mark in marks)}
 
 
 def _held_apart(variables: Variables, frozen: frozenset[_Path],
@@ -460,6 +450,6 @@ def _held_apart(variables: Variables, frozen: frozenset[_Path],
     rest = {name: tree for name, tree in variables.items() if name != "params"}
     params = {"params": variables["params"]}
     held = {FROZEN: select(params, lambda path: path in frozen)["params"]}
-    if frozen >= _leaf_paths(variables, "params"):
+    if frozen >= _paths(variables, "params"):
         return {**rest, **held}
     return {**rest, "params": select(params, lambda path: path not in frozen)["params"], **held}

@@ -71,6 +71,7 @@ from dew.nn.progress import END, Progress, progressed
 from .activations import GatedActivation
 from .attention import AttentionImpl
 from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention, kept_context
+from .attention_masks import max_attention_logits, visibility_mask
 from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
@@ -195,6 +196,39 @@ class CrossBlocks(Protocol):
         """The part of `flops` done by matrices the decoder holds, its layer's own, which train as its
         trunk does: a frozen trunk's take no weight gradient (`dew.nn.flops.frozen_training_flops`)."""
         ...
+
+
+CONTEXT_LOGITS = "context_max_logits"
+"""The `qk` collection's entry of each head's largest logit over a context a layer's own attention read
+(`AttendsContext.attend_context`), which the layer's own maxima take in (`with_context_logits`)."""
+
+
+def context_mask(query: jax.Array, key: jax.Array, lengths: jax.Array, queries: jax.Array | None = None,
+                 segments: jax.Array | None = None) -> jax.Array:
+    """The keys a read of a context sees (`AttendsContext.attend_context`): `query` `[B, S, H, D]` over a
+    context's `key` `[B, C, ..., D]`, each row's first `lengths` keys real and, where given, each query
+    its own document's keys alone (`queries` `[B, S]`, `segments` `[B, C]`), unmasked by causality."""
+    documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
+    return visibility_mask(query.shape[1], key.shape[-3], causal=False, sliding_window=None,
+                           segment_ids=documents, key_value_seq_lengths=lengths)
+
+
+def sow_context_logits(module: nn.Module, query: jax.Array, key: jax.Array, lengths: jax.Array,
+                       queries: jax.Array | None = None, segments: jax.Array | None = None) -> None:
+    """A read of a context's per-head largest logit over the keys it sees (`context_mask`), sown in
+    `module`'s `qk` collection (`CONTEXT_LOGITS`) where a caller opened it, so the layer's own call takes
+    it in beside its own sequence's (`with_context_logits`) and the QK-Clip bounds both."""
+    if not module.is_initializing() and module.is_mutable_collection("qk"):
+        seen = context_mask(query, key, lengths, queries, segments)
+        module.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
+
+
+def with_context_logits(module: nn.Module, found: jax.Array) -> jax.Array:
+    """`found`, a layer's own call's per-head largest logits, beside those of a context the call read
+    first through the same projections (`sow_context_logits`)."""
+    if module.has_variable("qk", CONTEXT_LOGITS):
+        return jnp.maximum(found, module.get_variable("qk", CONTEXT_LOGITS)[-1])
+    return found
 
 
 @runtime_checkable
@@ -641,6 +675,7 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
     return product[..., 0]
 
 
-__all__ = ["CROSS_CACHE", "CROSS_LENGTHS", "NAME", "AttendsContext", "ContextEncoder", "CrossAttention",
-           "CrossBlocks", "GatedCrossAttention", "LayerReads", "SharedCrossAttention",
-           "SharedGatedCrossAttention", "crossed_flops", "crossing", "encode_context", "gated_join"]
+__all__ = ["CONTEXT_LOGITS", "CROSS_CACHE", "CROSS_LENGTHS", "NAME", "AttendsContext", "ContextEncoder",
+           "CrossAttention", "CrossBlocks", "GatedCrossAttention", "LayerReads", "SharedCrossAttention",
+           "SharedGatedCrossAttention", "context_mask", "crossed_flops", "crossing", "encode_context",
+           "gated_join", "sow_context_logits", "with_context_logits"]

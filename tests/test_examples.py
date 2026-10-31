@@ -18,6 +18,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from lane_environment import outside_suite
 from diffusion_stubs import RES, TOKENS, StubText
 from PIL import Image
 from process_support import dew_train, logged_losses
@@ -42,9 +43,8 @@ def single_device(offline=True, devices=1) -> dict[str, str]:
     run asks for the network and carries the marker. No smoke reaches a paid
     endpoint, so none is handed the caller's OpenAI key.
     """
-    return {**{key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"},
+    return {**{key: value for key, value in outside_suite(os.environ).items() if key != "OPENAI_API_KEY"},
             "PYTHONPATH": str(REPO_ROOT / "src"),
-            "JAX_PLATFORMS": "cpu",
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}",
             "HF_HUB_OFFLINE": "1" if offline else "0",
             "TOKENIZERS_PARALLELISM": "false"}

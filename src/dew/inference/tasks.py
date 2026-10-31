@@ -50,6 +50,7 @@ from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
+from dew.nn.progress import END, Progress
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
@@ -887,6 +888,9 @@ class TextGeneration(_NativeTextTask):
     prefix: int | Literal["prompt"] | None = None
     """The prefix run the model trained (`LMObjective(prefix=...)`): a prompt's first tokens, or all of it
     under "prompt", form one block the model reads whole. A request's own blocks stand; None is causal."""
+    progress: Progress = END
+    """The run's progress a model that reads one draws at (`dew.nn.progress`): a run's collection's, the
+    updates it committed before its step (`LMObjective.policy`); a finished run's end otherwise."""
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -904,6 +908,12 @@ class TextGeneration(_NativeTextTask):
                              "that lists its vocabulary; pass processor=")
         return (decoding.stop_strings(self.processor, strings,
                                       self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+
+    def bind(self, variables: Variables, progress: Progress | None = None) -> Self:
+        """This task over `variables` (`_NativeTextTask.bind`), drawing at the run's `progress` where one
+        is given, a collection's step's (`EpisodeInference.bind`), else at its own."""
+        bound = super().bind(variables)
+        return bound if progress is None else dataclasses.replace(bound, progress=progress)
 
     def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
                   ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
@@ -986,7 +996,7 @@ class TextGeneration(_NativeTextTask):
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
-                                 trips=trips, prefix=self.prefix)
+                                 trips=trips, prefix=self.prefix, progress=self.progress)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return self._decoded(_requested(generated, budget, padding))
 
