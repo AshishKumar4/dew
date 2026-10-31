@@ -36,7 +36,7 @@ from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
 from dew.optim import OptimConfig
 from dew.telemetry.benchmark import samples
-from dew.telemetry.profile import capture_options
+from dew.telemetry.profile import Profiler
 
 
 def timed(function, arguments, repeats: int) -> dict[str, float]:
@@ -156,7 +156,8 @@ def step(args: argparse.Namespace) -> dict[str, object]:
         state, loss, _, seconds = timed_steps(compiled.step, state, args.steps)
         step_ms = seconds / args.steps * 1e3
         if args.trace:
-            with jax.profiler.trace(args.trace, profiler_options=capture_options()):
+            # The trace alone, which XProf opens as it is.
+            with Profiler(args.trace, reports=False):
                 state, loss, _, _ = timed_steps(compiled.step, state, 3)
         losses.append(float(loss))
         compile_seconds = compiled.compile_seconds

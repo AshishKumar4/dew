@@ -238,10 +238,12 @@ def dew_train(directory, environment: Mapping[str, str], *arguments: str) -> Non
 
 
 def logged_losses(run_directory) -> list[float]:
-    """The training losses a run in `run_directory` logged, in step order (its tracking's scalars)."""
-    rows = (Path(run_directory) / "tracking" / "scalars.jsonl").read_text().splitlines()
-    scalars = [json.loads(row)["scalars"] for row in rows]
-    return [row["train/loss"] for row in scalars if "train/loss" in row]
+    """The training losses a run in `run_directory` logged, in step order (its tracking's scalars,
+    `LocalTracker.scalars`)."""
+    from dew.training import LocalTracker
+
+    reports = LocalTracker(Path(run_directory) / "tracking").scalars()
+    return [values["train/loss"] for _, values in reports if "train/loss" in values]
 
 
 def running(pid: int) -> bool:
