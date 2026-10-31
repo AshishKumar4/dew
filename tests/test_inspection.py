@@ -578,23 +578,35 @@ def test_a_pipelined_language_models_watched_layers_read_none_of_its_padding():
     assert len(first) >= 48 and first == second
 
 
-def test_a_preference_runs_watched_layers_read_none_of_its_padding():
-    """A preference pair objective's watched layers are summarized at its sampled step over each half's
-    real tokens alone (row 2324), its prompt and its completion, the padding past them read nowhere:
-    the pairs' padding filled with another id gives the same summaries to the bit."""
-    from objective_cases import preference_pairs
+def test_a_preference_runs_watched_layers_read_each_halfs_real_tokens_alone():
+    """A preference pair objective's watched layers are summarized over each half's real tokens alone
+    (row 2324), as its pairs' layout marks them, whatever their completion marks: a pair whose chosen half
+    ends in an unmarked token, its padding filled with another id, gives the same summaries to the bit,
+    and that last real token changed gives others."""
+    from objective_cases import decoder
 
+    from dew.data import Memory, presets
+    from dew.objectives.rl import DPOObjective
     from dew.training import MeshSpec
 
-    objective, batch = preference_pairs()
-    run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), mesh=MeshSpec().build(jax.devices()[:1]),
+    pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5], "chosen_mask": [0, 0, 1, 0],
+            "rejected_mask": [0, 0, 1]}
+    (batch,) = list(Memory([pair] * 2).pipe(presets.preferences, seq_len=6, batch=2))
+    run = Trainer(DPOObjective(decoder(), 5), optax.sgd(RATE), key=jax.random.key(0),
+                  mesh=MeshSpec().build(jax.devices()[:1]),
                   inspection=Inspection(modules=("*MLP",), targets=("params",)))
     ids = np.asarray(batch["input_ids"])
-    real = np.arange(ids.shape[-1]) < np.array([4, 3])[None, :, None]
-    refilled = {**batch, "input_ids": np.where(real, ids, 7).astype(ids.dtype)}
-    first, second = ({name: value for name, value in inspected(run, rows).items() if "activations" in name}
-                     for rows in (batch, refilled))
-    assert first and first == second
+    padding = np.arange(ids.shape[-1]) >= np.array([4, 3])[None, :, None]
+    last = np.zeros(ids.shape, bool)
+    last[:, 0, 3] = True
+
+    def summaries(rows):
+        return {name: value for name, value in inspected(run, {**batch, "input_ids": rows}).items()
+                if "activations" in name}
+
+    first = summaries(ids)
+    assert first and first == summaries(np.where(padding, 7, ids).astype(ids.dtype))
+    assert first != summaries(np.where(last, 9, ids).astype(ids.dtype))
 
 
 @pytest.mark.mesh(devices=4)
