@@ -19,7 +19,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import cost, mosaic, resources
 
 LOG2E = math.log2(math.e)
 """`exp(z) = exp2(z log2(e))`: the scan's decays are exp2 of the rate scaled by it."""
@@ -173,49 +173,155 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     return (*outs, None) if not scan.entered else tuple(outs)
 
 
+def padding(family: mosaic.Family, columns: int, dtype) -> int:
+    """The elements each row of a shared tile `columns` wide of `dtype` pads by, so the family's load of
+    it in its accumulator's layout (`Family.tile_of`) reads every bank once a wavefront: a warp's lanes read
+    a row's fragment, as wide as the layout's last two-dimensional tile, and the rows one wavefront serves
+    then start a fragment's bytes apart modulo the banks' width (`cost.SHARED_BYTES_PER_CLOCK`). A tile
+    written a row at a traced token cannot be swizzled (Mosaic GPU's tiling takes no row index). Unpadded,
+    a 128-column fp32 tile's rows sat 512 bytes apart, on the same banks: 251M of the backward's 608M
+    shared-load wavefronts conflicted (an H100, mamba1-ncu-ref-h100-1d3b0f647)."""
+    fragment = next(tile for tile in reversed(family.layout.to_mgpu().tiling.tiles) if len(tile) == 2)[-1]
+    size = jnp.dtype(dtype).itemsize
+    return (fragment - columns) * size % cost.SHARED_BYTES_PER_CLOCK // size
+
+
 def group(scan: "Scan", streamed: int) -> int:
     """The states a backward chunk replays at once: the most, a power of two dividing the states, whose
-    per-token states `[C + 1, group, block]` fp32, one `[C * group, block]` tile of the cross-channel terms
-    and the tokens' two `[C, block]` gradients fit the family's shared memory beside the `streamed` bytes of
-    the chunk's streams. Each group replays the chunk once and sums its cross-channel terms twice
-    (`rows_summed`), so the fewer the groups, the fewer the replays and sums."""
-    per_state = (2 * scan.chunk + 1) * scan.block * 4
-    fixed = streamed + 2 * scan.chunk * scan.block * 4 + scan.block * 4
-    return max((size for size in (8, 4, 2, 1) if scan.states % size == 0
-                and fixed + size * per_state <= scan.family.most_shared), default=1)
+    per-token states `[C + 1, group, block]` fp32 and one `[2 C group, block]` tile of the channels' terms
+    (each token's and state's for the readout's and the write's gradients, its rows padded, `padding`), as
+    many rows as whole tiles of the accumulator's layout, fit a program's share of the family's shared
+    memory beside the chunk's streams (`streamed` bytes) and the tokens' two `[C, block]` gradients: two
+    programs' shares where any group fits them (a program's walk stalls on its own barriers alone), else
+    one's. The fewer the groups, the fewer the replays and sums."""
+    family, chunk, block = scan.family, scan.chunk, scan.block
+    rows = family.layout.to_mgpu().base_tile_shape[0]
+    terms = 2 * chunk * (block + padding(family, block, jnp.float32)) * 4
+    per_state = (chunk + 1) * block * 4 + terms
+    fixed = streamed + 2 * chunk * block * 4 + block * 4
+    held = [size for size in (8, 4, 2, 1) if scan.states % size == 0 and 2 * chunk * size % rows == 0]
+    for programs in (2, 1):
+        budget = resources.program_shared(family.most_shared, programs)
+        fitting = [size for size in held if fixed + size * per_state <= budget]
+        if fitting:
+            return max(fitting)
+    return min(held)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Chunk:
+    """A backward step's chunk: its streams' slots (`x`, `dt` `[C, block]`, `b`, `c` `[C, N]`, `dy`, and
+    the resets where the scan is packed), the program's rates, and its shared tiles: each token's kept states
+    `[C + 1, size, block]`, the channels' terms `[2 C size, block]` (the readout's rows, then the write's),
+    and the tokens' write and decay gradients' sums `[C, block]`."""
+
+    xs: object
+    dts: object
+    bs: object
+    cs: object
+    dys: object
+    resets: object
+    rates: list
+    kept: object
+    terms: object
+    writes: object
+    decays: object
+    size: int
+
+    @property
+    def chunk(self) -> int:
+        return self.xs.shape[0]
+
+    def row(self, ref, t) -> jax.Array:
+        """Token `t`'s row of a stream's slot, fp32."""
+        return ref[t, :].astype(jnp.float32)
+
+    def decay(self, t, n) -> jax.Array:
+        """Token `t`'s decay of state `n`, `exp2(dt rate)`, zero at a document's first token."""
+        kept = 1.0 if self.resets is None else 1.0 - self.resets[t, 0].astype(jnp.float32)
+        return jnp.exp2(self.row(self.dts, t) * self.rates[n]) * kept
+
+    def group(self, own: range, start: list, g: list, d_rates: list) -> tuple[list, list]:
+        """The group `own`'s states through the chunk from `start`, each token's kept and its readout's
+        terms `dy_t h_t` beside them, then walked back from the cotangents `g` leaving the chunk, `g_t = C_t
+        dy_t + a_{t+1} g_{t+1}` for the decay `a_t`: the write's terms `g_t w_t`, each token's write and decay
+        gradients' sums `sum_n g_t B_t` and `sum_n g_t h_{t-1} a_t rate`, and the rates' gradients `d_rates`
+        summed. Returns the cotangents entering the chunk and the rates' gradients."""
+        chunk, size = self.chunk, self.size
+
+        def replay(t, h):
+            written = self.row(self.dts, t) * self.row(self.xs, t)
+            out_grad = self.row(self.dys, t)
+            h = [self.decay(t, n) * h[i] + written * self.bs[t, n].astype(jnp.float32)
+                 for i, n in enumerate(own)]
+            for i in range(size):
+                self.kept[t + 1, i, :] = h[i]
+                self.terms[t * size + i, :] = out_grad * h[i]
+            return h
+
+        def back(i, carried):
+            g, d_rates = carried
+            t = chunk - 1 - i
+            step = self.row(self.dts, t)
+            written = step * self.row(self.xs, t)
+            out_grad = self.row(self.dys, t)
+            g = [g[j] + self.cs[t, n].astype(jnp.float32) * out_grad for j, n in enumerate(own)]
+            writes, decays = self.writes[t, :], self.decays[t, :]
+            for j, n in enumerate(own):
+                a = self.decay(t, n)
+                writes = writes + g[j] * self.bs[t, n].astype(jnp.float32)
+                through = g[j] * self.kept[t, j, :] * a
+                decays = decays + through * self.rates[n]
+                d_rates[j] = d_rates[j] + through * step
+                self.terms[(chunk + t) * size + j, :] = g[j] * written
+                g[j] = g[j] * a
+            self.writes[t, :] = writes
+            self.decays[t, :] = decays
+            return g, d_rates
+
+        # The entering state the replay's first row, each token's a row past it.
+        for i in range(size):
+            self.kept[0, i, :] = start[i]
+        lax.fori_loop(0, chunk, replay, start, unroll=UNROLLED)
+        return lax.fori_loop(0, chunk, back, (g, d_rates))
+
+    def tokens(self, skip, d_skip) -> jax.Array:
+        """Each token's write and decay gradients in place of their sums (`exp2(dt rate)`'s derivative in
+        `dt` is `rate ln(2)` times it), and the skip's gradient `d_skip` summed."""
+        def token(t, d_skip):
+            out_grad, value = self.row(self.dys, t), self.row(self.xs, t)
+            writes, decays = self.writes[t, :], self.decays[t, :]
+            self.writes[t, :] = skip * out_grad + writes * self.row(self.dts, t)
+            self.decays[t, :] = writes * value + decays * math.log(2.0)
+            return d_skip + out_grad * value
+
+        return lax.fori_loop(0, self.chunk, token, d_skip, unroll=UNROLLED)
 
 
 def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     """The scan's gradients from `forward`'s padded operands, its chunks' entering states `entered` `[R,
-    chunks, N, D]` fp32 and the output's and final state's cotangents `dy` `[R, T, D]`, `dfinal` `[R, N, D]`
-    fp32: `(dx, ddt [R, T, D], db, dc [R, blocks, chunks, N // size, C * size], dA [R, N, D], dD [R, 8,
-    D], dstate [R, N, D])`, fp32, `db` and `dc` each program's sum over its channels (the caller sums the
-    programs), `dA` and `dD` each row's. A program walks its row's chunks from the last, each a group of
-    `size` states at a time: it replays the group's states through the chunk from the chunk's entering state
-    (`entered`), each token's kept in shared memory, then walks them back, the state's cotangent `g` carried
-    from token to token and chunk to chunk: `g_t = C_t dy_t + a_{t+1} g_{t+1}` for the decay `a_t =
-    exp2(dt_t rate)` (zero at a document's first token), its channels' sums `dB_t = sum_c g_t w_t`, `dC_t =
-    sum_c dy_t h_t` through a shared tile summed across them, and the channel's own terms: the write's
-    `dw_t = sum_n g_t B_t`, the decay's `g_t h_{t-1} a_t`."""
+    chunks, N, D]` fp32 and the cotangents `dy` `[R, T, D]`, `dfinal` `[R, N, D]` fp32: `(dx, ddt [R, T, D],
+    sums [R, blocks, chunks, N // size, 2 C size], dA [R, N, D], dD [R, 8, D], dstate [R, N, D])`, fp32,
+    `sums` each program's channels' sums of the readout's terms, then the write's (the caller sums the
+    programs), `dA` and `dD` each row's. A program walks its row's chunks from the last, a group of `size`
+    states at a time (`group`, `_Chunk.group`), each group's entering states read from global memory a group
+    ahead; the rates, the skip and `dfinal` are read once into registers."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
     blocks = {"x": ((chunk, block), x.dtype), "dt": ((chunk, block), dt.dtype),
               "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype),
-              "dy": ((chunk, block), dy.dtype), "entering": ((states, block), jnp.float32)}
+              "dy": ((chunk, block), dy.dtype)}
     if scan.packed:
         blocks["resets"] = ((chunk, RESET_WIDTH), jnp.int8)
-    once = {"parameters": ((states + PARAMETER_ROWS, block), jnp.float32),
-            "leaving": ((states, block), jnp.float32)}
     # One stage of each stream: two put an H100's program past its shared memory beside the replay's tiles.
-    streamed = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in
-                   (*blocks.values(), *once.values()))
+    streamed = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
     size = group(scan, streamed)
     groups = states // size
-    streams = {"walked": family.streams(blocks, 1, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED)),
-               "once": family.streams(once, 1, 1, swizzles=dict.fromkeys(once, mosaic.UNSWIZZLED))}
+    pad = padding(family, block, jnp.float32)
+    streams = {"walked": family.streams(blocks, 1, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED))}
     shape = (scan.rows, scan.length, scan.channels)
-    partial = (scan.rows, scan.blocks, scan.chunks, groups, chunk * size)
+    partial = (scan.rows, scan.blocks, scan.chunks, groups, 2 * chunk * size)
     out_type = (jax.ShapeDtypeStruct(shape, jnp.float32), jax.ShapeDtypeStruct(shape, jnp.float32),
-                jax.ShapeDtypeStruct(partial, jnp.float32), jax.ShapeDtypeStruct(partial, jnp.float32),
+                jax.ShapeDtypeStruct(partial, jnp.float32),
                 jax.ShapeDtypeStruct((scan.rows, states, scan.channels), jnp.float32),
                 jax.ShapeDtypeStruct((scan.rows, PARAMETER_ROWS, scan.channels), jnp.float32),
                 jax.ShapeDtypeStruct((scan.rows, states, scan.channels), jnp.float32))
@@ -226,115 +332,63 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
         return chunks - 1 - i, 0
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, entered_ref, resets_ref, dy_ref, dfinal_ref,
-              dx_ref, ddt_ref, db_ref, dc_ref, da_ref, dd_ref, dstate_ref):
+              dx_ref, ddt_ref, sums_ref, da_ref, dd_ref, dstate_ref):
         row, part = lax.axis_index("rows"), lax.axis_index("blocks")
         columns = pl.ds(part * block, block)
         views = {"x": (x_ref.at[row, :, columns], reversed_steps),
                  "dt": (dt_ref.at[row, :, columns], reversed_steps),
                  "b": (b_ref.at[row], reversed_steps), "c": (c_ref.at[row], reversed_steps),
-                 "dy": (dy_ref.at[row, :, columns], reversed_steps),
-                 "entering": (entered_ref.at[row, :, columns], reversed_steps)}
+                 "dy": (dy_ref.at[row, :, columns], reversed_steps)}
         if scan.packed:
             views["resets"] = (resets_ref.at[row], reversed_steps)
-        once_views = {"parameters": (parameters_ref.at[:, columns], _down),
-                      "leaving": (dfinal_ref.at[row, :, columns], _down)}
 
         def body(staged, *, streams):
             kept_smem, summed_smem, writes_smem, decays_smem, vector_smem = staged
             walked = family.opened(streams["walked"], views)
-            given = family.opened(streams["once"], once_views)
+            terms = summed_smem.at[:, pl.ds(0, block)]
 
             def consumer(wg):
-                def taken(index, slots, carry, accumulators):
-                    del index, carry
-                    parameters, leaving = slots["parameters"], slots["leaving"]
-                    return ([parameters[n, :] for n in range(states)], parameters[states, :],
-                            [leaving[n, :] for n in range(states)]), accumulators
-
-                vector = jnp.zeros((block,), jnp.float32)
-                (rates, skip, g0), _ = family.walk(family.fed(given, once_views, 0, 1, wg), ((taken, 0, 1),),
-                                                   ([vector] * states, vector, [vector] * states), (),
-                                                   scan.interpret)
+                # Each row's channels; the padding's columns stay zero, which the sums add.
+                summed_smem[...] = jnp.zeros(summed_smem.shape, jnp.float32)
+                rates = [parameters_ref[n, columns] for n in range(states)]
+                skip = parameters_ref[states, columns]
+                g0 = [dfinal_ref[row, n, columns] for n in range(states)]
 
                 def step(index, slots, carry, accumulators):
                     g, d_rates, d_skip = carry
                     n_chunk = chunks - 1 - index
-                    xs, dts, bs, cs, dys, entering = (slots[name] for name in ("x", "dt", "b", "c", "dy",
-                                                                               "entering"))
-                    resets = slots["resets"] if scan.packed else None
+                    walk = _Chunk(*(slots[name] for name in ("x", "dt", "b", "c", "dy")),
+                                  slots["resets"] if scan.packed else None, rates, kept_smem, terms,
+                                  writes_smem, decays_smem, size)
                     writes_smem[...] = jnp.zeros(writes_smem.shape, jnp.float32)
                     decays_smem[...] = jnp.zeros(decays_smem.shape, jnp.float32)
 
-                    def decay(t, n):
-                        kept = 1.0 if resets is None else 1.0 - resets[t, 0].astype(jnp.float32)
-                        return jnp.exp2(dts[t, :].astype(jnp.float32) * rates[n]) * kept
+                    def entering(k):
+                        own = range(k * size, (k + 1) * size)
+                        return [entered_ref[row, n_chunk, n, columns] for n in own]
 
+                    # The next group's entering states read while this one replays and walks back.
+                    ahead = entering(0)
                     for k in range(groups):
                         own = range(k * size, (k + 1) * size)
-
-                        def replay(t, h, own=own):
-                            # The group's states through the chunk from its entering one, each token's kept;
-                            # the outputs' terms `dy_t h_t` beside them for the states' sums.
-                            written = dts[t, :].astype(jnp.float32) * xs[t, :].astype(jnp.float32)
-                            out_grad = dys[t, :].astype(jnp.float32)
-                            h = [decay(t, n) * h[i] + written * bs[t, n].astype(jnp.float32)
-                                 for i, n in enumerate(own)]
-                            for i in range(size):
-                                kept_smem[t + 1, i, :] = h[i]
-                                summed_smem[t * size + i, :] = out_grad * h[i]
-                            return h
-
-                        # The entering state the replay's first row, each token's a row past it.
-                        for i, n in enumerate(own):
-                            kept_smem[0, i, :] = entering[n, :]
-                        lax.fori_loop(0, chunk, replay, [entering[n, :] for n in own], unroll=UNROLLED)
-                        family.rows_summed(summed_smem, dc_ref.at[row, part, n_chunk, k])
-
-                        def back(i, carried, own=own):
-                            g_own, d_rates_own = carried
-                            t = chunk - 1 - i
-                            written = dts[t, :].astype(jnp.float32) * xs[t, :].astype(jnp.float32)
-                            out_grad = dys[t, :].astype(jnp.float32)
-                            step_ = dts[t, :].astype(jnp.float32)
-                            g_own = [g_own[j] + cs[t, n].astype(jnp.float32) * out_grad
-                                     for j, n in enumerate(own)]
-                            writes = writes_smem[t, :]
-                            decays = decays_smem[t, :]
-                            for j, n in enumerate(own):
-                                before = kept_smem[t, j, :]
-                                a = decay(t, n)
-                                writes = writes + g_own[j] * bs[t, n].astype(jnp.float32)
-                                through = g_own[j] * before * a
-                                decays = decays + through * rates[n]
-                                d_rates_own[j] = d_rates_own[j] + through * step_
-                                summed_smem[t * size + j, :] = g_own[j] * written
-                                g_own[j] = g_own[j] * a
-                            writes_smem[t, :] = writes
-                            decays_smem[t, :] = decays
-                            return g_own, d_rates_own
-
-                        g_own, d_own = lax.fori_loop(0, chunk, back, ([g[n] for n in own],
-                                                                     [d_rates[n] for n in own]))
+                        start = ahead
+                        if k + 1 < groups:
+                            ahead = entering(k + 1)
+                        g_own, d_own = walk.group(own, start, [g[n] for n in own],
+                                                  [d_rates[n] for n in own])
                         for j, n in enumerate(own):
                             g[n], d_rates[n] = g_own[j], d_own[j]
-                        family.rows_summed(summed_smem, db_ref.at[row, part, n_chunk, k])
+                        # The group's readout's and write's terms summed over the channels at once.
+                        sums = family.tile_of(summed_smem).sum(axis=1)
+                        plgpu.store(sums_ref.at[row, part, n_chunk, k], sums, optimized=False)
 
-                    def tokens(t, d_skip):
-                        out_grad = dys[t, :].astype(jnp.float32)
-                        value = xs[t, :].astype(jnp.float32)
-                        writes, decays = writes_smem[t, :], decays_smem[t, :]
-                        # Each token's gradients in place of its sums: `exp2(dt rate)`'s derivative in `dt` is
-                        # `rate ln(2)` times it.
-                        writes_smem[t, :] = skip * out_grad + writes * dts[t, :].astype(jnp.float32)
-                        decays_smem[t, :] = writes * value + decays * math.log(2.0)
-                        return d_skip + out_grad * value
-
-                    d_skip = lax.fori_loop(0, chunk, tokens, d_skip, unroll=UNROLLED)
+                    d_skip = walk.tokens(skip, d_skip)
                     span = pl.ds(n_chunk * chunk, chunk)
                     family.stored([writes_smem[...]], [dx_ref.at[row, span, columns]], smem=writes_smem)
                     family.stored([decays_smem[...]], [ddt_ref.at[row, span, columns]], smem=decays_smem)
                     return (g, d_rates, d_skip), accumulators
 
+                vector = jnp.zeros((block,), jnp.float32)
                 carry = (list(g0), [vector] * states, vector)
                 (g, d_rates, d_skip), _ = family.walk(family.fed(walked, views, 0, chunks, wg),
                                                       ((step, 0, chunks),), carry, (), scan.interpret)
@@ -347,13 +401,12 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 family.store_wait(0)
 
             def producer():
-                family.stream(given, once_views, 0, 1)
                 family.stream(walked, views, 0, chunks)
 
             family.roles(1, consumer, producer)
 
         allocations = (plgpu.SMEM((chunk + 1, size, block), jnp.float32),
-                       plgpu.SMEM((chunk * size, block), jnp.float32),
+                       plgpu.SMEM((2 * chunk * size, block + pad), jnp.float32),
                        plgpu.SMEM((chunk, block), jnp.float32), plgpu.SMEM((chunk, block), jnp.float32),
                        plgpu.SMEM((block,), jnp.float32))
         family.scoped(body, allocations, streams=streams)
@@ -362,10 +415,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     launched = family.kernel(entry, out_type=out_type, grid=(scan.rows, scan.blocks),
                              grid_names=("rows", "blocks"), consumers=1, interpret=scan.interpret,
                              name="selective_scan_backward")
-    # Each chunk's entering state a `[N, D]` block of a row's rows, as a stream steps them.
-    laid = entered.reshape(scan.rows, chunks * states, scan.channels)
-    return launched(x, dt, b, c, parameters, laid, resets, dy, dfinal)
-
+    return launched(x, dt, b, c, parameters, entered, resets, dy, dfinal)
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
@@ -413,8 +463,11 @@ def _scan_forward(x, dt, A, B, C, D, entering, resets, scan: Scan):
 def _scan_backward(scan: Scan, residuals, grads):
     x, dt, A, B, C, D, entered, resets = residuals
     dy, dfinal = grads
-    dx, ddt, db, dc, da, dd, dstate = backward(x, dt, B, C, _parameters(A, D, scan.channels), entered, resets,
-                                               dy.astype(x.dtype), dfinal.astype(jnp.float32), scan)
+    dx, ddt, sums, da, dd, dstate = backward(x, dt, B, C, _parameters(A, D, scan.channels), entered, resets,
+                                             dy.astype(x.dtype), dfinal.astype(jnp.float32), scan)
+    # Each group's readout's terms, then its write's.
+    half = sums.shape[-1] // 2
+    dc, db = sums[..., :half], sums[..., half:]
 
     def laid(partial):
         """Each program's `[chunks, N // size, C * size]` sums over its channels, summed over the programs,
