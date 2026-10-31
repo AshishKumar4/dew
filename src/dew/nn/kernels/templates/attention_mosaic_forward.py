@@ -33,13 +33,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import (
-    attention_algebra as algebra,
-    attention_portable,
-    mosaic,
-    report,
-    resources,
-)
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, resources
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -652,23 +646,22 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
                      peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
                      counted=counted, finishes=finishes, target=generation.gpu_target(),
-                     names=(name, report.named(name)))
+                     name=name)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "names"))
+                      "counted", "finishes", "target", "name"))
 def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
-              names: tuple[str, str | None]):
+              name: str):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
     and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
-    `names` its name and the one its trace reports (`report.named`)."""
+    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it)."""
     del target
     leaves, treedef = jax.tree.flatten(read)
-    name, kernel_name = names
     batch, queries, heads, width = query.shape
     keys_count, kv_heads = key.shape[1], key.shape[2]
     group, consumers = heads // kv_heads, tiles.consumers
@@ -760,6 +753,6 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
-                         approx_math=approx_math, name=name, kernel_name=kernel_name, cost=cost,
+                         approx_math=approx_math, name=name, cost=cost,
                          reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod)
                          )(query, key, value, *leaves)

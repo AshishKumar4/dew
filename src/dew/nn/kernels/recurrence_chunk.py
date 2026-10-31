@@ -1459,9 +1459,14 @@ _STRIDED_CP_ASYNC = ("mma.sync's streams copy a block untiled by cp.async, which
                      "row read the wrong rows (cp-async-alone4-h100-3674febe1, before the fix the jax fork "
                      "ships in post42)")
 
+_UNGATED = ("the template's selective scan has no gate of its own yet: no per-shard lowering, no mixer "
+            "parity at the mixer's fp32 operands, no GPU cell, no stability regimes (row 2968)")
+
 SELECTIVE_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('mma.sync', 'forward'): ('xla', _STRIDED_CP_ASYNC),
     ('mma.sync', 'training'): ('xla', _STRIDED_CP_ASYNC),
+    ('wgmma', 'forward'): ('xla', _UNGATED),
+    ('wgmma', 'training'): ('xla', _UNGATED),
 }
 """The cells, each an instruction family and a product (`SelectiveCase.cell`), where the selective scan
 runs the portable math though the template takes the call, each with its reason: the selector runs

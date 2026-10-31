@@ -207,7 +207,7 @@ class Mma(mosaic.Family):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0, kernel_name: str | None = None) -> Callable:
+               reducing_warpgroups: int = 0) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups
@@ -215,8 +215,7 @@ class Mma(mosaic.Family):
         built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                              compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                              interpret=mosaic.interpreted(interpret),
-                             kernel_name=report.named(name) if kernel_name is None else kernel_name,
-                             cost_estimate=cost)
+                             kernel_name=report.named(name), cost_estimate=cost)
         return mosaic.checked(built, name or self.name)
 
     def scoped(self, body, *allocations, streams):

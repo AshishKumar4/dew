@@ -155,7 +155,13 @@ def named(name: str | None) -> str | None:
     """A kernel's name carrying the launch tracing it (`launching`; `kernel` for an unnamed one), as is
     where none is."""
     digest = launch_digest()
-    return name if digest is None else f"{name or 'kernel'}__l{digest}"
+    return name if digest is None else launch_name(name or "kernel", digest)
+
+
+def launch_name(kernel: str, launch: str | None) -> str:
+    """`kernel`'s name carrying `launch`'s digest (`LAUNCH_SUFFIX`), as is where None: `kernel_of`'s
+    inverse."""
+    return kernel if launch is None else f"{kernel}__l{launch}"
 
 
 def launch_digest() -> str | None:

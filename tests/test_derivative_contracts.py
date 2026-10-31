@@ -22,8 +22,9 @@ from dew.nn import attention, categorical, kv_cache, precision
 from dew.nn.activations import exact_gelu
 from dew.nn.blocks import table_rows
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
+from dew.nn.kernels.templates import mosaic_sm90
 from dew.nn.kernels.templates.gemm import template
-from dew.nn.kernels.templates.recurrence import mainloop
+from dew.nn.kernels.templates.recurrence import mainloop, selective
 from dew.nn.protocols import OutputTable
 from dew.objectives import base, residuals
 from dew.objectives.lm import chunked
@@ -960,6 +961,34 @@ def test_the_template_rule_holds_its_orders(edge):
 
     assert_contract(rule, primals, direction, cotangent, f"the template rule {edge}", truth_fn=recurrent,
                     plain_fn=recurrent, without=REVERSE_ONLY)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_selective_scan_holds_its_orders(edge):
+    """Mamba's selective scan on the recurrence template (`selective.selective_scan`, a custom VJP over its
+    forward and backward launches, interpreted off a GPU by the wgmma bundle), fp32 over one block of 128
+    channels and 16 states from no state: the primal and reverse derivative of its output finite wherever
+    float64 is a normal float32 and the portable scan is (`dew.nn.mixers.mamba.selective_scan`, in float64
+    the truth), at inputs and skips scaled to the edge. Forward mode and reverse over reverse do not run
+    (`REVERSE_ONLY`, ledger 2655)."""
+    from dew.nn.mixers.mamba import selective_scan as portable
+
+    scale = EDGES[edge]
+    x, dt, a, b, c, skip = normal_draw(2977, (1, 64, 128), (1, 64, 128), (128, 16), (1, 64, 16), (1, 64, 16),
+                                       (128,))
+    primals = (x * scale, jax.nn.softplus(dt - 3.0), -jnp.exp(0.5 * a), b, c, skip)
+    drawn = normal_draw(2978, *(operand.shape for operand in primals))
+    direction = (drawn[0] * scale, *drawn[1:])
+    (cotangent,) = normal_draw(2979, x.shape)
+
+    def scanned(*operands):
+        return selective.selective_scan(*operands, family=mosaic_sm90.WGMMA, interpret=INTERPRETED)[0]
+
+    def plain(*operands):
+        return portable(*operands, None, None, chunk_size=32)[0]
+
+    assert_contract(scanned, primals, direction, cotangent, f"the selective scan {edge}", truth_fn=plain,
+                    plain_fn=plain, without=REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)

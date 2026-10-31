@@ -166,6 +166,41 @@ def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_
     assert (flops.hardware, flops.unsized) == (sum(entry["flops"] for entry in templated), unstated)
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(generation):
+    """A grouped GEMM's forward in a while loop of no trips, its counter counting from 0 while below 0: the
+    template's kernels, lowered once in a function of their own (`tuning.lowered_once`), which JAX lowers
+    and compiles, so the compile gate's inventory holds them (`kernel_calls(..., unrun=True)`), and which
+    launch none, so the kernel report and the FLOP count leave them out alike, the step's Triton kernel its
+    one launch (2958's review: a kernel of no runs once turned a live kernel's stated FLOPs unknown)."""
+    from dew.nn.kernels.templates.gemm import template
+    from dew.telemetry.instrumentation import hlo_flops
+    from dew.training._lowering import kernel_calls
+
+    def step(x, w, sizes):
+        def body(carry):
+            trip, total = carry
+            product = template.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            return trip + 1, total + product
+
+        _, total = jax.lax.while_loop(lambda carry: carry[0] < 0, body, (jnp.int32(0), jnp.float32(0)))
+        return total, _doubled(x)
+
+    x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+        lowered = jax.jit(step).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
+    assert any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered, unrun=True))
+    assert not any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered))
+    record = kernel_report(found, lowered).record()
+    assert not templated_calls(record)
+    assert triton_kernels(lowered) == {"doubled": 1}
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None and flops.hardware == 0
+    assert record["unsized"] == flops.unsized
+
+
 def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
     """A function's runs from the entry (`instrumentation.call_weights`) take nothing from a call that runs
     none: one in a loop of no trips inside a function of unknown runs (a loop of no static count around
