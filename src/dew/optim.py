@@ -214,7 +214,13 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
     head's block orthogonalized and scaled alone (Kimi K3's per-head Muon, arXiv 2607.24653 2.5);
     `ns_coeffs="polar_express"`, Polar Express's coefficients (`polar_express`); and `neuron_beta2`,
     NorMuon's neuron-wise normalization of the orthogonal update at that second-moment decay
-    (`scale_by_neuron_norm`)."""
+    (`scale_by_neuron_norm`).
+
+    Its Newton-Schulz costs once an update, whatever its microbatches, so it is timed per update: a
+    Qwen3.5-4B decision fine-tune on one H100 at 65536 tokens an update, eight microbatches accumulated,
+    steps in 469 ms against AdamW's 466 (0.6% over, the bfloat16 iteration); at 8192 tokens, one
+    microbatch an update, in 844 ms against 495 (1.71x), the iteration's cost undivided (node job
+    LR-h100-muon-2752c at 699d038ca; `ns_operands` holds each precision's; ledger 2637, 2685, 2752)."""
     def labels(params):
         return jax.tree.map(lambda numbers: "adam" if numbers is None else "muon",
                             muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
