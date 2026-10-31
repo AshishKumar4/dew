@@ -146,6 +146,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
     read = walk.places_read(masked=True)
+    fused = add_dq is not None
     if rows_of is None:
         # Streamed (a shared dQ's): its queries `CHUNK_QUERIES` at a time, each chunk's statistics and places
         # read from their stages where it weighs them.
@@ -161,28 +162,28 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
             entries = slice(start, start + CHUNK_QUERIES)
             rows = tuple(functools.partial(stage_of, name) for name in STATISTICS)
             chunks.append(_weighed(walk, coords, params_of(q_first + start, s[:, entries]), s[:, entries],
-                                   dp[:, entries], rows, do_slot.dtype))
+                                   dp[:, entries], rows, (do_slot.dtype, q_slot.dtype), one_part=fused))
         narrowed, logits, pieces = _joined(chunks, kinds)
     else:
         coords = coords_of(q_first, shape=shape, read=read)
         rows = rows_of(q_first, count)
-        narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s), s, dp, rows, do_slot.dtype)
+        narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s), s, dp, rows,
+                                            (do_slot.dtype, q_slot.dtype), one_part=fused)
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
     dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
-    if add_dq is None:
+    if not fused:
         # Each part formed as its product is issued (`algebra.formed_parts`).
         parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
         dk_acc = family.register_products(dk_acc, parts, q_columns, walk.interpret)
     else:
-        # The fused launch's (the fast form's one part): dK's left operand from the registers, and staged,
-        # its transpose dQ's (`algebra.cotangent_product`'s `a @ b`), the tile's dQ added into dQ, the
-        # query tile's other key blocks adding theirs (`_fused_adds`); a consumer's share of a 128-query
-        # slot is 64 rows, warpgroup MMA's least (`MosaicBackward.legal`).
-        ((part_tile, _),) = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=False)
-        dk_acc = family.register_products(dk_acc, ((part_tile, None),), q_columns, walk.interpret)
-        add_dq(part_tile, q_first)
+        # The fused launch's (the fast form's one part, `_weighed`'s): dK's left operand from the registers,
+        # and staged, its transpose dQ's (`algebra.cotangent_product`'s `a @ b`), the tile's dQ added into
+        # dQ, the query tile's other key blocks adding theirs (`_fused_adds`); a consumer's share of a
+        # 128-query slot is 64 rows, warpgroup MMA's least (`MosaicBackward.legal`).
+        dk_acc = family.register_products(dk_acc, ((logits, None),), q_columns, walk.interpret)
+        add_dq(logits, q_first)
     if _grading(shares):
         store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
         key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
@@ -197,17 +198,24 @@ elementwise stage (the shared dQ at 64 x 64, width 128, ptxas 12.9's SASS: 278 r
 walk."""
 
 
-def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtype) -> tuple:
-    """A keys-first tile's, or a chunk of its queries': its weights narrowed for dV in `dtype`
-    (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them undropped),
-    its pulled score cotangents and its hook's pieces (`algebra.pulled`), from its products `s` and `dp`
-    under its queries' statistics `rows`, its coordinates and its hook's parameters (`_scores`)."""
+def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
+             one_part: bool) -> tuple:
+    """A keys-first tile's, or a chunk of its queries': its weights narrowed for dV in the output cotangents'
+    dtype (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them
+    undropped), its pulled score cotangents and its hook's pieces (`algebra.pulled`), from its products `s`
+    and `dp` under its queries' statistics `rows`, its coordinates and its hook's parameters (`_scores`);
+    the cotangents the fast form's one part in the queries' dtype where the launch takes it from the
+    registers (`one_part`, the fused launch's), narrowed as they are formed: a chunk's at a time, the whole
+    tile's fp32 not held to the last chunk."""
+    values, queries = dtypes
     exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows, masked=True)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
+    if one_part:
+        ((logits, _),) = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     if multiplier is not None:
         exponentials, weights = exponentials * multiplier, weights * multiplier
-    return algebra.value_weights(exponentials, weights, dtype, multiplier is not None), logits, pieces
+    return algebra.value_weights(exponentials, weights, values, multiplier is not None), logits, pieces
 
 
 def _joined(chunks: list, kinds: tuple[Kind, ...]) -> tuple:
