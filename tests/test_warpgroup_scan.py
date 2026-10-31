@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
+from reference_error import assert_fp32_reduction_bound
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, scan
@@ -67,17 +68,17 @@ def _walked(decays, writes, reverse: bool, exclusive: bool) -> tuple[np.ndarray,
 
 
 def _assert_walked(found, decays, writes, reverse: bool, exclusive: bool) -> None:
-    """The kernel's states, last state and sum within an fp32 scan's rounding of the walk's: each one's
-    error against the largest state's size (the writes' largest for the sum), which a sum of `T` fp32
-    products of decays below one keeps under `T` roundings."""
-    states, (last,), (total,) = (np.asarray(x, np.float64) for x in found)
+    """The kernel's states, last state and sum within an fp32 reduction's bound of the walk's
+    (`assert_fp32_reduction_bound`): a state sums at most `T` products of writes and decays below one, so
+    the largest state's size bounds each one's terms, and the sum's terms are the writes'."""
+    states, last, total = (np.asarray(x, np.float64) for x in found)
     truth, past = _walked(decays, writes, reverse, exclusive)
-    rounding = len(truth) * np.finfo(np.float32).eps
     size = max(np.abs(truth).max(), abs(past))
-    np.testing.assert_array_less(np.abs(states - truth), rounding * size)
-    np.testing.assert_array_less(np.abs(last - past), rounding * size)
+    positions = len(truth)
+    assert_fp32_reduction_bound(states, truth, np.full_like(truth, size), positions)
+    assert_fp32_reduction_bound(last, [past], [size], positions)
     b = np.asarray(writes, np.float64)
-    np.testing.assert_array_less(np.abs(total - b.sum()), rounding * np.abs(b).sum())
+    assert_fp32_reduction_bound(total, [b.sum()], [np.abs(b).sum()], positions)
 
 
 @pytest.mark.parametrize("exclusive", [False, True])

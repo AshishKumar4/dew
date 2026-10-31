@@ -14,10 +14,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith, memref, nvvm, vector
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax.experimental.mosaic.gpu import fragmented_array as fa, utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend.mlir import ir
 
 THREADS = 128
 """A warpgroup's threads, a block's positions spread over them."""
@@ -26,7 +27,7 @@ WARP = 32
 """A warp's threads, whose aggregates a shuffle combines."""
 
 
-def blocked(positions: int) -> plgpu.Layout:
+def blocked(positions: int) -> plgpu_core.SomeLayout:
     """The layout a block of `positions` takes for its scan: each of the warpgroup's threads its
     `positions // THREADS` consecutive positions, the first thread's the first."""
     if positions % THREADS:
@@ -34,7 +35,7 @@ def blocked(positions: int) -> plgpu.Layout:
     return plgpu.Layout.WG_STRIDED((positions,), vec_size=positions // THREADS)
 
 
-def scratch() -> plgpu.SMEM:
+def scratch():
     """The shared memory a scan's warps exchange their aggregates through: a decay and a write each warp."""
     return plgpu.SMEM((2, THREADS // WARP), jnp.float32)
 
@@ -64,13 +65,13 @@ BANKS = 32
 """Shared memory's banks, a 4-byte word each (`cost.SHARED_BYTES_PER_CLOCK`'s 128 bytes a clock)."""
 
 
-def striped(positions: int) -> plgpu.Layout:
+def striped(positions: int) -> plgpu_core.SomeLayout:
     """The layout a block of `positions` takes across the threads: position `t + 128 i` thread `t`'s `i`-th,
     a warp's threads adjacent at each step, as a coalesced global access takes them."""
     return plgpu.Layout.WG_STRIDED((positions,), vec_size=1)
 
 
-def exchange_scratch(positions: int) -> plgpu.SMEM:
+def exchange_scratch(positions: int):
     """The shared memory `to_striped` takes for a block of `positions`: a word each and one more each
     `BANKS`, so no two threads of a warp store or load the same bank at once (cub's padded BlockExchange)."""
     return plgpu.SMEM((positions + positions // BANKS,), jnp.float32)
