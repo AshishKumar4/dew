@@ -353,7 +353,8 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     10,000 updates, and the cloned and the final agents' first drones filmed (cloned.npz, video.npz), each
     on an evaluation race of its own, on the training families and, held out, the others. Without
     `highlight` the next gate is not lit and the courses are loops alone (a comparison). Every race is at the
-    curriculum's `level` (its courses' difficulty and its drones' randomization), the teacher's. Each drone
+    curriculum's `level` (its courses' difficulty and its drones' randomization), the teacher's, which the
+    online phase raises as the teacher's curriculum did (`teacher`) toward 1. Each drone
     flies `demonstration_seconds` for the demonstrations; the agent flies `environment_seconds` online over
     all its drones (FlyDreamer's 1M steps at 30 Hz); the replay holds `capacity_seconds` a drone (16 GB of
     96-pixel images over 16 drones at 60 Hz). Every `saved_every` updates of either phase (about ten minutes
@@ -428,6 +429,11 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     online = progress["updates"] if progress["phase"] == "online" else 0
     if online:
         agent.variables = _resumed(out, agent, progress["world"])
+    # The online curriculum goes on from the teacher's level, as the teacher's did: up a tenth, to 1, at each
+    # score whose crashes fall under a third, its every race's courses and drones drawn at it.
+    level = progress.get("level", level)
+    for raced_now in (simulator, judged, held_out):
+        raced_now.difficulty = raced_now.ramp = level
     rollout = DreamerRollout(agent, simulator, batch=16, length=length, train_ratio=128.0, replay=replay)
     trainer = Trainer(agent, laprop(), key=jax.random.key(8 + online), rollout=rollout)
     updates = int(environment_seconds * hz * rollout.train_ratio / (rollout.batch * rollout.length))
@@ -438,15 +444,19 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
         chunk = min(saved_every, updates - done, 10_000 - done % 10_000)
         state = trainer.fit(_idle(), steps=int(state.step) + chunk, log_every=1000, state=state)
         done += chunk
-        progress = _saved(out, progress, "online", done, state.variables)
+        progress = _saved(out, {**progress, "level": level}, "online", done, state.variables)
         if done % 10_000 and done < updates:
             continue
-        point = {"updates": done, "environment_steps": rollout.environment_steps,
+        point = {"updates": done, "environment_steps": rollout.environment_steps, "level": level,
                  "seconds": time.perf_counter() - began, "episode_return": rollout.metrics["episode_return"],
                  **judge(agent.act, state.variables, agent.memory(drones), jax.random.key(done))}
         report["online"].append(point)
         print(json.dumps(point), flush=True)
         _written(out / "world.json", json.dumps(report, indent=1))
+        if point["crashed"] < 1 / 3 and level < 1.0:
+            level = round(min(1.0, level + 0.1), 1)
+            for raced_now in (simulator, judged, held_out):
+                raced_now.difficulty = raced_now.ramp = level
     (out / "world.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
     report["online_agent"] = judge(agent.act, state.variables, agent.memory(drones), jax.random.key(9),
                                    film=out / "video.npz")
