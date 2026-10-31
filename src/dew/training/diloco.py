@@ -35,9 +35,6 @@ from dew.optim import learning_rate
 from dew.state import REPLICA_FIELDS, Replicas, TrainState
 from dew.training.transaction import cleared, example_groups, window_dropped
 
-__all__ = ["DiLoCo", "dropped", "group_of", "grouped", "learning_rate_of", "on_groups", "rated", "rates_set",
-           "regrouped", "shared_by_groups", "windowed"]
-
 
 @dataclasses.dataclass(frozen=True)
 class DiLoCo:
