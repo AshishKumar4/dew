@@ -257,7 +257,8 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
 
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
     """`--trainer.compile-ahead.frontier` (`RunConfig.cli`) asks the step compiled ahead for its frontier,
-    which its saved plan records (row 3108): each rung above the plan at fewer microbatches that fits."""
+    which its saved plan records (rows 3108, 3147): on GPUs of 0.0007 GiB, where the plan needs two
+    microbatches, a rung above it that fits at one."""
     from run_kinds import lm
 
     from dew.config.lm import LMRunConfig
@@ -267,13 +268,15 @@ def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_sa
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
                            "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
                            "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
-                           "--trainer.compile-ahead.capacity-gib", "1", "--trainer.compile-ahead.frontier"],
+                           "--trainer.compile-ahead.capacity-gib", "0.0007",
+                           "--trainer.compile-ahead.frontier"],
                           default=lm(tmp_path, drawn=False))
     with pytest.raises(CompiledAhead) as ended:
         run.run()
     assert ended.value.code == 0
     plan = record(AheadOfTime.load(path).plan, "plan")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    assert plan["split"] == 2 and frontier
     assert all(entry["fits"] is True and entry["split"] < plan["split"] for entry in frontier)
 
 
