@@ -15,6 +15,7 @@ driver decides when an ended episode restarts: `simulator_rollout` restarts it a
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Protocol, runtime_checkable
 
 import jax
@@ -73,6 +74,20 @@ def chosen(mask: jax.Array, new: Any, old: Any) -> Any:  # noqa: ANN401
     return jax.tree.map(pick, new, old)
 
 
+def device_of(tree: Any) -> jax.Device:  # noqa: ANN401
+    """The device a simulator's arrays are on, its first leaf's."""
+    return next(iter(jax.tree.leaves(tree)[0].devices()))
+
+
+@functools.partial(jax.jit, static_argnums=0)
+def _acted(policy: Policy, params: Params, carry: Carry) -> tuple[jax.Array, Any, Any, jax.Array]:
+    """A policy's step from a rollout's carry, compiled once for each policy: its action, extras and
+    memory, and the carry's next key."""
+    key, act_key = jax.random.split(carry.key)
+    action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
+    return action, extras, memory, key
+
+
 def simulator_start(simulator: Simulator, key: jax.Array, memory: Any = None) -> Carry:  # noqa: ANN401
     """A rollout's carry at fresh episodes of `simulator`: its first observations, seeded from `key`,
     and the policy's `memory` as it starts."""
@@ -90,18 +105,10 @@ def simulator_rollout(simulator: Simulator, policy: Policy, params: Params, carr
     its transition keeping the observation it ended at; a simulator that restarts its episodes itself
     (`DrivenSimulator`) passes False. The policy acts on the device the simulator's arrays are on, its
     `params` and `carry` put there (a no-op where they already are)."""
-    device = next(iter(jax.tree.leaves(carry.observation)[0].devices()))
-    params, carry = jax.device_put((params, carry), device)
-
-    @jax.jit
-    def act(carry: Carry) -> tuple[jax.Array, Any, Any, jax.Array]:
-        key, act_key = jax.random.split(carry.key)
-        action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
-        return action, extras, memory, key
-
+    params, carry = jax.device_put((params, carry), device_of(carry.observation))
     recorded = []
     for _ in range(steps):
-        action, extras, memory, key = act(carry)
+        action, extras, memory, key = _acted(policy, params, carry)
         following = received(simulator.step(action))
         following = TimeStep(following.observation, following.reward, following.terminated.astype(bool),
                              following.truncated.astype(bool))
@@ -151,5 +158,5 @@ def rollout_start(env: Env | Simulator, key: jax.Array, memory: Any = None) -> C
     return simulator_start(env, key, memory) if isinstance(env, Simulator) else start(env, key, memory)
 
 
-__all__ = ["Arrays", "DrivenSimulator", "Simulator", "chosen", "received", "rollout_start",
+__all__ = ["Arrays", "DrivenSimulator", "Simulator", "chosen", "device_of", "received", "rollout_start",
            "simulator_rollout", "simulator_start"]

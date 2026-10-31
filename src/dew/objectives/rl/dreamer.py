@@ -49,7 +49,7 @@ from dew.rl.distributions import (
 )
 from dew.rl.env import Carry, Driven, Env, Observation, TimeStep, Transition, env_rollout, start
 from dew.rl.replay import ReplayBuffer
-from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
+from dew.rl.simulator import DrivenSimulator, Simulator, device_of, simulator_rollout, simulator_start
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -717,12 +717,14 @@ class DreamerRollout:
         """The steps every environment has taken so far, summed."""
         return self._taken
 
-    def _policy(self, random: bool) -> Callable:
-        def uniform(params, observed, key, memory):
-            shape = (observed["reward"].shape[0], self.env.action_size)
-            return jax.random.uniform(key, shape, minval=-1, maxval=1), {}, memory
+    def _uniform(self, params: Variables, observed: Mapping[str, jax.Array], key: jax.Array,
+                 memory: tuple) -> tuple[jax.Array, dict, tuple]:
+        """The prefill's policy: actions uniform in [-1, 1]."""
+        shape = (observed["reward"].shape[0], self.env.action_size)
+        return jax.random.uniform(key, shape, minval=-1, maxval=1), {}, memory
 
-        return uniform if random else self.objective.act
+    def _policy(self, random: bool) -> Callable:
+        return self._uniform if random else self.objective.act
 
     def _kept(self, replay: ReplayBuffer, returns: jax.Array,
               recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
@@ -766,7 +768,10 @@ class DreamerRollout:
         return self.sample(sample_key)
 
     def sample(self, key: jax.Array) -> Batch:
-        """`batch` windows of `length` steps drawn from the replay as an update draws them."""
+        """`batch` windows of `length` steps drawn from the replay as an update draws them; a simulator's
+        replay is on its device, where the key is put."""
+        if isinstance(self.env, Simulator):
+            key = jax.device_put(key, device_of(self._replay.data))
         return jax.device_get(self._sample(self._replay, key))
 
     def _advance(self, variables: Variables, steps: int, *, random: bool) -> None:
