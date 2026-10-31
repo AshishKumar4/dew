@@ -85,6 +85,40 @@ class Target:
         return x, TimeStep(x[None], -jnp.square(x - 1), jnp.abs(x) > 3, jnp.zeros((), bool))
 
 
+@struct.dataclass
+class SharedTarget:
+    """`Target`, its state holding its point twice, one array in two fields (as a Playground state holds
+    one zero in several)."""
+
+    action_size: int = struct.field(pytree_node=False, default=1)
+
+    def reset(self, key):
+        x, step = Target().reset(key)
+        return {"x": x, "again": x}, step
+
+    def step(self, state, action):
+        x, step = Target().step(state["x"], action)
+        return {"x": x, "again": x}, step
+
+
+def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
+    """A Dreamer rollout donates its live state to the steps that advance it, each buffer once, so it runs
+    over an environment whose state holds one array in two fields: three updates at a train ratio of 32 over
+    windows of 16 in batches of 8 take the prefill and exactly the steps they owe."""
+    from dew.data.dataset import Loader
+    from dew.training import Trainer
+
+    env = Batched(TimeLimit(SharedTarget(), episode_length=20), 8)
+    objective = DreamerV3Objective(tiny())
+    rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
+    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
+                  records=8, batch=8)
+    trainer.fit(data, steps=3, log_every=3)
+    owed = -(-3 * 8 * 16 // 32)
+    assert rollout.environment_steps == 8 * 24 + 8 * -(-owed // 8)
+
+
 def test_a_driver_records_an_episodes_last_observation_then_restarts():
     """Driven answers each step whole: an episode's last observation is a step of its own, `last`,
     with the reward that came with it, and the step after it, whatever the action, starts the next

@@ -825,7 +825,9 @@ class DreamerRollout:
         """Every environment's first episode begun, and the replay: the one given, or a fresh one the
         prefill fills."""
         count = self.env.count if isinstance(self.env, Simulator) else self.env.reset(key)[1].reward.shape[0]
-        carry = self._begin(key, self.objective.memory(count))
+        # The live state is donated to the steps that advance it, each buffer once, so each leaf gets a buffer
+        # of its own: an environment's state may hold one array in two of its fields (Playground's do).
+        carry = jax.tree.map(jnp.copy, self._begin(key, self.objective.memory(count)))
         returns = jnp.zeros(count)
         if self.replay is not None:
             return _Live(carry, self.replay, returns)
