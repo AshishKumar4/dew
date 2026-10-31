@@ -2104,3 +2104,56 @@ def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_ty
 
     over, unresolved, stage = _staged(drawn, 32, "over later")
     assert stage == 2 and [finding.leaf for finding in over] == ["over laterleaf"] and not unresolved
+
+
+def stacked_examples(seed):
+    """A draw of 16 examples whose two arms round apart, each example its own heavy-tailed scale (lognormal,
+    sigma 3, shared by the arms) and each arm's own rounding's size on it (lognormal, sigma 0.4 on its log
+    RMS error): the draw's RMS error is ruled by its worst example (ledger 2469)."""
+    rng = np.random.default_rng([2469, 16, seed])
+    return (rng.standard_normal((16, 32)).astype(np.float32),
+            np.exp(rng.normal(0, 3.0, 16)).astype(np.float32),
+            np.exp(rng.normal(0, 0.4, (2, 16))).astype(np.float32))
+
+
+def stacked_arm(arm: int, factor: float = 1.0, every: int = 0):
+    """`stacked_examples`' arm `arm`: each example's value plus its own rounding, the example's scale times
+    its size times a fixed pattern of its own; Dew's `factor` times further on every `every`th example."""
+    @as_given
+    def run(x, scale, sizes):
+        rng = np.random.default_rng([arm, int(np.asarray(x).view(np.uint32)[0, 0])])
+        noise = rng.standard_normal(x.shape) * (scale * sizes[arm] * 1e-7)[:, None]
+        if every:
+            noise[::every] *= factor
+        return {"rows": np.asarray(x, np.float64) + noise}
+    return run
+
+
+def exact_rows(x, scale, sizes):
+    return {"rows": np.asarray(x, np.float64)}
+
+
+def test_a_site_that_stacks_examples_is_judged_by_its_examples_paired_ratios_and_refuses_a_fault_on_some():
+    """At a site whose leaves stack independent examples (`assert_as_exact`'s `examples`), a leaf the pooled
+    ratio cannot size, its draws ruled by their worst example, is judged by its examples' paired ratios
+    (ledger 2469): an equally exact pair passes at the count it sizes; Dew three times off on a fifth of
+    each draw's examples, which their draws' medians barely see, is refused by their tail about those
+    medians."""
+    from reference_error import _interval
+
+    reference = stacked_arm(1)
+    seeds = seeds_for(reference, stacked_examples, "stacked", truth_fn=exact_rows, dew_fn=stacked_arm(0),
+                      examples=True)
+    # The pooled ratio does not resolve at that count: its draws are ruled by their worst examples.
+    def squared(arm, seed):
+        x, scale, sizes = stacked_examples(seed)
+        return float(np.mean((arm(x, scale, sizes)["rows"] - np.asarray(x, np.float64)) ** 2))
+
+    pooled = [[squared(arm, seed) for seed in range(seeds)] for arm in (stacked_arm(0), reference)]
+    low, high = _interval(*(np.asarray(errors) for errors in pooled))
+    assert high > PARITY * low and seeds <= MOST_SEEDS
+    assert_as_exact(stacked_arm(0), reference, stacked_examples, "stacked", seeds=seeds, truth_fn=exact_rows,
+                    examples=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(stacked_arm(0, 3.0, every=5), reference, stacked_examples, "a fifth three times off",
+                        seeds=seeds, truth_fn=exact_rows, examples=True)
