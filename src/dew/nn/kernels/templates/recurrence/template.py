@@ -57,18 +57,17 @@ _PLANS: dict = {}
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
              max_segments: int | None, delta: bool, backward: bool,
-             floor: float | None, rounded: bool = False) -> tuple[mainloop.Launch, ...]:
+             floor: float | None, rounded: bool = False, wide: bool = False) -> tuple[mainloop.Launch, ...]:
     """`mainloop_backward.planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
     sm87's and an sm80's multiprocessors and shared memory differ)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
-    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded,
-           generation.numerics().forms)
+    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded, wide)
     if key not in _PLANS:
         *operands, starts = shapes
         _PLANS[key] = mainloop_backward.planned(*operands, tiles=tiles, family=family, starts=starts,
                                        max_segments=max_segments, delta=delta, backward=backward, floor=floor,
-                                       target=target, rounded=rounded)
+                                       target=target, rounded=rounded, wide=wide)
     return _PLANS[key]
 
 
@@ -135,7 +134,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         return _planned(shapes, config, family, target, arguments.get("max_segments"),
                         arguments.get("delta", True), bool(fast), arguments.get("floor"),
-                        arguments.get("rounded", False))
+                        arguments.get("rounded", False), arguments.get("wide", False))
 
     GENERATES: ClassVar[bool] = True
 

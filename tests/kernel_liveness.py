@@ -382,6 +382,40 @@ def _streams_into(value, parent, seen=None) -> bool:
     return True
 
 
+def _recomputed(op, seen: set) -> int:
+    """The instructions recomputing `op`'s results from special registers and constants: its own (none for a
+    regrouping, `COSTLESS`; five for a remainder or quotient by a constant not a power of two, a
+    multiply-high sequence), and those of the operations it reads, each once."""
+    name = op.name.removeprefix(PREFIX)
+    if op in seen or name in FREE:
+        return 0
+    seen.add(op)
+    cost = 0 if COSTLESS.match(name) else 1
+    if name in ("arith.remui", "arith.remsi", "arith.divui", "arith.divsi"):
+        divisor = _constant(op.operands[1])
+        cost = 1 if divisor and divisor & (divisor - 1) == 0 else 5
+    return cost + sum(_recomputed(operand.owner.operation, seen) for operand in op.operands
+                      if not isinstance(operand.owner, ir.Block))
+
+
+def _read_in_outer_loop(op) -> bool:
+    """Whether a result of `op` is read inside a loop that `op` lies outside of."""
+    def inside(loop) -> bool:
+        enclosing = op.parent
+        while enclosing is not None and enclosing != loop:
+            enclosing = enclosing.parent
+        return enclosing is not None
+
+    for result in op.results:
+        for use in result.uses:
+            parent = use.owner.operation.parent
+            while parent is not None:
+                if parent.name.removeprefix(PREFIX) in ("scf.for", "scf.while") and not inside(parent):
+                    return True
+                parent = parent.parent
+    return False
+
+
 class _Pass:
     def __init__(self, divergent: set | None = None, compiler: Compiler | None = None):
         self.atoms = Atoms()
@@ -454,6 +488,12 @@ class _Pass:
                 self.mma_words = max(self.mma_words, words)
         self.atoms.making = f"{name}:{str(op.results[0].type)[:28]}" if len(op.results) else name
         produced = list(op.results)
+        if (name not in FREE and self._rematerialized(op, name) and _read_in_outer_loop(op)
+                and _recomputed(op, set()) > RECOMPUTED):
+            # Hoisted out of a loop that reads it, and longer than ptxas recomputes: kept in registers.
+            for value in produced:
+                self.atoms.of[value] = self.atoms.fresh(value.type)
+            return
         if name in FREE or self._rematerialized(op, name):
             for value in produced:
                 self.atoms.of[value] = []
@@ -560,7 +600,17 @@ class _Pass:
         if name == "llvm.inline_asm":
             tied = _tied(op)
             if tied is not None and len(produced) == 1:
-                self.atoms.of[produced[0]] = [a for operand in tied for a in self.atoms.of.get(operand, [])]
+                # An MMA accumulating in place keeps its tied inputs' registers. A word whose input holds none
+                # (a product into a fresh accumulator ties its outputs to zeros, `use_acc` false) is
+                # allocated at the product's issue: the sm90 dQ launch's two zero-started products, 128 words
+                # in flight, read as none.
+                held = [a for operand in tied for a in self.atoms.of.get(operand, [])]
+                words = len(self._lanes(produced[0].type))
+                held += [None] * (words - len(held))
+                if any(atom is None for atom in held):
+                    fresh = self.atoms.fresh(produced[0].type)
+                    held = [atom if atom is not None else fresh[k] for k, atom in enumerate(held)]
+                self.atoms.of[produced[0]] = held
                 return True
             accumulated = self._accumulated(op)
             if accumulated is not None:
@@ -673,6 +723,16 @@ class _Pass:
 
 
 CANONICAL = "builtin.module(canonicalize,cse,loop-invariant-code-motion,canonicalize,cse)"
+RECOMPUTED = 3
+"""The longest chain of instructions from special registers and constants ptxas recomputes at a use rather
+than keeps; a longer one hoisted out of a loop it is read in is held across the loop (192 hoisted values at
+a 128-register cap: chains of 3 from the thread id recompute, of 4 spill, on CUDA 12.9 and 13.4; an sm80
+attention mask's column ids, 45 to 127 of them, held so in its SASS)."""
+COSTLESS = re.compile(r"(arith\.(index_cast|index_castui|extui|extsi|trunci|bitcast)"
+                      r"|vector\.(broadcast|splat|extract|extractelement|from_elements|insert|insertelement|bitcast)"
+                      r"|llvm\.(bitcast|extractvalue|insertvalue|extractelement|insertelement|zext|sext|trunc)"
+                      r"|builtin\.unrealized_conversion_cast)")
+"""Operations that regroup or reinterpret registers, which a recomputation costs nothing (`_recomputed`)."""
 """The scalar clean-up a kernel's module takes before the pass (LLVM's own folds, value numbering and
 loop-invariant motion run on it before ptxas): constants folded, duplicates merged, invariants hoisted."""
 
