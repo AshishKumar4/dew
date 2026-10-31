@@ -385,15 +385,20 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     return step, vectors
 
 
+PREDICATE_REGISTERS = 7
+"""The predicate registers a GPU thread holds (P0 to P6): a mask's predicates past them ptxas saves to
+general registers (P2R) until the selects that read them (`_mask_registers`)."""
+
+
 def _mask_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
     """The registers a queries-first backward step's mask holds (`algebra.seen`), from its logits to its
-    cotangents: its predicates packed a bit an entry, a row pass's of them pending in registers between
-    the compares that form them and the selects that read them (ptxas saves each, its seven predicate
-    registers too few, P2R), and the coordinates it compares, the keys' column vector and the queries' row
+    cotangents: its predicates packed a bit an entry; a row pass's of them, a role's rows, pending between
+    the compares that form them and the selects that read them, all but those its predicate registers hold
+    (`PREDICATE_REGISTERS`); and the coordinates it compares, the keys' column vector and the queries' row
     vector, int32 (the SASS of dQ at 128 x 64, width 64, under sinks: 49 words, 2 packed, 27 pending and 20
-    coordinates; at 64 x 64, width 128, under a tile bias 25 pending)."""
+    coordinates; at 64 x 64, width 128, 44 in the accurate form, 1, 24 and 18, its need 255 unspilled)."""
     entries = block_q * block_k // resources.THREADS
-    pending = family.role_rows * block_k // resources.THREADS
+    pending = max(0, family.role_rows * block_k // resources.THREADS - PREDICATE_REGISTERS)
     coordinates = family.column_registers(block_k, jnp.int32) + family.row_registers(block_q, jnp.int32)
     return -(-entries // 32) + pending + coordinates
 
@@ -548,9 +553,9 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     products = [(block_q, block_k, jnp.float32)] * 2 + [(block_q, block_k, jnp.int8)] + held
     pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes
     if dq:
-        # dQ's mask priced as its SASS holds it (`_mask_registers`), its hook's parameters and gradients beside
-        # its pullback, not its products: they stream in and out of its entries (dQ under a tile bias at
-        # 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
+        # dQ's mask priced as its SASS holds it (`_mask_registers`), its hook's parameters and gradients
+        # beside its pullback, not its products: they stream in and out of its entries (dQ under a tile
+        # bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
         mask = _mask_registers(family, block_q, block_k)
         products = products[:2]
         pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
@@ -560,7 +565,8 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
         # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
-        return resources.live_registers(family, carried, products, pullback, cotangents) + mask + rows + vectors
+        phases = resources.live_registers(family, carried, products, pullback, cotangents)
+        return phases + mask + rows + vectors
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
         # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
