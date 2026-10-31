@@ -1530,7 +1530,7 @@ FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
                 for training in (template.Kept.NONE, template.Kept.SPLIT)]
 FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
-                 for hooks in BACKWARD_HOOKS if hooks != "none"]
+                 for hooks in BACKWARD_HOOKS if hooks != "none"] + [(256, template.Kept.NONE, "softcap")]
 """The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
 forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
 set beside the walk's)."""
