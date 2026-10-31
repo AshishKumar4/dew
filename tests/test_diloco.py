@@ -9,13 +9,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, FEATURES, Counting, dataset
+from affine_run import BATCH, FEATURES, Counting, dataset, raw_leaf
 from flax import linen as nn
 from reference_error import assert_computes_the_oracle
 
 from dew.objectives.base import Aux, Objective, Ratio, Weighted
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.diloco import DiLoCo
+from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer
 
 RATE, OUTER_RATE, MOMENTUM = 0.05, 0.7, 0.9
 
@@ -76,8 +75,7 @@ def trainer(replicas: int, *, diloco: DiLoCo | None = None, optimizer=None, path
 
 def values(state) -> list[np.ndarray]:
     """Every leaf of `state` as NumPy, a key as its data."""
-    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-            for leaf in jax.tree.leaves(state)]
+    return [np.asarray(raw_leaf(leaf)) for leaf in jax.tree.leaves(state)]
 
 
 def params(tree) -> np.ndarray:
