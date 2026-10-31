@@ -1764,3 +1764,24 @@ def test_a_vocabulary_split_heads_forward_derivative_is_one_devices(tile):
     for tangent, single, name in zip(split, alone, ("losses'", "log partitions'"), strict=True):
         # Each logit sums its 16 features, each row's partition its 512 logits.
         assert_computes_the_oracle(tangent, single, f"the split head's {name} tangent", roundings=16 + 512)
+
+
+def test_a_tiled_heads_forward_derivative_holds_where_its_tiles_maxima_tie():
+    """Two vocabulary tiles whose maxima tie, their sums unequal and their maxima moved apart: the tiled
+    head's log partition's tangent is the whole logits' in float64 (the 2690 review: 7/22 where the
+    derivative is 4/11, each tile's sum moved to the shared maximum without its own maximum's tangent)."""
+    with jax.enable_x64(new_val=True):
+        hidden = jnp.ones((1, 1), jnp.float64)
+        table = jnp.asarray([[0.0], [-np.log(2.0)], [0.0], [-np.log(4.0)]], jnp.float64)
+        targets = jnp.zeros((1,), jnp.int32)
+        bias, direction = jnp.zeros((4,), jnp.float64), jnp.asarray([1.0, 0.0, 0.0, 0.0], jnp.float64)
+
+        def log_z(bias):
+            head = OutputTable(table, vocab_major=True, bias=bias, precision=jax.lax.Precision.HIGHEST)
+            return chunked_cross_entropy(hidden, head, targets, 2, tile=(1, 2), predict=False)[2]
+
+        def whole(bias):
+            return jax.nn.logsumexp(hidden @ table.T + bias, axis=-1)
+
+        moved, truth = (jax.jvp(fn, (bias,), (direction,))[1] for fn in (log_z, whole))
+    assert_computes_the_oracle(moved, truth, "the tied tiles' log partition's tangent", roundings=4)
