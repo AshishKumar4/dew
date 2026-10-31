@@ -464,6 +464,17 @@ def _arms(dew_fn, reference_fn):
     return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile, pairing)), reference
 
 
+def _arms_with(dew_fn, reference_fn, further: list, label: str):
+    """A site's arms and each further reference's, compiled as `_arms` pairs them, Dew's once beside all:
+    refused where, beside a plain Dew arm, a further reference is not of the reference's kind (plain or
+    as given), as no one compilation of Dew's pairs with both."""
+    if not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in further):
+        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
+                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
+    dew, reference = _arms(dew_fn, reference_fn)
+    return dew, reference, [_arms(dew_fn, fn)[1] for fn in further]
+
+
 def _refuse_owned_policies(compile, *arms) -> None:
     """Refuse an arm compiled with a policy the gate does not own (row 2287): a `without_ynn` program,
     which `_compiled` runs as it is, beside an arm run `as_given`, where the gate compiles Dew's arm as
@@ -1613,8 +1624,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
           also, terms):
     """A check 1 site's arguments held to what it may ask (`assert_as_exact`): its term program, the
     traced truth (refused run as given or recorded), and its further references; refused below
-    `FEWEST_SEEDS`, with a library arm not named by its row and leaves, or with further references of
-    mixed kinds beside a plain Dew arm."""
+    `FEWEST_SEEDS`, or with a library arm not named by its row and leaves."""
     terms_fn = None
     if callable(terms):
         terms_fn = _SiteTerms(terms)
@@ -1631,12 +1641,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
     if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
         raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
                          f"the leaves it covers")
-    also = dict(also or {})
-    mixed = not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in also.values())
-    if also and mixed:
-        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
-                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
-    return terms_fn, also
+    return terms_fn, dict(also or {})
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
@@ -1721,8 +1726,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     narrow_leaves: list[str] = []
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
-    further = [_arms(dew_fn, fn)[1] for fn in also.values()]
-    dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    dew_fn, reference_fn, further = _arms_with(dew_fn, reference_fn, list(also.values()), label)
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
     truth_fn = _truth_program(truth_fn)
     # Each range's draws, every reference's, computed once for the stages of them all.
