@@ -1,7 +1,7 @@
 """Write a saved run of each run kind at this checkout, for tests/test_saved_runs.py to read at every
 later main (row 2282).
 
-Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/test_run_options.py's `KINDS`, its data
+Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/run_kinds.py's `KINDS`, its data
 as there, synthetic tickets, the repo's tiny image records and token files, the tiny Laya fixture, an LM
 run over a tiny multimodal source, and each serialized variant beside them) trains two steps from Python,
 or to its examples clock's bound, its own trainer otherwise, and keeps its last checkpoint; what

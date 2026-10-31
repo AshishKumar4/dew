@@ -12,7 +12,6 @@ beneath that branch's path. Each module is parsed into MLIR objects, and each `s
 read for its operands' element types and the innermost scope its location names."""
 
 import json
-import re
 import sys
 import tempfile
 from collections.abc import Callable, Mapping
@@ -27,9 +26,6 @@ from saved_run_kinds import answered
 
 from dew.config import RunConfig
 from dew.registry import objectives
-
-NAMED = re.compile(r'loc\("([^"]*)"')
-"""A location's name stack, which an operation's printed location leads with."""
 
 SCOPE = "scope|"
 """What a module's name-stack segment begins with: its variable scope's path follows, joined by `|`."""
@@ -82,8 +78,8 @@ def signature(tree) -> frozenset:
 def module_path(location: ir.Location) -> str:
     """The variable scope of the innermost module a product's location names (`scoped`), its path
     joined by `/`; empty where it runs in none."""
-    named = NAMED.match(str(location))
-    segments = [] if named is None else named.group(1).split("/")
+    # A lowered operation's location names its name stack (`ir.NameLoc`), the call sites beneath it.
+    segments = location.name_str.split("/") if isinstance(location, ir.NameLoc) else []
     scopes = [segment.removeprefix(SCOPE) for segment in segments if segment.startswith(SCOPE)]
     return scopes[-1].replace("|", "/") if scopes else ""
 
