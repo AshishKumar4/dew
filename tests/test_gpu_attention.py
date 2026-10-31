@@ -1,9 +1,9 @@
 """Attention on the GPU (G14, the owner's rule: no unit tests on GPUs): each attention route whose kernel
 runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's property:
 
-- The frozen Triton template at every config of its forward's and its backward's spaces, bf16, every hook,
-  over causal documents under a window and the irregular calls (test_attention_triton); its default form
-  finite where the reference is at fp32's edges for the families too slow to interpret
+- The Pallas-Triton template at every tile its forward's and its backward's derivations step through, bf16,
+  every hook, over causal documents under a window and the irregular calls (test_attention_triton); its
+  default form finite where the reference is at fp32's edges for the families too slow to interpret
   (test_attention_stability).
 - The Mosaic mainloop's default form, and its backward in two launches, finite where the reference is at
   fp32's edges over every family it takes, on an H100 (test_attention_stability).
@@ -97,7 +97,7 @@ def test_the_attention_kernels_run_on_this_gpu():
     run_cells([
         sweep(triton.every_config_on_a_gpu, triton.attention_triton.FORWARD_STEPS),
         sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_STEPS),
-        *(Cell(f"the frozen Triton mainloop's default is finite at fp32's edges: {family}",
+        *(Cell(f"the Pallas-Triton mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "triton"))
           for family in stability.GPU_TRITON_FAMILIES),
         *(Cell(f"the Mosaic mainloop's default is finite at fp32's edges: {family}",

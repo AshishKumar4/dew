@@ -71,7 +71,8 @@ where 64 by 64 holds 160 at 2.1x: TRAINTILES3-a100), then fewer keys, a stage's 
 its keys."""
 
 BLOCK = max(max(tiles.block_q, tiles.block_k) for tiles in FORWARD_STEPS)
-"""The largest tile the forward or the backward takes, the block a call pads to (`padded_call`)."""
+"""The forward's largest tile, the block a call pads to (`padded_call`); the backward's tiles are within
+it (`BACKWARD_STEPS`)."""
 
 
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
@@ -87,15 +88,15 @@ def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
 
 def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
     """Why this mainloop takes no call over `spans` under `hooks`, or None: a call's runs, several key
-    intervals a query (`KeySpans`), which the frozen mainloop does not walk, the Mosaic and plain-JAX
+    intervals a query (`KeySpans`), which this mainloop does not walk, the Mosaic and plain-JAX
     mainloops do (ledger 956, `attention_route`); probability dropout (`Hooks.drop`), which it does not
     draw, the plain-JAX mainloop does (ledger row 1521)."""
     if spans.start.ndim == 3:
         return Refusal('spans', "the Triton mainloop walks one key interval a query; a call's runs take the "
                        "Mosaic or the plain-JAX mainloop")
     if hooks is not None and hooks.drop is not None:
-        return Refusal('dropout', "the Triton mainloop is frozen and takes no probability dropout (the route "
-                       "runs a dropping call on the reference path, ledger row 1521)")
+        return Refusal('dropout', "the Pallas-Triton mainloop takes no probability dropout (the route runs a "
+                       "dropping call on the reference path, ledger row 1521)")
     return None
 
 

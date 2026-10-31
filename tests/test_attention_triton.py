@@ -47,8 +47,8 @@ config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp3
 
 @pytest.fixture(autouse=True)
 def _interpreted_as_an_a100():
-    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the frozen
-    Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
+    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the
+    Pallas-Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
     if jax.default_backend() != "cpu":
         yield
         return
@@ -62,7 +62,7 @@ def geometry(case: dict) -> tuple[int, int]:
 
 
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
-          attention_triton.Tiles(32, 64, 8, 3), attention_triton.Tiles(128, 128, 8, 2))
+          attention_triton.Tiles(128, 64, 4, 2))
 """The configs each case runs at on the CPU, where interpreting every tile the derivation steps through
 (`FORWARD_STEPS`) would take hours; a GPU runs each (`every_config_on_a_gpu`, a cell of
 tests/test_gpu_attention.py)."""
@@ -184,7 +184,7 @@ def test_the_plain_forward_is_on_par_over_runs(form, config):
 
 
 def test_the_frozen_mainloop_refuses_runs():
-    """The frozen Triton mainloop walks one key interval a query: called on a call's runs, its forward and
+    """The Pallas-Triton mainloop walks one key interval a query: called on a call's runs, its forward and
     backward refuse them before any launch rather than compute them as one interval (ledger 956)."""
     queries, keys = core_geometry(RUN_CASES["runs"])
     spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
@@ -199,7 +199,7 @@ def test_the_frozen_mainloop_refuses_runs():
 @pytest.mark.parametrize("config", PINNED[:2], ids=str)
 def test_one_run_a_query_is_the_interval_the_frozen_mainloop_walks(config):
     """One run a query (`test_attention_template.ONE_RUN`, a chunked or banded local-attention layer's runs)
-    is one key interval, which the frozen Triton mainloop walks forward and backward (ledger 1991)."""
+    is one key interval, which the Pallas-Triton mainloop walks forward and backward (ledger 1991)."""
     check(ONE_RUN, HOOKS["none"], jnp.float32, config)
     check_backward(ONE_RUN, (), jnp.float32, config)
 
