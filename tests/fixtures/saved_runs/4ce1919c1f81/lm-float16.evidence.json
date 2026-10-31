@@ -2,8 +2,24 @@
  "step": 2,
  "compute": "float16",
  "products": {
-  "float16": 12,
-  "float64": 2
+  "": [
+   "float64"
+  ],
+  "layers_0/mlp/down_proj": [
+   "float16"
+  ],
+  "layers_0/mlp/gate_up_proj": [
+   "float16"
+  ],
+  "layers_0/self_attn": [
+   "float16"
+  ],
+  "layers_0/self_attn/o_proj": [
+   "float16"
+  ],
+  "layers_0/self_attn/qkv_proj": [
+   "float16"
+  ]
  },
  "params": [
   "float32"

@@ -21,7 +21,7 @@ except where it packs several records into one row.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from dew.data import (
     audio as audio_steps,
@@ -51,9 +51,6 @@ from dew.data.pipeline import (
 )
 from dew.data.prompts import PROMPT_LONG, PROMPT_PAD
 from dew.data.text import SavedTokenizer
-
-if TYPE_CHECKING:
-    pass
 
 
 def images(dataset: Dataset, size: int, *, batch: int | None,
