@@ -151,23 +151,21 @@ class Mma(mosaic.Family):
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
 
-    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
-        # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`), one
-        # instruction's at the narrowest swizzle (a stream staged so by `streams`' `swizzles`: D64's K in
-        # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, ET's census80). An ordinary one
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
+        # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`; D64's
+        # K in QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80). An ordinary one
         # slices its rows' 8-row tiles.
-        return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
+        return self._staged_depth(depth) if transposed else self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int) -> int:
         return self._staged_depth(depth)
 
-    def _staged_depth(self, depth: int, swizzle: int | None = None) -> int:
-        """The depth a load of a stage whose rows are `depth` deep takes: one tile of its `swizzle` (bytes;
-        the widest its row bytes allow where None, `swizzled`, `_depth_granule`), the whole depth where it
-        is narrower."""
+    def _staged_depth(self, depth: int) -> int:
+        """The depth a load of a stage whose rows are `depth` deep takes: one tile of the widest swizzle its
+        row bytes allow (`swizzled`, `_depth_granule`), the whole depth where it is narrower."""
         itemsize = jnp.dtype(self.dtype).itemsize
-        swizzle = plgpu.find_swizzle(depth * itemsize * 8) if swizzle is None else swizzle
-        return max(self.fragment_depth(depth), min(depth, swizzle // itemsize))
+        widest = plgpu.find_swizzle(depth * itemsize * 8) // itemsize
+        return max(self.fragment_depth(depth), min(depth, widest))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
