@@ -25,21 +25,27 @@ class Affine64(nn.Module):
 
 
 class Regression64(Objective):
-    """Squared error of a float64 affine map against `2 * x[:, :2]`."""
+    """Squared error of a float64 affine map against `2 * x[:, :2]`; `noisy`, its inputs perturbed by the
+    step's draw, so a step's key shows in its gradient; `scaled`, its error times a batch scalar."""
 
-    def __init__(self):
-        self.model = Affine64()
+    def __init__(self, *, noisy: bool = False, scaled: bool = False):
+        self.model, self.noisy, self.scaled = Affine64(), noisy, scaled
 
     def fresh_variables(self, key, held):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
     def loss(self, variables, batch, step):
-        prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux({})
+        x = batch["x"]
+        if self.noisy:
+            x = x + 0.1 * jax.random.normal(step.key, x.shape, x.dtype)
+        error = jnp.mean((self.model.apply(variables, x) - batch["y"]) ** 2)
+        return error * (batch["weight"] if self.scaled else 1.0), Aux({})
 
 
-def trainer(replicas: int, *, diloco: DiLoCo | None = None, optimizer=None, path=None, **options) -> Trainer:
-    return Trainer(Regression64(), optax.sgd(RATE) if optimizer is None else optimizer, key=jax.random.key(0),
+def trainer(replicas: int, *, diloco: DiLoCo | None = None, optimizer=None, path=None, objective=None,
+            **options) -> Trainer:
+    return Trainer(Regression64() if objective is None else objective, optax.sgd(RATE) if optimizer is None
+                   else optimizer, key=jax.random.key(0),
                    layout=Layout(min_shard=1, tolerance=1.0),
                    mesh=MeshSpec(diloco=replicas).build(jax.devices()[:replicas]), diloco=diloco,
                    checkpoints=None if path is None else Checkpoints(str(path)), **options)
@@ -57,16 +63,19 @@ def params(tree) -> np.ndarray:
     return np.concatenate([np.ravel(np.asarray(dense[name], np.float64)) for name in ("kernel", "bias")])
 
 
-def reference(initial: dict, steps: int, replicas: int, every: int, inner_momentum: float) -> np.ndarray:
+def reference(initial: dict, steps: int, replicas: int, every: int, inner_momentum: float,
+              accumulation: int = 1) -> np.ndarray:
     """DiLoCo in NumPy float64 (Douillard et al., 2023, Algorithm 1): each replica takes `every` steps of
     SGD with momentum on its contiguous share of each batch's rows from the outer parameters, the outer
-    gradient is the outer parameters less the replicas' mean, and the outer step is Nesterov SGD."""
+    gradient is the outer parameters less the replicas' mean, and the outer step is Nesterov SGD; with
+    `accumulation`, each inner update the mean of that many steps' gradients, and `every` counts updates."""
     kernel, bias = np.asarray(initial["kernel"], np.float64), np.asarray(initial["bias"], np.float64)
     outer = np.concatenate([kernel.ravel(), bias.ravel()])
     outer_momentum = np.zeros_like(outer)
     inner = [outer.copy() for _ in range(replicas)]
     inner_velocity = [np.zeros_like(outer) for _ in range(replicas)]
     source = Counting()
+    pooled = [np.zeros_like(outer) for _ in range(replicas)]
     for step in range(steps):
         batch = next(source)
         x, y = batch["x"].astype(np.float64), batch["y"].astype(np.float64)
@@ -77,10 +86,14 @@ def reference(initial: dict, steps: int, replicas: int, every: int, inner_moment
             b = inner[replica][FEATURES * 2:]
             residual = x[rows] @ w + b - y[rows]
             scale = 2 / residual.size
-            gradient = np.concatenate([(scale * x[rows].T @ residual).ravel(), scale * residual.sum(0)])
+            pooled[replica] += np.concatenate([(scale * x[rows].T @ residual).ravel(),
+                                               scale * residual.sum(0)])
+            if (step + 1) % accumulation:
+                continue
+            gradient, pooled[replica] = pooled[replica] / accumulation, np.zeros_like(outer)
             inner_velocity[replica] = inner_momentum * inner_velocity[replica] + gradient
             inner[replica] = inner[replica] - RATE * inner_velocity[replica]
-        if (step + 1) % every == 0:
+        if (step + 1) % (every * accumulation) == 0:
             delta = outer - np.mean(inner, axis=0)
             outer_momentum = MOMENTUM * outer_momentum + delta
             outer = outer - OUTER_RATE * (delta + MOMENTUM * outer_momentum)
@@ -104,7 +117,36 @@ def test_a_two_replica_diloco_run_is_the_algorithms_float64_reference():
 
 
 @pytest.mark.mesh(devices=2)
-def test_diloco_of_one_inner_update_a_sync_and_plain_sgd_is_data_parallel_training():
+def test_a_two_replica_diloco_run_pooling_two_steps_an_update_is_the_float64_reference():
+    """Each replica pooling two steps' gradients into each inner update, two updates between meetings:
+    the outer parameters after eight steps, two meetings, are the reference's, each update the mean of
+    its window's gradients (row 876 review)."""
+    with jax.enable_x64(new_val=True):
+        run = trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
+                      optimizer=optax.sgd(RATE, momentum=0.5), accumulation=2)
+        initial = jax.device_get(run.initial_state().variables["params"]["Dense_0"])
+        state = run.fit(dataset(), steps=8, log_every=1)
+        found = params(state.variables["params"])
+    # Each parameter sums its replica's 4 rows' terms over 8 steps, and 2 replicas' means.
+    assert_computes_the_oracle(found, reference(initial, 8, 2, 2, 0.5, accumulation=2),
+                               "a pooling DiLoCo run's outer parameters", roundings=4 * 8 * 2 + 2 * 2)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_diloco_run_reads_a_batchs_scalar_input_in_every_group():
+    """A batch input of no rows, a scalar every group reads whole, reaches each group's step: a run whose
+    loss weighs its error by it trains as it does with the weight folded into its rate."""
+    def weighted(rows):
+        return {**rows, "weight": np.asarray(0.5, np.float32)}
+
+    with jax.enable_x64(new_val=True):
+        scaled = trainer(2, diloco=DiLoCo(every=1, rate=1.0, momentum=0.0),
+                         objective=Regression64(scaled=True)).fit(
+            dataset(train=lambda: map(weighted, Counting())), steps=2, log_every=1)
+        halved = trainer(2, diloco=DiLoCo(every=1, rate=1.0, momentum=0.0),
+                         optimizer=optax.sgd(RATE / 2)).fit(dataset(), steps=2, log_every=1)
+    assert_computes_the_oracle(params(scaled.variables["params"]), params(halved.variables["params"]),
+                               "a scalar-weighted DiLoCo run's parameters", roundings=8 * 2 + 4)
     """Two replicas that sync after every inner update with plain SGD inside and an outer step of rate 1
     and no momentum train as one data-parallel run over the whole batch: the replicas' mean step is the
     whole batch's."""
@@ -118,11 +160,15 @@ def test_diloco_of_one_inner_update_a_sync_and_plain_sgd_is_data_parallel_traini
 
 
 def test_a_single_replica_diloco_run_between_syncs_trains_as_a_plain_run():
-    """One replica between syncs takes the plain run's steps: its inner parameters and optimizer state
-    after three steps, no sync among them, are the plain run's to the bit."""
+    """One replica between syncs takes the plain run's steps, its draws among them: its inner parameters
+    and optimizer state after three steps of a loss its key perturbs, no sync among them, are the plain
+    run's to the bit."""
     with jax.enable_x64(new_val=True):
-        diloco = trainer(1, diloco=DiLoCo(every=8), optimizer=optax.adam(RATE)).fit(dataset(), steps=3)
-        plain = trainer(1, optimizer=optax.adam(RATE)).fit(dataset(), steps=3)
+        noisy = Regression64(noisy=True)
+        diloco = trainer(1, diloco=DiLoCo(every=8), optimizer=optax.adam(RATE), objective=noisy).fit(
+            dataset(), steps=3)
+        plain = trainer(1, optimizer=optax.adam(RATE), objective=Regression64(noisy=True)).fit(dataset(),
+                                                                                              steps=3)
     for field in ("variables", "opt_state"):
         for mine, theirs in zip(jax.tree.leaves(getattr(diloco.inner, field)),
                                 jax.tree.leaves(getattr(plain, field)), strict=True):
@@ -143,6 +189,7 @@ def test_a_resumed_diloco_run_restores_each_replica_and_ends_where_an_unbroken_o
     with jax.enable_x64(new_val=True):
         unbroken = run().fit(dataset(), steps=5, log_every=1)
         stopped = run(tmp_path / "run").fit(dataset(), steps=3, checkpoint_every=1, log_every=1)
+        assert (stopped.inner.accumulation is not None) == (accumulation > 1)
         restored, _, _ = run(tmp_path / "run").place()
         for mine, theirs in zip(values(stopped), values(restored), strict=True):
             np.testing.assert_array_equal(mine, theirs)
