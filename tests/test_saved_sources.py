@@ -129,6 +129,7 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
         assert report["processes"] == 2 and report["spanning"] > 0
         assert report["refused_outside"]
         assert report["largest_leaf"] <= report["peak"] < report["whole"] / 2
+    assert publisher["differing"] == {}
     assert publisher["release"] == publisher["alone"] == reader["alone"] and len(publisher["release"]) > 10
     assert reader["release"] == {} and reader["small_files"] == publisher["small_files"]
 

@@ -38,6 +38,14 @@ def digests(directory: Path) -> dict[str, str]:
             for path in sorted(directory.glob("*.safetensors"))}
 
 
+def tensors(directory: Path) -> dict[str, tuple[str, list[int], str]]:
+    """Each tensor a directory's weight files hold, by name: its dtype, shape and bytes' digest."""
+    from safetensors.numpy import load_file
+
+    return {name: (str(array.dtype), list(array.shape), hashlib.sha256(array.tobytes()).hexdigest())
+            for path in sorted(directory.glob("*.safetensors")) for name, array in load_file(path).items()}
+
+
 def exported(args) -> dict:
     """The decoder exported placed across the pool, and written unplaced and outside the scope."""
     import tracemalloc
@@ -74,7 +82,10 @@ def exported(args) -> dict:
     tracemalloc.stop()
     alone = root / f"alone{rank}"
     PretrainedDecoder.from_model(model, variables).save(alone)
+    written, own = tensors(destination), tensors(alone)
     return {"processes": jax.process_count(), "rank": rank,
+            "differing": {name: [written.get(name), own.get(name)] for name in sorted({*written, *own})
+                          if written.get(name) != own.get(name)} if rank == 0 else {},
             "spanning": sum(not leaf.is_fully_addressable for leaf in leaves),
             "refused_outside": refused, "release": digests(destination), "alone": digests(alone),
             "small_files": sorted(path.name for path in destination.iterdir()
