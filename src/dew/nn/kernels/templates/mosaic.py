@@ -1017,9 +1017,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         keys (a keys-first walk's maxima and denominators)."""
         return plgpu.layout_cast(jnp.full((columns,), value, jnp.float32), self.column)
 
-    def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
-        """Indices along `dimension` of a tile in the accumulator's layout or a row's (`zeros`)."""
-        layout = self.layout if len(shape) == 2 else self.row
+    def iota(self, shape: tuple[int, ...], dimension: int, *, columns: bool = False) -> jax.Array:
+        """Indices along `dimension` of a tile in the accumulator's layout, or a vector's in a row's layout
+        (`zeros`) or, `columns`, a column's (a tile's keys': each of a thread's indices its lane's base and
+        an immediate, no element's index computed from its place in the tile)."""
+        layout = self.layout if len(shape) == 2 else self.column if columns else self.row
         return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=layout)
 
     def rows_of(self, ref) -> jax.Array:
