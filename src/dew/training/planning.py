@@ -497,10 +497,14 @@ def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch) -> dic
     """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
     read before them (`FitSearch.derived`), and the kernels those compiles found spilling and the launch
     configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
-    (`StepCompiled`). There is no alternative-policy timing or selection in the run's admission record."""
+    (`StepCompiled`); planned ahead with its frontier, each rung above the plan that fits
+    (`FitSearch.frontier`). There is no alternative-policy timing or selection in the record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
+    above: dict[str, JSON] = ({} if search.frontier is None
+                              else {"frontier": [probe.record() for probe in search.frontier]})
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels}
+            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels,
+            **above}
 
 
 def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> dict[str, JSON]:
@@ -577,6 +581,10 @@ class FitSearch[LossT, EffectsT]:
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`) and each launch config they refused
     (`report.refused_launches`), none the registry held before it searched."""
+    frontier: list[Probe] | None = None
+    """With a list, past the admitted plan, each rung above it at its fewest microbatches that fit
+    (`above`): the plans a run's speed is chosen among offline (`dew.training.ahead.compile_ahead`), none of
+    which the run takes; None in a run, which compiles no rung but the one it takes."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
@@ -603,7 +611,25 @@ class FitSearch[LossT, EffectsT]:
         self.kernels = {"spills": spills, "refused": refused}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
-        return self.found(split), tuple(self.probes)
+        found, probes = self.found(split), tuple(self.probes)
+        if self.frontier is not None:
+            self.above(candidates[:candidates.index(split) + 1])
+        return found, probes
+
+    def above(self, candidates: Sequence[int]) -> None:
+        """Each rung above the objective's, at the fewest of `candidates` that fit there, compiled and kept in
+        `frontier` until a rung fits none: a rung that recomputes more takes no more microbatches than the
+        one below it needs, so each searches up to its split alone. The objective is left at the last."""
+        while self.onward(lambda: recompute_more(self.objective, self.base)):
+            asked = len(self.probes)
+            fewest = planned(candidates, 0, self.fits_here, lambda: False,
+                             lambda split: self.forecast.likely(self.rung(), split))
+            if fewest is None:
+                return
+            assert self.frontier is not None
+            self.frontier.append(next(probe for probe in self.probes[asked:] if probe.fits
+                                      and probe.split == fewest))
+            candidates = candidates[:candidates.index(fewest) + 1]
 
     def derived_start(self, split: int) -> None:
         """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's
