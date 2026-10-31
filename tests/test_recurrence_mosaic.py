@@ -581,6 +581,44 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     assert any(len({shared for _, shared in found}) == 2 for found in launches.values()), launches
 
 
+@lowers('sm90')
+def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
+    """The 27B gated delta net's forward over 4089 tokens and over 4096 in one program on an H100, each at its
+    derived tiles under its own launch (`report.launching`): the mainloop pads both lengths to the same
+    chunks, so its launches' statics meet, and each launch's kernels still carry its own launch's digest
+    (`tuning.lowered_once` keys a trace on the launch tracing it). They shared one trace and the second's
+    kernels were named for the first, a spill of one refused as the other (row 2941)."""
+    from dew.training._lowering import kernel_calls
+
+    target = 'sm90'
+    family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
+    lengths = (4089, 4096)
+    operands = {length: resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, length) for length in lengths}
+    with generation.assumed(facts):
+        launches = {length: (bound := template.MOSAIC.bind(*operands[length], None, max_segments=None,
+                                                           floor=None), template.MOSAIC.variants(bound)[0])
+                    for length in lengths}
+
+    def both(*flat):
+        outputs, at = [], 0
+        for length in lengths:
+            bound, tiles = launches[length]
+            with report.launching(template.MOSAIC, bound, tiles):
+                outputs.append(mainloop.forward(*flat[at:at + 6], tiles=tiles, starts=None, max_segments=None,
+                                                family=family))
+            at += 6
+        return outputs
+
+    with generation.assumed(facts):
+        lowered = jax.jit(both).trace(*operands[4089], *operands[4096]).lower(lowering_platforms=('cuda',))
+    named: dict[str, set] = {}
+    for call in kernel_calls(lowered):
+        if call.kind == 'mosaic_gpu':
+            named.setdefault(call.name, set()).add(call.launch)
+    assert named and None not in set().union(*named.values())
+    assert all(len(found) == 2 for found in named.values()), named
+
+
 @pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     """A compile that refused the 27B gated delta net's joined tiles on an H100 (`report.spilled`: a kernel
