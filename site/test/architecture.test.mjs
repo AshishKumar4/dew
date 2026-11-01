@@ -15,9 +15,13 @@ test('the architecture page shows each of its figures inline, so each follows th
 	for (const { alt, name } of figures) {
 		// The page's figure is the asset's markup under the alt text, which says what it shows there (scripts/lib.mjs).
 		const label = alt.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
-		const [, drawing] = /^<svg[^>]*?(viewBox="[^"]+")/.exec(read(`../docs/assets/${name}.svg`));
-		assert.ok(new RegExp(`<svg aria-label="${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*${drawing}`).test(page),
-			`${name} is not inline in the page`);
+		// Each figure is drawn twice, wide and for a phone (<name>-narrow.svg), and the page holds both (theme.css
+		// shows the one that fits), so a phone's labels stay readable (review).
+		for (const file of [name, `${name}-narrow`]) {
+			const [, drawing] = /^<svg[^>]*?(viewBox="[^"]+")/.exec(read(`../docs/assets/${file}.svg`));
+			assert.ok(new RegExp(`<svg aria-label="${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*${drawing}`).test(page),
+				`${file} is not inline in the page`);
+		}
 	}
 	assert.ok(!/<img[^>]+architecture-[a-z]+\.svg/.test(page), 'a figure is an <img>, which follows only the system theme');
 });

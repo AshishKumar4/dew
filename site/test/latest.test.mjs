@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { latest, shown } from '../src/latest.mjs';
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 const text = (html) => html.replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+test('a tutorial is dated by the commit that added it, before the last change to it', async () => {
+	const { lastUpdated, published } = await import('../scripts/lib.mjs');
+	const source = 'tutorials/01-diffusion-from-scratch.ipynb';
+	assert.ok(published(source) < lastUpdated(source), 'the first commit and the last are one');
+});
 
 test('the newest of the tutorials and posts come first, a post or tutorial git does not hold yet first of all', () => {
 	const tutorials = [
@@ -23,8 +30,9 @@ test('the newest of the tutorials and posts come first, a post or tutorial git d
 test('the landing page lists the four newest tutorials and posts, each with its title, line and date from its source', () => {
 	const tutorials = JSON.parse(read('src/generated/tutorial-cards.json'));
 	const posts = JSON.parse(read('src/generated/posts.json'));
-	// Every tutorial and post a build of the repository holds is dated by the commit that added it.
-	assert.ok([...tutorials, ...posts].every((entry) => entry.published), 'an entry the repository holds has no date');
+	// Every tutorial and post git holds is dated by the commit that added it; one written since has no date yet.
+	const held = new Set(execFileSync('git', ['ls-files', 'tutorials', 'docs/posts'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' }).split('\n'));
+	for (const entry of [...tutorials, ...posts]) assert.equal(Boolean(entry.published), held.has(entry.source), entry.source);
 	const page = read('dist/index.html');
 	const listed = [...page.matchAll(/<a class="latest-link" href="\/([^"]+)\/">(.*?)<\/a>/gs)].map(([, slug, inner]) => ({
 		slug,
@@ -36,7 +44,7 @@ test('the landing page lists the four newest tutorials and posts, each with its 
 	assert.deepEqual(listed, latest(tutorials, posts, 4).map((entry) => ({
 		slug: entry.slug,
 		kind: entry.kind,
-		date: [entry.published, shown(entry.published)],
+		date: entry.published ? [entry.published, shown(entry.published)] : undefined,
 		title: entry.title,
 		line: entry.description ?? '',
 	})));
