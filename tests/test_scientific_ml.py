@@ -233,6 +233,42 @@ def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named
                     seeds=seeds_for(numpy, draw, label, truth_fn=exact, dew_fn=grouped))
 
 
+@pytest.mark.parametrize("clip", [0.0, 0.05])
+def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_step(clip, tmp_path):
+    """A run whose command line names Gauss-Newton by its import path and its damping 1e-3, setting no
+    learning rate: its rate is Gauss-Newton's own, the whole step (1.0, recorded as the config's), so its
+    optimizer steps the damped solve's step from zero, on par with NumPy's float32 solve from its float64
+    solve (check 1), with `clip_grads` set that step capped to the clip's norm; and the run's own path
+    (`RunConfig.train`) trains the least-squares objective one step with it (rows 3359, 3360)."""
+    from dew.config import RunConfig
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.gauss_newton import solves_equations
+
+    flags = ["--optim.optimizer", "dew.gauss_newton:gauss_newton", "--optim.optimizer-opts",
+             json.dumps({"damping": 1e-3}), "--optim.clip-grads", str(clip), "--trainer.steps", "1",
+             "--trainer.checkpoint-dir", str(tmp_path), "--trainer.eval-every", "none",
+             "--trainer.checkpoint-every", "none", "--trainer.checkpoint-final", "false"]
+    config = RunConfig.cli(flags)
+    assert config.optim.learning_rate == 1.0
+    rows, features = 64, 8
+    draw = least_squares_draw(rows, features, 0x6E)
+
+    def capped(step):
+        norm = np.linalg.norm(step)
+        return step if not clip or norm <= clip else step * (clip / norm)
+
+    numpy = as_given(lambda x, y: capped(-solved(x, y, 1e-3)).astype(x.dtype))
+    exact = as_given(lambda x, y: capped(-solved(x.astype(np.float64), y.astype(np.float64), 1e-3)))
+    configured = gauss_newton_arm(rows, features, 1, config.optim.build(1))
+    label = f"configured whole gauss-newton step clip {clip}"
+    assert_as_exact(configured, numpy, draw, label, truth_fn=exact,
+                    seeds=seeds_for(numpy, draw, label, truth_fn=exact, dew_fn=configured))
+    x, y = draw(0)
+    state = config.train(LeastSquares(features), Pipeline(Memory({"x": x, "y": y})).batch(rows), name="run")
+    assert int(state.updates) == 1 and solves_equations(state.opt_state)
+
+
 def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():
     """A run whose optimizer the command line names (`--optim.optimizer gauss_newton`, its rate 0.5 and
     its damping 1e-3 among `optimizer_opts`), built as `OptimConfig` builds every optimizer
