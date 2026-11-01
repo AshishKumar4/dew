@@ -232,7 +232,8 @@ def test_a_library_caller_preparing_with_flags_after_jaxlib_loaded_is_told_they_
                           cwd=ROOT, check=False)
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout.strip().splitlines()[-1]) == [False, "fusion=all"]
-    assert "XLA_FLAGS" in done.stderr
+    # The warning names the flags it cannot prove, once.
+    assert done.stderr.count(STATED) == 1
 
 
 HELD = """
