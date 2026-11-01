@@ -121,7 +121,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            reduction_scratch: int = 0) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
-    (`report.named`)."""
+    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,

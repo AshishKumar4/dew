@@ -13,12 +13,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
 
-import jax
-import jax.numpy as jnp
-import numpy as np
 from etils import epath
 from jax.typing import DTypeLike
 
@@ -26,10 +23,8 @@ from dew.batch import Variables
 from dew.cache import persist_compilations
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
 from dew.config import SourceOptions
-from dew.data.text import Tokenizer
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
-from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.precision import Numerics
 from dew.objectives.base import SavedTask
 from dew.registry import dtype_name
@@ -189,41 +184,3 @@ def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | N
     shardings = chosen_layout.shardings(placed_on, variables)
     chosen_layout.check(variables, shardings, placed_on)
     return stream(variables, shardings)
-
-
-@dataclass(frozen=True)
-class RunProcessor:
-    """Adapts a run's tokenizer to the `Processor` interface a task uses.
-
-    Calling it encodes each text prompt and left-pads the rows into
-    `ModelInputs`; a text run takes no images or audio. `decode` returns one
-    string per token row.
-    """
-
-    tokenizer: Tokenizer
-
-    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
-                 audio: Media | None = None) -> ModelInputs:
-        if images is not None or audio is not None:
-            raise ValueError("a text run takes no images or audio")
-        rows = [text] if isinstance(text, str) else list(text)
-        ids = [self.tokenizer.encode(row) for row in rows]
-        tokens, fields = pad_token_rows(ids)
-        return ModelInputs(jnp.asarray(tokens), jax.tree.map(jnp.asarray, fields))
-
-    def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
-        return [self.tokenizer.decode(row) for row in np.asarray(tokens)]
-
-    def encode(self, text: str, *, specials: bool) -> list[int]:
-        """`text`'s ids from the run's tokenizer, with the special tokens it adds around a sequence
-        where `specials`, and none otherwise."""
-        return self.tokenizer.encode(text, add_special_tokens=specials)
-
-    def spelling(self, ids: Sequence[int]) -> str:
-        """The text the run's tokenizer decodes `ids` to, its special tokens spelled out."""
-        return self.tokenizer.decode(list(ids))
-
-    @property
-    def bos_id(self) -> int | None:
-        """The id the run's tokenizer starts a sequence with, or None."""
-        return self.tokenizer.bos_id

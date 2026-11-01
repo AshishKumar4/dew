@@ -305,7 +305,7 @@ class Pretrained:
         if self.processor is not None or not isinstance(self.tokenizer, str):
             return self.processor
         from dew.data.text import tokenizer_for
-        from dew.inference.loading import RunProcessor
+        from dew.inference.tasks import RunProcessor
         return RunProcessor(tokenizer_for(self.tokenizer, local_files_only=True))
 
     @classmethod

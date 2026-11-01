@@ -219,7 +219,7 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
 `/tmp/pool.json` records the mesh, the losses and, for every fsdp group, the processes its devices are on:
 
 ```text
-{"processes": 4, "devices": 8, "mesh": {"data": 4, "expert": 1, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}, "fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]], "partition": {"count": 4, "readers": 1}, "placed_whole": false, "losses": [4.891427993774414, 3.6097896099090576, 2.8838775157928467], "loss_steps": [1, 2, 3]}
+{"processes": 4, "devices": 8, "mesh": {"diloco": 1, "data": 4, "expert": 1, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}, "fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]], "partition": {"count": 4, "readers": 1}, "placed_whole": false, "losses": [4.891427993774414, 3.6097896099090576, 2.8838775157928467], "loss_steps": [1, 2, 3]}
 ```
 
 Each fsdp group spans the two hosts of its replica. With `--mesh '{"fsdp": 2}'` and no `replicas`, `jax.make_mesh` gives `"fsdp_groups": [[0], [1], [2], [3]]`. Run as one process with `XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`, the worker records losses of 4.891427993774414, 3.609790086746216 and 2.8838775157928467, within 1e-6 of the pool's.

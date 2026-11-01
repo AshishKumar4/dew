@@ -26,7 +26,6 @@ import numpy as np
 from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
-from dew.state import Accumulation
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
     StepFlops,
@@ -284,12 +283,12 @@ class Interval:
         intervals' and the current interval's, read from the devices."""
         return self.clocked(None)[0]
 
-    def clocked(self, window: Accumulation | None) -> tuple[int, int]:
-        """The lifetime real tokens (`real_tokens`) and the tokens an update's open `window` holds
-        (`Accumulation.tokens`; 0 for none), in one read off the devices."""
+    def clocked(self, pending: jax.Array | None) -> tuple[int, int]:
+        """The lifetime real tokens (`real_tokens`) and the tokens an update's open window holds
+        (`pending`, `TrainState.pending_tokens`; 0 for none), in one read off the devices."""
         counted = [tokens for tokens in (self.logged_tokens, self.book.tokens if self.tokens_counted and
                                          self.book is not None else None) if tokens is not None]
-        read, held = jax.device_get((counted, None if window is None else window.tokens))
+        read, held = jax.device_get((counted, pending))
         return (self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in read),
                 0 if held is None else _TokenCount.host(held))
 

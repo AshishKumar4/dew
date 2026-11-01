@@ -144,6 +144,47 @@ print(json.dumps("dew.training.trainer" in sys.modules))
     assert json.loads(run.stdout.splitlines()[-1]) is False
 
 
+IMAGE_GENERATION = ("dew.data.images", "dew.data.audio", "dew.data.video", "dew.diffusion.presets",
+                    "dew.nn.vision", "dew.nn.autoencoders", "dew.objectives.diffusion",
+                    "dew.inference.images",
+                    *(f"dew.nn.backbones.{name}" for name in (
+                        "dit", "edm2", "flux", "flux2", "mmdit", "qwen_image", "sd3", "ssm_dit", "unet",
+                        "unet3d", "unet_condition", "uvit", "video_dit", "wan", "z_image")))
+"""Image generation's and media's modules: shared diffusion math (`dew.diffusion.process`, its schedules)
+and text encoders are any domain's."""
+
+FOREIGN = {
+    "dew.config": (*IMAGE_GENERATION, "dew.objectives.lm", "dew.decision",
+                   "dew.nn.backbones.causal_transformer"),
+    "dew.config.lm": IMAGE_GENERATION,
+    "dew.config.diffusion": ("dew.nn.backbones.causal_transformer", "dew.nn.mla", "dew.objectives.lm",
+                             "dew.data.chat"),
+    "dew.decision.config": tuple(name for name in IMAGE_GENERATION if name != "dew.nn.vision"),
+}
+"""Each run configuration's module and the modules outside its domain it must not import: an LM's no image
+diffusion, vision tower, autoencoder or media data; a diffusion model's no decoder language model or chat
+data, its text encoders' decoder blocks its own; a decision task's no image generation or autoencoder,
+the vision towers its multimodal reader reads its own (row 2042)."""
+
+
+@pytest.mark.parametrize("module", sorted(FOREIGN))
+def test_a_run_configuration_imports_its_own_domain_alone(module):
+    """A run configuration's module imports, in a fresh interpreter, none of the modules outside its
+    domain (`FOREIGN`): a change there re-runs none of its tests."""
+    script = f"""
+import json, sys
+import {module}
+print(json.dumps(sorted(sys.modules)))
+"""
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    loaded = json.loads(run.stdout.splitlines()[-1])
+    foreign = FOREIGN[module]
+    assert [name for name in loaded
+            if name in foreign or name.startswith(tuple(f"{prefix}." for prefix in foreign))] == []
+
+
 def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
     """Only `dew.rl` and `dew.objectives.rl` import `dew.rl`, and `dew.rl` imports nothing of
     `dew.training` (docs/design/architecture.md). The test reads every module's imports, absolute
@@ -182,7 +223,11 @@ def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
 
 
 @pytest.mark.parametrize(("package", "read"), [("dew.sampling", "text.Sampling"),
-                                               ("dew.nn.backbones", "dit.SimpleDiT")])
+                                               ("dew.nn.backbones", "dit.SimpleDiT"),
+                                               ("dew.data", "images.DecodeImage"),
+                                               ("dew.data", "presets.sft"),
+                                               ("dew.diffusion", "presets.EDM"),
+                                               ("dew.diffusion", "discrete.DiscreteProcess")])
 def test_a_lazy_packages_modules_read_through_it_as_an_eager_packages_did(package, read):
     """A lazily exporting package (`dew._exports`) reads each of its modules that defines an export as
     its attribute, in a fresh interpreter that imported the package alone, as its eager imports bound
@@ -191,6 +236,19 @@ def test_a_lazy_packages_modules_read_through_it_as_an_eager_packages_did(packag
     script = (f"import importlib, {package}\n"
               f"assert getattr({package}.{module}, {name!r}) is getattr(importlib.import_module("
               f"'{package}.{module}'), {name!r})\n")
+    subprocess.run([sys.executable, "-c", script], check=True,
+                   env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
+
+
+@pytest.mark.parametrize(("package", "modules"), [("dew.data", ("audio", "chat", "images", "preferences",
+                                                                "presets", "prompts", "text", "video")),
+                                                   ("dew.diffusion", ("discrete", "presets"))])
+def test_a_lazy_packages_star_import_binds_its_modules_as_its_eager_one_did(package, modules):
+    """`from package import *` binds each module the package exported when it imported them eagerly, each
+    the module itself, in a fresh interpreter."""
+    script = (f"import importlib\nfrom {package} import *\n"
+              f"assert all(globals()[name] is importlib.import_module('{package}.' + name)\n"
+              f"           for name in {modules!r})\n")
     subprocess.run([sys.executable, "-c", script], check=True,
                    env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
 

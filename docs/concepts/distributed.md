@@ -59,6 +59,7 @@ Each `MeshSpec` field sets how many devices one axis gets, and the `data` axis g
 
 | Axis | `MeshSpec` field | Splits |
 |---|---|---|
+| `diloco` | `diloco` | DiLoCo's replica groups (`Trainer(diloco=DiLoCo(every))`): each group trains its own copy of the model on its own batch rows, and the groups average every `every` updates |
 | `data` | (the remainder) | Batch rows; parameters are replicated over it |
 | `expert` | `expert` | The expert dimension of mixture-of-experts layers, and batch rows |
 | `fsdp` | `fsdp` | Parameter dimensions the layout assigns to it, and batch rows |
@@ -75,9 +76,9 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 ```
 
 ```text
-{'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
+{'diloco': 1, 'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
 ```
 
 `MeshSpec` also has `replicas` (host groups the data axis spans; see [Multiple hosts](../guides/multi-node.md)).
@@ -185,6 +186,14 @@ Host-parameter placement works only for decoder stack variables. Dew rejects a s
 Every host-resident weight you select is copied to the device on each forward pass, including every decode step, so PCIe transfers can take most of the time per token. `tools/benchmark_host_offload.py` reports local addressable-shard bytes, the device and host compiled-memory fields, process RSS and execution times. Its bytes per token divided by the decode latency is an end-to-end effective rate, not a measurement of PCIe bandwidth alone.
 
 An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_layers=8`) reported 18.74 GiB final RSS and 37.9 GiB peak RSS. The saved load probe synchronized every bank, so a backlog of asynchronous work alone cannot explain that peak. The numbers do not separate temporary storage, allocator reservation and duplicate driver mappings. There is no completed result yet for generating on a GPU with a model larger than device memory, and no throughput result. Looking further into the allocator needs a small process tree with a hard memory cap, swap accounting and RSS/PSS measurements. The earlier oversized runs with an RSS watchdog are not a safe way to do it.
+
+## GPU memory outside XLA's pool
+
+XLA preallocates a share of each GPU's memory as its pool. A Dew training process takes 95% unless `XLA_PYTHON_CLIENT_MEM_FRACTION` names another share. A step's collectives allocate their NCCL communicators outside that pool, on the step's first run. cuBLAS's workspaces and the loaded kernels are also allocated there. Each communicator takes its channels' buffers. The plan's fit check covers the pool alone, so a share that leaves too little room outside the pool fails the first run on more than one GPU.
+
+When that failure surfaces as an error, Dew raises it as the step's (`dew.training.memory.FirstRunFailed`). The error includes each GPU's free bytes outside the pool, labelled `outside`, both at the fit check and after the failure. When a GPU instead stalls before it joins the collective, XLA ends the process after waiting 40 seconds for its peers. A first run that succeeds logs each GPU's free bytes outside the pool at the fit check and after the run. The CUDA driver reports that figure for the whole device, so the change counts every process's allocations and a growing pool's growth, as well as the step's communicators.
+
+For example, a LoRA fine-tune of Qwen3.5-9B on two H100s with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.97` left 2,264 MiB free outside the pool on a GPU. Its step's collectives used two communicators, each with 24 collective channels, 32 point-to-point channels per peer and 16 NVLS channels. That did not fit: the first run failed. A full fine-tune of Qwen3.5-4B used one communicator and ran. JAX's documentation gives the remedy: lowering the preallocated share fixes out-of-memory errors at program start.
 
 ## Rematerialization
 

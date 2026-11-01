@@ -35,8 +35,8 @@ from dew.rl.flight import (
     corners,
     developed,
     drawn_course,
-    dynamics,
     nearest,
+    physics,
     privileged,
     quaternion,
     raced,
@@ -742,13 +742,13 @@ def test_an_asset_comes_out_of_hyperluxs_loader_as_it_was_made(tmp_path):
 
 def test_a_drone_whose_drag_and_disturbances_are_off_shows_them_neutral():
     """A quadrotor with its rotor, quadratic and vertical drag and its constant disturbances turned off: every
-    drone's dynamics view holds those terms at their neutral values exactly (each drag at the nominal's, 1;
+    drone's physics view holds those terms at their neutral values exactly (each drag at the nominal's, 1;
     each disturbance 0) and every other entry finite, so a teacher's view and a world model's target are
     numbers."""
     off = Quadrotor(rotor_drag=0.0, quadratic_drag=(0.0, 0.0), vertical_drag=0.0, bias_force=0.0,
                     bias_moment=0.0)
     racing = Racing(quadrotor=off)
-    shown = np.asarray(jax.vmap(lambda race: dynamics(racing, race))(races(racing, 9, 64)))
+    shown = np.asarray(jax.vmap(lambda race: physics(racing, race))(races(racing, 9, 64)))
     np.testing.assert_array_equal(shown[:, 7:11], np.ones((64, 4), shown.dtype))
     np.testing.assert_array_equal(shown[:, 14:], np.zeros((64, 6), shown.dtype))
     assert np.isfinite(shown).all()

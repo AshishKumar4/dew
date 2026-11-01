@@ -1338,10 +1338,13 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
 def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
     """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
     is out of its way (`dew.cache.uncached`): a cache that a program here writes to gains nothing from
-    the topology's compile, and the next program here writes to it again."""
+    the topology's compile, and the next program here writes to it again. The trainer is built before
+    the cache is read, as its key is drawn by a program of this host's, which the cache keeps (ledger
+    3174: alone in its process the test saw that program's entries)."""
     from jax.experimental.compilation_cache import compilation_cache
 
     from dew.cache import enable_compilation_cache
+    from dew.training.ahead import compile_ahead
 
     monkeypatch.setenv("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))
     settings = ("jax_compilation_cache_dir", "jax_enable_compilation_cache",
@@ -1351,10 +1354,12 @@ def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_pa
         jax.config.update("jax_enable_compilation_cache", val=True)
         enable_compilation_cache(str(tmp_path / "cache"))
         compilation_cache.reset_cache()
+        trainer = _topology_trainer("v5e:2x2")
         jax.jit(lambda x: x * 3.0).lower(1.0).compile()
         written = sorted((tmp_path / "cache").iterdir())
         assert written
-        assert _topology_ahead("v5e:2x2").executable
+        rows = np.zeros((trainer.device_mesh.devices.size, 65), np.int32)
+        assert compile_ahead(trainer, {"text": rows}).executable
         assert sorted((tmp_path / "cache").iterdir()) == written
         jax.jit(lambda x: x * 5.0).lower(1.0).compile()
         assert len(list((tmp_path / "cache").iterdir())) > len(written)

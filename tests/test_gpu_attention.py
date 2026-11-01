@@ -41,16 +41,12 @@ import test_attention_triton as triton
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import Cell, cells_of, repeats_bit_for_bit, run_cells, when
+from gpu_flow import BF16_PRODUCTS, Cell, cells_of, repeats_bit_for_bit, run_cells, when
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
 
 pytestmark = pytest.mark.gpu(reason="each route's GPU kernel: Triton, Mosaic, flash and the band")
-
-BF16_PRODUCTS = "needs a GPU whose bf16 products run, sm80 or later"
-"""Why a library kernel's cell skips: flash, cuDNN, tokamax's Triton and the band run wherever bf16 products
-do (`bf16_dot_runs`), an A10 and an L4 among them, whatever Dew's own launches' sizes."""
 
 CASES = ("causal-documents-window", *triton.IRREGULAR)
 """The Triton sweeps' calls (`triton.every_config_on_a_gpu`)."""
@@ -181,9 +177,13 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
     ])
 
 
+@pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_mosaic_template_holds_on_an_h100():
     """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
-    long sequence, each one's failure kept and all raised together."""
+    long sequence, each one's failure kept and all raised together, without XLA's deterministic ops: the
+    fused backward forms its cells pin add dQ atomically, which a deterministic run never derives
+    (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's `_repeat_promised`) they
+    failed as unpaired draws (row 3171)."""
     run_cells([
         *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
