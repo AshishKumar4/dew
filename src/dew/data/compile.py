@@ -622,9 +622,10 @@ class _Measured:
     branches: tuple[Pipeline, ...]
     metadata: Mapping[str, object] | None
     counts: tuple[dict[str, CorpusCounts], ...]
-    ahead: bool = False
-    """Whether its training read is bounded ahead of the expansion its memory would hold, to a count set
-    once it holds the examples (`_UNCOUNTED`, `_staged`)."""
+    ahead: str | None = None
+    """Where its training read is bounded ahead of what its memory would hold (`_held_ahead`): its
+    expansion, to a count set once it holds the examples (`_UNCOUNTED`, `_staged`), or its pack, the bound
+    held with it, its passes counted as it holds them (`Limit.passes`); None for neither."""
 
 
 def _measure(
@@ -662,10 +663,12 @@ def _measure(
         )
     # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
     # a count set once it holds them (`_staged`).
-    ahead = epochs is not None and training and _holds_expansion(branches[0], read)
-    examples = _UNCOUNTED if ahead else examples
+    ahead = None if epochs is None or not training else _held_ahead(branches[0], read)
+    examples = _UNCOUNTED if ahead is not None else examples
     if examples is not None and training:
         branches = (_bounded(branches[0], examples), *branches[1:])
+        if ahead == "layout":
+            branches = (_rebound(branches[0], _UNCOUNTED, epochs), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
@@ -850,7 +853,12 @@ def _staged(
         validation = None
     build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     passes = None
-    if epochs is not None and measured.ahead:
+    if epochs is not None and measured.ahead == "layout":
+        # The bound it held with its pack counted its passes as it held the documents (`Limit.passes`).
+        count = _held_count(train)
+        passes = count // epochs
+        original = _rebound(original, count)
+    elif epochs is not None and measured.ahead == "expansion":
         # Bounded before the expansion it would hold, it now holds the examples a pass reaches it with.
         passes = _pass_examples(train, read)
         if passes is not None:
@@ -871,26 +879,44 @@ _UNCOUNTED = 1 << 62
 count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
 
 
-def _holds_expansion(train: Pipeline, read: Read) -> bool:
-    """Whether a memory read would make rows of its source examples as it holds them (an objective's
-    expansion among the steps it runs over its whole source, `_EAGER`): a bound in examples stands before
-    that step (`_bounded`), so a run of epochs bounds it there before it holds anything."""
+def _held_ahead(train: Pipeline, read: Read) -> str | None:
+    """Where a run of epochs bounds a memory read before it holds anything, as a run bounded in examples
+    does (`_bounded`), its bound standing among the steps the read runs over its whole source (`_EAGER`):
+    "expansion" where the read would make rows of its source examples as it holds them, the bound then
+    ahead of that step, its count set once the read holds the rest (`_UNCOUNTED`, `_rebound`); "layout"
+    where it would pack them as it holds them and reads the windows per share after (an objective's rows),
+    the bound held with the pack, its passes counted as the read holds the documents (`Limit.passes`).
+    None for any other read, whose pass is counted once it is prepared (`_staged`)."""
     if read != "memory" or isinstance(train.source, (Mixture, Phases)):
-        return False
+        return None
     eager = next((index for index, stage in enumerate(train.stages)
                   if not isinstance(stage, (*_EAGER, Configured))), len(train.stages))
     batched = _until(train.stages, (BatchStage, TokenBudget))
     at = next((index for index, stage in enumerate(train.stages[:batched])
                if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
-    return at < eager and _expands(train.stages[at])
+    if at >= eager:
+        return None
+    if _expands(train.stages[at]):
+        return "expansion"
+    after = dataclasses.replace(train, stages=train.stages[eager:])
+    return "layout" if isinstance(train.stages[at], Pack) and _analyzed(after, read).per_share else None
 
 
-def _rebound(pipeline: Pipeline, examples: int) -> Pipeline:
-    """`pipeline`, bounded (`_bounded`), its bound's limit `examples`."""
+def _rebound(pipeline: Pipeline, examples: int, passes: int | None = None) -> Pipeline:
+    """`pipeline`, bounded (`_bounded`), its bound's limit `examples`, or `passes` over the rows reaching
+    it, which a memory read holding them counts (`Limit.passes`)."""
     at = examples_bound(pipeline.stages)
     assert at is not None and isinstance(pipeline.stages[at - 1], Limit)
-    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at - 1], Limit(examples),
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at - 1], Limit(examples, passes),
                                                  *pipeline.stages[at:]))
+
+
+def _held_count(train: Pipeline) -> int:
+    """The examples a memory read's held bound resolved to (`Limit.passes`), as the stages it ran state."""
+    ran = _written(train.source, ())
+    at = examples_bound(ran)
+    assert at is not None and isinstance(ran[at - 1], Limit), "a held bound is among the stages it ran"
+    return ran[at - 1].count
 
 
 def _output_batch(pipeline: Pipeline) -> int:

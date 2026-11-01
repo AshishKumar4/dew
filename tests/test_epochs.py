@@ -439,12 +439,11 @@ def test_epochs_count_no_pass_where_a_step_after_a_repeat_drops_records():
         Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
 
 
-def test_epochs_count_no_pass_of_a_memory_read_that_packs_its_examples_as_it_holds_them():
+def test_epochs_of_a_memory_read_that_packs_its_examples_as_it_holds_them_are_passes_over_its_documents():
     """Documents a memory read packs as it holds them, before a shuffle, then an objective makes two rows of
-    each window, so its read has no record count: its held windows are no source examples a bound could
-    count before the pack, which a run bounded in examples refuses too, so no pass is stated and a run of
-    epochs over it is refused, where counting the windows would clock them as examples (row 1902's
-    review)."""
+    each window, so its read has no record count: an epoch is a pass over its 10 documents, which the read
+    holds twice for two epochs, its bound held with its pack (`Limit.passes`), so the run trains on the
+    examples clock to 20 of them (row 1902)."""
     import optax
 
     from dew.data.compile import fitted
@@ -460,6 +459,6 @@ def test_epochs_count_no_pass_of_a_memory_read_that_packs_its_examples_as_it_hol
     documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
     chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(8)
     loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
-    assert (loader.records, loader.epochs, loader.pass_examples) == (None, None, None)
-    with pytest.raises(ValueError):
-        Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert (loader.records, loader.epochs, loader.pass_examples, loader.examples) == (None, 2, 10, 20)
+    state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 20

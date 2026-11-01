@@ -50,6 +50,7 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
+    MarkConsumed,
     Measure,
     Mixture,
     Native,
@@ -632,6 +633,19 @@ _EAGER = (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)
 """The stages a memory read runs over the whole source before the first other stage."""
 
 
+def _held_bound(stages: Sequence[Stage], at: int) -> int:
+    """The stages of a bound in examples standing at `at` before a pack a memory read runs over its whole
+    source (`dew.data.compile._bounded`: a repeat without a count where it reads on, its limit and its
+    marks): the memory read runs them as it holds the rest, the source examples cycled to the limit and
+    marked before the pack lays them out, so the pack's windows carry the examples they consume. None (0)
+    where no such bound stands there."""
+    repeats = int(at < len(stages) and isinstance(stages[at], Repeat) and stages[at].epochs is None)
+    bound = stages[at + repeats:at + repeats + 3]
+    marked = (len(bound) == 3 and isinstance(bound[0], Limit) and isinstance(bound[1], Map)
+              and isinstance(bound[1].step, MarkConsumed) and isinstance(bound[2], Pack))
+    return repeats + 2 if marked else 0
+
+
 _LOCAL = (Map, MapWithIndex, Filter, FlatMap)
 """The deterministic record steps that run before a cache or an interleave,
 inside the reader of each input or shard."""
@@ -869,8 +883,11 @@ def _analyzed(
     # source first, as it does without a cache, and the cache holds the rest.
     viewed = cache is not None and any(isinstance(stage, _VIEWS) for stage in stages[:cache])
     eager = 0 if cache is None or viewed else cache + 1
-    while read == "memory" and not nested and eager < len(stages) and isinstance(stages[eager], _EAGER):
-        eager += 1
+    while read == "memory" and not nested and eager < len(stages):
+        held = 1 if isinstance(stages[eager], _EAGER) else _held_bound(stages, eager)
+        if not held:
+            break
+        eager += held
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)

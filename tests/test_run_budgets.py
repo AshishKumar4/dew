@@ -184,6 +184,44 @@ def bound_read(
     return read, consumed
 
 
+class Twice:
+    """An objective's step that makes two rows of each packed window (`FlatMap.examples`)."""
+
+    identity = "twice@1"
+
+    def flat_map(self, element):
+        return (element, element)
+
+
+@pytest.mark.parametrize("expands", [False, True])
+@pytest.mark.parametrize("examples", [7, 10, 23])
+def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(examples, expands):
+    """Ten documents a memory read packs as it holds them, before a global shuffle of its windows, read
+    alone or through an objective that makes two rows of each window after: bounded to 7, 10 or 23
+    examples, it holds that many documents, cycling them past a pass, and packs those, each window
+    consuming the documents it ends (`EXAMPLES_CONSUMED`), so a read of it consumes the bound whole, each
+    document's tokens held as many times as the bound reads it (row 1902)."""
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    objective = ObjectiveData(train=(Twice(),)) if expands else None
+    loader = compile(chain, read="memory", examples=examples, objective=objective)
+    stream = loader.train(DataPartition())
+    consumed, tokens = 0, collections.Counter()
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+            for row in np.asarray(batch["id"])[real][::2 if expands else 1]:
+                tokens.update(int(token) for token in row if token)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert consumed == examples
+    reads = [examples // 10 + (index < examples % 10) for index in range(10)]
+    assert tokens == collections.Counter({index: reads[index] * (index % 3 + 2)
+                                          for index in range(1, 10) if reads[index]})
+
+
 @pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
 @pytest.mark.parametrize("kind", ["memory", "parquet"])
 @pytest.mark.parametrize("examples", [15, 7, 20])

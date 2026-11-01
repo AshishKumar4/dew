@@ -31,6 +31,7 @@ from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
+    _ConsumedAt,
     _counts_rows,
     _fill,
     _Locality,
@@ -41,8 +42,11 @@ from dew.data.lowering import (
 )
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
+    ACCOUNTS,
+    CONSUMED,
     Artifact,
     FlatMap,
+    Limit,
     Map,
     Mixture,
     Pack,
@@ -50,6 +54,7 @@ from dew.data.pipeline import (
     Pipeline,
     Record,
     Rejected,
+    Repeat,
     Stage,
     TokenSplit,
     Windows,
@@ -226,10 +231,16 @@ def _memory_stages(
                                for stage in pipeline.stages[:consumed])
     # The layout facts are numbered by the stages the chain wrote, a cache the compiler placed none.
     placed = consumed - len(written(pipeline.stages[:consumed]))
+    # The rows a bound's repeat reads on over, which its limit cycles (`analysis._held_bound`).
+    cycled: list[tuple[tuple[int, ...], Record]] | None = None
     for stage in pipeline.stages[consumed:eager]:
         counting = counting or isinstance(stage, (Windows, Pack)) or (
             isinstance(stage, Map) and isinstance(stage.step, CountTargets))
-        if isinstance(stage, TokenSplit):
+        if isinstance(stage, Repeat):
+            cycled = rows
+        elif isinstance(stage, Limit):
+            rows, pipeline = _limited(pipeline, consumed, rows, cycled)
+        elif isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
@@ -253,7 +264,8 @@ def _memory_stages(
                 [list(identifier) for identifier, _ in rows]
             )
             rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
-            documents = tuple(stage.document(record(value, "packing document")) for _, value in rows)
+            marked = any(isinstance(value, Mapping) and CONSUMED in value for _, value in rows)
+            stage, documents = _documents(stage, rows, marked=marked)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             refuse_overlong(sizes, stage, source.describe())
             if stage.policy == "first-fit" and not stage.along:
@@ -315,22 +327,68 @@ def _memory_stages(
                          counted=counted)
 
 
+def _limited(pipeline: Pipeline, at: int, rows: list[tuple[tuple[int, ...], Record]],
+             cycled: list[tuple[tuple[int, ...], Record]] | None,
+             ) -> tuple[list[tuple[tuple[int, ...], Record]], Pipeline]:
+    """The rows a bound's limit at `at` keeps, as a memory read holds them (`analysis._held_bound`): its
+    count of the rows, or of the rows a repeat before it reads on over (`cycled`), pass after pass, each
+    pass's rows numbered by it; a run of epochs's limit its passes over them (`Limit.passes`), which the
+    stages the read ran state as the count it resolves to."""
+    stage = pipeline.stages[at]
+    assert isinstance(stage, Limit)
+    held = rows if cycled is None else cycled
+    count = stage.count if stage.passes is None else stage.passes * len(held)
+    if stage.passes is not None:
+        pipeline = dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], Limit(count),
+                                                         *pipeline.stages[at + 1:]))
+    if cycled is None:
+        return rows[:count], pipeline
+    turns = -(-count // len(held)) if held else 0
+    passes = [((*identifier, turn), value) for turn in range(turns) for identifier, value in held]
+    return passes[:count], pipeline
+
+
+def _documents(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], *, marked: bool,
+               ) -> tuple[Pack, tuple[Record, ...]]:
+    """The documents a held pack lays out, and the pack that lays them: where a bound marked the rows
+    (`analysis._held_bound`), each document's marks ride its last token (`_ConsumedAt`), packed beside
+    its fields, which the window that holds it sums."""
+    if not marked:
+        return stage, tuple(stage.document(record(value, "packing document")) for _, value in rows)
+    laid = _ConsumedAt(stage.fields[0])
+    carried = dataclasses.replace(stage, fields=(*stage.fields, *ACCOUNTS))
+    return carried, tuple(carried.document(record(laid(record(value, "packing document")), "marked document"))
+                          for _, value in rows)
+
+
 def _targeted(
     rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str, rule: CountRule | None
 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
     """The windows a pack or windows stage made that hold a valid target of
     their token `field`, each counted by the rule their documents were (`counted_window`),
-    and their total, as an indexed or streamed read accepts them."""
+    and their total, as an indexed or streamed read accepts them. Windows of documents a bound in
+    examples marked (`ACCOUNTS`, at each document's last token) hold their sums, one count a window, and
+    a window left out passes its counts to the next kept, the last kept taking what none after holds, so
+    the kept windows consume every example the bound read."""
 
     kept, total = [], 0
+    owed = dict.fromkeys(ACCOUNTS, 0)
     for identifier, value in rows:
         window = counted_window(record(value, "packed window"), rule, field)
+        if CONSUMED in window:
+            window = {**window, **{name: int(np.sum(window[name])) + owed[name] for name in ACCOUNTS}}
+            owed = dict.fromkeys(ACCOUNTS, 0)
         count = ValidTargets(field)(window)
         if count:
             kept.append((identifier, window))
             total += count
         else:
             counter.rejected["zero_targets"] += 1
+            owed = {name: owed[name] + integer(window.get(name, 0), name) for name in ACCOUNTS}
+    if any(owed.values()) and kept:
+        identifier, last = kept[-1]
+        kept[-1] = (identifier, {**last, **{name: integer(last[name], name) + owed[name]
+                                            for name in ACCOUNTS}})
     return kept, {"valid_targets": total}
 
 
