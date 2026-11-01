@@ -600,8 +600,11 @@ class TrainerConfig:
     xla_flags: str | None = None
     """Extra XLA_FLAGS for this run, appended to the environment by `prepare_process`.
 
-    `prepare_process` appends them before JAX opens a backend. Library users set
-    XLA_FLAGS themselves; docs/performance.md records what was measured.
+    `dew train` sets them in XLA_FLAGS before the process loads jaxlib, so they hold
+    for every runtime XLA loads (`dew.devices.hold_xla_flags`); `prepare_process`
+    appends them before JAX opens a backend, unproven where jaxlib has loaded.
+    Library users set XLA_FLAGS before the process starts to make them certain;
+    docs/performance.md records what was measured.
     """
     quantization: Quantization | None = None
     """The quantized-training spec, wrapped around the module the objective trains.

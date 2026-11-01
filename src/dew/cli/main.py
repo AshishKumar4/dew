@@ -190,6 +190,17 @@ def run_named(named: str, trust: tuple[str, ...]) -> RunConfig:
     return built if built.unrecorded() else RunConfig.read(built.record(), trust=(*trust, path.stem))
 
 
+def run_held(named: str, trust: tuple[str, ...], assigned: tuple[str, ...]) -> RunConfig:
+    """The run `named` names (`run_named`) with its `assigned` fields, its `trainer.xla_flags` held for every
+    runtime XLA loads: where they do not hold, the command runs again from its start with them in XLA_FLAGS
+    (`dew.devices.hold_xla_flags`), as `import dew` loads jaxlib before the run is read."""
+    from dew.devices import hold_xla_flags
+
+    run = run_named(named, trust).assigned(assigned)
+    hold_xla_flags(run.trainer.xla_flags)
+    return run
+
+
 @dataclasses.dataclass(frozen=True)
 class Train:
     """Train a run: the one a Python file builds, or the one a run's `run.json` records."""
@@ -203,7 +214,7 @@ class Train:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        run_named(self.run, self.trust).assigned(self.set).run()
+        run_held(self.run, self.trust, self.set).run()
         return 0
 
 
@@ -241,8 +252,8 @@ class Profile:
         given = {"host_tracer_level": self.host_tracer_level, "python_tracer_level": self.python_tracer_level,
                  "activity_cap": self.activity_cap}
         capture = CaptureOptions(**{name: value for name, value in given.items() if value is not None})
-        report = run_named(self.run, self.trust).assigned(self.set).profile(self.out, warmup=self.warmup,
-                                                                            steps=self.steps, capture=capture)
+        report = run_held(self.run, self.trust, self.set).profile(self.out, warmup=self.warmup,
+                                                                  steps=self.steps, capture=capture)
         if report is not None:
             emit(report.text())
         return 0
@@ -262,7 +273,7 @@ class Inspect:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        emit(json.dumps(run_named(self.run, self.trust).assigned(self.set).inspected(), sort_keys=True))
+        emit(json.dumps(run_held(self.run, self.trust, self.set).inspected(), sort_keys=True))
         return 0
 
 
