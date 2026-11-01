@@ -20,6 +20,7 @@ from dew._exports import lookup as _lookup
 from dew.data import storage as storage
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew.data import audio, chat, images, preferences, presets, prompts, text, video
     from dew.data.chat import Role
     from dew.data.dataset import Loading
     from dew.data.pipeline import Dataset, Rejected, concat, mix, phases, schedule
@@ -38,6 +39,14 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.data.text import ByteTokenizer, HFTokenizer
 
 _EXPORTS = {
+    "audio": "dew.data.audio",
+    "chat": "dew.data.chat",
+    "images": "dew.data.images",
+    "preferences": "dew.data.preferences",
+    "presets": "dew.data.presets",
+    "prompts": "dew.data.prompts",
+    "text": "dew.data.text",
+    "video": "dew.data.video",
     "Role": "dew.data.chat",
     "Loading": "dew.data.dataset",
     "Dataset": "dew.data.pipeline",
@@ -75,12 +84,20 @@ __all__ = [
     "Rejected",
     "Role",
     "Source",
+    "audio",
+    "chat",
     "concat",
     "from_grain",
     "from_hf",
     "from_iter",
     "from_torch",
+    "images",
     "mix",
     "phases",
+    "preferences",
+    "presets",
+    "prompts",
     "schedule",
+    "text",
+    "video",
 ]

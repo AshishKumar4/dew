@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew.diffusion import discrete, presets
     from dew.diffusion.process import Denoiser, Process
     from dew.diffusion.schedules import (
         ContinuousNoiseScheduler,
@@ -46,6 +47,8 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     )
 
 _EXPORTS = {
+    "discrete": "dew.diffusion.discrete",
+    "presets": "dew.diffusion.presets",
     "Denoiser": "dew.diffusion.process",
     "Process": "dew.diffusion.process",
     "ContinuousNoiseScheduler": "dew.diffusion.schedules",
@@ -105,6 +108,8 @@ __all__ = [
     "Weighting",
     "broadcast_rates",
     "cosine_beta_schedule",
+    "discrete",
     "expand",
     "linear_beta_schedule",
+    "presets",
 ]
