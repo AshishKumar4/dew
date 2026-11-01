@@ -18,8 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, exported, kimi_source
-from one_draw import assert_as_exact_as_the_reference
+from kimi_support import assert_greedy_as_exact, assert_logits_as_recorded, exported, kimi_source
 from reference_error import ieee_fixture
 
 from dew.interop import Pretrained
@@ -45,13 +44,10 @@ def test_situ_matches_the_released_activation():
 
 
 def test_forward_matches_the_reference_over_left_padding(source):
-    """fp32 logits over 70 tokens (past one KDA chunk), one row left-padded
-    by 9, against fla 0.5.2 on CUDA with its intra-chunk solve in IEEE fp32
-    (tools/kimi_k3_reference.py): Dew's RMS distance from the float64
-    logits at most twice the reference's, and argmax exact. Observed RMS
-    from float64: Dew 1.67e-6, the reference 1.97e-6 (ratio 0.85 on CPU,
-    0.87 on an RTX 4080, 0.89 on an RTX 3090)."""
-    assert_forward_as_exact(source)
+    """fp32 logits over drawn batches of 70 tokens (past one KDA chunk), one row left-padded by 9, on par
+    with fla 0.5.2's on CUDA with its intra-chunk solve in IEEE fp32 over the recorded seeds (check 1,
+    `assert_logits_as_recorded`; tools/kimi_k3_reference.py seeds), Dew's float64 forward the truth."""
+    assert_logits_as_recorded(source, TINY, "logits")
 
 
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
@@ -103,21 +99,10 @@ def test_cached_prefill_and_token_steps_are_as_exact_as_the_reference(source):
     the KDA state and the MLA cache: its logits are held to the reference
     forwards' distance from float64, the reference read at the shapes the
     steps compute (`stepped_logits`: the prefill's from one forward over it,
-    each later token's from one over the row up to it; ledger 1543), as the
-    parallel forward is held to the whole forward's."""
-    loaded, inputs, reference = source
-    model, variables = loaded.model, loaded.variables
-    ids = inputs.tokens[:1]
-    state = model.apply(variables, 1, method="init_cache", mutable=["cache"])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :40], decode=True, mutable=["cache"])
-    pieces = [np.asarray(out)]
-    for index in range(40, ids.shape[1]):
-        out, state = model.apply(
-            {**variables, **state}, ids[:, index : index + 1], decode=True, mutable=["cache"]
-        )
-        pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1)[0], reference["stepped_logits"][0],
-                                     reference["logits_f64"][0], "cached decode")
+    each later token's from one over the row up to it; ledger 1543), over the recorded seeds' drawn
+    rows (check 1, `assert_logits_as_recorded`), as the parallel forward is held to the whole
+    forward's."""
+    assert_logits_as_recorded(source, TINY, "stepped")
 
 
 @pytest.mark.parametrize("param_dtype", ["bfloat16", "auto"])

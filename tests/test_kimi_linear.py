@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, exported, kimi_source
+from kimi_support import assert_greedy_as_exact, assert_logits_as_recorded, exported, kimi_source
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "kimi-linear-tiny"
@@ -29,14 +29,10 @@ def source():
 
 
 def test_forward_matches_the_reference_over_left_padding(source):
-    """fp32 logits over 70 tokens (past one KDA chunk), one row left-padded
-    by 9, against fla 0.4.0 on CUDA in IEEE fp32
-    (tools/kimi_linear_reference.py): Dew's RMS distance from the float64
-    logits at most twice the reference's, and argmax exact. The reference
-    sits 1.04e-6 from float64 (RMS); Dew at 0.88 of that on CPU, 0.79 on an
-    AVX-512 CPU (Intel SDE's Ice Lake server, the CI runners' ISA) and 0.68
-    on an RTX 4080."""
-    assert_forward_as_exact(source)
+    """fp32 logits over drawn batches of 70 tokens (past one KDA chunk), one row left-padded by 9, on par
+    with fla 0.4.0's on CUDA in IEEE fp32 over the recorded seeds (check 1, `assert_logits_as_recorded`;
+    tools/kimi_linear_reference.py seeds), Dew's float64 forward the truth."""
+    assert_logits_as_recorded(source, TINY, "logits")
 
 
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):

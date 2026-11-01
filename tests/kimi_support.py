@@ -9,9 +9,17 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from model_support import parameter_loss
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import FACTOR, assert_as_exact_over_orders, distance, ieee_fixture
+from model_support import as_stepped, parameter_loss
+from reference_error import (
+    FACTOR,
+    as_given,
+    assert_as_exact,
+    assert_as_exact_over_orders,
+    distance,
+    ieee_fixture,
+    indexed_recording,
+    recording,
+)
 from residual_orders import permuted
 from scipy.special import log_softmax
 
@@ -32,16 +40,74 @@ def kimi_source(directory: Path) -> tuple[Pretrained, ModelInputs, dict[str, np.
     return loaded, inputs, reference
 
 
-def assert_forward_as_exact(source) -> None:
-    """The real tokens' logits as exact as the reference's from float64, with its argmax."""
-    loaded, inputs, reference = source
-    valid = reference["attention_mask"].astype(bool)
-    logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(
-        loaded.variables
-    )
-    assert_as_exact_as_the_reference(np.asarray(logits)[valid], reference["logits"][valid],
-                                     reference["logits_f64"][valid], "logits")
-    np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
+RECORDING = "recording.npz"
+"""Each fixture's check-1 evidence of the reference's logits over drawn batches (`drawn_batch`), written by
+its tool's `seeds` command (tools/kimi_k3_reference.py's `record_forward_seeds`)."""
+
+STEPPED_PREFILL = 40
+"""The prefill of a cached decode the recording's 'stepped' leaf scores (`stepped_logits`)."""
+
+
+def drawn_batch(seed: int) -> dict[str, np.ndarray]:
+    """A seed's batch of the fixtures' geometry: two rows of 70 ids past the specials, past one 64-token KDA
+    chunk, the second left-padded by 9, a stream of its own for each seed."""
+    ids = np.random.default_rng([0x3755, seed]).integers(3, 512, (2, 70)).astype(np.int32)
+    mask = np.ones_like(ids)
+    ids[1, :9], mask[1, :9] = 0, 0
+    return {"input_ids": ids, "attention_mask": mask}
+
+
+def _forward(model, variables, inputs) -> jax.Array:
+    """Each valid position's logits of `model` over a batch (`drawn_batch`)."""
+    logits = model.apply(variables, jnp.asarray(inputs["input_ids"]),
+                         attention_mask=jnp.asarray(inputs["attention_mask"], bool))
+    return logits[jnp.asarray(inputs["attention_mask"], bool)]
+
+
+def stepped_logits(model, variables, row) -> jax.Array:
+    """`row`'s logits `[tokens, vocab]` from a cached decode: its first `STEPPED_PREFILL` tokens prefilled,
+    then a token a step through the cache."""
+    state = model.apply(variables, 1, method="init_cache", mutable=["cache"])[1]
+    out, state = model.apply({**variables, **state}, row[None, :STEPPED_PREFILL], decode=True,
+                             mutable=["cache"])
+    pieces = [out[0]]
+    for index in range(STEPPED_PREFILL, row.shape[0]):
+        out, state = model.apply({**variables, **state}, row[None, index:index + 1], decode=True,
+                                 mutable=["cache"])
+        pieces.append(out[0])
+    return jnp.concatenate(pieces)
+
+
+def assert_logits_as_recorded(source, directory: Path, leaf: str) -> None:
+    """Check 1 of Dew's float32 logits against the reference's recorded over drawn batches (`RECORDING`):
+    'logits', each valid position's of a batch's forward; 'stepped', the first row's from Dew's cached
+    decode (`stepped_logits`), against the reference's forwards at the shapes the decode computes them
+    (ledger 1543). Dew's own float64 forward is the truth, held to the recorded truth's sketch."""
+    loaded = source[0]
+    model, variables = loaded.model, loaded.variables
+    stored = recording(directory / RECORDING)
+    seeds = int(stored["forward.seeds"])
+    forward = jax.jit(lambda inputs: _forward(model, variables, inputs))
+    if leaf == "logits":
+        dew = as_given(lambda index, inputs: {"logits": forward(inputs)})
+    else:
+        dew = as_given(lambda index, inputs: {"stepped": stepped_logits(
+            model, variables, jnp.asarray(inputs["input_ids"][0]))})
+    with jax.enable_x64(new_val=True):
+        wide = Pretrained.load(directory, dtype="float64", param_dtype="float64", attention_impl="reference")
+        wide_forward = jax.jit(lambda inputs: _forward(wide.model, wide.variables, inputs))
+        wide_rows = jax.jit(lambda ids: wide.model.apply(wide.variables, ids))
+
+    def truth(inputs):
+        with jax.enable_x64(new_val=True):
+            if leaf == "logits":
+                return {"logits": wide_forward(inputs)}
+            row = jnp.asarray(inputs["input_ids"][:1])
+            return {"stepped": as_stepped(wide_rows, row, STEPPED_PREFILL)[0]}
+
+    drawn, reference, recorded_truth = indexed_recording(stored, "forward", seeds, inputs_of=drawn_batch,
+                                                         truth_fn=as_given(truth), leaves=(leaf,))
+    assert_as_exact(dew, reference, drawn, f"{directory.name} {leaf}", seeds=seeds, truth_fn=recorded_truth)
 
 
 def assert_update_as_exact(source, directory: Path) -> Variables:

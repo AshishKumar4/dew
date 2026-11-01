@@ -66,6 +66,7 @@ from kimi_k3_reference import (
     fixture_on_gpu,
     float64_truth,
     greedy,
+    record_forward_seeds,
     record_orders,
     record_picks,
     scatter,
@@ -254,6 +255,31 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
         return float64_truth(model.eval(), directory, lambda name: True)
 
 
+def record_seeds(directory: Path = DESTINATION) -> None:
+    """The Kimi Linear fixture's recording over drawn batches (`record_forward_seeds`): the released model as
+    `main` runs it (`released_modules`) and its float64 twin as `truth` builds it."""
+    from safetensors.torch import load_file
+    from torch_precision import float64
+
+    config = json.loads((directory / "config.json").read_text())
+    tensors = load_file(str(directory / "model.safetensors"))
+    configuration, modeling = released_modules()
+
+    def built(dtype: torch.dtype) -> torch.nn.Module:
+        model = modeling.KimiLinearForCausalLM(configuration.KimiLinearConfig(**copy.deepcopy(config)))
+        model = model.to(dtype)
+        model.config._attn_implementation = "eager"
+        load_weights(model, tensors)
+        return model
+
+    narrow = built(torch.float32)
+    with float64():
+        wide = built(torch.float64)
+    record_forward_seeds(directory, narrow.cuda().eval(), wide.eval(), modeling, repo=REPO, revision=REVISION,
+                         license="other (kimi-linear)",
+                         command="TRITON_F32_DEFAULT=ieee python tools/kimi_linear_reference.py seeds")
+
+
 def orders(drawn: Path) -> None:
     """The reference's own rounding draws over the residual orders
     tools/rounding_orders.py wrote under `drawn` (`record_orders`), every
@@ -273,5 +299,7 @@ if __name__ == "__main__":
         orders(Path(sys.argv[2]))
     elif sys.argv[1:2] == ["truth"]:
         write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
+    elif sys.argv[1:2] == ["seeds"]:
+        record_seeds(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION)
     else:
         main()

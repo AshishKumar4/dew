@@ -193,41 +193,6 @@ def record_released_padding() -> None:
                    json.loads((DESTINATION / "config.json").read_text()), DESTINATION, ("text_config",))
 
 
-STEPPED_PREFILL = 40
-"""The prefill of tests/test_kimi_k3.py's cached decode, whose steps `record_stepped` records the reference
-at the shapes of."""
-
-
-def record_stepped() -> None:
-    """reference.npz's `stepped_logits` [1, tokens, vocab] for the committed fixture: the released model on
-    the CUDA device as `main` runs it (`released_modules`), holding the fixture's weights (`load_weights`),
-    over its batch's first row at the shapes tests/test_kimi_k3.py's cached decode computes them (ledger
-    1543): the first `STEPPED_PREFILL` positions from one forward over them, each later one from a forward
-    over the row up to it. Every other array of the file is kept as it is."""
-    from safetensors.torch import load_file
-
-    configuration, modeling, _ = released_modules()
-    config = json.loads((DESTINATION / "config.json").read_text())
-    model = modeling.KimiK3ForConditionalGeneration(
-        configuration.KimiK3Config(**copy.deepcopy(config))).float()
-    model.language_model.config._attn_implementation = "eager"
-    load_weights(model, load_file(str(DESTINATION / "model.safetensors")))
-    model = model.cuda().eval()
-    with np.load(DESTINATION / "reference.npz") as stored:
-        arrays = {name: stored[name] for name in stored.files}
-    row = torch.tensor(arrays["input_ids"][:1], device="cuda")
-    with torch.no_grad():
-        def forward(length: int) -> np.ndarray:
-            return model(input_ids=row[:, :length], use_cache=False).logits.cpu().numpy()
-
-        stepped = np.concatenate([forward(STEPPED_PREFILL), *(forward(length)[:, -1:]
-                                                               for length in range(STEPPED_PREFILL + 1,
-                                                                                   row.shape[1] + 1))], 1)
-    arrays["stepped_logits"] = stepped
-    np.savez(DESTINATION / "reference.npz", **arrays)
-    print("wrote", DESTINATION / "reference.npz", "stepped_logits", stepped.shape)
-
-
 def remote_modules():
     """The pinned configuration, modeling and linear modules as the release writes them, the routed experts
     in the backward pass (the second of the changes above)."""
@@ -260,6 +225,13 @@ def matmul_precision() -> str:
 
     solve = chunk_intra.SOLVE_TRIL_DOT_PRECISION
     return recorded_matmuls(**{"the intra-chunk solve": str(getattr(solve, "value", solve))})
+
+
+def exactly_decoded(tensors: dict[str, torch.Tensor]) -> None:
+    """Refuse a fixture whose MXFP4 experts a float64 twin would not hold exactly: compressed-tensors decodes
+    them in bfloat16 (`reference_mxfp4`), exact while each scale byte is at most 252, a power of two up to
+    2^125, since every E2M1 code times one is a bfloat16."""
+    assert max(int(value.max()) for name, value in tensors.items() if name.endswith(".weight_scale")) <= 252
 
 
 def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
@@ -352,9 +324,7 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
     configuration, modeling, linear = remote_modules()
     config = json.loads((directory / "config.json").read_text())
     tensors = load_file(str(directory / "model.safetensors"))
-    # compressed-tensors decodes MXFP4 in bfloat16 (`reference_mxfp4`), exact while each scale byte is at
-    # most 252, a power of two up to 2^125, since every E2M1 code times one is a bfloat16.
-    assert max(int(value.max()) for name, value in tensors.items() if name.endswith(".weight_scale")) <= 252
+    exactly_decoded(tensors)
     with installed(linear), float64():
         model = modeling.KimiK3ForConditionalGeneration(
             configuration.KimiK3Config(**copy.deepcopy(config))).double()
@@ -391,6 +361,82 @@ def float64_truth(model: torch.nn.Module, directory: Path,
 
     return {"logits_f64": grid(logits), "loss_f64": np.float64(loss.detach()),
             "updated_logits_f64": grid(updated), "step_logits_f64": step_logits}
+
+
+def recorded_logits(model: torch.nn.Module, inputs: dict[str, np.ndarray],
+                    device: str) -> dict[str, np.ndarray]:
+    """What tests/kimi_support.py's `assert_logits_as_recorded` reads of `model` over a batch
+    (`kimi_support.drawn_batch`): each valid position's logits of the batch's forward ('logits'), and the
+    first row's at the shapes its cached decode computes them ('stepped', ledger 1543): its first
+    `kimi_support.STEPPED_PREFILL` positions from one forward over them, each later one from a forward over
+    the row up to it."""
+    from kimi_support import STEPPED_PREFILL
+
+    ids = torch.tensor(inputs["input_ids"], device=device)
+    mask = torch.tensor(inputs["attention_mask"], device=device)
+    with torch.no_grad():
+        logits = model(input_ids=ids, attention_mask=mask, use_cache=False).logits.cpu().numpy()
+
+        def forward(length: int) -> np.ndarray:
+            return model(input_ids=ids[:1, :length], use_cache=False).logits[0].cpu().numpy()
+
+        stepped = np.concatenate([forward(STEPPED_PREFILL), *(forward(length)[-1:] for length in
+                                                              range(STEPPED_PREFILL + 1, ids.shape[1] + 1))])
+    return {"logits": logits[inputs["attention_mask"].astype(bool)], "stepped": stepped}
+
+
+def record_forward_seeds(directory: Path, narrow: torch.nn.Module, wide: torch.nn.Module, modules, *,
+                         repo: str, revision: str, license: str, command: str) -> None:
+    """tests/kimi_support.py's `RECORDING` for the fixture at `directory`: check 1's evidence over drawn
+    batches (`kimi_support.drawn_batch`) of the forward's two leaves (`recorded_logits`), `narrow` the
+    released model's float32 run on the CUDA device and `wide` its float64 twin on the CPU, fla's kernels
+    answered by its own references (`fla_float64`, installed in `modules`), each holding the fixture's
+    weights, kept as the reference's evidence alone (`record_case`'s summary): the test draws the batches
+    again and holds Dew's own float64 forward to the truth's sketch."""
+    import jax
+    from fla_float64 import installed
+    from kimi_support import RECORDING, drawn_batch
+    from recorded_references import provenance, record_case, save
+    from torch_precision import float64
+
+    def evaluate(inputs):
+        found = recorded_logits(narrow, inputs, "cuda")
+        with installed(modules), float64():
+            exact = recorded_logits(wide, inputs, "cpu")
+        return found, exact
+
+    with jax.enable_x64(new_val=True):
+        recorded = record_case("forward", drawn_batch, evaluate, store_inputs=False, summary=True)
+    recorded["forward.provenance"] = provenance(f"{repo} remote code", revision, torch.cuda.get_device_name(),
+                                                command, torch=torch.__version__)
+    written = save(directory / RECORDING, recorded, reference=f"{repo} {revision}", license=license)
+    print(f"{written}: {written.stat().st_size} bytes", flush=True)
+
+
+def record_seeds(directory: Path = DESTINATION) -> None:
+    """The K3 fixture's recording over drawn batches (`record_forward_seeds`): the released model as `main`
+    runs it (`released_modules`) and its float64 twin as `truth` builds it."""
+    from safetensors.torch import load_file
+    from torch_precision import float64
+
+    config = json.loads((directory / "config.json").read_text())
+    tensors = load_file(str(directory / "model.safetensors"))
+    exactly_decoded(tensors)
+    configuration, modeling, linear = released_modules()
+
+    def built(dtype: torch.dtype) -> torch.nn.Module:
+        model = modeling.KimiK3ForConditionalGeneration(configuration.KimiK3Config(**copy.deepcopy(config)))
+        model = model.to(dtype)
+        model.language_model.config._attn_implementation = "eager"
+        load_weights(model, tensors)
+        return model
+
+    narrow = built(torch.float32)
+    with float64():
+        wide = built(torch.float64)
+    record_forward_seeds(directory, narrow.cuda().eval(), wide.eval(), linear, repo=REPO, revision=REVISION,
+                         license="other (kimi-k3)",
+                         command="TRITON_F32_DEFAULT=ieee python tools/kimi_k3_reference.py seeds")
 
 
 def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]]) -> None:
@@ -518,8 +564,8 @@ if __name__ == "__main__":
         orders(Path(sys.argv[2]))
     elif sys.argv[1:] == ["padding"]:
         record_released_padding()
-    elif sys.argv[1:] == ["stepped"]:
-        record_stepped()
+    elif sys.argv[1:2] == ["seeds"]:
+        record_seeds(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION)
     elif sys.argv[1:2] == ["truth"]:
         write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:
