@@ -58,7 +58,7 @@ def test_four_trials_train_their_own_points_and_reach_the_callers_tracker(tmp_pa
     reported = journal(tmp_path / 'sweep', 'records.jsonl')
     assert [row['type'] for row in reported] == ['TrialFinished'] * 4
     assert [row['value']['name'] for row in reported] == [trial.name for trial in trials]
-    assert ([row['scalars']['sweep/value'] for row in journal(tmp_path / 'sweep', 'scalars.jsonl')]
+    assert ([values['sweep/value'] for _, values in LocalTracker(tmp_path / 'sweep').scalars()]
             == [trial.value for trial in trials])
     assert json.loads((tmp_path / 'ledger.json').read_text())['trials'][2]['index'] == 2
 

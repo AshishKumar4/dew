@@ -288,6 +288,21 @@ def test_empty_native_tool_discovery_is_an_export_failure(tmp_path, native_repor
     assert active_profile() is None
 
 
+def test_a_capture_without_reports_keeps_its_trace_and_manifest_and_needs_no_xprof(tmp_path):
+    """A capture whose reader reads its trace alone (`reports=False`), as a benchmark's device timeline
+    and XLA's profile-guided estimates do, keeps its trace and its manifest and writes no report, so it
+    neither needs XProf nor spends a report's conversion (row 2932)."""
+    with dew.Profiler(tmp_path, reports=False) as profiler:
+        jax.block_until_ready(work())
+    (capture,) = profiler.captures
+    written = manifest(capture)
+    assert (written["capture_status"], written["export_status"], written["reports"]) == (
+        "completed", "completed", [])
+    assert "xprof" not in written["versions"]
+    assert not (capture / "reports").exists()
+    assert list(capture.glob("plugins/profile/*/*.xplane.pb"))
+
+
 def test_a_captures_kernels_are_filed_under_the_programs_that_ran_them(tmp_path):
     """`program_kernels` files each kernel_stats row under the first named program its op name holds, the
     rest under '', longest total time first; a capture whose export wrote no kernel_stats raises naming it."""
