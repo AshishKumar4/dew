@@ -398,11 +398,12 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
     the run's own budgets: its layout holds every option's line as its text, and the run's data counters
     count no cut of a question and refuse no example. The same run declaring each option's line the
     longest line's tokens before the end every intent's name shares ("_of_the_customer", the tokens every
-    line ends with) cuts some of that end from each, every line being longer, keeping the index that
-    tells it apart, however its tokenizer spells an index (GPT-2's "12" one token, Qwen3.5's a token a
-    digit): it counts that cut of every example's options, in examples, rows and tokens, and refuses
-    none. Declaring each line three tokens, which keep its label alone, leaves every option alike:
-    training leaves each example out under that reason, counted."""
+    line ends with) cuts some of that end from each line longer than that, the longest among them,
+    keeping the index that tells each apart, however its tokenizer spells an index (GPT-2's "12" one
+    token, Qwen3.5's a token a digit, which leaves its lines of two digits longer): it counts that cut of
+    every example's options, in examples, rows and tokens, and refuses none. Declaring each line three
+    tokens, which keep its label alone, leaves every option alike: training leaves each example out
+    under that reason, counted."""
     objective, dataset, summary = _run(backbone, count).prepare().train("x")
     [counts] = dataset.counts.values()
     assert counts.accepted == count and counts.refused == {}
@@ -423,7 +424,7 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
     while len({span[len(span) - shared - 1:] for span in spans}) == 1:
         shared += 1
     kept = max(map(len, spans)) - shared
-    assert kept < min(map(len, spans))
+    assert shared > 0
     _, declared, stated = _run(backbone, count, option_tokens=kept).prepare().train("x")
     assert stated["capacities"]["option"] == {"tokens": kept, "from": "stated"}
     [cut] = declared.counts.values()
