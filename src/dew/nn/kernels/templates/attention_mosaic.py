@@ -437,7 +437,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and
     196). Where its family reads operands from registers, its products' fragments beside their tiles
     (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
-    weights."""
+    weights. A key tile whose indices do not fold (`Family.folds_indices`) holds the places its masks
+    compare, the queries' and the keys', an int32 tile each."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
@@ -445,6 +446,9 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     step = [logits, weights, *([weights] if residuals else [])]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
+    if not family.folds_indices(block_k):
+        # Its masks' query and key places, each entry's formed apart.
+        step += [bits, bits]
     phases = [step]
     if natural:
         phases.append([logits] * 2 + [bits])
