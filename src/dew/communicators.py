@@ -489,7 +489,8 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     else:
         made = collectives_kept(fingerprint, gpus, lambda: executable.as_text() or "")
         memory = executable.memory_analysis()
-        loaded = Loaded(fingerprint, gpus, int(getattr(memory, "generated_code_size_in_bytes", 0) or 0))
+        # A backend that states no memory analysis states no code of the program's either.
+        loaded = None if memory is None else Loaded(fingerprint, gpus, memory.generated_code_size_in_bytes)
     _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded)
 
 
