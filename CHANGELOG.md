@@ -19,6 +19,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   imports loads jaxlib; `dew train`, `dew profile` and `dew inspect` run again from their start with a
   run's `trainer.xla_flags` set where they do not hold yet; `prepare_process` warns that flags it sets
   after jaxlib loaded are unproven, and still refuses flags asked for after the backend opened.
+- A float64 `SafetensorsBanks` stream under `jax.enable_x64` no longer depends on the thread XLA runs a
+  layer's fetch on. The setting is thread-local, and JAX narrows a callback's results by it on the thread
+  that runs the callback, so a fetch on one of XLA's workers (a forward with a wide graph runs it there)
+  was refused with "Incorrect output dtype for return value". A 64-bit leaf now crosses the callback as
+  its 32-bit words and is bitcast back on the device.
 - A token export's documents are the records its producer wrote, by its length index, not its tokens'
   EOS: an EOS a document's own text spells splits nothing, an export without an EOS packs, an empty
   record is no document, and no `train.documents.npy` is written or read. A plan saved before resumes
