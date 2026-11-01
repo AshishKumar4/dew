@@ -389,6 +389,18 @@ def _grad_buffers(graded: list[Kind], shapes: list, batch: int, heads: int, quer
     return [(*shape[:2], keys_padded) if kind == Kind.KEY else (*shape[:2], keys_padded, queries)
             for shape, kind in zip(shapes, graded, strict=True)]
 
+def _graded(score_params: tuple, kinds: tuple, shares: tuple, shape: tuple, keys_padded: int, *,
+            adds_vectors: bool) -> tuple[list[Kind], list[tuple], tuple[tuple[int, ...], ...]]:
+    """The kinds of the hook gradients a dK/dV program of `shares` writes (`DKV_GRADS`; none for a later
+    share's), their buffers' shapes (`_grad_buffers`) and the groups of one shape (`_grad_groups`), for a
+    call whose queries are `shape` `[B, Q, H, D]`."""
+    graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
+    graded_shapes = [param.shape for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
+    buffers = _grad_buffers(graded, graded_shapes, shape[0], shape[2], shape[1], keys_padded,
+                            adds_vectors=adds_vectors)
+    return graded, buffers, _grad_groups(buffers)
+
+
 def _grad_groups(buffers: list[tuple]) -> tuple[tuple[int, ...], ...]:
     """The graded parameters whose gradient buffers share a shape, each group's indices in parameter order: a
     group's buffers are one ref, as views of it (`_grad_views`), so no two aliased operands of the launch are
@@ -540,11 +552,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     pair, count = (block_k, block_q // consumers) if split else (consumers * block_k, block_q)
     q_steps = queries // block_q
     stages = min(program.tiles.stages, q_steps)
-    graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
-    graded_shapes = [param.shape for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
-    buffers = _grad_buffers(graded, graded_shapes, query.shape[0], heads, queries, key.shape[1],
-                            adds_vectors=family.adds_vectors)
-    groups = _grad_groups(buffers)
+    graded, buffers, groups = _graded(score_params, kinds, shares, query.shape, key.shape[1],
+                                      adds_vectors=family.adds_vectors)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
     staged_logits = program.tiles.staged_logits
     # A shared dQ's queries' places streamed beside their statistics (`_dkv_step`'s chunks).
