@@ -2275,9 +2275,8 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
-            checkpoints.save, step, self.staging.saved(state), position, metadata,
-            share=DataPartition.of(self.device_mesh), ranking=ranking,
-            control={**run.stop_control, **interval.token_control},
+            checkpoints.save, step, self.staging.saved(state), position, metadata, ranking=ranking,
+            share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
         with run.held():

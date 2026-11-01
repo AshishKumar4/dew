@@ -53,7 +53,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.inference.banks import in_namespace
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn.backbones.decoder_stack import DecoderBank, RowCut, RowStack, stacked_rows
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program, program
 from dew.nn.sharding import held_by_stage
 from dew.optim import STACKED_STATES
 
@@ -242,7 +242,7 @@ class StageLocal:
         stacked state's shapes, and that placement."""
         stack = functools.partial(self.state, convert=self.staged)
         placement = validated(jax.eval_shape(stack, state))
-        return (jax.jit(stack, out_shardings=placement)(state) if self.sites
+        return (owned_program(stack, out_shardings=placement)(state) if self.sites
                 else jax.device_put(state, placement)), placement
 
     @overload
@@ -325,7 +325,7 @@ class StageLocal:
                     "a stage's rows are read onto its own devices")
                 # A stage's rows are the restore's own arrays, no other leaf's: its piece takes them over.
                 piece = _sharded(row, devices.mesh, (None, *[None] * (len(shape) - 1), *row.spec))
-                pieces.append(jax.jit(_stacked_piece, static_argnames="within", donate_argnums=0,
+                pieces.append(program(_stacked_piece, static_argnames="within", donate_argnums=0,
                                       out_shardings=piece)(held, within=shape[1:]))
             return jax.make_array_from_single_device_arrays(
                 (*shape, *rows[0].shape), self._stacked_sharding(row, len(shape)),
