@@ -218,7 +218,7 @@ def assert_trains_as_replicated(model, optimizer, label: str, variables=None):
         for (path, held), other in zip(jax.tree_util.tree_leaves_with_path(mine), jax.tree.leaves(theirs),
                                        strict=True):
             held, other = np.asarray(held), np.asarray(other)
-            assert held.dtype == other.dtype and np.array_equal(held.view(np.uint8), other.view(np.uint8)), (
+            assert (held.dtype, held.shape, held.tobytes()) == (other.dtype, other.shape, other.tobytes()), (
                 f"{label} {jax.tree_util.keystr(path)} at seed {seed}")
 
 
