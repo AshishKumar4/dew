@@ -1,12 +1,14 @@
-"""Measure `dew.interop.verify._GRADIENT_PARITY`: how much farther transformers' float32 gradient of
-every parameter is from the float64 truth than Dew's on tier 2's probe (`verify.gradient_parity`), over
-the causal LM types transformers builds whose every part Dew knows (`dew.interop.parts`) and the
-compositions of those parts tier 2 admits (`COMPOSITIONS`).
+"""Measure `dew.interop.verify._GRADIENT_PARITY` and `_LOGITS_PARITY`: how much farther transformers'
+float32 gradient of every parameter, and its float32 logits, are from the float64 truth than Dew's on
+tier 2's probe (`verify.gradient_parity`, `verify.logits_parity`).
 
-Each is built at the probe's shrunken sizes with the probe's weights (`verify.shrink`,
-`verify.scatter_weights`), assembled from parts, and its gradients compared as the probe compares them
-(`verify.gradient_parity`). Prints each one's measure and the largest; the probe's bound is twice the
-largest, as its logits' is twice `_ROUNDING`.
+The gradients are measured over the causal LM types transformers builds whose every part Dew knows
+(`dew.interop.parts`) and the compositions of those parts tier 2 admits (`COMPOSITIONS`): each built at
+the probe's shrunken sizes with the probe's weights (`verify.shrink`, `verify.scatter_weights`),
+assembled from parts, and its gradients compared as the probe compares them. The logits are measured
+over the same types and compositions as the probe compares them, each read as tier 2 reads it: from
+parts, or a type whose attention no part is by the registered family it verifies as (`CONVENTIONS`).
+Prints each one's measures and the largest; each bound is twice its largest.
 
     python tools/gradient_parity.py
 """
@@ -17,7 +19,9 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from dew.interop import hf_decoders, parts, sources, verify
+from dew.interop import decoder_parts, hf_decoders, parts, sources, verify
+from dew.interop.decoder_families import ENTRIES
+from dew.registry import models
 
 TYPES = ("llama", "mistral", "mixtral", "qwen2", "qwen3", "qwen3_moe", "gemma", "olmo", "helium", "seed_oss",
          "smollm3", "cwm", "olmoe")
@@ -49,27 +53,40 @@ def _mixed(config) -> torch.nn.Module:
 COMPOSITIONS = {"llama+mixtral+gemma": ("llama", _mixed)}
 """Each composition of known parts measured: its base config's model_type and its builder."""
 
+CONVENTIONS = {"seed_oss": "qwen2"}
+"""Each type that assembles from no parts by the registered family the probe verifies it as."""
 
-def measured(model_type: str, built=None) -> float | str:
-    """The type's measure (`built` of its shrunken config, transformers' own model where None), or why
-    it is not one Dew assembles from parts."""
+
+def measured(model_type: str, built=None) -> tuple[float, float] | str:
+    """The type's gradient and logits measures (`built` of its shrunken config, transformers' own model
+    where None), the logits read by its `CONVENTIONS` family where it has one, or why it is not one Dew
+    reads."""
     config = verify.shrink({"model_type": model_type, **FIELDS})
     shrunk = AutoConfig.for_model(model_type, **config)
     reference = (AutoModelForCausalLM.from_config(shrunk, dtype=torch.float32) if built is None
                  else built(shrunk).float())
     verify.scatter_weights(reference)
     reference.set_attn_implementation("eager")
-    try:
-        assembly = parts.assemble(reference)
-    except parts.Ambiguous as ambiguous:
-        return str(ambiguous)
-    family = parts.family(model_type, assembly)
+    ids = verify.probe_ids(shrunk.vocab_size)
+    with torch.no_grad():
+        expected = reference(torch.as_tensor(ids, dtype=torch.long), use_cache=False).logits.numpy()
+    if model_type in CONVENTIONS:
+        family = next(entry for entry in ENTRIES if CONVENTIONS[model_type] in entry.model_types)
+        record = decoder_parts.translate_family_config({**config, "model_type": model_type}, family)[0]
+    else:
+        try:
+            assembly = parts.assemble(reference)
+        except parts.Ambiguous as ambiguous:
+            return str(ambiguous)
+        family, record = parts.family(model_type, assembly), assembly.fields
     with tempfile.TemporaryDirectory() as folder:
         # As a release stores it (Mixtral's experts one by one), which the assembly reads through the
         # load's conversion, as verify's training qualification does.
         reference.save_pretrained(folder)
-        variables = hf_decoders.translate_weights(sources.load_shards(Path(folder)), assembly.fields, family)
-    return verify.gradient_parity(reference, family, assembly.fields, variables)
+        variables = hf_decoders.translate_weights(sources.load_shards(Path(folder)), record, family)
+    model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
+    return (verify.gradient_parity(reference, family, record, variables),
+            verify.logits_parity(expected, model, record, variables, ids))
 
 
 def main() -> None:
@@ -77,10 +94,11 @@ def main() -> None:
     for name, (model_type, built) in {**{name: (name, None) for name in TYPES}, **COMPOSITIONS}.items():
         result = measured(model_type, built)
         print(f"{name}: {result}")
-        if isinstance(result, float):
+        if isinstance(result, tuple):
             measures[name] = result
-    worst = max(measures, key=measures.__getitem__)
-    print(f"largest: {measures[worst]:.3f} ({worst}) over {len(measures)} types")
+    for index, kind in enumerate(("gradients", "logits")):
+        worst = max(measures, key=lambda name: measures[name][index])
+        print(f"largest {kind}: {measures[worst][index]:.3f} ({worst}) over {len(measures)} types")
 
 
 if __name__ == "__main__":
