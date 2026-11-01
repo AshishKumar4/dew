@@ -54,7 +54,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import bundles, mosaic, product, resources
@@ -82,9 +81,6 @@ def block_of(family: mosaic.Family) -> int:
     the widest depth its products step over in 16-bit operands (`Family.depths`), whose bf16 parts an fp32
     call's products take too."""
     return family.depths(jnp.bfloat16)[0]
-
-LOG2_E = math.log2(math.e)
-"""log2(e) to double precision, the prefix's base-2 scale (fla's RCP_LN2 is 1.93e-8 short of it)."""
 
 PARTS = 3
 """The bf16 parts of an fp32 operand: 8 of its significand's 24 bits each."""
@@ -1684,21 +1680,6 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
         *(() if skip is None else (skip.astype(jnp.float32),)))
 
 
-@jax.jit
-def prefix(g):
-    """The decay's prefix within each chunk, compensated, in base 2: `g` `[..., C, H]` (natural log) to `(hi,
-    lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,
-    `precision.two_product`, plus its product with the rounding's remainder) summed compensated
-    (`precision.compensated_add`), so a difference of two positions is as precise as its own range. One
-    program JAX traces once for `g`'s type: its exact sums traced afresh, each layer's forward, its kept
-    forward in the backward and its gradient's preparation each paid them, 226 s of Qwen3.5-4B's 1208 s
-    ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
-    scale = np.float32(LOG2_E)
-    scaled, error = precision.two_product(g, jnp.full_like(g, scale), bit_split=True)
-    error = error + g * float(np.float32(LOG2_E - float(scale)))
-    return lax.associative_scan(precision.compensated_add, (scaled, error), axis=g.ndim - 2)
-
-
 def _padded(x, axis: int, size: int):
     """`x` padded with zeros on the end of `axis` to `size`."""
     return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
@@ -1885,7 +1866,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     held = given if delta or rounded else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                  interpret, generation.gpu_target(), ranged=ranged)
-    hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))
+    hi, lo = algebra.prefix(laid(g).reshape(chunks, CHUNK, -1))
     # A decay a head's prefix a head's row of vectors `[HV, R]`, one a key dimension's tiles `[R, HV * Dk]`.
     hi, lo = (x.reshape(rows, -1) if per_key else x.reshape(rows, heads).T for x in (hi, lo))
     beta = laid(beta).reshape(rows, heads).T

@@ -20,11 +20,11 @@ chunk and head (`chunk_step`):
 Each enclosure is outward interval arithmetic in float64, each end snapped to its op's own grid: products of
 16-bit values (or of an fp32 operand's three bf16 parts, six of them a pair, `product.formed`) exact, summed
 as the native-dot contract holds a tensor core's sum (gamma_n at a truncating add's unit, of the terms that
-may be nonzero); fp32 adds and multiplies rounded to nearest, a product before an add rounded or exact
-(an FMA's contraction); casts to nearest; `exp2` within `reach` steps of the fp32 grid of its correctly
-rounded value (PTX ISA 9.4 §9.7.3.21: ex2.approx.f32's 2 ulp, the mainloop's `approx_math`); and each log
-decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensated scan, `mainloop.prefix`),
-then the kernel's own roundings of its differences."""
+may be nonzero); fp32 adds and multiplies rounded to nearest, a product before an add rounded or exact (an
+FMA's contraction); casts to nearest; `exp2` within `reach` steps of the fp32 grid of its correctly rounded
+value (PTX ISA 9.4 §9.7.3.21: ex2.approx.f32's 2 ulp, the mainloop's `approx_math`); and each log decay's
+base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensated scan,
+`recurrence_algebra.prefix`), then the kernel's own roundings of its differences."""
 
 import dataclasses
 import functools
@@ -52,12 +52,12 @@ from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop
 
 CHUNK = mainloop.CHUNK
-LOG2E = mainloop.LOG2_E
+LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
-"""How far a position's prefix `hi + lo` (`mainloop.prefix`) lies from its exact `log2(e) cumsum(g)`, as a
-share of `log2(e) sum |g|` over the positions it spans: each compensated add rounds two adds of its
-remainders, each within 2^-23 of their sum, at most 2^-24 of the running value each; an element of a 64-long
-`associative_scan` takes at most 2 log2(64) such adds, under 2^-41 in all, and each token's exponent
+"""How far a position's prefix `hi + lo` (`recurrence_algebra.prefix`) lies from its exact `log2(e)
+cumsum(g)`, as a share of `log2(e) sum |g|` over the positions it spans: each compensated add rounds two adds
+of its remainders, each within 2^-23 of their sum, at most 2^-24 of the running value each; an element of a
+64-long `associative_scan` takes at most 2 log2(64) such adds, under 2^-41 in all, and each token's exponent
 `g log2(e)` is a Dekker product and its rounded remainder, within 2^-46 of it. Four times their sum."""
 FRACTION = 2.0 ** -22
 """What `algebra.raised` rounds off its exponent: the fraction `(whole - floor(whole)) + part`, under 2,
