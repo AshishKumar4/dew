@@ -375,9 +375,12 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     """A step's score-hook parameters (`params`, each its `Kind` and dtype), live beside its logits: a
     TILE's `[bq, bk]` tile, a KEY's vector in the accumulator's column layout and a QUERY's in its row
     layout (`Family.column_registers`, `row_registers`); a HEAD's scalar no tile; each in the dtype its kernel
-    loads it (`kept_dtype`). With `grads`, a backward launch's gradients of them too, fp32, where it forms
-    them: a TILE's tile a step and a KEY's carried across its walk in the dK/dV launch (`grads="keys"`), a
-    QUERY's carried in the dQ launch (`grads="queries"`, `DQ_GRADS`). A `keys_first` step's
+    loads it (`kept_dtype`). With `grads`, a backward launch's gradients of them too, fp32, where it carries
+    them: a KEY's across its walk in the dK/dV launch (`grads="keys"`), a QUERY's in the dQ launch
+    (`grads="queries"`, `DQ_GRADS`); a TILE's gradient is the step's score cotangents through the hook's
+    slope, formed in their place and stored, no tile beside them (an A100's dK/dV under a tile bias at
+    64 x 64, width 64: 255 registers unspilled and none spilled at a cap of 247, where its tile beside them
+    priced 280). A `keys_first` step's
     tile lays its keys along its rows, so a KEY's vector is in the row layout and a QUERY's in the column.
     Returns the step's tiles and the vectors' registers."""
     keys, queries = ((family.row_registers, family.column_registers) if keys_first
@@ -385,8 +388,7 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     step, vectors = [], 0
     for kind, dtype in params:
         if kind is Kind.TILE:
-            grad = [(block_q, block_k, jnp.float32)] if grads == "keys" else []
-            step += [(block_q, block_k, dtype), *grad]
+            step.append((block_q, block_k, dtype))
         elif kind is Kind.KEY:
             vectors += keys(block_k, dtype) + (keys(block_k, jnp.float32) if grads == "keys" else 0)
         elif kind is Kind.QUERY:
