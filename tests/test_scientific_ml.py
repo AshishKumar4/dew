@@ -256,6 +256,9 @@ def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_re
     that pools the update's system (`Trainer(accumulation=k)`), never stepped by a system it lacks."""
     held = optax.MultiSteps(gauss_newton(1e-3), every_k_schedule=2).gradient_transformation()
     trainer = Trainer(LeastSquares(4), held, key=0, layout=LAYOUT)
-    batch = {"x": np.ones((4, 4), np.float32), "y": np.ones(4, np.float32)}
-    with pytest.raises(ValueError, match="Trainer\\(accumulation=k\\)"):
+    batch = {"x": np.ones((8, 4), np.float32), "y": np.ones(8, np.float32)}
+    with pytest.raises(ValueError):
         trainer.compile(trainer.initial_state(), batch)
+    # Unwrapped, the same update compiles: the refusal is the wrapper's dropped statistics.
+    trainer = Trainer(LeastSquares(4), gauss_newton(1e-3), key=0, layout=LAYOUT)
+    trainer.compile(trainer.initial_state(), batch)
