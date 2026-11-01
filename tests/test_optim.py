@@ -1146,9 +1146,11 @@ def program_of(closed) -> tuple:
     steps = []
     for equation in equations(closed.jaxpr):
         literals = [operand.val for operand in equation.invars if isinstance(operand, Literal)]
-        # The sub-programs a parameter holds are walked as equations of their own.
+        # The sub-programs a parameter holds, one or a cond's branches, are walked as equations of their own.
         params = tuple(sorted((name, value) for name, value in equation.params.items()
-                              if not isinstance(value, (Jaxpr, ClosedJaxpr))))
+                              if not isinstance(value, (Jaxpr, ClosedJaxpr)) and not (
+                                  isinstance(value, tuple) and value
+                                  and all(isinstance(each, (Jaxpr, ClosedJaxpr)) for each in value))))
         steps.append((equation.primitive.name, params, constants(literals)))
     return tuple(steps), constants(closed.consts)
 
