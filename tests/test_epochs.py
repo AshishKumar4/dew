@@ -474,12 +474,26 @@ def _jittered(metadata):
     return Jittered()
 
 
-@pytest.mark.parametrize("before", ["configured draw", "cache"])
+class _KeptWhole:
+    """A step that keeps each record as it is."""
+
+    identity = "kept-whole@1"
+
+    def __call__(self, row):
+        return row
+
+
+def _kept_whole(metadata):
+    return _KeptWhole()
+
+
+@pytest.mark.parametrize("before", ["configured draw", "cache", "configured map and cache"])
 def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_over_its_documents(before):
     """Documents a memory read packs before its shuffle and an objective's rows, behind a draw configured for
     the run (which binds to a random map the read holds no rows past, so it streams the bound before the
-    pack) or behind a cache the read fills (after which it holds the pack): an epoch is a pass over its 10
-    documents either way, so two epochs bound the run to 20 of them, its clock at 20 (row 1902's review)."""
+    pack), behind a cache the read fills (after which it holds the pack), or behind a map configured for its
+    source and a cache that map's bound step keys: an epoch is a pass over its 10 documents each way, so two
+    epochs bound the run to 20 of them, its clock at 20 (row 1902's review)."""
     import optax
 
     from dew.data.cache import Cache
@@ -495,8 +509,12 @@ def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_o
 
     documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
     chain = Pipeline(Memory(documents))
-    chain = (chain.map(Configured(_jittered, needs=(), scope="run", random=True, one_to_one=True))
-             if before == "configured draw" else chain.cache(Cache(f"memory://epochs-{id(chain)}")))
+    if before == "configured draw":
+        chain = chain.map(Configured(_jittered, needs=(), scope="run", random=True, one_to_one=True))
+    else:
+        if before == "configured map and cache":
+            chain = chain.map(Configured(_kept_whole, needs=(), one_to_one=True))
+        chain = chain.cache(Cache(f"memory://epochs-{id(chain)}"))
     chain = chain.pack(8, fields=("id",)).shuffle(seed=1, window=4).read("memory").batch(8)
     loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
     assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
