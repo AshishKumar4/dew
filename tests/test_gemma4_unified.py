@@ -229,8 +229,8 @@ def gradient_functions(source, group: str | None = None):
     @as_given
     def ours(inputs):
         """Each row's program over its own length (`native_observations`), compiled once a length
-        rather than once a window's lengths, every row dispatched before any is read, and the rows'
-        observations read to the host at once and collected there."""
+        rather than once a window's lengths, and the rows' observations collected on the device, every
+        row dispatched before any is read; each row's fields grouped in one pass over the draw."""
         rows: dict[int, dict] = {}
         for name, value in inputs.items():
             if name.startswith("native/"):
@@ -239,7 +239,7 @@ def gradient_functions(source, group: str | None = None):
         observed = [native_observations(ModelInputs(**unflatten_dict(rows[row], sep="/")),
                                         inputs[f"probe/{row}"])
                     for row in range(inputs["input/input_ids"].shape[0])]
-        return collect(jax.device_get(observed), np)
+        return collect(observed, jnp)
 
     def theirs(model, given, *, wide=False):
         inputs = {name.removeprefix("input/"): value for name, value in given.items()
