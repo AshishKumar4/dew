@@ -273,7 +273,10 @@ def rotations(lo, hi, first, stages: int, step: Callable[[jax.Array, "Turn"], No
         return ()
 
     run, start, stop = rotated(turned, lo, hi, first, stages)
-    pl.loop(start, stop)(run)
+
+    @pl.loop(start, stop)
+    def _(rotation):
+        run(rotation)
 
 
 def taken(active, step: Callable, *state):
