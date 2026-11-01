@@ -889,8 +889,9 @@ def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool()
     assert [device["id"] for device in record["devices"] if device["outside"] is not None] == gpus
     loss = compiled(jnp.float32(1))
     observed = first_run(loss, 0, record, mesh)
-    assert sorted(observed) == ["checked", "now"]
-    assert [list(observed[moment]) for moment in ("checked", "now")] == [gpus, gpus]
+    assert observed["checked"] == {device["id"]: device["outside"] for device in record["devices"]
+                                   if device["outside"] is not None}
+    assert list(observed["now"]) == gpus and all(free >= 0 for free in observed["now"].values())
     with pytest.raises(FirstRunFailed) as raised:
         first_run(Refused(), 0, record, mesh)
     assert isinstance(raised.value.__cause__, jax.errors.JaxRuntimeError)
