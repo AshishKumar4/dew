@@ -28,7 +28,9 @@ Each episode is flown on a course of its own (`drawn_course`), of a `family`:
   gate a relative turn, climb and distance from the last, with split-S (a gate below the last, facing back)
   and dive primitives; the paper gives no ranges, so these match its tracks' 110 to 150 m and climbs up to
   17 m (Fig 7), and its curriculum from near-straight (Sec III-C.3);
-- `figure8`: a closed figure-eight whose lobes cross at different heights.
+- `figure8`: a closed figure-eight whose lobes cross at different heights;
+- `single`: one gate, 2 m up at the origin and facing along x, the same every episode: an open track whose
+  passing ends it, the simplest course to learn from (Dream to Fly and SkyDreamer each train one fixed track).
 The `difficulty`, from 0 to 1, scales the jitter, turns, climbs and primitives, and the obstacles' number, a
 curriculum (Song 2021 raised it on the crash rate). Obstacles are vertical pillars beside or on the racing
 line.
@@ -83,7 +85,7 @@ LAYOUTS = {
 AlphaPilot.yaml, MIT) and FlyDreamer's loop (AshishKumar4/FlyDreamer dreamerv3/configs.yaml `static_gates`,
 turned from NED). Each gate faces along the course (`facings`): the layouts' own gate rotations follow their
 simulator's model's axes, which the files do not state."""
-FAMILIES = ("layout", "loop", "chain", "figure8")
+FAMILIES = ("layout", "loop", "chain", "figure8", "single")
 """The course families (`drawn_course`)."""
 GATES = 16
 """The most gates a course holds; a shorter one's last are inactive."""
@@ -167,8 +169,9 @@ class Racing:
 
     @property
     def delays(self) -> tuple[int, int]:
-        """The latency's range in whole control steps."""
-        return round(self.latency[0] * self.hz), max(round(self.latency[1] * self.hz), 1)
+        """The latency's range in whole control steps, each rounded; none where `latency` is (0, 0)."""
+        shortest = round(self.latency[0] * self.hz)
+        return shortest, max(round(self.latency[1] * self.hz), shortest)
 
 
 @struct.dataclass
@@ -360,6 +363,12 @@ def _figure8(key: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jnp.where((order < count)[:, None], center, center[0]), count
 
 
+def _single() -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One gate, 2 m up at the origin and facing along x, the same every episode; its gates (the one in every
+    slot, as an inactive slot repeats the first), count and facings."""
+    return jnp.tile(jnp.asarray([0.0, 0.0, 2.0]), (GATES, 1)), jnp.ones((), jnp.int32), jnp.zeros(GATES)
+
+
 def _obstacles(racing: Racing, key: jax.Array, center: jax.Array, count: jax.Array, closed: jax.Array,
                difficulty: jax.Array) -> jax.Array:
     """Up to `racing.obstacles` times the difficulty vertical pillars `[O, 4]` (x, y, radius, height): each
@@ -391,7 +400,7 @@ def _obstacles(racing: Racing, key: jax.Array, center: jax.Array, count: jax.Arr
 
 def drawn_course(racing: Racing, key: jax.Array, difficulty: jax.Array) -> Course:
     """An episode's course (`Course`): its family drawn at `racing.families`' weights, then its gates
-    (`_layout`, `_loop`, `_chain`, `_figure8`), facings and obstacles."""
+    (`_layout`, `_loop`, `_chain`, `_figure8`, `_single`), facings and obstacles."""
     family_key, layout_key, loop_key, chain_key, eight_key, obstacle_key = jax.random.split(key, 6)
     weights = np.asarray([dict(racing.families).get(name, 0.0) for name in FAMILIES])
     family = jax.random.choice(family_key, len(FAMILIES), p=jnp.asarray(weights / weights.sum()))
@@ -399,10 +408,14 @@ def drawn_course(racing: Racing, key: jax.Array, difficulty: jax.Array) -> Cours
     loop, loop_count = _loop(loop_key, difficulty)
     chain, chain_count, chain_facing = _chain(chain_key, difficulty)
     eight, eight_count = _figure8(eight_key)
-    center = jnp.stack([layout, loop, chain, eight])[family]
-    count = jnp.stack([layout_count, loop_count, chain_count, eight_count])[family]
-    closed = family != FAMILIES.index("chain")
-    facing = jnp.where(closed, facings(center, count, closed), chain_facing)
+    single, single_count, single_facing = _single()
+    center = jnp.stack([layout, loop, chain, eight, single])[family]
+    count = jnp.stack([layout_count, loop_count, chain_count, eight_count, single_count])[family]
+    chained = family == FAMILIES.index("chain")
+    closed = ~chained & (family != FAMILIES.index("single"))
+    # An open track's gates face as its family drew them; a closed one's along the course.
+    drawn = jnp.where(chained, chain_facing, single_facing)
+    facing = jnp.where(closed, facings(center, count, closed), drawn)
     obstacles = _obstacles(racing, obstacle_key, center, count, closed, difficulty)
     return Course(center, facing, count, closed, family, obstacles)
 
