@@ -13,7 +13,6 @@ import dataclasses
 from collections.abc import Callable, Mapping
 
 import jax
-import numpy as np
 from egglog import Expr, StringLike, Vec, get_callable_args, get_literal_value, i64, i64Like, method
 from jax.core import ShapedArray
 from jax.extend import core as jcore
@@ -82,15 +81,16 @@ class Region:
     """A jaxpr held as terms: the count of its leaves (the inputs and constants first, then the outputs of the
     equations outside the language), those equations in program order (`opaque`), each output's term (None
     for a literal output, kept in `literal_outputs`), the parameters terms refer to by index (`params`: a
-    primitive and its parameters), its literals' exact values (`literals`), each term's shape as its equation
-    states it (`shapes`) and the longest chain of the language's equations (`depth`)."""
+    primitive and its parameters), its literals as the program holds them, value and weak type
+    (`literals`), each term's shape as its equation states it (`shapes`) and the longest chain of the
+    language's equations (`depth`)."""
 
     leaves: int
     opaque: list[Opaque]
     outputs: list[Term | None]
     literal_outputs: list
     params: list[tuple[jcore.Primitive, Mapping]]
-    literals: list[np.ndarray]
+    literals: list
     shapes: list[tuple[Term, tuple[int, ...]]]
     depth: int
     equations: int
@@ -117,7 +117,7 @@ def region(closed: jcore.Jaxpr) -> Region:
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
     indexed: dict[tuple[str, str], int] = {}
-    literals: list[np.ndarray] = []
+    literals: list = []
     shapes: list[tuple[Term, tuple[int, ...]]] = []
     depths: dict[jcore.Var, int] = {}
 
@@ -137,7 +137,7 @@ def region(closed: jcore.Jaxpr) -> Region:
 
     def read(atom) -> Term:
         if isinstance(atom, jcore.Literal):
-            literals.append(np.asarray(atom.val, dtype=getattr(atom.aval, "dtype", None)))
+            literals.append(atom.val)
             term = Term.literal(len(literals) - 1)
             shapes.append((term, _shape(atom)))
             return term

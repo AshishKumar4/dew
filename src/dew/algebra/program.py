@@ -72,6 +72,8 @@ def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation:
     for term, extent in region.shapes:
         graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent))))
     for index, (primitive, params) in enumerate(region.params):
+        if primitive in (jax.lax.add_p, jax.lax.mul_p) and params.get("out_dtype") is None:
+            graph.register(rules.plain(i64(index)))
         if primitive is jax.lax.broadcast_in_dim_p:
             rank, laid = len(params["shape"]), tuple(params["broadcast_dimensions"])
             missing = [axis for axis in range(rank) if axis not in laid]
