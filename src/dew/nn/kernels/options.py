@@ -194,12 +194,19 @@ class OuterProgram:
             return self.function(*args, **kwargs)
         return jax.jit(traced, **self.arguments)
 
+    @functools.cached_property
+    def _nested(self) -> jax.stages.Wrapped:
+        """Its jit within another trace: the enclosing program's own options are the ones it compiles under,
+        as JAX takes compiler options on the outermost jit alone."""
+        arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
+        return jax.jit(self.function, **arguments)
+
     def __call__(self, *args, **kwargs):
         # Within another trace, a tracer its arguments hold or one its function closes over, the
         # enclosing program compiles this one as part of its own; under `jax.disable_jit` its jit runs
         # the function as Python.
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
-            return self.jitted(*args, **kwargs)
+            return self._nested(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
