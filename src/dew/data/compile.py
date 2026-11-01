@@ -74,7 +74,6 @@ from dew.data.dataset import (
     take_batch,
 )
 from dew.data.facts import merge_facts
-from dew.data.holdout import selecting
 from dew.data.lowering import (
     _as_iter,
     _Build,
@@ -337,17 +336,6 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
         for key, child_measuring in _measured(child, measuring).items():
             found[key] = (*found.get(key, ()), *child_measuring)
     return found
-
-
-def _stores(source: Source) -> Iterator[Source]:
-    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
-    selects from."""
-    for _, selected in selecting(source):
-        if isinstance(selected, Concatenate):
-            for part in selected.sources:
-                yield from _stores(part)
-        else:
-            yield selected
 
 
 def _token_stores(source: Source) -> Iterator[TokenFiles]:

@@ -636,6 +636,16 @@ def pool_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
+def test_no_process_of_a_cpu_pool_traces_residuals_its_devices_never_judge(pool_checkpoint):
+    """A step's derived footprint judges each process's own device, so no process of a CPU pool, whose
+    devices state no memory, traces the residuals its loss's pullback keeps (row 3093): process 1 judged
+    process 0's device before, and traced them on every compile."""
+    for report in pool_checkpoint["reports"]:
+        assert report["derived_residuals"], "each process derives its step's footprint"
+        assert all(residuals is None for residuals in report["derived_residuals"])
+
+
+@pytest.mark.distributed
 def test_a_pools_observer_holds_every_processs_parameters_whole_at_each_observed_step(tmp_path):
     """An observer on two processes of one device each, whose parameters fsdp splits between them:
     every process runs the call and holds each observed step's variables whole, copied home before
