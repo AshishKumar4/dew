@@ -2039,21 +2039,13 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
         # The language model's config as its decoder reads it (`decoders.decoder_config`), a quantized
         # wrapper's module selection renamed with its tensors; a bundle its own family reads whole keeps
         # its decoder's names and their codec.
-        quantized = not decoders.bundles(config) and source_quantization(config) is not None
-        text = decoders.decoder_config(config)
-        if quantized:
-            quantization = decoders.language_model_quantization(config, language, inventory)
-            text = {key: value for key, value in text.items() if key != "quantization_config"}
-            if quantization is not None:
-                text["quantization_config"] = quantization
-        config = text
+        config = decoders.decoder_config(config, inventory)
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
         # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).
         decoders.refuse_unported(route.wrapper)
     elif text_only and isinstance(route, DiffusionGemmaRoute):
-        raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
-                         "its whole model")
+        raise ValueError(decoders.WHOLE_DECODER)
     if isinstance(route, TorchRoute | DiffusionGemmaRoute):
         _unread_overrides(overrides, "the transformers forward" if isinstance(route, TorchRoute)
                           else "a diffusion Gemma's text tower")

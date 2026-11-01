@@ -982,7 +982,7 @@ def _at_opmath(env, lowering, keeps_fp32: tuple[int, str] | None):
 
 def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
     """`closed` evaluated on `arguments` with each broadcast of a floating value
-    narrower than fp32 summing its gradient in fp32 (`_accumulated`): an explicit
+    narrower than fp32 summing its gradient in fp32 (`dew.nn.precision.broadcast_summed`): an explicit
     `broadcast_in_dim`, and the size-1 dimensions an elementwise operation
     broadcasts implicitly (`_BROADCASTING`), each made explicit first; a jit's body
     is inlined so its broadcasts are found too. jax transposes a broadcast into a
@@ -1010,14 +1010,14 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
                 inner = equation.params["jaxpr"]
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
             elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
-                outputs = [_accumulated(inputs[0], tuple(equation.params["shape"]),
-                                        tuple(equation.params["broadcast_dimensions"]))]
+                outputs = [broadcast_summed(inputs[0], tuple(equation.params["shape"]),
+                                            tuple(equation.params["broadcast_dimensions"]))]
             else:
                 if equation.primitive in _BROADCASTING:
                     shape = equation.outvars[0].aval.shape
                     rank = len(shape)
                     # An operand broadcasts on its trailing dimensions: a scalar on none.
-                    inputs = [_accumulated(value, shape, tuple(range(rank - jnp.ndim(value), rank)))
+                    inputs = [broadcast_summed(value, shape, tuple(range(rank - jnp.ndim(value), rank)))
                               if _narrow_float(value) and jnp.shape(value) != shape else value
                               for value in inputs]
                 # As `jax.core.eval_jaxpr` binds an equation.
@@ -1042,12 +1042,6 @@ def _narrow_float(value) -> bool:
     """Whether `value` is a floating array narrower than fp32."""
     dtype = jnp.result_type(value)
     return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 32
-
-
-def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
-    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype at every
-    order, as a Dew bias's does (`dew.nn.precision.broadcast_summed`, ledgers 2653 and 3038)."""
-    return broadcast_summed(value, shape, dimensions)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,

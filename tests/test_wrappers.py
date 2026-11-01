@@ -621,8 +621,10 @@ def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_an
 def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_path):
     """A wrapper's compressed-tensors groups and ignore list, by name and by a pattern over the wrapper's
     own modules (`re:`), read `text_only` under its text checkpoint's names: a pattern resolved into the
-    language model's modules it matches, the tower's matches dropped, a class target kept as it is."""
-    from dew.interop.hf_decoders import language_model_quantization, translate_wrapper_config
+    language model's modules it matches, the tower's matches dropped, a class target kept as it is; the
+    decoder a tool builds reads them so (`decoder_config`, ledger 3138), and DiffusionGemma's decoder,
+    its whole model, is no text-only decoder."""
+    from dew.interop.hf_decoders import decoder_config, language_model_quantization, translate_wrapper_config
     from dew.interop.safetensors_io import read_file
 
     source = FIXTURES / "qwen35-native-tiny"
@@ -630,13 +632,18 @@ def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_p
     names, _ = read_file(source / "model.safetensors")
     quantization = {"quant_method": "compressed-tensors", "format": "float-quantized",
                     "config_groups": {"fp8": {
-                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"]}},
+                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"],
+                        "weights": {"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": False}}},
                     "ignore": ["lm_head", "re:.*visual\\.blocks\\.0\\..*", "model.language_model.layers.1"]}
     projected = language_model_quantization({**config, "quantization_config": quantization},
                                             translate_wrapper_config(config), lambda: names.keys())
     assert projected["config_groups"]["fp8"]["targets"] == [
         "Linear", "model.layers.0.mlp.down_proj", "model.layers.0.mlp.up_proj"]
     assert projected["ignore"] == ["lm_head", "model.layers.1"]
+    built = decoder_config({**config, "quantization_config": quantization}, lambda: names.keys())
+    assert built["quantization_config"] == projected
+    with pytest.raises(ValueError):
+        decoder_config({"model_type": "diffusion_gemma", "text_config": {}})
 
 
 def test_every_codecs_tensors_beside_a_weight_route_as_the_weight_does():

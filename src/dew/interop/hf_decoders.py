@@ -1351,18 +1351,35 @@ def bundles(config: Mapping[str, object]) -> bool:
             and config.get("vision_config") is not None)
 
 
-def decoder_config(config: Mapping[str, object]) -> Mapping[str, object]:
-    """A checkpoint's config as its decoder reads it, as a load of its language model reads it
-    (`Pretrained.load(..., text_only=True)`): a media bundle its own family reads whole, without its
-    vision_config (`bundle_text_config`); another wrapper's language model as its text family states it,
-    the wrapper's head policy, dtype and overrides over its text_config (`language_model_config`); and
-    any other config, a registered family's that reads its whole record among them (kimi_k25's), as it
-    is. A tool that builds a checkpoint's decoder from its config reads it here (ledger 3006)."""
+WHOLE_DECODER = ("text_only takes a media wrapper's language model; DiffusionGemma's decoder is its whole "
+                 "model")
+"""Why a text-only decoder of DiffusionGemma is refused (`decoder_config`, `Pretrained.load`)."""
+
+
+def decoder_config(config: Mapping[str, object],
+                   inventory: Callable[[], Collection[str] | None] = lambda: None) -> Mapping[str, object]:
+    """A checkpoint's config as its decoder reads it, the one routing a load of its language model reads
+    (`Pretrained.load(..., text_only=True)`) and a tool that builds a checkpoint's decoder (ledger 3006,
+    3138): a media bundle its own family reads whole, without its vision_config (`bundle_text_config`);
+    another wrapper's language model as its text family states it, the wrapper's head policy, dtype and
+    overrides over its text_config (`language_model_config`), a quantized wrapper's module selection
+    renamed with its tensors (`language_model_quantization`, over `inventory`'s tensor names); and any
+    other config, a registered family's that reads its whole record among them (kimi_k25's), as it is.
+    DiffusionGemma's decoder is its whole model, refused (`WHOLE_DECODER`)."""
+    from dew.interop.codecs import source_quantization
+
     if bundles(config):
         return bundle_text_config(config)
+    if config.get("model_type") == "diffusion_gemma":
+        raise ValueError(WHOLE_DECODER)
     if config.get("model_type") in families() or "text_config" not in config:
         return config
-    return language_model_config(config)
+    text = language_model_config(config)
+    if source_quantization(config) is None:
+        return text
+    quantization = language_model_quantization(config, translate_wrapper_config(config), inventory)
+    text = {key: value for key, value in text.items() if key != "quantization_config"}
+    return text if quantization is None else {**text, "quantization_config": quantization}
 
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
