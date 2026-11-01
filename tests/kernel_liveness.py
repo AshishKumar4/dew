@@ -424,6 +424,17 @@ class _Pass:
         self.compiler = compiler
         self.launches: list[Peak] = []
         self.mma_words = 0
+        # Each run of a block's warpgroup products' accumulator atoms, by the run's key: ptxas issues every
+        # product of a run before it reads any of their accumulators (`uses`, `_define_all`).
+        self.products: dict = collections.defaultdict(set)
+        # Each product's run, each op's products of its block it reads through (`_define_all`), and each
+        # block's open run: its key and its products (ops by their operations, whose wrappers compare by the
+        # operation they wrap).
+        self.run: dict = {}
+        self.reads: dict = {}
+        self.open: dict = {}
+        # Each block's open run's products whose values the threads wrote to shared memory since it opened.
+        self.stored: dict = {}
 
     def _streamed(self, op, name: str) -> bool:
         if not _elementwise(op, name):
@@ -631,6 +642,13 @@ class _Pass:
                 return
         for operand in op.operands:
             into.update(a for a in self.atoms.of.get(operand, ()) if a is not None)
+        if _product(op):
+            # ptxas issues every warpgroup product of a run before it reads any of their accumulators, so
+            # each is live to its run's last product: the recurrence's states launch holds its twelve
+            # products' 96 words at its peak, which the program order kills six at a time (its 202
+            # registers a thread against 117 counted).
+            # A nested block's products are placed when its own block is walked (`block`).
+            into.update(self.products.get(self.run.get(op), ()))
         for nested_region in op.regions:
             for block in nested_region.blocks:
                 for inner in block.operations:
@@ -717,9 +735,104 @@ class _Pass:
         return peak
 
     def _define_all(self, op):
+        """`op` defined (`define`), a product placed in its run: a block's products in order, a run closing
+        where a product reads a product of the run's, through any ops between (a region's yields among them)
+        or through shared memory (attention's S, then P stored from it and fenced to the async proxy, then
+        PV: one can't be issued before the one it reads), so only independent products' accumulators are
+        held to their run's last (row 3154)."""
         if op.results and op.results[0] in self.atoms.of:
             return
         self.define(op)
+        upstream = self._read(op.operands) | self._captured(op)
+        key, members = self.open.get(op.parent, (None, set()))
+        if _stores_shared(op):
+            # A run's product's value written to shared memory, which a product after the fence may read.
+            self.stored[op.parent] = self.stored.get(op.parent, set()) | (upstream & members)
+        if _fences_shared_for_products(op) and self.stored.get(op.parent):
+            self.open.pop(op.parent, None)
+            self.stored.pop(op.parent, None)
+            key, members = None, set()
+        if _product(op):
+            # A product accumulating in place onto another's accumulators (a contraction's next K step) is
+            # the same accumulation: only its other operands (its left operand's registers, an address) can
+            # read a run-mate.
+            tied = _tied(op) or []
+            reads = self._read([operand for operand in op.operands if not any(operand == t for t in tied)])
+            if key is None or reads & members:
+                key, members = (op.parent, op), set()
+                self.stored.pop(op.parent, None)
+            members.add(op)
+            self.open[op.parent] = (key, members)
+            self.run[op] = key
+            self.products[key].update(a for value in op.results for a in self.atoms.of.get(value, ())
+                                      if a is not None)
+            upstream.add(op)
+        self.reads[op] = frozenset(upstream)
+
+    def _read(self, operands) -> set:
+        """The products of their blocks `operands` read through (`_define_all`)."""
+        return set().union(*(self.reads.get(operand.owner, ()) for operand in operands
+                             if not isinstance(operand.owner, ir.Block)))
+
+    def _captured(self, op) -> set:
+        """The products a region op's results read through the values its regions capture from outside
+        it, which its body may yield (a loop's or a branch's result): none for an op without regions."""
+        if not op.regions:
+            return set()
+        inside, captured = set(), []
+
+        def visit(inner):
+            inside.add(inner)
+            captured.extend(inner.operands)
+            return ir.WalkResult.ADVANCE
+
+        for region in op.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    inner.operation.walk(visit)
+        return self._read(operand for operand in captured
+                          if isinstance(operand.owner, ir.Block) or operand.owner not in inside)
+
+
+def _stores_shared(op) -> bool:
+    """Whether `op` writes shared memory (address space 3): `stmatrix` (attention's P and dS, written from
+    their products' accumulators, `nvvm.stmatrix`), or a store to it, as an op or its assembly."""
+    name = op.name.removeprefix(PREFIX)
+    if name == "nvvm.stmatrix":
+        return True
+    if name in ("llvm.store", "vector.store", "memref.store", "vector.transfer_write"):
+        return any(_shared(operand.type) for operand in op.operands)
+    return (name == "llvm.inline_asm" and "asm_string" in op.attributes
+            and re.search(r"\bst(matrix)?\.(.*\.)?shared", ir.StringAttr(op.attributes["asm_string"]).value)
+            is not None)
+
+
+SHARED = re.compile(r"^!llvm\.ptr<3>$|^memref<.*,\s*(3|#gpu\.address_space<workgroup>)>$")
+"""A type in shared memory: an LLVM pointer of address space 3, or a memref whose memory space is 3 or the
+workgroup's."""
+
+
+def _shared(kind) -> bool:
+    """Whether `kind` (a type) addresses shared memory (`SHARED`)."""
+    return SHARED.match(str(kind)) is not None
+
+
+def _fences_shared_for_products(op) -> bool:
+    """Whether `op` fences the threads' shared-memory writes before the asynchronous proxy reads them (a
+    warpgroup product's operands): `nvvm.fence.proxy` of an async kind, or `fence.proxy.async`'s
+    assembly; the tensor-map fences (`nvvm.fence.proxy.acquire`, `.release`) order no shared memory."""
+    name = op.name.removeprefix(PREFIX)
+    if name == "nvvm.fence.proxy":
+        return "async" in str(op.attributes["kind"]) if "kind" in op.attributes else False
+    return (name == "llvm.inline_asm" and "asm_string" in op.attributes
+            and re.search(r"fence\.proxy\.async(\.shared)?", ir.StringAttr(op.attributes["asm_string"]).value)
+            is not None)
+
+
+def _product(op) -> bool:
+    """Whether `op` issues a warpgroup MMA (`wgmma.mma_async` assembly)."""
+    return (op.name.removeprefix(PREFIX) == "llvm.inline_asm" and "asm_string" in op.attributes
+            and "wgmma.mma_async" in ir.StringAttr(op.attributes["asm_string"]).value)
 
 
 CANONICAL = "builtin.module(canonicalize,cse,loop-invariant-code-motion,canonicalize,cse)"

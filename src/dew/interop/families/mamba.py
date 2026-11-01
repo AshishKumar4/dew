@@ -27,6 +27,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
+from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 LAYER: Mapping[str, tuple[str, ...]] = {
     "norm.weight": ("input_layernorm", "scale"),
@@ -109,6 +110,19 @@ MAMBA = DecoderFamily(
     export_path=partial(mamba2.export_path, layer_names=_LAYER_NAMES, family="Mamba"),
     # The path map names every leaf of the mixer, so the shared writer writes it whole.
     export_weights=decoder_tensors,
+    preserve_source_layout=True,
+    tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
+)
+
+MAMBA2 = DecoderFamily(
+    ("mamba2",),
+    mamba2.config_from_hf,
+    lambda fields: isinstance(fields.mixer, Mamba2Mixer),
+    "mamba2",
+    "Mamba2ForCausalLM",
+    lambda model: {},
+    weight_path=mamba2.weight_path,
+    export_path=mamba2.export_path,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
 )

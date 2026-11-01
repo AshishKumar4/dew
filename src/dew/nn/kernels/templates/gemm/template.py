@@ -33,8 +33,8 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax.typing import PrecisionLike
+from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation, grouped_matmul, selection
@@ -129,7 +129,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                                            prologue_axes, compute, work if not each else None, plain)
                      for place, d_product, matrix, work, each in zip(places, d_products, matrices, works,
                                                                      narrow, strict=True)]
-        leaves = [d_lhs, gradients[0], np.zeros(group_sizes.shape, jax.dtypes.float0),
+        leaves = [d_lhs, gradients[0], zero_from_primal(group_sizes),
                   *(d_prologue or (None,) * len(prologue_arrays)),
                   *(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)),
                   *gradients[1:]]

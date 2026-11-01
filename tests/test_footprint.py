@@ -156,6 +156,26 @@ def test_a_called_program_holds_what_it_would_inline():
         inline, weights, (rows,), platform="gpu", workspace=none)
 
 
+def test_a_called_product_in_a_loop_is_priced_at_its_fused_workspace():
+    """A loop's turn reads a slice of its stacked weights, which XLA fuses with the cuBLAS product reading it
+    (`Slicing.fused`), the product keeping the GEMM rewriter's workspace (`Workspace.sliced`): priced so
+    where the product runs in a called program (a wide sum's, `precision.accumulated`, traced once for its
+    types), as XLA inlines it (row 3193)."""
+    from dew.nn.precision import accumulated
+
+    def loss(weights, rows):
+        def turn(carry, weight):
+            return accumulated(jnp.dot, carry, weight), None
+
+        return jax.lax.scan(turn, rows, weights)[0].sum(), None
+
+    weights = jax.ShapeDtypeStruct((3, 64, 64), jnp.float32)
+    rows = jax.ShapeDtypeStruct((128, 64), jnp.float32)
+    free = gradient_peak(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
+    fused = gradient_peak(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 64 << 20)).bytes
+    assert fused - free >= 32 << 20, (free, fused)
+
+
 def test_a_loops_stacked_results_are_held_beside_each_turns_own():
     """A loop's stacked results are held whole beside what each turn holds while it runs: ten turns, each
     multiplying twice, hold the ten results and a turn's two products at once."""

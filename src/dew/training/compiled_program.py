@@ -86,8 +86,9 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
     (`_cond_lowering`, jax/_src/lax/control_flow/conditionals.py, keeps the branches whose platforms
     hold the lowering's, and lowers a sole branch as the computation itself), and each call (`CALLS`)
     as its program in its caller, a differentiated checkpoint's operands behind its barrier
-    (`prevented`); through every program an equation runs but a native Pallas kernel's,
-    which XLA never sees (`opaque`)."""
+    (`prevented`), a nested `jit` among them (a wide sum's, `precision.accumulated`, traced once for its
+    types: called, its GEMMs were no fusion's of the slices that read them, row 3193); through every program
+    an equation runs but a native Pallas kernel's, which XLA never sees (`opaque`)."""
     renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
     equations: list[jcore.JaxprEqn] = []
 
