@@ -25,10 +25,21 @@ ENVIRONMENTS=2026-10-17T00:00:00Z
 CERTIFI=2026-10-20T03:00:00Z
 # Every package Dew's package index (constraints.txt's extra index) serves its own builds of, as its root page
 # lists them (the fork's patch_stack.py writes it: jax, qwix), takes no date: the index's static pages give no
-# upload times, which a date would need. Read at each lock, so a package the index takes on resolves with it.
+# upload times, which a date would need. Read at each lock, so a package the index takes on resolves with it,
+# and none of the dated lists below dates one (both at once filtered every version of the CUDA plugins once the
+# index took them: ledger 3116).
 INDEX=$(sed -n 's/^--extra-index-url //p' constraints.txt)
 UNDATED=$(curl -fsS "$INDEX/" | sed -n 's|.*<a href="\([^/"]*\)/">.*|\1|p')
 [ -n "$UNDATED" ] || { echo "Dew's package index $INDEX lists no package" >&2; exit 1; }
+# Each package of a dated list the index does not serve (`UNDATED`), with its date: `--exclude-newer-package
+# NAME=DATE -P NAME`.
+dated() {
+  date=$1
+  shift
+  for package in "$@"; do
+    case " $(echo $UNDATED) " in *" $package "*) ;; *) echo --exclude-newer-package "$package=$date" -P "$package" ;; esac
+  done
+}
 lock() {
   name=$1
   shift
@@ -37,8 +48,7 @@ lock() {
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
     $(for package in $UNDATED; do echo --exclude-newer-package "$package=false"; done) \
     --exclude-newer-package "certifi=$CERTIFI" -P certifi --emit-index-url \
-    $(for package in jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt libtpu; do
-      echo --exclude-newer-package "$package=$JAXLIB" -P "$package"; done) \
+    $(dated "$JAXLIB" jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt libtpu) \
     $(for package in openenv daytona daytona-api-client daytona-api-client-async daytona-toolbox-api-client \
         daytona-toolbox-api-client-async daytona-analytics-api-client daytona-analytics-api-client-async; do
       echo --exclude-newer-package "$package=$ENVIRONMENTS"; done) \
