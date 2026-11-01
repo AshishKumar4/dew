@@ -30,6 +30,7 @@ from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec
 
 from dew._records import JSON
+from dew.nn.kernels.options import program
 
 if TYPE_CHECKING:
     from jax._src.distributed import State
@@ -90,7 +91,7 @@ def _gathered(group: list[jax.Array], held: bool) -> list[np.ndarray] | None:
     if mesh is None:
         return [np.asarray(multihost_utils.process_allgather(group[0], tiled=True))]
     replicated = NamedSharding(mesh, PartitionSpec())
-    outputs = jax.jit(_identity, out_shardings=(replicated,) * len(group))(*group)
+    outputs = program(_identity, out_shardings=(replicated,) * len(group))(*group)
     if not held:
         jax.block_until_ready(outputs)
         return None
