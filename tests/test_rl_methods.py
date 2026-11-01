@@ -453,6 +453,30 @@ def test_a_run_drawing_further_batches_resumes_after_the_last_it_drew(tmp_path):
     assert fit(1, Checkpoints(checkpoints)) + fit(2, Checkpoints(checkpoints)) == whole
 
 
+def test_a_run_drawing_further_batches_past_its_orders_end_trains_the_groups_it_admitted():
+    """A run whose step draws further batches to fill its groups (`generation_batches`) over a finite
+    global order of one batch, whose shares run out together, so its reads after the first are not
+    agreed (`FitRun.agrees`): the step's further draw finds the order's end (`FitRun.further`, None),
+    trains the groups it admitted, and the run ends there, after one step (row 2766's review)."""
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+    from dew.training import Layout
+
+    sessions = {str(task): (agreeing if task == 0 else varying)(task) for task in range(2)}
+    objective, rollout = composed("dapo", TinyHead(vocab_size=VOCAB), 15)
+    collector = Scripted(sessions)
+    scheduler = RolloutScheduler(Synchronous(collector), groups=2, admit=4, generation_batches=3, **rollout)
+    tasks = [0, 0, 0, 0, 1, 1, 0, 0]
+    order = compile(Pipeline(Memory({"task_id": np.asarray(tasks, np.int32)})).repeat(1).batch(8), seed=0,
+                    loading=Loading(workers=0))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), rollout=scheduler,
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    state = trainer.fit(order, steps=2, log_every=1)
+    assert int(state.step) == 1
+    assert [collected for collected, _ in collector.collected] == [tasks]
+
+
 def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():
     """RLOO (arXiv:2402.14740 equations 3 and 6): each sequence's reward less reward_kl times its summed
     log-ratio of the policy that drew it (its recorded raw likelihoods, the proximal policy) to the

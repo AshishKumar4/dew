@@ -69,6 +69,7 @@ AVERAGING = Path(__file__).with_name("averaging_worker.py")
 PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
 """The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
+READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pools that run on the examples clock."""
 CLOCKED = 17
 """The examples a pool's run bounded in examples is bounded to: of ten records, seven read twice, and in
@@ -1784,6 +1785,20 @@ def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_ex
     assert all("profile stop" in (report["failed"] or "") for report in reports), reports
     assert reports[1]["manifests"] == 1
     assert all(report["recovered"] == 2 for report in reports)
+
+
+@pytest.mark.distributed
+def test_a_pools_reads_after_its_first_agree_nothing_where_no_share_can_run_out_alone(tmp_path):
+    """A pool agrees a read of its training stream after the first only where its shares may run out
+    apart: over a finite global order, which every share runs out of at the same read, over arrays
+    handed whole, over a Grain map dataset handed to read without end, and in a cooldown branch of an
+    endless order, a run of twice the steps takes no round more than the shorter one (a read agreed
+    at each step, as every one of these was, takes one a step: 1.4 ms on two loopback processes, 38 ms
+    on eight containers, docs/performance.md)."""
+    reports = run_pool("read_rounds", tmp_path / "rounds", 2, script=READ_ROUNDS, timeout=300, steps=4)
+    for report in reports:
+        assert {kind: longer - shorter for kind, (shorter, longer) in report.items()} == {
+            "global": 0, "whole": 0, "map": 0, "cooldown": 0}, report
 
 
 @pytest.mark.distributed
