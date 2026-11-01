@@ -314,7 +314,7 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
 
 RESETTING = {
     "ssd": (update, readout, OPERANDS, (STATE, WIDTH), draw, ("x", "dt", "B", "C"),
-            {"rate": RATE, "skip": SKIP}),
+            {"rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}),
     "gated_delta": (gated_delta, gated_readout, GATED, (KEY, VALUE), gated_draw, tuple(GATED), {}),
     "kimi_delta": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw, tuple(GATED), {}),
 }
@@ -423,4 +423,4 @@ def test_no_gradient_crosses_a_reset(rule):
     for name in names:
         assert not np.any(np.asarray(grads[name][:reset])), f"{rule}: {name}'s gradient crosses the reset"
     if "g" in grads:
-        assert not np.any(np.asarray(grads["g"][reset])), f"{rule}: the reset token's own decay has a gradient"
+        assert not np.any(np.asarray(grads["g"][reset])), f"{rule}: the reset token's decay has a gradient"
