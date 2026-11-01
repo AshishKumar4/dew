@@ -31,7 +31,8 @@ TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's;
 followed.py's children hold 4."""
 CHILD_START = BaseProcess.start.__code__
-"""Where every multiprocessing context starts a child: Python 3.12 audits no spawn or forkserver start."""
+"""Where every multiprocessing context starts a child: Python 3.12 audits no spawn or forkserver start, and
+3.14 audits the exec beneath it (followed.py's `start`)."""
 
 root = os.getcwd() + os.sep
 owners: list[str] = [SHARED]
@@ -105,9 +106,11 @@ def kept(read: str | None) -> None:
 
 def started(code, offset):
     """sys.monitoring's PY_START: the checkout's code a run executes, once an owner, and where it reads the
-    backend; a multiprocessing child's start, whose child no event follows."""
+    backend; a multiprocessing child's start, followed where it spawns the child (`followed.spawned`)."""
     if code is CHILD_START:
-        write(owner(), f"{STARTED}unfollowed")
+        # The callback runs in the frame of the `start` it is called for: a spawned child records itself.
+        if (how := followed.spawned(code, sys._getframe(1))) != "forked":
+            write(owner(), f"{STARTED}{how}")
         return None
     if code.co_name == followed.OPENED[0] and code.co_filename.endswith(followed.OPENED[1]):
         # Registered after jax's own clean-up, so it reads the pool before the backend closes.
@@ -190,6 +193,8 @@ def boot() -> None:
     path = Path(os.environ[LOG])
     log = path.open("a", buffering=1)
     atexit.register(closing)
+    # A forked child writes into this log as this process does, and its end is not this process's.
+    os.register_at_fork(after_in_child=lambda: atexit.unregister(closing))
     directory = path.with_name(f"{path.name}.children")
     directory.mkdir(exist_ok=True)
     children = str(directory)
@@ -213,6 +218,24 @@ def followed_children() -> None:
                    "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                    "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, ""), "DEW_EXECUTED_FILE": SHARED}
     followed.installed()
+    followed_spawn()
+
+
+def followed_spawn() -> None:
+    """The children `multiprocessing` spawns (a `Process` of its `spawn` context: Grain's loading workers)
+    start with the site, as a Python child of any other start does, so the `.pth` (followed.py's `installed`)
+    runs `follow` in them: this process runs with -S (session.py's `BOOT`), which `multiprocessing` passes
+    on to its children, whose site (and so the `.pth`) is then never made."""
+    import multiprocessing.spawn
+
+    command_line = multiprocessing.spawn.get_command_line
+
+    def with_site(**keywords):
+        command = command_line(**keywords)
+        code = command.index("-c")
+        return [argument for at, argument in enumerate(command) if argument != "-S" or at > code]
+
+    multiprocessing.spawn.get_command_line = with_site
 
 
 def run(installed=lambda: None) -> None:

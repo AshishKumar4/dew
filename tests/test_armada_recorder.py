@@ -19,8 +19,11 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     (tools/armada/followed.py), once and silently though its site-packages are
     processed again: its reads of the backend join the file's evidence, and
     the files it executed and the pages it read the file's key, which holds
-    until one changes. A child given an environment of its own, or killed
-    before it wrote its record, leaves its file without a key."""
+    until one changes, though it leaves through os._exit, it writes each as it
+    happens, or execs itself again (dew.devices' restart under XLA's flags),
+    whose new image writes on into the log of the old. A child given an
+    environment of its own, or killed before it wrote its record, leaves its
+    file without a key."""
     url, _, _ = cache_worker
     cached(monkeypatch, url)
     started = "import os, subprocess, sys\ndef test_child():\n    "
@@ -32,10 +35,18 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                     "import devices, plain\n"
                     "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n"
                     "assert open('notes/page.md').read()\n",
+        "exit.py": "import os, plain\nassert plain.helper()\nos._exit(0)\n",
+        "reexec.py": "import os, sys\nimport plain\n"
+                     "if os.environ.get('REEXECED') != '1':\n"
+                     "    again = {**os.environ, 'REEXECED': '1'}\n"
+                     "    os.execve(sys.executable, [sys.executable, __file__], again)\n"
+                     "assert plain.helper()\n",
         "test_child.py": started + "done = subprocess.run([sys.executable, 'tests/child.py'], check=True,\n"
                                    "                      capture_output=True, text=True)\n"
                                    "    assert not done.stderr, done.stderr\n",
         "test_quiet.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
+        "test_exits.py": started + "subprocess.run([sys.executable, 'tests/exit.py'], check=True)\n",
+        "test_reexecs.py": started + "subprocess.run([sys.executable, 'tests/reexec.py'], check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
@@ -51,16 +62,115 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
 
-    assert reused() == [True, True, False, False]
+    assert reused() == [True, True, True, True, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
-    assert reused() == [False, True, False, False]
+    assert reused() == [False, True, True, True, False, False]
     (tmp_path / "notes/page.md").write_text("page\n")
-    assert reused() == [True, True, False, False]
+    assert reused() == [True, True, True, True, False, False]
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
-    assert reused() == [False, True, False, False]
+    assert reused() == [False, True, False, False, False, False]
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
+                                   "tests/test_exits.py": ["changed"],
                                    "tests/test_killed.py": ["changed"],
-                                   "tests/test_own_environment.py": ["changed"]}
+                                   "tests/test_own_environment.py": ["changed"],
+                                   "tests/test_reexecs.py": ["changed"]}
+
+
+def test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A child multiprocessing spawns (a `Process` of its `spawn` context: Grain's loading workers, whose
+    start Python 3.12 audits no event of) records itself as a Python child any other start makes does
+    (test_a_python_child_joins_its_files_record), though this process runs with -S, which multiprocessing
+    passes on to the children it spawns: the functions they ran and the pages they read are their file's
+    key, those of a child one of them spawns in turn too (and the resource tracker it starts, which runs
+    the standard library alone, records nothing), and an edit to what only a child ran reruns the file. A
+    forked child, whose code runs under its parent's hooks and writes into its log, joins the record as it
+    is; one a forkserver runs, which no hook reaches, leaves its file without a key."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    spawned = ("import multiprocessing\ndef test_child():\n"
+               "    child = multiprocessing.get_context('spawn').Process(")
+    started = "child.start()\n    child.join()\n    assert child.exitcode == 0\n"
+    files = {
+        "plain.py": "def helper(): return 1\n",
+        "inner.py": "def inner(): return 2\n",
+        "forked.py": "def in_fork(): return 3\ndef in_mp_fork(): return 4\n",
+        "worker.py": "import multiprocessing\nimport plain\n"
+                     "def work(path):\n    assert plain.helper() and open(path).read()\n"
+                     "def spawn_inner():\n    import inner\n"
+                     "    context = multiprocessing.get_context('spawn')\n"
+                     "    done = context.Event()\n"
+                     "    child = context.Process(target=inner.inner)\n"
+                     "    child.start()\n    child.join()\n    done.set()\n    assert child.exitcode == 0\n",
+        "test_spawn.py": "import worker\n" + spawned + "target=worker.work, args=('notes/page.md',))\n    "
+                         + started,
+        "test_nested.py": "import worker\n" + spawned + "target=worker.spawn_inner)\n    " + started,
+        "test_os_fork.py": "import os, forked\ndef test_child():\n    pid = os.fork()\n    if pid == 0:\n"
+                           "        try:\n            forked.in_fork()\n"
+                           "        finally:\n            os._exit(0)\n"
+                           "    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0\n",
+        "test_fork.py": "import multiprocessing, forked\ndef test_child():\n"
+                        "    child = multiprocessing.get_context('fork').Process(target=forked.in_mp_fork)\n"
+                        "    " + started,
+        "test_forkserver.py": "import multiprocessing, os\ndef test_child():\n"
+                              "    context = multiprocessing.get_context('forkserver')\n"
+                              "    child = context.Process(target=os.getpid)\n    " + started,
+    }
+    written(tmp_path, files)
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes/page.md").write_text("page\n")
+    interpreter(tmp_path, "3.12")
+    tests = [f"tests/{name}" for name in files if name.startswith("test_")]
+    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+
+    def reused() -> list[bool]:
+        return reusable_now(ci, tests)
+
+    def edited(name: str, source: str) -> list[bool]:
+        """Whether each file is reused with `name` as `source`, which `name` is restored from after."""
+        path = tmp_path / name
+        original = path.read_text()
+        path.write_text(source)
+        try:
+            return reused()
+        finally:
+            path.write_text(original)
+
+    assert reused() == [True, True, True, True, False]
+    assert edited("notes/page.md", "page again\n") == [False, True, True, True, False]
+    assert edited("tests/inner.py", "def inner(): return 3 - 1\n") == [True, False, True, True, False]
+    assert edited("tests/plain.py", "def helper(): return 2 - 1\n") == [False, True, True, True, False]
+    # What only a forked child ran, and the files after it in the process, which take what ran before them.
+    assert edited("tests/forked.py", "def in_fork(): return 3\ndef in_mp_fork(): return 5 - 1\n") == [
+        True, True, True, False, False]
+    assert edited("tests/forked.py", "def in_fork(): return 4 - 1\ndef in_mp_fork(): return 4\n") == [
+        True, True, False, False, False]
+
+
+def test_a_native_media_binary_keeps_its_files_key_and_what_it_opened_is_that_keys_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The media binary imageio-ffmpeg ships, named for its platform and version, and the other native
+    programs of `followed.TOOLS` run no checkout code and hold no GPU: a file that starts one keeps its key,
+    whose inputs include the data files the program opened under tests/ (the watch's: it raises no Python
+    audit event). A shell script of the same directory, which may run any code, leaves its file without a
+    key."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    run = ("import subprocess\ndef test_run():\n"
+           "    subprocess.run(['tests/bin/{}'], check=True, capture_output=True)\n")
+    written(tmp_path, {"clip.bin": "frames\n"})
+    (tmp_path / "tests/bin").mkdir()
+    for name in ("ffmpeg-linux-x86_64-v7.0.2", "unlisted"):
+        (tmp_path / "tests/bin" / name).write_text("#!/bin/sh\ncat tests/clip.bin\n")
+        (tmp_path / "tests/bin" / name).chmod(0o755)
+    written(tmp_path, {"test_media.py": run.format("ffmpeg-linux-x86_64-v7.0.2"),
+                       "test_shell_script.py": run.format("unlisted")})
+    interpreter(tmp_path, "3.12")
+    tests = ["tests/test_media.py", "tests/test_shell_script.py"]
+    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    assert reusable_now(ci, tests) == [True, False]
+    (tmp_path / "tests/clip.bin").write_text("more frames\n")
+    assert reusable_now(ci, tests) == [False, False]
 
 
 def test_what_a_conftest_starts_before_any_test_is_every_files_input(ci, tmp_path, monkeypatch,
@@ -372,8 +482,9 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     """The children's logs join the file that started them (`followed.gathered`): their files, and the
     GPU they held, the most a child that took the parent's fraction used, those children as shares and
     the bytes of those that named their own, counted only while they lived at once. A file is followed
-    only where every start it and its children saw left a closed log naming it and none started a
-    process it did not follow; one whose child's log never closed, killed before its end, is not."""
+    only where every start it and its children saw left a log naming it and none started a process it
+    did not follow; a child killed before its end left its log as far as it got, which is what it ran,
+    but its pool is not known (`measured`), as the child reads it as its last atexit runs."""
     followed = load("followed", "tools/armada")
     gib = 2 ** 30
 
@@ -396,5 +507,8 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     child(9, "tests/d.py", 0, 1, unfollowed=True)
     found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
     assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
-                                   "followed": True, "peak": 5 * gib, "shares": 2, "pools": 5 * gib}
-    assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3
+                                   "followed": True, "measured": True, "peak": 5 * gib, "shares": 2,
+                                   "pools": 5 * gib}
+    assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [
+        False, True, False]
+    assert [found[name]["measured"] for name in ("tests/c.py", "tests/d.py")] == [False, True]

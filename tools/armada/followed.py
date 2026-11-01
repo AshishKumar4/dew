@@ -1,16 +1,19 @@
 """The processes a test file starts, as executed.py's records count them: a native tool's start keeps the
-file's key (`TOOLS`), a Python child that records itself is followed, and any other start leaves the
-file without a key, as code no event sees ran.
+file's key (`TOOLS`), a Python child that records itself is followed, a forked child writes into its
+parent's log and is followed with it, and any other start leaves the file without a key, as code no event
+sees ran.
 
 A child is this checkout's Python started with an environment that names DEW_EXECUTED_CHILDREN, the
-parent's or one passed on with it. The `.pth` the parent installs in the environment (`installed`)
+parent's or one passed on with it, and with its site: a child multiprocessing spawns is started so
+(lifetime.py's `followed_spawn`). The `.pth` the parent installs in the environment (`installed`)
 runs `follow` as the child starts: it logs the checkout's files the child executed and read (`read`, as
 the parent logs its own, lifetime.py), the modules it imported, where it read the backend, the processes it
 started in turn and the GPU pool it held, each as it happens, and a closing line as its last atexit runs.
-A child whose log never closed (killed, or leaving through os._exit) is lost, and the parent then counts
-its file's starts as unfollowed (`gathered`), as it does a count of logs other than the starts it saw.
-It imports the standard library alone, since the `.pth` runs it in every child before the child's own
-imports."""
+A child killed or leaving through os._exit has no closing line but every line it wrote before its end,
+which is all it ran: its file keeps its key, and no GPU memory is known of it (`gathered`). A child that
+left no log at all (killed before its site ran), or more logs than starts the parent saw, is a count that
+does not match: the parent then counts its file's starts as unfollowed. It imports the standard library
+alone, since the `.pth` runs it in every child before the child's own imports."""
 
 import atexit
 import dis
@@ -27,14 +30,21 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
-TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas"}
+TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas", "ffmpeg", "ffplay", "cc", "rsync", "wandb-core"}
 """The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs),
-uname and file (the `platform` module's answers) and ptxas (a GPU kernel's PTX compiled to machine
-code, on the host alone). Any other start, a shell's or a launcher's included, may run the
-checkout's code or hold the GPU."""
+uname and file (the `platform` module's answers), ptxas (a GPU kernel's PTX compiled to machine
+code, on the host alone), ffmpeg and ffplay (the media binary imageio-ffmpeg ships, which moviepy reads
+clips with, named for its platform: `ffmpeg-linux-x86_64-v7.0.2`), cc (a stand-in driver compiled for a
+test), rsync and wandb-core (wandb's service, a binary of the package). Each is a native program that
+runs no checkout code and holds no GPU; the data files it opens under tests/ and src/ are the watch's
+(watched.py). Any other start, a shell's or a launcher's included, may run the checkout's code or hold
+the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
-"""Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
+"""Audit events of a process start; a multiprocessing child's is `spawned`'s."""
+MULTIPROCESSING = os.path.join("multiprocessing", "process.py")
+"""Where `multiprocessing` starts every child (`BaseProcess.start`): Python 3.12 audits no spawn or forkserver
+start, and 3.14 audits the helper that execs one (`start`)."""
 HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes")
 """The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings), each
 the input of the files that read it alone; any other hidden entry (.git, an environment, a cache) is none."""
@@ -266,20 +276,74 @@ def programs(event: str, args: tuple) -> list:
     return []
 
 
+def tool(path) -> str:
+    """The name of the program at `path` as `TOOLS` has it: its file's, but for imageio-ffmpeg's binary, which
+    names its platform and version (`ffmpeg-linux-x86_64-v7.0.2`)."""
+    name = os.path.basename(os.fsdecode(path))
+    return "ffmpeg" if name.startswith("ffmpeg-") else name
+
+
 def native(names: list) -> bool:
     """Whether every one of `names`, and at least one, is a program of `TOOLS`. A start that names
     its program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
-    return bool(names) and all(isinstance(name, (str, bytes, os.PathLike))
-                               and os.path.basename(os.fsdecode(name)) in TOOLS for name in names)
+    return bool(names) and all(isinstance(name, (str, bytes, os.PathLike)) and tool(name) in TOOLS
+                               for name in names)
 
 
-def start(event: str, args: tuple, directory: str) -> str | None:
+def spawned(code: types.CodeType, frame: types.FrameType) -> str | None:
+    """How the child that `code`, run in `frame`, starts counts for its file, where `code` is
+    multiprocessing's `Process.start`: "followed" for a spawned child, which starts with the site, so the
+    `.pth` (`installed`) runs `follow` in it (lifetime.py's `followed_spawn`); "forked" for a forked one,
+    which runs this process's own code under its hooks and writes into its log, so it counts for no start;
+    "unfollowed" for a forkserver one, whose server no hook reaches; None for any other code."""
+    if code.co_qualname != "BaseProcess.start" or not code.co_filename.endswith(MULTIPROCESSING):
+        return None
+    # multiprocessing is imported once a Process starts; the default context's Process names no method.
+    from multiprocessing import context
+
+    process = frame.f_locals["self"]
+    return ("followed" if isinstance(process, context.SpawnProcess) else
+            "forked" if isinstance(process, context.ForkProcess) else "unfollowed")
+
+
+def tracker() -> bool:
+    """Whether this process is multiprocessing's resource tracker, which a process that uses its semaphores
+    and queues starts once and which runs the standard library alone: it records nothing."""
+    argv = sys.orig_argv
+    return argv[-2:-1] == ["-c"] and argv[-1].startswith("from multiprocessing.resource_tracker import main")
+
+
+def _beneath_spawnv() -> bool:
+    """Whether the start being audited is multiprocessing's own exec of a child or of its resource tracker (a
+    standard library process), which `spawned` counts for the child: Python 3.14 audits it, 3.12 does not."""
+    frame = sys._getframe(2)
+    for _ in range(4):
+        if frame is None:
+            return False
+        if frame.f_code.co_name == "spawnv_passfds" and frame.f_code.co_filename.endswith(
+                os.path.join("multiprocessing", "util.py")):
+            return True
+        frame = frame.f_back
+    return False
+
+
+def start(event: str, args: tuple, directory: str, child: bool = False) -> str | None:
     """How a process start the audit names counts for its test file: None for none of its own (a
-    native tool, or `subprocess`'s own start beneath the Popen its audit already named), "followed"
-    for a child that records itself into `directory`, else "unfollowed"."""
+    native tool, `subprocess`'s own start beneath the Popen its audit already named, multiprocessing's
+    exec of a spawned child, which `spawned` counts, a fork, whose child runs this process's own code
+    under its hooks, and, in a followed `child`, its exec of this Python again with the recorder's
+    environment, which records into its log, the pid's), "followed" for a child that records itself into
+    `directory`, else "unfollowed"."""
     if event not in SPAWNS:
         return None
+    if event in ("os.fork", "os.forkpty"):
+        return None
     if event != "subprocess.Popen" and _beneath_popen():
+        return None
+    if event == "_posixsubprocess.fork_exec" and _beneath_spawnv():
+        return None
+    if child and event == "os.exec" and _this_python(args[0]) and \
+            (os.environ if args[2] is None else args[2]).get(CHILDREN) == directory:
         return None
     if native(programs(event, args)):
         return None
@@ -390,7 +454,7 @@ def follow() -> None:
     records no files, and says so (`unfollowed`): its file then has no key, and the child starts as it would
     without the recorder."""
     holder = sys.monitoring.get_tool(FOLLOWER_TOOL)
-    if holder == FOLLOWER:
+    if holder == FOLLOWER or tracker():
         return
     directory, root = Path(os.environ[CHILDREN]), os.environ["DEW_EXECUTED_ROOT"]
     log = (directory / f"{os.getpid()}.log").open("a", buffering=1)
@@ -424,6 +488,13 @@ def follow() -> None:
             if sys._getframe(1).f_locals.get("platform") in GPUS:
                 atexit.register(held)
             return None
+        if (how := spawned(code, sys._getframe(1))) is not None:
+            # A child this one starts through multiprocessing: counted as the parent's own are (lifetime.py).
+            if how == "followed":
+                log.write("start\tfollowed\n")
+            elif how == "unfollowed":
+                write("unfollowed", 1)
+            return None
         name = code.co_filename
         if checkout(name, root):
             recorded(code_unit(code, root))
@@ -448,7 +519,7 @@ def follow() -> None:
         if (taken := coded(event, args, root)) is not None:
             recorded(taken)
             return
-        kind = start(event, args, str(directory))
+        kind = start(event, args, str(directory), child=True)
         if kind == "followed":
             log.write("start\tfollowed\n")
         elif kind == "unfollowed":
@@ -460,6 +531,8 @@ def follow() -> None:
         sys.meta_path.insert(0, closed_imports(seen, root))
 
     atexit.register(closing)
+    # A forked child writes into this log as this process does, and its end is not this process's.
+    os.register_at_fork(after_in_child=lambda: atexit.unregister(closing))
     if holder is not None:
         write("unfollowed", 1)
         return
@@ -517,10 +590,13 @@ def logged(path: Path) -> dict:
 def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
     """What each test file's children logged in `directory`, by the file that started them (`""`, every
     file's, for those started outside a file's tests), given how many children each file's own process
-    started (`expected`): their files and reads, whether every start was followed and every child's log
-    closed, the most GPU memory a child that took the parent's fraction held (`peak`), and the GPU pools they
-    held at once, the parent's share counted apart (`shares`, the children that took its fraction) from the
-    bytes of those that named their own. Read once the process group has exited, so every log is whole."""
+    started (`expected`): their files and reads, whether every start was followed (`followed`: each left a
+    log naming its file, and none started a process no event follows; a child killed or leaving through
+    os._exit is followed, its log whole up to its end, as it writes each event as it happens) and every
+    child's log closed (`measured`: only a child that ran to its end read the GPU memory it held), the most
+    GPU memory a child that took the parent's fraction held (`peak`), and the GPU pools they held at once,
+    the parent's share counted apart (`shares`, the children that took its fraction) from the bytes of
+    those that named their own. Read once the process group has exited, so every log is whole."""
     records = [logged(path) for path in directory.glob("*.log")] if directory.is_dir() else []
     found: dict[str, dict] = {}
     for name in {*expected, *(record["file"] for record in records)}:
@@ -532,7 +608,8 @@ def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
         found[name] = {
             "files": {path for record in own for path in record["files"]},
             "reads": {site for record in own for site in record["reads"]},
-            "followed": len(whole) == len(own) == starts and not any(r["unfollowed"] for r in own),
+            "followed": len(own) == starts and not any(r["unfollowed"] for r in own),
+            "measured": len(whole) == len(own),
             "peak": max((record["peak"] for record in inherited if record["peak"] is not None), default=None),
             "shares": _most_at_once(inherited, lambda record: 1),
             "pools": _most_at_once([r for r in pooled if not r["inherited"]], lambda record: record["pool"])}
@@ -562,7 +639,8 @@ def recorded(path: Path) -> dict[str, dict]:
     closed = [SHARED, CLOSED] in lines
     starts = Counter(name for name, item in lines if item == f"{STARTED}followed")
     children = gathered(path.with_name(f"{path.name}.children"), dict(starts))
-    blank = {"files": set(), "reads": set(), "followed": True, "peak": None, "shares": 0, "pools": 0}
+    blank = {"files": set(), "reads": set(), "followed": True, "measured": True, "peak": None, "shares": 0,
+             "pools": 0}
     shared_child = children.get(SHARED, blank)
     visits = [(index, name) for index, (name, item) in enumerate(lines) if item == VISIT]
     files = list(dict.fromkeys(name for _, name in visits if name != SHARED))
@@ -585,7 +663,9 @@ def recorded(path: Path) -> dict[str, dict]:
             "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
-            "peak": max(held) if len(files) == 1 and whole and held else None,
+            # A child that never closed held a pool its record does not name: the file's peak is not known.
+            "peak": max(held) if len(files) == 1 and whole and child["measured"] and shared_child["measured"]
+                    and held else None,
             # The shared children may run beside the file's own: their counts together bound both.
             "shares": child["shares"] + shared_child["shares"],
             "pools": child["pools"] + shared_child["pools"]}

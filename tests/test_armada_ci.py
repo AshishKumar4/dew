@@ -258,16 +258,24 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process a record does not follow
-    (test_a_python_child_joins_its_files_record), a shell's or any
-    multiprocessing context's, has no key, so it is in, and no task reuses
-    its row, whatever names its program (a descriptor, for `os.execve`); one
-    that asked a native tool about the host or compiled a kernel with ptxas
-    (`followed.TOOLS`) keeps its key. The command line
+    (test_a_python_child_joins_its_files_record), a shell's or a forkserver
+    multiprocessing child's, has no key, so it is in, and no task reuses its
+    row, whatever names its program (a descriptor, for `os.execve`); one that
+    asked a native tool about the host or compiled a kernel with ptxas
+    (`followed.TOOLS`), or spawned or forked a multiprocessing child
+    (test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs_it),
+    keeps its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
     device = "class Device:\n    platform = 'gpu'\n"
+    children = {method: "import multiprocessing, os\n"
+                        "def test_child():\n"
+                        f"    context = multiprocessing.get_context('{method}')\n"
+                        "    child = context.Process(target=os.getpid)\n"
+                        "    child.start()\n    child.join()\n    assert child.exitcode == 0\n"
+                for method in ("spawn", "forkserver", "fork")}
     files = {
         "devices.py": device + "def placed(device): return device.platform\n",
         "conftest.py": "import pytest\nfrom devices import Device, placed\n"
@@ -295,6 +303,10 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
                         "    subprocess.run(['tests/compiler/ptxas', '--version'], check=True)\n"
                         "    assert platform.platform()\n",
+        # Before the files whose starts no record follows: such a start leaves each file after it in its
+        # process without a key too (followed.py's `recorded`).
+        "test_spawn.py": children["spawn"],
+        "test_fork.py": children["fork"],
         "test_shell.py": "import os, subprocess, sys\n"
                          "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n"
                          "def test_by_descriptor():\n"
@@ -306,12 +318,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                          "        finally:\n"
                          "            os._exit(1)\n"
                          "    assert os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]) == 0\n",
-        **{f"test_{method}.py": "import multiprocessing, os\n"
-                                "def test_child():\n"
-                                f"    context = multiprocessing.get_context('{method}')\n"
-                                "    child = context.Process(target=os.getpid)\n"
-                                "    child.start()\n    child.join()\n    assert child.exitcode == 0\n"
-           for method in ("spawn", "forkserver", "fork")},
+        "test_forkserver.py": children["forkserver"],
         "test_new.py": "def test_unrun(): pass\n",
     }
     written(tmp_path, files)
@@ -339,16 +346,14 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_one.py": ["tests/devices.py:placed"],
         "tests/test_passed.py": ["tests/test_passed.py:chosen"],
         "tests/test_plain.py": ["changed"],
-        "tests/test_fork.py": ["changed"],
         "tests/test_forkserver.py": ["changed"],
         "tests/test_shell.py": ["changed"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
-        "tests/test_spawn.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
-                         "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
+                         "test_fork.py", "test_shell.py")] == [True, True, True, False, True, False]
     # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
     # --marked names it for the caller that still passes it (2714); --evidence prints each beside its reads.
     tier = functools.partial(named_tier, ci, monkeypatch, capsys)
