@@ -107,7 +107,7 @@ class HyperLuxRenderer:
         self._lens = None if fisheye is None else tuple(
             jnp.asarray(part, dtype) for part, dtype in zip(fisheye_map(size, int(source or 0), fisheye)[:2],
                                                            (jnp.int32, jnp.float32), strict=True))
-        drawn = size if source is None else source
+        resolution = size if source is None else source
 
         folder = Path(assets)
         manifest = json.loads((folder / "manifest.json").read_text())
@@ -134,7 +134,7 @@ class HyperLuxRenderer:
         self._rgb = RGB("rgba8")
         layout = self._layout()
         self.renderer = hyperlux.HyperLux(
-            drawn, drawn, batch_size=count, fidelity=fidelity, num_probes=0,
+            resolution, resolution, batch_size=count, fidelity=fidelity, num_probes=0,
             cameras=(CameraSpec("front", (self._rgb,)),), num_overlays=count,
             max_overlay_instances=len(layout), max_overlays_per_camera=1, motion_blur_samples=motion_blur)
         self.renderer.init(scene, asset_pool=pool)

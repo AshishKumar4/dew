@@ -4,16 +4,16 @@ thrust and body rates: its task, reward, termination and starts, with Dew's quad
 The task (Sec II-C, Table III): a track's gates passed in order, each through its pre-gate, itself and its
 post-gate, planes `depth` / 2 before and after it. The reward is 5 progress - rate + 30 gate. Progress is the
 step's approach to the next pre-gate, zero from the pre-gate through the post-gate: a step that crosses the
-pre-gate approaches it up to where it crosses. The rate penalty is (exp(min(|rates|_1, 17)) - 1) over
-2 f_c 1e5. The gate reward at each of the three planes is 1 - max(|y|, |z|) / `size` where the drone crosses
-it. An episode ends, its last reward zero, when the drone crosses one of those planes beyond `size` of the
-gate's centre, strikes the frame of a gate it is not passing (the race's opening and frame, `Racing`), or is
-within 0.5 m of the ground while descending faster than 1 m/s or rolled or pitched past 60 degrees; it is cut
-after `steps` steps (2000, 22 s: the length of SkyDreamer's flights in Fig 5; the paper states no other). An
-episode starts on one of the race's `tracks`, drawn alike, 2 to 4 m before a gate (any gate in `anywhere` of
-starts, else the first), within 1 m to its side and up to 1.3 m below its centre (0.7 to 1.3 m before the
-first), at rest, rolled, pitched and turned from the gate's heading up to 20 degrees, its body rates up to
-0.1 rad/s and its rotors at a quarter to half of their top speed.
+pre-gate approaches it up to where it crosses. The rate penalty is (exp(min(|rates|_1, 17)) - 1) over 2 f_c
+1e5. The gate reward at each of the three planes is 1 - max(|y|, |z|) / `size` where the drone crosses it. An
+episode ends, its last reward zero, when the drone crosses one of those planes beyond `size` of the gate's
+centre, where the race has `frames` strikes the frame of a gate it is not passing (the race's opening and
+frame, `Racing`), or is within 0.5 m of the ground while descending faster than 1 m/s or rolled or pitched
+past 60 degrees; it is cut after `steps` steps (2000, 22 s: the length of SkyDreamer's flights in Fig 5; the
+paper states no other). An episode starts on one of the race's `tracks`, drawn alike, 2 to 4 m before a gate
+(any gate in `anywhere` of starts, else the first), within 1 m to its side and up to 1.3 m below its centre
+(0.7 to 1.3 m before the first), at rest, rolled, pitched and turned from the gate's heading up to 20 degrees,
+its body rates up to 0.1 rad/s and its rotors at a quarter to half of their top speed.
 
 A track's gates are seen or not: SkyDreamer adds gates no one sees to its tracks in training "to enforce the
 correct flight maneuvers" (Sec III-A), a gate above one to fly over it. Its two tracks, given only in figures
@@ -113,7 +113,8 @@ class Sky:
     """SkyDreamer's race (the module docstring): its control rate `hz`, the `tracks` an episode is drawn
     over (`TRACKS`' names), its gate rewards' `size` and the pre- and post-gates' span `depth` (Table III),
     the share of starts before any gate (`anywhere`), the camera's horizontal field of view `fov` (degrees),
-    the command's nominal `latency` (seconds), the `quadrotor`, and the episode's `steps`."""
+    the command's nominal `latency` (seconds), the `quadrotor`, the episode's `steps`, and whether the frames
+    of gates the drone is not passing are struck (`frames`)."""
 
     hz: float = 90.0
     tracks: tuple[str, ...] = ("circle",)
@@ -124,6 +125,7 @@ class Sky:
     latency: float = 0.0
     quadrotor: Quadrotor = QUADCOPTER
     steps: int = 2000
+    frames: bool = False
 
     def __post_init__(self):
         # A record holds the names as a list.
@@ -374,7 +376,8 @@ class SkyRace:
             stage = jnp.where(inside, (stage + 1) % len(PLANES), stage)
             crossing = inside
         slots = jnp.arange(sky.layout[0].shape[1])
-        collided = collided | struck(sky, track, before, after, (slots == lap.index) | (slots == index))
+        if sky.frames:
+            collided = collided | struck(sky, track, before, after, (slots == lap.index) | (slots == index))
         # Progress toward the pre-gate headed for, up to where it is crossed; none from it to the post-gate.
         approached = lap.distance - jnp.linalg.norm(reached - pre_gate(sky, track, lap.index))
         progress = jnp.where(approaching, approached, 0.0)

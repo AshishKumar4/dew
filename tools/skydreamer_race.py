@@ -70,10 +70,9 @@ class Setting:
         return {"class": "dew.rl.hyperlux:HyperLuxRenderer",
                 "fields": {"count": drones, "assets": str(assets), "size": self.pixels, **self._lens}}
 
-    def race(self, assets: Path, sky: Sky, ramp: float) -> SkyDreamerRace:
-        """A race of its own over `sky` at `ramp`, its renderer the setting's, to judge on."""
-        renderer = HyperLuxRenderer(ENVIRONMENTS, assets, size=self.pixels, **self._lens)
-        return SkyDreamerRace(renderer, sky, ramp=ramp)
+    def judge_renderer(self, assets: Path) -> HyperLuxRenderer:
+        """A renderer of the setting's cameras over `assets`, which every race judged on shares in turn."""
+        return HyperLuxRenderer(ENVIRONMENTS, assets, size=self.pixels, **self._lens)
 
     @property
     def _lens(self) -> dict:
@@ -81,10 +80,11 @@ class Setting:
 
 
 BASE = Setting(Sky(), pixels=64, fisheye=None, replay=2_000_000, curriculum=False,
-               judging="untrained at each level beside each point; Table III evaluation and held-out "
-                       "training episodes, fixed seeds")
+               judging="untrained beside each point; Table III evaluation and held-out training episodes, "
+                       "fixed seeds")
 """The base check: the circle seen through a 64-pixel pinhole, nothing randomized and no latency."""
-REALISM = Setting(Sky(tracks=("circle", "inverted_loop", "ladder"), fov=120.0, latency=0.044), pixels=96,
+REALISM = Setting(Sky(tracks=("circle", "inverted_loop", "ladder"), fov=120.0, latency=0.044, frames=True),
+                  pixels=96,
                   fisheye=(120.0, 160), replay=1_000_000, curriculum=True,
                   judging="untrained at each level; each track's Table III evaluation and held-out training "
                           "episodes at the level trained at, fixed seeds")
@@ -149,13 +149,13 @@ def trained(out: Path, assets: Path, updates: int, every: int, setting: Setting 
     made again), each chunk's agent judged greedy (`judged`) into OUT/base.json beside the untrained policy
     judged alike: on the base check's race, on Table III's evaluation and held-out training episodes; with a
     curriculum, on each track alone at the level the chunk trained at, the level then raised a tenth, to 1,
-    where the evaluation's flights crashed under a third of the time, the untrained judged at each level
-    reached. A run going on goes on at the level its report reached."""
+    where the evaluation's flights crashed under a third of the time on average, and the untrained judged at
+    each level as it is reached. A run going on goes on at the level its report reached."""
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     path = out / "base.json"
     report: dict = (json.loads(path.read_text()) if path.exists()
-                    else {"points": [], "judging": setting.judging, "level": 0.0})
+                    else {"points": [], "judging": setting.judging})
     if report.get("judging") != setting.judging:
         raise ValueError(f"{path} was judged otherwise than this run judges ({setting.judging}); go on in a "
                          "fresh OUT")
@@ -167,29 +167,51 @@ def trained(out: Path, assets: Path, updates: int, every: int, setting: Setting 
     rollout, agent = prepared.rollout, prepared.objective
     assert isinstance(rollout, DreamerRollout) and isinstance(agent, DreamerV3Objective)
     assert isinstance(rollout.env, SkyDreamerRace)
-    level = rollout.env.ramp = report["level"]
+    level = rollout.env.ramp = report.setdefault("level", 0.0)
+    # The races judged on, built once, each track's (or the race's) Table III evaluation (every start
+    # before the first gate, the gates' size 1 m) and held-out training episodes, sharing one renderer.
+    renderer = setting.judge_renderer(assets)
     tracks = setting.sky.tracks if setting.curriculum else (None,)
+    races = {}
+    for track in tracks:
+        sky = setting.sky if track is None else dataclasses.replace(setting.sky, tracks=(track,))
+        races[track or "race"] = {
+            "evaluation": SkyDreamerRace(renderer, dataclasses.replace(sky, anywhere=0.0, size=1.0)),
+            "held_out": SkyDreamerRace(renderer, sky)}
+    seeds = {"evaluation": EVALUATION_SEED, "held_out": HELD_OUT_SEED}
 
     def judged(variables, level: float) -> dict:
-        """Each track's (or the race's) Table III evaluation (every start before the first gate, the gates'
-        size 1 m) and held-out training episodes at `level`."""
+        """Each judged race at `level`: the flights of `variables`' greedy policy, from fixed seeds."""
         scores = {}
-        for track in tracks:
-            sky = setting.sky if track is None else dataclasses.replace(setting.sky, tracks=(track,))
-            evaluation = setting.race(assets, dataclasses.replace(sky, anywhere=0.0, size=1.0), level)
-            held_out = setting.race(assets, sky, level)
-            scores[track or "race"] = {
-                "evaluation": scored(evaluation, agent, variables, jax.random.key(EVALUATION_SEED)),
-                "held_out": scored(held_out, agent, variables, jax.random.key(HELD_OUT_SEED))}
+        for name, splits in races.items():
+            for split, race in splits.items():
+                race.ramp = level
+                key = jax.random.key(seeds[split])
+                scores.setdefault(name, {})[split] = scored(race, agent, variables, key)
         return scores if setting.curriculum else scores["race"]
 
-    untrained = report.setdefault("untrained", {})
-    began, state = time.perf_counter(), None
-    scored_at = {point["updates"] for point in report["points"]}
-    while state is None or done < updates:
+    def baseline(level: float) -> None:
+        """The untrained policy judged at `level`, once: per level with a curriculum, else once."""
+        if not setting.curriculum:
+            if "untrained" not in report:
+                report["untrained"] = judged(agent.init(jax.random.key(0)), level)
+            return
+        untrained = report.setdefault("untrained", {})
         if str(level) not in untrained:
             untrained[str(level)] = judged(agent.init(jax.random.key(0)), level)
             print(json.dumps({"untrained": level, **untrained[str(level)]}), flush=True)
+
+    def written() -> None:
+        # Written aside and moved over, so a stop mid-write leaves the last report whole.
+        aside = path.with_suffix(".json.part")
+        aside.write_text(json.dumps(report, indent=1))
+        aside.replace(path)
+
+    baseline(level)
+    written()
+    began, state = time.perf_counter(), None
+    scored_at = {point["updates"] for point in report["points"]}
+    while state is None or done < updates:
         # A chunk checkpointed and stopped before its score is restored there and scored before the next.
         pending = state is None and done > 0 and done not in scored_at
         reached = done if pending else min(updates, (done // every + 1) * every)
@@ -204,14 +226,13 @@ def trained(out: Path, assets: Path, updates: int, every: int, setting: Setting 
         report["points"].append(point)
         scored_at.add(done)
         print(json.dumps(point), flush=True)
-        crashed = [scores["evaluation"]["crashed"] for scores in point.values() if isinstance(scores, dict)]
-        if setting.curriculum and np.mean(crashed) < 1 / 3 and level < 1.0:
-            level = rollout.env.ramp = round(min(1.0, level + 0.1), 1)
+        if setting.curriculum:
+            crashed = np.mean([point[name]["evaluation"]["crashed"] for name in races])
+            if crashed < 1 / 3 and level < 1.0:
+                level = rollout.env.ramp = round(min(1.0, level + 0.1), 1)
+                baseline(level)
         report["level"] = level
-        # Written aside and moved over, so a stop mid-write leaves the last report whole.
-        aside = path.with_suffix(".json.part")
-        aside.write_text(json.dumps(report, indent=1))
-        aside.replace(path)
+        written()
     return report
 
 

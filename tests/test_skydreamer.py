@@ -40,10 +40,10 @@ def written_step(sky: Sky, gates, before: np.ndarray, after: np.ndarray, velocit
                  rates: np.ndarray, orientation: np.ndarray, held: tuple) -> tuple:
     """A step of the race over `gates` written from Sec II-C, from the drone's position before and after it:
     the planes crossed in order on the step's straight path (pre-gate, gate, post-gate, then the next gate's),
-    each crossing's gate reward or, outside the gate's size, the end there; any seen gate's frame (between its
-    1.5 m opening and its 2 m outer edge) crossed but those headed for, the end; progress toward the pre-gate
-    headed for up to where the step crosses it; the rate penalty; the shaped ground contact; a final reward of
-    zero at an end."""
+    each crossing's gate reward or, outside the gate's size, the end there; where the race strikes frames,
+    any seen gate's frame (between its 1.5 m opening and its 2 m outer edge) crossed but those headed for, the
+    end; progress toward the pre-gate headed for up to where the step crosses it; the rate penalty; the
+    shaped ground contact; a final reward of zero at an end."""
     index, stage, distance, passed = held
     approaching, aimed, gate, collided, reached = stage == 0, index, 0.0, False, after
     for _ in range(3):
@@ -68,7 +68,7 @@ def written_step(sky: Sky, gates, before: np.ndarray, after: np.ndarray, velocit
     for other, (center, heading, seen) in enumerate(gates):
         normal, left = axes_of(heading)
         start, end = (before - center) @ normal, (after - center) @ normal
-        if not seen or other in (aimed, index) or start * end > 0 or start == end:
+        if not sky.frames or not seen or other in (aimed, index) or start * end > 0 or start == end:
             continue
         where = before + start / (start - end) * (after - before) - np.asarray(center)
         across = max(abs(where @ left), abs(where[2]))
@@ -94,7 +94,7 @@ def test_a_race_rewards_and_ends_as_skydreamer_writes(track):
     the distance its progress differences, and its end, the gate headed for, the plane next and the gates
     passed are the written race's exactly, to each drone's first end; some drones pass a plane, some a whole
     gate, and some end."""
-    sky, gates = Sky(tracks=(track,)), TRACKS[track]
+    sky, gates = Sky(tracks=(track,), frames=True), TRACKS[track]
     race = SkyRace(sky, views=("passed",))
     rng = np.random.default_rng([532, 3001, 11])
     planes = passes = ends = 0
@@ -140,8 +140,9 @@ def test_a_race_rewards_and_ends_as_skydreamer_writes(track):
 def test_a_frame_flown_into_ends_a_flight_and_an_opening_does_not():
     """On the inverted loop, a drone headed for the gate over the second, flying level at 3.6 m/s across the
     second gate's plane, ends its flight where it crosses the frame (0.9 m from the centre) and flies on
-    through the opening (0.3 m from it) or past the frame's outer edge (1.2 m)."""
-    sky = Sky(tracks=("inverted_loop",))
+    through the opening (0.3 m from it) or past the frame's outer edge (1.2 m), where the race strikes frames;
+    where it does not, as in the base check, it flies on everywhere."""
+    sky = Sky(tracks=("inverted_loop",), frames=True)
     race = SkyRace(sky, views=("passed",))
     center, heading, _ = TRACKS["inverted_loop"][2]
     normal, left = axes_of(heading)
@@ -157,7 +158,9 @@ def test_a_frame_flown_into_ends_a_flight_and_an_opening_does_not():
             here = dataclasses.replace(lap, flight=flight, track=jnp.asarray(0), index=jnp.asarray(1),
                                        stage=jnp.asarray(0), distance=jnp.asarray(5.0))
             _, taken = race.step(here, jnp.zeros(4))
-            assert bool(taken.terminated) == ended
+            unframed = SkyRace(dataclasses.replace(sky, frames=False), views=("passed",))
+            _, unstruck = unframed.step(here, jnp.zeros(4))
+            assert (bool(taken.terminated), bool(unstruck.terminated)) == (ended, False)
 
 
 def test_a_race_starts_before_a_gate_at_rest():
