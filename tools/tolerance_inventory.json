@@ -441,10 +441,6 @@
    "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_mamba2.py": {
-   "comparisons": 1,
-   "lane": "Training"
-  },
   "tests/test_mamba2_interop.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
