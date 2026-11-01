@@ -818,16 +818,23 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
         assert rows == 24
 
 
+def wide_draw(metadata):
+    return WideDraw()
+
+
+@pytest.mark.parametrize("draw", ["written", "configured"])
 @pytest.mark.parametrize("workers", [0, 2])
-def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples(workers):
+def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples(workers, draw):
     """A memory read of the 12 records, in their order and unbounded, read alone or by loading workers,
-    whose objective makes 24 rows of them (`Questioned`), then draws (`WideDraw`) and refuses 4 of those
-    rows (`ThirdQuestionRefused`): it makes the rows as it holds the corpus, before the reader opens,
-    which reads them on through the draw and the refusal, and the corpus's rows (data/rows) are its 12
-    source examples, as many as it held, however many rows the reader has read (row 1944)."""
+    whose objective makes 24 rows of them (`Questioned`), then draws (`WideDraw`, written, or configured
+    for the run, which a memory read binds between two passes that each hold the corpus) and refuses 4
+    of those rows (`ThirdQuestionRefused`): it makes the rows as it holds the corpus, before the reader
+    opens, which reads them on through the draw and the refusal, and the corpus's rows (data/rows) are
+    its 12 source examples, as many as it held, however many rows the reader has read (row 1944)."""
+    drawn = WideDraw() if draw == "written" else Configured(wide_draw, needs=(), scope="run", random=True)
     data = compile(_asked("memory", shuffled=False).batch(2), read="memory",
                    loading=dataclasses.replace(READ, workers=workers),
-                   objective=ObjectiveData(train=(Questioned(), WideDraw(), ThirdQuestionRefused())))
+                   objective=ObjectiveData(train=(Questioned(), drawn, ThirdQuestionRefused())))
     stream = data.train(DataPartition())
     try:
         for read in (3, 12):
