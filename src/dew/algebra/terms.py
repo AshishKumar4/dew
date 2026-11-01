@@ -190,7 +190,7 @@ def region(closed: jcore.Jaxpr) -> Region:
 
 
 def spoken(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` is of the language (`_term` makes a term of it) and outside every protected region."""
+    """Whether `equation` is of the language (`_term` makes a term of it), outside every protected region."""
     name, arity = equation.primitive.name, len(equation.invars)
     if len(equation.outvars) != 1 or protected(equation):
         return False

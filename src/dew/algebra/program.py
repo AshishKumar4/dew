@@ -124,10 +124,10 @@ of another read from outside it."""
 
 
 def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
-    """`jaxpr` with the values its windows yield (`_windows`) computed in their cheapest forms, where those are
-    cheaper than the windows as traced: all windows saturated in one e-graph and extracted together, each
-    cheaper value's form traced and spliced in where its equation stood, the rest of the program kept as
-    traced, so a body is never traced again."""
+    """`jaxpr` with the values its windows yield (`_windows`) computed in their cheapest forms, where those
+    are cheaper than the windows as traced: all windows saturated in one e-graph and extracted together,
+    each cheaper value's form traced and spliced in where its equation stood, the rest of the program kept
+    as traced, so a body is never traced again."""
     windows = _windows(jaxpr)
     if windows is None:
         return jaxpr
@@ -164,8 +164,20 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
                                      for equation in traced.jaxpr.eqns]
     if not spliced:
         return jaxpr
-    return jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
-                               for kept in spliced.get(id(equation), [equation])])
+    return _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
+                                     for kept in spliced.get(id(equation), [equation])]))
+
+
+def _live(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`jaxpr` without the equations nothing reads: those a spliced form left behind, an equation with an
+    effect kept whatever reads it."""
+    wanted = {atom for atom in jaxpr.outvars if not isinstance(atom, jcore.Literal)}
+    kept: list[jcore.JaxprEqn] = []
+    for equation in reversed(jaxpr.eqns):
+        if equation.effects or any(var in wanted for var in equation.outvars):
+            kept.append(equation)
+            wanted.update(atom for atom in equation.invars if not isinstance(atom, jcore.Literal))
+    return jaxpr.replace(eqns=kept[::-1])
 
 
 def _windows(jaxpr: jcore.Jaxpr) -> tuple[jcore.Jaxpr, list[jcore.Var]] | None:
