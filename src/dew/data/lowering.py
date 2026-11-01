@@ -87,7 +87,9 @@ from dew.data.mixing import (
 )
 from dew.data.packing import FirstFitPacked
 from dew.data.pipeline import (
+    ACCOUNTS,
     CONSUMED,
+    REFUSED,
     Artifact,
     Batched,
     BatchStage,
@@ -455,20 +457,23 @@ count known ahead."""
 
 
 def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> tuple[Record, ...]:
-    """`step`'s outputs of `given`, the source examples `given` consumes (`CONSUMED`) kept out of the step's
-    sight and carried to its last output: a row's count beside its own, a rejected row's on its marker
-    (`Rejected.consumed`), which the corpus's next kept row carries on (`Accepted`). Every other row
-    holds none, so the rows of one read hold the same fields."""
+    """`step`'s outputs of `given`, the source examples `given` consumes (`CONSUMED`, and of them those it
+    carries for refused ones, `REFUSED`) kept out of the step's sight and carried to its last output: a
+    row's counts beside its own, a rejected row's on its marker (`Rejected.consumed`, every one of them
+    refused now), which the corpus's next kept row carries on (`Accepted`). Every other row holds none, so
+    the rows of one read hold the same fields."""
     if given is None or isinstance(given, (bytes, Rejected)) or CONSUMED not in given:
         return step(given)
     consumed = integer(given[CONSUMED], "a row's consumed examples")
-    outputs = step({name: column for name, column in given.items() if name != CONSUMED})
+    refused = integer(given.get(REFUSED, 0), "a row's refused examples")
+    outputs = step({name: column for name, column in given.items() if name not in ACCOUNTS})
     *rest, last = outputs
-    rest = [{CONSUMED: 0, **row} if isinstance(row, Mapping) else row for row in rest]
+    rest = [{CONSUMED: 0, REFUSED: 0, **row} if isinstance(row, Mapping) else row for row in rest]
     if isinstance(last, Rejected):
         carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed)
     elif isinstance(last, Mapping):
-        carried = {**last, CONSUMED: consumed + integer(last.get(CONSUMED, 0), "a row's consumed examples")}
+        carried = {**last, CONSUMED: consumed + integer(last.get(CONSUMED, 0), "a row's consumed examples"),
+                   REFUSED: refused + integer(last.get(REFUSED, 0), "a row's refused examples")}
     else:
         raise ValueError(f"a row of a run bounded in examples became {type(last).__name__}, which carries no "
                          "count of the examples it consumes; a step after the bound returns records")
@@ -564,7 +569,8 @@ def _consumed_forward(elements: Sequence[Record]) -> list[Record]:
     """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
     to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that
     holds its markers apart from its rows (`_Grouped`) moves none to an earlier row: only a marker no row
-    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows."""
+    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows; the row it
+    moves to carries it as refused (`REFUSED`)."""
     carried: list[Record] = []
     markers: list[int] = []
     owed = Owed()
@@ -604,7 +610,7 @@ class _Grouped:
                  and all(row.keys() == records[0].keys() for row in records))
         # The source examples each row consumes are the run's accounting, no batch column: they cross as
         # the integers they are, which the reading process counts (`_Ungrouped`, `Accepted`).
-        held = ({name: [row[name] for row in records] if name == CONSUMED else
+        held = ({name: [row[name] for row in records] if name in ACCOUNTS else
                  self.column([row[name] for row in records]) for name in records[0]} if alike else rows)
         return {"held": held, "alike": alike, "rows": len(rows), "markers": markers}
 
@@ -659,8 +665,10 @@ class _Groups:
         # The source examples the group's rows consume are the run's accounting, out of the step's sight:
         # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
         # last row, as a record step's expansion does (`_consumed_by`).
-        consumed = [integer(row[CONSUMED], "a row's consumed examples") for row in rows if CONSUMED in row]
-        rows = [{name: value for name, value in row.items() if name != CONSUMED} for row in rows]
+        counted = [row for row in rows if CONSUMED in row]
+        consumed = [integer(row[CONSUMED], "a row's consumed examples") for row in counted]
+        refused = [integer(row.get(REFUSED, 0), "a row's refused examples") for row in counted]
+        rows = [{name: value for name, value in row.items() if name not in ACCOUNTS} for row in rows]
         columns = {name: [row[name] for row in rows] for name in rows[0]}
         made = dict(self.stage.step(columns))
         counts = {len(values) for values in made.values()}
@@ -673,8 +681,9 @@ class _Groups:
                                  f"returned {count}; flat_map(batched=True) changes the count")
             kept = [{**row, **{name: values[index] for name, values in made.items()}}
                     for index, row in enumerate(rows)]
-            return kept if not consumed else [{**row, CONSUMED: held}
-                                              for row, held in zip(kept, consumed, strict=True)]
+            return kept if not consumed else [
+                {**row, CONSUMED: held, REFUSED: carried}
+                for row, held, carried in zip(kept, consumed, refused, strict=True)]
         outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
         if not consumed:
             return outputs
@@ -682,7 +691,8 @@ class _Groups:
             # A group it makes no rows of leaves its examples on a marker, which the next row carries on
             # (`Carried`).
             return [Rejected("empty_expansion", consumed=sum(consumed))] if sum(consumed) else []
-        return [*({**row, CONSUMED: 0} for row in outputs[:-1]), {**outputs[-1], CONSUMED: sum(consumed)}]
+        return [*({**row, CONSUMED: 0, REFUSED: 0} for row in outputs[:-1]),
+                {**outputs[-1], CONSUMED: sum(consumed), REFUSED: sum(refused)}]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -957,9 +967,9 @@ class _Ruled(pygrain.IterDataset):
     """The windows a pack or windows stage makes of `documents`, each counted by the one rule its
     documents' targets were counted by (`counted_window`), as a memory read counts them
     (`materialize._targeted`): a document's count describes no window. Where the documents carry
-    the source examples they consume (`consumed`, `CONSUMED`), each document's count stands at its
-    last token, a field the stage lays out beside its tokens, and a window's is what it holds of them
-    (`_ConsumedAt`)."""
+    the source examples they consume (`consumed`, `CONSUMED` and `REFUSED`), each document's counts stand
+    at its last token, fields the stage lays out beside its tokens, and a window's are what it holds of
+    them (`_ConsumedAt`)."""
 
     def __init__(self, documents: pygrain.IterDataset, stage: Pack | Windows, consumed: bool = False):
         super().__init__(documents)
@@ -972,7 +982,7 @@ class _Ruled(pygrain.IterDataset):
         documents, stage = self._documents.map(seen), self._stage
         if self._consumed:
             documents = documents.map(_ConsumedAt(stage.fields[0]))
-            stage = dataclasses.replace(stage, fields=(*stage.fields, CONSUMED))
+            stage = dataclasses.replace(stage, fields=(*stage.fields, *ACCOUNTS))
         windows = (_packed(documents.map(stage.document), stage)
                    if isinstance(stage, Pack) else CausalWindows(documents, stage))
         return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed)
@@ -980,16 +990,20 @@ class _Ruled(pygrain.IterDataset):
 
 @dataclasses.dataclass(frozen=True)
 class _ConsumedAt:
-    """A document's consumed source examples (`CONSUMED`) as a field beside its `field`'s tokens: its
-    count at its last token, none at the rest, so the window that holds that token holds it."""
+    """A document's counts of source examples (`CONSUMED`, `REFUSED`) as fields beside its `field`'s
+    tokens: each count at its last token, none at the rest, so the window that holds that token holds
+    it."""
 
     field: str
 
     def __call__(self, document: Batch) -> Batch:
-        held = np.zeros(len(document[self.field]), np.int32)
-        if len(held):
-            held[-1] = integer(document.get(CONSUMED, 0), "a row's consumed examples")
-        return {**document, CONSUMED: held}
+        laid = {}
+        for name in ACCOUNTS:
+            held = np.zeros(len(document[self.field]), np.int32)
+            if len(held):
+                held[-1] = integer(document.get(name, 0), f"a row's {name}")
+            laid[name] = held
+        return {**document, **laid}
 
 
 class _RuledIterator(pygrain.DatasetIterator):
@@ -1003,7 +1017,7 @@ class _RuledIterator(pygrain.DatasetIterator):
         if not self._consumed:
             return window
         # The window consumes the source examples its documents' last tokens hold.
-        return {**window, CONSUMED: int(np.sum(window[CONSUMED]))}
+        return {**window, **{name: int(np.sum(window[name])) for name in ACCOUNTS}}
 
     def get_state(self) -> Mapping[str, object]:
         return {"windows": self._windows.get_state(), "rule": self._seen.state()}
@@ -1766,7 +1780,7 @@ class _Build:
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
         if self.elastic and carried >= 0:
             carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked))
-        ran, counting = consumed, _counts_own_rows(pipeline)
+        ran, counting, examples = consumed, _counts_own_rows(pipeline), False
         # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
         passes: tuple[int, int] | None = None
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
@@ -1790,12 +1804,14 @@ class _Build:
             if isinstance(stage, Workers) and pool is not None:
                 continue
             if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
-                # The corpus's counts are of its source examples: they are taken before an objective's
-                # step makes rows of them (`FlatMap.examples`), and not again after, nor where a memory
-                # read made rows of them before (`_counts_rows`).
-                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
-                                rows=_counts_rows(pipeline, index))
-                counting = False
+                # The corpus's counts are of its source examples (`FlatMap.examples`): a run bounded in
+                # examples counts each where its last row is delivered, as the row says (`CONSUMED`, less
+                # those it carries for refused ones, `REFUSED`), in the reading process; any other counts
+                # each before the objective's step makes rows of it, and not again after, nor where a
+                # memory read made rows of them before (`_counts_rows`).
+                examples, counting = True, _consumes(pipeline)
+                rows = rows if counting else Accepted(_as_iter(rows, self.loading), _name(pipeline),
+                                                      _label(pipeline), rows=_counts_rows(pipeline, index))
             if isinstance(stage, _RECORD):
                 # The record steps from here run as one operator (`_run`), up to where the workers
                 # hand their rows on.
@@ -1832,7 +1848,7 @@ class _Build:
                                certain_after=_barren_bound(pipeline.stages, passes, carried))
         if not self.global_order and counting:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
-                            rows=_counts_rows(pipeline, len(pipeline.stages)))
+                            rows=examples or _counts_rows(pipeline, len(pipeline.stages)), examples=examples)
         return rows
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:

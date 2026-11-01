@@ -238,11 +238,9 @@ def test_each_batch_states_the_examples_it_kept_by_then_and_a_resumed_read_goes_
 @pytest.mark.parametrize("workers", [0, 2])
 def test_each_batch_states_the_source_examples_read_by_then_and_a_resumed_read_goes_on_from_them(workers):
     """Fifteen examples in shards of three, each made one to three rows of, read eight rows a batch by
-    `workers` loading workers: after each batch the corpus states the source examples its read has moved
-    past (its position's count, taken before the objective makes rows of them), none whose rows the
-    batches have yet to deliver, so never more than they consumed, and all fifteen at its end; a read
-    resumed from a position saved after the second batch states the same counts after each later batch as
-    the read it was saved from."""
+    `workers` loading workers: after each batch the corpus states the source examples whose rows it
+    delivered by then, the sum of what those batches consume; a read resumed from a position saved after
+    the second batch states the same counts after each later batch as the read it was saved from."""
     ids = np.arange(1, 16, dtype=np.int32)
     loading = Loading(workers=workers)
 
@@ -265,10 +263,7 @@ def test_each_batch_states_the_source_examples_read_by_then_and_a_resumed_read_g
     finally:
         if isinstance(whole, Closeable):
             whole.close()
-    stated_by = [stated_then for _, stated_then in seen]
-    assert stated_by == sorted(stated_by)
-    assert all(stated_then <= consumed_then for consumed_then, stated_then in seen), seen
-    assert seen[-1] == (15, 15)
+    assert [stated_then for _, stated_then in seen] == [consumed_then for consumed_then, _ in seen]
     resumed_loader, resumed = stream()
     resumed.set_state(saved)
     try:

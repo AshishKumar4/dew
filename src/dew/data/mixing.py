@@ -20,7 +20,7 @@ import numpy as np
 from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import CONSUMED, Owed, Record, Rejected
+from dew.data.pipeline import CONSUMED, REFUSED, Owed, Record, Rejected
 
 _log = logging.getLogger(__name__)
 
@@ -47,6 +47,11 @@ class CorpusCounts:
     name: str
     label: str
     rows: bool = True
+    examples: bool = False
+    """Whether the rows it counts delivered stand for the corpus's source examples their last rows
+    complete, as each says (`CONSUMED`, less those it carries for examples a step refused or made no row
+    of, `REFUSED`): a run bounded in examples counts them so where its rows are delivered, in the reading
+    process (`dew.data.lowering._Build.records`)."""
     attempted: int = 0
     accepted: int = 0
     truncated: int = 0
@@ -75,9 +80,14 @@ class CorpusCounts:
         (`_dew_declined`)."""
         if not self.rows:
             return
-        self.accepted += 1
         if not isinstance(element, Mapping):
+            self.accepted += 1
             return
+        if self.examples:
+            self.accepted += (integer(element.get(CONSUMED, 0), "a row's consumed examples")
+                              - integer(element.get(REFUSED, 0), "a row's refused examples"))
+        else:
+            self.accepted += 1
         self.truncated += int(bool(element.get("_dew_truncated", False)))
         for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
             self.cut_examples[kind] += 1
@@ -360,13 +370,14 @@ class Accepted(pygrain.IterDataset[Batch]):
         tokens: Callable[[Batch], int] | None = None,
         certain_after: int | None = None,
         rows: bool = True,
+        examples: bool = False,
     ):
         super().__init__(parent)
         self._records, self._name, self._label = parent, name, label
-        self._tokens, self._certain_after, self._rows = tokens, certain_after, rows
+        self._tokens, self._certain_after, self._rows, self._examples = tokens, certain_after, rows, examples
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        counts = CorpusCounts(self._name, self._label, rows=self._rows)
+        counts = CorpusCounts(self._name, self._label, rows=self._rows, examples=self._examples)
         predicate = _KeepAccepted(counts, self._tokens, self._certain_after)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
