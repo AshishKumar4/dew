@@ -183,10 +183,10 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
 
     splits: dict = {}
 
-    def ranges(chunk: Mapping, affine) -> dict[int, float]:
+    def ranges(chunk: Mapping, affine, chunk_size: int) -> dict[int, float]:
         # Each token value's range (`_token`'s) as the declared operands' bound it (`terms.Region`'s
-        # magnitudes), by its place among the chunk function's operands after its decays (each at most 1);
-        # a value an unbounded operand's has none.
+        # magnitudes), by its place among the chunk function's operands after its decays (each at most 1)
+        # and its solve's inverse; a value an unbounded operand's has none.
         tokens = [jax.ShapeDtypeStruct(tuple(extent for extent, axis in zip(chunk[name].shape,
                                                                               declaration.operands[name],
                                                                               strict=True)
@@ -200,20 +200,30 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         for index, output in enumerate(region.outputs):
             magnitude = None if output is None else region.magnitudes.get(str(output))
             if magnitude is not None and not any(magnitude.degrees):
-                bounded[DECAYS + index] = 2.0 ** magnitude.log2
+                bounded[DECAYS + 1 + index] = 2.0 ** magnitude.log2
+        # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries
+        # are at most `a` in magnitude is at most `(1 + a)^(C - 1)` (by induction on the substitution); its
+        # entries `s_i C_i . B_j` times a decay at most 1, at most the corrections' bounds' product.
+        tokens_at = {name: DECAYS + 1 + place for place, name in enumerate(("B", "U", "s", "C", "Q", "R"))}
+        if all(tokens_at[name] in bounded for name in ("B", "s", "C")):
+            entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at["B"]]
+            bounded[DECAYS] = (1.0 + entry) ** max(chunk_size - 1, 0)
         return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
     def prepare(chunk):
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
         natural = _scanned(exponent)[-1] * (math.log(2.0) if affine.base2 else 1.0)
-        given = (*decays, *values)
+        B, _, s, C, _, _ = values
+        # The solve's inverse reads no state: an operand of the chunk's function, prepared with the rest.
+        lower = _inverse_of(decays, B, s, C) if affine.corrections else jnp.zeros((B.shape[0],) * 2, B.dtype)
+        given = (*decays, lower, *values)
         key = (affine.base2, bool(affine.corrections), *((value.shape, str(value.dtype)) for value in given))
         if key not in splits:
             h = jax.ShapeDtypeStruct(shape, dtype)
             avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
             splits[key] = carry.split(functools.partial(_chunk, bool(affine.corrections)), h, avals, (1,),
-                                      saturation=saturation, ranges=ranges(chunk, affine))
+                                      saturation=saturation, ranges=ranges(chunk, affine, B.shape[0]))
         return Prepared((natural, splits[key].prepare(*given)), splits[key])
 
     def step(state, prepared):
@@ -266,15 +276,16 @@ class Prepared:
 
 
 DECAYS = 4
-"""The chunk function's leading operands: its decays (`_Decays`' four fields)."""
+"""The chunk function's leading operands: its decays (`_Decays`' four fields), the solve's inverse after."""
 
 
-def _chunk(corrects: bool, h, entering, to_last, whole, between, B, U, s, C, Q, R):
+def _chunk(corrects: bool, h, entering, to_last, whole, between, lower, B, U, s, C, Q, R):
     """A chunk's outputs and the state it leaves, from the state `h` entering it, its decays (`_Decays`'
-    fields, each at most 1) and its tokens' values (`_token`): the module's forms, the solve where a token
-    corrects the state, which `carry.split` splits."""
+    fields, each at most 1), its solve's inverse less its diagonal (`_inverse_of`, zeros where no token
+    corrects the state) and its tokens' values (`_token`): the module's forms, which `carry.split`
+    splits."""
     decays = _Decays(entering=entering, to_last=to_last, whole=whole, between=between)
-    w = _corrected(decays, B, U, s, C, h) if corrects else U
+    w = _corrected(decays, lower, U, s, C, h) if corrects else U
     carried = float32_einsum("tk,tv->kv", B * decays.to_last, w)
     outputs = float32_matmul(Q * decays.entering, h) + float32_matmul(_paired(Q, B, decays.between), w) + R
     return outputs, decays.whole[:, None] * h + carried
@@ -573,13 +584,18 @@ def _token(affine: _Affine, token: tuple) -> tuple:
     return jnp.broadcast_to(read(affine.exponent), (keys,)), B, U, s, C, Q, R
 
 
-def _corrected(decays: _Decays, B, U, s, C, h):
-    """The inputs each token's correction leaves (the module's `w`): the unit lower-triangular solve of the
-    corrections' decayed overlaps, from the state entering the chunk."""
+def _inverse_of(decays: _Decays, B, s, C):
+    """The unit lower-triangular solve's inverse less its diagonal (`_lowered`) of the corrections'
+    decayed overlaps: it reads no state, so a chunk's walk prepares it with its other values."""
     strictly = jnp.tril(jnp.ones(decays.between.shape[:2], bool), -1)[:, :, None]
-    overlaps = s[:, None] * _paired(C, B, jnp.where(strictly, decays.between, 0.0))
+    return _lowered(s[:, None] * _paired(C, B, jnp.where(strictly, decays.between, 0.0)))
+
+
+def _corrected(decays: _Decays, lower, U, s, C, h):
+    """The inputs each token's correction leaves (the module's `w`): the solve (its inverse less its
+    diagonal `lower`, `_inverse_of`) of the corrections, from the state entering the chunk."""
     given = U - float32_matmul(s[:, None] * C * decays.entering, h)
-    return _applied(_lowered(overlaps), given)
+    return _applied(lower, given)
 
 
 def _paired(left, right, between):
