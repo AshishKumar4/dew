@@ -13,13 +13,15 @@ import numpy as np
 import optax
 import pytest
 import test_run_budgets
+from objective_cases import cases
+from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
 from run_kinds import KINDS, lm, scalars
 
 from dew.cli.main import main
 from dew.data.dataset import Loader
-from dew.nn.inspection import statistics
+from dew.nn.inspection import HISTOGRAM_EDGES, statistics
 from dew.telemetry.instrumentation import Compiles
-from dew.training import Inspection, Trainer, inspected
+from dew.training import Inspection, MeshSpec, Trainer, inspected
 
 BATCH, RATE = 8, 0.25
 FEATURES = test_run_budgets.FEATURES
@@ -276,6 +278,39 @@ def test_a_sampled_step_summarizes_each_watched_modules_output(scanned):
         assert {"mean", "std", "rms"} <= summarized
 
 
+def test_a_watched_module_path_selects_its_layer_alone():
+    """A glob over a module's path (`Block_1`) watches that call alone (row 2324): a sampled step
+    summarizes the second block's output as its forward computed it, and no other block's."""
+    run = watched_run(Stacked(scanned=False), Inspection(modules=("Block_1",), targets=("params",)))
+    logged = inspected(run, {"x": ROWS})
+    blocks = sorted({name.rsplit("/", 1)[0] for name in logged if name.startswith("inspect/activations/")})
+    assert blocks == ["inspect/activations/Block_1"]
+    expected = statistics(jnp.asarray(outputs_of(run, 3)[1]))
+    for statistic in ("abs_max", "non_finite", "zero_fraction"):
+        assert logged[f"{blocks[0]}/{statistic}"] == float(expected[statistic]), statistic
+
+
+def test_a_summary_over_no_entries_is_a_zero_one():
+    """A summary of no entries (a row set all padding) is a zero tensor's, as a cotangent probe no
+    cotangent reached reads (row 3143): mean, deviation, root mean square and non-finite share 0, its zero
+    share 1, its histogram all in the lowest decade, none of it NaN."""
+    summary = statistics(jnp.ones((3, 4, 5)), histogram=True, where=jnp.zeros((3, 4), bool))
+    assert {name: float(value) for name, value in summary.items()} == {
+        "mean": 0.0, "std": 0.0, "rms": 0.0, "abs_max": 0.0, "non_finite": 0.0, "zero_fraction": 1.0,
+        **{f"histogram_{index}": float(index == 0) for index in range(len(HISTOGRAM_EDGES) + 1)}}
+
+
+def test_a_summarys_deviation_holds_far_from_zero():
+    """A summary's standard deviation of values far from zero, 1e4 apart by 1e-1, is float64's within
+    float32's rounding of their sum (row 3143): taken about the values' own mean, not as the gap between
+    two squares a float32 cannot tell apart."""
+    values = (1e4 + 0.1 * np.random.default_rng(3).normal(size=(64, 32))).astype(np.float32)
+    variance = np.var(values.astype(np.float64))
+    deviation = float(statistics(jnp.asarray(values))["std"])
+    # The variance sums its 2048 entries' squares about their mean, which itself sums them.
+    assert_fp32_reduction_bound(deviation ** 2, variance, variance, terms=2 * values.size)
+
+
 def test_a_watched_histogram_sums_to_its_whole_output():
     """An opt-in histogram reports the share of a watched output's magnitudes in each decade, one scalar
     a bin, which together are the whole output."""
@@ -299,14 +334,15 @@ def test_watching_a_kind_no_module_is_refused():
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp_path):
     """A run of every kind watching module kinds on its command line (`trainer.inspection.modules`)
-    logs a summary of each watched module's output at its sampled step, its mean, standard deviation,
-    largest magnitude and non-finite share, and none at a step it does not sample."""
+    logs a summary of each watched module's output and of the loss's cotangent there at its sampled step,
+    its mean, standard deviation and non-finite share, the output's largest magnitude, and none at a step
+    it does not sample: every objective's model calls carry the step's cotangent probes (row 2324)."""
     record, runs = tmp_path / "record", tmp_path / "runs"
     (tmp_path / "data").mkdir()
     KINDS[kind](tmp_path / "data", drawn=False).save(str(record))
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"modules": ["*Attention*", "*Block*", "*Mlp*", "*MLP*"], "every": 2,
-                             "targets": ["params"]}}
+                             "targets": ["params"], "cotangents": True}}
     settings = {"trainer.name": "watched", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
                 "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
                 "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
@@ -316,7 +352,9 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
     logged = scalars(runs / "watched")
     watched = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/activations/")}
     assert {"mean", "std", "abs_max", "non_finite"} <= watched
-    assert not any(name.startswith("inspect/activations/") for name in logged[1])
+    cotangents = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/cotangents/")}
+    assert {"mean", "std", "rms", "non_finite"} <= cotangents
+    assert not any(name.startswith("inspect/") for name in logged[1])
 
 
 class Headed(nn.Module):
@@ -448,7 +486,6 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     as an H100 would run it (`generation.assumed`), the sampled loss and gradient hold the unsampled's
     products and kernel launches, so no second forward rides on a compiler merging it, which two
     attention kernels of different forms never are (rows 2512 and 2718)."""
-    from objective_cases import cases
     from reference_error import equations
 
     from dew.nn.inspection import Watched, watching
@@ -481,3 +518,430 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     plain, _ = work(watched=False)
     sampled, inspected = work(watched=True)
     assert inspected and plain["dot_general"] and sampled == plain
+
+
+def test_a_watched_summary_over_given_positions_is_their_statistics():
+    """Watched with the positions a summary reads (`watched_positions`, `[rows, tokens]`), a module's
+    output is summarized over those positions alone, every feature of each, as its statistics over them
+    are; an output whose leading axes are no `[rows, tokens]` is summarized whole."""
+    from dew.nn.inspection import INSPECTED, SOWN, watched_positions, watching
+
+    class Mapped(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(3, name="inner")(x).sum(axis=1)
+
+    values = jnp.asarray(np.random.default_rng(2).normal(size=(4, 5, 2)), jnp.float32)
+    positions = jnp.asarray(np.arange(20).reshape(4, 5) % 3 != 0)
+    variables = Mapped().init(jax.random.key(0), values)
+
+    def summarized(variables, values, positions):
+        with watching(("Dense", "Mapped")), watched_positions(positions):
+            output, sown = Mapped().apply(variables, values, mutable=[INSPECTED])
+        inner = nn.Dense(3).apply({"params": variables["params"]["inner"]}, values)
+        return sown[INSPECTED], inner, statistics(output)
+
+    sown, inner, whole = jax.jit(summarized)(variables, values, positions)
+    # The statistics no reduction order changes identify the very entries summarized.
+    expected = statistics(jnp.asarray(np.asarray(inner)[np.asarray(positions)]))
+    for statistic in ("abs_max", "non_finite", "zero_fraction"):
+        assert float(sown["inner"][SOWN][statistic]) == float(expected[statistic]), statistic
+    assert jax.tree.map(float, sown[SOWN]) == jax.tree.map(float, whole)
+
+
+def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool = False,
+                                warmup: bool = False) -> dict[str, float]:
+    """A language model's watched MLP summaries over eight rows, two padded past their text: the pad id
+    `tail` fills them, or, `packed`, its coordinates mark them unreal (no pad id) and `tail` is what
+    they hold; `pipelined`, over two stages of two microbatches; `warmup`, an MLA decoder's indexer
+    warm-up, whose loss is the indexer's alone."""
+    from model_support import TINY_DECODER
+
+    from dew.batch import coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import IndexerTraining, LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    model = (CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, head_dim=16,
+                               mlp_features=64, max_seq_len=16, mixer={"class": "mla", "fields": {
+                                   "q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8,
+                                   "qk_rope_head_dim": 8, "v_head_dim": 8, "index_topk": None,
+                                   "index_n_heads": 2, "index_head_dim": 16}}) if warmup
+             else models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                               num_kv_heads=2))
+    indexer = {"indexer": IndexerTraining("warmup")} if warmup else {}
+    staged = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])} if pipelined
+              else {})
+    run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail, **indexer), optax.sgd(RATE),
+                  key=jax.random.key(0), inspection=Inspection(modules=("*MLP",), targets=("params",)),
+                  **staged)
+    tokens = np.random.default_rng(1).integers(1, 63, size=(8, 17)).astype(np.int32)
+    real = np.ones(tokens.shape, bool)
+    real[1, 10:], real[6, 3:] = False, False
+    tokens[~real] = tail
+    batch = {"text": tokens, **({"text_coordinates": coordinates(valid=real, xp=np)} if packed else {})}
+    return {name: value for name, value in inspected(run, batch).items() if "activations" in name}
+
+
+@pytest.mark.parametrize("layout", ["padded", "packed", "indexer warm-up"])
+def test_a_language_models_watched_layers_read_none_of_its_padding(layout):
+    """A language model's watched layers summarize their outputs at its real tokens alone (row 2324): two
+    rows padded past their text, once with one id and once with another, whose causal forward is the
+    same at every real token and differs at the padding, give the same summary of each MLP to the bit,
+    the padding marked by the pad id or by the batch's coordinates."""
+    first, second = (padding_invariant_summaries(pad, packed=layout == "packed",
+                                                 warmup=layout == "indexer warm-up") for pad in (0, 63))
+    assert len(first) >= 12 and first == second
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipelined_language_models_watched_layers_read_none_of_its_padding():
+    """Pipelined over two stages of two microbatches, each microbatch's summary of a watched layer reads
+    that microbatch's real tokens alone: the two pad ids give the same summaries to the bit."""
+    first, second = (padding_invariant_summaries(pad, pipelined=True) for pad in (0, 63))
+    assert len(first) >= 48 and first == second
+
+
+def test_a_preference_runs_watched_layers_read_each_halfs_real_tokens_alone():
+    """A preference pair objective's watched layers are summarized over each half's real tokens alone
+    (row 2324), as its pairs' layout marks them, whatever their completion marks: a pair whose chosen half
+    ends in an unmarked token, its padding filled with another id, gives the same summaries to the bit,
+    and that last real token changed gives others."""
+    from objective_cases import decoder
+
+    from dew.data import Memory, presets
+    from dew.objectives.rl import DPOObjective
+    from dew.training import MeshSpec
+
+    pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5], "chosen_mask": [0, 0, 1, 0],
+            "rejected_mask": [0, 0, 1]}
+    (batch,) = list(Memory([pair] * 2).pipe(presets.preferences, seq_len=6, batch=2))
+    run = Trainer(DPOObjective(decoder(), 5), optax.sgd(RATE), key=jax.random.key(0),
+                  mesh=MeshSpec().build(jax.devices()[:1]),
+                  inspection=Inspection(modules=("*MLP",), targets=("params",)))
+    ids = np.asarray(batch["input_ids"])
+    padding = np.arange(ids.shape[-1]) >= np.array([4, 3])[None, :, None]
+    last = np.zeros(ids.shape, bool)
+    last[:, 0, 3] = True
+
+    def summaries(rows):
+        return {name: value for name, value in inspected(run, {**batch, "input_ids": rows}).items()
+                if "activations" in name}
+
+    first = summaries(ids)
+    assert first and first == summaries(np.where(padding, 7, ids).astype(ids.dtype))
+    assert first != summaries(np.where(last, 9, ids).astype(ids.dtype))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
+    """A decoder pipelined over two stages of two microbatches each reports every layer it watches (row
+    2324): each of its four MLPs' summary, one a microbatch the pipeline runs, finite, from the sampled
+    step's own forward, each named by its layer's place in the decoder, not in its stage."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                         num_kv_heads=2)
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+                  inspection=Inspection(modules=("*MLP",), targets=("params",)))
+    tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+    logged = inspected(run, {"text": tokens})
+    summaries = {name.rsplit("/", 1)[0]: value for name, value in logged.items()
+                 if name.endswith("/rms") and "activations" in name}
+    assert set(summaries) == {f"inspect/activations/layers_{layer}/mlp/{microbatch}"
+                              for layer in range(4) for microbatch in range(2)}
+    assert all(np.isfinite(value) and value > 0 for value in summaries.values())
+
+
+def test_a_watched_cotangent_is_the_updates_loss_whatever_its_split():
+    """A window split into microbatches summarizes the cotangent of the update's pooled loss at its
+    committing microbatch, not the microbatch's own loss (row 3144): over a batch of one row repeated, the
+    split of two logs the cotangent the whole batch's step logs, and a loss stated as a scalar is
+    summarized too."""
+    def logged(split: int, *, scalar: bool = False) -> dict[str, float]:
+        objective = watched_run(Stacked(scanned=False), None).objective
+        if scalar:
+            # A loss its objective states as one scalar, pooled by the microbatches' mean.
+            objective.loss = lambda variables, batch, step, loss=objective.loss: (
+                lambda stats, aux: (stats.mean()[0], aux))(*loss(variables, batch, step))
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), split=split,
+                      mesh=MeshSpec().build(jax.devices()[:1]),
+                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True))
+        # One row throughout, so any microbatch's rows are the batch's own, however the split deals them.
+        rows = np.repeat(ROWS[:1], BATCH, axis=0)
+        return {name: value for name, value in inspected(run, {"x": rows}).items() if "/cotangents/" in name}
+
+    whole, split = logged(1), logged(2)
+    assert set(whole) == set(split) and logged(2, scalar=True)
+    # The mean square sums the committing microbatch's entries, half the batch's, each the same row's.
+    squares = np.square(whole["inspect/cotangents/Block_1/rms"])
+    assert_fp32_reduction_bound(np.square(split["inspect/cotangents/Block_1/rms"]), squares, squares,
+                                terms=ROWS.size)
+
+
+def test_a_watched_cotangent_is_summarized_unscaled_under_a_dynamic_loss_scale():
+    """Under a dynamic loss scale, whose backward is seeded with the scale, a watched block's cotangent is
+    summarized as the unscaled loss's (row 2324 review): its every statistic, the histogram's decades
+    included, the unscaled run's to the bit, a power of two scaling and unscaling each entry exactly."""
+    def logged(**scaled) -> dict[str, float]:
+        objective = watched_run(Stacked(scanned=False), None).objective
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), **scaled,
+                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True,
+                                            histogram=True))
+        return {name: value for name, value in inspected(run, {"x": ROWS}).items() if "/cotangents/" in name}
+
+    plain, scaled = logged(), logged(dynamic_scale=True)
+    assert any("histogram" in name for name in plain) and scaled == plain
+
+
+def test_a_watched_layers_cotangent_is_summarized_as_the_losses_cotangent_there():
+    """With cotangents watched, a sampled step summarizes the loss's cotangent at each watched block's
+    output (row 2324): the root mean square, mean and shares it logs are those of the cotangent Linen's
+    own perturbation of the block's output receives under the same loss, from a probe's few numbers
+    rather than a tensor of the output's size; its gradients and activations are the unwatched step's to
+    the bit."""
+
+    class Perturbed(nn.Module):
+        """`Stacked(scanned=False)`'s layers under its names, the second block's output perturbed."""
+
+        @nn.compact
+        def __call__(self, x):
+            x = x.astype(jnp.float32)
+            for index in range(3):
+                x, _ = Block()(x)
+                if index == 1:
+                    x = self.perturb("block_1", x)
+            return nn.Dense(1, name="head")(x)
+
+    def logged(*, cotangents: bool) -> dict[str, float]:
+        run = watched_run(Stacked(scanned=False), Inspection(modules=("Block_1",), targets=("grads",),
+                                                             cotangents=cotangents))
+        return inspected(run, {"x": ROWS})
+
+    watched, unwatched = logged(cotangents=True), logged(cotangents=False)
+    state, _, _ = watched_run(Stacked(scanned=False), None).place()
+    params = jax.device_get(state.variables)["params"]
+    perturbations = Perturbed().init(jax.random.key(0), jnp.asarray(ROWS))["perturbations"]
+
+    def loss(perturbations):
+        outputs = Perturbed().apply({"params": params, "perturbations": perturbations}, jnp.asarray(ROWS))
+        return jnp.mean(jnp.square(outputs[:, 0]))
+
+    expected = statistics(jax.grad(loss)(perturbations)["block_1"])
+    for statistic in ("rms", "mean", "non_finite", "zero_fraction"):
+        # Each statistic sums the cotangent's entries, each entry its rows' squared outputs' derivatives.
+        assert_computes_the_oracle(watched[f"inspect/cotangents/Block_1/{statistic}"], expected[statistic],
+                                   f"the watched block's cotangent {statistic}", roundings=ROWS.size)
+    assert {name: value for name, value in watched.items() if "/cotangents/" not in name} == unwatched
+
+
+@pytest.fixture(scope="module")
+def windows(tmp_path_factory):
+    from objective_data import corpus_windows
+
+    return corpus_windows(tmp_path_factory.mktemp("corpus"))
+
+
+@pytest.mark.parametrize("name", sorted(set(cases(None)) - {"flow_grpo"}))
+def test_every_objectives_watched_cotangents_reach_its_model_calls(name, windows, tmp_path):
+    """Every objective's step that summarizes its watched outputs' cotangents (row 2324) carries its
+    cotangent probes to each model call it watches, which no step refuses, and the loss's cotangent
+    reaches each probe: a count of entries and a finite sum of their squares, the parameters' gradient
+    the unprobed step's to the bit. Flow-GRPO's, trained on rollouts, is `test_flow_grpo`'s."""
+    from test_whole_validation import runnable
+
+    from dew.nn.inspection import Watched
+    from dew.objectives.base import Step
+    from dew.training.transaction import probed_loss
+
+    objective, batch = runnable(name, windows, tmp_path)
+    if name == "ppo":
+        mask = np.asarray(batch["response_mask"], np.float32)
+        batch = {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+    variables = objective.init(jax.random.key(0))
+    numeric = {key: value for key, value in batch.items()
+               if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
+    held = {key: value for key, value in batch.items() if key not in numeric}
+    watched = Watched(("*Block*", "*Attention*", "*Mlp*", "*MLP*"), cotangents=True)
+
+    def step(watched):
+        return Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables, watched=watched)
+
+    def reduced(stats):
+        return objective.reduce_loss(stats)[0]
+
+    def gradients(numeric):
+        stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step(watched))
+        _, seed = jax.vjp(reduced, stats)
+        return back(seed(jnp.ones(()))[0])
+
+    def plain(numeric):
+        def loss(params):
+            return reduced(objective._loss({**variables, "params": params}, {**numeric, **held},
+                                           step(Watched(watched.modules)))[0])
+        return jax.grad(loss)(variables["params"])
+
+    (params, probes), expected = jax.jit(gradients)(numeric), jax.jit(plain)(numeric)
+    # rCM's student phase runs its fake score under no gradient (`test_an_rcm_critic_updates_...`).
+    trained = {key: tree for key, tree in probes.items() if not (name == "rcm" and key == "fake_score")}
+    assert trained and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all()
+                           for leaf in jax.tree.leaves(trained))
+    assert all((left == right).all()
+               for left, right in zip(jax.tree.leaves(params), jax.tree.leaves(expected), strict=True))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbatches():
+    """A decoder pipelined over two stages of two microbatches summarizes the loss's cotangent at each
+    watched layer over every microbatch it ran (row 2324), one summary a layer: its entries those of the
+    unpipelined step's, none of a bubble iteration's discarded zeros, so its zero and non-finite shares
+    are the unpipelined step's to the bit."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    def cotangents(**placed) -> dict[str, float]:
+        model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                             num_kv_heads=2)
+        run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
+                      inspection=Inspection(modules=("*MLP",), targets=("params",), cotangents=True))
+        tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+        return {name: value for name, value in inspected(run, {"text": tokens}).items()
+                if name.startswith("inspect/cotangents/")}
+
+    piped = cotangents(microbatches=2, mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
+    whole = cotangents(mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
+    assert set(piped) == set(whole)
+    assert {f"inspect/cotangents/layers_{layer}/mlp/rms" for layer in range(4)} <= set(piped)
+    for name, value in whole.items():
+        if name.endswith(("/zero_fraction", "/non_finite")):
+            assert piped[name] == value, name
+        assert np.isfinite(piped[name])
+
+
+def rcm_probes(windows, tmp_path, *, student: bool, consistency_weight: float | None = None) -> dict:
+    """The gradient of an rCM step's watched blocks' cotangent probes (`probed_loss`), at the first update
+    past its warm-up of the phase `student` names, its consistency weight `consistency_weight` if given."""
+    from test_whole_validation import runnable
+
+    from dew.nn.inspection import Watched
+    from dew.objectives.base import Step
+    from dew.training.transaction import probed_loss
+
+    objective, batch = runnable("rcm", windows, tmp_path)
+    if consistency_weight is not None:
+        objective.consistency_weight = consistency_weight
+    variables = objective.init(jax.random.key(0))
+    numeric = {key: value for key, value in batch.items()
+               if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
+    held = {key: value for key, value in batch.items() if key not in numeric}
+    update = next(update for update in range(objective.tangent_warmup, objective.tangent_warmup + 64)
+                  if bool(objective._student(update)) == student)
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables,
+                committed=jnp.asarray(update), watched=Watched(("*Block*",), cotangents=True))
+
+    def probed(numeric):
+        stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step)
+        _, seed = jax.vjp(lambda stats: objective.reduce_loss(stats)[0], stats)
+        return back(seed(jnp.ones(()))[0])[1]
+
+    return jax.jit(probed)(numeric)
+
+
+def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, tmp_path):
+    """An rCM critic update past its warm-up, which trains the fake score and runs the student under no
+    gradient, summarizes the loss's cotangent at the fake score's watched modules, each reached by it, and
+    the student's as the zero it is (row 2324 review): no statistic NaN, a probe no cotangent reached
+    counting none."""
+    from dew.nn.inspection import summarized
+    from dew.objectives.diffusion.consistency import FAKE_SCORE
+
+    probes = rcm_probes(windows, tmp_path, student=False)
+    fake = jax.tree.leaves(probes[FAKE_SCORE])
+    student = jax.tree.leaves({name: tree for name, tree in probes.items() if name != FAKE_SCORE})
+    assert fake and student
+    assert all(leaf[..., 0].min() > 0 for leaf in fake) and all((leaf[..., 0] == 0).all() for leaf in student)
+    for leaf in student:
+        summary = summarized(leaf.reshape(-1, leaf.shape[-1])[0], histogram=False)
+        assert all(np.isfinite(float(value)) for value in summary.values())
+        assert float(summary["rms"]) == 0 and float(summary["zero_fraction"]) == 1
+
+
+def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_call(windows, tmp_path):
+    """An rCM student update by distribution matching alone, whose simulation's every call but the last
+    runs under no gradient, summarizes the loss's cotangent at the student's watched modules from the call
+    that trains it, the simulation's last (row 2324 review): each student probe counts that call's
+    entries."""
+    from dew.objectives.diffusion.consistency import FAKE_SCORE
+
+    probes = rcm_probes(windows, tmp_path, student=True, consistency_weight=0.0)
+    trained = jax.tree.leaves({name: tree for name, tree in probes.items() if name != FAKE_SCORE})
+    assert trained and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all() for leaf in trained)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("stacked", ["scanned", "pipelined"])
+def test_a_path_glob_selects_the_layer_its_log_names(stacked):
+    """A glob over a module's path names it as the log does, by its layer's place in the decoder (row
+    3126): `layers_2/*` logs layer 2's modules alone, every entry and value a run watching every module
+    logs for them, their outputs and their cotangents, whether the decoder scans its layers as one run
+    (`layers_0_3`) or pipelines them over two stages (`stages/layers_j`); a glob naming no layer of the
+    decoder is refused."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    def logged(*modules: str) -> dict[str, float]:
+        fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
+        model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
+        placed = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
+                  if stacked == "pipelined" else {})
+        run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
+                      inspection=Inspection(modules=modules, targets=("params",), cotangents=True))
+        tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+        return {name: value for name, value in inspected(run, {"text": tokens}).items()
+                if name.startswith(("inspect/activations/", "inspect/cotangents/"))}
+
+    selected, every = logged("layers_2/*"), logged("layers_*/*")
+    reference = {name: value for name, value in every.items() if name.split("/")[2] == "layers_2"}
+    assert set(selected) == set(reference) and any("/cotangents/" in name for name in selected)
+    # The statistics no reduction order changes are the very entries' to the bit; a cotangent's root mean
+    # square, which sums every entry of the layer's output (8 rows of 16 tokens by its width), the reference's
+    # as one order of that sum is another's.
+    for name in selected:
+        if name.endswith(("/abs_max", "/non_finite", "/zero_fraction")):
+            assert selected[name] == reference[name], name
+        elif "/cotangents/" in name and name.endswith("/rms"):
+            assert_computes_the_oracle(selected[name], reference[name], name, roundings=8 * 16 * 64)
+    with pytest.raises(ValueError):
+        logged("layers_9/*")
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipeline_stage_modules_cotangent_is_refused():
+    """A pipeline's stage module (`stages`), which runs a stage's layers and which the log names by no
+    layer, has its watched cotangent refused as the step traces, naming the layers to watch instead
+    (row 3126 review)."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                         num_kv_heads=2)
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+                  inspection=Inspection(modules=("stages",), targets=("params",), cotangents=True))
+    with pytest.raises(ValueError):
+        inspected(run, {"text": np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)})

@@ -267,8 +267,9 @@ class JepaObjective(Objective[Ratio]):
         squared = (predictions.astype(wide) - targets.astype(wide)) ** 2
         loss = self.row_mean(squared, batch)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
-        inspected = None if step.watched is None else {"encoder": encoder.get(INSPECTED, {}),
-                                                       "predictor": predictor.get(INSPECTED, {})}
+        # Each part's under the name its variables take (`part`), which its cotangent probes are cut by.
+        inspected = None if step.watched is None else {CONTEXT_ENCODER: encoder.get(INSPECTED, {}),
+                                                       PREDICTOR: predictor.get(INSPECTED, {})}
         return loss, Aux(representation_health(pooled), inspected=inspected)
 
     def evaluate(self, params, batch, step: Step):
