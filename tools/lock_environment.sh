@@ -40,10 +40,11 @@ dated() {
     case " $(echo $UNDATED) " in *" $package "*) ;; *) echo --exclude-newer-package "$package=$date" -P "$package" ;; esac
   done
 }
-lock() {
-  name=$1
-  shift
-  uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
+# resolve <python> <output> <uv arguments>: pyproject.toml under constraints.txt, as the locks resolve it.
+resolve() {
+  python=$1 output=$2
+  shift 2
+  uv pip compile -q --no-header pyproject.toml -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
     $(for package in $UNDATED; do echo --exclude-newer-package "$package=false"; done) \
@@ -52,7 +53,12 @@ lock() {
     $(for package in openenv daytona daytona-api-client daytona-api-client-async daytona-toolbox-api-client \
         daytona-toolbox-api-client-async daytona-analytics-api-client daytona-analytics-api-client-async; do
       echo --exclude-newer-package "$package=$ENVIRONMENTS"; done) \
-    --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
+    --python-version "$python" "$@" -o "$output"
+}
+lock() {
+  name=$1
+  shift
+  resolve "$(tr -d '\n' < .python-version)" "locks/$name.txt" --extra ci --extra tutorials --extra mutation "$@"
 }
 # A host with no GPU compiles kernels for one with the CUDA plugin of the kernel-compile extra; a GPU host's
 # own CUDA extra holds its plugin, and two CUDA plugins in one environment would both claim 'cuda'.
@@ -69,4 +75,22 @@ for extra in cuda12 cuda13; do
   lock "$extra-aarch64" --extra "$extra" --torch-backend cpu --python-platform aarch64-manylinux_2_35
   diff "locks/$extra.txt" "locks/$extra-aarch64.txt" >&2 || {
     echo "locks/$extra.txt resolves otherwise for aarch64: lock it for each machine" >&2; exit 1; }
+done
+# Each GPU extra installs on every Python pyproject.toml admits, from requires-python's floor to its newest
+# classifier, on each machine: a CUDA plugin built for fewer Pythons fails here, at the pin, and not at a user's
+# install (row 3298: post42's plugins came for 3.12 and 3.14 alone, and dewml[cuda12] refused 3.13).
+floor=$(sed -n 's/^requires-python = ">=3\.\([0-9]*\)"$/\1/p' pyproject.toml)
+newest=$(sed -n 's/.*"Programming Language :: Python :: 3\.\([0-9]*\)".*/\1/p' pyproject.toml | sort -n | tail -1)
+[ -n "$floor" ] && [ -n "$newest" ] || { echo "pyproject.toml names no requires-python floor or Python classifier" >&2; exit 1; }
+checked=$(mktemp)
+trap 'rm -f locks/cuda12-aarch64.txt locks/cuda13-aarch64.txt "$checked"' EXIT
+for minor in $(seq "$floor" "$newest"); do
+  for extra in cuda12 cuda13; do
+    for machine in x86_64 aarch64; do
+      : > "$checked"
+      resolve "3.$minor" "$checked" --extra "$extra" --torch-backend cpu --python-platform "$machine-manylinux_2_35" || {
+        echo "dewml[$extra] does not install on Python 3.$minor for $machine: build its plugin for that Python" >&2
+        exit 1; }
+    done
+  done
 done
