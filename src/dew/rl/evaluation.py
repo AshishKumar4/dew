@@ -62,7 +62,9 @@ def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Me
         following = (taken.following if reward.ndim
                      else jax.tree.map(lambda leaf: leaf[:, None], taken.following))
         rows = first_episode_rows(following, {name: view(following.observation, name) for name in reached})
-        return {name: jnp.mean(rows[name].astype(jnp.float32)) for name in ("return", "steps", *reached)}
+        # The return at the reward's own width; counts and views as floats.
+        return {"return": jnp.mean(rows["return"]),
+                **{name: jnp.mean(rows[name].astype(jnp.float32)) for name in ("steps", *reached)}}
 
     def score(variables: Params, key: jax.Array) -> dict[str, float]:
         return {name: float(value) for name, value in jax.device_get(scored(variables, key)).items()}

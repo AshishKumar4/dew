@@ -210,6 +210,7 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
     the share of its first episodes' steps whose next gate lies in the camera's view (`in_view`), which a
     policy of the camera alone needs of the flights it learns from."""
     from dew.rl.env import env_rollout, start
+    from dew.rl.evaluation import first_episodes
     from dew.rl.flight import mounted
 
     def rolled(params, key):
@@ -219,8 +220,8 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
         return taken, jax.vmap(mounted)(camera), camera.fov
 
     taken, mounts, fov = jax.device_get(jax.jit(rolled)(params, key))
-    following, last = taken.following, taken.following.terminated | taken.following.truncated
-    alive = np.cumsum(last, 0) - last == 0
+    following = taken.following
+    alive = np.asarray(first_episodes(following))
     seen = in_view(taken.observation["gates"], mounts, fov)
     return {**_first_episodes(following, following.observation["passed"], crash_penalty),
             "in_view": float(seen[alive].mean())}
