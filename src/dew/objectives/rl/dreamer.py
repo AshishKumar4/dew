@@ -68,6 +68,7 @@ from dew.rl.env import (
     view,
     views,
 )
+from dew.rl.evaluation import episodes, first_episode_rows
 from dew.rl.replay import ReplayBuffer, Steps
 from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
 
@@ -1135,24 +1136,16 @@ def demonstration_replay(episodes: Sequence[Mapping[str, np.ndarray]]) -> Replay
 
 def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variables: Variables, key: jax.Array,
                     steps: int) -> float:
-    """The mean return of `env`'s environments, an `Env` or a `Simulator`, over `steps` steps of the agent
-    from fresh episodes: the rewards of every transition the steps reach, one episode each where `steps`
-    is its length."""
+    """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
+    `Simulator`, over `steps` steps of the agent's draws from fresh episodes: the whole episode where
+    `steps` is its length. Read as every first episode is (`dew.rl.evaluation.first_episode_rows`; an
+    `Env`'s by `dew.rl.evaluation.episodes`)."""
     if isinstance(env, Simulator):
         driven = DrivenSimulator(env)
         carry = simulator_start(driven, key, objective.memory(env.count))
         _, recorded = simulator_rollout(driven, objective.act, variables, carry, steps, reset=False)
-        return float(jnp.mean(jnp.sum(view(recorded.following.observation, "reward"), axis=0)))
-    stepped = Driven(env)
-    count = env.reset(key)[1].reward.shape[0]
-
-    @OuterProgram
-    def run(variables: Variables, key: jax.Array) -> jax.Array:
-        carry = start(stepped, key, objective.memory(count))
-        _, recorded = env_rollout(stepped, objective.act, variables, carry, steps, reset=False)
-        return jnp.mean(jnp.sum(view(recorded.following.observation, "reward"), axis=0))
-
-    return float(run(variables, key))
+        return float(jnp.mean(first_episode_rows(recorded.following)["return"]))
+    return episodes(objective.act, Driven(env), steps, memory=objective.memory)(variables, key)["return"]
 
 
 __all__ = ["AUXILIARY_SCALE", "AgentMemory", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout",

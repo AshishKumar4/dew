@@ -51,7 +51,7 @@ import numpy as np
 from flax import struct
 
 from dew.rl.env import TimeStep
-from dew.rl.flight import GATES, OBSTACLES, Camera, Renderer, Scene, Seen, quaternion, shown
+from dew.rl.flight import GATES, OBSTACLES, Camera, Renderer, Scene, Seen, gate_axes, quaternion, shown
 from dew.rl.quadrotor import GRAVITY, Body, Flight, Quadrotor, drawn_body, flown, hovering
 
 CIRCLE = (((3.0, 0.0, 1.5), 90.0), ((0.0, 3.0, 1.5), 180.0), ((-3.0, 0.0, 1.5), 270.0),
@@ -120,22 +120,16 @@ class Lap:
     steps: jax.Array
 
 
-def _axes(heading: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A gate's normal (its passing direction) and its left, level."""
-    cos, sin, zero = jnp.cos(heading), jnp.sin(heading), jnp.zeros_like(heading)
-    return jnp.stack([cos, sin, zero], -1), jnp.stack([-sin, cos, zero], -1)
-
-
 def in_gate(sky: Sky, index: jax.Array, point: jax.Array) -> jax.Array:
     """`point` in gate `index`'s frame: along its normal, to its left and up from its centre."""
-    normal, left = _axes(jnp.asarray(sky.headings)[index])
+    normal, left = gate_axes(jnp.asarray(sky.headings)[index])
     offset = point - jnp.asarray(sky.centers)[index]
     return jnp.stack([offset @ normal, offset @ left, offset[2]])
 
 
 def pre_gate(sky: Sky, index: jax.Array) -> jax.Array:
     """Gate `index`'s pre-gate's centre."""
-    normal, _ = _axes(jnp.asarray(sky.headings)[index])
+    normal, _ = gate_axes(jnp.asarray(sky.headings)[index])
     return jnp.asarray(sky.centers)[index] - sky.depth / 2 * normal
 
 
@@ -180,7 +174,7 @@ class SkyRace:
     def observed(self, lap: Lap) -> dict[str, jax.Array]:
         """The views of `lap` asked for."""
         sky, flight = self.sky, lap.flight
-        normal, left = _axes(jnp.asarray(sky.headings)[lap.index])
+        normal, left = gate_axes(jnp.asarray(sky.headings)[lap.index])
         up = jnp.asarray([0.0, 0.0, 1.0])
         in_its = jnp.stack([flight.velocity @ axis for axis in (normal, left, up)])
         roll, pitch = roll_pitch(flight.orientation)
@@ -215,7 +209,7 @@ class SkyRace:
         along = jax.random.uniform(next(keys), (), minval=-4.0, maxval=-2.0)
         aside = jax.random.uniform(next(keys), (), minval=-1.0, maxval=1.0)
         below = jax.random.uniform(next(keys), (), minval=low, maxval=1.3)
-        normal, left = _axes(jnp.asarray(sky.headings)[index])
+        normal, left = gate_axes(jnp.asarray(sky.headings)[index])
         position = jnp.asarray(sky.centers)[index] + along * normal + aside * left - below * jnp.asarray(
             [0.0, 0.0, 1.0])
         turned = jax.random.uniform(next(keys), (3,), minval=-math.pi / 9, maxval=math.pi / 9)
@@ -297,14 +291,9 @@ class SkyDreamerRace(Seen):
 
     def __init__(self, renderer: Renderer | None, sky: Sky | None = None, views: tuple[str, ...] = VIEWS,
                  count: int | None = None):
-        if not views or not set(views) <= set(VIEWS):
-            raise ValueError(f"a SkyDreamer race shows some of {VIEWS}, not {views}")
-        if renderer is None and count is None:
-            raise ValueError("a race without a renderer is told its drones' count")
         self.sky = Sky() if sky is None else sky
-        shown = tuple(view for view in views if view != "image")
-        count = renderer.count if renderer is not None else int(count or 0)
-        super().__init__(renderer, SkyRace(self.sky, shown if shown else ("passed",)), views, count)
+        race = SkyRace(self.sky, Seen.privileged(views))
+        super().__init__(renderer, race, views, VIEWS, "a SkyDreamer race", count)
 
 
 __all__ = ["CIRCLE", "PLANES", "QUADCOPTER", "VIEWS", "Lap", "Sky", "SkyDreamerRace", "SkyRace",

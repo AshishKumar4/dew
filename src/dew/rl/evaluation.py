@@ -24,6 +24,25 @@ def first_episodes(following: TimeStep) -> jax.Array:
     return (jnp.cumsum(following.done, 0) - following.done) == 0
 
 
+def first_episode_rows(following: TimeStep,
+                       reached: Mapping[str, jax.Array] | None = None) -> dict[str, jax.Array]:
+    """Each environment's first episode from the steps that followed its actions `[T, envs]`: its
+    undiscounted `return`, its `steps`, whether it was `terminated` (not cut), the reward of its last step
+    (`last_reward`), and each array of `reached` (`[T, envs, ...]`, an observation view) at its last step.
+    The one reading of first episodes, which `episodes` averages and a tool's judge reads whole."""
+    inside = first_episodes(following)
+    last = jnp.sum(inside, 0) - 1
+
+    def at_last(value: jax.Array) -> jax.Array:
+        value = jnp.asarray(value)
+        return jnp.take_along_axis(value, last.reshape(1, -1, *([1] * (value.ndim - 2))), 0)[0]
+
+    rows = {"return": jnp.sum(jnp.where(inside, following.reward, 0), 0), "steps": jnp.sum(inside, 0),
+            "terminated": jnp.any(inside & jnp.asarray(following.terminated, bool), 0),
+            "last_reward": at_last(following.reward)}
+    return {**rows, **{name: at_last(value) for name, value in (reached or {}).items()}}
+
+
 def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Memory] | None = None,
              reached: Sequence[str] = ()) -> Callable[[Params, jax.Array], dict[str, float]]:
     """A scorer of `policy` in fresh environments of `env`, flown `steps` steps without restarting
@@ -42,15 +61,8 @@ def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Me
         # One environment's steps `[T]` taken as a batch of one's `[T, 1]`.
         following = (taken.following if reward.ndim
                      else jax.tree.map(lambda leaf: leaf[:, None], taken.following))
-        inside = first_episodes(following)
-        scores = {"return": jnp.mean(jnp.sum(jnp.where(inside, following.reward, 0), axis=0)),
-                  "steps": jnp.mean(jnp.sum(inside, axis=0).astype(jnp.float32))}
-        last = jnp.sum(inside, axis=0) - 1
-        for name in reached:
-            value = view(following.observation, name)
-            ended = jnp.take_along_axis(value.reshape(value.shape[0], count, -1), last[None, :, None], 0)[0]
-            scores[name] = jnp.mean(ended.astype(jnp.float32))
-        return scores
+        rows = first_episode_rows(following, {name: view(following.observation, name) for name in reached})
+        return {name: jnp.mean(rows[name].astype(jnp.float32)) for name in ("return", "steps", *reached)}
 
     def score(variables: Params, key: jax.Array) -> dict[str, float]:
         return {name: float(value) for name, value in jax.device_get(scored(variables, key)).items()}
@@ -58,4 +70,4 @@ def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Me
     return score
 
 
-__all__ = ["episodes", "first_episodes"]
+__all__ = ["episodes", "first_episode_rows", "first_episodes"]

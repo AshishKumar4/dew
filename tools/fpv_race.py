@@ -175,32 +175,33 @@ def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
     """Each drone's first episode under `policy` (reading the driven step whole) over `steps` steps from
     fresh episodes of `simulator`, an evaluation race of its own (`_first_episodes`); with `film`, the first
     four drones' camera images after each step written there `[steps, 4, H, W, 3]`."""
+    from dew.rl.env import view, views
     from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
 
     driven = DrivenSimulator(simulator)
     _, taken = simulator_rollout(driven, policy, params, simulator_start(driven, key, memory), steps,
                                  reset=False)
-    observed = jax.device_get(taken.following.observation)
+    following = taken.following
     if film is not None:
-        np.savez_compressed(film, frames=observed["observation"]["image"][:, :4])
-    return _first_episodes(observed["reward"], observed["observation"]["passed"], observed["terminal"],
-                           observed["last"], simulator.racing.crash_penalty)
+        frames = view(views(following.observation)["observation"], "image")
+        np.savez_compressed(film, frames=np.asarray(frames)[:, :4])
+    passed = view(views(following.observation)["observation"], "passed")
+    return _first_episodes(following, passed, simulator.racing.crash_penalty)
 
 
-def _first_episodes(reward: np.ndarray, passed: np.ndarray, terminal: np.ndarray, last: np.ndarray,
-                    crash_penalty: float) -> dict:
-    """Each drone's first episode from its steps' rewards, gates passed so far, and whether each step was its
-    episode's `terminal` or `last` `[steps, drones]`: its return, gates passed, whether it crashed or
-    finished an open track (an end whose step paid less than half the crash penalty is a crash) and its
+def _first_episodes(following, passed, crash_penalty: float) -> dict:
+    """Each drone's first episode from the steps that followed its actions and the gates passed so far
+    `[steps, drones]` (`dew.rl.evaluation.first_episode_rows`): its return, gates passed, whether it crashed
+    or finished an open track (an end whose step paid less than half the crash penalty is a crash) and its
     steps, averaged over the drones."""
-    ended = np.cumsum(last, 0) - last > 0
-    earned = np.where(ended, 0, reward)
-    gates = np.where(ended, 0, passed).max(0)
-    ending = terminal & ~ended
-    crashed = ending & (reward < -crash_penalty / 2)
-    return {"return": float(earned.sum(0).mean()), "gates": float(gates.mean()),
-            "gates_max": int(gates.max()), "crashed": float(crashed.any(0).mean()),
-            "finished": float((ending & ~crashed).any(0).mean()), "steps": float((~ended).sum(0).mean())}
+    from dew.rl.evaluation import first_episode_rows
+
+    rows = jax.device_get(first_episode_rows(following, {"passed": passed}))
+    gates = np.asarray(rows["passed"])
+    crashed = rows["terminated"] & (rows["last_reward"] < -crash_penalty / 2)
+    return {"return": float(rows["return"].mean()), "gates": float(gates.mean()),
+            "gates_max": int(gates.max()), "crashed": float(crashed.mean()),
+            "finished": float((rows["terminated"] & ~crashed).mean()), "steps": float(rows["steps"].mean())}
 
 
 def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: float) -> dict:
@@ -221,8 +222,8 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
     following, last = taken.following, taken.following.terminated | taken.following.truncated
     alive = np.cumsum(last, 0) - last == 0
     seen = in_view(taken.observation["gates"], mounts, fov)
-    return {**_first_episodes(following.reward, following.observation["passed"], following.terminated, last,
-                              crash_penalty), "in_view": float(seen[alive].mean())}
+    return {**_first_episodes(following, following.observation["passed"], crash_penalty),
+            "in_view": float(seen[alive].mean())}
 
 
 def in_view(gates: np.ndarray, mounts: np.ndarray, fov: np.ndarray) -> np.ndarray:

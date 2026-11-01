@@ -76,6 +76,8 @@ def scored(simulator, objective, variables, key: jax.Array) -> dict:
     """Each drone's first episode flying `objective`'s greedy policy from fresh episodes of `simulator`
     for one episode's steps: its return, gates passed, whether it ended (a crash: the race ends no episode
     otherwise but by its cut) and its steps, averaged over the drones."""
+    from dew.rl.env import view, views
+    from dew.rl.evaluation import first_episode_rows
     from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
 
     driven = DrivenSimulator(simulator)
@@ -83,14 +85,14 @@ def scored(simulator, objective, variables, key: jax.Array) -> dict:
     _, taken = simulator_rollout(driven, objective.greedy, variables,
                                  simulator_start(driven, key, objective.memory(simulator.count)), steps,
                                  reset=False)
-    observed = jax.device_get(taken.following.observation)
-    last, terminal = np.asarray(observed["last"]), np.asarray(observed["terminal"])
-    ended = np.cumsum(last, 0) - last > 0
-    reward = np.where(ended, 0, np.asarray(observed["reward"]))
-    gates = np.where(ended, 0, np.asarray(observed["observation"]["passed"])).max(0)
-    return {"return": float(reward.sum(0).mean()), "gates": float(gates.mean()),
-            "gates_max": int(gates.max()), "crashed": float((terminal & ~ended).any(0).mean()),
-            "steps": float((~ended).sum(0).mean())}
+    following = taken.following
+    # A driven step holds the environment's observation, whose `passed` view counts the gates.
+    passed = view(views(following.observation)["observation"], "passed")
+    rows = jax.device_get(first_episode_rows(following, {"passed": passed}))
+    gates = np.asarray(rows["passed"])
+    return {"return": float(rows["return"].mean()), "gates": float(gates.mean()),
+            "gates_max": int(gates.max()), "crashed": float(rows["terminated"].mean()),
+            "steps": float(rows["steps"].mean())}
 
 
 def trained(out: Path, assets: Path, updates: int, every: int) -> dict:

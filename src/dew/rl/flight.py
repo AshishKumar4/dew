@@ -415,7 +415,7 @@ def quaternion(roll: jax.Array, pitch: jax.Array, yaw: jax.Array) -> jax.Array:
                       cr * cp * sy - sr * sp * cy], -1)
 
 
-def _gate_axes(facing: jax.Array) -> tuple[jax.Array, jax.Array]:
+def gate_axes(facing: jax.Array) -> tuple[jax.Array, jax.Array]:
     """A gate's normal (its passing direction) and its left `[..., 3]`, level, from its facing."""
     zero = jnp.zeros_like(facing)
     normal = jnp.stack([jnp.cos(facing), jnp.sin(facing), zero], -1)
@@ -455,7 +455,7 @@ def _start(racing: Racing, course: Course, key: jax.Array, difficulty: jax.Array
     last = jnp.where(course.closed, course.count, course.count - 1)
     index = jax.random.randint(gate_key, (), 0, jnp.maximum(last, 1))
     target = course.center[index]
-    normal, left = _gate_axes(course.facing[index])
+    normal, left = gate_axes(course.facing[index])
     back, aside, up = jax.random.uniform(place_key, (3,), minval=jnp.asarray([2.0, -1.0, -0.5]),
                                          maxval=jnp.asarray([4.0, 1.0, 0.5]))
     hovering_at = target - back * normal + aside * left + jnp.asarray([0.0, 0.0, 1.0]) * up
@@ -553,7 +553,7 @@ def struck(racing: Racing, race: Race, path: jax.Array) -> tuple[jax.Array, jax.
     opening less `radius`."""
     course = race.course
     grounded = jnp.any((path[1:, 2] < racing.radius) | (path[1:, 2] > racing.ceiling))
-    normal, left = _gate_axes(course.facing)
+    normal, left = gate_axes(course.facing)
     up = jnp.broadcast_to(jnp.asarray([0.0, 0.0, 1.0], normal.dtype), normal.shape)
     frame = jnp.stack([normal, left, up], -1)  # [G, 3 (world), 3 (gate)]
     begin, end = path[:-1, None], path[1:, None]
@@ -649,7 +649,7 @@ def corners(racing: Racing, race: Race, ahead: int = 2) -> jax.Array:
     for step in range(ahead):
         index = jnp.where(course.closed, (race.index + step) % course.count,
                           jnp.minimum(race.index + step, course.count - 1))
-        _, left = _gate_axes(course.facing[index])
+        _, left = gate_axes(course.facing[index])
         center = course.center[index]
         up = jnp.asarray([0.0, 0.0, 1.0], center.dtype)
         for sideways, upward in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
@@ -871,18 +871,30 @@ class Viewed(Protocol):
 
 
 class Seen:
-    """A batch of `count` drones of a JAX environment `env` (stepped on device), seen through `renderer`'s
-    cameras, as a `dew.rl.simulator.Simulator`: actions `[B, A]`; observations a dict of the `views` asked
-    for, each `[B, ...]`, `image` the renderer's and the rest `env`'s. `env` steps one drone (`reset`,
-    `step`) and shows its views (`observed`, its states `Viewed`) and its scene (`scene`)."""
+    """A batch of drones of a JAX environment `env` (stepped on device), seen through `renderer`'s cameras,
+    as a `dew.rl.simulator.Simulator`: actions `[B, A]`; observations a dict of the `views` asked for, some
+    of those `offered` by `what`, each `[B, ...]`, `image` the renderer's and the rest `env`'s, which shows
+    the privileged views asked for (`privileged`). `env` steps one drone (`reset`, `step`) and shows its
+    views (`observed`, its states `Viewed`) and its scene (`scene`). The batch is the renderer's, or `count`
+    drones where there is none, and then no image."""
 
     _key: jax.Array
     _states: Viewed
 
-    def __init__(self, renderer: Renderer | None, env, views: tuple[str, ...], count: int):
-        if renderer is None and "image" in views:
-            raise ValueError("a race without a renderer shows no image")
-        self.renderer, self.views, self.count = renderer, views, count
+    @staticmethod
+    def privileged(views: tuple[str, ...]) -> tuple[str, ...]:
+        """The views of `views` an environment shows, all but the renderer's image (the gates `passed` where
+        there are none)."""
+        shown = tuple(view for view in views if view != "image")
+        return shown if shown else ("passed",)
+
+    def __init__(self, renderer: Renderer | None, env, views: tuple[str, ...], offered: tuple[str, ...],
+                 what: str, count: int | None = None):
+        shown(views, offered, what)
+        if renderer is None and ("image" in views or count is None):
+            raise ValueError(f"{what} without a renderer shows no image and is told its drones' count")
+        self.renderer, self.views = renderer, views
+        self.count = renderer.count if renderer is not None else int(count or 0)
         self.action_size = env.action_size
         self._env = env
         self._started = OuterProgram(lambda env, key: jax.vmap(env.reset)(jax.random.split(key, self.count)))
@@ -947,19 +959,14 @@ class GateRace(Seen):
     def __init__(self, renderer: Renderer | None, racing: Racing | None = None,
                  views: tuple[str, ...] = VIEWS, count: int | None = None, difficulty: float = 1.0,
                  ramp: float = 1.0):
-        if not views or not set(views) <= set(VIEWS):
-            raise ValueError(f"a gate race shows some of {VIEWS}, not {views}")
-        if renderer is None and ("image" in views or count is None):
-            raise ValueError("a gate race without a renderer shows no image and is told its drones' count")
         racing = Racing() if racing is None else racing
         if renderer is not None and tuple(renderer.gate) != (racing.opening, racing.frame, racing.depth):
             raise ValueError(f"the renderer draws gates of opening, frame and depth {tuple(renderer.gate)}, "
                              f"the race's are {(racing.opening, racing.frame, racing.depth)}: its drones "
                              "would see gates they do not fly through")
         self.racing, self.difficulty, self.ramp = racing, difficulty, ramp
-        shown = tuple(view for view in views if view != "image")
-        count = renderer.count if renderer is not None else int(count or 0)
-        super().__init__(renderer, FlightEnv(racing, shown if shown else ("passed",)), views, count)
+        super().__init__(renderer, FlightEnv(racing, Seen.privileged(views)), views, VIEWS, "a gate race",
+                         count)
 
     def _env_now(self) -> FlightEnv:
         return dataclasses.replace(self._env, difficulty=float(self.difficulty), ramp=float(self.ramp))
@@ -972,43 +979,8 @@ def _scene(racing: Racing, race: Race) -> Scene:
     return Scene(course.center, course.facing, course.count, lit, course.obstacles, race.camera.look)
 
 
-__all__ = [
-    "ASPECTS",
-    "FAMILIES",
-    "GATES",
-    "INTERFACE",
-    "LAYOUTS",
-    "NEAREST",
-    "OBSTACLES",
-    "TEACHER",
-    "VIEWS",
-    "Camera",
-    "Course",
-    "FlightEnv",
-    "GateRace",
-    "Race",
-    "Racing",
-    "Renderer",
-    "Scene",
-    "Seen",
-    "Viewed",
-    "airframe",
-    "bars",
-    "cameras",
-    "commanded",
-    "corners",
-    "developed",
-    "drawn_camera",
-    "drawn_course",
-    "facings",
-    "looking",
-    "mounted",
-    "nearest",
-    "physics",
-    "privileged",
-    "quaternion",
-    "raced",
-    "shown",
-    "started",
-    "struck",
-]
+__all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER", "VIEWS",
+           "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene", "Seen",
+           "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
+           "drawn_course", "facings", "gate_axes", "looking", "mounted", "nearest", "physics", "privileged",
+           "quaternion", "raced", "shown", "started", "struck"]
