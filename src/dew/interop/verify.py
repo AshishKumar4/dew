@@ -710,6 +710,15 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     return parity, _LOGITS_PARITY
 
 
+def _users_arithmetic(dtype: str):
+    """The precision the parities run Dew's decoder at (`logits_parity`, `gradient_parity`): a float32 run
+    as a user's process runs it, its products summed in float32 (`precision.FP32_SUMS`), not in TF32 on a
+    GPU nor in float64 as a test process's wide CPU arithmetic sums them
+    (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than users get; the float64
+    truth at the highest precision."""
+    return precision.configured_precision(precision.FP32_SUMS if dtype == 'float32' else 'highest')
+
+
 def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.DecoderFields,
                   variables: Variables, ids: np.ndarray) -> float:
     """How much farther the source's float32 logits over `ids` (`expected`) are from the float64 truth
@@ -724,16 +733,16 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
     arithmetic sums them (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than
     users get and the ratio past what users' rounding reaches."""
 
-    def logits(dtype: str, network: nn.Module, algorithm: str) -> np.ndarray:
+    def logits(dtype: str, network: nn.Module) -> np.ndarray:
         held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
-        with jax.default_matmul_precision(algorithm):
+        with _users_arithmetic(dtype):
             return np.asarray(network.apply(held, ids), np.float64)
 
-    ours = logits('float32', model, precision.FP32_SUMS)
+    ours = logits('float32', model)
     with jax.enable_x64(new_val=True):
         wide = models.build('causal_transformer',
                             {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
-        truth = logits('float64', wide, 'highest')
+        truth = logits('float64', wide)
     expected = np.asarray(expected, np.float64)
     if not all(np.isfinite(values).all() for values in (expected, ours, truth)):
         return math.inf
@@ -796,7 +805,7 @@ def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFam
             logits = model.apply({**held, 'params': params}, jnp.asarray(ids))
             return jnp.sum(jnp.asarray(logits) * jnp.asarray(cotangent, dtype))
 
-        with jax.default_matmul_precision('highest'):
+        with _users_arithmetic(dtype):
             return {path: np.asarray(leaf, np.float64) for path, leaf in
                     flax_traverse.flatten_dict(jax.grad(loss)(held['params'])).items()}
 
