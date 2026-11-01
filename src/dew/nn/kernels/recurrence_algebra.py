@@ -931,8 +931,8 @@ def key_diagonal_pairs(rows: Callable[[int], jax.Array], shifted: Shifted, colum
     chunk_kda_fwd_intra_token_parallel). The rows `rows(c)` and prefix halves `gates(c)` of key block `c` of
     `columns`; `shifted(c)` readies the block's shifted reads (a mainloop stages it once) and `shifted(c)(e)`
     gives its keys and separated prefix `(keys, whole, fraction)`, each row `i` holding token `i - e`'s, any
-    value where `i < e` (masked). Each offset `e` of a pair below its row's diagonal is a row's sum over the keys, placed
-    at `(i, i - e)`: a rolled loop over the offsets, a row's vector each."""
+    value where `i < e` (masked). Each offset `e` of a pair below its row's diagonal is a row's sum over the
+    keys, placed at `(i, i - e)`: a rolled loop over the offsets, a row's vector each."""
     rows_index, columns_index = _grid((chunk, chunk))
     total = jnp.zeros((chunk, chunk), jnp.float32)
     for c in range(columns):
