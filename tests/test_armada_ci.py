@@ -1334,21 +1334,14 @@ def counted_runs(ci, root: Path, monkeypatch, cache_worker,
     return run
 
 
-def packed(root: Path, names: list[str]) -> None:
-    """The durations record timing each of `names` (tests/<name>) at a second, so the plan packs them into one
-    task, as CI packs small files."""
-    (root / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/{name}::{name[len('test_'):-len('.py')]}": 1.0 for name in names}))
-
-
-def test_a_reader_files_share_in_one_process_is_every_such_files_input(
+def test_what_a_shared_fixtures_lazy_reader_opens_is_each_files_input(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A data file a reader opens or probes, and code it runs, is the input of every test file its pytest
-    process ran after it, not only the one that ran it: a session fixture's lazy reader, a process-lived
-    cache (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files), or a module
-    imported inside a test, run under one file serves the next without running again, so a change to the
-    data, an optional file's arrival or a change to the module reruns both (train 239's review, row 1987;
-    the CI bundle's review; row 2228: 256 test files hold ~2,300 imports inside tests)."""
+    """A data file a session fixture's lazy reader opens or probes, and a module a test imports inside it, are
+    the input of each test file whose run reads them, each file in a process of its own: a process-lived cache
+    (dew.data.text's load_tokenizer, which asks after a tokenizer's optional files) or a module imported
+    inside a test, so a change to the data, an optional file's arrival or a change to the module reruns both
+    (train 239's review, row 1987; the CI bundle's review; row 2228: 256 test files hold ~2,300 imports
+    inside tests)."""
     (tmp_path / "tests/fixtures").mkdir(parents=True)
     (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
     (tmp_path / "tests/lazy_values.py").write_text("VALUE = 1\n")
@@ -1361,7 +1354,6 @@ def test_a_reader_files_share_in_one_process_is_every_such_files_input(
             "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n"
             "    import lazy_values\n    assert lazy_values.VALUE\n")
     written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
-    packed(tmp_path, ["test_a.py", "test_b.py"])
     run = counted_runs(ci, tmp_path, monkeypatch, cache_worker, ("a", "b"))
 
     assert run() == [1, 1]
