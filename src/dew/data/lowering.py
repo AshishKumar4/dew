@@ -334,6 +334,13 @@ def _counts_own_rows(pipeline: Pipeline) -> bool:
     return any(isinstance(stage, Native) for stage in pipeline.stages)
 
 
+def _counts_rows(pipeline: Pipeline, at: int) -> bool:
+    """Whether a counter of `pipeline`'s rows before its stage at `at` counts those it keeps as the
+    corpus's rows: not past an objective's step that makes rows of source examples, which the corpus
+    counted before it (`FlatMap.examples`, `CorpusCounts.rows`)."""
+    return not any(isinstance(stage, FlatMap) and stage.examples for stage in pipeline.stages[:at])
+
+
 def _unplaced(value: Record) -> Record:
     if value is None or isinstance(value, (bytes, Rejected)) or _POSITION not in value:
         return value
@@ -1741,7 +1748,7 @@ class _Build:
                 # What a Grain step drops from a stream leaves no marker: the workers hand on before it.
                 carried = index
             if index == carried and pool is not None:
-                rows = self.handed(rows, pipeline, partition, pool,
+                rows = self.handed(rows, pipeline, partition, pool, carried,
                                    certain_after=_barren_bound(pipeline.stages, passes, carried))
             if isinstance(stage, (BatchStage, MapBatch)):
                 break
@@ -1778,7 +1785,7 @@ class _Build:
                 elif pool is not None:
                     # It made a stream, whose drops leave no marker: the workers hand on after it, and
                     # a worker whose inputs it drops whole holds the others up (docs/design/data.md).
-                    rows = self.handed(rows, pipeline, partition, pool)
+                    rows = self.handed(rows, pipeline, partition, pool, index + 1)
                     carried = -1
             else:
                 endless = isinstance(stage, Repeat) and stage.epochs is None
@@ -1788,7 +1795,7 @@ class _Build:
                     stage = Limit(quota)
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
-            rows = self.handed(rows, pipeline, partition, pool,
+            rows = self.handed(rows, pipeline, partition, pool, carried,
                                certain_after=_barren_bound(pipeline.stages, passes, carried))
         if not self.global_order and counting:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
@@ -1837,17 +1844,18 @@ class _Build:
             if _consumes(pipeline):
                 rows = Carried(rows)
         else:
-            return self.layout_stage(rows, stage, pipeline)
+            return self.layout_stage(rows, stage, pipeline, at)
         return rows
 
-    def layout_stage(self, rows: Rows, stage: Stage, pipeline: Pipeline) -> Rows:
+    def layout_stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, at: int) -> Rows:
+        """`rows` through `stage`, a layout step written at `at` in `pipeline`."""
         if isinstance(stage, TokenSplit):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows = _TokenSplit(rows, stage)
         elif isinstance(stage, (Pack, Windows)):
             rows = self.targeted(_Ruled(_as_iter(rows, self.loading), stage, consumed=_consumes(pipeline)),
-                                 stage.fields[0], pipeline)
+                                 stage.fields[0], pipeline, at + 1)
         elif isinstance(stage, Artifact):
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
@@ -1858,11 +1866,14 @@ class _Build:
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")
         return rows
 
-    def targeted(self, windows: pygrain.IterDataset, field: str, pipeline: Pipeline) -> pygrain.IterDataset:
+    def targeted(self, windows: pygrain.IterDataset, field: str, pipeline: Pipeline,
+                 at: int) -> pygrain.IterDataset:
         """The windows that hold a target of their token `field`, as a memory read's and a packing
         plan's are (`materialize._targeted`, `packing.plan_windows`): one with nothing to predict
-        is counted as zero_targets and left out, so how a run reads does not change its steps."""
-        return Accepted(windows, _name(pipeline), _label(pipeline), tokens=ValidTargets(field))
+        is counted as zero_targets and left out, so how a run reads does not change its steps. Its
+        counter stands before the stage at `at` (`_counts_rows`)."""
+        return Accepted(windows, _name(pipeline), _label(pipeline), tokens=ValidTargets(field),
+                        rows=_counts_rows(pipeline, at))
 
     def block_shuffle(self, rows: Rows, stage: Shuffle, pipeline: Pipeline, partition: DataPartition) -> Rows:
         from dew.data.ordering import BlockShuffle
@@ -1901,12 +1912,13 @@ class _Build:
                 rows = viewed
         return rows
 
-    def handed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, *,
+    def handed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, at: int, *,
                certain_after: int | None = None) -> pygrain.IterDataset:
         """`rows`, read by this corpus's loading workers (`pool`), each handing on every row with
         a marker in place of each record its steps dropped, which the reading process drops here,
-        counting each by its reason, and refusing a run of `certain_after` rejections of inputs
-        read in order (`_barren_bound`) as certain to go on forever."""
+        before the stage at `at` (`_counts_rows`), counting each by its reason, and refusing a run of
+        `certain_after` rejections of inputs read in order (`_barren_bound`) as certain to go on
+        forever."""
         # A worker hands on its rows and markers a share's batch count at a time, the fields that
         # stack stacked as a batch's are, as many groups in flight as it had batches.
         size = partition.rows(self.batch)
@@ -1919,7 +1931,7 @@ class _Build:
                     "outputs as a stream, which loading workers cannot read in order by index: read "
                     "it with Loading(workers=0), or publish the cache and read the generation by index")
             return Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
-                            certain_after=certain_after)
+                            certain_after=certain_after, rows=_counts_rows(pipeline, at))
         if self.elastic and isinstance(rows, pygrain.MapDataset):
             size = self.batch
             handed = _InputOrder(rows, size, functools.partial(self.read_in, pipeline=pipeline,
@@ -1933,7 +1945,8 @@ class _Build:
                 # groups' inputs in another order: a run of rejections spans two rounds more.
                 certain_after += 2 * pool.count * size
         flat = gx.FlatMapIterDataset(_as_iter(handed, self.loading), _Ungrouped(size))
-        return Accepted(flat, _name(pipeline), _label(pipeline), certain_after=certain_after)
+        return Accepted(flat, _name(pipeline), _label(pipeline), certain_after=certain_after,
+                        rows=_counts_rows(pipeline, at))
 
     def read_in(self, groups: Rows, *, pipeline: Pipeline, partition: DataPartition,
                 pool: Workers) -> pygrain.IterDataset:
@@ -1955,7 +1968,7 @@ class _Build:
                         unplaced=unplaced)
         if not marked and any(_drops(stage) for stage in run):
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
-                            certain_after=certain_after)
+                            certain_after=certain_after, rows=_counts_rows(pipeline, at + len(run)))
         return rows
 
     def batches(

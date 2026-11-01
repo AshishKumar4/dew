@@ -39,10 +39,14 @@ class CorpusCounts:
     among them. `declined` counts, by the reason its layout refuses it, the delivered rows whose
     augmentation a training read declines where it draws it (a decision row's "none of the above",
     `_dew_declined`), each then read as it was admitted. `attempted` counts what its last
-    filter read, for its own warning; it describes no one unit of the corpus, so no metric shows it."""
+    filter read, for its own warning; it describes no one unit of the corpus, so no metric shows it.
+    A counter past an objective's step that makes rows of the source examples it counted before
+    (`rows` false) counts what it rejects of those rows and none it delivers: a corpus none of whose
+    counters counts rows shows its rejections alone."""
 
     name: str
     label: str
+    rows: bool = True
     attempted: int = 0
     accepted: int = 0
     truncated: int = 0
@@ -69,6 +73,8 @@ class CorpusCounts:
         the tokens it removed), the members it left out by reason (`_dew_rejected`) and the tokens their
         cuts removed (`_dew_left_out_cut`), and the augmentation a read declines for it, by reason
         (`_dew_declined`)."""
+        if not self.rows:
+            return
         self.accepted += 1
         if not isinstance(element, Mapping):
             return
@@ -113,9 +119,10 @@ class CorpusCounts:
         """The metrics a run logs of this corpus under `label`, each exact in one unit: the rows it
         delivered, its rejections and the augmentation it declined by reason as integers, the share
         of those rows cut short and the chunks per chunked record."""
+        delivered = {f"data/rows/{label}": self.accepted,
+                     f"data/truncated/{label}": self.truncated / max(1, self.accepted)} if self.rows else {}
         return {
-            f"data/rows/{label}": self.accepted,
-            f"data/truncated/{label}": self.truncated / max(1, self.accepted),
+            **delivered,
             f"data/chunks_per_record/{label}": self.chunks / max(1, self.chunk_records),
             **{f"data/rejected/{label}/{reason}": count for reason, count in self.refused.items()},
             **{f"data/cut_examples/{label}/{kind}": count for kind, count in self.cut_examples.items()},
@@ -159,12 +166,12 @@ class CorpusCounts:
 
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
-        read after them: the reader delivered the rows and counted those cut short, and the two
-        dropped and chunked apart."""
+        read after them: the reader delivered the rows and counted those cut short, unless it counts
+        none (`rows`), and the two dropped and chunked apart."""
         return dataclasses.replace(
-            reader, attempted=max(self.attempted, reader.attempted), chunks=self.chunks + reader.chunks,
-            chunk_records=self.chunk_records + reader.chunk_records, rejected=self.rejected + reader.rejected,
-            rejected_cut=self.rejected_cut + reader.rejected_cut)
+            reader if reader.rows else self, attempted=max(self.attempted, reader.attempted),
+            chunks=self.chunks + reader.chunks, chunk_records=self.chunk_records + reader.chunk_records,
+            rejected=self.rejected + reader.rejected, rejected_cut=self.rejected_cut + reader.rejected_cut)
 
     def expanded(self, outputs: Sequence[Record]) -> None:
         """Count one chunked document and its fan-out before later stages can reject chunks."""
@@ -218,9 +225,11 @@ class _KeepAccepted:
                 "every record")
         if logged_run(self.consecutive, LONG_RUN):
             reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
+            # What it kept, which a counter past an objective's expansion reads but counts as no rows.
+            kept = self.counts.attempted - sum(self.counts.rejected.values())
             _log.warning("corpus %s rejected its last %d records and has kept %d; the read goes on until "
-                         "one is kept (most rejected: %s)", self.counts.label, self.consecutive,
-                         self.counts.accepted, reasons)
+                         "one is kept (most rejected: %s)", self.counts.label, self.consecutive, kept,
+                         reasons)
         return False
 
 
@@ -243,7 +252,10 @@ class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
         return {"parent": self._read.get_state(), _COUNTER: self._counted()}
 
     def _counted(self) -> Mapping[str, object]:
-        return {"corpus": self._counts.name, "label": self._counts.label, "counts": self._counts.state()}
+        # A counter that counts no rows says so (`CorpusCounts.rows`); any other counts them.
+        rowless = {} if self._counts.rows else {"rows": False}
+        return {"corpus": self._counts.name, "label": self._counts.label, "counts": self._counts.state(),
+                **rowless}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "counted parent"))
@@ -334,7 +346,9 @@ class _CarriedIterator(pygrain.DatasetIterator[Batch]):
 class Accepted(pygrain.IterDataset[Batch]):
     """Grain's filter, with checkpointed counts. A filter of an endless repeat whose passes it
     rejects alike refuses a run of `certain_after` rejections, two whole passes, as reading nothing
-    forever; any other run of rejections it logs and reads on, a fetch that failed for now say."""
+    forever; any other run of rejections it logs and reads on, a fetch that failed for now say. One
+    past an objective's step that makes rows of source examples counts none of the rows it keeps
+    (`rows` false, `CorpusCounts.rows`)."""
 
     def __init__(
         self,
@@ -344,13 +358,14 @@ class Accepted(pygrain.IterDataset[Batch]):
         *,
         tokens: Callable[[Batch], int] | None = None,
         certain_after: int | None = None,
+        rows: bool = True,
     ):
         super().__init__(parent)
         self._records, self._name, self._label = parent, name, label
-        self._tokens, self._certain_after = tokens, certain_after
+        self._tokens, self._certain_after, self._rows = tokens, certain_after, rows
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        counts = CorpusCounts(self._name, self._label)
+        counts = CorpusCounts(self._name, self._label, rows=self._rows)
         predicate = _KeepAccepted(counts, self._tokens, self._certain_after)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
@@ -772,12 +787,18 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
 
     def visit(branch) -> dict[str, CorpusCounts]:
         counted: dict[str, CorpusCounts] = {}
+        rowless: CorpusCounts | None = None
         if isinstance(branch, Mapping):
             node = branch.get(_COUNTER)
             if isinstance(node, Mapping):
                 corpus = text(node["corpus"], "corpus")
-                counted[corpus] = CorpusCounts(corpus, text(node["label"], "label"))
-                counted[corpus].restore(record(node["counts"], "corpus counts"))
+                counts = CorpusCounts(corpus, text(node["label"], "label"),
+                                      rows=boolean(node.get("rows", True), "counter rows"))
+                counts.restore(record(node["counts"], "corpus counts"))
+                if counts.rows:
+                    counted[corpus] = counts
+                else:
+                    rowless = counts
             interleaved = branch.get("iterators_in_use_states")
             if isinstance(interleaved, list):
                 # A restored interleave keeps the positions of shards past its cycle as future states.
@@ -793,6 +814,9 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
         elif isinstance(branch, (tuple, list)):
             for child in branch:
                 _nested(counted, visit(child))
+        if rowless is not None:
+            # Its rows are those the counters inside it counted, which it adds its rejections to.
+            _nested(counted, {rowless.name: rowless})
         return counted
 
     return visit(state)
@@ -834,7 +858,7 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
 def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     """Add a corpus's counts from an iterator that read records of its own."""
     if counts.name not in counted:
-        counted[counts.name] = CorpusCounts(counts.name, counts.label)
+        counted[counts.name] = CorpusCounts(counts.name, counts.label, rows=counts.rows)
     combined = counted[counts.name]
     combined.attempted += counts.attempted
     combined.accepted += counts.accepted
