@@ -867,10 +867,13 @@ def _staged(
     build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     passes = None
     if epochs is not None and measured.ahead == "layout":
-        # The bound it held with its pack counted its passes as it held the documents (`Limit.passes`).
+        # The bound it held with its pack counted its passes as it held the documents (`Limit.passes`). The
+        # prepared chain states that count where it holds the bound unrun; one its measure held already (a
+        # configured chain's, `_measure`) ran it to that count.
         count = _held_count(train)
         passes = count // epochs
-        original = _rebound(original, count)
+        if examples_bound(original.stages) is not None:
+            original = _rebound(original, count)
     elif epochs is not None and measured.ahead == "expansion":
         # Bounded before the expansion it would hold, it now holds the examples a pass reaches it with.
         passes = _pass_examples(train, read)
