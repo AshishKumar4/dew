@@ -168,9 +168,10 @@ class EpisodesConfig:
         if isinstance(objective, DreamerV3Objective):
             driven = DrivenSimulator(flown) if isinstance(flown, Simulator) else Driven(flown)
             score = episodes(objective.greedy, driven, self.steps, memory=objective.memory,
-                             reached=self.reached)
+                             reached=self.reached, models=objective.towers())
         else:
-            score = episodes(objective.greedy, flown, self.steps, reached=self.reached)
+            score = episodes(objective.greedy, flown, self.steps, reached=self.reached,
+                             models=objective.towers())
         reached = {view: Shown(better="higher") for view in self.reached}
         return Episodes(score, {"return": Shown(better="higher"), "steps": Shown(), **reached})
 

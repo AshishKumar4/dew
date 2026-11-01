@@ -99,6 +99,10 @@ def app(server: ScoringServer, *, api_key: str | None = None) -> Starlette:
         except ValueError as refused:
             return JSONResponse({"error": str(refused)}, status_code=422)
 
+    async def metrics(request: Request) -> JSONResponse:
+        # What the served task reports of its passes and its requests (`ScoringServer.metrics`).
+        return JSONResponse(server.metrics())
+
     async def health(request: Request) -> JSONResponse:
         # The task served now, whose name a reload's task replaces.
         served = server.task
@@ -106,6 +110,7 @@ def app(server: ScoringServer, *, api_key: str | None = None) -> Starlette:
         return JSONResponse({"model": served.decide.name})
 
     return Starlette(routes=[Route("/v1/systemone", systemone, methods=["POST"]),
+                             Route("/metrics", metrics, methods=["GET"]),
                              Route("/health", health, methods=["GET"])], lifespan=lifespan)
 
 

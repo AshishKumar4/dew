@@ -152,7 +152,7 @@ class Objective()  [dew.objectives.base]
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
-  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
+  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Env, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
   .progress(self, step: Step) -> Progress
   .progress_readers(self) -> tuple[nn.Module, ...]
@@ -243,7 +243,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
-  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
+  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Env, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
   .progress(self, step: Step) -> Progress
   .progress_readers(self) -> tuple[nn.Module, ...]

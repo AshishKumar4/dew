@@ -91,6 +91,7 @@ from dew.cleanup import attempted
 from dew.files import write_atomically
 from dew.mesh import LogicalAxes, mesh_axes
 from dew.nn import sharding
+from dew.nn.kernels.options import owned_program, program
 from dew.nn.precision import at_least_fp32
 from dew.telemetry.profile import region
 
@@ -341,7 +342,7 @@ def _mixed(module, words, index):
                          for seed in _SEEDS])
 
 
-@jax.jit
+@program
 def _marks(leaves: list[jax.Array]) -> jax.Array:
     """Two 32-bit marks of each leaf's stored bits at their positions, `[leaves, 2]`.
 
@@ -495,7 +496,7 @@ def _from_delta_planes(planes, live):
     return (delta ^ live.view(kind)).view(live.dtype)
 
 
-@jax.jit(static_argnums=2)
+@functools.partial(program, static_argnums=2)
 def _decode_delta(planes: jax.Array, live: jax.Array, dtype) -> jax.Array:
     """`_from_delta_planes` as one program per leaf signature: a model's
     repeated blocks share a handful, where one program over every leaf
@@ -558,7 +559,7 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
     if not chosen:
         return state_tree, []
     for index in chosen:
-        encode = jax.jit(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
+        encode = program(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
         leaves[index] = encode(leaves[index], lives[index])
     return ({**state_tree, 'ema': jax.tree.unflatten(structure, leaves)},
             [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
@@ -891,7 +892,7 @@ def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
 
         summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
                                 in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
-        summed = jax.jit(summing)(jax.device_put(values, held.with_memory_kind("device")), masks[split])
+        summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")), masks[split])
         value = (summed != 0 if values.dtype == np.bool_
                  else jax.lax.bitcast_convert_type(summed, values.dtype))
         value = jax.device_put(value, held)
