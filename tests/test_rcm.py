@@ -3,6 +3,7 @@ and forward-mode attention for its tangent."""
 
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -160,38 +161,37 @@ def test_continuous_consistency_trains_a_teacher_with_its_own_time_scale(time_sc
         np.testing.assert_array_equal(start, end)
 
 
-def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_critic(tmp_path):
-    """The teacher is a saved run; the student and fake score start from
-    it. Past the warmup one step in two trains the student and the other
-    the fake score, each leaving the other's gradient zero, and the saved
-    student's task samples as the objective's own. A LoRA student distills
-    the same teacher, whose model and the fake score's are the run's
-    without the adapter. A saved student, which holds its teacher, loads without its teacher's run."""
-    import dataclasses
+class _Teacher(NamedTuple):
+    """A saved flow run and what its training step left: its run, its directory, its state and a batch."""
 
+    run: object
+    directory: Path
+    state: object
+    batch: object
+
+
+@pytest.fixture(scope="module")
+def saved_teacher(tmp_path_factory) -> _Teacher:
+    """A flow run trained one step and saved as its run saves it, its task's record beside its weights,
+    shared by the module's distillations of it."""
     from diffusion_stubs import batch_for
     from diffusion_support import images_of
 
-    from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
     from dew.config import ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
-    from dew.inference import TextToImage
     from dew.inputs import TextCondition
-    from dew.lora import LoRA
-    from dew.objectives.base import TEACHER, Step
-    from dew.objectives.diffusion import ConsistencyDistillationObjective
-    from dew.objectives.diffusion.objective import FAKE_SCORE
     from dew.registry import ModelConfig
-    from dew.sampling import Consistency, Euler
+    from dew.sampling import Euler
     from dew.training import Trainer
 
+    root = tmp_path_factory.mktemp("rcm")
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                          "time_scale": 0.002, "dtype": "float32", "attention_impl": "xla"}),
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
@@ -200,26 +200,50 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     state = trainer.initial_state()
     batch = batch_for(teacher, 4)
     state, *_ = trainer.compile(state, batch)(state, batch)
-    for directory in ("teacher", "student"):
-        (tmp_path / directory).mkdir()
-    checkpoints = Checkpoints(str(tmp_path / "teacher"))
+    directory = root / "teacher"
+    directory.mkdir()
+    checkpoints = Checkpoints(str(directory))
     # As the teacher's run saves it, its task's record beside its weights.
     checkpoints.save(1, state, None, {}, artifact=teacher.inference_record())
     checkpoints.wait()
-    teacher_run.save(str(tmp_path / "teacher"))
+    teacher_run.save(str(directory))
+    return _Teacher(teacher_run, directory, state, batch)
 
-    def distilling(**fields):
-        objective = ObjectiveConfig("rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None, **fields})
-        return dataclasses.replace(teacher_run, teacher_run=str(tmp_path / "teacher"), objective=objective)
 
+def _distilling(teacher: _Teacher, directory: Path | None = None, **fields):
+    """An rCM run distilling `teacher`'s saved run (from `directory`, a copy of it, where given)."""
+    import dataclasses
+
+    from dew.config import ObjectiveConfig
+    from dew.sampling import Consistency
+
+    objective = ObjectiveConfig("rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None, **fields})
+    source = str(directory or teacher.directory)
+    return dataclasses.replace(teacher.run, teacher_run=source, objective=objective)
+
+
+ALTERNATING = {"teacher_guidance": 2.0, "tangent_warmup": 1, "student_update_freq": 2,
+               "max_simulation_steps": 2}
+"""The run's rCM fields: guidance past one, a warmup of one step, the student every other step."""
+
+
+def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_critic(saved_teacher):
+    """The teacher is a saved run; the student and fake score start from it, reading its Fourier table
+    whatever scale the model record names. Past the warmup one step in two trains the student and the
+    other the fake score, each leaving the other's gradient zero."""
+    import dataclasses
+
+    from dew.objectives.base import TEACHER, Step
+    from dew.objectives.diffusion import ConsistencyDistillationObjective
+    from dew.objectives.diffusion.objective import FAKE_SCORE
+
+    teacher, state, batch = saved_teacher.run, saved_teacher.state, saved_teacher.batch
     # The checkpoint's Fourier table is authoritative, whatever scale the model record names.
     for time_scale in (16, 0.001):
-        model = dataclasses.replace(teacher_run.model, fields={**teacher_run.model.fields,
-                                                                "time_scale": time_scale})
-        dataclasses.replace(distilling(), model=model).build()
+        model = dataclasses.replace(teacher.model, fields={**teacher.model.fields, "time_scale": time_scale})
+        dataclasses.replace(_distilling(saved_teacher), model=model).build()
 
-    config = distilling(teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2, max_simulation_steps=2)
-    task = config.build()
+    task = _distilling(saved_teacher, **ALTERNATING).build()
     assert isinstance(task, ConsistencyDistillationObjective)
     params = task.init(jax.random.PRNGKey(0))
     expected = task.model_variables(state.variables)
@@ -244,6 +268,23 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     assert size({k: v for k, v in student.items() if k != FAKE_SCORE}) > 0 and size(student[FAKE_SCORE]) == 0
     assert size({k: v for k, v in critic.items() if k != FAKE_SCORE}) == 0 and size(critic[FAKE_SCORE]) > 0
 
+
+def test_a_lora_student_distills_the_saved_teacher_without_its_adapter(saved_teacher):
+    """A LoRA student distills the same teacher, whose model and the fake score's are the run's without
+    the adapter: it starts as the run that has none, up to its branch's rounding, and its training step
+    keeps every frozen leaf finite."""
+    import dataclasses
+
+    from dew.batch import FROZEN
+    from dew.lora import LoRA
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion.objective import FAKE_SCORE
+    from dew.training import Trainer
+
+    batch = saved_teacher.batch
+    config = _distilling(saved_teacher, **ALTERNATING)
+    task = config.build()
+    params = task.init(jax.random.PRNGKey(0))
     # A LoRA student starts as the teacher: B is zero, up to its branch's rounding.
     adapted = dataclasses.replace(config, lora=LoRA(rank=2, modules=("ada_proj", "final_proj"))).build()
     assert [program.trained for program in adapted.program_key()] == [True, False, True]
@@ -260,9 +301,27 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     tuned, *_ = trainer.compile(tuned, batch)(tuned, batch)
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(tuned.variables[FROZEN]))
 
+
+def test_a_saved_student_samples_as_its_objective_and_holds_its_teacher(saved_teacher, tmp_path):
+    """The saved student's task samples as the objective's own; a saved student, which holds its
+    teacher, loads without its teacher's run."""
+    import shutil
+
+    from dew.checkpoints import Checkpoints
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.inference import TextToImage
+    from dew.training import Trainer
+
+    batch = saved_teacher.batch
+    # The teacher's run copied here, as this test moves it away.
+    teacher = tmp_path / "teacher"
+    shutil.copytree(saved_teacher.directory, teacher)
+    config = _distilling(saved_teacher, teacher, **ALTERNATING)
+    task = config.build()
     trainer = Trainer(task, optax.adam(1e-3), key=jax.random.PRNGKey(5))
     distilled = trainer.initial_state()
     distilled, *_ = trainer.compile(distilled, batch)(distilled, batch)
+    (tmp_path / "student").mkdir()
     checkpoints = Checkpoints(str(tmp_path / "student"))
     checkpoints.save(1, distilled, None, artifact=task.inference_record())
     checkpoints.wait()
@@ -271,7 +330,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], key=9)
                                   .host().images, expected)
     # The student holds its teacher: it rebuilds over its own tree, its teacher's run moved away.
-    (tmp_path / "teacher").rename(tmp_path / "moved")
+    teacher.rename(tmp_path / "moved")
     rebuilt = DiffusionRunConfig.load(str(tmp_path / "student")).build(variables=distilled.variables)
     np.testing.assert_array_equal(rebuilt.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images,
                                   expected)
