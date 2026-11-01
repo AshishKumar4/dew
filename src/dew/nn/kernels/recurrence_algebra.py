@@ -883,17 +883,17 @@ def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value,
 
 
 def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, out_grads: TileLoad,
-                   blocks: int, scale: float, dtype, issue: Issue, *,
+                   blocks: int, scale: float, dtype, issue: Issue, summed: Callable[[list], jax.Array], *,
                    emit: Callable[[int, jax.Array], None], laid: tuple | None = None) -> None:
     """The corrected values' gradient from the chunk's own output, each value block `j`'s `[C, BV]` fp32 to
     `emit(j, dv)`: `A^T do` for `chunk_output`'s scores `A[t, s] = scale (q_t . k_s) exp2(g_t - g_s)`
-    (`s <= t`), its transpose taken as `k q^T` ('local_t') and cast to the gradient's `dtype` once for every
-    block's product with `out_grads(j)` ('local_dv'); `laid` as `chunk_output`'s. The pairs' decays come
-    before the products, as `chunk_scores`'."""
+    (`s <= t`), its transpose taken as `k q^T` ('local_t', the key blocks' sum in one accumulator,
+    `summed`) and cast to the gradient's `dtype` once for every block's product with `out_grads(j)`
+    ('local_dv'); `laid` as `chunk_output`'s. The pairs' decays come before the products, as
+    `chunk_scores`'."""
     column_gate, column_low = (gate, low) if laid is None else laid
     decay = decayed(-gate, -low, -column_gate, -column_low)
-    product = functools.reduce(jnp.add, (issue("local_t", keys(c), queries(c).T) for c in range(columns)))
-    product = product * decay
+    product = summed([("local_t", keys(c), queries(c).T) for c in range(columns)]) * decay
     lag = _lags(product.shape)
     scores = jnp.where(lag <= 0, product * scale, 0.0).astype(dtype)
     for j in range(blocks):
