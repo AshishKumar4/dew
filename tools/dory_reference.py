@@ -383,15 +383,11 @@ def write_tiny() -> None:
     ids = rng.integers(12, CONFIG['vocab_size'], (2, 9))
     arrays = {'input_ids': ids}
 
-    def both(name, compute, config=CONFIG, **fields):
-        arrays[name] = compute(DoryReference(config, tensors, torch.float32, **fields))
-        arrays[f'{name}_f64'] = compute(DoryReference(config, tensors, torch.float64, **fields))
-
     # The float64 logits a float64 Dew is held to; the float32 runs the tests compare are drawn live.
     for loops in (1, 2, 4):
         wide = DoryReference(CONFIG, tensors, torch.float64, loops=loops)
         arrays[f'logits_{loops}_f64'] = wide.forward(ids)
-    both('keys', lambda reference: reference.first_keys(ids))
+    arrays['keys_f64'] = DoryReference(CONFIG, tensors, torch.float64).first_keys(ids)
     arrays['keys_bf16'] = DoryReference(CONFIG, tensors, torch.bfloat16).first_keys(ids)
     for mode, loops in itertools.product(('per_loop', 'last_loop'), (None, 4)):
         # The tiny's own two loops, and four, whose cached passes a decode step scans.
