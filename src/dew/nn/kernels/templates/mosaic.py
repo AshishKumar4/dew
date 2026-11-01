@@ -1510,7 +1510,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
-                      reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups)
+                      # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
+                      # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
+                      reduction_scratch=(self.reduction_scratch
+                                         + self.warpgroup_reduction_scratch * reducing_warpgroups))
 
     def scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
