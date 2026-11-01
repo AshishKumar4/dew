@@ -1882,7 +1882,11 @@ def test_a_scope_named_apart_compiles_as_many_bare_programs_as_it_names(tmp_path
                                                "        return jax.jit(f)\n"),
              "src/dew/training/interval.py": ("import jax\n"
                                               "def bookkeep(f):\n"
-                                              "    return jax.jit(f), jax.jit(f)\n"),
+                                              "    return jax.jit(f), jax.jit(f)\n"
+                                              "def _added_tokens(f):\n"
+                                              "    return jax.jit(f)\n"
+                                              "def held(f):\n"
+                                              "    return jax.jit(f)\n"),
              "src/dew/nn/flops.py": "def traced_flops(f):\n    return f\n"}
     for relative, text in files.items():
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
