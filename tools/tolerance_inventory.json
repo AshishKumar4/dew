@@ -446,7 +446,7 @@
    "lane": "Training"
   },
   "tests/test_mamba2_interop.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_masked_diffusion.py": {
@@ -672,10 +672,6 @@
   "tests/test_serving.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_short_conv.py": {
-   "comparisons": 1,
-   "lane": "Recurrence & Dory"
   },
   "tests/test_source_schedulers.py": {
    "comparisons": 7,
