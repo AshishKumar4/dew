@@ -11,7 +11,7 @@ import pytest
 from reference_error import assert_as_exact
 from test_algebra_derive import walked
 
-from dew.algebra import SATURATION, derive
+from dew.algebra import SATURATION, derive, forms as algebra_forms
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_portable
 from dew.nn.precision import float32_einsum
 
@@ -230,3 +230,28 @@ def test_the_backward_serving_each_cell_is_on_par(form, walked):
         served, reference = derived_backward(form, walked), oracle_backward(form)
     assert_as_exact(jax.jit(served), jax.jit(reference), backward_draw,
                     f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))
+
+
+@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+@pytest.mark.parametrize("form", ["full", "causal"])
+def test_the_portable_mainloop_computes_attention_by_either_forms(form, derived):
+    """The plain-JAX mainloop's forward (`attention_portable.attend`) with its walk's step, merge and finish
+    the hand-written forms or the derived ones behind the switch (`dew.algebra.forms.derived`), the product
+    of its weights with the values its own (`Keys.dot`): on par with the reference (check 1) either way."""
+    spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
+
+    def ours(q, k, v):
+        with algebra_forms.derived(derived):
+            out = attention_portable.attend(q[None, :, None], k[None, :, None], v[None, :, None], spans,
+                                            **TILES)
+        return out[0, :, 0]
+
+    def reference(q, k, v):
+        return template.reference(q[None, :, None], k[None, :, None], v[None, :, None], spans, None)[0, :, 0]
+
+    def operands(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rng.standard_normal((LENGTH, DEPTH)), jnp.float32) for _ in range(3))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), operands, f"portable forward {form} derived {derived}",
+                    seeds=16)

@@ -44,13 +44,13 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     closed, shaped = jax.make_jaxpr(function, return_shape=True)(*operands)
     region = terms.region(closed)
     graph, bundle, roots = program.graphed(region)
-    device = cost.Device.of()
-    timed = cost.model(device)
+    facts = cost.target()
+    timed = cost.model(region, cost.fused(facts))
     _, written_seconds = graph.extract(bundle, include_cost=True, cost_model=timed, extractor="greedy-dag")
     program.saturate(graph, region, rules.admitted(accurate=False, dev=True), saturation)
     tree = jax.tree.structure(shaped)
     candidates = [Candidate("as written", written_seconds.value, function)]
-    for name, model in (("cheapest", timed), ("stable", cost.stable(device))):
+    for name, model in (("cheapest", timed), ("stable", cost.stable(region, cost.fused(facts)))):
         chosen, _ = program.extracted(graph, bundle, model)
         candidates.append(Candidate(name, _priced(region, chosen, timed),
                                     _valued(region, closed.consts, dict(zip(map(str, roots), chosen,

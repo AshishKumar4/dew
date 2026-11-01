@@ -1,11 +1,13 @@
 """What every derivation shares (`derive`, `scan`, `carry`): the forms a declaration derives (`Derived`),
 those forms with their math rewritten by the engine (`rewritten`), its refusal (`Refused`), the reading of a
 declaration's jaxpr (what a value reads, an equation's evaluation, a value's array type), a declaration
-traced with Dew's products as one each (`inlined`), and an extracted form's value (`evaluated`)."""
+traced with Dew's products as one each (`inlined`), an extracted form's value (`evaluated`, `evaluator`), and
+the one switch the templates take their derived forms behind (`derived`)."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+import contextlib
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -14,6 +16,7 @@ from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew.algebra import program, terms
+from dew.cache import DERIVED
 from dew.nn.precision import float32_dot_general
 
 
@@ -30,7 +33,13 @@ class Derived(NamedTuple):
     (the carry, and a chunk's outputs from the state entering it); its `backward(tiles, state, d_state,
     d_outputs)` is a chunk's adjoint: the cotangent of the state entering it and of each of its operands, from
     the state entering it and the cotangents of the state leaving it and of its outputs (a reduction's
-    backward is a declaration of its own, None here)."""
+    backward is a declaration of its own, None here). A reduction's `slots(shapes)` names each carried
+    state's monoid (`max`, `sum`) and shape in the state's order, so a template holds each where its mainloop
+    holds that value; its `step(state, tiles, product=, accumulate=)` takes a mainloop's own matrix product
+    (`evaluator`) and its own accumulator for a sum stepped as `state * factor + weights @ values`
+    (`accumulate(state, factor, weights, values)`, the factor a row's); its `merge(a, b, operands=None)` and
+    `finish(state, operands=None)` read the state (and the unwalked operands given), their forms those its
+    walk took."""
 
     init: Callable
     step: Callable
@@ -40,6 +49,7 @@ class Derived(NamedTuple):
     report: Mapping
     backward: Callable | None = None
     prepare: Callable = lambda tiles: tiles
+    slots: Callable | None = None
 
 
 class Program(Protocol):
@@ -161,12 +171,39 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
     return [read(atom) for atom in jaxpr.outvars]
 
 
+@contextlib.contextmanager
+def derived(on: bool = True) -> Iterator[None]:
+    """Within the block, the templates take their algebra's derived forms (`derive`, `scan`) where they hold
+    them in place of their hand-written ones (`on`), or the hand-written ones: a context of JAX's trace
+    (`dew.cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
+    hand-written forms swap behind, which check 1 drives both ways (docs/design/algebra.md §6.9)."""
+    with DERIVED(on):
+        yield
+
+
+def derived_on() -> bool:
+    """Whether the templates take their derived forms here (`derived`)."""
+    return bool(DERIVED.value)
+
+
 def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
               known: Mapping[str, jax.Array]) -> jax.Array:
-    """A form's value: its leaves the given values (`leaves`, by index; None for one no form reads) and the
-    outputs of the region's equations outside the language over them, each term `known` names (by its text)
-    its value there, each product Dew's (`float32_dot_general`), every other term the engine's
-    (`terms.value_of`)."""
+    """A form's value (`evaluator`'s)."""
+    return evaluator(region, leaves, known)(form)
+
+
+PLAIN_PRODUCT = (((1,), (0,)), ((), ()))
+"""A matrix product's dimension numbers, `a @ b`: the left's last axis with the right's first, no batch."""
+
+
+def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[str, jax.Array], *,
+              product: Callable[[jax.Array, jax.Array], jax.Array] | None = None
+              ) -> Callable[[terms.Term], jax.Array]:
+    """The values of a region's forms, each term once however many forms read it: its leaves the given
+    values (`leaves`, by index; None for one no form reads) and the outputs of the region's equations
+    outside the language over them, each term `known` names (by its text) its value there, each matrix
+    product `product(a, b)` where a caller holds its own (a mainloop's issuer) and every other product
+    Dew's (`float32_dot_general`), every other term the engine's (`terms.value_of`)."""
     values = dict(known)
     outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
     given = dict(enumerate(leaves))
@@ -188,13 +225,17 @@ def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
         elif (args := get_callable_args(term, terms.Term.dot)) is not None:
             left, right, index = args
             _, params = region.params[int(get_literal_value(index))]
-            made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
-                                       precision=params.get("precision"),
-                                       preferred_element_type=params.get("preferred_element_type"))
+            numbers = jax.tree.map(int, params["dimension_numbers"])
+            if product is not None and numbers == PLAIN_PRODUCT:
+                made = product(value(left), value(right))
+            else:
+                made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
+                                           precision=params.get("precision"),
+                                           preferred_element_type=params.get("preferred_element_type"))
         else:
             # Every leaf is read above.
             made = terms.value_of(term, value, region, ())
         values[key] = made
         return made
 
-    return value(form)
+    return value

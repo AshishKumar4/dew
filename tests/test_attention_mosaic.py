@@ -27,6 +27,7 @@ from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
+from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -462,6 +463,17 @@ def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
 def test_the_forward_is_on_par_interpreted(call, dtype):
     """The forward, the base-2 fold, under Mosaic GPU's interpreter."""
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal", "spans"])
+def test_the_forward_by_its_derived_forms_is_on_par_interpreted(call):
+    """The forward, the base-2 fold, its walk's step, merge and finish the derived forms behind the switch
+    (`dew.algebra.forms.derived`, `attention_algebra.derived_forms`), its weighted values' sums in the
+    mainloop's accumulator (`Keys.accumulate`), under Mosaic GPU's interpreter: on par with the reference
+    (check 1), as the hand-written forms are (`test_the_forward_is_on_par_interpreted`)."""
+    with algebra_forms.derived():
+        _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True)
 
 
 @INTERPRETS

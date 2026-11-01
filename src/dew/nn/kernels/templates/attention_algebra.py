@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import derive
+from dew.algebra.forms import derived_on
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import (
     LOG2E,
@@ -1096,7 +1097,10 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys`: its softmax and the product of its weights with its values, the
     mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
     form). A tile held keys first (`Coords.keys_first`, a decode program's `K Qᵀ`) takes its sums so: the
-    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk."""
+    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk. Behind the switch, the derived
+    forms' (`dew.algebra.forms.derived`, `_derived_step`)."""
+    if derived_on():
+        return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     if held is None and keys.accumulate is not None:
@@ -1423,7 +1427,10 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
-    keys), so `empty` is its identity under every spec."""
+    keys), so `empty` is its identity under every spec. Behind the switch, the derived forms'
+    (`dew.algebra.forms.derived`, `_derived_merge`)."""
+    if derived_on():
+        return _derived_merge(spec, first, second)
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
     if first.guard is None and second.guard is None:
@@ -1486,8 +1493,12 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
-    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves."""
+    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, the
+    output the derived forms' (`dew.algebra.forms.derived`, `_derived_output`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
+    if derived_on():
+        out = _derived_output(spec, state)
+        return (out if output_mod is None else output_mod(out, *output_params)), m, denominator
     out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
     fields = state.guard
     if fields is not None:
@@ -2250,28 +2261,129 @@ def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: b
     return exponentials.astype(dtype).astype(jnp.float32)
 
 
-def softmax_of(logits: jax.Array, seen: jax.Array, values: jax.Array, *, base2: bool) -> jax.Array:
+def softmax_of(logits: jax.Array, seen: jax.Array | None, values: jax.Array, *, base2: bool
+               ) -> jax.Array:
     """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
-    query's softmax over the keys it sees of its `logits` `[rows, keys]` (scaled, in the exponent's base),
-    its weights' sum of the `values` `[keys, width]` over their total, Dew's product (`float32_einsum`); a
-    query that sees no key, zeros (its weights selected away, whatever its maximum's)."""
+    query's softmax over the keys it sees of its `logits` `[rows, keys]` (scaled, in the exponent's base;
+    `seen` None where each query sees every key), its weights at the values' dtype (the reference's, as
+    `narrow` takes them) summed over the `values` `[keys, width]` by Dew's product (`float32_einsum`), over
+    their total; a query that sees no key, zeros (its weights selected away, whatever its maximum's)."""
     exponent = jnp.exp2 if base2 else jnp.exp
-    s = jnp.where(seen, logits, -jnp.inf)
+    s = logits if seen is None else jnp.where(seen, logits, -jnp.inf)
     m = jnp.max(s, axis=-1)
-    p = jnp.where(seen, exponent(s - m[:, None]), 0.0)
+    p = exponent(s - m[:, None])
+    p = p if seen is None else jnp.where(seen, p, 0.0)
     total = jnp.sum(p, axis=-1)
-    return float32_einsum("qk,kd->qd", p, values) / jnp.where(total == 0, 1.0, total)[:, None]
+    weighted = float32_einsum("qk,kd->qd", p.astype(values.dtype), values)
+    return weighted / jnp.where(total == 0, 1.0, total)[:, None]
 
 
-def declaration(*, base2: bool):
+def declaration(*, base2: bool, masked: bool = True):
     """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
     template's formed tiles, walked along the keys, its exponent the base the template folds
-    (`folds`: 2 where it folds `log2(e)` into its logits). Its derived forms stand beside this module's
-    (`peak`, `stepped`, `merge`, `finish`), which they replace only on par with them against float64 and
-    no slower in the kernel (docs/design/algebra.md)."""
-    axes = {"logits": ("rows", "keys"), "seen": ("rows", "keys"), "values": ("keys", "width")}
-    return derive.Reduction(functools.partial(softmax_of, base2=base2), axes, walked="keys",
-                            exponent=2 if base2 else "e")
+    (`folds`: 2 where it folds `log2(e)` into its logits), a mask operand `seen` where a query may see no
+    key (`masked`). Its derived forms stand beside this module's (`plain_step`, `merge`, `finish`), behind
+    the one switch (`dew.algebra.forms.derived`, `derived_forms`), which they replace only on par with them
+    against float64 and no slower in the kernel (docs/design/algebra.md)."""
+    exponent = 2 if base2 else "e"
+    if masked:
+        axes = {"logits": ("rows", "keys"), "seen": ("rows", "keys"), "values": ("keys", "width")}
+        return derive.Reduction(functools.partial(softmax_of, base2=base2), axes, walked="keys",
+                                exponent=exponent)
+
+    def unmasked(logits, values):
+        return softmax_of(logits, None, values, base2=base2)
+
+    axes = {"logits": ("rows", "keys"), "values": ("keys", "width")}
+    return derive.Reduction(unmasked, axes, walked="keys", exponent=exponent)
+
+
+@functools.cache
+def derived_forms(base2: bool, masked: bool) -> derive.Derived:
+    """The forward's derived forms (`declaration`'s, the fast class), the template's behind the switch
+    (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own."""
+    from dew.algebra import SATURATION
+
+    return derive.derive(declaration(base2=base2, masked=masked), accurate=False, saturation=SATURATION)
+
+
+_SLOTS: dict[tuple[bool, bool], tuple[str, ...]] = {}
+"""Each derived forms' carried states as `Partial`'s fields, in their order (`_slotted`), named at their
+walk's first step: the declaration's reductions' order, whatever the tile."""
+
+
+def _slotted(base2: bool, masked: bool, shapes: Mapping | None = None) -> tuple[str, ...]:
+    """The `Partial` field each of the derived forms' carried states is (`Derived.slots`): its maximum `m`,
+    its sum of one value a query `total`, its sum of a row a query `acc`; at a tile's `shapes`, else as the
+    walk's first step named them (a merge's and a finish's, which read the state alone)."""
+    key = (base2, masked)
+    if key not in _SLOTS:
+        if shapes is None:
+            raise derive.Refused("a merge or finish of derived forms before their walk's first step")
+        slots = derived_forms(base2, masked).slots
+        assert slots is not None, "a reduction's derived forms name their slots"
+        fields = tuple("m" if monoid == "max" else "total" if len(shape) == 1 else "acc"
+                       for monoid, shape in slots(shapes))
+        if sorted(fields) != ["acc", "m", "total"]:
+            raise derive.Refused(f"the derived forms carry {fields}, not a softmax's maximum, total and sums")
+        _SLOTS[key] = fields
+    return _SLOTS[key]
+
+
+def _derivable(spec: Forward, guard: Guard | None, keys: Keys | None = None) -> None:
+    """Refused (`derive.Refused`) where the walk takes a form the declaration states none of: the accurate
+    forms' (natural or raw logits, compensated sums), the headroom guard's, dropout's draws, a tile held keys
+    first."""
+    unstated = [name for name, holds in (
+        ("the accurate forms (natural or raw logits, compensated sums)",
+         spec.natural or spec.raw or spec.compensated),
+        ("the headroom guard", spec.headroom or guard is not None),
+        ("dropout's draws", keys is not None and keys.coords.drop is not None),
+        ("a tile held keys first", keys is not None and keys.coords.keys_first)) if holds]
+    if unstated:
+        raise derive.Refused(f"the forward's declaration states none of {', '.join(unstated)}")
+
+
+def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
+    """`plain_step` by the derived forms: the tile's logits (a query that may see no key reading its mask
+    from them, the -inf `modify` writes where it sees none) and values; the weighted values' sums the
+    mainloop's own where it holds them (`Keys.accumulate`), every product the mainloop's (`Keys.dot`)."""
+    _derivable(spec, state.guard, keys)
+    forms = derived_forms(spec.base2, spec.guarded)
+    tiles = {"logits": keys.logits, "values": keys.load()}
+    if spec.guarded:
+        tiles["seen"] = keys.logits > -jnp.inf
+    shapes = {name: (value.shape, value.dtype) for name, value in tiles.items()}
+    fields = _slotted(spec.base2, spec.guarded, shapes)
+    held_by = keys.accumulate
+
+    def accumulate(acc, factor, weights, values):
+        def scale(held):
+            return keys.coords.queries(factor, held) * held
+
+        assert held_by is not None
+        return held_by(acc, scale, (weights,), values)
+
+    stepped = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
+                         accumulate=None if held_by is None else accumulate)
+    return Partial(**dict(zip(fields, stepped, strict=True)))
+
+
+def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
+    """`merge` by the derived forms."""
+    _derivable(spec, first.guard if first.guard is not None else second.guard)
+    fields = _slotted(spec.base2, spec.guarded)
+    merged = derived_forms(spec.base2, spec.guarded).merge(tuple(getattr(first, field) for field in fields),
+                                                           tuple(getattr(second, field) for field in fields))
+    return Partial(**dict(zip(fields, merged, strict=True)))
+
+
+def _derived_output(spec: Forward, state: Partial) -> jax.Array:
+    """`finish`'s output before its hook by the derived forms: the weighted values over their total, zero
+    for a query that saw nothing."""
+    _derivable(spec, state.guard)
+    fields = _slotted(spec.base2, spec.guarded)
+    return derived_forms(spec.base2, spec.guarded).finish(tuple(getattr(state, field) for field in fields))
 
 
 def softmax_gradients(q, k, values, dout, peak, total, delta, seen, *, scale: float):

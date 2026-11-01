@@ -56,7 +56,8 @@ from egglog import (
 from egglog.bindings import EggSmolError
 
 from dew.algebra import cost, program, rules, terms
-from dew.algebra.forms import Derived, Refused, evaluated, inlined
+from dew.algebra.cost import Work
+from dew.algebra.forms import Derived, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
 from dew.nn.kernels.templates import report as kernel_report
 
@@ -411,21 +412,23 @@ DECOUPLED = rules.Rules("decoupled", "reorders", _decoupled(),
 PLAIN = _plain()
 
 
-UNBOUNDED = cost.Seconds(math.inf)
+UNBOUNDED = Work(operations=math.inf)
+"""A reading's work (`_priced`): a form that keeps one is no form."""
 _READINGS = (Term.stepped, Term.merged, Term.finished, Term.held)
 
 
-def _priced(device: cost.Device) -> DagCostModel:
-    """The program's cost (`cost.model`), each of the derivation's readings unbounded: a form that keeps one
-    is no form."""
-    timed = cost.model(device)
+def _priced(region: terms.Region, schedule) -> DagCostModel:
+    """The template's tile walk's price of each node (`cost.model` under `cost.walk`: a form the template's
+    algebra takes runs between its mainloop's products, not as XLA fuses it), each of the derivation's
+    readings unbounded."""
+    timed = cost.model(region, schedule)
 
     def marginal(graph: EGraph, node) -> cost.Seconds:
         if any(get_callable_args(node, reading) is not None for reading in _READINGS):
-            return UNBOUNDED
+            return cost.Seconds(UNBOUNDED, schedule)
         return timed.marginal_cost(graph, node)
 
-    return DagCostModel(marginal_cost=marginal, identity=cost.Seconds(0.0))
+    return DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -479,37 +482,82 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         return {str(Term.state(i64(index), i64(side))): state[index] for side, state in enumerate(states)
                 for index in range(len(made.reductions))}
 
-    def step(state, tiles):
+    def held(state) -> _Forms:
+        # The forms a state's walk took: the merges and finishes read the state alone, so its shapes name
+        # them whatever tile the walk took.
+        shapes = tuple(tuple(value.shape) for value in state)
+        for made in reversed(cache.values()):
+            if tuple(made.region.shape(reduction) for reduction in made.reductions) == shapes:
+                return made
+        raise Refused(f"a state of shapes {shapes} no walk formed (`init`, `step`)")
+
+    def step(state, tiles, *, product=None, accumulate=None):
         made = forms(shaped(tiles))
-        leaves = [*made.consts, *(tiles[name] for name in names)]
-        return tuple(evaluated(made.region, form, leaves, carried(made, state)) for form in made.steps)
+        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
+                          carried(made, state), product=product)
+        stepped = []
+        for index, form in enumerate(made.steps):
+            if accumulate is not None and (parts := _accumulated(form, index)) is not None:
+                factor, weights, values = parts
+                stepped.append(accumulate(state[index], value(factor), value(weights), value(values)))
+            else:
+                stepped.append(value(form))
+        return tuple(stepped)
 
-    def merge(a, b, operands):
-        # The forms the walks took; a merge reads no walked operand (`_derived`), its unwalked ones whole.
-        made = next(reversed(cache.values())) if cache else forms(shaped(operands))
-        leaves = [*made.consts, *(None if name in walked_axes else operands[name] for name in names)]
-        return tuple(evaluated(made.region, form, leaves, carried(made, a, b)) for form in made.merges)
+    def merge(a, b, operands=None):
+        made = held(a)
+        # A merge reads no walked operand (`_derived`), its unwalked ones whole.
+        leaves = [*made.consts, *(None if operands is None or name in walked_axes else operands[name]
+                                  for name in names)]
+        value = evaluator(made.region, leaves, carried(made, a, b))
+        return tuple(value(form) for form in made.merges)
 
-    def finish(state, operands):
-        made = forms(shaped(operands))
-        leaves = [*made.consts, *(operands[name] for name in names)]
+    def finish(state, operands=None):
+        made = held(state)
+        leaves = [*made.consts, *(None if operands is None else operands[name] for name in names)]
+        value = evaluator(made.region, leaves, carried(made, state))
         # A literal output is its literal; one along the walked axis, `mapped`'s.
-        outputs = [jnp.asarray(literal) if term is None else
-                   None if form is None else evaluated(made.region, form, leaves, carried(made, state))
+        outputs = [jnp.asarray(literal) if term is None else None if form is None else value(form)
                    for term, literal, form in zip(made.region.outputs, made.region.literal_outputs,
                                                   made.finishes, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def mapped(tiles):
         made = forms(shaped(tiles))
-        leaves = [*made.consts, *(tiles[name] for name in names)]
-        outputs = [evaluated(made.region, form, leaves, {}) if along and form is not None else None
+        value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)], {})
+        outputs = [value(form) if along and form is not None else None
                    for form, along in zip(made.outputs, made.mapped, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
+    def slots(shapes) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        made = forms(shapes)
+        return tuple((str(get_literal_value(get_callable_args(reduction, Term.reduce)[1])),
+                      made.region.shape(reduction)) for reduction in made.reductions)
+
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
-                    "rules": ("walking", "decoupled")})
+                    "rules": ("walking", "decoupled")}, slots=slots)
+
+
+def _accumulated(form: Term, index: int) -> tuple[Term, Term, Term] | None:
+    """A sum's step a mainloop takes into its own accumulator (`Derived.step`'s `accumulate`): `form`, the
+    `index`th state's, as `state * lift(factor) + weights @ values`, its row factor, weights and values; None
+    for a step of another form."""
+    args = get_callable_args(form, Term.binary)
+    if args is None or get_literal_value(args[1]) != "add":
+        return None
+    for scaled, added in ((args[0], args[2]), (args[2], args[0])):
+        product = get_callable_args(added, Term.dot)
+        times = get_callable_args(scaled, Term.binary)
+        if product is None or times is None or get_literal_value(times[1]) != "mul":
+            continue
+        for state, lifted in ((times[0], times[2]), (times[2], times[0])):
+            at = get_callable_args(state, Term.state)
+            lift = get_callable_args(lifted, Term.shaped)
+            slot = None if at is None else (int(get_literal_value(at[0])), int(get_literal_value(at[1])))
+            if slot == (index, 0) and lift is not None and get_literal_value(lift[1]) == "broadcast_in_dim":
+                return lift[0], product[0], product[1]
+    return None
 
 
 def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int],
@@ -553,13 +601,14 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     declared = Term.bundle(Vec[Term](*region.roots()))
     bundle = Term.bundle(Vec[Term](*roots) if roots else Vec[Term].empty())
     graph.register(declared, bundle)
-    timed = cost.model(cost.Device.of())
-    _, before = graph.extract(declared, include_cost=True, cost_model=timed, extractor="greedy-dag")
+    schedule = cost.walk(cost.target())
+    _, before = graph.extract(declared, include_cost=True, cost_model=cost.model(region, schedule),
+                              extractor="greedy-dag")
     facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
     _decoupled_through(graph, region, facts)
     saturated = program.saturate(graph, region, (*rules.admitted(accurate), DECOUPLED),
                                  saturation, facts)
-    chosen, after = program.extracted(graph, bundle, _priced(cost.Device.of()))
+    chosen, after = program.extracted(graph, bundle, _priced(region, schedule))
     if not math.isfinite(after.value):
         unwritten = next(root for root, form in zip(roots, chosen, strict=True) if not _written(form))
         raise Refused(f"no rule writes {unwritten} in the language: a walked reduction read other than by a "

@@ -35,6 +35,7 @@ import numpy as np
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.algebra.forms import derived_on
 from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
@@ -576,13 +577,14 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
                                      floor=hooks.floor, bound=hooks.inverse_bound, rounded=fast_rounding())
-            if kernel == 'derived':
-                return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
-                                    chunk_size=chunk_size, dtype=work)
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                 scale=scale, wide=epilogue, firsts=firsts)
+            if derived_on():
+                # Behind the switch, the portable math's forms derived from the token update.
+                return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
+                                    chunk_size=chunk_size, dtype=work)
             group = value.shape[2] // key.shape[2]
             if group > 1:
                 query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -749,22 +751,14 @@ port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
-DERIVED_SUPPORTS: tuple[Requirement[PortCase], ...] = (
-    Requirement('measured', lambda case: False,
-                "the forms derived from the token update (`derived_rule`), taken where a call names them: "
-                "held on par with the portable math by check 1 and not yet measured against it",
-                row=INHERENT, kind='measured'),
-)
-"""Where the derived forms run (`derived_rule`): a call that names them."""
-
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('derived', DERIVED_SUPPORTS),
-                                Kernel('xla', (), generic=True)),
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
 recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
-portable math; the forms derived from the token update (`derived_rule`) where a call names them."""
+portable math, whose forms are those derived from the token update behind the switch (`derived_rule`,
+`dew.algebra.forms.derived`)."""
 
 
 def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,

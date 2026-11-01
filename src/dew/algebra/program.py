@@ -258,7 +258,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     began = time.perf_counter()
     region = terms.region(closed)
     graph, bundle, roots = graphed(region)
-    priced = cost.model(cost.Device.of())
+    priced = cost.model(region, cost.fused(cost.target()))
     _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
     saturated = saturate(graph, region, rules.admitted(accurate), saturation)
     forms, after = extracted(graph, bundle, priced)

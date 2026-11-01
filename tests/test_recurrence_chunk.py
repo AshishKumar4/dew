@@ -21,6 +21,7 @@ from reference_error import (
     widened,
 )
 
+from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.precision import float32_einsum, l2norm
@@ -205,11 +206,16 @@ scan without the delta rule (Mamba2's SSD, the scan's own op)."""
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', DERIVED, ids=str)
 def test_the_derived_forms_are_as_exact_as_the_recurrence_token_by_token(hooks, packed):
-    """The forms derived from the token update (`recurrence_chunk.derived_rule`, `dew.algebra.scan`), named
-    for the rule, against the same recurrence a token at a time, output and final memory, on the portable
-    math's draws of one sequence or of packed documents, each document's first token its forms' reset (check
-    1): the accuracy check the derived forms are taken behind."""
-    dew = jax.jit(functools.partial(chunk_on, 'derived', hooks, chunk_size=CHUNK))
+    """The forms derived from the token update (`recurrence_chunk.derived_rule`, `dew.algebra.scan`), the
+    portable math's behind the switch (`dew.algebra.forms.derived`), against the same recurrence a token at
+    a time, output and final memory, on the portable math's draws of one sequence or of packed documents,
+    each document's first token its forms' reset (check 1): the accuracy check the derived forms are taken
+    behind."""
+    def derived(*args, **kwargs):
+        with algebra_forms.derived():
+            return chunk_on('xla', hooks, *args, chunk_size=CHUNK, **kwargs)
+
+    dew = jax.jit(derived)
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, lambda seed: draw(hooks, packed=packed, seed=seed), f'{hooks} derived',
                     seeds=SEEDS[hooks, packed])

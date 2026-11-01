@@ -44,6 +44,7 @@ from egglog import (
 )
 
 from dew.algebra import cost, forms, program, rules, terms
+from dew.algebra.cost import Work
 from dew.algebra.forms import Refused
 from dew.algebra.terms import Term
 
@@ -140,33 +141,39 @@ CARRIED = rules.Rules("carried", "reorders", _carried(), receipt="docs/design/al
 """The split's rules, never among the engine's sets (`rules.admitted`)."""
 
 
-@dataclasses.dataclass(frozen=True, order=True)
+@dataclasses.dataclass(frozen=True)
 class Priced:
-    """A carried form's price, compared in order: the seconds of its work that reads the state (once a chunk,
-    in sequence), then the seconds of the rest (every chunk's at once), each `cost.model`'s."""
+    """A carried form's price, compared in order: its work that reads the state (once a chunk, in sequence),
+    then the rest (every chunk's at once), each in seconds under the template's tile walk (`cost.walk`)."""
 
-    sequential: float
-    parallel: float
+    sequential: cost.Seconds
+    parallel: cost.Seconds
 
     def __add__(self, other: Priced) -> Priced:
         return Priced(self.sequential + other.sequential, self.parallel + other.parallel)
 
+    def __lt__(self, other: Priced) -> bool:
+        return (self.sequential.value, self.parallel.value) < (other.sequential.value, other.parallel.value)
 
-def _carry_priced(device: cost.Device) -> DagCostModel:
-    """`Priced` per node: its seconds (`cost.model`) sequential where an operand reads the state (the
-    e-classes the extractor hands the callback, which alone it may look up), parallel otherwise."""
-    timed = cost.model(device)
+    def __le__(self, other: Priced) -> bool:
+        return (self.sequential.value, self.parallel.value) <= (other.sequential.value, other.parallel.value)
+
+
+def _carry_priced(region: terms.Region, schedule) -> DagCostModel:
+    """`Priced` per node: its work (`cost.work`) sequential where an operand reads the state (the e-classes
+    the extractor hands the callback, which alone it may look up), parallel otherwise."""
+    none = cost.Seconds(Work(), schedule)
 
     def marginal(graph: EGraph, node) -> Priced:
-        seconds = timed.marginal_cost(graph, node).value
+        done = cost.Seconds(cost.work(graph, node, region), schedule)
         operands = next((args for constructor in terms.LANGUAGE
                          if (args := get_callable_args(node, constructor)) is not None), ())
         if any(isinstance(operand, Term) and graph.lookup_function_value(reads(operand)) is not None
                for operand in operands):
-            return Priced(seconds, 0.0)
-        return Priced(0.0, seconds)
+            return Priced(done, none)
+        return Priced(none, done)
 
-    return DagCostModel(marginal_cost=marginal, identity=Priced(0.0, 0.0))
+    return DagCostModel(marginal_cost=marginal, identity=Priced(none, none))
 
 
 class Split(NamedTuple):
@@ -207,9 +214,9 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     graph.register(sequential, others)
     facts = seq(rules.FACTS.saturate(), CARRYING.saturate())
     program.saturate(graph, region, (CARRIED,), saturation, facts)
-    device = cost.Device.of()
-    carry_forms, _ = program.extracted(graph, sequential, _carry_priced(device))
-    emit_forms, _ = program.extracted(graph, others, cost.model(device))
+    schedule = cost.walk(cost.target())
+    carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule))
+    emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule))
     prepared = list({str(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
     consts = list(closed.consts)

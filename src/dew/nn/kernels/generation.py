@@ -478,7 +478,7 @@ def capability(generation: str) -> tuple[int, int] | None:
 INTERPRETED_GENERATION = "sm90"
 """The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
 interpreted bundle's (`templates.bundles.INTERPRETED`, wgmma's); the algebra pass prices a CPU process's
-forms by its facts too (`dew.algebra.cost.Device`)."""
+forms by its facts too (`dew.algebra.cost.target`)."""
 
 
 def gpu_target(identifier: str | None = None) -> GpuTarget:
