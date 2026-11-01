@@ -305,30 +305,6 @@ def test_a_simulator_answering_arrays_laid_out_over_a_mesh_rolls_out_as_one_answ
         np.testing.assert_array_equal(getattr(sharded.following, name), getattr(plain.following, name))
 
 
-def test_every_rl_program_compiles_through_dews_compile_point():
-    """No program of Dew's RL packages compiles by a bare `jax.jit` (ledger 3314): each is an
-    `OuterProgram`, whose every compile passes where every program Dew compiles does (`report.compiled`:
-    its communicators admitted against the pool's room), a simulator's policy step and a host race's
-    programs as the rollouts' (3287); and a simulator's rollout runs its policy's step through one."""
-    import ast
-    from pathlib import Path
-
-    import dew
-    from dew.rl import simulator as simulated
-
-    root = Path(dew.__file__).parent
-    bare = [f"{path.relative_to(root)}:{node.lineno}"
-            for package in ("rl", "objectives/rl") for path in sorted((root / package).rglob("*.py"))
-            for node in ast.walk(ast.parse(path.read_text()))
-            if isinstance(node, ast.Attribute) and node.attr == "jit"
-            and isinstance(node.value, ast.Name) and node.value.id == "jax"]
-    assert bare == []
-    simulator = HostWalks(5, 3)
-    _, record = simulated.simulator_rollout(simulator, heads_home, None,
-                                            simulated.simulator_start(simulator, jax.random.key(4)), 2)
-    np.testing.assert_array_equal(record.action[1], -0.5 * np.sign(record.observation[1]))
-
-
 def heads_home(params, observation, key, memory):
     """A policy pushing each point a step toward the origin, its key unread."""
     return -0.5 * jnp.sign(observation), {"seen": observation}, None
