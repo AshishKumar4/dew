@@ -259,42 +259,7 @@ def _memory_stages(
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0], rule)
         elif isinstance(stage, Pack):
-            from dew.data.packing import _Held, _PackedRows, refuse_overlong
-
-            derived[f"accepted_before_pack_{consumed - placed}"] = fingerprint(
-                [list(identifier) for identifier, _ in rows]
-            )
-            rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
-            marked = any(isinstance(value, Mapping) and CONSUMED in value for _, value in rows)
-            stage, documents = _documents(stage, rows, marked=marked)
-            sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
-            refuse_overlong(sizes, stage, source.describe())
-            if stage.policy == "first-fit" and not stage.along:
-                # The plan and windows reader of an indexed read of documents that state
-                # their lengths (`PackedSource.planned`): it reads the windows that hold a
-                # target, and the plan counts the rest as zero_targets.
-                plan = _Held(_Memory(source, documents, sizes, {}), stage)
-                planned = plan.arrays
-                derived["packing"] = fingerprint([planned["order"].tolist(), planned["starts"].tolist()])
-                packed = _PackedRows(documents, plan)
-                counter.rejected.update(["zero_targets"] * plan.at("totals", 1))
-                # The plan counts every target a window holds; windows of documents counted by a
-                # rule are counted by it (`_targeted`), as an indexed or streamed read's are. A window the
-                # plan leaves out passes the examples its documents end to the next it keeps (`_owed`).
-                owed = _owed(planned, documents) if marked else None
-                rows, targets = _targeted([((plan.at("accepted", index),), packed[index] if owed is None
-                                            else _credited(packed[index], owed[index]))
-                                           for index in range(len(packed))], counter, stage.fields[0], rule)
-            else:
-                # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
-                # the corpus as an indexed read streams it (`_packed`).
-                packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
-                derived["packing"] = fingerprint(sizes)
-                rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
-                                          stage.fields[0], rule)
-            ids = f"{stage.fields[0]}_segment_ids"
-            documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
-                             for _, value in rows), default=0)
+            rows, targets, documents = _memory_pack(stage, rows, source, counter, derived, consumed - placed)
         else:
             if isinstance(stage, FlatMap) and stage.examples and examples is None:
                 # The corpus counts its source examples, so its counts are taken here, before an
@@ -331,6 +296,48 @@ def _memory_stages(
                          counted=counted)
 
 
+def _memory_pack(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], source: Source,
+                 counter: CorpusCounts, derived: dict[str, str], at: int,
+                 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int] | None, int]:
+    """A memory read's windows of `rows` as `stage`, the `at`-th stage the chain wrote, packs them, their
+    targets' counts, and the most documents a window holds; the plan's facts go into `derived`."""
+    from dew.data.packing import _Held, _PackedRows, refuse_overlong
+
+    derived[f"accepted_before_pack_{at}"] = fingerprint([list(identifier) for identifier, _ in rows])
+    rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
+    marked = any(isinstance(value, Mapping) and CONSUMED in value for _, value in rows)
+    stage, documents = _documents(stage, rows, marked=marked)
+    sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
+    refuse_overlong(sizes, stage, source.describe())
+    if stage.policy == "first-fit" and not stage.along:
+        # The plan and windows reader of an indexed read of documents that state
+        # their lengths (`PackedSource.planned`): it reads the windows that hold a
+        # target, and the plan counts the rest as zero_targets.
+        plan = _Held(_Memory(source, documents, sizes, {}), stage)
+        planned = plan.arrays
+        derived["packing"] = fingerprint([planned["order"].tolist(), planned["starts"].tolist()])
+        packed = _PackedRows(documents, plan)
+        counter.rejected.update(["zero_targets"] * plan.at("totals", 1))
+        # The plan counts every target a window holds; windows of documents counted by a
+        # rule are counted by it (`_targeted`), as an indexed or streamed read's are. A window the
+        # plan leaves out passes the examples its documents end to the next it keeps (`_owed`).
+        owed = _owed(planned, documents) if marked else None
+        rows, targets = _targeted([((plan.at("accepted", index),), packed[index] if owed is None
+                                    else _credited(packed[index], owed[index]))
+                                   for index in range(len(packed))], counter, stage.fields[0], rule)
+    else:
+        # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
+        # the corpus as an indexed read streams it (`_packed`).
+        packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
+        derived["packing"] = fingerprint(sizes)
+        rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
+                                  stage.fields[0], rule)
+    ids = f"{stage.fields[0]}_segment_ids"
+    most = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0)) for _, value in rows),
+               default=0)
+    return rows, targets, most
+
+
 def _limited(pipeline: Pipeline, at: int, rows: list[tuple[tuple[int, ...], Record]],
              cycled: list[tuple[tuple[int, ...], Record]] | None,
              ) -> tuple[list[tuple[tuple[int, ...], Record]], Pipeline]:
@@ -352,7 +359,7 @@ def _limited(pipeline: Pipeline, at: int, rows: list[tuple[tuple[int, ...], Reco
     return passes[:count], pipeline
 
 
-def _owed(planned: Mapping[str, np.ndarray], documents: Sequence[Record]) -> list[int]:
+def _owed(planned: Mapping[str, np.ndarray], documents: Sequence[Batch]) -> list[int]:
     """For each window a first-fit plan keeps (`accepted`), the examples ended by the documents of the
     windows it leaves out before it (`order`, `starts`), the last kept also owed those of the windows it
     leaves out after every kept one, so the kept windows consume every example, each owed one refused
@@ -375,7 +382,7 @@ def _owed(planned: Mapping[str, np.ndarray], documents: Sequence[Record]) -> lis
     return owed
 
 
-def _credited(window: Record, owed: int) -> Record:
+def _credited(window: Batch, owed: int) -> Batch:
     """`window` owed `owed` more examples, each refused (`_owed`, `Owed`), at its last token, which its
     sums take (`_targeted`)."""
     if not owed:

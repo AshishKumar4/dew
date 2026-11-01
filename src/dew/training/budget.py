@@ -44,8 +44,8 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
         return loader.example_steps(examples, accumulation)
     if epochs is None:
         return steps
-    if loader.records is None and loader.epochs is not None:
-        # A read with no record count, bounded to passes over its source examples (`fitted`).
+    if loader.records is None and loader.epochs is not None and loader.examples is not None:
+        # A read with no record count, bounded to `examples`, its passes over its source examples (`fitted`).
         if loader.epochs != epochs:
             raise ValueError(f"this data was compiled for a run of {loader.epochs} epochs, bounded to its "
                              f"{loader.examples} examples, and the run asks for {epochs}: give the run the "
