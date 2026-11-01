@@ -1,6 +1,6 @@
 """A corpus's `data/rows` counts its source examples where an objective makes several rows of each, whatever
-rows its step makes of them or windows its pack lays them in (`CorpusCounts.examples`), and `data/truncated`
-and the cut counters are those of the examples, not of the windows that hold none of their records' fields
+rows its step makes of them or windows its pack lays them in, counted in the reading process as each
+delivered row says (`CorpusCounts.examples`): read by workers, after every batch, and across a saved position
 (row 1890)."""
 
 import numpy as np
@@ -73,11 +73,9 @@ def test_a_corpus_counts_its_source_examples_whatever_windows_a_pack_lays_their_
     assert counted(loader) == [23]
 
 
-def test_a_decision_corpus_counts_its_source_examples_and_the_cuts_of_each():
+def test_a_decision_corpus_counts_its_source_examples():
     """A decision run's examples, two questions each, cut by a window too short for their states: the
-    corpus counts every example it delivered, every one of them cut, as `data/rows` and
-    `data/truncated`, whatever windows its rows were packed into, as the counters before the pack
-    count them and the pack's, which sees no cut, does not."""
+    corpus counts every example it delivered as `data/rows`, whatever windows its rows were packed into."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
     from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
@@ -90,8 +88,45 @@ def test_a_decision_corpus_counts_its_source_examples_and_the_cuts_of_each():
     records = [{"example": Example(f"state {index} " + "long " * 150, asked, answers)} for index in range(10)]
     loader = compile(Pipeline(Memory(records)).pipe(decisions).batch(BATCH), read="memory",
                      objective=objective.data(), examples=23)
-    windows, consumed = read_whole(loader, "segments")
+    _, consumed = read_whole(loader, "segments")
     assert consumed == 23
     assert counted(loader) == [23]
-    assert counted(loader, "data/truncated/") == [1.0], windows
-    assert 23 in counted(loader, "data/cut_examples/")
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_each_batch_states_the_source_examples_read_by_then_and_a_resumed_read_goes_on_from_them(workers):
+    """Fifteen examples, each made one to three rows of, read eight rows a batch by `workers` loading
+    workers: after each batch the corpus states the source examples whose rows it delivered by then, the
+    sum of what those batches consume; a read resumed from a position saved after the second batch states
+    the same counts after each later batch as the read it was saved from."""
+    ids = np.arange(1, 16, dtype=np.int32)
+    loading = Loading(workers=workers)
+
+    def stream():
+        loader = compile(Pipeline(Memory({"id": ids})).batch(BATCH), read="streamed",
+                         objective=ObjectiveData(train=(Questioned(),)), examples=15, loading=loading)
+        return loader, loader.train(DataPartition())
+
+    def stated(loader) -> int:
+        return int(counted(loader)[0]) if counted(loader) else 0
+
+    loader, whole = stream()
+    seen, consumed, saved = [], 0, None
+    try:
+        for index, batch in enumerate(whole):
+            consumed += int(np.sum(batch.get(EXAMPLES_CONSUMED, 0)))
+            seen.append((consumed, stated(loader)))
+            if index == 1:
+                saved = whole.get_state()
+    finally:
+        if isinstance(whole, Closeable):
+            whole.close()
+    assert [stated_then for _, stated_then in seen] == [consumed_then for consumed_then, _ in seen]
+    resumed_loader, resumed = stream()
+    resumed.set_state(saved)
+    try:
+        assert [stated(resumed_loader) for _ in resumed] == [stated_then for _, stated_then in seen[2:]]
+    finally:
+        if isinstance(resumed, Closeable):
+            resumed.close()
+
