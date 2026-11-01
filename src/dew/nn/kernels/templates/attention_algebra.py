@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.algebra import derive
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import (
     LOG2E,
@@ -48,6 +49,7 @@ from dew.nn.precision import (
     added_to,
     compensated_sum,
     compensates_loops,
+    float32_einsum,
     running_sum,
     running_total,
     two_product,
@@ -2243,3 +2245,60 @@ def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: b
     if dropped:
         return narrowed(exponentials, dtype)
     return exponentials.astype(dtype).astype(jnp.float32)
+
+
+def softmax_of(logits: jax.Array, seen: jax.Array, values: jax.Array, *, base2: bool) -> jax.Array:
+    """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
+    query's softmax over the keys it sees of its `logits` `[rows, keys]` (scaled, in the exponent's base),
+    its weights' sum of the `values` `[keys, width]` over their total, Dew's product (`float32_einsum`); a
+    query that sees no key, zeros (its weights selected away, whatever its maximum's)."""
+    exponent = jnp.exp2 if base2 else jnp.exp
+    s = jnp.where(seen, logits, -jnp.inf)
+    m = jnp.max(s, axis=-1)
+    p = jnp.where(seen, exponent(s - m[:, None]), 0.0)
+    total = jnp.sum(p, axis=-1)
+    return float32_einsum("qk,kd->qd", p, values) / jnp.where(total == 0, 1.0, total)[:, None]
+
+
+def declaration(*, base2: bool):
+    """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
+    template's formed tiles, walked along the keys, its exponent the base the template folds
+    (`folds`: 2 where it folds `log2(e)` into its logits). Its derived forms stand beside this module's
+    (`peak`, `stepped`, `merge`, `finish`), which they replace only on par with them against float64 and
+    no slower in the kernel (docs/design/algebra.md)."""
+    axes = {"logits": ("rows", "keys"), "seen": ("rows", "keys"), "values": ("keys", "width")}
+    return derive.Reduction(functools.partial(softmax_of, base2=base2), axes, walked="keys",
+                            exponent=2 if base2 else "e")
+
+
+def softmax_gradients(q, k, values, dout, peak, total, delta, seen, *, scale: float):
+    """Attention's gradients from its residuals, whole (theme A's backward declaration,
+    `backward_declaration`): each query's weights recomputed from its maximum `peak` and denominator `total`
+    over the keys it sees (`seen`), the forward's own rows (a log-sum-exp rounds `log(total)` into a value
+    as large as the logits, its weights' error that much larger), its score cotangents `p (dO Vᵀ - delta)`
+    with `delta` its rowsum(dO O), and the queries', keys' and values' gradients their products at `scale`,
+    each product Dew's (`float32_einsum`, a template's every product). The rows are natural whatever base
+    the forward walked (`finished_rows`), so the backward's exponent is `e`; each exponent at most 0, a
+    logit past the forward's maximum by the rounding the two passes do not share the maximum itself
+    (`below`: unclamped, a causal dV walked queries first erred 1.62 times the template's against
+    float64, its early keys' rows' largest weights past 1); a query that sees no key, zeros (its weights
+    selected away, over a denominator of 1)."""
+    s = float32_einsum("qd,kd->qk", q, k) * scale
+    over = jnp.where(total == 0, 1.0, total)
+    p = jnp.where(seen, jnp.exp(jnp.minimum(s - peak[:, None], 0.0)), 0.0) / over[:, None]
+    ds = p * (float32_einsum("qd,kd->qk", dout, values) - delta[:, None])
+    return (float32_einsum("qk,kd->qd", ds, k) * scale, float32_einsum("qk,qd->kd", ds, q) * scale,
+            float32_einsum("qk,qd->kd", p, dout))
+
+
+def backward_declaration(*, scale: float, walked: str):
+    """Attention's backward as theme A's declaration (`softmax_gradients`), walked over its key tiles
+    (`walked="keys"`, queries first: dQ the walk's sum, dK and dV each tile's own) or its query tiles
+    (`"rows"`, keys first: dK and dV the walk's sums, dQ each tile's own), from the forward's natural
+    residual rows."""
+    axes = {"q": ("rows", "width"), "k": ("keys", "width"), "values": ("keys", "values"),
+            "dout": ("rows", "values"), "peak": ("rows",), "total": ("rows",), "delta": ("rows",),
+            "seen": ("rows", "keys")}
+    return derive.Reduction(functools.partial(softmax_gradients, scale=scale), axes, walked=walked,
+                            exponent="e")
+
