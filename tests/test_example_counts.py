@@ -278,12 +278,14 @@ class Cut:
 @pytest.mark.parametrize("bounded", [True, False])
 def test_a_corpus_states_the_share_of_its_rows_cut_short_in_rows(bounded):
     """Twelve examples an objective makes 1 to 3 rows of each, every row cut short, read bounded to them
-    or not: the share of the corpus's rows cut short (data/truncated) is a share of the rows it delivered,
+    or once: the share of the corpus's rows cut short (data/truncated) is a share of the rows it delivered,
     all of them, 1.0, and the tokens its cuts removed are its 24 rows' two each, wherever it counts its
     source examples, one per example's last row or one per example before the step (row 1890's
     review)."""
     ids = np.arange(1, 13, dtype=np.int32)
-    loader = compile(Pipeline(Memory({"id": ids}, shard_rows=4)).batch(BATCH), read="streamed",
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4))
+    # Unbounded, a training read repeats without end: it is read once.
+    loader = compile((chain if bounded else chain.repeat(1)).batch(BATCH), read="streamed",
                      objective=ObjectiveData(train=(Cut(),)), examples=12 if bounded else None)
     read_whole(loader, "question")
     assert counted(loader) == [12]
