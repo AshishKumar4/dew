@@ -115,24 +115,6 @@ def test_one_recurrent_step_matches_selective_state_update(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "step")
 
 
-def test_the_chunked_and_recurrent_forms_agree(reference):
-    initial = jnp.asarray(reference["scan.initial"])
-    chunked = chunk_ssd(*operands(reference), initial, 32)
-    recurrent = recurrent_ssd(*operands(reference), initial)
-    as_exact(recurrent, chunked, in_float64(chunk_ssd, *operands(reference), initial, 32), "recurrent")
-
-
-def test_a_sequence_split_in_two_carries_its_state_across_the_cut(reference):
-    """Chunk boundaries that do not line up with the cut: 70 tokens as 30
-    then 40 at a chunk of 32, the second half from the first's final state."""
-    x, step, A, B, C, D = operands(reference)
-    whole = chunk_ssd(x, step, A, B, C, D, None, 32)
-    head, carried = chunk_ssd(x[:, :30], step[:, :30], A, B[:, :30], C[:, :30], D, None, 32)
-    tail, tail_final = chunk_ssd(x[:, 30:], step[:, 30:], A, B[:, 30:], C[:, 30:], D, carried, 32)
-    as_exact((jnp.concatenate([head, tail], axis=1), tail_final), whole,
-             in_float64(chunk_ssd, x, step, A, B, C, D, None, 32), "the cut sequence")
-
-
 CHUNK_SIZE_SEEDS = 64
 """Sized by seeds_for against the 32-token XLA chunk scan (2026-10-20, armada)."""
 
@@ -142,6 +124,32 @@ def chunk_size_draw(seed):
     arrays = mamba2_draw(seed)
     arrays["dt"] = jax.nn.softplus(jnp.asarray(arrays["dt"]) + jnp.asarray(arrays["dt_bias"]))
     return tuple(arrays[name] for name in ("x", "dt", "A", "B", "C", "D"))
+
+
+FORMS_SEEDS = 64
+"""The declared draws of the recurrent and cut forms against the 32-token XLA chunk scan (check 1), its
+chunk size's (`CHUNK_SIZE_SEEDS`): the same scan as the reference on the same draws."""
+
+
+def test_the_chunked_and_recurrent_forms_agree():
+    """The scan token by token against the chunked scan from a carried state (check 1)."""
+    def draw(seed):
+        return (*chunk_size_draw(seed), jnp.asarray(mamba2_draw(seed)["h0"]))
+
+    assert_as_exact(jax.jit(recurrent_ssd), jax.jit(lambda *inputs: chunk_ssd(*inputs, 32)), draw,
+                    "the recurrent form", seeds=FORMS_SEEDS)
+
+
+def test_a_sequence_split_in_two_carries_its_state_across_the_cut():
+    """Chunk boundaries that do not line up with the cut: 70 tokens as 30 then 40 at a chunk of 32, the
+    second half from the first's final state, against the whole sequence's scan (check 1)."""
+    def cut(x, step, A, B, C, D):
+        head, carried = chunk_ssd(x[:, :30], step[:, :30], A, B[:, :30], C[:, :30], D, None, 32)
+        tail, final = chunk_ssd(x[:, 30:], step[:, 30:], A, B[:, 30:], C[:, 30:], D, carried, 32)
+        return jnp.concatenate([head, tail], axis=1), final
+
+    assert_as_exact(jax.jit(cut), jax.jit(lambda *inputs: chunk_ssd(*inputs, None, 32)), chunk_size_draw,
+                    "the cut sequence", seeds=FORMS_SEEDS)
 
 
 def test_the_chunk_size_does_not_change_the_scan():
