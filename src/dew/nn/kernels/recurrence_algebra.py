@@ -979,16 +979,17 @@ def key_memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, gates:
 def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower: Tile, betas, dtype,
                     issue: Issue, *, emit: Callable[[int, jax.Array], None]) -> tuple[jax.Array, jax.Array]:
     """The values' part of `key_memory_gradients`: through `u = (I + L) (v beta)`, each value block `j`'s
-    `d(v beta) = (I + L)^T du` ('merge') of the corrected values' gradient `value_grads(j)`, its values'
-    gradient `beta d(v beta)` `[C, BV]` fp32 to `emit(j, dv)`, and `(dA, dbeta)`, the inverse's gradient's
-    part `du (v beta)^T` `[C, C]` and the write gates' `sum(v d(v beta))`, fp32."""
+    `d(v beta) = (I + L)^T du` ('values_merge') of the corrected values' gradient `value_grads(j)`, its
+    values' gradient `beta d(v beta)` `[C, BV]` fp32 to `emit(j, dv)`, and `(dA, dbeta)`, the inverse's
+    gradient's part `du (v beta)^T` `[C, C]` and the write gates' `sum(v d(v beta))`, fp32."""
     d_system = jnp.zeros((lower.shape[0],) * 2, jnp.float32)
     d_betas = jnp.zeros(betas.shape, jnp.float32)
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
         scaled = Transposed((value * betas[:, None]).astype(dtype))
-        d_system = d_system + issue("merge", value_grads(j), scaled)
-        d_scaled = value_grads(j).value().astype(jnp.float32) + issue("merge", lower.T, value_grads(j))
+        d_system = d_system + issue("values_merge", value_grads(j), scaled)
+        d_scaled = (value_grads(j).value().astype(jnp.float32)
+                    + issue("values_merge", lower.T, value_grads(j)))
         d_betas = d_betas + jnp.sum(d_scaled * value, axis=1)
         emit(j, d_scaled * betas[:, None])
     return d_system, d_betas
@@ -1002,10 +1003,10 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     prefix halves from the chunk's start `gates` `[C, BK]` and the chunk's last token's `last` as a row's
     vectors, and each value block `j`'s memory entered `entered(j)` and its gradient leaving `leaving(j)`
     `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the
-    weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw') and the memory decay's `sum(h dh)`; then
-    `d(kg beta) = (I + L)^T dw` ('merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log decay's terms
-    `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's on its last token (`sum(h dh) exp2(g_last)
-    + sum(k dk)`), and `(dA, dbeta)`, the inverse's gradient's part `dw (kg beta)^T` `[C, C]` and the write
+    weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw') and the memory decay's `sum(h dh)`;
+    then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log
+    decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's on its last token
+    (`sum(h dh) exp2(g_last) + sum(k dk)`), and `(dA, dbeta)`, the inverse's gradient's part `dw (kg beta)^T` `[C, C]` and the write
     gates' `sum(kg d(kg beta))`, fp32."""
     decays = raised(*gates)
     to_last = range_decay(*(half[None, :] for half in last), *gates)
@@ -1021,8 +1022,9 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     keys = key.value().astype(jnp.float32)
     gated = keys * decays
     # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`.
-    d_gated = -(d_weight + issue("merge", lower.T, d_weight.astype(dtype)))
-    d_system = -issue("merge", d_weight.astype(dtype), Transposed((gated * betas[:, None]).astype(dtype)))
+    d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
+    gated_rows = Transposed((gated * betas[:, None]).astype(dtype))
+    d_system = -issue("weights_merge", d_weight.astype(dtype), gated_rows)
     rows, _ = _grid(d_query.shape)
     # The chunk's last prefix's terms on its last token: the memory's decay across the chunk, and the gated
     # keys' `exp2(g_last - g)` every token's.
@@ -1037,11 +1039,11 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
 def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
     """The keys' system's gradient `[C, C]` fp32 of a chunk's from its inverse's `d_system` (`I + L`, `L`
     `lower`): `-(I + L)^T dA (I + L)^T`, strictly lower, each side's identity outside its product
-    ('merge'), as fla_kda's wy_dqkg forms its `dA`."""
+    ('system_merge'), as fla_kda's wy_dqkg forms its `dA`."""
     lag = _lags(d_system.shape)
     d_system = jnp.where(lag > 0, d_system, 0.0)
-    right = d_system + issue("merge", d_system.astype(dtype), lower.T)
-    return jnp.where(lag > 0, -(right + issue("merge", lower.T, right.astype(dtype))), 0.0)
+    right = d_system + issue("system_merge", d_system.astype(dtype), lower.T)
+    return jnp.where(lag > 0, -(right + issue("system_merge", lower.T, right.astype(dtype))), 0.0)
 
 
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
