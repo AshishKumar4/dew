@@ -5,6 +5,7 @@ here, and runs on one in the GPU gate."""
 
 import dataclasses
 import functools
+import types
 
 import jax
 import jax.numpy as jnp
@@ -261,3 +262,49 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
     assert small is not None and (small[0].programs, small[0].stages) == (2, min(8, share // (16 * 1024)))
     assert wide is not None and wide[0].programs == (2 if share >= 2 * 40 * 1024 else 1)
     assert past is None
+
+
+ISSUED = 64
+
+
+def _issued_sums(a, b, c, d, exponent, *, retired: bool):
+    """`restored(a @ b, exponent) + c @ d` through one prepared-operand issuer (`operands.Issuer.summed`) on
+    warpgroup MMA, interpreted: `a` a scaled register operand (`product.Scaled`), its product in an
+    accumulator of its own and restored by `2**exponent`, `c` a plain register operand, each staged into its
+    product's buffer, `b` and `d` shared tiles (`operands.Parts`); `retired`, each product done before the
+    next is formed."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands, product
+
+    family = mosaic_sm90.WGMMA
+    tile = ((ISSUED, ISSUED), jnp.bfloat16)
+    call = types.SimpleNamespace(family=family, interpret=True)
+
+    def body(a_gmem, b_gmem, c_gmem, d_gmem, exponent_gmem, out_gmem):
+        def scoped(staged, b_smem, d_smem):
+            b_smem[...], d_smem[...] = b_gmem[...], d_gmem[...]
+            issuer = operands.Issuer(call, {"scaled": (staged,), "plain": (staged,)},
+                                     restored=lambda value, k: value * jnp.exp2(k.astype(jnp.float32)))
+            products = iter([("scaled", product.Scaled(a_gmem[...], exponent_gmem[0]),
+                              operands.Parts((b_smem,), jnp.bfloat16)),
+                             ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16))])
+            out_gmem[...] = issuer.summed(products, retired=retired)
+
+        pl.run_scoped(scoped, *(plgpu.SMEM(*tile) for _ in range(3)))
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=True, name="issued")(a, b, c, d, exponent)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("retired", [False, True])
+def test_a_scaled_operands_product_is_summed_apart_and_restored(retired):
+    """Interpreted: a scaled operand's product restored by its power of two and a plain one's, summed by one
+    issuer, the plain product staged into the same buffer the scaled one's operand used: exactly
+    `2**k a @ b + c @ d`, products retired one at a time or not."""
+    keys = jax.random.split(jax.random.key(2), 4)
+    a, b, c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
+    exponent = jnp.array([3], jnp.int32)
+    summed = _issued_sums(a, b, c, d, exponent, retired=retired)
+    f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
+    np.testing.assert_array_equal(np.asarray(summed), 8 * f32[0] @ f32[1] + f32[2] @ f32[3])

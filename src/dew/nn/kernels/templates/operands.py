@@ -6,7 +6,7 @@ template's own parts move onto it."""
 
 import functools
 import itertools
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Protocol, cast
 
 import jax
@@ -62,10 +62,12 @@ class Issuer:
     buffers are a count takes a register left operand in that many parts as they are, staged nowhere, on a
     family whose products read their operands from registers (`Family.operands_in_registers`,
     `register_operand`). Operands of three parts issue the products whose parts' orders sum under three,
-    smallest first; of two, under two."""
+    smallest first; of two, under two. A scaled operand (`product.Scaled`) takes its product into an
+    accumulator of its own, restored by the algebra's `restored(value, exponent)` (attention's exact
+    power of two)."""
 
-    def __init__(self, call: Issuing, buffers: dict | None = None):
-        self.call, self.buffers = call, buffers or {}
+    def __init__(self, call: Issuing, buffers: dict | None = None, restored: Callable | None = None):
+        self.call, self.buffers, self.restored = call, buffers or {}, restored
         # By product name: each set's value (held, so its identity stays its own) and its last use.
         self.held: dict = {}
 
@@ -110,27 +112,59 @@ class Issuer:
             read.append(buffer)
         return self.call.family.staged(value, buffer)
 
-    def summed(self, products: Iterable, shape: tuple[int, int] | None = None) -> jax.Array:
+    def summed(self, products: Iterable, shape: tuple[int, int] | None = None, *,
+               retired: bool = False) -> jax.Array:
         """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
         accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
         attention's output, `algebra.key_decayed_output`). Each product's operands are staged as it is
-        issued, so `products` may form them one at a time (`algebra.key_decayed_pairs`), a staging into a
-        tile an issued product may still read waiting for the products in flight first
-        (`Family.settled`). An operand may be a callable forming it then, where `shape`, the sum's, is
-        given."""
+        issued, so `products` may form them one at a time (`algebra.key_decayed_pairs`, attention's parts), a
+        staging into a tile an issued product may still read waiting for the products in flight first
+        (`Family.settled`); `retired`, each product done before the next is formed, so a register operand's
+        registers are free again (attention's parts, formed a part at a time). A product of a scaled operand
+        (`product.Scaled`) takes an accumulator of its own and is restored (`restored`), the unscaled
+        products before and after it each summed in one. An operand may be a callable forming it then, where
+        `shape`, the sum's, is given."""
         products = iter(products)
         first = next(products)
         family, interpret = self.call.family, self.call.interpret
+        shape = (first[1].shape[0], first[2].shape[1]) if shape is None else shape
+        held: list = [first]  # the next product not yet issued, where a group stopped before it
 
-        def issued(acc):
+        def group(acc, alone: bool):
+            # Products into `acc` until a scaled one (left held for its own group), or the one scaled
+            # product alone.
             read: list = []
-            for name, lhs, rhs in itertools.chain([first], products):
+            while held:
+                name, lhs, rhs = held[-1]
+                if isinstance(lhs, product.Scaled):
+                    if not alone:
+                        return acc
+                    lhs = lhs.value
+                held.pop()
                 left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
                 acc = family.issued(acc, left, right, interpret)
+                if retired:
+                    family.settled(0)
+                held.extend(itertools.islice(products, 1))
+                if alone:
+                    return acc
             return acc
 
-        shape = (first[1].shape[0], first[2].shape[1]) if shape is None else shape
-        return family.summed(shape, issued, interpret)
+        def summed_group() -> jax.Array:
+            # The group at the held product: a scaled product's own accumulator, restored, or the unscaled
+            # products from it to the next scaled one in one.
+            scaled = held[-1][1] if isinstance(held[-1][1], product.Scaled) else None
+            part = family.summed(shape, lambda acc: group(acc, scaled is not None), interpret)
+            if scaled is None:
+                return part
+            if self.restored is None:
+                raise ValueError("a scaled operand's product needs the algebra's restore (`restored`)")
+            return self.restored(part, scaled.exponent)
+
+        total = summed_group()
+        while held:
+            total = total + summed_group()
+        return total
 
     def _registered(self, name: str, lhs) -> tuple | None:
         """`lhs`'s parts in registers where its product takes it there (its buffers a count, `Issuer`'s),
