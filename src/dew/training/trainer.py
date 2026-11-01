@@ -1204,7 +1204,7 @@ class Trainer(Generic[Loss, Effects]):
             stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
                                      batch_consumed(micro))
             return (apart(stepped)[0], *rest)
-        # The algebra pass rewrites the step, its backward included, where it is jitted (algebra.md §6.7).
+
         return jax.jit(algebra.rewritten(step), in_shardings=(moving, frozen, placement, replicated),
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
@@ -2484,8 +2484,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
-        it until the run's cleanup waits for them and its outcome reports the window
-        (`_reported_outcome`)."""
+        it until the run's cleanup waits for them and its outcome reports the window (`_reported_outcome`)."""
         stop_capture(profiler, run.loss)
         run.profiled = (run.traced, run.current)
 
