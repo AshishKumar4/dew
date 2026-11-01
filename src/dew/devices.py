@@ -204,9 +204,35 @@ def divide_exactly() -> None:
     _gpu_default("xla_backend_extra_options", "--xla_backend_extra_options=-nvptx-prec-divf32=2")
 
 
+POOL_NAMES = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE",
+              "XLA_PYTHON_CLIENT_ALLOCATOR")
+"""The environment variables a run names its GPU pool by."""
+
+DEW_SHARE, JAX_SHARE = 0.95, 0.75
+"""The share of each GPU XLA's pool takes as Dew prepares a process (`preallocate_gpu_pool`), and as JAX
+takes it where a run names preallocation or the allocator without a fraction (docs.jax.dev,
+gpu_memory_allocation)."""
+
+
+def pool_bound(*, cuda: bool) -> float | None:
+    """The share of each GPU XLA's pool takes as this run names it, which Dew may size it below and never
+    above (`dew.communicators`): its fraction where it names one; Dew's own where it names nothing
+    (`preallocate_gpu_pool`); JAX's where it names preallocation or the allocator without one. None where
+    the pool holds no fixed share: a process off CUDA, a pool that grows
+    (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) or another allocator than XLA's own (`platform`)."""
+    allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
+    growing = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "true").lower() in ("false", "0")
+    if not cuda or growing or allocator not in ("default", "bfc"):
+        return None
+    named = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")
+    if named is not None:
+        return float(named)
+    return JAX_SHARE if any(name in os.environ for name in POOL_NAMES) else DEW_SHARE
+
+
 def preallocate_gpu_pool() -> None:
-    """Preallocate 95% of each GPU as XLA's pool for a training process,
-    unless the run named its pool (fraction, preallocation or allocator).
+    """Preallocate 95% of each GPU (`DEW_SHARE`) as XLA's pool for a training process,
+    unless the run named its pool (fraction, preallocation or allocator, `POOL_NAMES`).
 
     A pool that grows takes a step's temporaries only in a new region from
     the part of its limit it has not taken (`dew.training.memory.placeable`),
@@ -222,9 +248,8 @@ def preallocate_gpu_pool() -> None:
     which its backend has already taken, and shares its GPU as that program chose."""
     if backend_open():
         return
-    named = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
-    if cuda_plugin() and not any(name in os.environ for name in named):
-        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+    if cuda_plugin() and not any(name in os.environ for name in POOL_NAMES):
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(DEW_SHARE)
 
 
 def cuda_builds() -> list[str]:
@@ -431,6 +456,15 @@ def gpu_name(ordinal: int) -> str | None:
     if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
         return None
     return None if cuda.cuDeviceGetName(name, len(name), device) else name.value.decode()
+
+
+def gpu_place(ordinal: int) -> str | None:
+    """The visible GPU `ordinal`'s PCI bus id, as the CUDA driver reports it (`0000:18:00.0`): where it sits,
+    which its links to the other GPUs follow."""
+    cuda, device, place = _driver(), ctypes.c_int(), ctypes.create_string_buffer(32)
+    if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
+        return None
+    return None if cuda.cuDeviceGetPCIBusId(place, len(place), device) else place.value.decode()
 
 
 def nccl_version() -> int | None:

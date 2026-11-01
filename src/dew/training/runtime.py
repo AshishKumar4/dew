@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import jax
 from jax.experimental import multihost_utils
 
+from dew import communicators
 from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.cache import enable_compilation_cache, persist_compilations
 from dew.devices import (
@@ -45,7 +46,6 @@ from dew.pool import (
     runs_on_gpu,
     slurm_tasks_here,
 )
-from dew.training.communicators import sized_pool
 
 _log = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
                      compilation_cache_dir: str | None, multi_host: bool | None = None) -> None:
     """The env vars wandb and the tokenizers read, the run's XLA flags and
     Dew's defaults beside them, the GPU pool's share sized to leave its
-    communicators room (`dew.training.communicators`, a process of one host
+    communicators room (`dew.communicators`, a process of one host
     alone), and the compilation cache: everything read before a backend opens."""
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
@@ -162,8 +162,8 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
                      "whose XLA may have parsed its flags since: they are unproven. Set XLA_FLAGS before "
                      "the process starts, as `dew train` does, to make them certain", xla_flags)
     preallocate_gpu_pool()
-    if not backend_open() and not joins_pool(multi_host, pool_cluster(multi_host)):
-        sized_pool()
+    if not joins_pool(multi_host, pool_cluster(multi_host)):
+        communicators.hold(communicators.sized_pool())
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 

@@ -195,7 +195,7 @@ XLA preallocates a share of each GPU's memory as its pool. A step's collectives 
 
 On a host of two or more GPUs, before the backend opens, `prepare_process` sizes the pool to leave the communicators their room at NCCL's full speed:
 
-1. A child process (`python -m dew.training.communicators`) creates a communicator of each kind over each group size that divides the host's GPUs. It reports the bytes each one took, and the bytes the runtime took beside its pool.
+1. A child process (`python -m dew.communicators`) creates a communicator of each kind over each group size that divides the host's GPUs. It reports the bytes each one took, and the bytes the runtime took beside its pool.
 2. The answer is kept in Dew's cache under `communicators/`, keyed by the GPUs' names, the driver, NCCL's version and every `NCCL_*` setting. A host pays for the measurement once per configuration.
 3. The pool takes your `XLA_PYTHON_CLIENT_MEM_FRACTION` (95% if you name none) as an upper bound. It shrinks below that bound only as far as it must to leave the room for a collective's communicator and a permute's over every GPU, plus the runtime's. No NCCL channel or buffer is cut to fit. The pool only has to hold the compiled step, and the fit check holds the step to it as before. Dew logs the share it took once, and the fit check's record carries it into the run record (`pool`).
 4. Once the step compiles, its own communicators are read from its program by kind and device grouping. A step that needs more than the room left for them is refused before it runs, with an error naming the bytes, instead of stalling in a collective.
