@@ -48,6 +48,14 @@ def plain(params: i64) -> Unit: ...
 operands' dtype, so a rule may move it past the arithmetic beside it (`program.rewrite` states it)."""
 
 
+@function
+def exact_scale(term: Term) -> Unit: ...
+"""Holds where a term is a scalar literal of a power of two: a multiply by it rounds nothing (but past the
+dtype's range), so moving it through a contraction leaves every rounding as it was (`program.rewrite`
+states it). A scale of any other value moved so reorders rounding, which the gate refused on the gated delta
+rule's adjoint (1.575 times the reference's error, past 1.5): it waits for error-aware extraction (§1.5)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Rules:
     """A named set of rules: its rounding class (`exact`: each rewrite rounds as the form it replaces;
@@ -61,14 +69,20 @@ class Rules:
 
 
 def _facts() -> Ruleset:
-    """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, a
-    layout-keeping one its operand's, a sum along one axis its operand's without that axis."""
+    """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, or over
+    an operand and a scalar the operand's, a layout-keeping one its operand's, a sum along one axis its
+    operand's without that axis."""
     term, x, y = vars_("term x y", Term)
     shaped, axes = vars_("shaped axes", Vec[i64])
     name = var("name", String)
     params = var("params", i64)
+    scalar = Vec[i64].empty()
     return ruleset(
         rule(eq(term).to(x.binary(name, y, params)), eq(shaped).to(shape(x)), eq(shape(y)).to(shaped)).then(
+            set_(shape(term)).to(shaped)),
+        rule(eq(term).to(x.binary(name, y, params)), eq(shaped).to(shape(x)), eq(shape(y)).to(scalar)).then(
+            set_(shape(term)).to(shaped)),
+        rule(eq(term).to(x.binary(name, y, params)), eq(shape(x)).to(scalar), eq(shaped).to(shape(y))).then(
             set_(shape(term)).to(shaped)),
         rule(eq(term).to(x.unary(name, params)), eq(shaped).to(shape(x))).then(set_(shape(term)).to(shaped)),
         rule(eq(term).to(x.convert(params)), eq(shaped).to(shape(x))).then(set_(shape(term)).to(shaped)),
@@ -80,14 +94,22 @@ def _facts() -> Ruleset:
 def _linear() -> Ruleset:
     """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
     distributivity over operands of one shape, a product's bilinearity (two products sharing an operand, one
-    product of the summed others), each over arithmetic in its operands' dtype (`plain`), and a
-    value a broadcast lays along every axis but a sum's
-    taken out of the sum where the other factor has the product's shape (the broadcast's extent along the axis
-    the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
+    product of the summed others, and a power of two's scale of the product on either operand instead), each
+    over arithmetic in its operands' dtype (`plain`), and a value a broadcast lays along every axis but a
+    sum's taken out of the sum where the other factor has the product's shape (the broadcast's extent along
+    the axis the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
     x, y, a = vars_("x y a", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
+    scalar = Vec[i64].empty()
     return ruleset(
+        # A contraction scaled by a power of two: the scale on either operand, the product linear in each.
+        rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
+            x.binary("mul", a, multiplied).dot(y, params), eq(shape(a)).to(scalar), exact_scale(a),
+            plain(params), plain(multiplied)),
+        rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
+            x.dot(y.binary("mul", a, multiplied), params), eq(shape(a)).to(scalar), exact_scale(a),
+            plain(params), plain(multiplied)),
         rewrite(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)).to(
             x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y)), plain(added)),
         rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
@@ -130,10 +152,11 @@ register(Rules("identities", "exact", _identities(), receipt="docs/design/algebr
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
 
 
-HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"})}
+HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
+         "mul": frozenset({"dot_general"})}
 """What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
-products or two contractions of one kind (`linear`), or a reduction of a product. Commutativity alone
-(`identities`) leaves every price as it was."""
+products or two contractions of one kind (`linear`), a reduction of a product, or a contraction scaled.
+Commutativity alone (`identities`) leaves every price as it was."""
 
 
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
@@ -172,5 +195,7 @@ def instances() -> Mapping[str, tuple[Callable, Callable, Callable]]:
         "linear: distributivity": (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y), rows),
         "linear: a row scalar out of a sum": (lambda x, s: jnp.sum(s[:, None] * x, -1),
                                               lambda x, s: s * jnp.sum(x, -1), scaled),
+        "linear: a scale through a contraction": (lambda x, y, a: jnp.dot(x, y.T) * 0.3,
+                                                  lambda x, y, a: jnp.dot(x * 0.3, y.T), rows),
         "identities: commutativity": (lambda x, y, a: x + y, lambda x, y, a: y + x, rows),
     }

@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 
 import jax
+import numpy as np
 from egglog import EGraph, Vec, get_callable_args, i64, set_
 from jax._src import config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
@@ -262,6 +263,9 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
             missing = [axis for axis in range(rank) if axis not in laid]
             if len(missing) == 1 and laid == tuple(axis for axis in range(rank) if axis != missing[0]):
                 graph.register(rules.along(i64(index), i64(missing[0])))
+    for index, value in enumerate(region.literals):
+        if _power_of_two(value):
+            graph.register(rules.exact_scale(terms.Term.literal(i64(index))))
     roots = region.roots()
     bundle = terms.Term.bundle(Vec[terms.Term](*roots))
     graph.register(bundle)
@@ -332,6 +336,14 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
     return _windowed(_within(closed, accurate, saturation), accurate, saturation)
+
+
+def _power_of_two(value) -> bool:
+    """Whether a literal is a scalar power of two, a multiply by which rounds nothing."""
+    if np.ndim(value) != 0 or not np.issubdtype(np.asarray(value).dtype, np.floating):
+        return False
+    mantissa, _ = np.frexp(float(value))
+    return mantissa in (0.5, -0.5)
 
 
 def _nodes(graph: EGraph) -> int:
