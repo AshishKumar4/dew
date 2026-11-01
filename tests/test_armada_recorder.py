@@ -266,8 +266,7 @@ def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, t
 def test_each_start_needs_its_own_record_though_two_start_alike(ci, tmp_path, monkeypatch, cache_worker):
     """Two children a file starts alike are two starts, each owing a record: two that record themselves
     keep the file's key, and one that records itself beside one that starts with no site (-S), which no
-    recorder sees, leave the file without one, so an edit to what the second ran cannot reuse its row. (The
-    unrecorded start runs last: what it may have left keys no file after it, ci.py's `left_behind`.)"""
+    recorder sees, leave the file without one, so an edit to what the second ran cannot reuse its row."""
     plain = "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_two.py": "import subprocess, sys\ndef test_two():\n" + plain * 2,
@@ -521,63 +520,59 @@ def test_a_marker_registered_in_pyproject_reruns_the_files_that_use_it_and_its_o
     assert reused() == [False, False, False, False]
 
 
-def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
+def one_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str], fresh: bool):
+    """`files` under tests/ written and run as one 3.12 task, in one container, fresh (ARMADA_FRESH, no task
+    ran in it) or not, with the test cache on: whether each test file's row is reused now, in order."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    written(tmp_path, files)
+    interpreter(tmp_path, "3.12")
+    if fresh:
+        monkeypatch.setenv("ARMADA_FRESH", "1")
+    else:
+        monkeypatch.delenv("ARMADA_FRESH", raising=False)
+    tests = [f"tests/{name}" for name in files if name.startswith("test_")]
+    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    rows = json.loads((tmp_path / "verdict.json").read_text())["rows"]
+    assert all(row["exitCode"] == 0 for row in rows), rows
+    return lambda: reusable_now(ci, tests)
+
+
+# A reader of what the writer left in shared scratch by a native tool, which no audit of Python's could see.
+LEFT = {
+    "build.py": "def build(): return 1\n",
+    "test_writer.py": "from build import build\ndef test_writer():\n"
+                      "    open('/tmp/dew-left-result', 'w').write('value=' + str(build()) + '\\n')\n",
+    "test_reader.py": "import subprocess\ndef test_reader():\n"
+                      "    assert 'text' in subprocess.run(['file', '-b', '/tmp/dew-left-result'],"
+                      " capture_output=True, text=True, check=True).stdout\n"}
+
+
+def test_only_the_first_file_to_execute_in_a_fresh_container_keeps_a_key(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A file run after one that wrote outside its own scratch and caches (a literal /tmp path) has no key,
-    as no record names the code that wrote what it may read: one file writes the result its helper builds
-    there, the next asserts on it, and an edit to the helper would leave the second's green row standing
-    (ci.py's `left_behind`); the writer, reading back what its own process wrote, keeps its key."""
-    shared = tmp_path.parent / f"{tmp_path.name}-shared.txt"
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "build.py": "def build(): return 1\n",
-        "test_writer.py": f"from build import build\ndef test_writer():\n"
-                          f"    open({str(shared)!r}, 'w').write(str(build()))\n"
-                          f"    assert open({str(shared)!r}).read() == '1'\n",
-        "test_reader.py": f"def test_reader():\n    assert open({str(shared)!r}).read() == '1'\n"}, {})
+    """A file run after another in its container may take anything the first left (a file, a process, its
+    memory), however it takes it, so it keeps no key: an edit to what the first left would leave its green row
+    standing. The first, run from the state the environment's snapshot left, keeps its key (Main,
+    2026-11-01: sound by construction, no write audited)."""
+    reused = one_task(ci, tmp_path, monkeypatch, cache_worker, LEFT, fresh=True)
     assert reused() == [True, False]
 
 
-@pytest.mark.parametrize("where", ["shared", "home"])
-@pytest.mark.parametrize("reading", [
-    "assert open({path!r}, 'a+').read() == '' or True",
-    "import os\n    assert os.path.exists({path!r})",
-    "import os\n    assert {name!r} in os.listdir({folder!r})",
-    "import subprocess\n    assert 'text' in subprocess.run(['file', '-b', {path!r}], capture_output=True,"
-    " text=True, check=True).stdout",
-], ids=["append", "probe", "listing", "native"])
-def test_a_file_that_takes_what_another_left_by_any_way_has_no_key(
-        ci, tmp_path, monkeypatch, cache_worker, reading, where):
-    """A file that takes what another file of its task left in shared scratch or the home has no key
-    however it takes it (reviews of the reuse-keys head): an open that keeps what was there (an append), a
-    probe of whether it is there, a listing of its directory, or a read by a native tool a file may run and
-    keep its key (`file`, one of followed.py's `TOOLS`), which no audit hook sees: the writer's write left it
-    (ci.py's `left_behind`), however the reader then takes it. The writer keeps its key."""
-    if where == "home":
-        monkeypatch.setenv("HOME", str(tmp_path.parent / f"{tmp_path.name}-home"))
-    folder = (tmp_path.parent / f"{tmp_path.name}-home/.cache/left" if where == "home"
-              else tmp_path.parent / f"{tmp_path.name}-shared")
-    shared = folder / "result.txt"
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "build.py": "def build(): return 1\n",
-        "test_writer.py": f"import os\nfrom build import build\ndef test_writer():\n"
-                          f"    os.makedirs({str(folder)!r}, exist_ok=True)\n"
-                          f"    open({str(shared)!r}, 'w').write('value=' + str(build()) + '\\n')\n",
-        "test_reader.py": "def test_reader():\n    " + reading.format(
-            path=str(shared), name=shared.name, folder=str(folder)) + "\n"}, {})
-    assert reused() == [True, False]
+def test_no_file_of_a_container_another_task_ran_in_keeps_a_key(ci, tmp_path, monkeypatch, cache_worker):
+    """A container armada does not say is fresh (no ARMADA_FRESH) may hold what an earlier task left: no file
+    run in it keeps a key, the first among them."""
+    reused = one_task(ci, tmp_path, monkeypatch, cache_worker, LEFT, fresh=False)
+    assert reused() == [False, False]
 
 
-def test_a_file_reading_what_another_left_in_a_hidden_directory_of_the_checkout_has_no_key(
+def test_a_reused_row_runs_nothing_so_the_first_file_to_execute_after_it_keeps_its_key(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A file run after one that wrote in a hidden directory of the checkout, which no record keys by its
-    content, has no key (review of the reuse-keys head: .memo/result); the writer keeps its key."""
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "build.py": "def build(): return 1\n",
-        "test_writer.py": "import os\nfrom build import build\ndef test_writer():\n"
-                          "    os.makedirs('.memo', exist_ok=True)\n"
-                          "    open('.memo/result', 'w').write(str(build()))\n",
-        "test_reader.py": "def test_reader():\n    assert open('.memo/result').read() == '1'\n"}, {})
-    assert reused() == [True, False]
+    """A reused row executes nothing in the container, so the first file that runs after it still runs from
+    the snapshot's state and keeps its key."""
+    keyed = one_task(ci, tmp_path, monkeypatch, cache_worker, {"test_a.py": PASSING["test_a.py"]}, fresh=True)
+    assert keyed() == [True]
+    reused = one_task(ci, tmp_path, monkeypatch, cache_worker, {**PASSING}, fresh=True)
+    assert reused() == [True, True]
 
 
 def test_a_marker_a_deselected_test_carries_is_its_files_input(ci, tmp_path, monkeypatch, cache_worker):

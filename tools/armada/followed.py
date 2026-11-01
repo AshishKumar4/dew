@@ -222,150 +222,9 @@ def private() -> bool:
         not configured or beneath(configured))
 
 
-WROTE = "wrote:"
-"""A write this file's processes made where a later file of the task may read it (`written`): the file keeps
-its key, and no file of its task run after it, or beside it on a GPU lane, keeps one (ci.py's `tested`)."""
-WRITES = {"os.mkdir", "os.rename", "os.remove", "os.rmdir", "os.symlink", "os.link", "os.truncate",
-          "shutil.rmtree", "os.utime", "sqlite3.connect"}
-"""The audit events of a change to a path beside an open to write (`read`): made, moved, removed, linked, cut,
-touched, or a database opened, which SQLite writes natively."""
-PATHS = READS | WRITES
-"""The audit events that name a path, read or changed."""
 STARTED_AT = "DEW_EXECUTED_STARTED"
 """The epoch second the task began, which ci.py's `task` sets for every process it records: a program made
 since is no tool (`tool`)."""
-GIT_READS = {"rev-parse", "ls-files", "ls-tree", "show", "log", "diff", "status", "cat-file", "merge-base",
-             "describe", "rev-list", "grep", "blame", "for-each-ref", "symbolic-ref", "show-ref", "name-rev",
-             "version", "check-ignore", "count-objects", "var"}
-"""git's commands that change no repository (but its index's stat cache, which `status` refreshes)."""
-
-
-def beneath(name: str, where: str) -> bool:
-    """Whether absolute path `name` lies beneath directory `where`, as each resolves."""
-    return name.startswith(os.path.join(os.path.realpath(where), ""))
-
-
-def own(name: str) -> bool:
-    """Whether absolute path `name` is this file's own to write, which no later file of the task reads: its
-    scratch and caches (ci.py's `alone`: TMPDIR, `PRIVATE`), uv's cache of packages by their digests, compiled
-    bytecode, the devices, and the harness's own record of its run (its log and its children's, its
-    collection's account, its JUnit report). Its scratch read from TMPDIR and tempfile's settled directory,
-    never asked of `tempfile.gettempdir`, whose first answer writes a probe file under a lock this hook,
-    called within it, would wait on for ever."""
-    if name.startswith(("/dev/", "/proc/")) or "__pycache__" in name.split(os.sep):
-        return True
-    # The recorder's own hook beside the interpreter's packages (`installed`), and its temporary name.
-    if os.path.basename(name).lstrip(".").startswith("dew_followed.pth"):
-        return True
-    log = os.environ.get("DEW_EXECUTED_LOG")
-    settled = getattr(sys.modules.get("tempfile"), "tempdir", None)
-    places = [where for where in (
-        os.environ.get("TMPDIR"), settled, os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR"),
-        os.environ.get(CHILDREN), log and f"{log}.children") if where]
-    exact = {os.path.abspath(path) for path in (log, os.environ.get("DEW_COLLECTED"),
-                                                os.environ.get("DEW_EXECUTED_REPORT")) if path}
-    return name in exact or any(name == os.path.realpath(where) or beneath(name, where) for where in places)
-
-
-@unprobed
-def written(path, dir_fd: int | None = None, made: bool = False) -> str | None:
-    """What a change to `path` (relative to `dir_fd` where one is given) leaves for a later file of the task:
-    its `WROTE` mark, or None where the path is this file's own (`own`) or names none (a descriptor, a
-    database in memory)."""
-    if isinstance(path, int) or path is None or path in (":memory:", b":memory:", ""):
-        return None
-    # The audit names no directory descriptor as -1 (or None, shutil's).
-    base = os.readlink(f"/proc/self/fd/{dir_fd}") if dir_fd is not None and dir_fd >= 0 else ""
-    name = os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path))))
-    # A directory made where one is already changes nothing (`os.makedirs(..., exist_ok=True)` asks of each).
-    if made and os.path.lexists(name):
-        return None
-    # A path of the checkout a read keys (`placed`: neither hidden nor bytecode) leaves nothing unkeyed: a
-    # later file that reads it keys what it read, which the next checkout, without it, answers otherwise.
-    root = os.environ.get("DEW_EXECUTED_ROOT")
-    if root and placed(name, os.path.join(root, "")) is not None:
-        return None
-    return None if own(name) else f"{WROTE}{name}"
-
-
-def heard(event: str, args: tuple) -> str | None:
-    """The `WROTE` mark of an audit event but a read: a change `WRITES` names (`changed`), or a tool's start
-    that may write (`tool_writes`); None for any other."""
-    if event in WRITES:
-        return changed(event, args)
-    return tool_writes(event, args) if event in SPAWNS else None
-
-
-def changed(event: str, args: tuple) -> str | None:
-    """The `WROTE` mark of a change a `WRITES` event names (`written`): its path, and a rename's or a link's
-    second, the first not this file's own."""
-    if event in ("os.rename", "os.link"):
-        return written(args[0], args[2]) or written(args[1], args[3])
-    if event == "os.symlink":
-        return written(args[1], args[2])
-    if event == "os.mkdir":
-        return written(args[0], args[2], made=True)
-    if event in ("os.rmdir", "os.remove", "os.utime"):
-        return written(args[0], args[-1] if isinstance(args[-1], int) else None)
-    if event == "shutil.rmtree":
-        return written(args[0], args[1])
-    return written(args[0])
-
-
-def outputs(found: str, argv: list[str], directory: str) -> list[str] | None:
-    """The paths tool `found` (`TOOLS`' name) run as `argv` in `directory` may write, or None where it may
-    write anywhere: none for one that only reads (uname, file, nvidia-smi, ffplay) or git's commands that
-    change no repository (`GIT_READS`); else the repository git changes, the file ptxas or cc writes (`-o`,
-    else any in the directory), the last argument of ffmpeg and rsync (their output); wandb's service writes
-    where its run's settings say, which its start never names. A run asking only for the tool's version or
-    help writes nothing; a repository git changes is its git directory (`.git`, hidden: no read keys it)."""
-    if found in ("uname", "file", "nvidia-smi", "ffplay") or (
-            argv[1:] and all(word in ("--version", "-V", "--help", "-h") for word in argv[1:])):
-        return []
-    if found == "git":
-        words, at, also = argv[1:], directory, []
-        while words and words[0].startswith("-"):
-            option = words.pop(0)
-            if option in ("-C", "-c", "--git-dir", "--work-tree") and words:
-                value = words.pop(0)
-                at = os.path.join(at, value) if option == "-C" else at
-                also += [os.path.join(at, value)] if option in ("--git-dir", "--work-tree") else []
-            elif option.startswith(("--git-dir=", "--work-tree=")):
-                also.append(os.path.join(at, option.partition("=")[2]))
-        return [] if words and words[0] in GIT_READS else [os.path.join(at, ".git"), *also]
-    if found in ("ptxas", "cc"):
-        for index, word in enumerate(argv):
-            if word in ("-o", "--output-file") and index + 1 < len(argv):
-                return [os.path.join(directory, argv[index + 1])]
-            if word.startswith(("-o", "--output-file=")) and word not in ("-o", "--output-file"):
-                return [os.path.join(directory, word.removeprefix("--output-file=").removeprefix("-o"))]
-        return [directory]
-    if found in ("ffmpeg", "rsync"):
-        return [os.path.join(directory, argv[-1])] if len(argv) > 1 else []
-    return None
-
-
-@unprobed
-def tool_writes(event: str, args: tuple) -> str | None:
-    """The `WROTE` mark of a start of a program of `TOOLS` (`native`) that may write where a later file of the
-    task reads (`outputs`, each of which `written` marks), or None: but `subprocess`'s own start beneath the
-    Popen its audit already named."""
-    if event not in ("subprocess.Popen", "os.posix_spawn", "os.exec", "os.spawn") or (
-            event != "subprocess.Popen" and _beneath_popen()):
-        return None
-    names = programs(event, args)
-    if not native(names):
-        return None
-    found = next(tool(name) for name in names if tool(name))
-    command = args[2] if event == "os.spawn" else args[1]
-    argv = [os.fsdecode(command)] if isinstance(command, (str, bytes)) else [
-        os.fsdecode(word) for word in command or ()]
-    directory = os.path.abspath(os.fsdecode(args[2])) if event == "subprocess.Popen" and args[2] is not None \
-        else os.getcwd()
-    paths = outputs(found, argv, directory)
-    if paths is not None and all(written(os.path.abspath(path)) is None for path in paths):
-        return None
-    return f"{WROTE}{found} in {directory}"
 
 
 def read(event: str, args: tuple, root: str) -> str | None:
@@ -373,10 +232,9 @@ def read(event: str, args: tuple, root: str) -> str | None:
     opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
     listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
     calls this; nor a module's source or bytecode the import system's loader reads to execute it, whose
-    record is the code it ran (`code_unit`), nor a read of the source to digest it (`digesting`). A file
-    opened to write is its `WROTE` mark where a later file may read it (`written`). An open relative to a
-    directory descriptor is `opening`'s to place. The interpreter audits the main script's open from no frame
-    at all."""
+    record is the code it ran (`code_unit`), nor a read of the source to digest it (`digesting`), nor a file
+    opened to write. An open relative to a directory descriptor is `opening`'s to place. The interpreter
+    audits the main script's open from no frame at all."""
     path = args[0]
     if isinstance(path, int):
         return None
@@ -387,7 +245,7 @@ def read(event: str, args: tuple, root: str) -> str | None:
         if mode is None and getattr(placing, "relative", False):
             return None
         if writes:
-            return written(path)
+            return None
         # The source loader's read of the module's text on its way to compiling it (its get_code beneath
         # get_data), not a caller's get_source or get_data, nor a sourceless loader's bytecode, nor
         # zipimport's archive, which are the module's only text.
@@ -474,10 +332,8 @@ def opening(recorded: Callable[[str], None], root: str) -> None:
         finally:
             placing.relative = False
         opened = os.readlink(f"/proc/self/fd/{descriptor}")
-        if flags & os.O_ACCMODE != os.O_RDONLY:
-            if (mark := written(opened)) is not None:
-                recorded(mark)
-        elif (name := placed(opened, root)) is not None:
+        # A file opened only to read is the run's input.
+        if flags & os.O_ACCMODE == os.O_RDONLY and (name := placed(opened, root)) is not None:
             recorded(name)
         return descriptor
 
@@ -824,9 +680,9 @@ def follow() -> None:
 
     def audited(event, args):
         # `read` called here, as it reads its caller's frames.
-        if (item := read(event, args, root) if event in READS else heard(event, args)) is not None:
-            write("file", item)
-        if event in PATHS:
+        if event in READS:
+            if (item := read(event, args, root)) is not None:
+                write("file", item)
             return
         if (taken := coded(event, args, root)) is not None:
             recorded(taken)
@@ -945,9 +801,9 @@ def _most_at_once(records: list[dict], weight) -> int:
 def recorded(path: Path) -> dict[str, dict]:
     """Each test file's record in the log at `path` and its children's (followed.py's `gathered`): the files
     it executed and read, every earlier file's up to the end of its last visit, `SHARED`'s whenever, and its
-    own and `SHARED`'s children's (`depends`, None for a file without a key); whether it may have left
-    something a later file reads (`wrote`); its reads of the backend and its marks; and the GPU memory it
-    held, its children's pools and shares. A file the log never names has no record."""
+    own and `SHARED`'s children's (`depends`, None for a file without a key); its reads of the backend and
+    its marks; and the GPU memory it held, its children's pools and shares. A file the log never names has
+    no record."""
     text = path.read_text() if path.is_file() else ""
     # A line cut short by a kill names no event.
     lines = [line.split("\t", 1) for line in text.splitlines() if "\t" in line]
@@ -972,14 +828,10 @@ def recorded(path: Path) -> dict[str, dict]:
             f"{STARTED}unfollowed" in shared
         items = {item for _, item in before if not item.startswith(EVIDENCE)} | {
             item for item in shared if not item.startswith(EVIDENCE)} | child["files"] | shared_child["files"]
-        inputs = {item for item in items if not item.startswith(WROTE)}
         whole = closed and not unfollowed and child["followed"] and shared_child["followed"]
         held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
         out[file] = {
-            "depends": sorted(inputs) if whole else None,
-            # What it may have left where a later file of the task reads: a write outside its own (`WROTE`),
-            # or a process or an end the log does not hold, whose writes no one saw (ci.py's `tested`).
-            "wrote": not whole or any(item.startswith(WROTE) for item in items),
+            "depends": sorted(items) if whole else None,
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             # A child that never closed held a pool its record does not name: the file's peak is not known.

@@ -146,11 +146,10 @@ def started(code, offset):
 
 
 def audited(event, args):
-    """A read the audit names, kept as the run's input; a write a later file may read, kept as its mark
-    (followed.py's `WROTE`); a process start, kept as how its owner's child ran."""
-    # `read` called here, as it reads its caller's frames.
-    kept(followed.read(event, args, root) if event in followed.READS else followed.heard(event, args))
-    if event in followed.PATHS:
+    """A read the audit names, kept as the run's input; a process start, kept as how its owner's child ran."""
+    if event in followed.READS:
+        # `read` called here, as it reads its caller's frames.
+        kept(followed.read(event, args, root))
         return
     if (taken := followed.coded(event, args, root)) is not None:
         write(owner(), taken)

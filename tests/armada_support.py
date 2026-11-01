@@ -41,8 +41,9 @@ def cached(monkeypatch, url: str) -> None:
 
 def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str],
                   sources: dict[str, str]) -> Callable[[], list[bool]]:
-    """`files` under tests/ and `sources` under src/ written, run as one 3.12 task with the test cache
-    on: whether each test file's row is reused now, in the files' order."""
+    """`files` under tests/ and `sources` under src/ written, each test file run as the plan runs a file the
+    cache does not hold, a 3.12 task of its own in a container no task ran in (armada's ARMADA_FRESH), with
+    the test cache on: whether each test file's row is reused now, in the files' order."""
     url, _, _ = cache_worker
     cached(monkeypatch, url)
     written(tmp_path, files)
@@ -51,9 +52,11 @@ def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str]
         (tmp_path / "src" / name).write_text(source)
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
-    rows = json.loads((tmp_path / "verdict.json").read_text())["rows"]
-    assert all(row["exitCode"] == 0 for row in rows), rows
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    for index, name in enumerate(tests):
+        ci.task("3.12", [name], "", tmp_path / f"verdict-{index}.json", 600.0)
+        rows = json.loads((tmp_path / f"verdict-{index}.json").read_text())["rows"]
+        assert all(row["exitCode"] == 0 for row in rows), rows
     return lambda: reusable_now(ci, tests)
 
 

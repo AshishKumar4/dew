@@ -38,7 +38,8 @@ def gpu_driver(root: Path, monkeypatch) -> None:
 def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 300.0) -> list[dict]:
     """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy` for tasks of `target` seconds, each run as
     armada starts it: .armada.json's command filled from its plan entry, in .armada.json's environment, which
-    the plan's DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
+    the plan's DEW_TEST_CACHE is not part of, in a container no task ran in where the entry asks (`fresh`,
+    armada's ARMADA_FRESH). Their rows, in the plan's order."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     monkeypatch.setenv("DEW_TEST_CACHE", policy)
     entries = [entry for entry in ci.plan(target, {}) if entry["python"] == "3.12"]
@@ -49,19 +50,21 @@ def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 
         filled = [re.sub(r"\{(\w+)\}", lambda field, values=values: str(values[field[1]]), word)
                   for word in command]
         monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+        if entry.get("fresh"):
+            monkeypatch.setenv("ARMADA_FRESH", "1")
+        else:
+            monkeypatch.delenv("ARMADA_FRESH", raising=False)
         assert ci.main() == 0
         rows += json.loads(out.read_text())["rows"]
     return rows
 
 
 def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(ci, tmp_path, monkeypatch):
-    """On 3.12 files are packed near the target by armada's medians, else
-    the recorded durations; a file nothing has timed runs alone; a file
-    heavier than the target splits into groups of itself. On a pushed run
-    3.14 runs its own files (NEWEST_FILES) the same way and imports every
-    other one in a few collect-only tasks; the daily run (DEW_TEST_CACHE off)
-    runs every file on both, with nothing only collected. Every row is named
-    once, test_gen_api never."""
+    """On 3.12 each file the cache does not hold runs in a fresh task of its own (armada's `fresh`), weighed
+    by armada's medians, else the recorded durations; a file heavier than the target splits into groups of
+    itself, each its own fresh task. On a pushed run 3.14 runs its own files (NEWEST_FILES) the same way and
+    imports every other one in a few collect-only tasks; the daily run (DEW_TEST_CACHE off) runs every file
+    on both, with nothing only collected. Every row is named once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
@@ -72,12 +75,13 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     entries = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0,
                                         "3.12:tests/test_light.py": 30.0}})
     floor = [(entry["tests"], entry["split"]) for entry in entries if entry["python"] == "3.12"]
-    assert sorted(floor) == [("tests/test_config.py tests/test_light.py tests/test_measured.py", ""),
-                             ("tests/test_heavy.py", "1/2"), ("tests/test_heavy.py", "2/2"),
-                             ("tests/test_new.py", "")]
+    assert sorted(floor) == [("tests/test_config.py", ""), ("tests/test_heavy.py", "1/2"),
+                             ("tests/test_heavy.py", "2/2"), ("tests/test_light.py", ""),
+                             ("tests/test_measured.py", ""), ("tests/test_new.py", "")]
+    assert all(entry["fresh"] for entry in entries if entry["split"] != ci.COLLECT)
     newest = [entry for entry in entries if entry["python"] == "3.14"]
-    assert [(entry["tests"], entry["split"]) for entry in newest if entry["split"] != ci.COLLECT] == [
-        ("tests/test_config.py tests/test_light.py", "")]
+    assert sorted((entry["tests"], entry["split"]) for entry in newest if entry["split"] != ci.COLLECT) == [
+        ("tests/test_config.py", ""), ("tests/test_light.py", "")]
     collected = sorted(name for entry in newest if entry["split"] == ci.COLLECT
                        for name in entry["tests"].split())
     assert collected == ["tests/test_heavy.py", "tests/test_measured.py", "tests/test_new.py"]
@@ -419,10 +423,10 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
 def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_records_them_apart(
         ci, tmp_path, monkeypatch, cache_worker):
     """The network lane runs each file's network-marked tests alone, which every other task sets aside,
-    with the Hub open, and records them on a class of their own: the same file's CUDA lane, Hub closed,
-    runs its other tests and is no reuse of the network lane's run, and a second network lane on the same
-    inputs reuses its own (the maintainer, 2026-10-25: no CI run reached the published checkpoints' parity
-    tests)."""
+    with the Hub open (the maintainer, 2026-10-25: no CI run reached the published checkpoints' parity
+    tests): the same file's CUDA lane, Hub closed, runs its other tests, and a second network lane on the
+    same inputs runs its tests again, as no file of a lane, which shares the device, is reused (Main,
+    2026-11-01)."""
     url, _, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     interpreter(tmp_path, "3.12")
@@ -450,7 +454,7 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     assert lane() == [("3.12:tests/test_hub.py", 0)]
     assert offline.is_file() and not hub.exists(), "the CUDA lane's run is its own"
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
-    assert not hub.exists(), "the network lane reuses its own green run on the same inputs"
+    assert hub.is_file(), "a lane's file runs every time"
 
 
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
@@ -514,7 +518,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     side by side, each with its peak and headroom, and one whose child took
     its share's fraction holds a share more beside them (`gpu_needs`). A red
     row stays red: nothing is run again. The rows join one verdict, each
-    recorded as a task's are, and a later lane reuses the green ones."""
+    recorded without a key, and a later lane runs every file again: the
+    files share the device (Main, 2026-11-01)."""
     url, stored, _ = cache_worker
     names, source = gpu_lane_at(tmp_path, monkeypatch, url, 5), LANE_TEST
     # One that fails on any share, and one that starts a process.
@@ -568,7 +573,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert json.loads(out.read_text()) == {"rows": []}, "an empty lane runs nothing"
     assert len(ran("test_red")) == 2, "a red row is never reused"
     assert ci.gpu_lane("3.12", names, out, cache="on", processes=4, deadline=600.0) == 0
-    assert all(len(ran(Path(name).stem)) == 2 for name in names), "the third lane reused the green rows"
+    assert all(len(ran(Path(name).stem)) == 3 for name in names), "a lane's green rows are never reused"
     # Their records, of these inputs as the lane keys them, read no backend: none is in the GPU tier.
     assert not set(names) & set(ci.gpu_tier("3.12"))
 
@@ -1582,9 +1587,9 @@ SCRIPT = str(ROOT / "tools/armada/ci.py")
 
 def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: str) -> dict[str, str]:
     """Test files `names` that import src/shapes.py (`module` its text), each weighing about a task, run
-    green by tools/armada/ci.py as a script, as one 3.12 task against the shared test cache, in a checkout
-    whose .armada.json pins its tasks to this host's class: the environment a plan of theirs runs in, which
-    names the cache and its tokens."""
+    green by tools/armada/ci.py as a script, each a fresh 3.12 task against the shared test cache, in a
+    checkout whose .armada.json pins its tasks to this host's class: the environment a plan of theirs runs in,
+    which names the cache and its tokens."""
     interpreter(root, "3.12")
     held = ci.cpu_class().split("-")
     config = json.loads((ROOT / ".armada.json").read_text())
@@ -1601,10 +1606,12 @@ def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: 
     env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
            "DEW_XLA_CACHE_READ_TOKEN": "token"}
     verdict = root / ".verdict/verdict.json"
-    tests = "--tests=" + " ".join(f"tests/test_{name}.py" for name in names)
-    subprocess.run([sys.executable, SCRIPT, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
-                   cwd=root, env=env, check=True)
-    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0] * len(names)
+    # Each file a task of its own in a container no task ran in, as the plan runs a file the cache lacks.
+    for name in names:
+        subprocess.run([sys.executable, SCRIPT, "task", "--python=3.12", f"--tests=tests/test_{name}.py",
+                        f"--out={verdict}", "--cache=on"], cwd=root, env={**env, "ARMADA_FRESH": "1"},
+                       check=True)
+        assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0]
     return env
 
 
