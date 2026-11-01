@@ -863,12 +863,12 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
                 functools.partial(column, "out", given), blocks, gate, low, scale,
                 grads.dtype if accumulated is None else jnp.float32, Issuer(call), laid=laid,
                 column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None)
-            # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
-            # pairs are gone.
-            decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)
             if accumulated is None:
+                # Stored before the pairs' sum forms the pairs' parts: held past it, an fp32 call's scores'
+                # gradient spilled 72 bytes a thread on an H100 (back-need32 at 061a26393).
                 grads.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
-            else:
+            decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)
+            if accumulated is not None:
                 # The key head's sum so far, in shared memory from step to step, zero at its first.
                 total = accumulated
 
