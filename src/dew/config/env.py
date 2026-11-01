@@ -75,7 +75,7 @@ class EnvConfig(Registered):
     _recorded: ClassVar[bool] = False
 
     @staticmethod
-    def _member(name: str) -> type | Callable[..., object]:
+    def _member(name: str) -> type | Callable[..., Configured]:
         return envs[name]
 
     def build(self) -> Env | Simulator:
@@ -107,7 +107,7 @@ class RolloutConfig(Registered):
     name: str = "dreamer"
 
     @staticmethod
-    def _member(name: str) -> type | Callable[..., object]:
+    def _member(name: str) -> type:
         return rollouts[name]
 
     def build(self, objective: Agent, env: Env | Simulator, **taught: Teacher) -> Rollout:
@@ -118,7 +118,7 @@ class RolloutConfig(Registered):
         if stated:
             raise ValueError(f"the run builds the rollout's {stated}; leave them out of its settings")
         member = rollouts[self.name]
-        declared = declared_type(member, "objective") if isinstance(member, type) else None
+        declared = declared_type(member, "objective")
         if isinstance(declared, type) and not isinstance(objective, declared):
             raise ValueError(f"{self.name} collects for a {declared.__name__}, and the run trains a "
                              f"{type(objective).__name__}; name the rollout of its objective")
@@ -126,7 +126,8 @@ class RolloutConfig(Registered):
         if untaken:
             raise ValueError(f"{self.name} takes no {untaken}; a teacher labels and demonstrates a Dreamer "
                              "rollout's steps")
-        return member(**read_arguments(member, self.arguments), objective=objective, env=env, **taught)
+        given = {**read_arguments(member, self.arguments), "objective": objective, "env": env, **taught}
+        return member(**given)
 
 
 @dataclasses.dataclass(frozen=True)

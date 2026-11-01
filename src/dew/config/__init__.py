@@ -67,6 +67,7 @@ from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
+    Configured,
     ModelConfig,
     Registered,
     declared_type,
@@ -173,7 +174,7 @@ def _metric_class(name: str) -> type:
     return member
 
 
-def _member_flags(member: type | Callable[..., object],
+def _member_flags(member: type | Callable[..., Configured],
                   given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
     """A dataclass of `member`'s own fields, one flag each, defaulting to
     `given` over the member's defaults, and the value each flag starts at.
