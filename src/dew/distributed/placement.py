@@ -24,6 +24,7 @@ from dew.batch import FROZEN, Variables
 from dew.mesh import (
     DATA_AXIS,
     DEFAULT_RULES,
+    DILOCO_AXIS,
     EXPERT_AXIS,
     FSDP_AXIS,
     MESH_AXES,
@@ -40,12 +41,13 @@ from dew.mesh import (
 from dew.nn.sharding import Suffix, boxed, boxed_axes, current_boxes, declarations, declared_axes, ruled_boxes
 from dew.state import VARIABLE_FIELDS
 
-# The role axes no parameter splits over: data holds a batch's replicas, and
-# stage the pipeline's stages of the layer stack, which the decoder places
-# itself. `Layout` refuses a parameter placed there. Every other axis a mesh
-# has, Dew's own (expert, fsdp, tensor, sequence) or a native mesh's, holds a
+# The role axes no parameter splits over: diloco holds DiLoCo's replica
+# groups, each with its own copy, data holds a batch's replicas, and stage the
+# pipeline's stages of the layer stack, which the decoder places itself.
+# `Layout` refuses a parameter placed there. Every other axis a mesh has,
+# Dew's own (expert, fsdp, tensor, sequence) or a native mesh's, holds a
 # parameter where the rules put one.
-UNSPLIT_AXES = (DATA_AXIS, STAGE_AXIS)
+UNSPLIT_AXES = (DILOCO_AXIS, DATA_AXIS, STAGE_AXIS)
 
 
 STATE_AXES = (FSDP_AXIS, SEQUENCE_AXIS)
@@ -163,6 +165,12 @@ class MeshSpec:
     same slice. At 1, `jax.make_mesh` places the devices of a single slice;
     devices on several slices still take the hybrid layout, with each slice
     as one replica when the slice count divides the data axis."""
+    diloco: int = 1
+    """DiLoCo's replica groups (`dew.training.diloco`), the mesh's outermost axis: each trains its own
+    inner copy of the model on its own share of every batch's rows over the devices of the rest of the
+    mesh, and the groups meet only when the outer model averages them, every few updates. Across several
+    slices, the groups take whole slices where they divide them, so only that average crosses the slow
+    network. 1 is no DiLoCo."""
     explicit: tuple[str, ...] = ()
     """The axes whose sharding an array's type carries (JAX's Explicit mode),
     where every other axis is left to the partitioner (Auto). An Explicit
@@ -177,9 +185,11 @@ class MeshSpec:
             raise ValueError(f"stage counts pipeline stages, got {self.stage}")
         if self.replicas < 1:
             raise ValueError(f"replicas counts host groups, got {self.replicas}")
+        if self.diloco < 1:
+            raise ValueError(f"diloco counts replica groups, got {self.diloco}")
 
     def build(self, devices: Sequence | None = None) -> Mesh:
-        """Build the six-axis device mesh this spec describes.
+        """Build the seven-axis device mesh this spec describes.
 
         Parameters shard over 'fsdp', 'expert' and 'tensor'. A batch's rows
         shard over 'data', 'expert' and 'fsdp', its sequence dimension over
@@ -219,7 +229,7 @@ class MeshSpec:
         """
         named = devices is not None
         devices = list(devices) if devices is not None else jax.devices()
-        sizes = {"expert": self.expert, "fsdp": self.fsdp, "tensor": self.tensor,
+        sizes = {"diloco": self.diloco, "expert": self.expert, "fsdp": self.fsdp, "tensor": self.tensor,
                  "sequence": self.sequence, "stage": self.stage}
         sharded = math.prod(sizes.values())
         if any(size < 1 for size in sizes.values()):
@@ -228,7 +238,7 @@ class MeshSpec:
             split = " x ".join(f"{axis} {size}" for axis, size in sizes.items() if size > 1)
             raise LayoutRefused(f"{split} is {sharded} devices a data replica, which does not divide "
                                 f"the {len(devices)} devices")
-        shape = (len(devices) // sharded, self.expert, self.fsdp, self.tensor, self.sequence,
+        shape = (self.diloco, len(devices) // sharded, self.expert, self.fsdp, self.tensor, self.sequence,
                  self.stage)
         # `jax.make_mesh` lays one slice out by the platform's topology, which on
         # GPU is the devices sorted by id whatever order they came in; a list the
@@ -236,7 +246,7 @@ class MeshSpec:
         # several slices, every GPU host its own, take the hybrid layout even as
         # one replica.
         types = tuple(AxisType.Explicit if axis in self.explicit else AxisType.Auto for axis in MESH_AXES)
-        if self.replicas == 1 and len({_slice(device) for device in devices}) == 1:
+        if self.replicas == 1 and self.diloco == 1 and len({_slice(device) for device in devices}) == 1:
             if named:
                 return Mesh(np.asarray(devices).reshape(shape), MESH_AXES, axis_types=types)
             return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=types)
@@ -281,7 +291,10 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     by_process = len({_slice(device) for device in devices}) == 1
     granules = len({device.process_index if by_process else device.slice_index
                     for device in devices})
-    data_width = shape[0]
+    # DiLoCo's groups take whole granules where they divide them, the rest of the mesh inside each.
+    groups = spec.diloco if granules % spec.diloco == 0 else 1
+    granules //= groups
+    data_width = shape[1]
     replicas = spec.replicas
     if replicas == 1 and not by_process and data_width % granules == 0:
         replicas = granules
@@ -295,7 +308,7 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
             f"each of the {replicas} replicas spans {per_replica} granules, "
             f"which only the fsdp axis may cross, and fsdp {spec.fsdp} does not "
             "divide over them")
-    dcn = (replicas, 1, per_replica, 1, 1, 1)
+    dcn = (groups, replicas, 1, per_replica, 1, 1, 1)
     ici = tuple(size // outer for size, outer in zip(shape, dcn, strict=True))
     return mesh_utils.create_hybrid_device_mesh(
         ici, dcn, devices, process_is_granule=by_process, allow_split_physical_axes=True)

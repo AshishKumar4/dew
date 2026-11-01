@@ -7,7 +7,6 @@ speed against fla's kernels are the GPU session's (c53 onwards).
 
 import contextlib
 import functools
-import os
 
 import fla_gdn_support as support
 import jax
@@ -860,10 +859,9 @@ def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
     (fla_kda), its queries, keys and values in `FLA_DTYPES[dtypes]` (beta in the values'): its output, final
     memory and every operand's gradient on par from float64 with fla 0.5.2's own on the same operands
     (`fla_side`, in its own interpreter, in their common dtype), check 1, the float64 token recurrence the
-    truth, at `FLA_SHAPE`. A GPU cell (tests/test_gpu_recurrence.py), skipped where its session names no fla
-    (`DEW_FLA_PYTHON`)."""
-    if not os.environ.get("DEW_FLA_PYTHON"):
-        pytest.skip("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch, the cell's reference")
+    truth, at `FLA_SHAPE`. A GPU cell (tests/test_gpu_recurrence.py), failed where its session names no fla
+    (`DEW_FLA_PYTHON`, `fla_side`): a GPU flow reads a skip as no failure, so a missing reference would leave
+    this proof unrun and the flow green."""
     batch, length, key_heads, value_heads, width = FLA_SHAPE
     kinds = FLA_DTYPES[dtypes]
     common = jnp.result_type(*kinds)

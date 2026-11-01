@@ -153,6 +153,30 @@ def test_a_bias_spread_over_a_sharded_axis_keeps_its_sharding():
     assert np.asarray(gradient).tolist() == np.ones((2, 1, 4)).tolist()
 
 
+@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
+def test_a_value_spread_over_a_size_one_explicit_axis_keeps_its_placement(wide, monkeypatch):
+    """A value `[1, 4]` placed on a size-one Explicit axis along the axis it spreads over is broadcast to
+    `[3, 4]` under jit, in either setting, where the doubling and the outer product would each drop
+    that placement and the platform choice refuse their types (review of ledger 1698's bias sites).
+    Its gradient JAX's own broadcast does not take (its transpose's cotangent keeps the spread shape),
+    so the forward is what `spread` keeps."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.precision import spread
+
+    if wide:
+        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    else:
+        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    mesh = jax.make_mesh((1,), ("row",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:1])
+    with jax.set_mesh(mesh):
+        value = jax.device_put(np.full((1, 4), 0.5, np.float32),
+                               NamedSharding(mesh, PartitionSpec("row", None)))
+        out = jax.jit(lambda value: spread(value, (3, 4)))(value)
+    assert jax.typeof(out).sharding.spec == PartitionSpec("row", None)
+    assert np.asarray(out).tolist() == np.full((3, 4), 0.5).tolist()
+
+
 def test_another_threads_quantized_trace_leaves_this_threads_products_dews():
     """While one thread traces a quantized model's method (`QUANTIZED_TRACE`, whose products Qwix
     owns), a product another thread compiles, and the same program after that trace ends, sum in
@@ -272,7 +296,8 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     """Each site of the wide CPU arithmetic, a float32 product and a bias's spread and a row's logsumexp
     (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
-    no platform choice and no float64 beside a float32 computation. Each is traced afresh, as a
+    no float64 beside a float32 computation, and no platform choice but the bias's, whose gradient a
+    CPU sums pairwise in float32 (`spread`, ledger 1698's bias sites). Each is traced afresh, as a
     process with either setting traces it."""
     from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
@@ -307,8 +332,41 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
             states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
     }
     for name, found in sites.items():
-        assert chosen(found) == wide, name
+        assert chosen(found) == (wide or name == "bias"), name
         assert float64(found) == wide, name
     # A float64 division is the plain division under either setting.
     with jax.enable_x64(new_val=True):
         assert not chosen(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
+
+
+def test_a_contraction_bound_to_any_arguments_sums_as_it_is_called():
+    """A float32 product's wide sum through each way a caller binds it (`accumulated`): dimension numbers
+    given as lists, as JAX takes them, sum as the same numbers given as tuples; a `functools.partial`
+    subclass that calls its product otherwise keeps its own call; a callable no hash holds sums as the
+    contraction it calls, its value and gradients each equal to the plain binding's."""
+    import dataclasses
+    import functools
+
+    lhs = jax.random.normal(jax.random.key(0), (6, 5))
+    rhs = jax.random.normal(jax.random.key(1), (5, 4))
+    numbers = (((1,), (0,)), ((), ()))
+    plain = functools.partial(jax.lax.dot_general, dimension_numbers=numbers)
+
+    class Doubled(functools.partial):
+        def __call__(self, *operands, **options):
+            return 2 * super().__call__(*operands, **options)
+
+    @dataclasses.dataclass
+    class Unhashed:
+        def __call__(self, *operands, **options):
+            return jax.lax.dot_general(*operands, numbers, **options)
+
+    def run(product):
+        return with_gradients(lambda a, b: accumulated(product, a, b))(lhs, rhs, jnp.ones((6, 4)))
+
+    expected = run(plain)
+    listed = functools.partial(jax.lax.dot_general, dimension_numbers=([[1], [0]], [[], []]))
+    for product, factor in ((listed, 1), (Unhashed(), 1), (Doubled(jax.lax.dot_general,
+                                                                    dimension_numbers=numbers), 2)):
+        for found, wanted in zip(jax.tree.leaves(run(product)), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(found), factor * np.asarray(wanted))

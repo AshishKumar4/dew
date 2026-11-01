@@ -66,6 +66,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     extents,
     reducing,
     refused,
+    score_places,
     stated,
 )
 
@@ -405,12 +406,13 @@ class _Residuals(NamedTuple):
 
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
-            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks) -> tuple:
+            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
-    bit. A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
-    rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering)."""
+    bit; its places read by the walk's dropout where it draws it (`drawn`). A tile every query sees whole
+    takes no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
+    loops, faulted on an H100 under jax 0.11.2's lowering)."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -418,12 +420,33 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     slots.release("keys")
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
-    coords = _coords(family, spans, row, first, k_first, shape,
+    # Its mask chosen at run time (`whole`): the masked tile's reads.
+    read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=drawn,
+                               padded=spec.keys % tiles.block_k != 0)
+    coords = _coords(family, spans, row, first, k_first, shape, read=read,
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head))
     params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
                    for ref, param in zip(hooked.score, hooks.score_params, strict=True))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
     return k_first, coords, logits, products
+
+
+def _initial(family: mosaic.Family, spec: algebra.Forward, hooked: _Hooked, rows: tuple,
+             live: jax.Array | None) -> algebra.Partial:
+    """The call's initial state at a consumer's `rows` (batch row, head, queries) in the family's layouts
+    (`algebra.resumed`), its `live` rows the guard's."""
+    assert hooked.initial is not None
+    m0, total0, acc0 = hooked.initial
+    return algebra.resumed(spec, family.rows_of(m0.at[rows]), family.rows_of(total0.at[rows]),
+                           family.tile_of(acc0.at[rows]), live=live)
+
+
+def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None) -> algebra.Partial:
+    """`algebra.started`'s empty state of a walk's `[bq, Dv]` sums (`shape`) in the family's layouts,
+    headroomed at the guard's `live` rows."""
+    rows = shape[0]
+    start = algebra.Partial(family.zeros(shape), family.full((rows,), -jnp.inf), family.zeros((rows,)))
+    return start if live is None else algebra.headroomed(start, live)
 
 
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
@@ -455,21 +478,18 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
     state_rows = (row, head, pl.ds(first, tiles.block_q))
     live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
-    if hooked.initial is not None:
-        m0, total0, acc0 = hooked.initial
-        start = algebra.resumed(spec, family.rows_of(m0.at[state_rows]),
-                                family.rows_of(total0.at[state_rows]), family.tile_of(acc0.at[state_rows]),
-                                live=live)
-    else:
-        # `algebra.started`'s empty state, in the family's layouts.
-        start = algebra.Partial(family.zeros((tiles.block_q, value_width)),
-                                family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
-        start = start if live is None else algebra.headroomed(start, live)
+
+    # A plain inference walk starts empty and merges the initial state past its keys (`algebra.merge`): read
+    # before the walk, the state's rows held live across it beside its products and the walk spilled 296
+    # bytes at D128's 64 x 128 (the held-term census), where an empty start's are constants.
+    merged = hooked.initial is not None and guard is None and residuals is None
+    start = (_initial(family, spec, hooked, state_rows, live) if hooked.initial is not None and not merged
+             else _empty(family, (tiles.block_q, value_width), live))
     pl.when(consumer == 1)(turn)
 
     def scored(index, slots):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks)
+                       hooks=hooks, drawn=hooked.drop is not None)
 
     def value_of(slots):
         # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
@@ -516,6 +536,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
     state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                      between=lambda: (turn(), turn()))
+    if merged:
+        state = algebra.merge(spec, _initial(family, spec, hooked, state_rows, live), state)
     if residuals is not None:
         # The split sums as the walk left them, shift 0 (`algebra.split_residuals`' plain walk).
         family.stored((state.acc,), (residuals.others,), smem=out_smem)
@@ -597,8 +619,9 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     pl.when(consumer == 1)(turn)
 
     def step(index, slots, arg, accumulators):
+        # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
-                                       turn, hooks=hooks)
+                                       turn, hooks=hooks, drawn=False)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)

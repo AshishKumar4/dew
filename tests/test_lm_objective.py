@@ -23,7 +23,7 @@ import selection_margins
 from affine_run import dataset
 from lm_support import token_batch_of
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact, over_windows, widened, windows
+from reference_error import as_given, assert_as_exact, over_windows, summed_as_run, widened, windows
 
 from dew.artifacts import TokenScores
 from dew.batch import TEXT_KEY, coordinates
@@ -566,7 +566,10 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
                             eval_every=1, metrics=(scores,))
         return jax.device_get(state.variables), scores.read
 
-    variables, _ = run(batches)
+    # The first run in the arithmetic check 1 runs its arms in (`summed_as_run`: a user's fp32 sums), so each
+    # later run, an arm's, leaves its state exactly.
+    with summed_as_run():
+        variables, _ = run(batches)
 
     def passed(given, tokens):
         after, (scores,) = run([{TEXT_KEY: tokens}])

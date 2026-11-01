@@ -1287,7 +1287,11 @@ class GlobalStream:
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
         if saved.plan is not None:
-            self.manifest_changes = self._plan.check(saved.plan, resume=self._resume)
+            from dew.data.plan import earlier_plan
+
+            # The saved position's one translation (`earlier_plan`), then its check.
+            translated = earlier_plan(saved.plan, self._plan)
+            self.manifest_changes = self._plan.check(translated, resume=self._resume)
         if saved.completed:
             raise ValueError(
                 f"the saved data position is {saved.records} records into a phased run "

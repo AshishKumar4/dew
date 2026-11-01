@@ -14,6 +14,10 @@ import jax
 from flax import linen as nn
 from flax.linen import spmd
 
+DILOCO_AXIS = 'diloco'
+"""The axis of DiLoCo's replica groups (`dew.training.diloco`), outermost: each group trains its own
+inner copy of the model on its own rows, every axis below it inside the group, and the groups meet only
+when the outer model averages them. No model's rule names it: a step's model runs inside one group."""
 DATA_AXIS = 'data'
 EXPERT_AXIS = 'expert'
 FSDP_AXIS = 'fsdp'
@@ -27,7 +31,7 @@ its queries over, and the tensor and stage axes, which hold a width and a
 pipeline stage and never a row."""
 
 
-MESH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
+MESH_AXES = (DILOCO_AXIS, DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
 """Every mesh's axes, in the order `MeshSpec.build` lays them out."""
 
 
@@ -225,11 +229,13 @@ def row_axes(batch: int, *, mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh 
 
 
 def batch_axes(mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> tuple[str, ...]:
-    """The axes of `mesh` a batch's rows split over: every axis
-    `activation_batch` takes, each of which divides `mesh.size` rows."""
-    return row_axes(mesh.size, mesh=mesh)
+    """The axes of `mesh` a batch's rows split over: DiLoCo's replica groups first where the mesh has
+    more than one, each group's rows its own, then every axis `activation_batch` takes, each of which
+    divides `mesh.size` rows."""
+    groups = (DILOCO_AXIS,) if mesh.shape.get(DILOCO_AXIS, 1) > 1 else ()
+    return groups + row_axes(mesh.size, mesh=mesh)
 
 
-__all__ = ["BATCH_AXES", "DATA_AXIS", "DEFAULT_RULES", "EXPERT_AXIS", "FSDP_AXIS", "MESH_AXES",
+__all__ = ["BATCH_AXES", "DATA_AXIS", "DEFAULT_RULES", "DILOCO_AXIS", "EXPERT_AXIS", "FSDP_AXIS", "MESH_AXES",
            "SEQUENCE_AXIS", "STAGE_AXIS", "TENSOR_AXIS", "LayoutRefused", "LogicalAxes", "LogicalAxisRules",
            "MeshAxes", "axis_rules", "batch_axes", "logical_spec", "mesh_axes", "row_axes"]
