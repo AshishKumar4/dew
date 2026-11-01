@@ -4,7 +4,6 @@ a run labelling and demonstrating the steps its own policy would, stages chained
 a resume ending where the run that never stopped ends, and each setup the kind refuses."""
 
 import dataclasses
-import itertools
 import json
 from pathlib import Path
 
@@ -16,7 +15,6 @@ from test_env_rollout import evaluation_key
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
-from dew.data.dataset import Loader, replayed
 from dew.nn.kernels import generation
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
@@ -80,16 +78,12 @@ def world_model(**fields) -> WorldModel:
     return WorldModel(13, 4, reads="state", dtype=jnp.bfloat16, **{**TINY, **fields})
 
 
-def idle() -> Loader:
-    return Loader(train=replayed(lambda partition: itertools.repeat({"step": np.zeros((), np.float32)})),
-                  val=None, records=None, batch=1)
-
-
 def fitted(run: EnvRunConfig, objective, rollout, steps: int):
-    """`objective` trained `steps` updates over `rollout` by a trainer composed in Python, under the run's
-    numerics, as `RunConfig.train` traces its programs."""
+    """`objective` trained `steps` updates over `rollout` by a trainer composed in Python, on the loader the
+    run's rollout replaces, under the run's numerics, as `RunConfig.train` traces its programs."""
     with generation.run_precision(run.trainer.precision):
-        return Trainer(objective, run.optim, key=0, rollout=rollout).fit(idle(), steps=steps, log_every=1)
+        return Trainer(objective, run.optim, key=0, rollout=rollout).fit(run.prepare().dataset, steps=steps,
+                                                                         log_every=1)
 
 
 def bits(tree) -> list[np.ndarray]:

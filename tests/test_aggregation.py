@@ -180,11 +180,9 @@ def test_a_demonstrated_prefill_writes_the_demonstrators_actions_and_a_teachers_
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=8.0, prefill=24,
                              demonstrator=Teacher(pilot, {"gain": jnp.asarray(0.75)}), teacher=teacher)
     dreamer_fit(None, objective, rollout, 2)
-    replay = rollout.held_replay
-    assert replay is not None
-    filled = int(replay.filled)
+    written = jax.device_get(rollout.held_replay)
+    filled, held = int(written.filled), written.held
     assert filled > 24
-    held = jax.device_get(replay.held)
     observation, action = np.asarray(held["observation"][:filled]), np.asarray(held["action"][:filled])
 
     def piloted(gain):
