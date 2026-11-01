@@ -171,9 +171,12 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
         wide = at_least_fp32(lhs.dtype)  # an fp64 product's sum in fp64
         # Each group's rows contracted, XLA's ragged dot's own weight gradient (its transpose's form) on the
         # operands as they are: a pullback from a matrix made here would hand a vmapped call (a pipeline
-        # stage's) an unbatched operand, which ragged_dot's batching rule refuses.
+        # stage's) an unbatched operand, which ragged_dot's batching rule refuses. The operands keep their
+        # dtype, summed in `wide`: a bf16 product is exact in fp32 either way, where operands widened first
+        # made the GPU's product an fp32 one (an sm120's 4096-token gate_up weight gradient 5.91 ms against
+        # 2.72 for the bf16 product).
         return jax.lax.ragged_dot_general(
-            lhs.astype(wide), rhs.astype(lhs.dtype).astype(wide), group_sizes, _CONTRACTED_ROWS,
+            lhs, rhs.astype(lhs.dtype), group_sizes, _CONTRACTED_ROWS,
             precision=precision, preferred_element_type=wide).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
