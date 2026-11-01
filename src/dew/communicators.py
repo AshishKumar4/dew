@@ -19,19 +19,20 @@ peer is first sent to, whatever that setting; their room is held for them here.
 
 Before the backend opens, a child process on this host's GPUs (`main`) makes, over each group size that
 divides them, a collective's communicator, an all-to-all's connections to every peer, and a permute's
-communicator to one peer and to every peer, and reports the bytes each GPU's driver saw go: NCCL's, and the
-runtime's own beside its pool. The answer is kept in Dew's cache per configuration (`configuration`), so a
-host pays for it once. The pool's share then leaves that room at NCCL's full speed, the run's share its upper
-bound (`dew.devices.pool_bound`, `pool_share`): the pool need hold only the compiled step, which the fit
-check holds to it, so no channel or buffer of NCCL's is cut to fit. Every program Dew compiles passes one
-point (`dew.nn.kernels.templates.report.compiled`), where its communicators, read from its HLO by the parser
-the FLOP count reads, are held with those of the programs before it to the room left (`admit`), so a program
-that would fail to connect is refused before it runs."""
+communicator connected along each directed pair in turn, as NCCL picks each peer's transport apart, and
+reports the bytes each GPU's driver saw go: NCCL's, and the runtime's own beside its pool. The answer is kept
+in Dew's cache per configuration (`configuration`), so a host pays for it once. The pool's share then leaves
+that room at NCCL's full speed, the run's share its upper bound (`dew.devices.pool_bound`, `pool_share`): the
+pool need hold only the compiled step, which the fit check holds to it, so no channel or buffer of NCCL's is
+cut to fit. Every program Dew compiles passes one point (`dew.nn.kernels.templates.report.compiled`), where
+its communicators, read from its HLO by the parser the FLOP count reads, are held with those of the programs
+before it to the room left (`admit`), so a program that would fail to connect is refused before it runs."""
 
 from __future__ import annotations
 
 import dataclasses
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -193,10 +194,15 @@ def configuration() -> dict:
             "xla_nccl": [setting for setting in flags if "nccl" in setting], "jax": jax.__version__}
 
 
+FORM = 2
+"""The form of the measurement Dew keeps, which names its place in the cache: a change to what the child
+measures or how it writes it takes the next, so a host measures afresh rather than read an earlier one."""
+
+
 def measured(configured: Mapping, *, measure: Callable[[Mapping], Needs]) -> Needs:
-    """The measurement for `configured`, from Dew's cache, or `measure`d and kept there."""
+    """The measurement for `configured`, from Dew's cache, or `measure`d and kept there, in this `FORM`."""
     digest = hashlib.sha256(json.dumps(configured, sort_keys=True).encode()).hexdigest()[:24]
-    path = Path(dew_cache_dir()) / "communicators" / f"{digest}.json"
+    path = Path(dew_cache_dir()) / "communicators" / f"form-{FORM}" / f"{digest}.json"
     if path.exists():
         return Needs.of(json.loads(path.read_text())["needs"])
     needs = measure(configured)
@@ -314,7 +320,6 @@ class Resident:
 
     def __init__(self) -> None:
         self.held = Collectives()
-        self.started = False
         self.lock = threading.Lock()
 
     def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
@@ -322,14 +327,17 @@ class Resident:
         """Admit a compiled program's communicators (`made`), refusing it, naming the bytes, before it runs,
         where they and the process's earlier ones, each counted once, with the runtime's need more than the
         room Dew left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it), or where those it
-        adds (`Needs.needed`), with the runtime's for the process's first program, need more than its GPUs
-        have free there now (`free`, by ordinal; a GPU of no answer is held to the room alone): NCCL takes a
-        communicator's buffers as the program first runs, after this, so an earlier program admitted and
-        not yet run holds room that is still free."""
+        adds (`Needs.needed`) need more than its GPUs have free there now (`free`, by ordinal; a GPU of no
+        answer is held to the room alone). What is free now is read after the runtime started and after
+        the earlier programs that ran made their communicators, so neither is charged again. NCCL takes a
+        communicator's buffers as its program first runs, which no process can see, so free memory cannot
+        tell an earlier program not yet run from one that ran: the room holds every program's together,
+        and what is free now refuses a program whose own communicators cannot fit even beside the earlier
+        ones all made."""
         with self.lock:
             held = self.held | made
             needed = needs.needed(held, room, runtime=True)
-            added = needs.needed(made, room, runtime=not self.started, made=self.held)
+            added = needs.needed(made, room, runtime=False, made=self.held)
             now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
             short = (any(needed[gpu] > room[gpu] for gpu in room)
                      or any(added[gpu] > now[gpu] for gpu in now))
@@ -341,7 +349,7 @@ class Resident:
                                        "process's, which its GPUs have too little room for outside XLA's "
                                        f"pool; lower {fraction_name()} by the shortfall over the GPU's bytes",
                                        needed, {gpu: min(room[gpu], now.get(gpu, room[gpu])) for gpu in room})
-            self.held, self.started = held, True
+            self.held = held
 
 
 @dataclasses.dataclass(frozen=True)
@@ -424,13 +432,27 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
                         _HELD.room, free)
 
 
+def peer_costs(runs: Iterable[tuple[int, int, Mapping[int, int]]]) -> tuple[int, int, int]:
+    """A permute communicator's base, send and receive bytes on a clique, from `runs` connecting each directed
+    pair of it in turn (the source, the target and the bytes each GPU gave), the first making the
+    communicator: NCCL picks each peer's transport apart, so the send and the receive are the most any later
+    run's source and target gave, and the base the most the first run took beside its own pair's
+    connections."""
+    (source, target, first), *later = runs
+    send = max((given[sender] for sender, _, given in later), default=0)
+    receive = max((given[receiver] for _, receiver, given in later), default=0)
+    base = max(first[source] - send, first[target] - receive,
+               *(given for gpu, given in first.items() if gpu not in (source, target)))
+    return max(base, 0), send, receive
+
+
 def main() -> None:
     """The child's measurement: each GPU's free bytes before the runtime starts; then, for each group size
     that divides this host's GPUs (the first GPUs of that many), the bytes each GPU gave, less its pool's
     growth, as a collective's communicator is made over them (an all-gather's), as an all-to-all connects
-    every peer beside it, and as a permute's communicator sends from the first to the second (its base on
-    every member, a send and a receive) and then back (one more send and receive), each the most a member
-    gave; and the rest, after a matrix product on each GPU, the runtime's beside its pool."""
+    every peer beside it, each the most a member gave, and as a permute's communicator connects each
+    directed pair of them in turn (`peer_costs`); and the rest, after a matrix product on each GPU, the
+    runtime's beside its pool."""
     import jax.numpy as jnp
     import numpy as np
 
@@ -466,18 +488,18 @@ def main() -> None:
     def exchanged_rows(part):
         return jax.lax.all_to_all(part, "group", 0, 0, tiled=True)
 
+    def permuted_along(pair: tuple[int, int]) -> Callable:
+        return lambda part: jax.lax.ppermute(part, "group", [pair])
+
     collective, exchanged, permuted = {}, {}, {}
     for size in (size for size in range(2, len(devices) + 1) if len(devices) % size == 0):
         group = devices[:size]
-        first, second = group[0].local_hardware_id, group[1].local_hardware_id
         collective[str(size)] = max(taken(group, gathered).values())
         exchanged[str(size)] = max(taken(group, exchanged_rows).values())
-        forth = taken(group, lambda part: jax.lax.ppermute(part, "group", [(0, 1)]))
-        back = taken(group, lambda part: jax.lax.ppermute(part, "group", [(1, 0)]))
-        send, receive = back[second], back[first]
-        base = max(forth[first] - send, forth[second] - receive,
-                   *(given for gpu, given in forth.items() if gpu not in (first, second)))
-        permuted[str(size)] = [base, send, receive]
+        runs = [(group[source].local_hardware_id, group[target].local_hardware_id,
+                 taken(group, permuted_along((source, target))))
+                for source, target in itertools.permutations(range(size), 2)]
+        permuted[str(size)] = list(peer_costs(runs))
     for device in devices:
         square = jax.device_put(jnp.ones((512, 512), jnp.float32), device)
         jax.block_until_ready(square @ square)

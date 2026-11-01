@@ -11,7 +11,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   the share the run names (`dew.devices.pool_bound`) is the pool's upper bound, a child process measures
   the communicators, all-to-all and permute connections once per configuration into Dew's cache, and a
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
-  the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`.
+  the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
+  through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
   mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
   outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.

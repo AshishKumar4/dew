@@ -18,7 +18,7 @@ import sys
 from collections.abc import Mapping, Sequence
 
 from dew.builds import CUDA_BUILDS, PACKAGE_INDEX, QUERY, listed_gpus, newest_build, runs_on
-from dew.pool import answered, runs_on_gpu
+from dew.pool import answered, cuda_driver, runs_on_gpu
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False
@@ -283,22 +283,13 @@ def nvidia_gpus() -> tuple[str, tuple[int, int]] | None:
     return listed_gpus(answered(QUERY, 10))
 
 
-def _driver() -> ctypes.CDLL | None:
-    """The CUDA user-mode driver library JAX's CUDA plugin loads, or None where none loads."""
-    try:
-        return ctypes.CDLL("libcuda.so.1")
-    except OSError as error:  # ctypes' answer for a library the loader does not find
-        _log.debug("no CUDA driver library loads: %s", error)
-        return None
-
-
 def cuda_driver_version() -> int | None:
     """The CUDA version the user-mode driver this process loads supports, as
     `cuDriverGetVersion` reports it (13.0 as 13000), the library JAX's CUDA
     plugin loads; None where no driver library loads. NVIDIA's
     forward-compatibility package raises it past what the kernel driver's
     major gives (`CUDA_BUILDS`)."""
-    cuda = _driver()
+    cuda = cuda_driver()
     if cuda is None:
         return None
     version = ctypes.c_int()
@@ -314,7 +305,7 @@ def gpu_attribute(ordinal: int, attribute: int) -> int | None:
     """The CUDA driver's `attribute` (a `CUdevice_attribute`) of the visible GPU `ordinal`: a device fact
     JAX's Device does not carry, a GPU's clocks above all. None where no driver library loads (a CPU
     host); a driver error raises."""
-    cuda = _driver()
+    cuda = cuda_driver()
     if cuda is None:
         return None
     device, value = ctypes.c_int(), ctypes.c_int()
@@ -452,7 +443,7 @@ def gpu_memory(ordinal: int) -> tuple[int, int] | None:
 
 def gpu_name(ordinal: int) -> str | None:
     """The visible GPU `ordinal`'s name, as the CUDA driver reports it (`NVIDIA H100 80GB HBM3`)."""
-    cuda, device, name = _driver(), ctypes.c_int(), ctypes.create_string_buffer(256)
+    cuda, device, name = cuda_driver(), ctypes.c_int(), ctypes.create_string_buffer(256)
     if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
         return None
     return None if cuda.cuDeviceGetName(name, len(name), device) else name.value.decode()
@@ -461,7 +452,7 @@ def gpu_name(ordinal: int) -> str | None:
 def gpu_place(ordinal: int) -> str | None:
     """The visible GPU `ordinal`'s PCI bus id, as the CUDA driver reports it (`0000:18:00.0`): where it sits,
     which its links to the other GPUs follow."""
-    cuda, device, place = _driver(), ctypes.c_int(), ctypes.create_string_buffer(32)
+    cuda, device, place = cuda_driver(), ctypes.c_int(), ctypes.create_string_buffer(32)
     if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
         return None
     return None if cuda.cuDeviceGetPCIBusId(place, len(place), device) else place.value.decode()
