@@ -153,6 +153,10 @@ class _ShardPass[Place](grain.IterDataset):
         self.root = self.root[selection]
 
     def __iter__(self) -> grain.DatasetIterator:
+        if not len(self.root):
+            # A loading worker whose slice of a bound's places holds none (`set_slice`) reads nothing,
+            # which Grain's interleave of no places cannot.
+            return grain.MapDataset.source(()).to_iter_dataset().__iter__()
         empty = _EmptyRun(self.name)
         return experimental.InterleaveIterDataset(
             self.root.map(_Reader(self.reader, empty)),

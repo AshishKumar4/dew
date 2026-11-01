@@ -15,7 +15,7 @@ from test_barren_reads import Untouched
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
-from dew.data import Memory
+from dew.data import Memory, text
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import ObjectiveData, Pipeline
@@ -204,6 +204,32 @@ POOL_DEALS = {
     "dealt shards rewound interleaved": lambda rows: rows.interleave(2).random_map(
         Untouched(), identity="untouched@1").repeat(),
 }
+
+
+@pytest.mark.parametrize("workers", [2, 3])
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_a_streamed_reads_bound_read_by_loading_workers_reads_what_one_reader_does(shuffled, workers):
+    """A streamed read of 12 records in shards of 4, in order or shuffled in a window, bounded to 8, 12 or
+    20 examples or to 16 an objective chunks, read by `workers` loading workers: each worker reads its
+    slice of the bound's shards (`dew.data.shards.bounded_places`), so the read holds every record as
+    many times as one reader's does, and a take of 5 rows takes 5, each record once, where each worker
+    read that many of its own slice (row 3295)."""
+    tokens = [np.arange(2 * (record % 3 + 1), dtype=np.int32) for record in range(1, 13)]
+    stored = Memory([{"id": np.int32(record), "tokens": held} for record, held in enumerate(tokens, start=1)],
+                    shard_rows=4)
+
+    def read(count, examples=None, objective=None, take=None):
+        chain = Pipeline(stored).shuffle(seed=3, window=12) if shuffled else Pipeline(stored)
+        if take is not None:
+            chain = chain.repeat(1).take(take)
+        return ids_read(compile(chain.batch(1), read="streamed", examples=examples, objective=objective,
+                                loading=Loading(workers=count, threads=1, read_buffer=2)), "id")
+
+    chunked = ObjectiveData(train=(text.Chunks(2, fields=("tokens",)),))
+    for examples, objective in ((8, None), (12, None), (20, None), (16, chunked)):
+        assert read(workers, examples, objective) == read(0, examples, objective), (examples, objective)
+    taken = read(workers, take=5)
+    assert sum(taken.values()) == len(taken) == 5
 
 
 @pytest.mark.parametrize("examples", [1, 7, 23])
@@ -600,8 +626,48 @@ def test_a_clocked_run_names_its_length_once():
     with pytest.raises(ValueError):
         thin_fit(x, chain=clocked_chain(x).take(2), examples=CLOCKED_RECORDS)
     with pytest.raises(ValueError):
-        clocked(CLOCK_LIMIT + 1, None, custom=False, rollout=False)
-    assert clocked(CLOCK_LIMIT, None, custom=False, rollout=False) == CLOCK_LIMIT
+        clocked(CLOCK_LIMIT + 1, None)
+    assert clocked(CLOCK_LIMIT, None) == CLOCK_LIMIT
+    # A pool's shares run out apart, and a share that ran out has nothing a rollout draws further from.
+    with pytest.raises(ValueError):
+        clocked(CLOCK_LIMIT, None, pooled_draws=True)
+
+
+def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_at_its_bound():
+    """A run bounded to EXAMPLES examples whose rollout hands back the batch it reads, each batch it makes
+    consuming the examples of those it read (`dew.training.rollout.clocked_rollout`), steps as the run
+    without a rollout: every step's loss and the final weight, its last short window closed, and its
+    clock at its bound (row 2437)."""
+    (x,) = records(0)
+    plain, rolled = RecordingTracker(), RecordingTracker()
+    alone = trainer(tracker=plain).fit(chain(x), examples=EXAMPLES, log_every=1)
+    handed = Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK)), key=0,
+                     accumulation=ACCUMULATION, tracker=rolled, rollout=lambda state, batch, key: batch).fit(
+        chain(x), examples=EXAMPLES, log_every=1)
+    assert int(handed.consumed) == int(alone.consumed) == EXAMPLES
+    np.testing.assert_array_equal(np.asarray(handed.variables["params"]["w"]),
+                                  np.asarray(alone.variables["params"]["w"]))
+    assert losses(rolled) == losses(plain) != []
+
+
+def test_a_custom_step_trains_a_run_bounded_in_examples_whose_schedule_reads_no_progress():
+    """A custom step (`Trainer(step=...)`), whose update the run's progress is not handed, trains a run
+    bounded in examples to its bound under a schedule of its own steps, its clock at the bound; under
+    one that decays over the whole run, which reads that progress, the run is refused before a step
+    (row 2437)."""
+    def stepped(objective, optimizer):
+        def step(state, batch):
+            return (state.replace(microstep=state.microstep + 1, updates=state.updates + 1),
+                    jnp.zeros([], jnp.float32), Aux({}))
+        return step
+
+    (x,) = records(0)
+    own = OptimConfig(optimizer="sgd", learning_rate=Linear(peak_value=PEAK, decay_steps=4))
+    state = Trainer(Pulled(), own, key=0, step=stepped).fit(chain(x), examples=EXAMPLES)
+    assert int(state.consumed) == EXAMPLES
+    whole = OptimConfig(optimizer="sgd", learning_rate=Linear(peak_value=PEAK))
+    with pytest.raises(ValueError):
+        Trainer(Pulled(), whole, key=0, step=stepped).fit(chain(x), examples=EXAMPLES)
 
 
 def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_clock_keeps_none(tmp_path):
