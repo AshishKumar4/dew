@@ -164,6 +164,43 @@ def test_what_a_gpu_has_spent_already_is_not_charged_to_a_program_again():
     assert resident.held == Collectives(groups=frozenset({(0, 1, 2, 3), (0, 1), (2, 3)}))
 
 
+def test_a_programs_code_is_held_beside_the_communicators_once():
+    """A program's code takes its GPUs' memory outside XLA's pool from its first run on, as its communicators
+    do: a program whose communicators fit the room but not with its code is refused, and a program admitted
+    again (another key compiling the same executable) charges its code once."""
+    room = dict.fromkeys(range(4), 3 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    resident = communicators.Resident()
+    loaded = communicators.Loaded(b"step", (0, 1, 2, 3), GIB // 4)
+    resident.admit(every, FOUR, room, lambda gpu: None, loaded)
+    resident.admit(every, FOUR, room, lambda gpu: None, loaded)
+    other = communicators.Loaded(b"other", (0, 1, 2, 3), GIB // 2)
+    with pytest.raises(CommunicatorRoom) as refused:
+        resident.admit(every, FOUR, room, lambda gpu: None, other)
+    assert refused.value.needed == dict.fromkeys(range(4), 2 * GIB + GIB // 2 + GIB // 4 + GIB // 2)
+
+
+def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeypatch):
+    """A program's communicators are read from its text once per executable, kept in Dew's cache by its
+    fingerprint as positions in its device assignment, so a warm start that loads it from the compilation
+    cache reads no text, and the same executable over other GPUs maps them to those."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+               "  %x = f32[8] parameter(0)\n"
+               "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+    read = []
+
+    def text():
+        read.append(1)
+        return program
+
+    first = communicators.collectives_kept(b"step", (0, 1, 2, 3), text)
+    again = communicators.collectives_kept(b"step", (3, 2, 1, 0), text)
+    assert read == [1]
+    assert first == Collectives(groups=frozenset({(0, 1), (2, 3)}))
+    assert again == Collectives(groups=frozenset({(3, 2), (1, 0)}))
+
+
 def test_programs_admitted_at_once_are_held_together():
     """Two programs compiled at once, each of whose communicators fits the room alone and not with the
     other's, are admitted one at a time: one is admitted and the other refused."""
