@@ -65,12 +65,9 @@ def test_a_measurement_is_paid_once_per_configuration(tmp_path, monkeypatch):
 def test_the_sized_pool_is_recorded_with_what_it_left_room_for(monkeypatch):
     """A pool Dew sized is recorded as the user's bound, the share it took and each GPU's room it left, which
     the fit check's record carries into the run record."""
-    monkeypatch.setattr(communicators, "needs_of", lambda: NEEDS)
-    monkeypatch.setattr(communicators, "gpu_count", lambda: 2)
-    monkeypatch.setattr(communicators, "gpu_memory", MEMORY.get)
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.97")
     monkeypatch.delenv("XLA_PYTHON_CLIENT_PREALLOCATE", raising=False)
-    communicators.sized_pool()
+    communicators.sized_pool(measure=lambda: NEEDS, memories=lambda: MEMORY)
     sized = communicators.SIZED
     assert sized is not None and sized["requested"] == 0.97
     assert float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) == sized["share"] < 0.97
