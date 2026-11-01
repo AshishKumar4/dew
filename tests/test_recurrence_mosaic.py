@@ -709,15 +709,16 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                and not (name in RATED and dtype == jnp.float32)
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
                                                            ('qwen3.5-27b-gdn', jnp.float32),
+                                                           ('kimi-linear-kda', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16)})
                and not (variant is not None and (training or packed or dtype == jnp.float32))]
-"""The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
-every geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the gated delta
-rule's 16-bit training pass (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key
-dimension); one row's 16-bit forward at its derived tiles apart from each of its variants (`variant`, a
-test each: an fp32 forward, which every family refuses, has none). One test compiling them all took 674
-seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three variants 117 on sm80 at
-9e65ee222's gate, each about the forward's 89 (armada)."""
+"""The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
+geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
+gated delta rule in both and of Kimi delta attention and the SSD in 16 bits (Kimi's keys, 128 wide, past what
+an fp32 call takes under a decay a key dimension); one row's 16-bit forward at its derived tiles apart from
+each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none). One test
+compiling them all took 674 seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three
+variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada)."""
 
 
 
