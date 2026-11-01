@@ -93,6 +93,30 @@ def test_a_decision_corpus_counts_its_source_examples():
     assert counted(loader) == [23]
 
 
+def test_a_decision_corpus_counts_the_examples_it_kept_apart_from_those_its_layout_refused():
+    """Ten decision examples, two of them asking a question no window holds, bound in examples: the corpus
+    counts the eight it kept as `data/rows` and the two its layout refused as unfit, together the ten its
+    batches consume."""
+    from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
+
+    from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
+
+    layout = StateFirstLayout(max_len=128)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout)
+    asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
+    unfit = {**asked, "long": Noul("Is it on? " + "Read the state whole. " * 100)}
+    answers = {"first": "true", "second": "false", "long": "true"}
+    records = [{"example": Example(f"state {index}", unfit if index in (3, 7) else asked,
+                                   {name: answers[name] for name in (unfit if index in (3, 7) else asked)})}
+               for index in range(10)]
+    loader = compile(Pipeline(Memory(records)).pipe(decisions).batch(BATCH), read="memory",
+                     objective=objective.data(), examples=10)
+    assert read_whole(loader, "segments")[1] == 10
+    assert counted(loader) == [8]
+    assert counted(loader, "data/rejected/") == [2]
+
+
 class Refusing:
     """An objective's expansion of each record into `id % 3 + 1` rows, refusing every record whose id is a
     multiple of five whole, as a decision layout refuses an example whose row it cannot lay out."""
