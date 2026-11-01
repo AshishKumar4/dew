@@ -257,7 +257,7 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
 def merged(units: list[Path]) -> Path:
     """The recording's units (`write_seeded`'s, their sites disjoint) joined and saved as the fixture, its
     provenance the units' own, which must agree."""
-    from recorded_references import save
+    from fetched_fixtures import save
 
     stored: dict[str, np.ndarray] = {}
     for unit in units:
