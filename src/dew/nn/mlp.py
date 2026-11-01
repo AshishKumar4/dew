@@ -28,8 +28,8 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
-from .ngpt import NGPT, gain
-from .precision import at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
+from .ngpt import NGPT, normed_hidden
+from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, LogicalAxes, constrain, logical_axes
 
@@ -248,12 +248,8 @@ class GatedMLP(nn.Module):
         """nGPT's hidden activations: the gate and up projections times their gains in at least fp32,
         back in their dtype, their gated product in at least fp32, unit-normed in the activations'
         dtype (dory.py:188-194)."""
-        factor = ngpt.hidden(self.out_features)
-        wide = at_least_fp32(jnp.result_type(gate, up))
-        gate = (gate.astype(wide) * gain(self.suv_gate, factor)).astype(gate.dtype)
-        up = (up.astype(wide) * gain(self.suv_up, factor)).astype(up.dtype)
-        hidden = gated_product(activation, axes=self._axes(gate))(gate.astype(wide), up.astype(wide))
-        return l2norm(hidden.astype(gate.dtype))
+        return normed_hidden(gate, up, self.suv_gate, self.suv_up, ngpt.hidden(self.out_features),
+                             gated_product(activation, axes=self._axes(gate)))
 
     def _down(self, hidden, train: bool):
         if self.dropout_rate:

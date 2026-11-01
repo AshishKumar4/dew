@@ -51,6 +51,7 @@ import jax.experimental.topologies as topologies
 import numpy as np
 from jax.experimental import serialize_executable
 
+from dew import communicators
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
@@ -145,13 +146,16 @@ class AheadProgram:
 
     def taken(self, lowered: jax.stages.Lowered, devices: list) -> jax.stages.Compiled:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
-        where that is another program than this one."""
+        where that is another program than this one, and admitted as a compiled one is
+        (`dew.communicators.admit`)."""
         if program_of(lowered) != self.program:
             raise ValueError("the sampled step compiled ahead is another program than the one this run "
                              "compiles: compile it ahead from this run's config, with its inspection")
         in_tree, out_tree = self.trees
-        return serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
-                                                         backend=devices[0].client)
+        loaded = serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
+                                                           backend=devices[0].client)
+        communicators.admit(loaded)
+        return loaded
 
 
 @dataclasses.dataclass(frozen=True)
@@ -243,15 +247,18 @@ class AheadOfTime:
 
     def loaded(self) -> jax.stages.Compiled:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
-        `generation`: called with the state and batch the step was compiled for, it runs the step."""
+        `generation`: called with the state and batch the step was compiled for, it runs the step. It is
+        admitted as a compiled one is (`dew.communicators.admit`)."""
         found = jax.devices()
         generations = {gpu_target(device.device_kind).generation for device in found}
         if len(found) != self.devices or generations != {self.generation}:
             raise ValueError(f"this step was compiled for {self.devices} {self.generation} devices; this "
                              f"process has {len(found)} of {sorted(generations)}")
         in_tree, out_tree = self.trees
-        return serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
-                                                         backend=found[0].client)
+        loaded = serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
+                                                           backend=found[0].client)
+        communicators.admit(loaded)
+        return loaded
 
 
     def derived_for(self, device: GpuTarget) -> GpuTarget:
