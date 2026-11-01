@@ -767,6 +767,37 @@ def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
     assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
 
 
+class Questioned:
+    """An objective's step that makes `id % 3 + 1` rows of each record (a decision layout's row a
+    question), marked as one (`FlatMap.examples`) where an objective appends it."""
+
+    identity = "questioned@1"
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question)}
+                     for question in range(int(element["id"]) % 3 + 1))
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read):
+    """A training read bounded to its 12 records, in one order or each share its own, through an
+    objective's step that makes 24 rows of them (`Questioned`): the corpus's rows (data/rows) are its 12
+    source examples, counted before the step makes rows of them, and not its rows again after (row 1944)."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4).named("asked"))
+    chain = chain.shuffle(seed=3, window=12) if read == "streamed" else chain.shuffle(seed=3)
+    data = compile(chain.batch(2), objective=ObjectiveData(train=(Questioned(),)), read=read, loading=READ,
+                   examples=12)
+    stream = data.train(DataPartition())
+    try:
+        rows = sum(len(batch["id"]) for batch in stream)
+        counts = data.statistics()
+    finally:
+        stream.close()
+    assert rows == sum(int(record) % 3 + 1 for record in ids) == 24
+    assert counts["data/rows/asked"] == 12
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_a_mixtures_grain_step_drops_rows_it_rejects_and_counts_them(read):
     """A Grain step after a mix that rejects rows (`Rejected`) has them dropped before the batch
