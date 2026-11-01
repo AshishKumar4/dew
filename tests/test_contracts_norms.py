@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 from contract_support import EDGES, OWN_FORWARD_ORDERS, assert_contract, normal_draw
 
-from dew.nn import precision
-from dew.nn.activations import exact_gelu
+from dew.nn import ngpt, precision
+from dew.nn.activations import exact_gelu, gated_product
 
 
 def joined(seam):
@@ -100,6 +100,51 @@ def test_the_fused_norms_and_products_hold_every_order(edge):
         del sites["a gated RMS norm"]
     for name, (fn, plain, primals, direction, pulled_back) in sites.items():
         assert_contract(fn, primals, direction, pulled_back, f"{name} {edge}", truth_fn=plain, plain_fn=plain)
+
+
+def plain_stepped(residual, branch, alpha):
+    """nGPT's join as its formula reads, each unit norm `precision.l2norm`'s: the reference its two-pass
+    reverse (`ngpt.stepped`) is held to."""
+    wide = precision.at_least_fp32(jnp.result_type(residual, branch, alpha))
+    start, end = (precision.l2norm(x).astype(wide) for x in (residual, branch))
+    rate = jnp.abs(alpha.astype(wide) * STEP)
+    return precision.l2norm(start + rate * (end - start)).astype(residual.dtype)
+
+
+def plain_hidden(gate, up, gate_gain, up_gain):
+    """nGPT's normed hidden as its formula reads (`GatedMLP._ngpt_hidden` before its two-pass reverse):
+    the gained gate and up rounded to their dtype, their SiLU product in at least fp32, unit-normed."""
+    wide = precision.at_least_fp32(jnp.result_type(gate, up))
+    gated = (gate.astype(wide) * ngpt.gain(gate_gain, HIDDEN)).astype(gate.dtype)
+    upped = (up.astype(wide) * ngpt.gain(up_gain, HIDDEN)).astype(up.dtype)
+    product = gated_product("swiglu", implementation="xla")
+    return precision.l2norm(product(gated.astype(wide), upped.astype(wide)).astype(gate.dtype))
+
+
+STEP, HIDDEN = 0.05, 4.0
+"""A join's step scale and the hidden gains' factor, at a model's magnitudes."""
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_ngpts_join_and_normed_hidden_hold_every_order(edge):
+    """nGPT's join (`ngpt.stepped`) and normed hidden (`ngpt.normed_hidden`), each through
+    `generation.linear_tangent` with a reverse of its own: every order finite wherever float64 is a normal
+    float32 and the plain formula, the norms, the step, the gains and the product as written, is."""
+    residual, branch, gate, up = normal_draw(2671, (3, 16), (3, 16), (3, 16), (3, 16), scale=EDGES[edge])
+    alpha, gate_gain, up_gain = normal_draw(2672, (16,), (16,), (16,))
+    directions = normal_draw(2673, (3, 16), (3, 16), (16,), (3, 16), (3, 16), (16,), (16,),
+                             scale=EDGES[edge])
+    (cotangent,) = normal_draw(2674, (3, 16))
+    product = gated_product("swiglu", implementation="xla")
+    sites = {
+        "nGPT's join": (lambda residual, branch, alpha: ngpt.stepped(residual, branch, alpha, STEP),
+                        plain_stepped, (residual, branch, alpha), directions[:3]),
+        "nGPT's normed hidden": (lambda gate, up, gate_gain, up_gain: ngpt.normed_hidden(
+                                     gate, up, gate_gain, up_gain, HIDDEN, product),
+                                 plain_hidden, (gate, up, gate_gain, up_gain), directions[3:]),
+    }
+    for name, (fn, plain, primals, direction) in sites.items():
+        assert_contract(fn, primals, direction, cotangent, f"{name} {edge}", truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
