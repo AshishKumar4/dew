@@ -376,6 +376,34 @@ def test_the_mosaic_launches_state_their_work(training):
     assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
 
 
+@lowers('sm80')
+@pytest.mark.parametrize('target', ['sm80', 'sm86'])
+def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(target):
+    """A decay a key dimension 16 wide over values 8 wide (the recurrence stability sites' geometry), its
+    floored gradient through the template lowered for an Ampere GPU: the key memory backward copies the
+    entered memory's 8 rows of 64 bf16 columns in with cp.async, one 8-row tile at its rows' 128-byte
+    swizzle, whose copy layout Mosaic GPU refuses ('Number of tiles is not a multiple of 4',
+    stab-floorless-a100-deba5b564); staged at the swizzle the copy tiles it lowers."""
+    rows, length, value_heads, width, value_width = 2, 70, 16, 16, 8
+    operands = [jax.ShapeDtypeStruct((rows, length, 1, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, value_width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, floor=FLOOR, write_bound=1.0)
+
+    def rule(*given):
+        return chunk_on('mosaic_gpu', hooks, Chunk(*given[:3], log_decay=given[3], beta=given[4]))
+
+    def loss(*given):
+        out, final = rule(*given)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    # Abstract devices stating the GPU's capability, which Mosaic GPU lowers cp.async's waits for.
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), target)
+    with generation.assumed(target), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
+
+
 def test_each_launch_lowers_once_however_many_layers_call_it():
     """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
     test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the

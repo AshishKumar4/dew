@@ -192,10 +192,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
         - stages: the deepest ring of the states launch's steps of which a multiprocessor holds as many
           programs as one stage's (`states_held`, `_staged`), one where none of two or more is legal.
-        - a forward without a gradient: the same rules without the fast backward's (`Tiles.forward`, where
-          they differ): on an H100 the 27B gated delta net's forward took 0.513 ms at the training call's
-          32-wide block, its states launch's 192 programs two waves, and 0.433 at 64 wide, one wave of 96,
-          where fla's port took 0.440 (JS-fwdtiles2-h100-a7ec9a134).
+        - a forward without a gradient: the same rules without the fast backward's (`Tiles.forward`), where
+          they run the states launch in one wave and the training call's do not: on an H100 the 27B gated
+          delta net's forward took 0.513 ms at the training call's 32-wide block, its states launch's 192
+          programs two waves, and 0.433 at 64 wide, one wave of 96, where fla's port took 0.440
+          (JS-fwdtiles2-h100-a7ec9a134); past one wave either way the training call's, as keys 128 and
+          values 256 wide over 16 heads of 8 rows took the states launch 0.114 ms 64 wide three deep against
+          0.095 32 wide five deep (batch-window-h100-0b202f7cc).
         None where no block is legal: the launch refuses the call.
 
         A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) steps the
@@ -208,6 +211,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
             if trained is None:
                 return None
             alone = self._derive(ba, target, training=False, refused=refused[False])
+            if alone is not None and target.multiprocessors is not None and (
+                    not self._one_wave(ba, alone, target) or self._one_wave(ba, trained, target)):
+                alone = None
             joined = trained if alone in (None, trained) else dataclasses.replace(trained, forward=alone)
             spilled = report.spilled(self, ba, joined)
             if not spilled:
@@ -224,7 +230,6 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(target, _dtype(ba))
         if family is None:
             return None
-        _, columns, _ = _widths(ba, family)
         blocks = self._blocks(ba, family)
         # Each rule gives way from the widest block to the next narrower where it does not hold, a block's
         # tiles staged as a rule first reads them: the widest legal, then the widest at which the fast
@@ -244,20 +249,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert chosen is not None
         if target.multiprocessors is None:
             return chosen
-        arguments = ba.arguments
-        batch, length, heads, _ = arguments["value"].shape
-        sequences = batch * (1 if arguments.get("starts") is None
-                             else arguments.get("max_segments") or length)
-        multiprocessors = target.multiprocessors
-
         def one_wave(tiles: mainloop.Tiles) -> bool:
-            programs = columns // tiles.block_v * sequences * heads
-            return programs <= multiprocessors * self.states_held(ba, tiles, target)
+            return self._one_wave(ba, tiles, target)
 
         if not one_wave(chosen):
-            programs = columns // chosen.block_v * sequences * heads
-            return self._walked(ba, chosen, target,
-                                programs // (multiprocessors * self.states_held(ba, chosen, target)),
+            return self._walked(ba, chosen, target, self._programs(ba, chosen, target)
+                                // (target.multiprocessors * self.states_held(ba, chosen, target)),
                                 training=training)
         # Narrower only while the fast backward holds where it held at the block given way from, and only
         # while the block's states ring holds one stage: of one wave, the widest whose ring holds two.
@@ -270,6 +267,26 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 break
             chosen = tiles
         return chosen
+
+    def _programs(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
+                  target: generation.GpuTarget) -> int:
+        """The states launch's programs at `tiles`: a value block of each sequence and head."""
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        _, columns, _ = _widths(ba, family)
+        arguments = ba.arguments
+        batch, length, heads, _ = arguments["value"].shape
+        sequences = batch * (1 if arguments.get("starts") is None
+                             else arguments.get("max_segments") or length)
+        return columns // tiles.block_v * sequences * heads
+
+    def _one_wave(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
+                  target: generation.GpuTarget) -> bool:
+        """Whether the states launch's programs at `tiles` run in one wave of `target`'s multiprocessors, as
+        many a multiprocessor as it holds (`states_held`)."""
+        assert target.multiprocessors is not None, "a wave counts the device's multiprocessors"
+        held = target.multiprocessors * self.states_held(ba, tiles, target)
+        return self._programs(ba, tiles, target) <= held
 
     def _walked(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                 waves: int, *, training: bool = True) -> mainloop.Tiles:

@@ -384,7 +384,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 ## 8. Determinism, D and the backward
 
-- **The attention backward takes FlashAttention-3's structure:** 5 products, dQ summed across key tiles by atomic adds where that is faster (FA3's TMA reduce-add), the default. Deterministic mode, one flag away, sums dQ in a fixed order: the fused, ticket-ordered launch under its proof and GPU gate (P5), or split programs (7 products: dK/dV and dQ) where those are faster, in one launch or two.
+- **The attention backward takes FlashAttention-3's structure:** 5 products, dQ summed across key tiles by atomic adds where that is faster (FA3's TMA reduce-add), the default. Deterministic mode, one flag away, sums dQ in a fixed order: the fused, ticket-ordered launch under its proof and GPU gate (P5), or split programs (7 products: dK/dV and dQ) where those are faster, in one launch or two. A launch's in-place operands are refs of distinct values: two equal zeros are one value to XLA, which a dynamic-slice fusion wrapping the launch passes once for both (row 3180: the one launch's dK and dV, and two hook gradients of one shape, stacked into one ref).
 - **The default is the fastest form that passes both checks, atomic where that is faster** (owner, decided before and confirmed 2026-10-21). Deterministic mode is one flag away and gets the same accuracy and speed gates. The fused ticket form, once proven, makes deterministic mode cost what FA's 5 products cost. The scoreboard measures both modes.
 - **D** is chosen by measurement among passing forms:
   - (a) the anchored pre-pass;

@@ -35,6 +35,7 @@ import numpy as np
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, l2norm
@@ -575,6 +576,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
                                      floor=hooks.floor, bound=hooks.inverse_bound, rounded=fast_rounding())
+            if kernel == 'derived':
+                return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
+                                    chunk_size=chunk_size, dtype=work)
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
@@ -615,6 +619,7 @@ class PortCase:
     decayed: bool = True
     bound: float | None = None
     per_key: bool = False
+    packed: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -744,13 +749,83 @@ port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
+DERIVED_SUPPORTS: tuple[Requirement[PortCase], ...] = (
+    Requirement('measured', lambda case: False,
+                "the forms derived from the token update (`derived_rule`), taken where a call names them: "
+                "held on par with the portable math by check 1 and not yet measured against it",
+                row=INHERENT, kind='measured'),
+)
+"""Where the derived forms run (`derived_rule`): a call that names them."""
+
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('derived', DERIVED_SUPPORTS),
+                                Kernel('xla', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
 recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
-portable math."""
+portable math; the forms derived from the token update (`derived_rule`) where a call names them."""
+
+
+def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,
+                 chunk_size: int, dtype):
+    """The recurrence over chunks by the forms derived from its token update (`dew.algebra.scan`, the compact
+    WY form and its prefix derived, not written): each value head's update `h = D h - beta k (k^T D h) + beta
+    k v^T` with the delta rule (`recurrence.update`'s), `h = D h + beta k v^T` without it, `D = exp(g)` a
+    head's or each key's own, read `scale q^T h`; `(output, final memory)` in `dtype`, the memory entering
+    `state` (zero where None). A length off the chunk grid is padded with tokens that leave the memory as it
+    was (zero keys and write gates, a unit decay). `starts` `[B, S]`, where given, marks packed documents'
+    first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`)."""
+    from dew.algebra import scan
+
+    group = value.shape[2] // key.shape[2]
+    if group > 1:
+        query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    rows, length, heads, columns = value.shape
+    width = key.shape[-1]
+    per_key = g.ndim == 4
+
+    def update(h, q, k, v, g, beta):
+        del q
+        decayed = jnp.exp(g).reshape(-1, 1) * h
+        written = v - k @ decayed if delta else v
+        return decayed + beta * k[:, None] * written[None, :]
+
+    def readout(h, q, k, v, g, beta):
+        del k, v, g, beta
+        return scale * (q @ h)
+
+    axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
+            "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
+    reset = None if starts is None else "first"
+    declared = axes if reset is None else {**axes, reset: ("time",)}
+    forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
+                                       state=((width, columns), dtype), reset=reset))
+    chunks = -(-length // chunk_size)
+    padded = chunks * chunk_size - length
+
+    def laid(x):
+        # [B, S, H, ...] padded and laid out as [B, H, chunks, C, ...].
+        x = jnp.pad(x, [(0, 0), (0, padded)] + [(0, 0)] * (x.ndim - 2))
+        x = jnp.moveaxis(x, 2, 1)
+        return x.reshape(rows, heads, chunks, chunk_size, *x.shape[3:])
+
+    operands = {name: laid(x.astype(dtype))
+                for name, x in zip(axes, (query, key, value, g, beta), strict=True)}
+    if reset is not None:
+        # Each head's tokens reset where their row's document starts; a padded token starts none.
+        operands[reset] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
+    entering = (jnp.zeros((rows, heads, width, columns), dtype) if state is None else state.astype(dtype))
+
+    def walked(operands, h):
+        def one(carried, chunk):
+            return forms.step(carried, chunk), forms.mapped(chunk, carried)
+
+        carried, outputs = jax.lax.scan(one, (jnp.zeros((width,), jnp.float32), h), operands)
+        return outputs.reshape(-1, columns), carried[1]
+
+    out, final = jax.vmap(jax.vmap(walked))(operands, entering)
+    return jnp.moveaxis(out[:, :, :length], 1, 2), final
 
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
@@ -772,7 +847,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
-                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4)
+                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
+                    packed=starts is not None)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
@@ -1033,12 +1109,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 f"the recurrence template's fast backward takes no gradient of this call ({form}, or its "
                 "launches past the device's at these tiles): the delta rule's selector gives a training call "
                 "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
-        grads = mainloop_backward.gradients(query, key, value, g, beta, state, out_grad, final_grad,
-                                            starts=starts, firsts=firsts, max_segments=max_segments,
-                                            scale=scale, inverse=inverse, kept=kept, delta=delta,
-                                            rounded=rounded, skip=skip, **run)
-        dskip = grads[6] if len(grads) > 6 else None
-        return (*grads[:5], None if state is None else grads[5], None, None,
+        *grads, dh0, dskip = mainloop_backward.gradients(
+            query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
+            max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta, rounded=rounded,
+            skip=skip, **run)
+        return (*grads, None if state is None else dh0, None, None,
                 None if dskip is None else dskip.astype(skip.dtype))
 
     rule.defvjp(forward, backward)
@@ -1214,15 +1289,6 @@ def _scan_widths(width: int) -> int:
     """A scan kernel's width for a head or state `width` (`_rated_scan`): the power of two at or past it, at
     least 16, the smallest block Triton's dot takes (`SSD_SUPPORTS`)."""
     return max(16, 1 << (width - 1).bit_length())
-
-
-RESET_DECAY = -1e4
-"""The log decay a document's first token takes in place of `A dt` in the TPU's Pallas scan: the
-state entering it is multiplied by `exp(-1e4)`, which is 0 in fp32. A step's own `A dt` is never
-positive, so every span containing a reset sums to at most this and decays to exactly 0, and a span
-without one never sees it. It stays finite because the kernel forms its segment sums as a matmul
-against a 0/1 triangle, where an infinity times 0 is a NaN; and it stays small enough that thousands
-of resets in one shard's total decay are nowhere near fp32's range."""
 
 
 def ssd_operands(x, dt, A, B, C, chunk_size: int, starts=None):

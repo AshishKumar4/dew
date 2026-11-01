@@ -109,12 +109,11 @@ def tile_of(values: dict, tile: int) -> dict:
     return {name: value[keys] if AXES[name][0] == "keys" else value for name, value in values.items()}
 
 
-def walked(forms: derive.Derived, values: dict, tiles: range):
-    """The state after walking `tiles` of the keys in order, from the empty state."""
-    first = tile_of(values, 0)
-    state = forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
+def walked(forms: derive.Derived, tiles: list[dict]):
+    """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state."""
+    state = forms.init({name: (value.shape, value.dtype) for name, value in tiles[0].items()})
     for tile in tiles:
-        state = forms.step(state, tile_of(values, tile))
+        state = forms.step(state, tile)
     return state
 
 
@@ -122,7 +121,7 @@ def walked_whole(forms: derive.Derived):
     """The declaration's derived step over every key tile in order, finished: a function of (q, k, v)."""
     def run(q, k, v):
         values = operands(q, k, v)
-        return forms.finish(walked(forms, values, range(KEYS // TILE)), values)
+        return forms.finish(walked(forms, [tile_of(values, tile) for tile in range(KEYS // TILE)]), values)
 
     return run
 
@@ -145,8 +144,8 @@ def test_two_walks_merged_compute_the_declared_function(name):
 
     def split(q, k, v):
         values = operands(q, k, v)
-        first = walked(forms, values, range(tiles // 2))
-        second = walked(forms, values, range(tiles // 2, tiles))
+        first = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2)])
+        second = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2, tiles)])
         return forms.finish(forms.merge(first, second), values)
 
     assert_as_exact(jax.jit(split), jax.jit(whole(DECLARED[name][0])), draw, f"{name} merged", seeds=16)

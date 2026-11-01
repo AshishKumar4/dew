@@ -407,6 +407,60 @@ def test_hoisted_index_chains_equal_in_every_thread_are_one_register():
     assert (shared - constant, distinct - constant) == (1, 2)
 
 
+def _positions_loop(addend: int) -> str:
+    """A launch of 128 threads whose loop compares a running row against two positions it forms each step
+    from the thread's own column (`(lane % 4) * 2`, a pair): `own + 2`, and `own + 1 + addend`, the same
+    numbers in every thread as the first where `addend` is 1."""
+    return f"""
+      module {{
+        func.func @kernel(%bound: vector<2xi32>) {{
+          %zero = arith.constant 0 : index
+          %one = arith.constant 1 : index
+          %steps = arith.constant 16 : index
+          %threads = arith.constant 128 : index
+          %four = arith.constant 4 : i32
+          %two = arith.constant 2 : i32
+          %first = arith.constant dense<[0, 1]> : vector<2xi32>
+          %plus_two = arith.constant dense<2> : vector<2xi32>
+          %plus_one = arith.constant dense<1> : vector<2xi32>
+          %plus_addend = arith.constant dense<{addend}> : vector<2xi32>
+          gpu.launch blocks(%bx, %by, %bz) in (%gx = %one, %gy = %one, %gz = %one)
+            threads(%tx, %ty, %tz) in (%sx = %threads, %sy = %one, %sz = %one) {{
+              %last = scf.for %i = %zero to %steps step %one iter_args(%row = %bound) -> (vector<2xi32>) {{
+                %thread = gpu.thread_id x
+                %id = arith.index_cast %thread : index to i32
+                %lane = arith.remui %id, %four : i32
+                %own = arith.muli %lane, %two : i32
+                %spread = vector.broadcast %own : i32 to vector<2xi32>
+                %columns = arith.addi %spread, %first : vector<2xi32>
+                %a = arith.addi %columns, %plus_two : vector<2xi32>
+                %b1 = arith.addi %columns, %plus_one : vector<2xi32>
+                %b = arith.addi %b1, %plus_addend : vector<2xi32>
+                %behind_a = arith.cmpi slt, %a, %row : vector<2xi32>
+                %behind_b = arith.cmpi slt, %b, %row : vector<2xi32>
+                %either = arith.ori %behind_a, %behind_b : vector<2xi1>
+                %kept = arith.select %either, %row, %a : vector<2xi1>, vector<2xi32>
+                %next = arith.select %behind_b, %kept, %b : vector<2xi1>, vector<2xi32>
+                scf.yield %next : vector<2xi32>
+              }}
+              llvm.inline_asm has_side_effects "", "r" %last : (vector<2xi32>) -> ()
+              gpu.terminator
+            }}
+          return
+        }}
+      }}
+    """
+
+
+def test_positions_formed_in_the_loop_holding_the_same_numbers_share_their_registers():
+    """Two positions a step forms from the thread's own columns, compared against a running row: where they
+    hold the same numbers in every thread (`own + 2` and `own + 1 + 1`) they are one pair of registers, where
+    they differ (`own + 1 + 3`) two, as ptxas compares a mask's positions against a few registers (the
+    two-launch dQ backward's 48 index casts, 24 distinct numbers, 24 `ISETP` operands)."""
+    same, different = (analyzed(_positions_loop(addend)).total for addend in (1, 3))
+    assert different - same == 2
+
+
 _TIED_SCALAR = """
   module {
     func.func @kernel(%x: f32) -> f32 {

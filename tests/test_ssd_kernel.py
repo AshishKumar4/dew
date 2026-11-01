@@ -32,7 +32,8 @@ import pytest
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit, stepwise_scan
 
-from dew.nn.kernels.recurrence_chunk import RESET_DECAY, ssd_operands
+from dew.algebra.scan import RESET_DECAY
+from dew.nn.kernels.recurrence_chunk import ssd_operands
 from dew.nn.kernels.ssd import ssd_chunk_scan
 
 pytestmark = pytest.mark.kernel
