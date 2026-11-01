@@ -3,9 +3,9 @@ a constructor for each kind of equation of the language, and the conversion of a
 and of an extracted term back into equations.
 
 A term names its equation's primitive and refers to the primitive's other parameters by an index into the
-region's table of them (`Region.params`), so a rule rewrites the math and keeps each parameter as the program
-wrote it. Each term carries the number of elements of its value where a rule cannot derive it (a leaf's, a
-broadcast's, a reduction's), from which the `elements` fact follows for the rest (`dew.algebra.facts`)."""
+region's table of them (`Region.params`), and a literal to its exact value in the region's table of literals,
+so a rule rewrites the math and keeps each parameter and constant as the program wrote it. Every term made
+from an equation states its shape (`rules.shape`), which rules read before they join or move values."""
 
 from __future__ import annotations
 
@@ -14,8 +14,11 @@ from collections.abc import Callable, Mapping
 
 import jax
 import numpy as np
-from egglog import Expr, StringLike, Vec, f64Like, get_callable_args, get_literal_value, i64, i64Like, method
+from egglog import Expr, StringLike, Vec, get_callable_args, get_literal_value, i64, i64Like, method
+from jax.core import ShapedArray
 from jax.extend import core as jcore
+
+from dew.nn.precision import PROTECTED
 
 BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "rem", "nextafter"})
 UNARY = frozenset({"neg", "exp", "exp2", "log", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign", "tanh",
@@ -33,19 +36,22 @@ class Term(Expr):
     or an equation of the language over other terms."""
 
     @classmethod
-    def leaf(cls, index: i64Like, elements: i64Like) -> Term: ...
+    def leaf(cls, index: i64Like) -> Term: ...
 
     @classmethod
-    def literal(cls, value: f64Like, params: i64Like) -> Term: ...
+    def literal(cls, index: i64Like) -> Term: ...
+
+    @classmethod
+    def bundle(cls, items: Vec[Term]) -> Term: ...
 
     @method(cost=1)
-    def binary(self, name: StringLike, other: Term) -> Term: ...
+    def binary(self, name: StringLike, other: Term, params: i64Like) -> Term: ...
+
+    @method(cost=1)
+    def compare(self, name: StringLike, other: Term, params: i64Like) -> Term: ...
 
     @method(cost=1)
     def unary(self, name: StringLike, params: i64Like) -> Term: ...
-
-    @method(cost=1)
-    def compare(self, name: StringLike, other: Term) -> Term: ...
 
     @method(cost=1)
     def select(self, false: Term, true: Term) -> Term: ...
@@ -54,10 +60,10 @@ class Term(Expr):
     def convert(self, params: i64Like) -> Term: ...
 
     @method(cost=1)
-    def shaped(self, name: StringLike, params: i64Like, elements: i64Like) -> Term: ...
+    def shaped(self, name: StringLike, params: i64Like) -> Term: ...
 
     @method(cost=1)
-    def reduce(self, monoid: StringLike, axes: Vec[i64], params: i64Like, elements: i64Like) -> Term: ...
+    def reduce(self, monoid: StringLike, axes: Vec[i64], params: i64Like) -> Term: ...
 
 
 @dataclasses.dataclass
@@ -73,36 +79,47 @@ class Opaque:
 
 @dataclasses.dataclass
 class Region:
-    """A jaxpr held as terms: each leaf's value in order (`leaves`, the inputs and constants first), the
-    equations outside the language in program order (`opaque`), each output's term (`outputs`, None for a
-    literal output, kept in `literal_outputs`), and the parameters the terms refer to by index (`params`: a
-    primitive and its parameters)."""
+    """A jaxpr held as terms: the count of its leaves (the inputs and constants first, then the outputs of the
+    equations outside the language), those equations in program order (`opaque`), each output's term (None
+    for a literal output, kept in `literal_outputs`), the parameters terms refer to by index (`params`: a
+    primitive and its parameters), its literals' exact values (`literals`), each term's shape as its equation
+    states it (`shapes`) and the longest chain of the language's equations (`depth`)."""
 
     leaves: int
     opaque: list[Opaque]
     outputs: list[Term | None]
-    literal_outputs: list[object]
+    literal_outputs: list
     params: list[tuple[jcore.Primitive, Mapping]]
+    literals: list[np.ndarray]
+    shapes: list[tuple[Term, tuple[int, ...]]]
+    depth: int
+    equations: int
+
+    def roots(self) -> list[Term]:
+        """The terms extraction chooses forms for: each output and each input of an equation outside the
+        language, once each, in program order."""
+        seen: dict[str, Term] = {}
+        for term in [*(term for opaque in self.opaque for term in opaque.inputs), *self.outputs]:
+            if term is not None:
+                seen.setdefault(str(term), term)
+        return list(seen.values())
 
 
 def protected(equation: jcore.JaxprEqn) -> bool:
-    """Whether an equation lies in a region a precision module marks protected (`dew.algebra.PROTECTED`, an
-    error-free transform's), which survives autodiff in the name stack its traced equations carry."""
-    from dew.algebra import PROTECTED
-
+    """Whether an equation lies in a region a precision module marks protected (`PROTECTED`, an error-free
+    transform's), which survives autodiff in the name stack its traced equations carry."""
     return PROTECTED in str(equation.source_info.name_stack)
 
 
-def _elements(aval) -> int:
-    return int(np.prod(getattr(aval, "shape", ()), dtype=np.int64))
-
-
-def region(closed: jcore.ClosedJaxpr) -> Region:
+def region(closed: jcore.Jaxpr) -> Region:
     """`closed`'s equations as terms: each of the language a constructor over its inputs' terms, each other
     one (and each protected one, `protected`) a leaf for each output, after its inputs' terms."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
     indexed: dict[tuple[str, str], int] = {}
+    literals: list[np.ndarray] = []
+    shapes: list[tuple[Term, tuple[int, ...]]] = []
+    depths: dict[jcore.Var, int] = {}
 
     def param(primitive: jcore.Primitive, values: Mapping) -> int:
         key = (primitive.name, repr(sorted(values.items(), key=lambda item: item[0])))
@@ -114,34 +131,47 @@ def region(closed: jcore.ClosedJaxpr) -> Region:
     env: dict[jcore.Var, Term] = {}
     leaves = 0
     for var in [*jaxpr.constvars, *jaxpr.invars]:
-        env[var] = Term.leaf(leaves, _elements(var.aval))
+        env[var] = Term.leaf(leaves)
+        shapes.append((env[var], _shape(var)))
         leaves += 1
 
     def read(atom) -> Term:
         if isinstance(atom, jcore.Literal):
-            return Term.literal(float(np.asarray(atom.val)), param(jax.lax.convert_element_type_p,
-                                                                   {"new_dtype": atom.aval.dtype}))
+            literals.append(np.asarray(atom.val, dtype=getattr(atom.aval, "dtype", None)))
+            term = Term.literal(len(literals) - 1)
+            shapes.append((term, _shape(atom)))
+            return term
         return env[atom]
 
     opaque: list[Opaque] = []
     for equation in jaxpr.eqns:
         term = None if protected(equation) else _term(equation, read, param)
         if term is not None:
-            env[equation.outvars[0]] = term
+            out = equation.outvars[0]
+            env[out] = term
+            shapes.append((term, _shape(out)))
+            depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
+                                   if not isinstance(atom, jcore.Literal)), default=0)
             continue
         outputs = []
         for var in equation.outvars:
-            env[var] = Term.leaf(leaves, _elements(var.aval))
+            env[var] = Term.leaf(leaves)
+            shapes.append((env[var], _shape(var)))
             outputs.append(leaves)
             leaves += 1
         opaque.append(Opaque(equation, [None if isinstance(atom, jcore.Literal) else env[atom]
                                         for atom in equation.invars],
                              [atom.val if isinstance(atom, jcore.Literal) else None
-                              for atom in equation.invars],
-                             outputs))
+                              for atom in equation.invars], outputs))
     outputs = [None if isinstance(atom, jcore.Literal) else env[atom] for atom in jaxpr.outvars]
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
-    return Region(leaves, opaque, outputs, literal_outputs, params)
+    return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
+                  max(depths.values(), default=0), len(jaxpr.eqns))
+
+
+def _shape(atom) -> tuple[int, ...]:
+    """An array value's shape; a value of no shape (a token, a key's) has none the rules read."""
+    return tuple(atom.aval.shape) if isinstance(atom.aval, ShapedArray) else ()
 
 
 def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | None:
@@ -149,79 +179,78 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
     name, primitive = equation.primitive.name, equation.primitive
     if len(equation.outvars) != 1:
         return None
-    if name in BINARY and len(equation.invars) == 2 and not equation.params:
-        return read(equation.invars[0]).binary(name, read(equation.invars[1]))
+    if name in BINARY and len(equation.invars) == 2:
+        return read(equation.invars[0]).binary(name, read(equation.invars[1]),
+                                               param(primitive, equation.params))
     if name in COMPARISONS and len(equation.invars) == 2:
-        return read(equation.invars[0]).compare(name, read(equation.invars[1]))
+        return read(equation.invars[0]).compare(name, read(equation.invars[1]),
+                                                param(primitive, equation.params))
     if name in UNARY and len(equation.invars) == 1:
         return read(equation.invars[0]).unary(name, param(primitive, equation.params))
-    if name == "convert_element_type":
+    if name == "convert_element_type" and len(equation.invars) == 1:
         return read(equation.invars[0]).convert(param(primitive, equation.params))
     if name == "select_n" and len(equation.invars) == 3:
         predicate, false, true = (read(atom) for atom in equation.invars)
         return predicate.select(false, true)
     if name in SHAPES and len(equation.invars) == 1:
-        return read(equation.invars[0]).shaped(name, param(primitive, equation.params),
-                                               _elements(equation.outvars[0].aval))
+        return read(equation.invars[0]).shaped(name, param(primitive, equation.params))
     if name in REDUCTIONS and len(equation.invars) == 1:
         axes = Vec[i64](*(i64(int(axis)) for axis in equation.params["axes"]))
-        return read(equation.invars[0]).reduce(REDUCTIONS[name], axes, param(primitive, equation.params),
-                                               _elements(equation.outvars[0].aval))
+        return read(equation.invars[0]).reduce(REDUCTIONS[name], axes, param(primitive, equation.params))
     return None
 
 
-PRIMITIVES = {name: getattr(jax.lax, f"{name}_p") for name in BINARY | COMPARISONS
-              if hasattr(jax.lax, f"{name}_p")}
-PRIMITIVES["select_n"] = jax.lax.select_n_p
-
-
-def evaluated(region_: Region, chosen: Callable[[Term], Term], values: list) -> list:
-    """The values of `region_`'s outputs over its leaves' `values` (inputs and constants first), each term as
-    extraction `chosen` its form: each equation outside the language bound in program order once its inputs
-    are known, each shared term evaluated once."""
+def evaluated(region_: Region, chosen: Mapping[str, Term], values: list) -> list:
+    """The values of `region_`'s outputs over its leaves' `values` (inputs and constants first), each root as
+    extraction `chosen` its form (by the root's text): each equation outside the language bound in program
+    order once its inputs are known, under its protected marker where it had one, each shared term evaluated
+    once."""
     known: dict[str, object] = {}
 
     def value(term: Term) -> object:
         key = str(term)
         if key not in known:
-            known[key] = _value(term, value, region_.params, values)
+            known[key] = _value(term, value, region_, values)
         return known[key]
 
     for opaque in region_.opaque:
-        operands = [opaque.literals[index] if term is None else value(chosen(term))
+        operands = [opaque.literals[index] if term is None else value(chosen[str(term)])
                     for index, term in enumerate(opaque.inputs)]
-        results = opaque.equation.primitive.bind(*operands, **opaque.equation.params)
-        results = results if opaque.equation.primitive.multiple_results else [results]
-        for leaf, result in zip(opaque.outputs, results, strict=True):
+        primitive = opaque.equation.primitive
+        subfuns, given = primitive.get_bind_params(opaque.equation.params)
+        if protected(opaque.equation):
+            with jax.named_scope(PROTECTED):
+                results = primitive.bind(*subfuns, *operands, **given)
+        else:
+            results = primitive.bind(*subfuns, *operands, **given)
+        for leaf, result in zip(opaque.outputs, results if primitive.multiple_results else [results],
+                                strict=True):
             values[leaf] = result
-    return [region_.literal_outputs[index] if root is None else value(chosen(root))
+    return [region_.literal_outputs[index] if root is None else value(chosen[str(root)])
             for index, root in enumerate(region_.outputs)]
 
 
-def _integers(vector) -> tuple[int, ...]:
-    return tuple(int(get_literal_value(item)) for item in vector.value)
+def _index(argument) -> int:
+    return int(get_literal_value(argument))
 
 
-def _value(term: Term, value: Callable[[Term], object], params: list, leaves: list) -> object:
+def _value(term: Term, value: Callable[[Term], object], region_: Region, leaves: list) -> object:
     """One term's value, its operands' from `value`."""
     if (args := get_callable_args(term, Term.leaf)) is not None:
-        return leaves[int(get_literal_value(args[0]))]
+        return leaves[_index(args[0])]
     if (args := get_callable_args(term, Term.literal)) is not None:
-        _, given = params[int(get_literal_value(args[1]))]
-        return np.asarray(float(get_literal_value(args[0])), dtype=given["new_dtype"])
-    if (args := get_callable_args(term, Term.binary)) is not None:
-        left, name, right = args
-        return PRIMITIVES[str(get_literal_value(name))].bind(value(left), value(right))
-    if (args := get_callable_args(term, Term.compare)) is not None:
-        left, name, right = args
-        return PRIMITIVES[str(get_literal_value(name))].bind(value(left), value(right))
+        return region_.literals[_index(args[0])]
+    for constructor in (Term.binary, Term.compare):
+        if (args := get_callable_args(term, constructor)) is not None:
+            left, _, right, index = args
+            primitive, given = region_.params[_index(index)]
+            return primitive.bind(value(left), value(right), **given)
     if (args := get_callable_args(term, Term.select)) is not None:
         predicate, false, true = args
         return jax.lax.select_n_p.bind(value(predicate), value(false), value(true))
-    # Each other constructor's primitive parameters, by index, after its operand and its other arguments.
-    for constructor, operand_count in ((Term.unary, 1), (Term.convert, 0), (Term.shaped, 1),
-                                       (Term.reduce, 2)):
+    # Each other constructor's primitive parameters, by index, last after its operand and its other arguments.
+    for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:
-            primitive, given = params[int(get_literal_value(args[1 + operand_count]))]
+            primitive, given = region_.params[_index(args[-1])]
             return primitive.bind(value(args[0]), **given)
     raise ValueError(f"a term of no known constructor: {term}")

@@ -1,10 +1,10 @@
 """The rules Dew's rewrite applies (docs/design/algebra.md §6.4), in named sets, and the facts they read
 (§6.3): each set an egglog ruleset with its rounding class, registered by name.
 
-`elements(t)` is each value's number of elements, which the cost model prices passes by: a leaf, a broadcast
-and a reduction state theirs, every elementwise term takes its operands'. `along(params, axis)` holds where
-a broadcast lays its operand along every axis of its result but `axis`: a value it makes is constant along
-`axis`, so a sum along that axis may take it out."""
+`shape(t)` is each value's shape, as the equation that made it states it (`terms.region`), carried to every
+form the rules make: a rule joins or moves values only where their shapes say the result is the program's.
+`along(params, axis)` holds where a broadcast lays its operand along every axis of its result but `axis`: a
+value it makes is constant along `axis`, so a sum along that axis may take it out."""
 
 from __future__ import annotations
 
@@ -14,35 +14,17 @@ from typing import Literal
 
 import jax.numpy as jnp
 import numpy as np
-from egglog import (
-    Ruleset,
-    String,
-    Unit,
-    Vec,
-    birewrite,
-    eq,
-    f64,
-    function,
-    i64,
-    rewrite,
-    rule,
-    ruleset,
-    set_,
-    var,
-    vars_,
-)
+from egglog import Ruleset, Unit, Vec, birewrite, eq, function, i64, rewrite, rule, ruleset, set_, var, vars_
 
 from dew.algebra.terms import Term
 
 
-@function(merge=lambda old, new: old.max(new))
-def elements(term: Term) -> i64: ...
+@function(merge=lambda old, new: old)
+def shape(term: Term) -> Vec[i64]: ...
 
 
 @function
 def along(params: i64, axis: i64) -> Unit: ...
-"""Holds where the broadcast whose parameters are `params` (`Region.params`) lays its operand along every axis
-of its result but `axis`, in order, so its result is constant along `axis` (`program.rewritten` states it)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,52 +40,39 @@ class Rules:
 
 
 def _facts() -> Ruleset:
-    """The `elements` fact of every term from its operands', or the count it states."""
-    term, left, right, operand = vars_("term left right operand", Term)
-    count, other, params = vars_("count other params", i64)
-    name = var("name", String)
-    axes = var("axes", Vec[i64])
-    value = var("value", f64)
-    return ruleset(
-        rule(eq(term).to(Term.leaf(params, count))).then(set_(elements(term)).to(count)),
-        rule(eq(term).to(Term.literal(value, params))).then(set_(elements(term)).to(i64(1))),
-        rule(eq(term).to(left.binary(name, right)), eq(count).to(elements(left)),
-             eq(other).to(elements(right))).then(set_(elements(term)).to(count.max(other))),
-        rule(eq(term).to(left.compare(name, right)), eq(count).to(elements(left)),
-             eq(other).to(elements(right))).then(set_(elements(term)).to(count.max(other))),
-        rule(eq(term).to(operand.select(left, right)), eq(count).to(elements(left)),
-             eq(other).to(elements(right))).then(set_(elements(term)).to(count.max(other))),
-        rule(eq(term).to(operand.unary(name, params)), eq(count).to(elements(operand))
-             ).then(set_(elements(term)).to(count)),
-        rule(eq(term).to(operand.convert(params)), eq(count).to(elements(operand))
-             ).then(set_(elements(term)).to(count)),
-        rule(eq(term).to(operand.shaped(name, params, count))).then(set_(elements(term)).to(count)),
-        rule(eq(term).to(operand.reduce(name, axes, params, count))).then(set_(elements(term)).to(count)),
-        name="facts")
+    """The shape of each form a rule makes, from the shape of the value it equals: every form of one value
+    has one shape, as each rule keeps it."""
+    term, other = vars_("term other", Term)
+    shaped = var("shaped", Vec[i64])
+    return ruleset(rule(eq(term).to(other), eq(shaped).to(shape(other))).then(set_(shape(term)).to(shaped)),
+                   name="facts")
 
 
 def _linear() -> Ruleset:
-    """Linearity of sums (two sums along one axis, one sum of their terms), distributivity, and a value
-    constant along a sum's axis taken out of it: each reorders rounding."""
+    """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
+    distributivity over operands of one shape, and a value constant along a sum's axis taken out of it where
+    the other factor has the product's shape: each reorders rounding."""
     x, y, a = vars_("x y a", Term)
-    axes = var("axes", Vec[i64])
-    params, count, laid, spread, axis = vars_("params count laid spread axis", i64)
+    axes, extent = vars_("axes extent", Vec[i64])
+    params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
     return ruleset(
-        rewrite(x.reduce("sum", axes, params, count).binary("add", y.reduce("sum", axes, params, count))).to(
-            x.binary("add", y).reduce("sum", axes, params, count)),
-        birewrite(a.binary("mul", x).binary("add", a.binary("mul", y))).to(
-            a.binary("mul", x.binary("add", y))),
-        rewrite(a.shaped("broadcast_in_dim", laid, spread).binary("mul", x).reduce(
-            "sum", Vec[i64](axis), params, count)).to(
-            a.binary("mul", x.reduce("sum", Vec[i64](axis), params, count)), along(laid, axis)),
+        rewrite(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)).to(
+            x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y))),
+        rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
+            a.binary("mul", x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y))),
+        rewrite(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce(
+            "sum", Vec[i64](axis), summed)).to(
+            a.binary("mul", x.reduce("sum", Vec[i64](axis), summed), multiplied), along(laid, axis),
+            eq(shape(x)).to(extent), eq(shape(a.shaped("broadcast_in_dim", laid))).to(extent)),
         name="linear")
 
 
 def _identities() -> Ruleset:
     """Commutativity of addition and multiplication: each rounds as the form it replaces."""
     x, y = vars_("x y", Term)
-    return ruleset(rewrite(x.binary("add", y)).to(y.binary("add", x)),
-                   rewrite(x.binary("mul", y)).to(y.binary("mul", x)), name="identities")
+    params = var("params", i64)
+    return ruleset(birewrite(x.binary("add", y, params)).to(y.binary("add", x, params)),
+                   birewrite(x.binary("mul", y, params)).to(y.binary("mul", x, params)), name="identities")
 
 
 FACTS = _facts()
@@ -138,10 +107,12 @@ def instances() -> Mapping[str, tuple[Callable, Callable, Callable]]:
                          for index, shape in enumerate(shapes))
         return drawn
 
-    rows = draw((8, 64), (8, 64), (8, 64))
+    rows, scaled = draw((8, 64), (8, 64), (8, 64)), draw((8, 64), (8,))
     return {
         "linear: two sums along an axis": (lambda x, y, a: jnp.sum(x, -1) + jnp.sum(y, -1),
                                            lambda x, y, a: jnp.sum(x + y, -1), rows),
         "linear: distributivity": (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y), rows),
+        "linear: a row scalar out of a sum": (lambda x, s: jnp.sum(s[:, None] * x, -1),
+                                              lambda x, s: s * jnp.sum(x, -1), scaled),
         "identities: commutativity": (lambda x, y, a: x + y, lambda x, y, a: y + x, rows),
     }

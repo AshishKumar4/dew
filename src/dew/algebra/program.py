@@ -1,6 +1,6 @@
 """The program pass (docs/design/algebra.md §6.7): a function's jaxpr held as terms (`terms.region`), the
-admitted rule sets run to their fixpoint or the region's limits, and each value's cheapest form under the cost
-model extracted and evaluated in place of the program's own."""
+admitted rule sets run to their fixpoint or the region's limits, and its roots' cheapest forms under the cost
+model extracted together and evaluated in place of the program's own."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 
 import jax
-from egglog import EGraph, i64
+from egglog import EGraph, Vec, get_callable_args, i64, set_
 from jax.extend import core as jcore
 
 from dew.algebra import cost, rules, terms
@@ -18,87 +18,90 @@ from dew.algebra import cost, rules, terms
 
 @dataclasses.dataclass(frozen=True)
 class Saturation:
-    """The limits a region's saturation stops at, from its size: nodes at `growth` per equation, iterations at
-    `iterations`. Measured: the largest the registered sets reach at their fixpoint on tests/test_algebra.py's
-    programs."""
+    """The limits a region's saturation stops at, from its size (`limits`): nodes at `growth` per equation,
+    iterations at `depth` per level of its longest chain of the language's equations."""
 
     growth: int
-    iterations: int
+    depth: int
 
-
-MEASURED = Saturation(growth=64, iterations=16)
+    def limits(self, region: terms.Region) -> tuple[int, int]:
+        """The nodes and iterations `region` may take."""
+        return self.growth * max(1, region.equations), self.depth * max(1, region.depth)
 
 
 @dataclasses.dataclass(frozen=True)
 class AlgebraReport:
-    """What one rewrite did: the equations it read, the sets admitted, its iterations and nodes, whether a
-    limit stopped it, and its seconds."""
+    """What one rewrite did: the equations it read, the sets admitted, its limits, its iterations and nodes,
+    whether a limit stopped it, and its seconds."""
 
     equations: int
     admitted: tuple[str, ...]
+    limits: tuple[int, int]
     iterations: int
     nodes: int
     limited: bool
     seconds: float
 
 
-REPORTS: list[AlgebraReport] = []
-"""This process's rewrites, newest last."""
+@dataclasses.dataclass(frozen=True)
+class Rewrite:
+    """A program's outputs computed in their cheapest forms, and the report of the rewrite that chose them."""
+
+    outputs: list
+    report: AlgebraReport
 
 
-def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation = MEASURED) -> Callable:
+def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation) -> Callable:
     """`fn` with its program rewritten: traced over its arguments, its terms saturated under the rule sets its
-    numerics admit (`rules.admitted`) and each value's cheapest form evaluated in its place. Its arguments,
-    outputs and their structure are `fn`'s."""
+    numerics admit (`rules.admitted`) and its values evaluated in their cheapest forms. Its arguments, outputs
+    and their structure are `fn`'s."""
     @functools.wraps(fn)
     def run(*args, **kwargs):
-        closed, shape = jax.make_jaxpr(functools.partial(fn, **kwargs), return_shape=True)(*args)
-        outputs = rewritten_closed(closed, jax.tree.leaves(args), accurate=accurate, saturation=saturation)
-        return jax.tree.unflatten(jax.tree.structure(shape), outputs)
+        closed, shaped = jax.make_jaxpr(functools.partial(fn, **kwargs), return_shape=True)(*args)
+        done = rewrite(closed, jax.tree.leaves(args), accurate=accurate, saturation=saturation)
+        return jax.tree.unflatten(jax.tree.structure(shaped), done.outputs)
     return run
 
 
-def rewritten_closed(closed: jcore.ClosedJaxpr, arguments: list, *, accurate: bool,
-                     saturation: Saturation) -> list:
-    """The outputs of `closed` over `arguments` (flattened), each value in its cheapest form."""
+def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> Rewrite:
+    """The outputs of `closed` over `arguments` (flattened), its roots' forms chosen together, with the
+    report of the rewrite."""
     began = time.perf_counter()
     region = terms.region(closed)
     graph = EGraph()
-    roots: dict[str, terms.Term] = {}
-    for term in [*region.outputs, *(term for opaque in region.opaque for term in opaque.inputs)]:
-        if term is not None and str(term) not in roots:
-            roots[str(term)] = graph.let(f"root{len(roots)}", term)
+    for term, extent in region.shapes:
+        graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent))))
     for index, (primitive, params) in enumerate(region.params):
         if primitive is jax.lax.broadcast_in_dim_p:
             rank, laid = len(params["shape"]), tuple(params["broadcast_dimensions"])
             missing = [axis for axis in range(rank) if axis not in laid]
             if len(missing) == 1 and laid == tuple(axis for axis in range(rank) if axis != missing[0]):
                 graph.register(rules.along(i64(index), i64(missing[0])))
+    roots = region.roots()
+    bundle = terms.Term.bundle(Vec[terms.Term](*roots))
+    graph.register(bundle)
     admitted = rules.admitted(accurate)
-    budget = saturation.growth * max(1, len(closed.jaxpr.eqns))
+    nodes, steps = saturation.limits(region)
     iterations, limited = 0, False
-    while iterations < saturation.iterations:
-        graph.run(rules.FACTS.saturate())
-        report = graph.run(sum((admitted_rules.ruleset for admitted_rules in admitted[1:]),
-                               admitted[0].ruleset) if admitted else rules.FACTS)
-        iterations += 1
-        if _nodes(graph) > budget:
+    while admitted:
+        if iterations == steps or _nodes(graph) > nodes:
             limited = True
             break
+        graph.run(rules.FACTS.saturate())
+        report = graph.run(functools.reduce(lambda left, right: left | right,
+                                            (admitted_rules.ruleset for admitted_rules in admitted)))
+        iterations += 1
         if not report.updated:
             break
-    else:
-        limited = True
     graph.run(rules.FACTS.saturate())
-    priced = cost.model(cost.Device.of())
-    chosen = {key: graph.extract(handle, cost_model=priced, extractor="greedy-dag")
-              for key, handle in roots.items()}
+    chosen = graph.extract(bundle, cost_model=cost.model(cost.Device.of()), extractor="greedy-dag")
+    (forms,) = get_callable_args(chosen, terms.Term.bundle)
+    picked = {str(root): form for root, form in zip(roots, forms.value, strict=True)}
     values = [*closed.consts, *arguments] + [None] * (region.leaves - len(closed.consts) - len(arguments))
-    outputs = terms.evaluated(region, lambda term: chosen[str(term)], values)
-    names = tuple(admitted_rules.name for admitted_rules in admitted)
-    REPORTS.append(AlgebraReport(len(closed.jaxpr.eqns), names, iterations, _nodes(graph), limited,
-                                 time.perf_counter() - began))
-    return outputs
+    outputs = terms.evaluated(region, picked, values)
+    report = AlgebraReport(region.equations, tuple(admitted_rules.name for admitted_rules in admitted),
+                           (nodes, steps), iterations, _nodes(graph), limited, time.perf_counter() - began)
+    return Rewrite(outputs, report)
 
 
 def _nodes(graph: EGraph) -> int:
