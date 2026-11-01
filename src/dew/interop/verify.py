@@ -114,16 +114,17 @@ _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # gradient by more than about 3.5e-4 of itself, the square root of eps, is above it.
 _GRADIENT_PARITY = float(np.finfo(np.float32).eps) ** -0.5
 # How much farther the source's float32 logits on the probe may be from the float64 truth than the
-# candidate's float32 logits are (`logits_parity`), by the same derivation as `_GRADIENT_PARITY`'s. Two
-# float32 roundings of one computation measure 0.86 to 1.04 over tools/gradient_parity.py's types and
-# composition, and 0.73 to 1.15 over the released configs tier 2 verifies at their probes' cut depths and
-# widths (armada IGPAR3: Hy3 0.73, LFM2.5-230M 0.86, Seed-OSS-36B 0.87, SmolLM3 0.94, Hunyuan-A13B 1.00,
-# OLMo 2 1.00, GLM-4.7-Flash 1.03, StableLM 1.03, ERNIE 4.5 1.09, Granite 4.1 1.12, OLMoE 1.12,
-# LFM2-24B-A2B 1.15); the tests' wide CPU sums put the candidate nearer the truth, and the ratio higher.
-# A computation the candidate does not share, moving the logits by a relative r, puts it near r / eps.
-# The geometric middle of the two holds at any depth and width, where a fixed rounding per layer did not
-# (a 2-layer cut of Seed-OSS's 64 sat 3.4 times past the one measured on width-64 fixtures).
-_LOGITS_PARITY = _GRADIENT_PARITY
+# candidate's, element by element (`logits_parity`: the largest errors' ratio). Two float32 roundings of
+# one computation measure 0.72 to 3.66: 0.73 to 1.34 over the released configs tier 2 verifies at their
+# probes' cut depths and widths (Hy3, LFM2.5-230M, Seed-OSS-36B, SmolLM3, Hunyuan-A13B, OLMo 2,
+# GLM-4.7-Flash, StableLM, ERNIE 4.5, Granite 4.1, OLMoE, LFM2-24B-A2B), and up to 3.66 over the tests'
+# sources (tests/test_tier2_parts.py's remote composition), whose wide CPU sums put the candidate nearer
+# the truth (armada IGPAR6). The bound is twice the largest. A computation the candidate does not share
+# moves it by its effect over the candidate's own rounding, which grows with the probe as the source's
+# does: logits scaled by 1 + 1e-5 put it at 6.6 to 10.6 and by 1 + 1e-4 at 65 to 111, one logit moved by
+# 1e-4 at 11 to 17 (tools/gradient_parity.py's Seed-OSS, Llama and Qwen3-MoE at logits up to 6.8, armada
+# IGSENS), where a fixed rounding per layer refused Seed-OSS's rounding at a 2-layer cut of its 64 layers.
+_LOGITS_PARITY = 7.31
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
@@ -525,7 +526,7 @@ class VerifiedMapping:
         warnings.warn(
             f"tier 2: verified mapping: model_type {self.model_type!r} loads {loads}; "
             f"{self.reference}'s fp32 logits on a random shrunken instance are {self.error:.3g} times as far "
-            f"from the float64 truth as its own (bound {self.bound:.0f}); it does not read the config "
+            f"from the float64 truth as its own (bound {self.bound:.2f}); it does not read the config "
             f"fields {list(self.inert)}, which changed nothing on that instance",
             VerifiedMappingWarning, stacklevel=3)
         return record
@@ -701,7 +702,7 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     parity = logits_parity(expected, model, record, variables, probe_ids(_VOCAB))
     if not parity <= _LOGITS_PARITY:
         raise _Mismatch(f"{name}'s fp32 logits on a random shrunken instance are {parity:.3g} times as far "
-                        f"from the float64 truth as {convention}'s, past the {_LOGITS_PARITY:.0f} that tells "
+                        f"from the float64 truth as {convention}'s, past the {_LOGITS_PARITY:.2f} that tells "
                         f"rounding from another computation, so its config fields {sorted(inert)} or its "
                         f"modeling compute something {convention} does not")
     return parity, _LOGITS_PARITY

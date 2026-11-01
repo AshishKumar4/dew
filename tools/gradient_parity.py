@@ -8,8 +8,8 @@ the probe's shrunken sizes with the probe's weights (`verify.shrink`, `verify.sc
 assembled from parts, and its gradients compared as the probe compares them. The logits are measured
 over the same types and compositions as the probe compares them, each read as tier 2 reads it: from
 parts, or a type whose attention no part is by the registered family it verifies as (`CONVENTIONS`).
-Prints each one's measures and the largest, which the probe's bounds sit orders of magnitude above
-(`verify._GRADIENT_PARITY`, `verify._LOGITS_PARITY`).
+Prints each one's measures and the largest (`verify._GRADIENT_PARITY` sits orders of magnitude above
+its; `verify._LOGITS_PARITY` is twice the largest over these, the released configs and the tests').
 
     python tools/gradient_parity.py
 """
