@@ -5,7 +5,6 @@ here, and runs on one in the GPU gate."""
 
 import dataclasses
 import functools
-import types
 
 import jax
 import jax.numpy as jnp
@@ -308,6 +307,13 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
 ISSUED = 64
 
 
+@dataclasses.dataclass(frozen=True)
+class _Call:
+    """A call an `operands.Issuer` reads: the bundle its products issue by, interpreted."""
+    family: mosaic.Family
+    interpret: bool = True
+
+
 def _issued_sums(a, b, c, d, exponent, *, retired: bool):
     """`restored(a @ b, exponent) + c @ d` through one prepared-operand issuer (`operands.Issuer.summed`) on
     warpgroup MMA, interpreted: `a` a scaled register operand (`product.Scaled`), its product in an
@@ -318,7 +324,7 @@ def _issued_sums(a, b, c, d, exponent, *, retired: bool):
 
     family = mosaic_sm90.FED  # one warpgroup, no producer
     tile = ((ISSUED, ISSUED), jnp.bfloat16)
-    call = types.SimpleNamespace(family=family, interpret=True)
+    call = _Call(family)
 
     def body(a_gmem, b_gmem, c_gmem, d_gmem, exponent_gmem, out_gmem):
         def scoped(staged, b_smem, d_smem):
@@ -358,7 +364,7 @@ def _carried_sums(a, b, c, d):
     from dew.nn.kernels.templates import mosaic_sm90, operands
 
     family = mosaic_sm90.FED  # one warpgroup, no producer
-    call = types.SimpleNamespace(family=family, interpret=True)
+    call = _Call(family)
 
     def body(a_gmem, b_gmem, c_gmem, d_gmem, out_gmem):
         def scoped(staged, b_smem, d_smem):

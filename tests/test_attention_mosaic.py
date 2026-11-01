@@ -1117,7 +1117,8 @@ def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
     interpreter."""
     with generation.assumed("sm90"):
         op, ba = _backward_call((1, 160, 2, 1), 256, accurate=False)
-        assert op.derived(ba, generation.gpu_target()).shared_keys
+        tiles = op.derived(ba, generation.gpu_target())
+        assert tiles is not None and tiles.shared_keys
     _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256)
 
 

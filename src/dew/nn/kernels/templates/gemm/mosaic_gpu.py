@@ -571,7 +571,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
                     place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
-                if tail is None:
+                if tail is None or workspace is None:
                     finished(*accs)
                     return
                 family.fixed_up(accs[0], workspace.at[:, wg], None if ready is None else ready.at[:, wg],
