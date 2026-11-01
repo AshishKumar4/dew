@@ -36,7 +36,7 @@ import tyro
 from dew._hashing import fmix32
 from dew._moments import bias_corrected
 from dew._records import share
-from dew.held_updates import refuse_untold, update_applied
+from dew.held_updates import holds_state, refuse_untold, update_applied
 from dew.laprop import laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
@@ -565,8 +565,7 @@ def clips_qk(opt_state) -> bool:
     """Whether an optimizer state holds a QK-Clip's (`QKClipState`), however the optimizer composes it:
     a run then asks its objective for the step's attention logit maxima (`dew.objectives.Step.qk_stats`)
     and hands them to the update."""
-    return any(isinstance(node, QKClipState) for node in jax.tree.leaves(
-        opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+    return holds_state(opt_state, QKClipState)
 
 
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:

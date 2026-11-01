@@ -28,6 +28,7 @@ from flax import struct
 from jax.flatten_util import ravel_pytree
 from jax.scipy.linalg import cho_factor, cho_solve
 
+from dew.held_updates import holds_state
 from dew.nn.precision import float32_einsum
 
 
@@ -81,8 +82,7 @@ def solves_equations(opt_state) -> bool:
     """Whether an optimizer state holds a Gauss-Newton update's (`GaussNewtonState`), however the optimizer
     composes it: a run then asks its objective for its system (`dew.objectives.Step.equations`) and hands
     the update's pooled statistics to the update."""
-    return any(isinstance(node, GaussNewtonState) for node in jax.tree.leaves(
-        opt_state, is_leaf=lambda node: isinstance(node, GaussNewtonState)))
+    return holds_state(opt_state, GaussNewtonState)
 
 
 def gauss_newton(damping: float) -> optax.GradientTransformationExtraArgs:
