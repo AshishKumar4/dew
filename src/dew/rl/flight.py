@@ -5,20 +5,20 @@ as a `dew.rl.simulator.Simulator` (`GateRace`).
 The reward is the one drone-racing RL has converged on: each step, the progress made toward the next gate's
 centre (Kaufmann et al., Nature 2023, Swift, Eq 8; Song et al., Sci. Robot. 2023, Eq 5; SkyDreamer, arXiv
 2510.14783, Sec II-C), less a cost on the body rates (Song 2023, b = 0.01 a step at 100 Hz, here 1 a second)
-and on the action's change (Swift's lambda5); a bonus on passing a gate, the more for passing it centred
-(SkyDreamer's r_gate); a reward for the camera's optical axis pointing at the next gate's centre (Swift's
-perception term, Eq 8: lambda2 exp(lambda3 delta_cam^4), the angle in radians), without which a drone flies
-its yaw where it likes: a teacher of the privileged views flew tail first, the next gate out of its camera's
-view on 95% of its steps (on a G4, 10-31), a flight no policy of the camera alone can learn. Its weights are
-those of Geles et al.'s policy from pixels (RSS 2024, arXiv 2406.12505, Sec III-A4: 0.025 exp(-delta^4) a
-step, here 1.5 exp(-delta^4) a second, 0.025 a step at 60 Hz), whose term pays four fifths of its most at a
-gate 40 degrees off the axis, where Swift's sharper one (Extended Data Table 1a: 0.02 exp(-10 delta^4)) pays a
-tenth: a teacher on Swift's turned to the gate on 59% of its steps at the curriculum's level 0.8; and a
-crash's penalty, which ends the episode (Song 2023's -10). A gate counts only when its plane is crossed
-through its opening in its direction; crossing the next gate's plane beside it misses it, a crash (SkyDreamer;
-Ferede et al., arXiv 2504.21586). The ground, the gates' frames and the obstacles are solid, the drone's path
-through each physics step tested against them (`struck`), so a fast drone cannot pass through one between two
-steps. An open track ends, a success, on passing its last gate.
+and on the action's rate of change (Swift's lambda5, here 0.005 a step at 60 Hz as a rate a second); a bonus
+on passing a gate, the more for passing it centred (SkyDreamer's r_gate); a reward for the camera's optical
+axis pointing at the next gate's centre (Swift's perception term, Eq 8: lambda2 exp(lambda3 delta_cam^4), the
+angle in radians), without which a drone flies its yaw where it likes: a teacher of the privileged views flew
+tail first, the next gate out of its camera's view on 95% of its steps (on a G4, 10-31), a flight no policy of
+the camera alone can learn. Its weights are those of Geles et al.'s policy from pixels (RSS 2024, arXiv
+2406.12505, Sec III-A4: 0.025 exp(-delta^4) a step, here 1.5 exp(-delta^4) a second, 0.025 a step at 60 Hz),
+whose term pays four fifths of its most at a gate 40 degrees off the axis, where Swift's sharper one (Extended
+Data Table 1a: 0.02 exp(-10 delta^4)) pays a tenth: a teacher on Swift's turned to the gate on 59% of its
+steps at the curriculum's level 0.8; and a crash's penalty, which ends the episode (Song 2023's -10). A gate
+counts only when its plane is crossed through its opening in its direction; crossing the next gate's plane
+beside it misses it, a crash (SkyDreamer; Ferede et al., arXiv 2504.21586). The ground, the gates' frames and
+the obstacles are solid, the drone's path through each physics step tested against them (`struck`), so a fast
+drone cannot pass through one between two steps. An open track ends, a success, on passing its last gate.
 
 Each episode is flown on a course of its own (`drawn_course`), of a `family`:
 - `layout`: a published racing layout (uzh-rpg/agile_flight, MIT: Split-S and its real-world variant,
@@ -122,7 +122,7 @@ class Racing:
     radius: float = 0.2
     progress_scale: float = 1.0
     rate_cost: float = 1.0
-    smoothness_cost: float = 0.005
+    smoothness_cost: float = 0.005 / 60
     gate_bonus: float = 6.0
     perception_scale: float = 1.5
     perception_sharpness: float = 1.0
@@ -588,15 +588,16 @@ def struck(racing: Racing, race: Race, path: jax.Array) -> tuple[jax.Array, jax.
 def raced(racing: Racing, race: Race, action: jax.Array, path: jax.Array) -> tuple[
         Race, jax.Array, jax.Array, jax.Array]:
     """A step's race, reward, and whether its episode `terminated` or was `truncated`, from the action taken
-    and the drone's path through the step to its flight after it. The reward is the progress toward the gate
-    headed for, its distance before the step less its distance after (times `progress_scale`), less
-    `rate_cost` times the body rates' norm over the step, less `smoothness_cost` times the squared change of
-    the action; plus `perception_scale` times exp(-`perception_sharpness` delta^4) over the step (a rate a
-    second, times its seconds), delta the angle in radians
-    between the camera's optical axis and the centre of the gate headed for after the step (`looking`); on
-    passing that gate, `gate_bonus` times one less its offset's share of half the opening, the drone heading
-    for the next; on a crash (`struck`), less `crash_penalty`, which ends the episode. Passing
-    an open track's last gate ends it, a success. An episode is cut after `max_steps` steps."""
+    and the drone's path through the step to its flight after it. The reward is the progress toward the
+    gate headed for, its distance before the step less its distance after (times `progress_scale`), less
+    `rate_cost` times the body rates' norm over the step, less `smoothness_cost` times the action's
+    squared rate of change over the step (its squared change over the step's seconds, a rate a second);
+    plus `perception_scale` times exp(-`perception_sharpness` delta^4) over the step (a rate a second,
+    times its seconds), delta the angle in radians between the camera's optical axis and the centre of the
+    gate headed for after the step (`looking`); on passing that gate, `gate_bonus` times one less its
+    offset's share of half the opening, the drone heading for the next; on a crash (`struck`), less
+    `crash_penalty`, which ends the episode. Passing an open track's last gate ends it, a success. An
+    episode is cut after `max_steps` steps."""
     crashed, passed, across = struck(racing, race, path)
     course, flight = race.course, race.flight
     distance = jnp.linalg.norm(course.center[race.index] - flight.position)
@@ -604,7 +605,7 @@ def raced(racing: Racing, race: Race, action: jax.Array, path: jax.Array) -> tup
     bonus = jnp.where(passed, racing.gate_bonus * (1 - across / (racing.opening / 2)), 0.0)
     rate = racing.rate_cost * jnp.linalg.norm(flight.angular_velocity) * racing.dt
     action = jnp.clip(action, -1, 1)
-    smoothness = racing.smoothness_cost * jnp.sum(jnp.square(action - race.action))
+    smoothness = racing.smoothness_cost * jnp.sum(jnp.square(action - race.action)) / racing.dt
     following = jnp.where(course.closed, (race.index + 1) % course.count, race.index + 1)
     finished = passed & ~course.closed & (following >= course.count)
     index = jnp.where(passed & ~finished, following, race.index)

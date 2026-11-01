@@ -86,15 +86,17 @@ def race(drones: int, views: tuple[str, ...], *, hz: float = 60.0, families=TRAI
     return GateRace(renderer, racing_at(hz, families, highlight=highlight), views=views, count=drones)
 
 
-def teacher_objective(observation_size: int | None = None):
+def teacher_objective(observation_size: int | None = None, hz: float = 60.0):
     """PPO over the teacher's view (`dew.rl.flight.TEACHER` wide, or `observation_size`), its policy's spread
-    a fifth of the actor-critic's, so the first rollouts fly rather than tumble."""
+    a fifth of the actor-critic's, so the first rollouts fly rather than tumble; at `hz` control steps a
+    second, its discount and its advantages' decay those of 0.99 and 0.95 a step at 60 Hz, so the teacher
+    looks as many seconds ahead at any rate."""
     from dew.objectives.rl.control import ActorCritic, ControlPPOObjective
     from dew.rl.flight import TEACHER
 
     networks = ActorCritic(4, (256, 256, 256), (256, 256, 256, 256), spread=0.2)
-    return ControlPPOObjective(networks, observation_size or TEACHER, discount=0.99, lam=0.95, clip=0.2,
-                               entropy_cost=1e-4, reads=("teacher",))
+    return ControlPPOObjective(networks, observation_size or TEACHER, discount=0.99 ** (60 / hz),
+                               lam=0.95 ** (60 / hz), clip=0.2, entropy_cost=1e-4, reads=("teacher",))
 
 
 def warmed(path: Path):
@@ -250,7 +252,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         shown = ("teacher", "passed", "gates")
         return Batched(FlightEnv(racing_at(hz, families), shown, difficulty=level, ramp=level), 1024)
 
-    objective = teacher_objective()
+    objective = teacher_objective(hz=hz)
     if warm is not None:
         objective.variables = warmed(warm)
     rollout = ControlRollout(objective, env_at(level), unroll_length=round(32 * hz / 30), epochs=4,
@@ -456,7 +458,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
 
     simulator, judged, held_out = raced(families), raced(families), raced(HELD_OUT)
     horizon = simulator.racing.max_steps
-    taught = teacher_objective()
+    taught = teacher_objective(hz=hz)
     held = serialization.from_bytes(taught.init(jax.random.key(0)), teacher_weights.read_bytes())
 
     def judge(policy, params, memory, key, film=None):

@@ -163,7 +163,7 @@ def oracle_step(racing: Racing, race, path, camera):
                 target += 1
         reward -= racing.rate_cost * np.linalg.norm(race.flight.angular_velocity[drone]) / racing.hz
         reward -= racing.smoothness_cost * np.sum((np.clip(race.action_taken[drone], -1, 1)
-                                                    - race.action[drone]) ** 2)
+                                                    - race.action[drone]) ** 2) * racing.hz
         axis = optical_axis(race.flight.orientation[drone], camera.mount[drone], camera.uptilt[drone])
         toward = center[target] - position
         angle = np.arctan2(np.linalg.norm(np.cross(axis, toward)), axis @ toward)
