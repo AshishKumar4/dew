@@ -1121,10 +1121,9 @@ def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted(
 @pytest.mark.parametrize("call", ["causal", "full"])
 def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
     """The fast backward 256 wide, whose consumers' own keys' whole dK and dV sums pass their registers, at
-    the tiles the derivation takes where it takes one launch (`ONE_LAUNCH`, held off for row 3180): one
-    launch whose two consumers share a key block, each its share of the columns
-    (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
-    interpreter."""
+    the tiles the derivation takes for it: one launch whose two consumers share a key block, each its share
+    of the columns (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's,
+    under the interpreter."""
     _check_backward(call, SHAPES["interpreted"], form="fused-shared-keys", interpret=True, width=256)
 
 

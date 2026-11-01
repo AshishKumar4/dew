@@ -248,8 +248,8 @@ BACKWARD_LAUNCHES = {
 }
 """The attention backward's pinned configs at 64 x 64 tiles and two stages (`BackwardTiles`) and the launch
 each checks: the one launch its two consumers feed (FlashAttention 3's), and the dQ launch of the two the
-derivation takes (dQ's one consumer, dK/dV's two feeding themselves), pinned so the test does not move with
-the derivation (`attention_mosaic.ONE_LAUNCH`, held off for row 3180). The two-launch dK/dV joins when the
+derivation takes for a call the one launch does not hold (dQ's one consumer, dK/dV's two feeding themselves),
+pinned so the test does not move with the derivation. The two-launch dK/dV joins when the
 pass holds it (row 3311: 210 against ptxas's least cap 192, its elementwise chains held in the form's order
 where ptxas has consumed them)."""
 
