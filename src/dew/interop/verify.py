@@ -103,15 +103,6 @@ _CONTEXT = 8
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoder_parts.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
-# How much farther the source's float32 logits on the probe may be from the float64 truth than the
-# candidate's float32 logits are (`logits_parity`). Two float32 roundings of one computation measure
-# 0.86 to 1.04 over tools/gradient_parity.py's types and composition at two layers, and 0.73 to 1.15
-# over the released configs tier 2 verifies (armada IGPAR2, at their probes' cut depths and widths:
-# Hy3 0.73, LFM2.5-230M 0.86, Seed-OSS-36B 0.87, SmolLM3 0.94, OLMo 2 1.00, GLM-4.7-Flash 1.03,
-# Granite 4.1 1.12, LFM2-24B-A2B 1.15). The bound is twice the largest, as `_GRADIENT_PARITY`'s; it
-# holds at any depth and width, where a fixed rounding per layer did not (a 2-layer cut of Seed-OSS's
-# 64 sat 3.4 times past the one measured on width-64 fixtures).
-_LOGITS_PARITY = 2.31
 # How much farther the source's float32 gradient of any parameter may be from the float64 truth than
 # Dew's own float32 gradient of it is (`gradient_parity`, each parameter's pooled over its elements on
 # the probe's draw). Two float32 roundings of one gradient put the ratio near one: tools/gradient_parity.py
@@ -122,6 +113,17 @@ _LOGITS_PARITY = 2.31
 # 2896): a draw's rounding spread stays orders of magnitude below it, and any backward that moves a
 # gradient by more than about 3.5e-4 of itself, the square root of eps, is above it.
 _GRADIENT_PARITY = float(np.finfo(np.float32).eps) ** -0.5
+# How much farther the source's float32 logits on the probe may be from the float64 truth than the
+# candidate's float32 logits are (`logits_parity`), by the same derivation as `_GRADIENT_PARITY`'s. Two
+# float32 roundings of one computation measure 0.86 to 1.04 over tools/gradient_parity.py's types and
+# composition, and 0.73 to 1.15 over the released configs tier 2 verifies at their probes' cut depths and
+# widths (armada IGPAR3: Hy3 0.73, LFM2.5-230M 0.86, Seed-OSS-36B 0.87, SmolLM3 0.94, Hunyuan-A13B 1.00,
+# OLMo 2 1.00, GLM-4.7-Flash 1.03, StableLM 1.03, ERNIE 4.5 1.09, Granite 4.1 1.12, OLMoE 1.12,
+# LFM2-24B-A2B 1.15); the tests' wide CPU sums put the candidate nearer the truth, and the ratio higher.
+# A computation the candidate does not share, moving the logits by a relative r, puts it near r / eps.
+# The geometric middle of the two holds at any depth and width, where a fixed rounding per layer did not
+# (a 2-layer cut of Seed-OSS's 64 sat 3.4 times past the one measured on width-64 fixtures).
+_LOGITS_PARITY = _GRADIENT_PARITY
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
@@ -475,7 +477,8 @@ class VerifiedMapping:
     """How much farther the reference's fp32 logits on the probe are from the float64 truth than Dew's
     route's (`logits_parity`)."""
     bound: float
-    """What fp32 rounding alone reaches of that ratio (`_LOGITS_PARITY`)."""
+    """The ratio past which another computation, not rounding, sets the reference apart
+    (`_LOGITS_PARITY`)."""
     inert: tuple[str, ...]
     """The config fields the convention does not read, which changed nothing on the probe's shrunken
     instance: a field whose effect starts past a context the probe never reaches (one `shrink` does not
