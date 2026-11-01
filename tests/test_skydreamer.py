@@ -70,10 +70,11 @@ def written_step(sky: Sky, before: np.ndarray, after: np.ndarray, velocity: np.n
 
 
 def test_a_race_rewards_and_ends_as_skydreamer_writes():
-    """64 drones started as the race starts them, flown up to 200 steps in float64 by a throttle near hover
-    and smoothly drawn rates: each step's reward is the race written out from the drone's path, to float64
-    rounding, and its end, the gate headed for, the plane next and the gates passed are the written race's
-    exactly, to each drone's first end; some drones pass a plane, some a whole gate, and some end."""
+    """64 drones started as the race starts them, flown up to 200 steps in float64: half by a throttle near
+    hover and smoothly drawn rates, half set level, hovering and flying at 5 m/s toward their gate. Each
+    step's reward is the race written out from the drone's path, to float64 rounding, and its end, the gate
+    headed for, the plane next and the gates passed are the written race's exactly, to each drone's first
+    end; some drones pass a plane, some a whole gate, and some end."""
     race = SkyRace(views=("passed",))
     rng = np.random.default_rng([532, 3001, 11])
     planes = gates = ends = 0
@@ -82,13 +83,21 @@ def test_a_race_rewards_and_ends_as_skydreamer_writes():
         for drone, key in enumerate(jax.random.split(jax.random.key(5), 64)):
             lap, _ = race.reset(key)
             assert isinstance(lap, Lap)
+            straight = drone % 2 == 1
+            if straight:
+                _, heading = CIRCLE[int(lap.index)]
+                heading = math.radians(heading)
+                level = jnp.asarray([math.cos(heading / 2), 0.0, 0.0, math.sin(heading / 2)])
+                flight = hovering(SKY.quadrotor, lap.body, lap.flight.position, level)
+                lap = dataclasses.replace(lap, flight=dataclasses.replace(
+                    flight, velocity=jnp.asarray([5 * math.cos(heading), 5 * math.sin(heading), 0.0])))
             held = (int(lap.index), 0, float(lap.distance), 0)
-            drift = np.cumsum(rng.normal(0, 0.02, (200, 4)), 0)
+            drift = np.zeros((200, 4)) if straight else np.cumsum(rng.normal(0, 0.02, (200, 4)), 0)
             got, want = [], []
             for t in range(200):
                 # A throttle of zero holds the hover's thrust.
-                wobble = 0.05 * np.sin(t / 20 + drone) + drift[t, 1:]
-                action = np.clip(np.r_[0.05 + drift[t, 0], wobble], -1, 1)
+                wobble = 0.0 if straight else 0.05 * np.sin(t / 20 + drone) + drift[t, 1:]
+                action = np.clip(np.r_[0.0 if straight else 0.05 + drift[t, 0], wobble], -1, 1)
                 before = np.asarray(lap.flight.position)
                 lap, taken = step(lap, jnp.asarray(action))
                 flight = lap.flight
