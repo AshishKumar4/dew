@@ -21,7 +21,19 @@ def main() -> None:
         raise OSError(ctypes.get_errno(), "cannot install parent-death signal")
     if os.getppid() != parent:
         os.kill(os.getpid(), signal.SIGKILL)
+    saved_coverage()
     os.execvpe(command[0], command, os.environ)
+
+
+def saved_coverage() -> None:
+    """Where the parent is measured, coverage's startup measures this launcher too (site's coverage `.pth`
+    reads the variables `launched` passes on); an exec replaces the process without its exit, where coverage
+    saves, so its data is saved first."""
+    measured = sys.modules.get("coverage")
+    current = None if measured is None else measured.Coverage.current()
+    if current is not None:
+        current.stop()
+        current.save()
 
 
 if __name__ == "__main__":
