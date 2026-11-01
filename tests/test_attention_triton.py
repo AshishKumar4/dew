@@ -795,8 +795,13 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down(monkeypa
         return grads.query, grads.key, grads.value
 
     def lowered():
+        # A function of its own each lowering, as a run's relowering takes (`options.OuterProgram._jitted`): JAX
+        # keeps a function's trace.
+        def fresh(*operands):
+            return backward(*operands)
+
         with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm120")):
-            return jax.jit(backward).trace(*[shape] * 4).lower()
+            return jax.jit(fresh).trace(*[shape] * 4).lower()
 
     with report.refusals():
         report.kept(lowered(), relower=lowered)
