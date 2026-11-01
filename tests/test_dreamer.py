@@ -104,19 +104,29 @@ class SharedTarget:
 def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
     """A Dreamer rollout donates its live state to the steps that advance it, each buffer once, so it runs
     over an environment whose state holds one array in two fields: three updates at a train ratio of 32 over
-    windows of 16 in batches of 8 take the prefill and exactly the steps they owe."""
+    windows of 16 in batches of 8 take the prefill and exactly the steps they owe. Its steps are the
+    objective's program (`Objective.program`, ledger 3343), which runs its policy: its modules key it and
+    its options compile it, its live state donated."""
     from dew.data.dataset import Loader
     from dew.training import Trainer
 
     env = Batched(TimeLimit(SharedTarget(), episode_length=20), 8)
     objective = DreamerV3Objective(tiny())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
+    built, program = [], objective.program
+
+    def recorded(name, function, **arguments):
+        built.append((name, arguments.get("donate_argnames")))
+        return program(name, function, **arguments)
+
+    objective.program = recorded
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
     data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
                   records=8, batch=8)
     trainer.fit(data, steps=3, log_every=3)
     owed = -(-3 * 8 * 16 // 32)
     assert rollout.environment_steps == 8 * 24 + 8 * -(-owed // 8)
+    assert ("rollout", ("live",)) in built
 
 
 def test_a_driver_records_an_episodes_last_observation_then_restarts():

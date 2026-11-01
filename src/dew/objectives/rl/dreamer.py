@@ -38,7 +38,7 @@ from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
 from dew.nn.categorical import kl_divergence
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import OuterProgram, program as outer_program
 from dew.nn.precision import at_least_fp32, divided
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.objectives.rl.tssm import TSSM, Cache
@@ -732,6 +732,21 @@ class DreamerV3Objective(Objective[Ratio]):
         return Ratio(total, jnp.ones(())), Aux(metrics, variables=stats)
 
 
+def _kept(replay: ReplayBuffer, returns: jax.Array,
+          recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
+    """The replay with a rollout's steps written, each environment's running return, and the sum
+    and count of the returns of the episodes that ended in it."""
+    observed = views(recorded.observation)
+    replay = replay.add({**observed, "action": recorded.action})
+
+    def tally(held, observed):
+        total = jnp.where(observed["first"], 0, held) + observed["reward"]
+        return total, (total, observed["last"])
+
+    returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
+    return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
+
+
 @dataclass
 class DreamerRollout:
     """The trainer's rollout of a `DreamerV3Objective` (`dew.training.rollout.Rollout`): its agent acts
@@ -763,14 +778,14 @@ class DreamerRollout:
         if isinstance(env, Simulator):
             driven = DrivenSimulator(env)
             self._begin = functools.partial(simulator_start, driven)
-            # The replay is written in place, its buffer donated to the step that writes it.
-            recorded = OuterProgram(self._kept, donate_argnames=("replay",))
+            # The replay is written in place, its buffer donated to the step that writes it: an outer
+            # program (`dew.nn.kernels.options.program`), since it runs no module of the objective's.
+            recorded = outer_program(_kept, donate_argnames=("replay",))
             self._roll = functools.partial(self._simulated, driven, recorded)
         else:
             stepped = Driven(env)
             self._begin = functools.partial(start, stepped)
-            self._roll = OuterProgram(functools.partial(self._stepped, stepped),
-                                 static_argnames=("steps", "random"), donate_argnames=("live",))
+            self._roll = functools.partial(self._rolled, stepped)
         self._sample = OuterProgram(lambda replay, key: replay.sample(key, self.batch, self.length))
 
     @property
@@ -797,27 +812,23 @@ class DreamerRollout:
     def _policy(self, random: bool) -> Policy:
         return self._uniform if random else self.objective.act
 
-    def _kept(self, replay: ReplayBuffer, returns: jax.Array,
-              recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
-        """The replay with a rollout's steps written, each environment's running return, and the sum
-        and count of the returns of the episodes that ended in it."""
-        observed = views(recorded.observation)
-        replay = replay.add({**observed, "action": recorded.action})
-
-        def tally(held, observed):
-            total = jnp.where(observed["first"], 0, held) + observed["reward"]
-            return total, (total, observed["last"])
-
-        returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
-        return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
-
     def _stepped(self, env: Env, variables: Variables, live: _Live, *, steps: int,
                  random: bool) -> tuple[_Live, jax.Array, jax.Array]:
         """`live` after `steps` steps of every environment of `env`, one scan, and the ended episodes'
         returns' sum and count."""
         carry, recorded = env_rollout(env, self._policy(random), variables, live.carry, steps, reset=False)
-        replay, returns, total, count = self._kept(live.replay, live.returns, recorded)
+        replay, returns, total, count = _kept(live.replay, live.returns, recorded)
         return _Live(carry, replay, returns), total, count
+
+    def _rolled(self, env: Env, variables: Variables, live: _Live, *, steps: int,
+                random: bool) -> tuple[_Live, jax.Array, jax.Array]:
+        """`_stepped` as the objective's program, since it runs the objective's policy (`Objective.program`:
+        its modules key it and its options compile it), `live` donated so the replay is written in place,
+        the environment held so another replaces it."""
+        rollout = self.objective.program("rollout", functools.partial(self._stepped, env),
+                                         static_argnames=("steps", "random"), donate_argnames=("live",),
+                                         holds=(env,))
+        return rollout(variables, live, steps=steps, random=random)
 
     def _simulated(self, simulator: DrivenSimulator, recorded: Callable, variables: Variables, live: _Live, *,
                    steps: int, random: bool) -> tuple[_Live, jax.Array, jax.Array]:
