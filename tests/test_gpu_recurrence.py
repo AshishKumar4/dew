@@ -59,12 +59,10 @@ pytestmark = pytest.mark.gpu(reason="each recurrence route's native kernel: the 
 
 
 def on_its_family(check):
-    """`check` where this GPU is of a family the mainloop's bundles claim (an A100's, an H100's)."""
-    def run():
-        if mainloop.family_of() is None:
-            pytest.skip("the mainloop's bundles run compiled on a GPU of the family each claims")
-        check()
-    return run
+    """`check` where this GPU is of a family the mainloop's bundles claim (an A100's, an H100's), else
+    skipped (`when`)."""
+    return when(mainloop.family_of() is not None,
+                "the mainloop's bundles run compiled on a GPU of the family each claims", check)
 
 
 PORT_KERNELS = {

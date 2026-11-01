@@ -223,11 +223,10 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
 
 def moved_weights(variables):
     """Check 1's `draw(seed)` over a trainer's `variables`: each trained leaf moved by the seed's draw,
-    so zero-initialized layers take a gradient too."""
-    host = jax.tree.map(np.asarray, variables)
-
+    so zero-initialized layers take a gradient too. A draw's weights stay where `variables` are, so the
+    arms read them in place, not each from the host."""
     def draw(seed):
-        return ({**host, "params": moved(host["params"], jax.random.key(seed), 0.02)},)
+        return ({**variables, "params": moved(variables["params"], jax.random.key(seed), 0.02)},)
 
     return draw
 

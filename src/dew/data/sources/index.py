@@ -3,6 +3,7 @@ mirror, pinned while the index is open."""
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -12,6 +13,11 @@ import numpy as np
 
 from dew.data.declared import Declared, mirrored
 from dew.data.storage import Store, local
+
+_MAPPING = threading.Lock()
+"""Held while an index takes its lease and maps its values: threads that first read one index at once
+(a reader its worker unpickled) each map the file of the one lease the index keeps, never a lease another
+thread took and dropped, whose descriptor the path names closed by then or reused for another file."""
 
 
 @dataclass(frozen=True)
@@ -39,7 +45,8 @@ class ArrayIndex:
 
     @cached_property
     def values(self) -> np.ndarray:
-        values = np.load(self.lease[0], mmap_mode="r", allow_pickle=False)
+        with _MAPPING:
+            values = np.load(self.lease[0], mmap_mode="r", allow_pickle=False)
         if not isinstance(values, np.ndarray):
             raise ValueError(f"index {self.url} must contain one NumPy array")
         return values

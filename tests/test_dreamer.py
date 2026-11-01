@@ -439,3 +439,16 @@ def test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot()
     assert "loss_policy" not in after
     for name in ("loss_decoder", "loss_reward", "loss_imitation"):
         assert after[name] < before[name], (name, before[name], after[name])
+
+
+@pytest.mark.parametrize("name", ["dynamics", "representation", "decoder", "reward", "continue", "imitation"])
+def test_an_auxiliary_head_named_as_a_world_model_loss_is_refused(name):
+    """An auxiliary head whose name is one of the objective's own losses is refused, where its regression
+    would replace that loss (a head named `dynamics` dropped the KL that trains the prior); one named apart
+    builds."""
+    def headed(head):
+        return tiny(0, image=(16, 16, 1), conv_depth=2, reads="image", auxiliary=((head, 1, 8),))
+
+    DreamerV3Objective(headed("physics"))
+    with pytest.raises(ValueError):
+        DreamerV3Objective(headed(name))

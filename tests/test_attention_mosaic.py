@@ -13,15 +13,17 @@ import dataclasses
 import functools
 import gc
 import weakref
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms
+from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -273,7 +275,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     if seeds is None:
         seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
                  else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds,
+                    terms=_gradient_terms(spans, hooked, score, jax.jit(reference)) if backward else None)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -375,18 +378,34 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept.name}",
-                    seeds=SEEDS, terms=_gradient_terms(spans) if kept is template.Kept.OUTPUT else False)
+                    seeds=SEEDS, terms=_gradient_terms(spans))
 
 
-def _gradient_terms(spans: template.KeySpans):
+def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, score: tuple = (),
+                    reference: Callable | None = None):
     """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
     logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
-    rounded output carries (`template.Kept.OUTPUT`'s, FlashAttention's), so a row that cancels to zero in
-    float64 is held to it, not to its own zero."""
+    rounded output carries (`template.Kept.OUTPUT`'s, and the fast form's: its anchor key's `dP - c` its
+    product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
+    score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
+    logits are the hook's (`template.score_modded`), and its parameters' gradients take the terms check 1
+    traces from `reference` (`float64_terms`). A call resuming from an initial state (`score` naming sinks
+    or a resumed partial) takes check 1's own terms (None): its weights start from the state, which
+    `attention_terms` does not carry."""
+    if {"sinks", "resumed"} & set(score):
+        return None
     keep = template.dense(spans)[:, None]
 
-    def terms(query, key, value, dout):
-        return tuple(attention_terms(query, key, value, dout, keep)[1:])
+    def terms(query, key, value, dout, *hooks):
+        if not hooks:
+            return tuple(attention_terms(query, key, value, dout, keep)[1:])
+        params, _ = hooks
+        wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
+        found = attention_terms(query, key, value, dout, keep,
+                                score=lambda raw: template.score_modded(raw, hooked(wide, None)))
+        with jax.enable_x64(new_val=True):
+            _, traced = float64_terms(reference, *widened((query, key, value, dout, *hooks)))
+        return (*found[1:], *traced[3:])
 
     return terms
 

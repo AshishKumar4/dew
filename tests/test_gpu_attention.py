@@ -41,16 +41,12 @@ import test_attention_triton as triton
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import Cell, cells_of, repeats_bit_for_bit, run_cells, when
+from gpu_flow import BF16_PRODUCTS, Cell, cells_of, repeats_bit_for_bit, run_cells, when
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
 
 pytestmark = pytest.mark.gpu(reason="each route's GPU kernel: Triton, Mosaic, flash and the band")
-
-BF16_PRODUCTS = "needs a GPU whose bf16 products run, sm80 or later"
-"""Why a library kernel's cell skips: flash, cuDNN, tokamax's Triton and the band run wherever bf16 products
-do (`bf16_dot_runs`), an A10 and an L4 among them, whatever Dew's own launches' sizes."""
 
 CASES = ("causal-documents-window", *triton.IRREGULAR)
 """The Triton sweeps' calls (`triton.every_config_on_a_gpu`)."""

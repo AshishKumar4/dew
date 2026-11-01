@@ -5,6 +5,7 @@ Each claim is held to a literal reading of equation 71, a Python loop over each 
 that steps the level by `rate` times its window's summed weighted gradient, written here apart from
 the scan, on par with it by check 1 against its own float64 run."""
 
+import functools
 from pathlib import Path
 
 import jax
@@ -100,12 +101,19 @@ def site(dew, reference, drawn, rate: float, scale: float, window: int, label: s
     assert_as_exact(dew, literal, drawn, label, seeds=seeds, truth_fn=truth)
 
 
+@functools.cache
+def variable_shapes(model: CausalTransformer):
+    """`model`'s variables' shapes, traced once a model: a site's every draw reads them
+    (`drawn_variables`)."""
+    return jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
+
+
 def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 0.5):
     """`model`'s variables drawn at `scale` N(0, 1), its level's `up` among them, so the level moves
     the states from its first window."""
     rng = np.random.default_rng(seed)
-    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
-    return jax.tree.map(lambda leaf: (scale * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
+    return jax.tree.map(lambda leaf: (scale * rng.standard_normal(leaf.shape)).astype(np.float32),
+                        variable_shapes(model))
 
 
 def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
@@ -486,10 +494,39 @@ def test_each_window_steps_from_its_level_as_the_literal_loop():
                     truth_fn=scored(reference(truth=True)))
 
 
-WINDOW_GRADIENT_SEEDS = 8
+WINDOW_GRADIENT_SEEDS = 512
 """Check 1's declared seeds for each window's gradient from its float64 level, sized paired by
-`seeds_for` on armada (the gate's validation: a paired null passed 24 runs of 24, Dew 1.6 times as far
-failed 24 of 24)."""
+`seeds_for` on armada over draws of `WINDOW_STACKED` (packed at 512, sf-size-2469 at 8faa6186d; documents
+the same count, the most a site declares), drawn as armada's map tasks and judged pooled
+(`reference_error.DRAWS`, ledger 2469). At 8 draws of one window set (the gate's validation: a paired null
+passed 24 runs of 24, Dew 1.6 times as far failed 24 of 24) it resolved before FP32 sums."""
+
+
+WINDOW_STACKED = 16
+"""The draws of windows each draw of their gradients stacks (`stacked_windows`): an embedding row or a
+level's column a draw's few windows touch is hit by a token or two, its error one Gaussian or two a draw,
+heavy-tailed past the pooled interval's reach (ledger 2469: 6.5 at `embed_tokens` and `continuum.up`).
+Stacked, a draw holds 16 draws' windows, paired window by window (`assert_as_exact`'s `examples`), each
+window's geometry its own."""
+
+
+def stacked_windows(kind: str, seed: int) -> tuple:
+    """`WINDOW_STACKED` draws of windows (`window_segments`), each a draw of its own and one example on a new
+    leading axis: a draw's rows share its windows, so they are one example, not many."""
+    parts = [window_segments(kind, seed * WINDOW_STACKED + index) for index in range(WINDOW_STACKED)]
+    return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *parts)
+
+
+@functools.cache
+def float64_levels(kind: str, window: int):
+    """The literal loop's levels in float64 over a `kind` row's fields (`equation_71`), one program a kind
+    and window: every draw's windows read it (`window_segments`), a stacked draw 32 times, so none
+    traces or compiles it again."""
+    fields = fields_of(kind)
+    adaptation = ChunkAdaptation(window=window, rate=0.5)
+    return jax.jit(lambda *inputs: equation_71(
+        MODEL, *inputs, {name: jnp.asarray(value) for name, value in fields.items()}, adaptation,
+        levels=True, truth=True)[1])
 
 
 def window_segments(kind: str, seed: int, window: int = 3):
@@ -499,12 +536,9 @@ def window_segments(kind: str, seed: int, window: int = 3):
     its own row with its own level and documents."""
     variables, hidden, targets, weights = draw(seed, scale=0.5)
     fields = fields_of(kind)
-    adaptation = ChunkAdaptation(window=window, rate=0.5)
     with jax.enable_x64(new_val=True):
-        loop = jax.jit(lambda *inputs: equation_71(
-            MODEL, *inputs, {name: jnp.asarray(value) for name, value in fields.items()}, adaptation,
-            levels=True, truth=True)[1])
-        levels = jax.device_get(loop(*widened((variables, hidden, targets, weights))))
+        levels = jax.device_get(float64_levels(kind, window)(*widened((variables, hidden, targets,
+                                                                       weights))))
     documents = fields.get("segment_ids", np.ones((len(targets), LENGTH), np.int32))
     picked = []
     for row in range(len(targets)):
@@ -531,6 +565,7 @@ def window_segments(kind: str, seed: int, window: int = 3):
 
 
 @pytest.mark.parametrize("kind", ["documents", "packed"])
+@pytest.mark.check1_shards(seeds=512, per_task=35)
 def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
     """At the corner, each window's gradient alone, by the variables and the states, started from the
     level the literal loop in float64 stands at there rounded to float32 (`window_segments`), on par
@@ -550,7 +585,9 @@ def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
                 return jnp.sum(weights * scores(variables, hidden[None], targets[None], weights[None],
                                                 fields)[0])
             return with_gradients(loss)(variables, hidden, jnp.ones((), hidden.dtype))
-        return jax.jit(jax.vmap(one))
+        # Each example a draw of windows (`stacked_windows`), each window a row of it; the draws one at a
+        # time, so one draw's intermediates are held at once, as one draw's were before they were stacked.
+        return jax.jit(lambda *drawn: jax.lax.map(lambda example: jax.vmap(one)(*example), drawn))
 
     def dew(variables, hidden, targets, weights, fields):
         return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation, predict=False,
@@ -560,9 +597,9 @@ def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
         return lambda variables, hidden, targets, weights, fields: equation_71(
             MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)
 
-    assert_as_exact(arm(dew), arm(reference(truth=False)), lambda seed: window_segments(kind, seed),
+    assert_as_exact(arm(dew), arm(reference(truth=False)), lambda seed: stacked_windows(kind, seed),
                     f"each window's gradient from its float64 level over {kind}", seeds=WINDOW_GRADIENT_SEEDS,
-                    truth_fn=arm(reference(truth=True)))
+                    truth_fn=arm(reference(truth=True)), examples=True)
 
 
 def test_a_level_at_its_start_is_the_identity():
