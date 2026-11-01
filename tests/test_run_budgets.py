@@ -760,17 +760,20 @@ def test_a_clocked_run_names_its_length_once():
 
 
 def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_at_its_bound():
-    """A run bounded to EXAMPLES examples whose rollout hands back the batch it reads, each batch it makes
-    consuming the examples of those it read (`dew.training.rollout.clocked_rollout`), steps as the run
-    without a rollout: every step's loss and the final weight, its last short window closed, and its
-    clock at its bound (row 2437)."""
-    (x,) = records(0)
+    """A run bounded to its CLOCKED_RECORDS records, read as a stream no plan counts steps ahead of (its
+    objective makes 0 to 2 rows of each, `Thin`), whose rollout hands back the batch it reads, each batch
+    it makes consuming the examples of those it read (`dew.training.rollout.clocked_rollout`), steps as
+    the run without a rollout, over its progress: every step's loss and the final weight, its last short
+    window closed, and its clock at its bound (row 2437)."""
+    (x,) = clocked_records(0)
     plain, rolled = RecordingTracker(), RecordingTracker()
-    alone = trainer(tracker=plain).fit(chain(x), examples=EXAMPLES, log_every=1)
-    handed = Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK)), key=0,
-                     accumulation=ACCUMULATION, tracker=rolled, rollout=lambda state, batch, key: batch).fit(
-        chain(x), examples=EXAMPLES, log_every=1)
-    assert int(handed.consumed) == int(alone.consumed) == EXAMPLES
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    alone = Trainer(Thin(), optim, key=0, accumulation=2, tracker=plain).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
+    handed = Trainer(Thin(), optim, key=0, accumulation=2, tracker=rolled,
+                     rollout=lambda state, batch, key: batch).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
+                                                                  log_every=1)
+    assert int(handed.consumed) == int(alone.consumed) == CLOCKED_RECORDS
     np.testing.assert_array_equal(np.asarray(handed.variables["params"]["w"]),
                                   np.asarray(alone.variables["params"]["w"]))
     assert losses(rolled) == losses(plain) != []
@@ -778,22 +781,22 @@ def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_
 
 def test_a_custom_step_trains_a_run_bounded_in_examples_whose_schedule_reads_no_progress():
     """A custom step (`Trainer(step=...)`), whose update the run's progress is not handed, trains a run
-    bounded in examples to its bound under a schedule of its own steps, its clock at the bound; under
-    one that decays over the whole run, which reads that progress, the run is refused before a step
-    (row 2437)."""
+    bounded in examples that no plan counts steps ahead of (`clocked_chain`) to its bound under a schedule
+    of its own steps, its clock at the bound; under one that decays over the whole run, which reads that
+    progress, the run is refused before a step (row 2437)."""
     def stepped(objective, optimizer):
         def step(state, batch):
             return (state.replace(microstep=state.microstep + 1, updates=state.updates + 1),
                     jnp.zeros([], jnp.float32), Aux({}))
         return step
 
-    (x,) = records(0)
-    own = OptimConfig(optimizer="sgd", learning_rate=Linear(peak_value=PEAK, decay_steps=4))
-    state = Trainer(Pulled(), own, key=0, step=stepped).fit(chain(x), examples=EXAMPLES)
-    assert int(state.consumed) == EXAMPLES
-    whole = OptimConfig(optimizer="sgd", learning_rate=Linear(peak_value=PEAK))
+    (x,) = clocked_records(0)
+    own = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, decay_steps=4))
+    state = Trainer(Thin(), own, key=0, step=stepped).fit(clocked_chain(x), examples=CLOCKED_RECORDS)
+    assert int(state.consumed) == CLOCKED_RECORDS
+    whole = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK))
     with pytest.raises(ValueError):
-        Trainer(Pulled(), whole, key=0, step=stepped).fit(chain(x), examples=EXAMPLES)
+        Trainer(Thin(), whole, key=0, step=stepped).fit(clocked_chain(x), examples=CLOCKED_RECORDS)
 
 
 def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_clock_keeps_none(tmp_path):
