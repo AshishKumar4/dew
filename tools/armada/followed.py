@@ -490,10 +490,7 @@ def follow() -> None:
             return None
         if (how := spawned(code, sys._getframe(1))) is not None:
             # A child this one starts through multiprocessing: counted as the parent's own are (lifetime.py).
-            if how == "followed":
-                log.write("start\tfollowed\n")
-            elif how == "unfollowed":
-                write("unfollowed", 1)
+            counted(how)
             return None
         name = code.co_filename
         if checkout(name, root):
@@ -519,7 +516,10 @@ def follow() -> None:
         if (taken := coded(event, args, root)) is not None:
             recorded(taken)
             return
-        kind = start(event, args, str(directory), child=True)
+        counted(start(event, args, str(directory), child=True))
+
+    def counted(kind: str | None) -> None:
+        # A start's count (`start`, `spawned`): a followed child's start a line each, any unfollowed once.
         if kind == "followed":
             log.write("start\tfollowed\n")
         elif kind == "unfollowed":
