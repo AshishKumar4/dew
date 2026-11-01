@@ -20,6 +20,7 @@ import abc
 import dataclasses
 import functools
 import math
+import operator
 from collections.abc import Callable
 from typing import Self
 
@@ -1330,11 +1331,14 @@ class Transport[Allocated, Opened](abc.ABC):
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
 
-    def fixed_up(self, summed, partials, ready, program, start, gathered, store) -> None:
+    def fixed_up(self, summed, partials, ready, program, start, gathered, store,
+                 combine=operator.add) -> None:
         """A balanced tail's consumer's share of a tile (`tail.Tail`), `summed` from its program's steps:
         left in `partials` (each program's, this consumer's) behind `ready` (`partials_ready`) where its
-        range starts inside the tile; otherwise added to every partial the programs after it up to
-        `gathered` left, each awaited, and stored (`store`)."""
+        range starts inside the tile; otherwise combined with every partial the programs after it up to
+        `gathered` left, each awaited, in their order, and stored (`store`). `combine(running, partial)` is
+        the algebra's merge of two partials of one tile (a sum's addition by default; a split walk's
+        softmax merge, a scan's composition), which the work's declaration supplies."""
         raise NotImplementedError(f"{self.name} fixes no tile up across programs (`fixes_up`)")
 
 
@@ -1638,7 +1642,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def partials_ready(self, shape: tuple[int, ...], interpret: bool):
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
-    def fixed_up(self, summed, partials, ready, program, start, gathered, store) -> None:
+    def fixed_up(self, summed, partials, ready, program, start, gathered, store,
+                 combine=operator.add) -> None:
         # GPU-scope signals and waits, proven to lower and run on an H100 at the pinned JAX: TGHYBRID1-h100's
         # SASS releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong
         # CAS. Interpreted, the partials are left before they are read (`tail.ordered`).
@@ -1653,7 +1658,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             def added(other, running):
                 if ready is not None:
                     plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
-                return running + partials[other]
+                return combine(running, partials[other])
 
             store(lax.fori_loop(program + 1, gathered, added, summed))
 
