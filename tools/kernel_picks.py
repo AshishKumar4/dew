@@ -29,7 +29,7 @@ import tokamax
 from huggingface_hub import hf_hub_download
 
 from dew import cache
-from dew.interop.hf_decoders import translate_config
+from dew.interop.hf_decoders import decoder_config, translate_config
 from dew.nn.backbones import CausalTransformer
 from dew.nn.kernels import generation, tuning
 from dew.objectives.lm import LMObjective
@@ -44,7 +44,8 @@ def model_of(arguments) -> CausalTransformer:
     path = local if local.is_file() else hf_hub_download(arguments.config, "config.json",
                                                          revision=arguments.revision)
     config = json.loads(Path(path).read_text())
-    fields = dict(translate_config(config.get("text_config", config)))
+    # A wrapper's decoder as its load reads it: the wrapper's head policy and overrides (ledger 3006).
+    fields = dict(translate_config(decoder_config(config)))
     return CausalTransformer(**{**fields, "dtype": jnp.dtype(arguments.dtype)})
 
 

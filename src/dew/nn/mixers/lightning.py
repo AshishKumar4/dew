@@ -52,7 +52,8 @@ ACTIVATIONS = {'silu': nn.silu}
 
 def lightning_slopes(heads: int) -> tuple[float, ...]:
     """Each head's slope, ALiBi's (`get_slopes`, :1237-1251), in double precision as the reference's
-    Python computes them before it stores them in fp32."""
+    Python computes them before it stores them in fp32: the schedule of the bias's slopes
+    (`dew.nn.attention_masks.alibi_slopes`), which BLOOM's computes in float32."""
 
     def power_of_two(n: int) -> list[float]:
         start = 2 ** (-(2 ** -(math.log2(n) - 3)))

@@ -60,7 +60,7 @@ from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
-from dew.nn.precision import at_least_fp32, configured_precision, exact_float32, scaled
+from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -1043,11 +1043,8 @@ def _narrow_float(value) -> bool:
 
 def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
     """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype at every
-    order: the broadcast taken in fp32 between two casts, each exact, so its transpose, wherever JAX forms
-    one (a gradient, a gradient's gradient, forward over reverse), widens the cotangent, sums it in fp32
-    and rounds the sum once (ledger 2653). A custom VJP takes no forward mode, and a custom JVP over the
-    plain broadcast would sum its nested derivatives narrow."""
-    return jax.lax.broadcast_in_dim(value.astype(jnp.float32), shape, dimensions).astype(value.dtype)
+    order, as a Dew bias's does (`dew.nn.precision.broadcast_summed`, ledgers 2653 and 3038)."""
+    return broadcast_summed(value, shape, dimensions)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,

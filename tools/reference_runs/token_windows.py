@@ -20,7 +20,8 @@ import json
 import numpy as np
 import pyarrow.parquet as pq
 from common import sha256
-from transformers import AutoTokenizer
+
+from dew.data.text import load_tokenizer
 
 
 def main() -> None:
@@ -34,7 +35,7 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    tokenizer = load_tokenizer(args.tokenizer)
     separator = tokenizer.convert_tokens_to_ids("<|endoftext|>")
     if separator is None or separator == tokenizer.unk_token_id:
         separator = tokenizer.eos_token_id
