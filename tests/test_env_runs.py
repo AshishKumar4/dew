@@ -139,19 +139,26 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
     assert_bitwise(state, saved.prepare().train("again"))
 
 
-def test_a_runs_episodes_score_its_greedy_flights_from_the_evaluations_key(tmp_path):
-    """A PPO run validated by its episodes logs at its end `episodes/return` and `episodes/steps`: the
-    first episodes its greedy policy earns flown 16 steps from the key the run's key gives its last step
-    (`dew.rl.evaluation.episodes`)."""
+@pytest.mark.parametrize("agent", ["ppo", "dreamer"])
+def test_a_runs_episodes_score_its_greedy_flights_from_the_evaluations_key(tmp_path, agent):
+    """A run validated by its episodes logs at its end `episodes/return` and `episodes/steps`: the first
+    episodes its greedy policy earns flown 16 steps from the key the run's key gives its last step
+    (`dew.rl.evaluation.episodes`), on its averaged weights where it keeps them; a PPO policy over the race's
+    observation, a Dreamer agent over the driven step (`Driven`) from the memory it starts with."""
+    from dew.rl.env import Driven
     from dew.training.tracker import LocalTracker
 
-    run, objective, _ = ppo(tmp_path)
+    run, objective, _ = ppo(tmp_path) if agent == "ppo" else dreamer(tmp_path)
+    run = dataclasses.replace(run, episodes=EpisodesConfig(steps=16))
     state = run.prepare().train("scored")
     logged = {name: value for _, scalars in LocalTracker(str(tmp_path / "scored" / "tracking")).scalars()
               for name, value in scalars.items() if name.startswith("episodes/")}
-    flown = episodes(objective.greedy, Batched(FlightEnv(racing(), VIEWS), 16), 16)
+    race = Batched(FlightEnv(racing(), VIEWS), 16 if agent == "ppo" else 8)
+    flown = (episodes(objective.greedy, race, 16) if agent == "ppo" else
+             episodes(objective.greedy, Driven(race), 16, memory=objective.memory))
     with generation.run_precision(run.trainer.precision):
-        expected = flown(state.variables, evaluation_key(state.key, 3))
+        expected = flown(state.variables if state.ema is None else state.averaged,
+                         evaluation_key(state.key, 3))
     assert logged == {f"episodes/{name}": value for name, value in expected.items()}
 
 
