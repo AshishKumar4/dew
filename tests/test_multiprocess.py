@@ -1516,7 +1516,8 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
 
     for report in reports:
         assert report["process_count"] == 2
-        assert report["image_spec"] == report["token_spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        requests = "P(('diloco', 'data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["image_spec"] == report["token_spec"] == requests
         assert report["image_rows"] == report["rows"] == 3
         assert set(report["rejected"]) == {"prompts", "guidance", "steps", "row_count",
                                            "prepared", "prepared_rows", "request_kind", "budget"}
@@ -1543,7 +1544,7 @@ def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_
 
     for report in reports:
         assert report["process_count"] == 2
-        assert report["spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["spec"] == "P(('diloco', 'data', 'expert', 'fsdp', 'tensor'),)"
         # Four placed prompt rows per process, three of them real, times three
         # continuations: the padded prompt's group stays out of the result.
         assert report["global_rows"] == 24 and report["rows"] == 9
