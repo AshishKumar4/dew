@@ -1218,6 +1218,141 @@ def cfg_sweep_figure():
     svg.save(HERE / "cfg-sweep.svg")
 
 
+def architecture_flow_figure():
+    """One training run through Dew, from the user's code to the GPU (docs/design/architecture.md)."""
+    svg = Figure(760, 432, label="One training run through Dew. A script calls Trainer(objective, optax, "
+                 "key).fit(data), or dew train builds the same Trainer from a RunConfig. Trainer.fit "
+                 "compiles the step: jax.jit traces it, the algebra pass rewrites the jaxpr, it is lowered "
+                 "to StableHLO with kernels as custom calls, and XLA compiles it. Kernels come from Dew's "
+                 "templates, vendor libraries or XLA, and run in one executable per step.")
+    for y, lane in ((49, "YOUR CODE"), (133, "TRAINER"), (217, "COMPILE"), (301, "KERNELS"), (385, "GPU")):
+        svg.text(16, y, lane, size=11, weight=600, color="muted")
+    box(svg, 110, 16, 340, 62, "Trainer(…).fit(data)", ["a script or notebook"])
+    box(svg, 462, 16, 282, 62, "or: dew train run.json", ["RunConfig builds the same Trainer"])
+    box(svg, 110, 100, 634, 62, "Trainer.fit",
+        ["compiles one step per batch shape, then runs it every micro-batch"])
+    box(svg, 110, 184, 140, 62, "jax.jit", ["traces the step"])
+    box(svg, 258, 184, 160, 62, "algebra pass", ["rewrites the jaxpr"], accent=True)
+    box(svg, 426, 184, 150, 62, "lower", ["StableHLO"])
+    box(svg, 584, 184, 160, 62, "XLA compile", ["fuses, runs ptxas"])
+    box(svg, 110, 268, 220, 62, "Dew's templates", ["Mosaic GPU, Triton, TPU"], accent=True)
+    box(svg, 338, 268, 200, 62, "vendor kernels", ["FlashAttention, cuDNN"])
+    box(svg, 546, 268, 198, 62, "XLA", ["fusions, cuBLAS"])
+    box(svg, 110, 352, 634, 62, "one executable per step",
+        ["kernels run in order; on sm90 and later a Mosaic launch may start the next early"])
+    for x1, y1, x2, y2 in ((427, 78, 427, 98), (427, 162, 427, 182), (250, 215, 256, 215),
+                           (418, 215, 424, 215), (576, 215, 582, 215), (427, 246, 427, 266),
+                           (427, 330, 427, 350)):
+        svg.arrow(x1, y1, x2, y2)
+    svg.save(HERE / "architecture-flow.svg")
+
+
+def architecture_pass_figure():
+    """The compile-time algebra pass, from a traced jaxpr to the program XLA compiles."""
+    svg = Figure(760, 332, label="The compile-time algebra pass. The traced jaxpr's arithmetic becomes "
+                 "terms, the rest opaque leaves; windows form around each head a rule can cheapen; facts and "
+                 "the identities and linear rule sets saturate within a budget; egglog's greedy DAG "
+                 "extraction picks each form by its price in seconds; a form is spliced in only where it "
+                 "costs less, and the outer jit lowers the result for XLA.")
+    box(svg, 16, 16, 170, 84, "traced jaxpr", ["the whole step,", "backward included"])
+    box(svg, 204, 16, 260, 84, "terms", ["language equations become terms;", "the rest stay opaque"],
+        accent=True)
+    box(svg, 482, 16, 262, 84, "windows", ["each cheapenable head with two", "producer levels; 64 equations"],
+        accent=True)
+    box(svg, 16, 140, 240, 84, "saturate", ["facts, identities, linear,", "round by round, in a budget"],
+        accent=True)
+    box(svg, 274, 140, 220, 84, "extract", ["greedy DAG, each form", "priced by cost.fused"], accent=True)
+    box(svg, 512, 140, 232, 84, "splice", ["only where the new form", "costs less"], accent=True)
+    svg.rect(16, 262, 478, 54, fill="none", stroke="rule")
+    svg.text(28, 284, "switch: dew.algebra.passes(on, target), on by default", size=12, color="muted")
+    svg.text(28, 304, "loop bodies are rewritten in place, never unrolled", size=12, color="muted")
+    box(svg, 512, 262, 232, 54, "outer jit lowers → XLA")
+    svg.arrow(186, 58, 202, 58)
+    svg.arrow(464, 58, 480, 58)
+    svg.polyline([(613, 100), (613, 120), (136, 120), (136, 138)], color="muted", width=1.25)
+    svg.arrow(256, 182, 272, 182)
+    svg.arrow(494, 182, 510, 182)
+    svg.arrow(628, 224, 628, 260)
+    svg.save(HERE / "architecture-pass.svg")
+
+
+def architecture_template_figure():
+    """A kernel template's layers, and an attention forward call through them."""
+    svg = Figure(760, 470, label="A template's layers, top deciding: choice derives one config from device "
+                 "facts; the mainloop orders the bundle's steps; the toolkit's Family is an issuer and a "
+                 "transport, with the WGMMA, FED, Mma and MmaFed bundles routed and TCGEN05 not; then "
+                 "structure, hooks and the algebra. An attention forward call goes from attention_route "
+                 "through MosaicForward.derived, bundles.of, the launch and each consumer's walk.")
+    svg.text(16, 22, "LAYERS, TOP DECIDES", size=11, weight=600, color="muted")
+    box(svg, 16, 34, 400, 58, "choice: Template.derived", ["one config from device facts, or none"],
+        accent=True)
+    box(svg, 16, 100, 400, 58, "mainloop", ["the order of the bundle's steps"], accent=True)
+    box(svg, 16, 166, 400, 86, "toolkit: Family = Issuer + Transport",
+        ["products, waits, walks, rings, roles"], accent=True)
+    for x, w, name, routed in ((28, 74, "WGMMA", True), (110, 50, "FED", True), (168, 50, "Mma", True),
+                               (226, 72, "MmaFed", True), (306, 84, "TCGEN05", False)):
+        svg.rect(x, 218, w, 24, fill="surface" if routed else "warm_fill",
+                 stroke="rule" if routed else "warm")
+        svg.text(x + 9, 235, name, size=12, mono=True, weight=600)
+    box(svg, 16, 260, 400, 58, "structure", ["block lists, groups, chunks, pages"])
+    box(svg, 16, 326, 400, 58, "hooks", ["score, mask and output callables"])
+    box(svg, 16, 392, 400, 58, "algebra", ["init, step, merge, finish on tiles"], accent=True)
+    svg.text(440, 22, "AN ATTENTION FORWARD CALL", size=11, weight=600, color="muted")
+    steps = [("attention_route.attend", "selector: mosaic, triton, portable"),
+             ("MosaicForward.derived", "choice: tiles, stages, consumers"),
+             ("bundles.of(target)", "toolkit: WGMMA on an H100"),
+             ("_launched", "mainloop: roles and the kernel"),
+             ("each consumer's walk", "algebra: plain_step, merge, finish")]
+    for k, (title, line) in enumerate(steps):
+        box(svg, 440, 34 + 78 * k, 304, 62, title, [line])
+        if k:
+            svg.arrow(592, 34 + 78 * k - 16, 592, 34 + 78 * k - 2)
+    svg.text(440, 440, "The recurrence takes the same path on the same bundles.", size=12, color="muted")
+    svg.save(HERE / "architecture-template.svg")
+
+
+def architecture_derived_figure():
+    """How a template's algebra is derived from a declaration, behind one switch."""
+    svg = Figure(760, 300, label="The derivation of a Reduction: the declaration is traced at one tile into "
+                 "terms, facts mark the walked sums and maxima, the step, merge and finish readings saturate "
+                 "under the decoupled rules, and extraction priced by the tile walk yields init, step, merge "
+                 "and finish, or refuses. The switch dew.cache.DERIVED, off by default, chooses the derived "
+                 "forms or the hand-written ones for the template's plain_step, merge and finish.")
+    box(svg, 16, 16, 172, 84, "declaration", ["a Reduction:", "softmax(s)·v by keys"])
+    box(svg, 200, 16, 172, 84, "traced at a tile", ["terms; facts mark", "walked sums, maxima"], accent=True)
+    box(svg, 384, 16, 172, 84, "saturate", ["step, merge, finish;", "decoupled rules"], accent=True)
+    box(svg, 568, 16, 176, 84, "extract", ["priced by the tile", "walk, or refused"], accent=True)
+    box(svg, 16, 146, 220, 84, "hand-written forms", ["attention_algebra,", "recurrence_algebra"])
+    svg.rect(272, 146, 240, 84, fill="warm_fill", stroke="warm")
+    svg.text(284, 169, "dew.cache.DERIVED", size=14, mono=True, weight=600)
+    svg.text(284, 191, "one switch, off by default", size=13, color="muted")
+    box(svg, 568, 146, 176, 84, "Derived", ["init, step, merge,", "finish"], accent=True)
+    box(svg, 196, 252, 392, 40, "plain_step, merge, finish")
+    for x1, y1, x2, y2 in ((188, 58, 198, 58), (372, 58, 382, 58), (556, 58, 566, 58), (656, 100, 656, 144),
+                           (568, 188, 514, 188), (236, 188, 270, 188), (392, 230, 392, 250)):
+        svg.arrow(x1, y1, x2, y2)
+    svg.save(HERE / "architecture-derived.svg")
+
+
+def architecture_cost_figure():
+    """One cost vocabulary, two schedules."""
+    svg = Figure(760, 332, label="One cost vocabulary, two schedules. templates.cost.Work counts "
+                 "tensor-core FLOPs, fp32 operations, SFU exponentials, conversions and device and shared "
+                 "bytes, over the device facts of GpuTarget. cost.fused, XLA's fusion, prices the "
+                 "compile-time pass; cost.walk, the template's tile walk, prices derived forms.")
+    box(svg, 230, 16, 300, 62, "GpuTarget + Architecture", ["rates, bandwidth, clock, SMs"])
+    box(svg, 170, 104, 420, 86, "templates.cost.Work",
+        ["tensor FLOPs · fp32 ops · SFU exp · conversions", "device bytes · shared bytes"], accent=True)
+    box(svg, 16, 232, 350, 84, "cost.fused: XLA's fusion",
+        ["whole-device rates, in series with", "memory: prices the compile pass"], accent=True)
+    box(svg, 394, 232, 350, 84, "cost.walk: the tile walk",
+        ["one tile on one SM, units overlapped:", "prices derived forms"], accent=True)
+    svg.arrow(380, 78, 380, 102)
+    svg.arrow(300, 190, 200, 230, color="accent")
+    svg.arrow(460, 190, 560, 230, color="accent")
+    svg.save(HERE / "architecture-cost.svg")
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
@@ -1227,7 +1362,10 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure, "sft-mask": sft_mask_figure,
            "pretrained-round-trip": pretrained_round_trip_figure, "jepa-step": jepa_step_figure,
            "lm-next-token": lm_next_token_figure, "agent-episode": agent_episode_figure,
-           "agent-lanes": agent_lanes_figure}
+           "agent-lanes": agent_lanes_figure, "architecture-flow": architecture_flow_figure,
+           "architecture-pass": architecture_pass_figure,
+           "architecture-template": architecture_template_figure,
+           "architecture-derived": architecture_derived_figure, "architecture-cost": architecture_cost_figure}
 
 
 if __name__ == "__main__":
