@@ -299,7 +299,7 @@ def stated(graph: EGraph, region: terms.Region) -> None:
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
             graph.register(rules.exact_scale(literal))
-        if np.ndim(value) == 0 and float(value) == 1.0:
+        if np.ndim(value) == 0 and np.issubdtype(np.asarray(value).dtype, np.inexact) and value == 1:
             graph.register(rules.unit(literal))
 
 
