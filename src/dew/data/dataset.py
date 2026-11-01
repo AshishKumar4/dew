@@ -738,7 +738,7 @@ class Loader:
     pass_examples: int | None = None
     """The source examples one pass of a training read with no record count holds (`records` None: an
     objective makes rows of them, or a pack lays them out, after the order, or a filter cuts it per share),
-    as its read states them (`dew.data.lowering._pass_examples`): an epoch of it; None where nothing
+    as its read states them (`dew.data.compile._pass_examples`): an epoch of it; None where nothing
     states them, or the read has a record count."""
     epochs: int | None = None
     """The epochs a training read with no record count is bounded to, `examples` their passes over its

@@ -39,8 +39,10 @@ from dew.data.analysis import (
     _capabilities,
     _configured,
     _cut,
+    _drops,
     _external,
     _identity,
+    _in_memory,
     _leaves,
     _Lowering,
     _manifest,
@@ -82,7 +84,7 @@ from dew.data.lowering import (
     _epoch_records,
     _Locality,
     _order_records,
-    _pass_examples,
+    _Present,
     _split_spans,
     _tail,
     _weights,
@@ -881,6 +883,62 @@ def _staged(
 _UNCOUNTED = 1 << 62
 """The bound in examples a memory read whose expansion it would hold takes before it holds them, past any
 count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
+
+
+def _pass_examples(train: Pipeline, read: Read) -> int | None:
+    """The source examples one pass of a training read with no record count holds (`_epoch_records`,
+    `Loader.pass_examples`): those reaching where a bound in examples stands (`dew.data.compile._bounded`:
+    the first step that packs or windows them or makes several rows of each, else the batch), before any
+    repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
+    or a streamed source's rows as its shards state them, each slice and limit before that place applied;
+    a mixture by weights, those in which every part it mixes comes round once (`Proportions.covering`). None
+    for a mixture by tokens, a memory read that laid its examples out as it held them, or where a
+    step before that place drops or adds one, or keeps them by a rule not yet bound, or nothing states
+    the count."""
+    source = train.source
+    if isinstance(source, Phases):
+        return None
+    batched = _until(train.stages, (BatchStage, TokenBudget))
+    at = next((index for index, stage in enumerate(train.stages[:batched])
+               if isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)),
+              batched)
+    # Every step before the bound's place reads the pass, a repeat's included; its slices and limits before
+    # the first repeat bound it.
+    if any(_drops(stage) or isinstance(stage, Native)
+           or (isinstance(stage, Configured) and not stage.one_to_one) for stage in train.stages[:at]):
+        return None
+    # A memory read that laid its examples out as it held them (a pack before its shuffle) holds no source
+    # example a bound before that layout could count, as a run bounded in examples refuses it too.
+    if any(isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)
+           for stage in _written(source, ())):
+        return None
+    prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
+    if isinstance(source, Mixture):
+        if source.tokens is not None:
+            # A mix by tokens draws each part as its tokens fall short (`TokenDeficit`), which no count of its
+            # examples states ahead.
+            return None
+        sizes = [_pass_examples(child, read) for child in source.pipelines]
+        known = [size for size in sizes if size is not None]
+        if len(known) != len(sizes):
+            return None
+        count = Proportions.of(_weights(source)).covering(known)
+    elif read == "streamed" and not _in_memory(source):
+        stated = [shard.rows for shard in source.manifest().shards]
+        held = [rows for rows in stated if rows is not None]
+        if len(held) != len(stated):
+            return None
+        count = sum(held)
+    else:
+        records = source.records(read)
+        present = _Present.of(records) if _in_memory(source) else None
+        count = len(records) if present is None else len(present.positions)
+    for stage in prefix:
+        if isinstance(stage, Limit):
+            count = min(count, stage.count)
+        elif isinstance(stage, Slice):
+            count = len(range(count)[stage.selection])
+    return count
 
 
 def _held_ahead(train: Pipeline, read: Read) -> str | None:

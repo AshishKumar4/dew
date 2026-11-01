@@ -388,7 +388,7 @@ def _credited(window: Record, owed: Mapping[str, int]) -> Record:
 
 
 def _documents(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], *, marked: bool,
-               ) -> tuple[Pack, tuple[Record, ...]]:
+               ) -> tuple[Pack, tuple[Batch, ...]]:
     """The documents a held pack lays out, and the pack that lays them: where a bound marked the rows
     (`analysis._held_bound`), each document's marks ride its last token (`_ConsumedAt`), packed beside
     its fields, which the window that holds it sums."""
