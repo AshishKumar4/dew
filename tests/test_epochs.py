@@ -330,3 +330,26 @@ def test_a_loader_compiled_for_epochs_runs_them_and_refuses_another_count():
     assert int(state.consumed) == 24
     with pytest.raises(ValueError):
         Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(loader, epochs=3, log_every=1)
+
+
+def test_epochs_of_a_memory_read_whose_filter_drops_records_are_passes_over_those_it_holds():
+    """Twelve records a filter keeps 9 of (`id % 4 != 0`) before an objective makes rows of each, read in
+    memory, which runs the filter as it holds them, so no count is stated ahead: an epoch is a pass over the
+    9 it holds, counted once it holds them, so two epochs bound the read to 18, the run on the examples
+    clock to them (row 1902's review)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids})).filter(_kept).shuffle(seed=3).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 18, 9)
+    state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 18
+
+
+def _kept(row):
+    return int(row["id"]) % 4 != 0
