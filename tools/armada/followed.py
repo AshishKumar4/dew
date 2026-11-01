@@ -96,6 +96,23 @@ placing = threading.local()
 """Whether the `os.open` this thread is making opens relative to a directory descriptor (`opening`)."""
 
 
+def unprobed(function):
+    """`function` with the probes it makes (`os.stat`, `os.path.isfile`, the `lstat` beneath
+    `os.path.realpath`) its own: no run's input, and not asked of `leaving` in turn, as `probed` wraps each of
+    them and `leaving` makes them again, without end."""
+
+    @functools.wraps(function)
+    def quietly(*arguments, **keywords):
+        before = getattr(placing, "probing", False)
+        placing.probing = True
+        try:
+            return function(*arguments, **keywords)
+        finally:
+            placing.probing = before
+
+    return quietly
+
+
 def checkout(name: str, root: str) -> bool:
     """Whether `name` is a Python file of the checkout at `root`. The environment's packages, which CI
     installs in the checkout, are the locks' to key."""
@@ -188,6 +205,7 @@ def configuring(frame: types.FrameType | None) -> bool:
     return False
 
 
+@unprobed
 def private() -> bool:
     """Whether Dew's caches (XDG_CACHE_HOME) and every store set apart from them (`CACHES`) lie in the caches
     ci.py's `alone` gave this process (`PRIVATE`)."""
@@ -249,6 +267,7 @@ def made_since(name: str) -> bool | None:
     return max(found.st_mtime, found.st_ctime) >= float(started)
 
 
+@unprobed
 def outside(name: str, root: str) -> bool:
     """Whether a read of file `name` reads what another process of the task may have left there, which no key
     holds: an existing file in the machine's shared scratch (`SHARED_ROOTS`), the user's home or the checkout
@@ -267,6 +286,7 @@ def outside(name: str, root: str) -> bool:
     return shared and not beneath(name, root) if since is None else since
 
 
+@unprobed
 def shared_scratch(name: str, root: str) -> bool:
     """Whether `name` is the machine's shared scratch (`SHARED_ROOTS`) or beneath it, outside the checkout
     `root` (which a test of these tools may make there) and not this process's own (`owned`): a listing of it,
@@ -277,6 +297,7 @@ def shared_scratch(name: str, root: str) -> bool:
         and not owned(name)
 
 
+@unprobed
 def leaving(name: str, root: str) -> bool:
     """Whether a probe of path `name` (`probed`) answers by what another process of the task may have left:
     one in shared scratch (`shared_scratch`) that is not there or was made since the task began, whose arrival
@@ -485,6 +506,7 @@ def tool(path) -> str | None:
     return "ffmpeg" if base.startswith("ffmpeg-") else base
 
 
+@unprobed
 def native(names: list) -> bool:
     """Whether every one of `names` that exists, and at least one, is a program of `TOOLS` (`tool`): a
     start's candidates along PATH (`_posixsubprocess`'s) run the first that exists. A start that names its

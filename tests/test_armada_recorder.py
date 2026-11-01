@@ -562,7 +562,7 @@ def test_a_file_that_takes_what_another_left_in_shared_scratch_by_any_way_has_no
         "build.py": "def build(): return 1\n",
         "test_writer.py": f"import os\nfrom build import build\ndef test_writer():\n"
                           f"    os.makedirs({str(folder)!r}, exist_ok=True)\n"
-                          f"    open({str(shared)!r}, 'w').write(str(build()))\n",
+                          f"    open({str(shared)!r}, 'w').write('value=' + str(build()) + '\\n')\n",
         "test_reader.py": "def test_reader():\n    " + reading.format(
             path=str(shared), name=shared.name, folder=str(folder)) + "\n"}, {})
     assert reused() == [True, False]
