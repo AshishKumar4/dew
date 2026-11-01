@@ -11,7 +11,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
   (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
   strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
-  (docs/installation.md lists each fix). On aarch64 the extras keep the release's own plugin for now.
+  (docs/installation.md lists each fix).
 - Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md),
   and through it on black, graphviz, anywidget and opentelemetry-api.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
