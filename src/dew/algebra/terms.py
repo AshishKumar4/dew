@@ -251,35 +251,6 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
     return None
 
 
-def evaluated(region_: Region, chosen: Mapping[str, Term], values: list) -> list[jax.Array]:
-    """The values of `region_`'s outputs over its leaves' `values` (inputs and constants first), each root as
-    extraction `chosen` its form (by the root's text): each equation outside the language bound in program
-    order once its inputs are known, under its protected marker where it had one, each shared term evaluated
-    once."""
-    known: dict[str, jax.Array] = {}
-
-    def value(term: Term) -> jax.Array:
-        key = str(term)
-        if key not in known:
-            known[key] = _value(term, value, region_, values)
-        return known[key]
-
-    for opaque in region_.opaque:
-        operands = [opaque.literals[index] if term is None else value(chosen[str(term)])
-                    for index, term in enumerate(opaque.inputs)]
-        primitive = opaque.equation.primitive
-        given = primitive.get_bind_params(opaque.equation.params)
-        if protected(opaque.equation):
-            with jax.named_scope(PROTECTED):
-                made = primitive.bind(*operands, **given)
-        else:
-            made = primitive.bind(*operands, **given)
-        for leaf, output in zip(opaque.outputs, made if primitive.multiple_results else [made], strict=True):
-            values[leaf] = output
-    return [region_.literal_outputs[index] if root is None else value(chosen[str(root)])
-            for index, root in enumerate(region_.outputs)]
-
-
 def _index(argument) -> int:
     return int(get_literal_value(argument))
 
