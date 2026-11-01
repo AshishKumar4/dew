@@ -80,8 +80,10 @@ from dew.data.lowering import (
     _as_iter,
     _Build,
     _epoch_records,
+    _in_memory,
     _Locality,
     _order_records,
+    _Present,
     _split_spans,
     _tail,
     _weights,
@@ -908,9 +910,6 @@ def _compiled(
     records = _epoch_records(train, build)
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
-    # An epoch of a read with no record count is a pass over its source examples, unless it is bounded.
-    unbounded = records is None and examples_bound(train.stages) is None
-    pass_examples = _pass_examples(train, read, counts) if unbounded else None
     order_records = _order_records(train, build)
     if order_records is None and _native_after_bound(train):
         # A native Grain step rebuilds or reorders rows as it likes, so the examples each row consumes
@@ -940,17 +939,29 @@ def _compiled(
         widths=_bound_widths(original),
         tail=_tail(train, build),
         order_records=order_records,
-        pass_examples=pass_examples,
     )
 
 
-def _pass_examples(train: Pipeline, read: Read, counts: Mapping[str, CorpusCounts]) -> int | None:
-    """The source examples one pass of `train`'s training read holds, where it has no record count
-    (`Loader.pass_examples`): those reaching the first step that makes rows of them or packs them, or its
-    batch (`_bounded`'s place), where no step before that drops or adds one and no repeat with a count,
-    slice or take ends a pass early. A memory read counts them as it held them, before any step made rows
-    of them (its corpus's counts, `materialize`); an indexed or streamed root, the records it holds, a
-    streamed one where every shard states its rows. None where none of these holds, a mixture's included."""
+def _epoch_bound(chain: Pipeline, objective: ObjectiveData | None, read: Read, epochs: int) -> int | None:
+    """The examples `epochs` passes over `chain`'s training read hold, where that read has no record
+    count, its order cut per share as an objective's rows or a pack after the order cut it
+    (`Loader.records`), and states how many source examples a pass holds (`_pass_examples`): a run of
+    `epochs` reads them as a run bounded in examples does (`fitted`). None where its read has a record
+    count, which an epoch counts, or states no count of its examples."""
+    branch = chain if objective is None else _objective_branch(chain, objective, train=True, read=read)
+    if not _analyzed(branch, read).per_share:
+        return None
+    count = _pass_examples(branch, read)
+    return None if count is None else epochs * count
+
+
+def _pass_examples(train: Pipeline, read: Read) -> int | None:
+    """The source examples one pass of `train`'s training read holds, as its source states them ahead:
+    those reaching the first step that makes rows of them or packs them, or its batch (`_bounded`'s
+    place), where no step before that drops or adds one and no repeat with a count, slice or take ends a
+    pass early: a streamed root's rows, where every shard states its own; another read's records, a
+    source held in memory's present ones (`dew.data.lowering._Present`). None where none of these holds,
+    a mixture's included."""
     if isinstance(train.source, (Mixture, Phases)):
         return None
     batched = _until(train.stages, (BatchStage, TokenBudget))
@@ -959,13 +970,12 @@ def _pass_examples(train: Pipeline, read: Read, counts: Mapping[str, CorpusCount
     if any(_drops(stage) or isinstance(stage, (Native, Slice, Limit)) or (
             isinstance(stage, Repeat) and stage.epochs is not None) for stage in train.stages[:at]):
         return None
-    if materialized(train.source):
-        held = counts.get(_name(train))
-        return None if held is None else held.accepted
     if read == "streamed":
         rows = [shard.rows for shard in train.source.manifest().shards]
         return None if any(count is None for count in rows) else sum(rows)
-    return len(train.source.records(read))
+    records = train.source.records(read)
+    present = _Present.of(records) if _in_memory(train.source) else None
+    return len(records) if present is None else len(present.positions)
 
 
 def _bound_widths(pipeline: Pipeline) -> Mapping[str, object]:
@@ -1571,9 +1581,9 @@ def fitted[Entry](
     training batch, and is read and loaded as it asks. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
     is passed on as it is. A run of `epochs` over a chain whose read has no
-    record count but counts the source examples a pass holds
-    (`Loader.pass_examples`) reads them that many times over, bounded to them
-    as `examples` bounds a read, and compiled again so."""
+    record count but states the source examples a pass holds (`_epoch_bound`)
+    reads them that many times over, bounded to them as `examples` bounds a
+    read, its Loader saying so (`Loader.epochs`)."""
     if not isinstance(dataset, (Dataset, Loader)):
         if examples is not None:
             raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
@@ -1592,8 +1602,11 @@ def fitted[Entry](
     scored = {name: _held_measure(chain, objective) for name, chain in held_chains.items()}
     if isinstance(dataset, Dataset):
         chain = dataset._chain()
+        read = chain.mode or _preferred_read((chain,), provision=True)
+        epoch_bound = None if epochs is None or examples is not None else _epoch_bound(
+            chain, objective, read, epochs)
+        examples = examples if epoch_bound is None else epoch_bound
         trained = chain if examples is not None else _endless(chain)
-        read = trained.mode or _preferred_read((trained,), provision=True)
         # A run of phases compiles each phase on its own (`_compile_phases`), so its measure is its own.
         measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
                     _training_measure(trained, None, objective=objective, read=read, provision=True,
@@ -1602,9 +1615,8 @@ def fitted[Entry](
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured)
-        if epochs is not None and loader.records is None and loader.pass_examples is not None:
-            return fitted(dataset, validation, objective=objective, seed=seed,
-                          examples=epochs * loader.pass_examples)
+        if epoch_bound is not None:
+            loader = dataclasses.replace(loader, epochs=epochs)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

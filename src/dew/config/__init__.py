@@ -803,12 +803,12 @@ class TrainerConfig:
 
     def _interval(self, value, dataset: Loader, field_name: str) -> int | str | Counted | None:
         """Steps for `epoch`, or the source examples a pass holds where the run reads its epochs as
-        passes over them (`Loader.pass_examples`, `fitted`); steps, a share of the run (which `fit`
+        passes over them (`Loader.epochs`, `Loader.pass_examples`); steps, a share of the run (which `fit`
         resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
-        if dataset.steps_per_epoch is None and dataset.examples is not None and self.epochs is not None:
-            return Counted(dataset.examples // self.epochs, "examples")
+        if dataset.steps_per_epoch is None and dataset.pass_examples is not None:
+            return Counted(dataset.pass_examples, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 f"--trainer.{field_name} epoch needs a dataset with a record count; this "
@@ -1947,7 +1947,8 @@ class RunConfig:
         trainer = self.built(objective, mesh, rollout,
                              checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
-            return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
+            # The run's bound in examples as its data was compiled to it (`viewed`).
+            return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None)
 
     def viewed(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
                rollout: Rollout | None = None,
@@ -1964,7 +1965,9 @@ class RunConfig:
         trainer = run.built(objective, run.trainer.mesh, rollout,
                             checkpoints=run.trainer.checkpoints(name) if held else None)
         with generation.run_precision(run.trainer.precision):
-            batch = first_step_batch(trainer, loader, steps, run.trainer.examples if steps is None else None)
+            # The run's bound in examples as its data was compiled to it: its `examples`, or its `epochs`'
+            # passes over a read with no record count (`fitted`).
+            batch = first_step_batch(trainer, loader, steps, loader.examples if steps is None else None)
             return inspected(trainer, batch, steps=steps)
 
     def inspected(self) -> dict[str, float]:

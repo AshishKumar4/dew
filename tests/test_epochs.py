@@ -297,3 +297,36 @@ def test_epochs_of_a_read_it_packs_as_its_rows_arrive_are_passes_over_its_docume
     chain = Pipeline(Memory(documents)).shuffle(seed=1).read("indexed").pack(8, fields=("id",)).batch(8)
     state = Trainer(_pulled(), optax.sgd(0.01), key=0).fit(chain, epochs=3, log_every=1)
     assert int(state.consumed) == 30
+
+
+def test_epochs_of_a_read_holding_missing_records_are_passes_over_those_it_holds():
+    """Twelve records of which two are missing, read in memory through an objective that makes rows of
+    each, so its read has no record count: an epoch is a pass over the 10 it holds, so two epochs bound
+    the read to 20 of them, none of the next pass's (row 1902's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+
+    records = [None if index in (4, 9) else {"id": np.int32(index + 1)} for index in range(12)]
+    chain = Pipeline(Memory(records)).shuffle(seed=3).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 20, 10)
+
+
+def test_a_loader_compiled_for_epochs_runs_them_and_refuses_another_count():
+    """Data compiled for a run of two epochs over a read with no record count (`fitted(epochs=2)`) runs
+    them, on the examples clock to its 24 examples, and a run of three over it is refused before a step:
+    its bound holds two passes (row 1902's review)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids})).shuffle(seed=3).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(loader, epochs=2, log_every=1)
+    assert int(state.consumed) == 24
+    with pytest.raises(ValueError):
+        Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(loader, epochs=3, log_every=1)
