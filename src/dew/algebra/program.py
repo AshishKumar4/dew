@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import numpy as np
-from egglog import EGraph, Vec, get_callable_args, i64, set_
+from egglog import EGraph, String, Vec, get_callable_args, i64, set_
 from jax._src import config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
@@ -250,11 +250,29 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     rewrite."""
     began = time.perf_counter()
     region = terms.region(closed)
+    graph, bundle, roots = graphed(region)
+    priced = cost.model(cost.Device.of())
+    _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
+    saturated = saturate(graph, region, rules.admitted(accurate), saturation)
+    forms, after = extracted(graph, bundle, priced)
+    cheaper = after < before.value
+    picked = {str(root): form for root, form in zip(roots, forms, strict=True)} if cheaper else {}
+    report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
+                           saturated.iterations, _nodes(graph), saturated.limited, before.value, after,
+                           time.perf_counter() - began)
+    return Rewrite(region, picked, report)
+
+
+def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]:
+    """An e-graph of `region`'s terms with the facts its rules read (each term's shape, which arithmetic
+    computes in its operands' dtype, which broadcasts lay along one axis, which literals are powers of two or
+    one, the primitives a stable rule writes), its roots bundled, the facts saturated."""
     graph = EGraph()
     for term, extent in region.shapes:
         graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent))))
+    arithmetic = (jax.lax.add_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
     for index, (primitive, params) in enumerate(region.params):
-        if primitive in (jax.lax.add_p, jax.lax.mul_p) and params.get("out_dtype") is None:
+        if primitive in arithmetic and params.get("out_dtype") is None:
             graph.register(rules.plain(i64(index)))
         if primitive is jax.lax.dot_general_p and params.get("preferred_element_type") is None:
             graph.register(rules.plain(i64(index)))
@@ -263,16 +281,36 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
             missing = [axis for axis in range(rank) if axis not in laid]
             if len(missing) == 1 and laid == tuple(axis for axis in range(rank) if axis != missing[0]):
                 graph.register(rules.along(i64(index), i64(missing[0])))
+    for name, index in region.stock.items():
+        graph.register(set_(rules.stock(String(name))).to(i64(index)))
     for index, value in enumerate(region.literals):
+        literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
-            graph.register(rules.exact_scale(terms.Term.literal(i64(index))))
+            graph.register(rules.exact_scale(literal))
+        if np.ndim(value) == 0 and float(value) == 1.0:
+            graph.register(rules.unit(literal))
     roots = region.roots()
     bundle = terms.Term.bundle(Vec[terms.Term](*roots))
     graph.register(bundle)
-    priced = cost.model(cost.Device.of())
     graph.run(rules.FACTS.saturate())
-    _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
-    admitted = rules.admitted(accurate)
+    return graph, bundle, roots
+
+
+@dataclasses.dataclass(frozen=True)
+class Saturated:
+    """What a saturation did: the matches each rule set fired, its limits (nodes, iterations), the iterations
+    it ran, and whether a limit stopped it."""
+
+    fired: Mapping[str, int]
+    limits: tuple[int, int]
+    iterations: int
+    limited: bool
+
+
+def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, ...],
+             saturation: Saturation) -> Saturated:
+    """`graph` run under the `admitted` rule sets to their fixpoint or `region`'s limits (`Saturation`), its
+    facts saturated after each set."""
     fired = dict.fromkeys((admitted_rules.name for admitted_rules in admitted), 0)
     nodes, steps = saturation.limits(region)
     iterations, limited = 0, False
@@ -290,16 +328,16 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
         if not updated:
             break
     graph.run(rules.FACTS.saturate())
-    chosen, after = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
-    extracted = get_callable_args(chosen, terms.Term.bundle)
-    if extracted is None:
+    return Saturated(fired, (nodes, steps), iterations, limited)
+
+
+def extracted(graph: EGraph, bundle: terms.Term, model) -> tuple[list[terms.Term], float]:
+    """The roots' forms `model` prices cheapest together, each shared value once, and their price."""
+    chosen, price = graph.extract(bundle, include_cost=True, cost_model=model, extractor="greedy-dag")
+    forms = get_callable_args(chosen, terms.Term.bundle)
+    if forms is None:
         raise ValueError(f"extraction chose no bundle of the program's roots: {chosen}")
-    (forms,) = extracted
-    cheaper = after.value < before.value
-    picked = {str(root): form for root, form in zip(roots, forms.value, strict=True)} if cheaper else {}
-    report = AlgebraReport(region.equations, tuple(fired), fired, (nodes, steps), iterations, _nodes(graph),
-                           limited, before.value, after.value, time.perf_counter() - began)
-    return Rewrite(region, picked, report)
+    return list(forms[0].value), price.value
 
 
 BODIES = frozenset({"jit", "pjit", "closed_call", "scan", "while", "cond", "remat2", "checkpoint",

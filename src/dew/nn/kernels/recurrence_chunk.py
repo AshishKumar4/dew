@@ -1067,7 +1067,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     run = {"family": issuing, "interpret": interpret, "tiles": tiles, "floor": floor,
            "ranged": template.ranged(dtype, delta, bound)}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4)
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, floor=floor)
             and mainloop_backward.backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=template.Mosaic.launched(), starts=starts,

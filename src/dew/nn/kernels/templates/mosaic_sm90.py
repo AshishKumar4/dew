@@ -52,6 +52,7 @@ class WgmmaIssuer(mosaic.Issuer):
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
     held_registers = 4
+    scalars_whole = False
     """A consumer thread's own state beside its tiles: its lane's coordinates in its fragment and the walk's
     counters where they diverge. Descriptors, barriers and TMA coordinates are warp-uniform and live in the
     uniform registers (ET-BATCH1's dK/dV SASS: HGMMA gdesc[UR16], SYNCS.PHASECHK [UR17], TMA [UR48], the

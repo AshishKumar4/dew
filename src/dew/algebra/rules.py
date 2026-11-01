@@ -17,6 +17,7 @@ import numpy as np
 from egglog import (
     Ruleset,
     String,
+    StringLike,
     Unit,
     Vec,
     birewrite,
@@ -49,6 +50,16 @@ operands' dtype, so a rule may move it past the arithmetic beside it (`program.r
 
 
 @function
+def stock(name: StringLike) -> i64: ...
+"""The index of a primitive a stable rule writes at its defaults (`terms.Region.stock`), by its name."""
+
+
+@function
+def unit(term: Term) -> Unit: ...
+"""Holds where a term is the scalar literal one, which `log(1 + x)` and `exp(x) - 1` read."""
+
+
+@function
 def exact_scale(term: Term) -> Unit: ...
 """Holds where a term is a scalar literal of a power of two: a multiply by it rounds nothing (but past the
 dtype's range), so moving it through a contraction leaves every rounding as it was (`program.rewrite`
@@ -66,6 +77,10 @@ class Rules:
     rounding: Literal["exact", "reorders", "bounded"]
     ruleset: Ruleset
     receipt: str
+    dev: bool = False
+    """Whether it runs at dev time alone, where each candidate's error is measured before it is taken
+    (`dew.algebra.error.choose`): a set whose forms are chosen for their accuracy, at a cost the program pass
+    would never pay."""
 
 
 def _facts() -> Ruleset:
@@ -89,6 +104,31 @@ def _facts() -> Ruleset:
         rule(eq(term).to(x.reduce(name, axes, params)), eq(shaped).to(shape(x)), eq(axes.length()).to(i64(1))
              ).then(set_(shape(term)).to(shaped.remove(axes[i64(0)]))),
         name="facts")
+
+
+def _stable() -> Ruleset:
+    """Stable forms (docs/design/algebra.md §1.5): `exp(x - (m + log t))` as `exp(x - m) / t`, so the
+    logarithm of a sum is never rounded into a value as large as the logits (a derived attention backward's
+    mapped dK and dQ came to 1.6-1.7 times the reference's error without it); `log(1 + x)` as `log1p(x)`
+    and `exp(x) - 1` as `expm1(x)`, which keep a small `x`'s digits. Each costs what it costs: the program
+    pass never runs them, and dev time takes a form of theirs only where its measured error asks it."""
+    x, m, t, one = vars_("x m t one", Term)
+    subbed, added, logged, exped = vars_("subbed added logged exped", i64)
+    # The stock primitives' indices are read in a rule's conditions, where egglog allows a lookup.
+    divided, plus_one, minus_one = vars_("divided plus_one minus_one", i64)
+    return ruleset(
+        rewrite(x.binary("sub", m.binary("add", t.unary("log", logged), added), subbed)
+                .unary("exp", exped)).to(
+            x.binary("sub", m, subbed).unary("exp", exped).binary("div", t, divided),
+            eq(shape(m)).to(shape(x)), eq(shape(t)).to(shape(x)), plain(subbed), plain(added),
+            eq(divided).to(stock("div"))),
+        rewrite(one.binary("add", x, added).unary("log", logged)).to(
+            x.unary("log1p", plus_one), unit(one), plain(added), eq(plus_one).to(stock("log1p"))),
+        rewrite(x.binary("add", one, added).unary("log", logged)).to(
+            x.unary("log1p", plus_one), unit(one), plain(added), eq(plus_one).to(stock("log1p"))),
+        rewrite(x.unary("exp", exped).binary("sub", one, subbed)).to(
+            x.unary("expm1", minus_one), unit(one), plain(subbed), eq(minus_one).to(stock("expm1"))),
+        name="stable")
 
 
 def _linear() -> Ruleset:
@@ -149,6 +189,8 @@ def register(rules: Rules) -> None:
 
 
 register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1"))
+register(Rules("stable", "bounded", _stable(), dev=True,
+               receipt="docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba"))
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
 
 
@@ -170,10 +212,12 @@ def heads(primitive: str, operands: Sequence[str | None]) -> bool:
     return any(operand in kinds for operand in operands)
 
 
-def admitted(accurate: bool) -> tuple[Rules, ...]:
+def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
-    under `--precision accurate`."""
-    return tuple(rules for rules in RULES.values() if not accurate or rules.rounding == "exact")
+    under `--precision accurate`; the dev-time sets (`Rules.dev`) only where `dev`, whose choice measures
+    each candidate's error instead."""
+    return tuple(rules for rules in RULES.values()
+                 if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact"))
 
 
 def instances() -> Mapping[str, tuple[Callable, Callable, Callable]]:

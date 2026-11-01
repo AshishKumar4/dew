@@ -12,7 +12,7 @@ update (`scan`), each shared piece in `forms`."""
 
 import functools
 
-from dew.algebra import cost, derive, forms, program, rules, scan, terms
+from dew.algebra import cost, derive, error, forms, program, rules, scan, terms
 from dew.algebra.derive import Reduction
 from dew.algebra.forms import Derived, Refused
 from dew.algebra.program import AlgebraReport, Rewrite, Saturation, passes
@@ -24,4 +24,4 @@ rewritten = functools.partial(program.rewritten, saturation=SATURATION)
 """`program.rewritten` at `SATURATION`: a function with its program rewritten."""
 
 __all__ = ["SATURATION", "AlgebraReport", "Derived", "Reduction", "Refused", "Rewrite", "Saturation", "Scan",
-           "cost", "derive", "forms", "passes", "program", "rewritten", "rules", "scan", "terms"]
+           "cost", "derive", "error", "forms", "passes", "program", "rewritten", "rules", "scan", "terms"]

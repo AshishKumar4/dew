@@ -99,14 +99,18 @@ def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> b
                for launch in launches)
 
 
-def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
+def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False,
+                       floor: float | None = None) -> bool:
     """Whether the fast backward takes a call's form: the delta rule, fla's DAG at fla's rounding, a decay a
     head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 `rounded` call without it and a decay a
     head (the SSD's under the run's fast forms, its route's), the same DAG without the delta rule's at
     mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
     delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
-    (the accurate forms) take none."""
+    (the accurate forms) take none. A decay a key dimension's `floor`, where it bounds a sub-chunk's range
+    (`algebra.factored_range`), factors each sub-chunk's own pairs; without one they are each their own decay
+    (`algebra.key_diagonal_pairs_back`)."""
+    del floor
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
     if per_key:
@@ -151,7 +155,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no
     `w^T dv`; a `skip` `[HV]` (Mamba2's `D`, `mainloop.forward`'s) adds `D do` to `dv`, its own gradient
     `sum(v do)` (`dskip`, None without a skip)."""
-    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
+    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4, floor=floor):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms, an fp32 call's under them alone")
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
