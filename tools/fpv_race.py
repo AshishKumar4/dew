@@ -150,15 +150,34 @@ def _first_episodes(reward: np.ndarray, passed: np.ndarray, terminal: np.ndarray
 
 def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: float) -> dict:
     """`scored` of a teacher's greedy flight in a batched JAX race (`dew.rl.flight.FlightEnv`, its views the
-    teacher's and `passed`), the whole flight one jitted rollout (`dew.rl.env.env_rollout`)."""
+    teacher's, `passed`, `gates` and `airframe`), the whole flight one jitted rollout
+    (`dew.rl.env.env_rollout`); and the share of its first episodes' steps whose next gate lies in the
+    camera's view (`in_view`), which a policy of the camera alone needs of the flights it learns from."""
     from dew.rl.env import env_rollout, start
 
     def rolled(params, key):
-        return env_rollout(env, objective.greedy, params, start(env, key), steps)[1].following
+        return env_rollout(env, objective.greedy, params, start(env, key), steps)[1]
 
-    following = jax.device_get(jax.jit(rolled)(params, key))
-    return _first_episodes(following.reward, following.observation["passed"], following.terminated,
-                           following.terminated | following.truncated, crash_penalty)
+    taken = jax.device_get(jax.jit(rolled)(params, key))
+    following, last = taken.following, taken.following.terminated | taken.following.truncated
+    alive = np.cumsum(last, 0) - last == 0
+    seen = in_view(taken.observation["gates"], taken.observation["airframe"])
+    return {**_first_episodes(following.reward, following.observation["passed"], following.terminated, last,
+                              crash_penalty), "in_view": float(seen[alive].mean())}
+
+
+def in_view(gates: np.ndarray, airframe: np.ndarray) -> np.ndarray:
+    """Whether the next gate's centre lies in the camera's field of view, from the `gates` view (its corners
+    in the body frame) and the `airframe` view (the camera's uptilt and field of view, its 5th and 6th): in
+    front of the camera, its angles across and up from the camera's axis (the body's forward pitched up by
+    the uptilt) within half the field of view."""
+    center = np.asarray(gates, np.float64)[..., :12].reshape(*np.shape(gates)[:-1], 4, 3).mean(-2)
+    uptilt, fov = np.asarray(airframe, np.float64)[..., 4], np.asarray(airframe, np.float64)[..., 5]
+    depth = center[..., 0] * np.cos(uptilt) + center[..., 2] * np.sin(uptilt)
+    up = -center[..., 0] * np.sin(uptilt) + center[..., 2] * np.cos(uptilt)
+    across = np.arctan2(np.abs(center[..., 1]), np.maximum(depth, 1e-9))
+    rise = np.arctan2(np.abs(up), np.maximum(depth, 1e-9))
+    return (depth > 0) & (across < fov / 2) & (rise < fov / 2)
 
 
 def teacher_policy(objective, *, explore: bool = False):
@@ -224,7 +243,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         return Batched(flight, drones)
 
     def judged_at(level: float, families) -> Batched:
-        shown = ("teacher", "passed")
+        shown = ("teacher", "passed", "gates", "airframe")
         return Batched(FlightEnv(racing_at(hz, families), shown, difficulty=level, ramp=level), 1024)
 
     objective = teacher_objective()
