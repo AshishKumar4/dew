@@ -93,22 +93,25 @@ def test_a_pyramid_reads_each_grid_at_its_own_points_and_scales_its_levels():
 
 
 class Line(nn.Module):
-    """A linear map of `features` inputs to one output, no bias, its weights stored in `param_dtype`."""
+    """A linear map of `features` inputs to one output, with a bias where `bias`, its weights stored in
+    `param_dtype`."""
 
     features: int
     param_dtype: jnp.dtype = jnp.float32
+    bias: bool = False
 
     @nn.compact
     def __call__(self, x):
-        return nn.Dense(1, use_bias=False, kernel_init=nn.initializers.zeros, dtype=self.param_dtype,
+        return nn.Dense(1, use_bias=self.bias, kernel_init=nn.initializers.zeros, dtype=self.param_dtype,
                         param_dtype=self.param_dtype)(x)[..., 0]
 
 
 class LeastSquares(Residuals):
-    """The residuals of a line through the batch's rows, `x @ w - y`, one a row."""
+    """The residuals of a line through the batch's rows, `x @ w - y` (`+ b` where it has a `bias`), one a
+    row."""
 
-    def __init__(self, features: int, param_dtype=jnp.float32):
-        self.model = self.bind_model(Line(features, param_dtype))
+    def __init__(self, features: int, param_dtype=jnp.float32, bias: bool = False):
+        self.model = self.bind_model(Line(features, param_dtype, bias))
         self.features = features
 
     def fresh_variables(self, key, held):
@@ -171,12 +174,12 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
                     truth_fn=exact)
 
 
-def gauss_newton_arm(rows: int, features: int, accumulation: int, optimizer=None):
+def gauss_newton_arm(rows: int, features: int, accumulation: int, optimizer=None, bias: bool = False):
     """One update of a least-squares objective of damping 1e-3 (by `optimizer` where given), from zero
     weights, of a draw's `rows` rows read in `accumulation` microbatches of an accumulation window: its
-    weights after it."""
-    trainer = Trainer(LeastSquares(features), optimizer or gauss_newton(damping=1e-3), key=0, layout=LAYOUT,
-                      accumulation=accumulation)
+    weights after it, its bias last where it has one."""
+    trainer = Trainer(LeastSquares(features, bias=bias), optimizer or gauss_newton(damping=1e-3), key=0,
+                      layout=LAYOUT, accumulation=accumulation)
     template = jax.tree.map(jnp.copy, trainer.initial_state())
     compiled = []
 
@@ -191,7 +194,8 @@ def gauss_newton_arm(rows: int, features: int, accumulation: int, optimizer=None
         for part in parts:
             state, *_ = compiled[0](state, part)
         assert int(state.updates) == 1
-        return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
+        weights = state.variables["params"]["Dense_0"]
+        return np.concatenate([np.asarray(weights["kernel"])[:, 0], np.asarray(weights.get("bias", []))])
 
     return stepped
 
@@ -204,9 +208,10 @@ than the weights though the update is not; four of 8 rows over 64 weights, the u
 
 @pytest.mark.parametrize("named", ["gauss_newton", "dew.gauss_newton:gauss_newton"])
 def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named):
-    """Gauss-Newton under two param groups, by its name or its import path: one damped solve over every
-    weight, each group's leaves of it scaled by the group's rate, so the kernels' step is half the solve's,
-    on par with the float64 solve so scaled (check 1), as the ungrouped run at that rate steps."""
+    """Gauss-Newton under two param groups, a line's kernel and its bias, by its name or its import path:
+    one damped solve over both (the rows' features beside a column of ones), each group's leaves of it
+    scaled by the group's rate, the kernel's half and the bias's a quarter: on par with NumPy's float32
+    solve so scaled from its float64 solve (check 1)."""
     from dew.optim import OptimConfig, ParamGroup
 
     config = OptimConfig(optimizer=named, learning_rate=0.5, optimizer_opts={"damping": 1e-3},
@@ -214,12 +219,18 @@ def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named
                                        ParamGroup("rest", ("*",), learning_rate_multiplier=0.5)))
     rows, features = 64, 8
     draw = least_squares_draw(rows, features, 0x6D)
-    exact = as_given(lambda x, y: -0.5 * solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
-    grouped = gauss_newton_arm(rows, features, 1, config.build(1))
-    halved = gauss_newton_arm(rows, features, 1, gauss_newton(0.5, damping=1e-3))
+    rates = np.asarray([0.5] * features + [0.25])
+
+    def scaled(x, y):
+        lifted = np.concatenate([x, np.ones((len(x), 1), x.dtype)], axis=1)
+        return -(rates * solved(lifted, y, 1e-3)).astype(x.dtype)
+
+    numpy = as_given(scaled)
+    exact = as_given(lambda x, y: scaled(x.astype(np.float64), y.astype(np.float64)))
+    grouped = gauss_newton_arm(rows, features, 1, config.build(1), bias=True)
     label = f"grouped gauss-newton {named}"
-    assert_as_exact(grouped, halved, draw, label, truth_fn=exact,
-                    seeds=seeds_for(halved, draw, label, truth_fn=exact, dew_fn=grouped))
+    assert_as_exact(grouped, numpy, draw, label, truth_fn=exact,
+                    seeds=seeds_for(numpy, draw, label, truth_fn=exact, dew_fn=grouped))
 
 
 def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():
