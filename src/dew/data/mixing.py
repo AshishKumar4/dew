@@ -177,11 +177,9 @@ class CorpusCounts:
         self.rejected = Counter(
             {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
         )
-        # A position saved before cuts were counted holds none.
-        for name in ("cut_examples", "cut_rows", "cut_removed", "left_out", "rejected_cut", "left_out_cut",
-                     "declined"):
+        for name in CUT_COUNTS:
             setattr(self, name, Counter({kind: integer(value, kind)
-                                         for kind, value in record(state.get(name, {}), name).items()}))
+                                         for kind, value in record(state[name], name).items()}))
 
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
@@ -255,6 +253,10 @@ class _KeepAccepted:
 
 
 COUNTER = "dew.corpus_counts"
+
+CUT_COUNTS = ("cut_examples", "cut_rows", "cut_removed", "left_out", "rejected_cut", "left_out_cut",
+              "declined")
+"""A corpus's counts by kind (`CorpusCounts`), each a record of its own in a saved position."""
 """Where a counting iterator's position keeps its corpus's counts, beside its parent's position:
 a key of Dew's own, which `state_counts` and `rewound` find and no Grain position holds."""
 
@@ -322,8 +324,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         super()._restore(counted)
         self._predicate.consecutive = integer(counted["consecutive"], "consecutive")
         self._predicate.warned = boolean(counted["warned"], "warned")
-        # A position saved before rows carried their consumed examples holds none pending.
-        self._predicate.owed = Owed(integer(counted.get("consumed", 0), "consumed examples pending"))
+        self._predicate.owed = Owed(integer(counted["consumed"], "consumed examples pending"))
 
 
 class Carried(pygrain.IterDataset[Batch]):
