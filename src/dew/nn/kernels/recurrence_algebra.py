@@ -1039,6 +1039,45 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def selective_decay(step, rate, kept=None):
+    """Mamba's selective scan's decay of a state by a token, `exp2(dt rate)` of its rate in base 2 (`A
+    log2(e)`), zero at a document's first token (`kept` 0, where given): the token and adjoint functions'
+    `a` (`selective_token`, `selective_adjoint`), which the scan's schedules take a token or a block of
+    tokens at a time (`templates.recurrence.selective`)."""
+    decay = jnp.exp2(step * rate)
+    return decay if kept is None else decay * kept
+
+
+def selective_token(states: list, decays: list, written, b: list) -> list:
+    """Each state's update by a token of the selective scan, `h_n = a_n h_n + (dt x) B_n`: `states` and
+    `decays` (`selective_decay`'s) a list a state, `written` the token's `dt x` and `b` its `B_n`."""
+    return [decay * state + written * b_n for state, decay, b_n in zip(states, decays, b, strict=True)]
+
+
+def selective_read(states: list, c: list, skip, value):
+    """A token's output of the selective scan, `y = sum_n C_n h_n + D x`, the states' terms summed as a
+    balanced tree, its depth log2 of their count: summed in turn, the readout's 16 states put an fp32 scan's
+    output 1.68 times the portable scan's distance from float64 where every decay is near zero, its own
+    write the whole state (the interpreted regime test)."""
+    terms = [c_n * state for c_n, state in zip(c, states, strict=True)]
+    while len(terms) > 1:
+        paired = [x + y for x, y in zip(terms[::2], terms[1::2], strict=False)]
+        terms = [*paired, *terms[len(terms) // 2 * 2:]]
+    return terms[0] + skip * value
+
+
+def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rate) -> tuple:
+    """One state's gradients of the selective scan through a token, from the cotangent the token's state
+    takes `cotangent` (`g_t = C_t dy_t + a_{t+1} g_{t+1}`, its read and what the tokens after pass back),
+    the state before it `before` (`h_{t-1}`), its `decay` (`selective_decay`'s), `written` (`dt x B`), and the
+    token's `step`, `value`, `b`, `dy` and the state's `rate` (base 2): `(dx, ddt, dB, dC, drate)`, the
+    rate's a token's term its schedule sums. `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times
+    it, in the rate `dt ln(2)` (taken in `drate`'s sum's `ln(2)` where the rate's own is `A log2(e)`)."""
+    through = cotangent * before * decay
+    return (cotangent * b * step, cotangent * b * value + through * (rate * math.log(2.0)),
+            cotangent * step * value, dy * (decay * before + written), through * step)
+
+
 def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
     """The write gate's gradient on values gated, `u = v beta`, from `u_grad` `[..., V]`, fp32: the values'
     own, `du beta`, and beta's `[...]`, `sum(v du)` over the last axis's columns."""
