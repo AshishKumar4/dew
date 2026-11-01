@@ -822,19 +822,25 @@ def wide_draw(metadata):
     return WideDraw()
 
 
-@pytest.mark.parametrize("draw", ["written", "configured"])
+def questioned(metadata):
+    return Questioned()
+
+
+@pytest.mark.parametrize("then", ["draw", "configured draw", "configured expansion"])
 @pytest.mark.parametrize("workers", [0, 2])
-def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples(workers, draw):
+def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples(workers, then):
     """A memory read of the 12 records, in their order and unbounded, read alone or by loading workers,
     whose objective makes 24 rows of them (`Questioned`), then draws (`WideDraw`, written, or configured
-    for the run, which a memory read binds between two passes that each hold the corpus) and refuses 4
-    of those rows (`ThirdQuestionRefused`): it makes the rows as it holds the corpus, before the reader
-    opens, which reads them on through the draw and the refusal, and the corpus's rows (data/rows) are
-    its 12 source examples, as many as it held, however many rows the reader has read (row 1944)."""
-    drawn = WideDraw() if draw == "written" else Configured(wide_draw, needs=(), scope="run", random=True)
+    for the run, which a memory read binds between two passes that each hold the corpus) or makes rows of
+    those rows in turn (a `Questioned` configured for the run), and refuses rows of the third question
+    (`ThirdQuestionRefused`): it makes the rows as it holds the corpus, before the reader opens, which
+    reads them on, and the corpus's rows (data/rows) are its 12 source examples, as many as it held,
+    however many rows the reader has read (row 1944)."""
+    step = {"draw": WideDraw(), "configured draw": Configured(wide_draw, needs=(), scope="run", random=True),
+            "configured expansion": Configured(questioned, needs=(), scope="run", expands=True)}[then]
     data = compile(_asked("memory", shuffled=False).batch(2), read="memory",
                    loading=dataclasses.replace(READ, workers=workers),
-                   objective=ObjectiveData(train=(Questioned(), drawn, ThirdQuestionRefused())))
+                   objective=ObjectiveData(train=(Questioned(), step, ThirdQuestionRefused())))
     stream = data.train(DataPartition())
     try:
         for read in (3, 12):
