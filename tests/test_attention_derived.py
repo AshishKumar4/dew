@@ -4,8 +4,6 @@
 walk merged, and are held on par against the float64 truth (check 1). The derived forms replace the oracle
 only on par with it and no slower in the kernel."""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -95,21 +93,29 @@ def oracle_walk(base2: bool, mask: str, split: bool):
     return run
 
 
+def attended(logits: jax.Array, seen: jax.Array, values: jax.Array) -> jax.Array:
+    """Each query's softmax over the keys it sees of its natural `logits` (XLA's, `jax.nn.softmax`), its
+    weights' product with the `values`; a query that sees no key, zeros."""
+    return float32_einsum("qk,kd->qd", jax.nn.softmax(logits, axis=-1, where=seen), values)
+
+
 @pytest.mark.parametrize("split", [False, True], ids=["walked", "merged"])
 @pytest.mark.parametrize("mask", list(MASKS))
 @pytest.mark.parametrize("base2", [True, False], ids=["fold", "natural"])
 def test_the_derived_forward_is_on_par_with_the_templates(base2, mask, split):
     """The derived walk (or a split walk merged) on par with the template's forms on the same tiles against
-    the float64 truth (check 1), a row of no key included."""
-    truth = functools.partial(algebra.softmax_of, seen=MASKS[mask](), base2=base2)
+    the float64 truth (check 1), XLA's softmax of the logits in their base, a row of no key included."""
+    natural = np.log(2.0) if base2 else 1.0
     assert_as_exact(jax.jit(derived_walk(base2, mask, split)), jax.jit(oracle_walk(base2, mask, split)), draw,
                     f"derived attention {mask} {'merged' if split else 'walked'}", seeds=16,
-                    truth_fn=lambda logits, value: truth(logits, values=value))
+                    truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
 
 
 LENGTH, DEPTH, BLOCK = 64, 32, 16
 SCALE = DEPTH ** -0.5
-SPANS = {"full": {}, "causal": {"causal": True}}
+SPANS = {"full": {}, "causal": {"causal": True},
+         # Its first queries before the keys' start: rows of no key.
+         "started": {"causal": True, "starts": jnp.array([LENGTH // 8])}}
 TILES = {"block_q": BLOCK, "block_k": BLOCK, "pad": BLOCK, "scale": SCALE}
 
 
@@ -122,19 +128,19 @@ def backward_draw(seed):
 
 def seen_of(form: str) -> jax.Array:
     places = jnp.arange(LENGTH)
-    return places[None, :] <= places[:, None] if form == "causal" else jnp.ones((LENGTH, LENGTH), bool)
+    causal = SPANS[form].get("causal")
+    seen = places[None, :] <= places[:, None] if causal else jnp.ones((LENGTH, LENGTH), bool)
+    return seen & (places[None, :] >= SPANS[form].get("starts", [0])[0])
 
 
-def attention_vjp(form: str):
-    """The forward on whole operands and its gradients by autodiff, the truth's arithmetic."""
+def xla_backward(form: str):
+    """XLA's gradients of the forward on whole operands (`attended`, by autodiff): the truth's arithmetic,
+    and in float32 the reference a served template form is held to (check 1's)."""
     seen = seen_of(form)
 
-    def forward(q, k, v):
-        s = jnp.where(seen, (q @ k.T) * SCALE, -jnp.inf)
-        return jax.nn.softmax(s, axis=-1) @ v
-
     def run(q, k, v, d):
-        return jax.vjp(forward, q, k, v)[1](d)
+        return jax.vjp(lambda q, k, v: attended(float32_einsum("qd,kd->qk", q, k) * SCALE, seen, v),
+                       q, k, v)[1](d)
 
     return run
 
@@ -215,21 +221,6 @@ error-aware extraction prices the choice that passes (docs/design/algebra.md §1
 acceptance case; a causal call walked queries first, whose derived dV erred 1.62 times the template's)."""
 
 
-def xla_backward(form: str):
-    """XLA's gradients of the forward on whole operands in float32: the reference a served template form is
-    held to (check 1's)."""
-    seen = seen_of(form)
-
-    def forward(q, k, v):
-        s = jnp.where(seen, float32_einsum("qd,kd->qk", q, k) * SCALE, -jnp.inf)
-        return float32_einsum("qk,kd->qd", jax.nn.softmax(s, axis=-1), v)
-
-    def run(q, k, v, d):
-        return jax.vjp(forward, q, k, v)[1](d)
-
-    return run
-
-
 @pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
 @pytest.mark.parametrize("form", list(SPANS))
 def test_the_backward_serving_each_cell_is_on_par(form, walked):
@@ -241,4 +232,4 @@ def test_the_backward_serving_each_cell_is_on_par(form, walked):
     else:
         served, reference = derived_backward(form, walked), oracle_backward(form)
     assert_as_exact(jax.jit(served), jax.jit(reference), backward_draw,
-                    f"attention backward {form} {walked}", seeds=16, truth_fn=attention_vjp(form))
+                    f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))

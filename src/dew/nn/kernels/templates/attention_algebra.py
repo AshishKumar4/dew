@@ -2265,9 +2265,11 @@ def softmax_gradients(q, k, values, dout, peak, total, delta, seen, *, scale: fl
     the forward walked (`finished_rows`), so the backward's exponent is `e`; each exponent at most 0, a
     logit past the forward's maximum by the rounding the two passes do not share the maximum itself
     (`below`: unclamped, a causal dV walked queries first erred 1.62 times the template's against
-    float64, its early keys' rows' largest weights past 1)."""
+    float64, its early keys' rows' largest weights past 1); a query that sees no key, zeros (its weights
+    selected away, over a denominator of 1)."""
     s = float32_einsum("qd,kd->qk", q, k) * scale
-    p = jnp.where(seen, jnp.exp(jnp.minimum(s - peak[:, None], 0.0)), 0.0) / total[:, None]
+    over = jnp.where(total == 0, 1.0, total)
+    p = jnp.where(seen, jnp.exp(jnp.minimum(s - peak[:, None], 0.0)), 0.0) / over[:, None]
     ds = p * (float32_einsum("qd,kd->qk", dout, values) - delta[:, None])
     return (float32_einsum("qk,kd->qd", ds, k) * scale, float32_einsum("qk,qd->kd", ds, q) * scale,
             float32_einsum("qk,qd->kd", p, dout))
