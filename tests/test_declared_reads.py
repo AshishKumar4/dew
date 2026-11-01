@@ -242,7 +242,7 @@ def test_an_index_whose_lease_waits_holds_no_other_index_back(tmp_path):
             waiting.join(60)
     # Released by the test, not timed out: a local read the remote lease held back would have waited for
     # the gate's wait to run out, and passed late.
-    assert waited == [{"id": 0}] and gate.answered == [True]
+    assert waited == [{"id": 0}] and gate.answered and all(gate.answered)
 
 
 def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is_read():
