@@ -28,7 +28,9 @@ from dew.rl.flight import TEACHER, FlightEnv, GateRace, Racing
 from dew.training import Trainer
 
 WORLD_MODEL, ACTOR_CRITIC = "dew.objectives.rl.dreamer:WorldModel", "dew.objectives.rl.control:ActorCritic"
-"""The agent's networks, by their import paths."""
+DREAMER_V3 = "dew.objectives.rl.dreamer:DreamerV3Objective"
+CONTROL_PPO = "dew.objectives.rl.control:ControlPPOObjective"
+"""The agent's networks and objectives, by their import paths."""
 
 RACING = {"families": [["loop", 1.0]], "obstacles": 0, "episode_seconds": 0.4, "hz": 30.0}
 """A race of loops, each episode cut after 12 steps, so the runs' few steps restart episodes."""
@@ -58,7 +60,7 @@ def teacher_run(root: Path, steps: int = 2) -> EnvRunConfig:
     """PPO over the race's privileged view, as tools/fpv_race.py's teacher, at a test's size."""
     model = ModelConfig(ACTOR_CRITIC, {"policy_layers": [16], "value_layers": [16]})
     return EnvRunConfig(env=flight(), model=model,
-                        objective=ObjectiveConfig("control_ppo", {"discount": 0.9, "reads": ["teacher"]}),
+                        objective=ObjectiveConfig(CONTROL_PPO, {"discount": 0.9, "reads": ["teacher"]}),
                         rollout=RolloutConfig("control", {"unroll_length": 4, "epochs": 1, "minibatches": 2}),
                         optim=OPTIM, trainer=trainer(root, steps))
 
@@ -172,7 +174,7 @@ def test_a_command_line_names_the_run_its_record_does(tmp_path):
     args = ["--env.name", "flight", "--env.count", "16", "--env.fields", json.dumps(
                 {"racing": RACING, "views": list(VIEWS)}),
             "--model", ACTOR_CRITIC, "--model.policy-layers", "16", "--model.value-layers", "16",
-            "--objective", "control_ppo", "--objective.discount", "0.9", "--objective.reads", "teacher",
+            "--objective", CONTROL_PPO, "--objective.discount", "0.9", "--objective.reads", "teacher",
             "--rollout.name", "control", "--rollout.fields", json.dumps(
                 {"unroll_length": 4, "epochs": 1, "minibatches": 2}),
             "--optim.optimizer", "adam", "--optim.learning-rate", "1e-3",
@@ -200,7 +202,7 @@ def test_stages_from_their_records_learn_from_their_saved_teacher_as_composed_in
     scales = {"policy": 0.0, "value": 0.0, "replay_value": 0.0}
     pretrains = {"batch": 8, "length": 8, "train_ratio": float("inf"), "prefill": 16, "capacity": 64}
     pretraining = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher"), demonstrates=True),
-                          objective=ObjectiveConfig("dreamer_v3", {"imitation": 1.0, "scales": scales}),
+                          objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "scales": scales}),
                           rollout=RolloutConfig("dreamer", pretrains))
     prepared = pretraining.prepare()
     assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
@@ -215,7 +217,7 @@ def test_stages_from_their_records_learn_from_their_saved_teacher_as_composed_in
 
     dagger = student(tmp_path, 2, teacher=TeacherConfig(str(tmp_path / "teacher")),
                      pretrained=str(tmp_path / "pretrain"), model=EnvRunConfig().model,
-                     objective=ObjectiveConfig("dreamer_v3", {"imitation": 1.0, "imitates": LABEL}))
+                     objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
     prepared = dagger.prepare()
     assert prepared.run.source.step == 2
     assert_bitwise(prepared.objective.variables, pretrained.variables)
@@ -262,7 +264,7 @@ def saved_teacher(tmp_path_factory) -> Path:
 
 REFUSED = {
     "no environment": {"env": None},
-    "labels imitated without a teacher": {"objective": ObjectiveConfig("dreamer_v3", {"imitation": 1.0,
+    "labels imitated without a teacher": {"objective": ObjectiveConfig(DREAMER_V3, {"imitation": 1.0,
                                                                                       "imitates": LABEL})},
     "a teacher that neither labels nor demonstrates": {"teacher": True},
     "a width the environment states": {"model": ModelConfig(WORLD_MODEL,
@@ -275,7 +277,7 @@ REFUSED = {
     "an unbatched environment": {"env": EnvConfig("flight", {"racing": RACING, "views": list(VIEWS)})},
     "another objective's rollout": {"rollout": RolloutConfig("control")},
     "a teacher for a rollout that takes none": {"teacher": "demonstrates", "objective": ObjectiveConfig(
-        "control_ppo", {"reads": ["state"]}), "model": ModelConfig(ACTOR_CRITIC),
+        CONTROL_PPO, {"reads": ["state"]}), "model": ModelConfig(ACTOR_CRITIC),
         "rollout": RolloutConfig("control", {"unroll_length": 4, "minibatches": 2})},
     "a model beside the run it starts from": {"pretrained": True},
 }

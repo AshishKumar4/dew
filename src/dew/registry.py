@@ -1421,13 +1421,11 @@ metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
 })
 objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
     "block_diffusion": "dew.objectives.diffusion.block:BlockDiffusionObjective",
-    "control_ppo": "dew.objectives.rl.control:ControlPPOObjective",
     "decision": "dew.decision.objective:DecisionObjective",
     "diffusion": "dew.objectives.diffusion.objective:DiffusionObjective",
     "distillation": "dew.objectives.distillation:DistillationObjective",
     "dpo": "dew.objectives.rl.preference:DPOObjective",
     "diffusion_nft": "dew.objectives.rl.nft:DiffusionNFTObjective",
-    "dreamer_v3": "dew.objectives.rl.dreamer:DreamerV3Objective",
     "flow_grpo": "dew.objectives.rl.flow:FlowGRPOObjective",
     "grpo": "dew.objectives.rl.grpo:GRPOObjective",
     "guidance_distillation": "dew.objectives.diffusion.guidance_distillation:GuidanceDistillationObjective",

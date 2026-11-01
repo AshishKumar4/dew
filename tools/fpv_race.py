@@ -63,6 +63,8 @@ from dew.registry import ModelConfig
 AUXILIARY = (("state", 13, 512), ("gates", 24, 512), ("airframe", 6, 256), ("physics", 20, 256),
              ("obstacles", 12, 256))
 """The world model's auxiliary heads: each privileged view, its width and its head's units."""
+CONTROL, DREAMER = "dew.objectives.rl.control", "dew.objectives.rl.dreamer"
+"""The modules the teacher's and the agent's networks and objectives are named from."""
 TRAINING = (("loop", 0.4), ("chain", 0.6))
 """The course families a teacher and an agent train on."""
 HELD_OUT = (("layout", 0.5), ("figure8", 0.5))
@@ -124,10 +126,11 @@ def teacher_run(out: Path, *, hz: float, level: float, drones: int = 4096) -> En
     every = SCORED_EVERY * rollout["epochs"] * rollout["minibatches"]
     return EnvRunConfig(
         env=EnvConfig("flight", flight, count=drones),
-        model=ModelConfig("dew.objectives.rl.control:ActorCritic",
+        model=ModelConfig(f"{CONTROL}:ActorCritic",
                           {"policy_layers": [256] * 3, "value_layers": [256] * 4, "spread": 0.2}),
-        objective=ObjectiveConfig("control_ppo", {"discount": 0.99 ** (60 / hz), "lam": 0.95 ** (60 / hz),
-                                                  "clip": 0.2, "entropy_cost": 1e-4, "reads": ["teacher"]}),
+        objective=ObjectiveConfig(f"{CONTROL}:ControlPPOObjective", {
+            "discount": 0.99 ** (60 / hz), "lam": 0.95 ** (60 / hz), "clip": 0.2, "entropy_cost": 1e-4,
+            "reads": ["teacher"]}),
         rollout=RolloutConfig("control", rollout), optim=OptimConfig(optimizer="adam", learning_rate=3e-4,
                                                                      clip_grads=1.0),
         trainer=TrainerConfig(checkpoint_dir=str(out), steps=every, log_every=every, eval_every=None,
@@ -402,7 +405,8 @@ class World:
         # DreamerV3's rate, 4e-5 after a linear warmup over its first 1000 updates.
         rate = Linear(peak_value=4e-5, warmup_steps=1000, end_value=4e-5)
         run = EnvRunConfig(
-            env=EnvConfig("gate_race", race), objective=ObjectiveConfig("dreamer_v3", objective),
+            env=EnvConfig("gate_race", race),
+            objective=ObjectiveConfig(f"{DREAMER}:DreamerV3Objective", objective),
             rollout=RolloutConfig("dreamer", rollout),
             teacher=TeacherConfig(str(self.teacher), self.teacher_step, demonstrates=True),
             optim=OptimConfig(optimizer="laprop", learning_rate=rate),
@@ -414,7 +418,7 @@ class World:
                     "context": self.length, "dtype": "bfloat16"}
         model = {"conv_depth": 64, "units": 1024, "reads": "image", "dtype": "bfloat16",
                  "auxiliary": [list(head) for head in AUXILIARY], "dynamics": dynamics}
-        return dataclasses.replace(run, model=ModelConfig("dew.objectives.rl.dreamer:WorldModel", model))
+        return dataclasses.replace(run, model=ModelConfig(f"{DREAMER}:WorldModel", model))
 
 
 def _staged(world: World, stage: str, updates: int, every: int | None, report: dict, judge, races: tuple,

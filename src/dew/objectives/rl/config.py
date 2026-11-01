@@ -172,7 +172,8 @@ class EpisodesConfig:
 class EnvRunConfig(RunConfig):
     """A run that trains an agent in an environment: the shared run fields, the environment (`env`), the
     agent's networks (`model`: a `WorldModel`, its `dynamics` a nested `TSSM` record where it has one, or an
-    `ActorCritic`, each by its import path) and objective (`objective`: `dreamer_v3` or `control_ppo`, its
+    `ActorCritic`, each by its import path) and objective (`objective`: a `DreamerV3Objective` or a
+    `ControlPPOObjective`, by its import path, its
     imitation among its arguments), the rollout's settings (`rollout`), an optional teacher (`teacher`), the
     saved run the agent starts from (`pretrained`) and the episodes each validation flies (`episodes`).
 
@@ -189,9 +190,10 @@ class EnvRunConfig(RunConfig):
     """The agent's networks. The run derives from its environment each width the class declares: its
     `action_size`, and a world model's `observation_size` and `image` from the view it `reads`; a record
     that states one is refused. A run that starts from a saved run trains that run's model, and names none."""
-    objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("dreamer_v3"))
+    objective: ObjectiveConfig = dataclasses.field(
+        default_factory=lambda: ObjectiveConfig("dew.objectives.rl.dreamer:DreamerV3Objective"))
     """The agent's objective and its arguments (`--objective.imitation 1 --objective.imitates label`); a
-    `control_ppo`'s `observation_size` is derived, the width of the views it `reads`."""
+    `ControlPPOObjective`'s `observation_size` is derived, the width of the views it `reads`."""
     trainer: TrainerConfig = dataclasses.field(
         default_factory=lambda: TrainerConfig(eval_every=None, checkpoint_every=None))
     env: Annotated[EnvConfig, tyro.conf.subcommand("env")] | None = None
