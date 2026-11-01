@@ -54,14 +54,13 @@ def tokens(rng, batch=2, length=SEQ):
 
 
 SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'routed softcap': 64,
-         'grouped': 32, 'sliding decode': 16, 'hybrid decode': 8, 'sandwich': 8, 'packed alone': 16,
+         'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
          'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64,
          'learned hybrid decode': 8, 'layouts': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
-sites on an A100): the most any of a site's cases took; the hybrid decode's paired with the reference
-(`seeds_for(dew_fn=...)`, the count check 1's paired verdict needs; 512 alone, 8 paired, 2026-11-01)."""
+sites on an A100): the most any of a site's cases took."""
 
 
 def drawn(model, batch=2, length=SEQ):

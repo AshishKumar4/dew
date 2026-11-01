@@ -801,10 +801,9 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
                                   expected(prompt, 3, key=7).host().tokens)
 
 
-PACKED_SEEDS = 64
+PACKED_SEEDS = 256
 """The packed quantized pipeline's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
-on armada paired with the canonical model (`dew_fn`, the count check 1's paired verdict needs; 256 alone,
-2026-11-01)."""
+on armada."""
 
 
 @pytest.mark.whole_suite

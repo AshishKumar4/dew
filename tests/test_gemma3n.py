@@ -171,12 +171,11 @@ STEP_ROWS, STEP_LENGTH = 4, 32
 """A training step's draw: rows a device and ids a row, within the checkpoint's 64 positions."""
 UPDATE_SEEDS = {0.0: 8, 0.1: 8}
 """Each decay's declared seeds for the update's check 1, sized by `seeds_for` (on armada)."""
-DENSE_ROWS, DENSE_ORDERS, DENSE_SEEDS = 16, 4, 256
+DENSE_ROWS, DENSE_ORDERS, DENSE_SEEDS = 16, 4, 512
 """The dense decoder's gradient draw's rows, the orders of them its rows are judged over (an orbit of
 the mean loss's exact symmetry, `assert_as_exact`'s `orders`), and check 1's declared seeds, sized by
-`seeds_for` on armada paired with the reference (`dew_fn`, the count check 1's paired verdict needs: 256,
-where the reference alone took 512, 2026-11-01). At STEP_ROWS AltUp's output scale in its third layer, a
-leaf of 32 values each summed over a draw's tokens, did not resolve within 512 seeds. Over one draw's orders the worst row of
+`seeds_for` (on armada). At STEP_ROWS AltUp's output scale in its third layer, a leaf of 32 values each
+summed over a draw's tokens, did not resolve within 512 seeds. Over one draw's orders the worst row of
 AltUp's correction gradient in its third layer, a sum that nearly cancels, ranges tenfold for the
 reference alone (2.2e-3 to 2.0e-2 of its size at one draw, on armada): one order is no measure of it."""
 
