@@ -123,7 +123,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-    built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+    built = plgpu.kernel(dependent(entry, interpret), out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
                          compiler_params=compiler_params(approx_math=approx_math,
                                                          reduction_scratch=reduction_scratch),
@@ -131,6 +131,26 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                          kernel_name=report.named(name), cost_estimate=cost, **clustered)
 
     return checked(built, name or family)
+
+
+def dependent(entry: Callable, interpret) -> Callable:
+    """`entry` as a dependent launch (programmatic dependent launch, PTX's `griddepcontrol`): once every
+    program has begun it lets the next such launch in its stream start (`launch_dependents`), whose
+    programs take each multiprocessor this launch's leave, and it waits for the launch before it to finish
+    and its writes to land (`wait`) before any memory access of its own, so it is ordered against any
+    launch as without it while the next launch's start overlaps its tail. A launch whose programs all begin
+    at once (Dew's persistent and cluster launches) gives no multiprocessor to a dependent before its own
+    programs run. Mosaic marks the launch (`mosaic_gpu.uses_pdl`) and the runtime launches it with
+    programmatic stream serialization. Interpreted, `entry` as it is."""
+    if interpreted(interpret):
+        return entry
+
+    def body(*refs):
+        plgpu.griddepcontrol_launch_dependents()
+        plgpu.griddepcontrol_wait()
+        entry(*refs)
+
+    return body
 
 
 def checked(built: Callable, kernel: str) -> Callable:
@@ -617,6 +637,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """The steps a walk keeps loading ahead of the one its products consume to hide its loads' latency: one
     where a producer's asynchronous copies run beside the consumers (TMA), more where the consumers issue
     them between their own products (`Mma`'s cp.async)."""
+    in_flight: int = 0
+    """The steps whose products a walk keeps running past their step (`walk`'s `in_flight`), each holding
+    its stage: none where products are synchronous; one where they run asynchronously, CUTLASS's sm90
+    mainloops' `K_PIPE_MMAS`, so a step's issue overlaps the previous step's products."""
     products_overlap: bool
     """Whether a warpgroup's products run asynchronously, an issued product's accumulator held while the
     program goes on (warpgroup MMA's), where each mma.sync product completes before the next: a launch's
@@ -1081,6 +1105,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     bounded_loads = True
     operands_in_registers = False
     products_overlap = True
+    in_flight = 1
     fixes_up = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
     warpgroup_reduction_scratch = 2048
@@ -1245,8 +1270,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                    first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
                    freed: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
         """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s)."""
-        if in_flight not in (0, 1):
-            raise ValueError(f"a walk keeps no step's products or one step's in flight, not {in_flight}")
+        if in_flight < 0:
+            raise ValueError(f"a walk keeps no step's products in flight or some, not {in_flight}")
 
         def given(counter, *, release: bool = False) -> None:
             # Step `counter`'s slots given back (`release`: here, a step its products ran past), then `freed`.
@@ -1265,21 +1290,21 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                     slots.done()
                     given(index - first)
                     return carry, accumulators
-                # The step's products run on while the next step's operands are waited for: the previous
-                # step's, done now, give back its slots.
+                # The step's products run on while the next steps' operands are waited for: the step
+                # `in_flight` back, done now, gives back its slots.
                 slots.held()
                 self.settled(in_flight)
-                pl.when(index > lo)(lambda: given(index - 1 - first, release=True))
+                pl.when(index >= lo + in_flight)(lambda: given(index - in_flight - first, release=True))
                 return carry, accumulators
 
             return run
 
         walked = self.accumulated(tuple((slotted(step, lo), lo, hi) for step, lo, hi in segments), start,
                                   shapes, interpret, initial)
-        if in_flight:
-            # Each segment's last step, its products done by the walk's end.
-            for _, lo, hi in segments:
-                pl.when(hi > lo)(lambda hi=hi: given(hi - 1 - first, release=True))
+        # Each segment's last `in_flight` steps, their products done by the walk's end, oldest first.
+        for _, lo, hi in segments:
+            for back in reversed(range(in_flight)):
+                pl.when(hi - back > lo)(lambda hi=hi, back=back: given(hi - 1 - back - first, release=True))
         return walked
 
     @abc.abstractmethod

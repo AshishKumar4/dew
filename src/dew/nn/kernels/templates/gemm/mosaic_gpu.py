@@ -153,8 +153,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       one before fewer rows (a family whose products read registers holds a step's fragments).
     - Stages: the deepest its program's share of shared memory holds at those programs (`resources.plan`,
       the planner every template's derivation reads), at least those the walk keeps busy (those loading
-      ahead, `Family.loads_ahead`, beside the one consumed and, on a family that keeps its products in
-      flight, the one in flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next
+      ahead, `Family.loads_ahead`, beside the one consumed and those whose products the family keeps in
+      flight, `Family.in_flight`); a tile that cannot stage that deep gives way to the next
       narrower or shorter one, or a shallower step.
     - Cluster: where grouped and a group's rows span at least as many row tiles as the family's cluster
       takes (`Family.cluster`: a pair on warpgroup MMA), that many multiprocessors a cluster, running row
@@ -172,7 +172,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     widest = min(width, family.widest_product or width)
     columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
     steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
-    busy = 1 + family.loads_ahead + (0 if family.operands_in_registers else _IN_FLIGHT)
+    busy = 1 + family.loads_ahead + family.in_flight
 
     def tiled(consumers: int, programs: int) -> Tiles | None:
         role = family.role_rows * consumers
@@ -588,7 +588,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
             family.persist(streams, (grid[0] * grid[1],), schedule, consumer, consumers=consumers,
                            axis="programs", outputs=allocations.outputs,
-                           interpret=bool(interpret), in_flight=_IN_FLIGHT)
+                           interpret=bool(interpret), in_flight=family.in_flight)
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,
@@ -649,11 +649,6 @@ def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half
     cut = [tiles_of[i].at[tuple(half if axis == halved else slice(None) for axis in axes)][...]
            for i, axes in enumerate(axes_of)]
     mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
-
-
-_IN_FLIGHT = 1
-"""The MMAs the kernels keep in flight while they prepare the next stage (`mosaic.Family.walk`): a step's
-slots go back a step late, and a tile's last once its walk ends, before the next tile's loads reuse them."""
 
 
 def _split(refs: tuple, prologue: int, epilogue: int) -> tuple:
@@ -814,7 +809,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             walks = (g, grid[0] * grid[1]) if tail is None else (tail.segments, multiprocessors)
             family.persist(streams, walks, schedule, consumer, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
-                           in_flight=_IN_FLIGHT)
+                           in_flight=family.in_flight)
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers))
