@@ -461,7 +461,8 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...], text: Callable[[
     executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, below
     the digest of Dew's own code (`dew.cache.package_digest`), so a warm start that loads it from the
     compilation cache reads no text, and another Dew's are read again."""
-    path = Path(dew_cache_dir()) / "communicators" / "programs" / package_digest() / f"{fingerprint.hex()}.json"
+    kept = Path(dew_cache_dir()) / "communicators" / "programs" / package_digest()
+    path = kept / f"{fingerprint.hex()}.json"
     if path.exists():
         return Collectives.of(json.loads(path.read_text()), gpus)
     positions = collectives_of(text(), tuple(range(len(gpus))))
