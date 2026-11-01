@@ -1784,18 +1784,27 @@ rule of `tests/reference_error.py`:
 
 ## XLA flags
 
-`TrainerConfig.xla_flags` appends to `XLA_FLAGS`, and `prepare_process`
-applies it before JAX opens a backend. The recipes and the CLI call
-`prepare_process` first; a script or notebook that builds a `Trainer` itself
-calls it before its first JAX call, or sets `XLA_FLAGS` in the environment.
+`TrainerConfig.xla_flags` appends to `XLA_FLAGS`. XLA parses `XLA_FLAGS` once
+for each runtime it loads (jaxlib's, and the CUDA plugin's), the first time it
+uses its debug options. That can happen before any backend opens, so a flag
+is certain only if `XLA_FLAGS` carries it before the process loads jaxlib,
+and nothing rewrites `XLA_FLAGS` without it afterwards. `dew train` makes
+sure of the first: when a run's flags do not hold yet, it runs itself again
+from the start with them set, unless the process loaded jaxlib before Dew
+(for example in a `sitecustomize`), where running again would change nothing. `prepare_process`, which the
+recipes call, still appends the flags if the backend has not opened. Where
+`import dew` has already loaded jaxlib, though, it warns that the flags are
+unproven. A script or notebook that builds a `Trainer` itself makes them
+certain by setting `XLA_FLAGS` before the process starts.
 
 Separately, `import dew` sets `--xla_allow_excess_precision=false` unless
 `XLA_FLAGS` already names that flag
 (`dew.devices.keep_roundings`). With XLA's default, a fusion may
 skip a bf16 rounding the program states, and which roundings it skips
 depends on the layout, so one device and four devices computed different
-bf16 forwards of the same model. XLA reads its flags when a backend opens,
-so import Dew before the first JAX computation. If the backend is already
+bf16 forwards of the same model. `import dew` sets the flag before anything
+it imports loads jaxlib, so import Dew before JAX to make the policy certain.
+If JAX is imported first, the policy is unproven. If the backend is already
 open, Dew logs a warning and the policy does not take effect; restart with
 `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX. On
 the RTX 4080 the policy also made steps faster: the 176M hybrid DiT at batch

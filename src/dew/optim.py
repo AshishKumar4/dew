@@ -1402,7 +1402,7 @@ def held_rates(opt_state: optax.OptState) -> dict[jax.tree_util.KeyPath, dict[st
     held: dict[jax.tree_util.KeyPath, dict[str, float]] = {}
 
     def read(path: jax.tree_util.KeyPath, rates: Mapping[str, jax.typing.ArrayLike], kind: str) -> None:
-        held[path] = {name: float(np.asarray(value)) for name, value in rates.items()}
+        held[path] = {name: float(np.asarray(value).reshape(-1)[0]) for name, value in rates.items()}
 
     _rated(opt_state, read)
     return held
@@ -1446,7 +1446,8 @@ def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
     injected = optax.InjectStatefulHyperparamsState
 
     def put(value, like):
-        return jax.device_put(np.asarray(value, like.dtype), like.sharding)
+        # A DiLoCo run's groups hold their rates stacked, each the same (`dew.training.diloco.rated`).
+        return jax.device_put(np.broadcast_to(np.asarray(value, like.dtype), like.shape), like.sharding)
 
     def walked(tree, prefix: jax.tree_util.KeyPath):
         def replaced(path: jax.tree_util.KeyPath, node):

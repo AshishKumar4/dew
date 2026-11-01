@@ -18,9 +18,9 @@ from dew import _records
 from dew.interop import release_pins
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
+    SHORT_CONV_LEAVES,
     DecoderFamily,
     DecoderFields,
-    Leaves,
     Renames,
     Ropes,
     SourceCode,
@@ -60,27 +60,19 @@ _PLAIN: Renames = (
 """LFM3's names onto the shared ones without sandwich norms: one norm before each mixer and one
 before each feed-forward."""
 
-_CONV_LEAVES: Leaves = {
-    **{f'conv.{projection}.{leaf}': ('self_attn', projection, 'kernel' if leaf == 'weight' else 'bias')
-       for projection in ('in_proj', 'out_proj') for leaf in ('weight', 'bias')},
-    'conv.conv.weight': ('self_attn', 'conv', 'weight'),
-    'conv.conv.bias': ('self_attn', 'conv', 'bias'),
-}
-"""A convolution layer's tensors, under the mixer's slot (`GatedShortConv`): its projections and its
-`[D, 1, K]` taps."""
 
 
 def lfm3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """A source tensor's path, by the model's fields record (its `sandwich_norms`)."""
     return renamed_path(_SANDWICH if config.get('sandwich_norms') else _PLAIN, name, config,
-                        layer_leaves=_CONV_LEAVES)
+                        layer_leaves=SHORT_CONV_LEAVES)
 
 
 def lfm3_export_path(name: str, config: Mapping[str, object]) -> str | None:
     """A leaf's source name, by the source config it exports beside (its `use_sandwich_norm`, true
     where it is omitted, as Lfm3Config's default)."""
     sandwich = bool(config.get('use_sandwich_norm', True))
-    return renamed_name(_SANDWICH if sandwich else _PLAIN, name, config, layer_leaves=_CONV_LEAVES,
+    return renamed_name(_SANDWICH if sandwich else _PLAIN, name, config, layer_leaves=SHORT_CONV_LEAVES,
                         sandwich_norms=sandwich)
 
 

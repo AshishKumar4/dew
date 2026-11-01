@@ -18,6 +18,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step
     from dew.training.budget import Pause, Plateau
     from dew.training.cooldown import Cooldowns
+    from dew.training.diloco import DiLoCo
     from dew.training.evaluation import EvalSuite, Evaluation
     from dew.training.inspection import Inspection, inspected
     from dew.training.observe import Observe
@@ -41,6 +42,7 @@ _EXPORTS = {
     "Best": "dew.training.selection",
     "Checkpoints": "dew.checkpoints",
     "Cooldowns": "dew.training.cooldown",
+    "DiLoCo": "dew.training.diloco",
     "Inspection": "dew.training.inspection",
     "inspected": "dew.training.inspection",
     "EMASpec": "dew.objectives.base",
@@ -86,6 +88,7 @@ __all__ = [
     "Best",
     "Checkpoints",
     "Cooldowns",
+    "DiLoCo",
     "EMASpec",
     "EvalSuite",
     "Evaluation",

@@ -7,6 +7,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
+  mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
+  outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.
+- A step that fails on its first run raises `FirstRunFailed`, naming each GPU's bytes free outside XLA's
+  pool, where its collectives' NCCL communicators take their buffers, as the fit check read them and
+  after the failure; a first run that succeeds logs each GPU's free bytes there at the check and after.
+- Dew no longer wraps JAX's `xla_bridge.backends`. XLA parses `XLA_FLAGS` once per runtime it loads,
+  possibly before a backend opens, so a flag holds for certain where `XLA_FLAGS` carried it before the
+  process loaded jaxlib (`dew.devices.flags_hold`). `import dew` sets its own flags before anything it
+  imports loads jaxlib; `dew train`, `dew profile` and `dew inspect` run again from their start with a
+  run's `trainer.xla_flags` set where they do not hold yet; `prepare_process` warns that flags it sets
+  after jaxlib loaded are unproven, and still refuses flags asked for after the backend opened.
 - A float64 `SafetensorsBanks` stream under `jax.enable_x64` no longer depends on the thread XLA runs a
   layer's fetch on. The setting is thread-local, and JAX narrows a callback's results by it on the thread
   that runs the callback, so a fetch on one of XLA's workers (a forward with a wide graph runs it there)
@@ -68,10 +80,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
     pillars and props (`tools/fpv_assets.py`, CC0 textures).
   - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
     DreamerV3 agent on the camera alone.
-- A step compiled ahead lists, past the plan it takes, each rung that recomputes more at the fewest
-  microbatches that fit (`compile_ahead(..., frontier=True)`, `--trainer.compile-ahead.frontier`), the plans
-  `tools/benchmark_step.py` times on the GPUs; a run names the fastest by its remat, `--trainer.split` and
-  `LMObjective.head_tile`.
+- A step compiled ahead lists, past the plan it takes, each rung that recomputes more and fits at fewer
+  microbatches than every plan before it (`compile_ahead(..., frontier=True)`,
+  `--trainer.compile-ahead.frontier`), the plans `tools/benchmark_step.py` times on the GPUs; a run names
+  the fastest by its remat, `--trainer.split` and `LMObjective.head_tile`.
 ## 0.2.0
 
 The first release on Dew's own package index, `pip install dewml --extra-index-url

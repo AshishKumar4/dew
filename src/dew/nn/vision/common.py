@@ -183,6 +183,20 @@ def projector_layout(kind: str) -> ProjectorLayout:
     return _held(projectors[kind].checkpoint if kind in projectors else None, "projector", kind)
 
 
+def tower_variables(kind: str, hf_tensors: Mapping[str, Stored], param_dtype: str
+                    ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """One vision tower's variables, in the requested storage (`tower_layout`), and the layouts
+    that write its tensors back from them."""
+    return tower_layout(kind).variables(hf_tensors, param_dtype)
+
+
+def projector_variables(kind: str, hf_tensors: Mapping[str, Stored], param_dtype: str
+                        ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    """One projector kind's parameters, in the requested storage (`projector_layout`), and the
+    layouts that write its tensors back from them."""
+    return projector_layout(kind).variables(hf_tensors, param_dtype)
+
+
 def _held[Layout](layout: Layout | None, what: str, kind: str) -> Layout:
     if layout is None:
         raise ValueError(f"{what} kind {kind!r} has no weight map here")
