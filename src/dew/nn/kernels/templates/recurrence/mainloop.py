@@ -482,8 +482,9 @@ class Launch:
     registers a consumer thread holds at its program's peak (`resources.live_registers` of the tiles it
     states), its steps, the chunks in flight, the bytes a step streams in, a program's tensor FLOPs and
     exponentials, the bytes it reads and writes in global memory, the programs a multiprocessor holds of it at
-    once (`resources.plan`), its consumer roles, and the bundle it issues by (`family`: the call's, or the
-    layout a launch takes for itself, `_solving`), which every check of it reads."""
+    once (`resources.plan`; zero where it holds none, a config past the device), its consumer roles, and the
+    bundle it issues by (`family`: the call's, or the layout a launch takes for itself, `_solving`), which
+    every check of it reads."""
 
     name: str
     programs: int
@@ -577,19 +578,19 @@ def _landed(landing: dict, family: mosaic.Family) -> dict:
 
 
 def _planned_launch(call: _Call, scope: Callable[[int], resources.Scope], registers: int, *, floor: int,
-                    most: int, consumers: int = 1) -> resources.LaunchPlan:
+                    most: int, consumers: int = 1) -> resources.LaunchPlan | None:
     """A launch's ring depth and the programs a multiprocessor holds of it (`resources.plan`, at its stated
-    `registers` and its streams `scope`d at each depth from `floor` to `most`), or where it holds at none (a
-    config past the device, which `template.Mosaic.legal` refuses) one stage and one program."""
+    `registers` and its streams `scope`d at each depth from `floor` to `most`), None where it holds at none: a
+    config past the device, whose record says so (`Launch.resident` zero) and `template.Mosaic.legal`
+    refuses."""
     found = resources.plan([resources.Launch(scope, consumers, registers, floor=floor, most=most)],
                            call.family, call.target)
-    if found:
-        return found[0]
-    return resources.LaunchPlan(floor, 1, resources.shared_bytes(call.family, scope(floor)))
+    return found[0] if found else None
 
 
 def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | tuple[int, int] | None, consumers: int = 1) -> tuple[resources.LaunchPlan, int]:
+          stages: int | tuple[int, int] | None,
+          consumers: int = 1) -> tuple[resources.LaunchPlan | None, int]:
     """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
     holds at once, at most its `tiles`, its rings two deep where they run on across its tiles (a family's
     whose walks do not scope their streams apart, `Family.walks_scoped`) and two deep hold as many programs as
@@ -598,11 +599,12 @@ def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, 
     thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d; an
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
     any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
-    most)` pair's."""
+    most)` pair's; None where no multiprocessor holds it (`_planned_launch`), a persistent launch then a
+    program a multiprocessor."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
         found = _planned_launch(call, scope, registers, floor=1, most=most)
-        return found, min(tiles, (call.target.multiprocessors or 1) * found.programs)
+        return found, min(tiles, (call.target.multiprocessors or 1) * (found.programs if found else 1))
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
     return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers), tiles
 
@@ -666,7 +668,11 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
 
     found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
                             consumers=consumers)
-    stages = found.stages
+    # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
+    # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
+    # it.
+    shallowest = 1 if persistent else stages[0] if isinstance(stages, tuple) else stages
+    stages = found.stages if found else shallowest
     streams = allocations(stages)
     name = f"recurrence{program.__qualname__.split('.')[0]}"
     collected = _PLANNED.get()
@@ -680,7 +686,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             flops = work.flops * _products(call.held.parts) * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     registers, work.steps * each, stages, stepped, flops,
-                                    work.exponentials * each, moved, found.programs, consumers, family))
+                                    work.exponentials * each, moved, found.programs if found else 0,
+                                    consumers, family))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
         return recorded

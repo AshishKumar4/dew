@@ -88,10 +88,11 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
 
 
 def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> bool:
-    """Whether each of `launches` fits a block of `shared` bytes and its consumer threads hold their registers
+    """Whether each of `launches` fits a block of `shared` bytes, its consumer threads hold their registers
     (`Launch.registers` within `Family.registers` at its consumer roles, of the bundle it issues by,
-    `Launch.family`, `family` where it names none): a generated launch spills nothing."""
-    return all(launch.shared <= shared
+    `Launch.family`, `family` where it names none) and a multiprocessor holds a program of it
+    (`Launch.resident`): a generated launch spills nothing."""
+    return all(launch.shared <= shared and launch.resident > 0
                and launch.registers <= (launch.family or family).registers(launch.consumers)
                for launch in launches)
 

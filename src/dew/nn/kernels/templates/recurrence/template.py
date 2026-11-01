@@ -152,12 +152,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
         """Whether every forward launch's consumer threads hold their registers at its own roles' budget
         (`Family.registers` at `Launch.consumers`: a walk of `Tiles.walkers` roles holds less a role than a
-        launch of one)."""
+        launch of one) and a multiprocessor holds a program of it (`Launch.resident`)."""
         target = self.launched()
         family = bundle(target, _dtype(ba))
         if family is None:
             return super()._held(ba, config)
-        return all(launch.registers <= (launch.family or family).registers(launch.consumers)
+        return all(launch.resident > 0
+                   and launch.registers <= (launch.family or family).registers(launch.consumers)
                    for launch in self._launches(ba, config, target, backward=False))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
