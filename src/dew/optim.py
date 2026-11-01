@@ -2352,10 +2352,13 @@ class OptimConfig:
         elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
             # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
+        # Gauss-Newton's one solve spans every parameter: each group scales its leaves of its direction.
+        solved = None
         if self.param_groups and self.optimizer == 'gauss_newton':
-            # One solve spans every parameter: each group scales its leaves of the solve's direction.
-            solved = solved_directions(**{name: opts.pop(name) for name in ('damping',) if name in opts})
-            make = _rate_only
+            damping = opts.pop('damping', 0.0)
+            if not isinstance(damping, int | float):
+                raise ValueError(f"Gauss-Newton's damping is a number, got {damping!r}")
+            solved, make = solved_directions(float(damping)), _rate_only
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
@@ -2372,7 +2375,7 @@ class OptimConfig:
                 solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
-            if self.optimizer == 'gauss_newton':
+            if solved is not None:
                 solver = optax.chain(solved, solver)
         else:
             if self.spared and self._spares(make):
