@@ -144,9 +144,19 @@ def _stepped_backward(scale: float, saved, operands, cotangent) -> tuple[jax.Arr
                                * (kept_dy - along * inverse[2] * kept_step))
     d_branch = inverse[1] * (rate * d_joined - columns * jnp.square(inverse[1]) * inverse[2]
                              * (moved_dy - along * inverse[2] * moved_step))
-    d_rate = jnp.sum(d_joined * (end - start), axis=tuple(range(d_joined.ndim - jnp.ndim(alpha))))
-    d_alpha = d_rate * jnp.sign(alpha.astype(wide) * scale) * scale
-    return d_residual.astype(residual.dtype), d_branch.astype(branch.dtype), d_alpha.astype(alpha.dtype)
+    # The rate's and each end's cotangents through `|alpha * scale|` and the broadcasts the step took, as JAX
+    # pulls them back: its derivative at zero and its sums over each broadcast axis.
+    _, rated = jax.vjp(lambda alpha: jnp.broadcast_to(jnp.abs(alpha.astype(wide) * scale), step.shape), alpha)
+    (d_alpha,) = rated(d_joined * (end - start))
+    return (_unbroadcast(d_residual, residual).astype(residual.dtype),
+            _unbroadcast(d_branch, branch).astype(branch.dtype), d_alpha.astype(alpha.dtype))
+
+
+def _unbroadcast(cotangent: jax.Array, operand: jax.Array) -> jax.Array:
+    """`cotangent`, of the shape `operand` broadcast to, summed back to `operand`'s shape, as JAX pulls a
+    broadcast back."""
+    _, pulled = jax.vjp(lambda wide: jnp.broadcast_to(wide, cotangent.shape), operand.astype(cotangent.dtype))
+    return pulled(cotangent)[0]
 
 
 def normed_hidden(gate: jax.Array, up: jax.Array, gate_gain: jax.Array, up_gain: jax.Array, factor: float,
