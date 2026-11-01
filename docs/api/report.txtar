@@ -1,0 +1,732 @@
+Dew's public surface (tools/api_report.py). A moved line is an API change: regenerate with
+`python tools/api_report.py --write` and say why in the commit.
+-- exports --
+class Aux(metrics: dict[str, jax.Array], variables: Variables | None = None, qk_stats: Variables | None = None, effects: Effects | None = None, inspected: Variables | None = None, record: Evaluated | Recorded | None = None) -> None  [dew.objectives.base]
+  .replace(self, **updates)
+class Best(metric: str | Metric | TrainingScalar | Summary | types.MethodType | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None, weights_only: bool = False, split: str | None = None, *, _source: Metric | TrainingScalar | Summary | Callable[[Mapping], float] | None = None)  [dew.training.selection]
+  .resolved(self, scored: Mapping[str, Sequence[Metric | Summary]]) -> Best
+class CFG(scale: float, interval: tuple[float, float] = (0.0, 1.0), rescale: float = 0.0) -> None  [dew.sampling.guidance]
+  .replace(self, **updates)
+  .walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk
+class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str | None = None, local_every: int | str | None = None)  [dew.checkpoints]
+  .accumulation_template(self, step: int)
+  .artifact(self, step: int | str | None = None) -> JSON
+  .best: property -> int | None
+  .boxed(self, step: int | str | None = None) -> dict[tuple[str, ...], LogicalAxes]
+  .close(self) -> None
+  .committed(self) -> list[int]
+  .control(self, step: int) -> dict
+  .cooldown(self, step: int) -> Mapping[str, object] | None
+  .cooling(self, pending: Mapping[str, object] | None) -> None
+  .kept(self) -> list[Kept]
+  .latest: property -> int | None
+  .local_path: property -> str
+  .materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *, step: int, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',))) -> Variables
+  .path(self, step: int) -> str
+  .pinned(self, step: int | str | None = None) -> int
+  .position(self, step: int, share: DataPartition) -> bytes | None
+  .posthoc_ema(self, std: float, step: int | None = None) -> Variables
+  .profile_metadata(self, step: int) -> tuple[int, tuple[float, ...]]
+  .profile_steps(self) -> list[int]
+  .python_run(self, reasons: Sequence[str]) -> None
+  .resolve(self, step: int | str | None) -> int | None
+  .restore(self, template=None, step: int | str | None = None, *, share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ())
+  .restore_profiles(self, step: int) -> tuple[Variables, ...]
+  .resumed(self, resume: Resume = 'auto') -> int | None
+  .rung(self, step: int) -> JSON
+  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None) -> None
+  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None) -> None
+  .source(self, step: int) -> str
+  .stored(self, step: int | str | None = None) -> Variables
+  .variables(self, *, step: int | str | None = None, ema: bool | None = None, mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',)), unread: tuple[tuple[str, ...], ...] = ()) -> Variables
+  .wait(self) -> None
+  .would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool
+class Condition(encoder: ConditionEncoder, field: str = 'text', unconditional: str | float | Mapping[str, object] = '') -> None  [dew.inputs.spec]
+  .bound(record: Mapping[str, object], *, params: Variables | None = None) -> Condition  [staticmethod]
+class Dataset()  [dew.data.pipeline]
+  .batch(self, size: int | None = None, *, tokens: int | None = None, drop_remainder: bool = True, batch_fn: Callable[[Sequence[Batch]], Batch] | None = None) -> Pipeline
+  .batched: property -> bool
+  .cache(self, cache: str | Cached) -> Pipeline
+  .elastic(self) -> Pipeline
+  .facts(self) -> Mapping[str, object]
+  .filter(self, predicate: Callable[[Batch], bool], *, reason: str | None = None, identity: str | None = None) -> Pipeline
+  .filter_map(self, *steps: RecordStep, identity: str | None = None) -> Pipeline
+  .flat_map(self, step: ExpandStep | ColumnStep, *, batched: bool = False, batch_size: int = 1000, identity: str | None = None) -> Pipeline
+  .grain(self, function: Callable[[pygrain.MapDataset | pygrain.IterDataset], pygrain.MapDataset | pygrain.IterDataset], *, identity: str | None = None) -> Pipeline
+  .holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None, split: str | tuple[str, ...] | None = None, tokens: float | None = None, fields: tuple[str, ...] = ('text',), **named: float) -> tuple[Dataset, ...]
+  .interleave(self, cycle_length: int = 16) -> Pipeline
+  .loading(self, loading: Loading) -> Pipeline
+  .map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000, identity: str | None = None) -> Pipeline
+  .map_with_index(self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None) -> Pipeline
+  .named(self, name: str) -> Pipeline
+  .pack(self, seq_len: int, *, fields: tuple[str, ...] = ('text',), bins: int = 32, policy: Literal['first-fit', 'best-fit', 'concat'] = 'first-fit', segments: int | None = None, along: tuple[tuple[str, int], ...] = (), overlap: int = 0) -> Pipeline
+  .pipe(self, stages: Callable[Concatenate[Dataset, Options], Dataset], *args: Options.args, **kwargs: Options.kwargs) -> Dataset
+  .prefetch(self, buffer: int = 64) -> Pipeline
+  .random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline
+  .random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline
+  .read(self, mode: Read) -> Pipeline
+  .remove_columns(self, *names: str) -> Pipeline
+  .rename_columns(self, names: Mapping[str, str]) -> Pipeline
+  .repeat(self, epochs: int | None = None) -> Pipeline
+  .select_columns(self, *names: str) -> Pipeline
+  .show(self, count: int = 8) -> None
+  .shuffle(self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None) -> Pipeline
+  .snapshot(self, url: str, *, format: Literal['array_record', 'parquet'] | Writer = 'array_record', rows_per_shard: int = 100000, deduplicate: NearDuplicates | None = None) -> Mapping[str, object]
+  .stats(self, records: int = 1000) -> dict[str, float]
+  .take(self, count: int) -> Pipeline
+  .threads(self, count: int) -> Pipeline
+  .windows(self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ('text',)) -> Pipeline
+  .workers(self, count: int, *, buffer: int = 1) -> Pipeline
+class EMASpec(decay: optax.Schedule, select: PathFilter = <function everything>, progressed: bool = False) -> None  [dew.objectives.base]
+  .constant(cls, decay: float | None) -> EMASpec | None  [classmethod]
+  .select(path: Path) -> bool
+class EvalSuite(data: Reader, metrics: Sequence[Metric] = (), every: int | str | Counted | None = None) -> None  [dew.training.evaluation]
+class Evaluation(step: int, split: str, scores: dict[str, float], coordinated_batches: int, records: int, event_key: tuple[int, ...], elapsed_seconds: float, previews: tuple[Artifact, ...], examples: int | None = None) -> None  [dew.training.evaluation]
+  .branched(self) -> Evaluation
+  .run(cls, objective: Objective[Loss, Effects], variables: Variables, batches: Reader | Dataset | None, *, key: int | jax.Array, metrics: Sequence[Metric] = (), step: int | jax.Array = 0, averaged: Variables | None = None, preview: bool = False, mesh: Mesh | None = None, split: str = 'val', schedule_step: int | jax.Array | None = None, loss: bool = False, training: Mapping[str, jax.Array] | None = None, warm: bool = False, updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None) -> Evaluation  [classmethod]
+  .scalars: property -> dict[str, float]
+class Field(key: str, shape: tuple[int, ...], variable_axes: tuple[int, ...] = ()) -> None  [dew.inputs.spec]
+  .held(self, batch: Batch) -> tuple[int, ...]
+  .of(cls, key: str, batch: Batch) -> Field  [classmethod]
+class ImageGrid(images: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
+  .replace(self, **updates)
+class InputSpec(sample: Field, conditions: Mapping[str, Condition] = <factory>, mask: Field | None = None) -> None  [dew.inputs.spec]
+  .bound(record: Mapping[str, object], *, params: Mapping[str, Variables] | None = None) -> InputSpec  [staticmethod]
+  .check(self, batch: Batch, *, whole: bool = True) -> None
+  .dependencies(self) -> Mapping[str, object]
+  .encode_fields(self, batch: Batch) -> dict[str, Mapping[str, np.ndarray]]
+  .encoders: property -> tuple[tuple[str, ConditionEncoder], ...]
+  .tokenize(self, captions: Sequence[str]) -> dict[str, Mapping[str, np.ndarray]]
+class Keep(latest: int = 2, every: int | None = None, interval: datetime.timedelta | str | None = None, where: Callable[[Kept], bool] | None = None) -> None  [dew.checkpoints]
+class Layout(rules: LogicalAxisRules | Mapping[str, MeshAxes] = (('vocab', ('fsdp', 'tensor')), ('mlp', 'tensor'), ('mlp', 'fsdp'), ('modulation', 'fsdp'), ('attention', 'tensor'), ('attention', 'fsdp'), ('linear', 'fsdp'), ('embed', 'fsdp'), ('head_dim', 'fsdp'), ('heads', ('fsdp', 'tensor')), ('kv', ('fsdp', 'tensor')), ('index', 'fsdp'), ('kvlora', 'fsdp'), ('qlora', 'fsdp'), ('output', 'fsdp'), ('exp', 'expert'), ('heads', 'tensor'), ('kv', 'tensor'), ('activation_batch', ('data', 'expert', 'fsdp')), ('activation_length', 'sequence'), ('activation_spread', ('sequence', 'tensor')), ('activation_spread', 'sequence'), ('activation_heads', 'tensor'), ('activation_kv', 'tensor'), ('activation_mlp', 'tensor'), ('activation_vocab', 'tensor'), ('pages', ('data', 'expert', 'fsdp')), ('activation_batch', ('data', 'expert')), ('activation_batch', 'data')), min_shard: int = 65536, tolerance: float = 0.02, host: tuple[str, ...] = (), host_parameters: tuple[str, ...] = (), frozen_whole: bool = False, data_axes: tuple[str, ...] = ()) -> None  [dew.distributed.placement]
+  .axis_rules: property -> LogicalAxisRules
+  .check(self, params: Variables, shardings: Placement[Variables], mesh: Mesh) -> None
+  .offloaded(self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]
+  .shardings(self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]
+  .validate(self, mesh: Mesh, state, *, capacity: int | None = None) -> Validation
+class LocalTracker(directory: str | Path, *, plots: bool = False)  [dew.training.tracker]
+  .artifact(self, value: Reported, step: int) -> None
+  .close(self) -> None
+  .log(self, scalars: Mapping[str, float], step: int) -> None
+  .plot(self, *metrics: str, smooth: int = 1, y_label: str | None = None, y_range: tuple[float, float] | None = None) -> Figure
+  .plot_files(self) -> list[Path]
+  .scalars(self) -> list[tuple[int, dict[str, float]]]
+class MLflowTracker(experiment: str, name: str | None = None, *, uri: str | None = None)  [dew.training.tracker]
+  .artifact(self, value: Reported, step: int) -> None
+  .close(self) -> None
+  .log(self, scalars: Mapping[str, float], step: int) -> None
+  .run: property -> tuple[MlflowClient, str]
+class Mean(fn: collections.abc.Callable[[Scored, Batch], jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | tuple[float, float]], name: str, better: Literal['higher', 'lower'], reads: type[Scored]) -> None  [dew.eval.common]
+  .finalize(self, accumulated: tuple[float, float]) -> float
+  .merge(accumulated: tuple[float, float], contribution: tuple[float, float]) -> tuple[float, float]  [staticmethod]
+  .shown: property -> dew.objectives.base.Shown
+class MeshSpec(fsdp: int = 1, expert: int = 1, tensor: int = 1, sequence: int = 1, stage: int = 1, replicas: int = 1, diloco: int = 1, explicit: tuple[str, ...] = ()) -> None  [dew.distributed.placement]
+  .build(self, devices: Sequence | None = None) -> Mesh
+class Objective()  [dew.objectives.base]
+  .accuracy(correct: jax.Array, batch: Batch, weights: jax.Array | None = None, *, rows: int | tuple[int, ...] = 0) -> Ratio  [staticmethod]
+  .apply_effects(self, variables: Variables, effects: Effects) -> Variables
+  .averages(self, update: jax.Array) -> jax.Array
+  .bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]
+  .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
+  .bind_widths(self, widths: Mapping[str, object]) -> None
+  .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
+  .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
+  .defines_validation_loss: property -> bool
+  .evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None
+  .evaluation_variables(self, variables: Variables, step: Step) -> Variables
+  .fresh_modules(self) -> tuple[str, ...]
+  .fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables
+  .held_variables(self) -> Variables | None
+  .inference_record(self) -> JSON
+  .init(self, key: jax.Array, variables: Variables | None = None) -> Variables
+  .initializer: property -> Initializer
+  .inputs: property -> InputSpec | None [set]
+  .loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
+  .model_flops(self, model, batch: Batch) -> float
+  .model_tree(cls, variables: Variables) -> Variables  [classmethod]
+  .model_variables(self, variables: Variables) -> Variables
+  .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .placement(self, layout: Layout) -> Layout
+  .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
+  .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
+  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
+  .program_key(self) -> tuple[ProgramModule, ...]
+  .progress(self, step: Step) -> Progress
+  .progress_readers(self) -> tuple[nn.Module, ...]
+  .projected(self, params: Variables, *, updated: bool) -> Variables
+  .real_lengths(self, batch: Batch) -> np.ndarray
+  .recorded_model(self) -> nn.Module
+  .reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]
+  .restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None
+  .row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *, rows: int | tuple[int, ...] = 0, weights: jax.Array | None = None) -> Ratio  [staticmethod]
+  .row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *, rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]  [staticmethod]
+  .row_tokens(self, batch: Batch) -> int | None
+  .row_weights(batch: Batch, rows: int) -> jax.Array  [staticmethod]
+  .scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]
+  .scalars: property -> TrainingScalars[Loss, Effects]
+  .scored_tokens(self, batch: Batch) -> np.ndarray
+  .scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None
+  .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
+  .substitute(self, modules: Sequence[nn.Module]) -> None
+  .task_settings(self) -> DataclassInstance | None
+  .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
+  .towers(self) -> tuple[Held, ...]
+  .training_flops(self, model, batch: Batch) -> float
+  .unfuse_head(self) -> str | None
+  .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
+  .validation_loss_refusal: property -> str | None
+  .with_gradients(stats: Loss, gradients, params: Variables) -> Loss  [staticmethod]
+class Observe(every: int, call: Callable[[TrainState], Any], values: list[tuple[int, Any]] = <factory>) -> None  [dew.training.observe]
+  .at(self, step: int, state: TrainState) -> None
+  .last(self, step: int, state: TrainState) -> None
+  .opened(self, step: int, state: TrainState, *, complete: bool) -> None
+  .take(self, step: int, state: TrainState) -> None
+class Pause(fraction: float) -> None  [dew.training.budget]
+  .at(self, steps: int | None, tokens: int | None, accumulation: int, examples: int | None = None) -> tuple[int | None, int | None, int | None]
+class Plateau(metric: Annotated[Metric | TrainingScalar | Summary | types.MethodType | str, tyro.conf.arg(constructor=str)], evals: int = 5, min_delta: float = 0.0, mode: Literal['min', 'max'] | None = None, split: str | None = None) -> None  [dew.training.budget]
+class Process(schedule: NoiseScheduler, prediction: PredictionTransform, weighting: Weighting = <factory>, sampling: NoiseScheduler | None = None, interval: bool = False) -> None  [dew.diffusion.process]
+  .denoiser(self, model, params, conditions: Mapping[str, Conditioning], unconditional: Mapping[str, Conditioning] | None = None, *, schedule: NoiseScheduler | None = None, opened: Sequence[str] = ()) -> Denoiser
+  .noise(self, key, shape) -> jax.Array
+  .rates(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
+  .sampler_schedule: property -> NoiseScheduler
+  .times(self, steps: int) -> jax.Array
+  .variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
+  .weight(self, t) -> jax.Array
+class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>) -> None  [dew.training.profiling]
+class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None  [dew.telemetry.profile]
+  .captures: property -> tuple[Path, ...]
+  .directory: property -> Path | None
+  .region(self, name: str) -> AbstractContextManager[None]
+  .running: property -> bool
+  .start(self) -> Self
+  .stop(self, *, wait: bool = True) -> None
+class Representations(features: jax.Array, labels: jax.Array) -> None  [dew.artifacts]
+  .replace(self, **updates)
+class Step(step: jax.Array, key: jax.Array, ema: Variables | None, training: bool = True, committed: jax.Array | None = None, example_key: jax.Array | None = None, example_index: jax.Array | None = None, example_count: int | None = None, tape: Mapping[str, jax.Array] | None = None, recorder: Recorder | None = None, record: bool = False, witness: Witness | None = None, qk_stats: bool = False, watched: Watched | None = None) -> None  [dew.objectives.base]
+  .boundary(self, name: str, value: jax.Array) -> jax.Array
+  .examples(self, rows: int) -> jax.Array
+  .places(self, rows: int) -> tuple[jax.Array, int]
+  .replace(self, **updates)
+  .sample(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None, *, dtype=None, rows: int) -> jax.Array
+  .sample_update(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None, *, dtype=None, rows: int) -> jax.Array
+  .sown(self, *collections: str) -> list[str]
+  .updates: property -> jax.Array
+class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics: Sequence[Criterion] = (), *, inputs: InputSpec | str, mode: str | None = None, work: Callable[[Batch], float] | None = None)  [dew.objectives.supervised]
+  .accuracy(correct: jax.Array, batch: Batch, weights: jax.Array | None = None, *, rows: int | tuple[int, ...] = 0) -> Ratio  [staticmethod]
+  .apply_effects(self, variables: Variables, effects: Effects) -> Variables
+  .averages(self, update: jax.Array) -> jax.Array
+  .bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]
+  .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
+  .bind_widths(self, widths: Mapping[str, object]) -> None
+  .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
+  .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
+  .defines_validation_loss: property -> bool
+  .evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None
+  .evaluation_variables(self, variables: Variables, step: Step) -> Variables
+  .fresh_modules(self) -> tuple[str, ...]
+  .fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables
+  .held_variables(self) -> Variables | None
+  .inference_record(self) -> JSON
+  .init(self, key: jax.Array, variables: Variables | None = None) -> Variables
+  .initializer: property -> Initializer
+  .inputs: property -> InputSpec | None [set]
+  .loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]
+  .model_flops(self, model, batch: Batch) -> float
+  .model_tree(cls, variables: Variables) -> Variables  [classmethod]
+  .model_variables(self, variables: Variables) -> Variables
+  .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .placement(self, layout: Layout) -> Layout
+  .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
+  .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
+  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
+  .program_key(self) -> tuple[ProgramModule, ...]
+  .progress(self, step: Step) -> Progress
+  .progress_readers(self) -> tuple[nn.Module, ...]
+  .projected(self, params: Variables, *, updated: bool) -> Variables
+  .real_lengths(self, batch: Batch) -> np.ndarray
+  .recorded_model(self) -> nn.Module
+  .reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]
+  .restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None
+  .row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *, rows: int | tuple[int, ...] = 0, weights: jax.Array | None = None) -> Ratio  [staticmethod]
+  .row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *, rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]  [staticmethod]
+  .row_tokens(self, batch: Batch) -> int | None
+  .row_weights(batch: Batch, rows: int) -> jax.Array  [staticmethod]
+  .scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]
+  .scalars: property -> TrainingScalars[Loss, Effects]
+  .scored_tokens(self, batch: Batch) -> np.ndarray
+  .scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, jax.Array]
+  .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
+  .substitute(self, modules: Sequence[nn.Module]) -> None
+  .task_settings(self) -> DataclassInstance | None
+  .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
+  .towers(self) -> tuple[Held, ...]
+  .training_flops(self, model, batch: Batch) -> float
+  .unfuse_head(self) -> str | None
+  .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
+  .validation_loss_refusal: property -> str | None
+  .with_gradients(stats: Loss, gradients, params: Variables) -> Loss  [staticmethod]
+class TensorBoardTracker(directory: str | Path)  [dew.training.tracker]
+  .artifact(self, value: Reported, step: int) -> None
+  .close(self) -> None
+  .log(self, scalars: Mapping[str, float], step: int) -> None
+  .writer: property -> EventFileWriter
+class TextSamples(tokens: jax.Array | np.ndarray, prompt: str = '', texts: tuple[str, ...] = ()) -> None  [dew.artifacts]
+  .replace(self, **updates)
+class TokenScores(losses: jax.Array, weights: jax.Array, correct: jax.Array) -> None  [dew.artifacts]
+  .replace(self, **updates)
+class Tracker(*args, **kwargs)  [dew.training.tracker]
+  .artifact(self, value: Reported, step: int) -> None
+  .close(self) -> None
+  .log(self, scalars: Mapping[str, float], step: int) -> None
+class Trackers(*trackers: Tracker)  [dew.training.tracker]
+  .artifact(self, value: Reported, step: int) -> None
+  .close(self) -> None
+  .log(self, scalars: Mapping[str, float], step: int) -> None
+class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, variables: Variables, opt_state: optax.OptState, ema: Variables | None, key: jax.Array, scale: DynamicScale | None, window_size: jax.Array, accumulation: Accumulation | None = None, consumed: jax.Array | None = None, deferred: jax.Array | None = None, inner: Replicas | None = None, compute: Variables | None = None) -> None  [dew.state]
+  .averaged: property -> Variables
+  .pending_tokens: property -> jax.Array | None
+  .replace(self, **updates)
+  .window: property -> Accumulation | None
+  .with_window(self, window: Accumulation | None) -> TrainState
+class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout = Layout(rules=(('vocab', ('fsdp', 'tensor')), ('mlp', 'tensor'), ('mlp', 'fsdp'), ('modulation', 'fsdp'), ('attention', 'tensor'), ('attention', 'fsdp'), ('linear', 'fsdp'), ('embed', 'fsdp'), ('head_dim', 'fsdp'), ('heads', ('fsdp', 'tensor')), ('kv', ('fsdp', 'tensor')), ('index', 'fsdp'), ('kvlora', 'fsdp'), ('qlora', 'fsdp'), ('output', 'fsdp'), ('exp', 'expert'), ('heads', 'tensor'), ('kv', 'tensor'), ('activation_batch', ('data', 'expert', 'fsdp')), ('activation_length', 'sequence'), ('activation_spread', ('sequence', 'tensor')), ('activation_spread', 'sequence'), ('activation_heads', 'tensor'), ('activation_kv', 'tensor'), ('activation_mlp', 'tensor'), ('activation_vocab', 'tensor'), ('pages', ('data', 'expert', 'fsdp')), ('activation_batch', ('data', 'expert')), ('activation_batch', 'data')), min_shard=65536, tolerance=0.02, host=(), host_parameters=(), frozen_whole=False, data_axes=()), microbatches: int | None = None, accumulation: int = 1, split: int | None = None, dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None)  [dew.training.trainer]
+  .compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *, capacity: int | None = None) -> CompiledStep
+  .device_mesh: cached property -> Mesh
+  .fit(self, dataset: Dataset | Loader | Handed, *, steps: int | None = None, epochs: int | None = None, tokens: int | None = None, examples: int | None = None, log_every: int | str = 100, eval_every: int | str | None = None, checkpoint_every: int | str | datetime.timedelta | None = None, checkpoint_final: bool = True, metrics: Sequence[Metric] = (), preview: bool = False, scored_to: str | os.PathLike[str] | None = None, best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None, stop: Plateau | Pause | None = None, validation: HandedSplits | None = None, summaries: Sequence[Summary] = (), restore_best: bool = False, state: TrainState | None = None, observe: Observe | None = None, device_prefetch: int = 2, resume: Resume = 'auto', cooldowns: Cooldowns | None = None) -> TrainState
+  .host_master: property -> bool
+  .initial_state(self, initializer: Initializer | None = None, key: int | jax.Array | None = None) -> TrainState
+  .key: property -> jax.Array
+  .microbatches: property -> int
+  .optimizer: property -> optax.GradientTransformation
+  .place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]
+  .reading(self, loader: Loader, prefetch: int = 2, *, examples=None, steps=None) -> None
+  .scheduled(self, updates: int | None) -> None
+  .shardings(self, state: TrainState) -> Placement[TrainState]
+  .state_mesh: cached property -> Mesh
+  .validate(self, batch: Batch | None = None, *, steps: int | None = None, capacity: int | None = None) -> Validation
+class VideoGrid(videos: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
+  .replace(self, **updates)
+class WandbTracker(project: str, name: str | None = None, *, entity: str | None = None, config: Mapping[str, object] | None = None, offline: bool = False, id: str | None = None)  [dew.training.tracker]
+  .artifact(self, value: Reported, step: int) -> None
+  .close(self) -> None
+  .log(self, scalars: Mapping[str, float], step: int) -> None
+  .render(value: Reported) -> Payload  [staticmethod]
+  .run: property
+__version__: str
+def pipeline(source: str, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, dtype: DTypeLike | None = None, param_dtype: DTypeLike | Literal['auto'] | None = None, ema: bool | None = None, step: int | str | None = None, revision: str | None = None, trust: Sequence[str] = (), options: SourceOptions | None = None, precision: Numerics | str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask  [dew.inference.loading]
+def sample(denoise: dew.diffusion.process.Denoiser | dew.diffusion.discrete.DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: dew.sampling.solvers.common.Solver[StateT], guidance: dew.sampling.guidance.Guidance | None = None, key: int | jax.Array | dew.sampling.solvers.common.RowKeys, times: jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | collections.abc.Sequence[float] | None = None, initial: StateT | None = None, final_denoise: bool = True, record: collections.abc.Callable[[jax.Array, StateT, jax.Array], RecordT] | None = None) -> jax.Array | tuple[jax.Array, RecordT]  [dew.sampling.walks]
+-- config --
+dew.config.DecoderRunConfig
+  model: dew.registry.ModelConfig = dew.registry.ModelConfig()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: dew.config.ObjectiveConfig | None = None
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  loop_steps: int | None = None
+  loop_layers: tuple[int, int] | None = None
+  loop_backprop_steps: int | None = None
+  loop_remat: bool = False
+dew.config.MetricConfig
+  name: str
+  fields: JsonDict = builtins.dict()
+  defaults: JsonDict = builtins.dict()
+  split: str | None = None
+dew.config.ObjectiveConfig
+  name: str
+  fields: JsonDict = builtins.dict()
+  defaults: JsonDict = builtins.dict()
+dew.config.Prepared
+  run: RunConfig
+  objective: dew.objectives.base.Objective[LossT, EffectsT]
+  dataset: dew.data.pipeline.Dataset | dew.data.dataset.Loader
+  metrics: collections.abc.Sequence[dew.objectives.base.Metric] = ()
+  rollout: dew.training.rollout.Rollout | None = None
+  summary: collections.abc.Mapping[str, object] | None = None
+  validation: dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset | Reader] | None = None
+  after: collections.abc.Callable[[dew.state.TrainState, str], None] | None = None
+dew.config.RunConfig
+  model: dew.registry.ModelConfig = dew.registry.ModelConfig()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: dew.config.ObjectiveConfig | None = None
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+dew.config.SourceOptions
+  text_only: bool = False
+  prediction_depths: int | None = None
+  attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
+  dex: Annotated[dew.nn.dex.DifferentialExtension, PrimitiveConstructorSpec] | None = None
+  scan_layers: bool = False
+  param_dtype: str | None = None
+  step: int | str | None = None
+  ema: bool | None = None
+dew.config.TrainerConfig
+  name: str | None = None
+  checkpoint_dir: str = './checkpoints'
+  keep: Annotated[int | dew.checkpoints.Keep, PrimitiveConstructorSpec] = 2
+  resume: Literal['auto', 'require', 'never'] = 'auto'
+  best: Annotated[str | dew.training.selection.Best | tuple[dew.training.selection.Best, ...] | None, PrimitiveConstructorSpec] = None
+  update_tokens: int | None = None
+  key: int = 0
+  steps: int | None = None
+  epochs: int | None = None
+  tokens: int | None = None
+  examples: int | None = None
+  stop: Annotated[dew.training.budget.Pause, _SubcommandConfig] | Annotated[dew.training.budget.Plateau, _SubcommandConfig] | None = None
+  restore_best: bool = False
+  cooldowns: Annotated[dew.training.cooldown.Cooldowns, _SubcommandConfig] | None = None
+  log_every: Annotated[int | str, PrimitiveConstructorSpec] = 100
+  eval_every: Annotated[int | str | None, PrimitiveConstructorSpec] = 'epoch'
+  checkpoint_every: Annotated[int | str | datetime.timedelta | None, PrimitiveConstructorSpec] = 'epoch'
+  checkpoint_final: bool = True
+  local_directory: str | None = None
+  local_every: int | str | None = None
+  scored_to: str | None = None
+  accumulation: int = 1
+  split: int | None = None
+  batch_ramp: dew.data.dataset.Ramp | None = None
+  dynamic_scale: bool | None = None
+  precision: Annotated[dew.nn.precision.Numerics, PrimitiveConstructorSpec] = dew.nn.precision.Numerics()
+  mesh: dew.distributed.placement.MeshSpec = dew.distributed.placement.MeshSpec()
+  microbatches: int | None = None
+  layout: dew.distributed.placement.Layout = dew.distributed.placement.Layout()
+  profile: dew.training.profiling.ProfileWindow | None = None
+  compilation_cache_dir: str | None = None
+  wandb: dew.training.tracker.Wandb | None = None
+  publish: bool = False
+  multi_host: bool | None = None
+  xla_flags: str | None = None
+  quantization: dew.quantization.Quantization | None = None
+  lower_for: str | None = None
+  compile_ahead: Annotated[dew.training.ahead.AheadTarget, _SubcommandConfig] | None = None
+  ahead: str | None = None
+  inspection: Annotated[dew.training.inspection.Inspection, _SubcommandConfig] | None = None
+  diloco: Annotated[dew.training.diloco.DiLoCo, _SubcommandConfig] | None = None
+  links: Annotated[collections.abc.Mapping[str, dew.nn.sharding.Link], PrimitiveConstructorSpec] = builtins.dict()
+  tune_kernels: bool = False
+dew.config.diffusion.DiffusionRunConfig
+  model: ModelConfig = (lambda: ModelConfig('unet', dict(DEFAULT_MODEL_CONFIG)))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('diffusion', {'solver': to_record(EulerAncestral(), Solver)}))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  preset: PresetSpec | None = dew.diffusion.presets.EDM()
+  text: TextCondition | None = dew.inputs.spec.TextCondition()
+  audio: AudioCondition | None = None
+  autoencoder: PretrainedAutoencoder | None = None
+  pretrained: str | None = None
+  teacher_run: str | None = None
+  rollout: Annotated[FlowRolloutConfig, tyro.conf.subcommand('rollout')] | None = None
+dew.config.diffusion.FlowRolloutConfig
+  reward: str = 'clip_score'
+  groups: int = 4
+  steps: int = 11
+  train_steps: int | None = None
+dew.config.jepa.JepaRunConfig
+  model: ModelConfig = (lambda: ModelConfig('jepa_encoder', {'precision': 'default'}))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('jepa'))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  predictor: JsonDict = builtins.dict()
+  num_target_blocks: int = 4
+  target_scale: tuple[float, float] = (0.15, 0.2)
+  target_aspect: tuple[float, float] = (0.75, 1.5)
+  probe_classes: int | None = None
+  knn_k: int = 20
+dew.config.lm.LMRunConfig
+  model: ModelConfig = (lambda: ModelConfig('causal_transformer', {}))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, weight_decay=0.1, clip_grads=1.0))()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('lm'))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  loop_steps: int | None = None
+  loop_layers: tuple[int, int] | None = None
+  loop_backprop_steps: int | None = None
+  loop_remat: bool = False
+  tokenizer: str = 'byte'
+  prompt: str = ''
+  max_new_tokens: int = 128
+  sampling: Sampling = (lambda: Sampling(temperature=0.8, top_k=40))()
+  pretrained: str | None = None
+  rollout: Annotated[PromptRollout, tyro.conf.subcommand('rollout')] | None = None
+dew.config.lm.PromptRollout
+  reward: str
+  groups: int = 4
+  max_new_tokens: int = 32
+  estimator: str | None = None
+  truncation: str = 'score'
+  sampling: Sampling = (lambda: Sampling(temperature=1.0))()
+  method: str | None = None
+  admit: int | None = None
+  overlong_cache: int | None = None
+  generation_batches: int = 1
+dew.config.sweep.GridSearch
+dew.config.sweep.OptunaSearch
+  seed: int = 0
+dew.config.sweep.RandomSearch
+  seed: int = 0
+-- cli --
+dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
+dew export  [dew.cli.main.Export]
+  run: str  [Positional]
+  destination: str  [Positional]
+  ema: bool | None = None
+  step: int | str | None = None
+  trust: tuple[str, ...] = ()
+dew inspect  [dew.cli.main.Inspect]
+  run: str  [Positional]
+  set: tuple[str, ...] = ()  [UseAppendAction]
+  trust: tuple[str, ...] = ()
+dew launch  [dew.cli.launch.Launch]
+  command: tuple[str, ...]  [Positional]
+  hosts: tuple[str, ...] = ()  [metavar='NAME']
+  hostfile: pathlib.Path | None = None  [metavar='FILE']
+  tpu: tuple[str, ...] = ()  [metavar='NAME']
+  zone: str | None = None  [metavar='ZONE']
+  processes_per_host: int | None = None  [metavar='N']
+  devices_per_process: int | None = None  [metavar='N']
+  port: int | None = None  [metavar='N']
+  coordinator: str | None = None  [metavar='HOST']
+  env: tuple[str, ...] = ()  [metavar='NAME=VALUE']  [UseAppendAction]
+  cwd: str | None = None  [metavar='DIR']
+  dry_run: bool = False
+dew profile  [dew.cli.main.Profile]
+  run: str  [Positional]
+  warmup: int = 20
+  steps: int = 10
+  out: str | None = None
+  set: tuple[str, ...] = ()  [UseAppendAction]
+  trust: tuple[str, ...] = ()
+  host_tracer_level: int | None = None
+  python_tracer_level: int | None = None
+  activity_cap: int | None = None
+dew train  [dew.cli.main.Train]
+  run: str  [Positional]
+  set: tuple[str, ...] = ()  [UseAppendAction]
+  trust: tuple[str, ...] = ()
+dew data  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
+dew data export  [dew.cli.main.DataExport]
+  data: str  [Positional]
+  destination: str  [Positional]
+  format: Literal['parquet', 'array_record'] | None = None
+  rows_per_shard: int = 100000
+  branch: Literal['train', 'validation'] = 'train'
+  read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
+  provision: bool = False
+  tokenizer: str | None = None
+  eos: bool = False
+dew data provision  [dew.cli.main.DataProvision]
+  source: str  [Positional]
+dew data publish  [dew.cli.main.DataPublish]
+  data: str  [Positional]
+  destination: str  [Positional]
+  branch: Literal['train', 'validation'] = 'train'
+  read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
+  provision: bool = False
+dew tpu  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
+dew tpu attach-disk  [dew.cli.tpu.AttachDisk]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  disk: str  [Positional]
+  read_only: bool = False
+dew tpu copy  [dew.cli.tpu.Copy]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  src: str  [Positional]
+  dst: str  [Positional]
+  worker: str = 'all'  [metavar='N|all']
+dew tpu create  [dew.cli.tpu.Create]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  type: str | None = None  [metavar='TYPE']
+  spot: bool = False
+  queued: bool = False
+  version: str | None = None  [metavar='VERSION']
+  disk: str | None = None  [metavar='DISK']
+dew tpu delete  [dew.cli.tpu.Delete]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+dew tpu describe  [dew.cli.tpu.Describe]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+dew tpu init  [dew.cli.tpu.Init]
+  project: str | None = None  [metavar='PROJECT']
+  zones: str | None = None  [metavar='ZONES']
+  accelerator_type: str | None = None  [metavar='TYPE']
+  runtime_version: str | None = None  [metavar='VERSION']
+  ssh_user: str | None = None  [metavar='USER']
+  gcs_bucket: str | None = None  [metavar='BUCKET']
+  data_disk: str | None = None  [metavar='DISK']
+  python_version: str | None = None  [metavar='X.Y']
+  dry_run: bool = False
+dew tpu list  [dew.cli.tpu.List]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+dew tpu logs  [dew.cli.tpu.Logs]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  job: str  [Positional]
+  worker: str = '0'  [metavar='N|all']
+  follow: bool = False
+  lines: int = 200
+dew tpu reset  [dew.cli.tpu.Reset]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+dew tpu run  [dew.cli.tpu.Run]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  worker: str = 'all'  [metavar='N|all']
+  detach: bool = False
+  job: str = ''  [metavar='JOB']
+dew tpu setup  [dew.cli.tpu.Setup]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  from_source: bool = False
+  version: str = ''  [metavar='VERSION']
+  extras: str = ''  [metavar='LIST']
+  gcs_bucket: str | None = None  [metavar='BUCKET']
+  python_version: str | None = None  [metavar='X.Y']
+  type: str | None = None  [metavar='TYPE']
+  delete: bool = False
+  git_key: pathlib.Path | None = None  [metavar='FILE']
+dew tpu spawn  [dew.cli.tpu.Spawn]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  base: str  [Positional]
+  count: int  [Positional]
+  type: str | None = None  [metavar='TYPE']
+  spot: bool = False
+  queued: bool = False
+  extras: str = ''  [metavar='LIST']
+dew tpu ssh  [dew.cli.tpu.Ssh]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  worker: int = 0
+  forward: tuple[int, ...] = ()  [UseAppendAction]  [aliases=('-L',)]  [metavar='PORT']
+dew tpu ssh-config  [dew.cli.tpu.SshConfig]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+dew tpu start  [dew.cli.tpu.Start]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+dew tpu status  [dew.cli.tpu.Status]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+dew tpu stop  [dew.cli.tpu.Stop]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+dew tpu sync  [dew.cli.tpu.Sync]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  exclude: tuple[str, ...] = ()  [UseAppendAction]  [metavar='PATTERN']
+  delete: bool = False
+dew tpu train  [dew.cli.tpu.Train]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  job: str = ''  [metavar='JOB']
+  delete: bool = False
+-- records --
+dew.telemetry.records.RunRecord
+  name: str
+  config: JSON
+  summary: JSON
+  steps: int | None
+  packages: Mapping[str, str]
+  dew_sha: str | None = dew.telemetry.records.checkout_revision()
+  device_kind: str | None = None
+  devices: int | None = None
+  processes: int | None = None
+dew.telemetry.records.FitStarted
+  start_step: int
+  target_steps: int | None
+  resumed_from: str | None
+  parameters: int
+  devices: int
+  device_kind: str
+  processes: int
+  mesh: Mapping[str, int]
+  sharded: float
+  seed: int | None = None
+  tokens: int | None = None
+  examples: int | None = None
+  cadences: Mapping[str, JSON] = builtins.dict()
+  groups: Mapping[str, str] | None = None
+dew.telemetry.records.StepCompiled
+  seconds: float
+  remat: JSON
+  links: Mapping[str, AxisLink]
+  memory: JSON = None
+  plan: JSON = None
+dew.telemetry.records.CheckpointRequested
+  directory: str
+  local: bool = False
+dew.telemetry.records.ProfileTraced
+  directory: str
+  steps: int
+dew.telemetry.records.FitEnded
+  status: Literal['completed', 'preempted', 'failed', 'interrupted', 'lowered']
+  seconds: float
+  error: str | None = None
+  traceback: str | None = None
+dew.telemetry.records.TrialFinished
+  index: int
+  name: str
+  overrides: Mapping[str, JSON]
+  value: float
+dew.data.generation.GENERATION_SCHEMA = 2
+dew.training.rungs.RECORD_VERSION = 2
+dew.nn.kernels.templates.report.KERNEL_PROTO_VERSION = 4

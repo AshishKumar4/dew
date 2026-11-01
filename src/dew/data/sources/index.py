@@ -14,11 +14,6 @@ import numpy as np
 from dew.data.declared import Declared, mirrored
 from dew.data.storage import Store, local
 
-_MAPPING = threading.Lock()
-"""Held while an index takes its lease and maps its values: threads that first read one index at once
-(a reader its worker unpickled) each map the file of the one lease the index keeps, never a lease another
-thread took and dropped, whose descriptor the path names closed by then or reused for another file."""
-
 
 @dataclass(frozen=True)
 class ArrayIndex:
@@ -29,11 +24,22 @@ class ArrayIndex:
     url: str
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
     declared: Declared | None = field(default=None, repr=False)
+    leasing: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+    """Held while the index takes its lease: threads that first read it at once (a reader its worker
+    unpickled) each map the file of the one lease it keeps, never a lease another thread took and dropped,
+    whose descriptor the path names closed by then or reused for another file; another index's first
+    read waits on none of it."""
 
-    @cached_property
+    @property
     def lease(self) -> tuple[str, BinaryIO | None]:
         """A path on this host to the index's bytes, and the open file that holds it there, none for an
-        undeclared local file, read where it is."""
+        undeclared local file, read where it is: taken once, by the first thread to ask."""
+        with self.leasing:
+            if "_lease" not in self.__dict__:
+                self.__dict__["_lease"] = self._leased()
+            return self.__dict__["_lease"]
+
+    def _leased(self) -> tuple[str, BinaryIO | None]:
         if self.declared is not None:
             return self.declared.leased()
         store = Store(self.url, self.storage_options)
@@ -45,17 +51,20 @@ class ArrayIndex:
 
     @cached_property
     def values(self) -> np.ndarray:
-        with _MAPPING:
-            values = np.load(self.lease[0], mmap_mode="r", allow_pickle=False)
+        values = np.load(self.lease[0], mmap_mode="r", allow_pickle=False)
         if not isinstance(values, np.ndarray):
             raise ValueError(f"index {self.url} must contain one NumPy array")
         return values
 
     def close(self) -> None:
         self.__dict__.pop("values", None)
-        lease = self.__dict__.pop("lease", None)
+        with self.leasing:
+            lease = self.__dict__.pop("_lease", None)
         if lease is not None and lease[1] is not None:
             lease[1].close()
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "declared": self.declared}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        self.__dict__.update(state, leasing=threading.Lock())
