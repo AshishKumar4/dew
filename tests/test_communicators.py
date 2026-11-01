@@ -169,7 +169,7 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     executable is released, neither of which a process sees: a program whose new communicators fit what its
     GPUs have free now but not with its code is refused, an executable admitted again is not charged its
     code again, and the room, which holds what stays made, never holds code."""
-    room = dict.fromkeys(range(4), 3 * GIB)
+    room = dict.fromkeys(range(4), 4 * GIB)
     every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
     pair = Collectives(groups=frozenset({(0, 1)}))
     resident = communicators.Resident()
