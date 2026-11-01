@@ -223,6 +223,22 @@ def test_armadas_word_that_a_container_is_fresh_reaches_no_process_its_task_star
     assert ci.reused("3.12", "tests/test_env.py", "", ci.shared("3.12")) is not None
 
 
+def test_armadas_word_that_a_container_is_fresh_reaches_no_process_a_gpu_lane_starts(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """`main` takes ARMADA_FRESH out of the environment before any operation starts, a GPU lane's among them,
+    so no pytest a lane starts, nor a task its test starts, inherits it (review: the word was taken only on
+    the task's own path)."""
+    url, _, _ = cache_worker
+    [name] = gpu_lane_at(tmp_path, monkeypatch, url, 1)
+    (tmp_path / name).write_text("import os\ndef test_env():\n    assert 'ARMADA_FRESH' not in os.environ\n")
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-lane", f"--tests={name}", f"--out={out}", "--cache=on"])
+    assert ci.main() == 0
+    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0]
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an
@@ -2074,7 +2090,7 @@ def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_d
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
 
 
-def test_a_kept_task_reuses_each_files_own_row_and_names_every_file_once(
+def test_a_kept_task_reuses_each_files_own_row_where_files_share_a_key_and_names_every_file_once(
         ci, tmp_path, monkeypatch, cache_worker):
     """Files whose runs read the same inputs, each importing the others, keep a row each: a kept task reuses
     each file's own green row (`green_key`, kept at the row's place), runs none of them again, and names
@@ -2090,6 +2106,11 @@ def test_a_kept_task_reuses_each_files_own_row_and_names_every_file_once(
 
     written(tmp_path, {f"test_{name}.py": body(name) for name in "abc"})
     armada_task(ci, monkeypatch, verdict)
+    # Each read every file, so each key hashes the same inputs: the keys are one, and the rows still three.
+    common = ci.shared("3.12")
+    keys = [ci.recorded(ci.record_key("3.12", f"3.12:tests/test_{name}.py", ci.device_class(), common),
+                        "token")["key"] for name in "abc"]
+    assert None not in keys and len(set(keys)) == 1, keys
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",

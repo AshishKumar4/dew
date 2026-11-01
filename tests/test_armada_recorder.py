@@ -73,6 +73,13 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                             "    bare = [sys.executable, '-W', 'ignore', '-S', __file__]\n"
                             "    os.execve(sys.executable, bare, again)\n"
                             "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
+        # The same with the option grouped with another (review: `-BX utf8` read the `utf8` as the program).
+        "reexec_bare_bx.py": "import os, sys\n"
+                             "if os.environ.get('REEXECED') != '1':\n"
+                             "    again = {**os.environ, 'REEXECED': '1'}\n"
+                             "    bare = [sys.executable, '-BX', 'utf8', '-S', __file__]\n"
+                             "    os.execve(sys.executable, bare, again)\n"
+                             "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
         "test_child.py": started + "done = subprocess.run([sys.executable, 'tests/child.py'], check=True,\n"
                                    "                      capture_output=True, text=True)\n"
                                    "    assert not done.stderr, done.stderr\n",
@@ -85,6 +92,8 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                             "                   check=True)\n",
         "test_reexecs_bare_w.py": started + "subprocess.run([sys.executable, 'tests/reexec_bare_w.py'],\n"
                                             "                   check=True)\n",
+        "test_reexecs_bare_bx.py": started + "subprocess.run([sys.executable, 'tests/reexec_bare_bx.py'],\n"
+                                             "                   check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
@@ -100,13 +109,13 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
 
-    assert reused() == [True, True, True, True, False, False, False, False, False]
+    assert reused() == [True, True, True, True, False, False, False, False, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
-    assert reused() == [False, True, True, True, False, False, False, False, False]
+    assert reused() == [False, True, True, True, False, False, False, False, False, False]
     (tmp_path / "notes/page.md").write_text("page\n")
-    assert reused() == [True, True, True, True, False, False, False, False, False]
+    assert reused() == [True, True, True, True, False, False, False, False, False, False]
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
-    assert reused() == [False, True, False, False, False, False, False, False, False]
+    assert reused() == [False, True, False, False, False, False, False, False, False, False]
     # A keyed file whose inputs moved is in as changed; one whose records keep no key (a child unfollowed) as
     # unrecorded, as no record is evidence of it.
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
@@ -115,6 +124,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_own_environment.py": ["unrecorded"],
                                    "tests/test_reexecs.py": ["changed"],
                                    "tests/test_reexecs_bare.py": ["unrecorded"],
+                                   "tests/test_reexecs_bare_bx.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_w.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_x.py": ["unrecorded"]}
 
@@ -669,6 +679,24 @@ def test_a_marker_a_child_pytest_looks_up_is_its_starters_input(ci, tmp_path, mo
                           "             'tests/child_case.py']\n"
                           "    alone = {**os.environ, 'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1'}\n"
                           "    subprocess.run(child, check=True, env=alone)\n"}, {})
+    assert reused() == [True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
+    assert reused() == [False]
+
+
+def test_the_settings_a_pytest_a_test_runs_in_its_process_reads_are_the_tests_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A pytest a test runs in its own process (`pytest.main`), a session the recorder's plugin does not
+    record, reads its settings as an input of the test's file (review: every configuration read in the process
+    was set aside as the recorded session's), so a registration the inner session reads reruns the file."""
+    project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = [\"tidy: {}\"]\n"
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "inner_case.py": "def test_inner(pytestconfig):\n"
+                         "    assert any('tidy' in line for line in pytestconfig.getini('markers'))\n",
+        "test_inner.py": "import pytest\ndef test_inner():\n"
+                         "    inner = ['-q', '-p', 'no:cacheprovider', 'tests/inner_case.py']\n"
+                         "    assert pytest.main(inner) == 0\n"}, {})
     assert reused() == [True]
     (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
     assert reused() == [False]

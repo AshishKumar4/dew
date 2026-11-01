@@ -1660,9 +1660,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # run as a tool was made (followed.py's `tool`).
     environ = {followed.STARTED_AT: str(time.time()), **environ}
     for index, name in enumerate(tests):
+        # The checkout as a run that may keep its key finds it, as its inputs must stand after (`moved`), read
+        # only where time is left, and the file given what the reading left (review).
+        fresh = container.fresh and not container.executed and deadline > time.monotonic() - began
+        before = standing() if fresh else None
         left = deadline - (time.monotonic() - began)
-        # The checkout as a run that may keep its key finds it, as its inputs must stand after (`moved`).
-        before = standing() if container.fresh and not container.executed else None
         alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
                        coverage, network, whole, release, site) if left > 0 else None
         container.executed = container.executed or alone_ is not None
@@ -2501,7 +2503,9 @@ def main() -> int:
         operations.add_parser("release", help="one requirement's release checks; exit 1 on a red row"))
     recording = operations.add_parser("durations")
     recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
-    args = parser.parse_args()
+    # armada's word that this task's container is fresh, taken as the arguments are, before any operation
+    # starts a process, so none inherits it (review: a GPU lane's pytest passed it on to a task it started).
+    args, fresh = parser.parse_args(), os.environ.pop("ARMADA_FRESH", "0") == "1"
     if args.operation == "pythons":
         return pythons(check=args.check)
     if args.operation == "gangs":
@@ -2563,10 +2567,8 @@ def main() -> int:
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
-    # armada's word that this task's container is fresh, taken so no process the task starts inherits it.
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, whole=args.whole == "1",
-                fresh=os.environ.pop("ARMADA_FRESH", "0") == "1")
+                coverage=args.coverage, whole=args.whole == "1", fresh=fresh)
 
 
 def pinned(argv: list[str]) -> None:
