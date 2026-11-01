@@ -24,6 +24,7 @@ from dew.interop import mamba2
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     PREDICTION_INPUTS,
+    PREDICTION_STEP_END,
     DecoderFamily,
     Packed,
     prediction_path,
@@ -218,7 +219,6 @@ def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:
 # block's final norm (vLLM nemotron_h_mtp.py, has_start_projections and
 # has_end_norm).
 _STEP_START = PREDICTION_INPUTS
-_STEP_END: Mapping[str, tuple[str, ...]] = {"final_layernorm.weight": ("final_norm", "scale")}
 # Each block of a step by its place in it: its pre-norm and the `MTPBlock`
 # block's slot its mixer fills.
 _STEP_SLOTS = (("input_layernorm", "self_attn"), ("post_attention_layernorm", "mlp"))
@@ -247,7 +247,7 @@ def _prediction_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
         return (path[0], path[1], slot, *path[3:])
 
     leaves = {**(_STEP_START if index % blocks == 0 else {}),
-              **(_STEP_END if index % blocks == blocks - 1 else {})}
+              **(PREDICTION_STEP_END if index % blocks == blocks - 1 else {})}
     return prediction_path(name, "mtp", step_depth(name, config), _records.integer(
         config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"), ".".join(parts[3:]),
         leaves, block)
@@ -289,7 +289,7 @@ def _prediction_name(parts: list[str], config: Mapping[str, object]) -> str:
     blocks = _step_blocks(config)
     first = int(parts[0].removeprefix("mtp_")) * blocks
     own = tuple(parts[1:])
-    for position, leaves in ((0, _STEP_START), (blocks - 1, _STEP_END)):
+    for position, leaves in ((0, _STEP_START), (blocks - 1, PREDICTION_STEP_END)):
         named = {path: name for name, path in leaves.items()}
         if own in named:
             return f"mtp.layers.{first + position}.{named[own]}"
