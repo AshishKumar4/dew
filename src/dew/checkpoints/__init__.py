@@ -90,7 +90,7 @@ from dew.cleanup import attempted
 from dew.files import write_atomically
 from dew.mesh import LogicalAxes, mesh_axes
 from dew.nn import sharding
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program, program
 from dew.nn.precision import at_least_fp32
 from dew.telemetry.profile import region
 
@@ -976,7 +976,7 @@ def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
 
         summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
                                 in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
-        summed = program(summing)(jax.device_put(values, held.with_memory_kind("device")), masks[split])
+        summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")), masks[split])
         value = (summed != 0 if values.dtype == np.bool_
                  else jax.lax.bitcast_convert_type(summed, values.dtype))
         value = jax.device_put(value, held)

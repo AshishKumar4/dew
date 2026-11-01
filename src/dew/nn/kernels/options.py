@@ -301,7 +301,8 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     options and arguments, which every call with the same reuses, so a quantized model and another never
     share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's, a
     load's or a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
-    `step`), but an objective's (`Objective.program`), which its cache keeps as long as the objective."""
+    `step`), but an objective's (`Objective.program`), which its cache keeps as long as the objective, and
+    a closure's or a bound method's a run makes, which its caller holds (`owned_program`)."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
@@ -309,6 +310,17 @@ def program[**P, R](function: Callable[P, R], *models: Held,
         donate_argnames=arguments.get("donate_argnames"),
         in_shardings=_Placed.of(arguments["in_shardings"]) if "in_shardings" in arguments else None,
         out_shardings=_Placed.of(arguments["out_shardings"]) if "out_shardings" in arguments else None)
+
+
+def owned_program[**P, R](function: Callable[P, R], *models: Held,
+                          step: Mapping[str, Option] | None = None,
+                          **arguments: Unpack[JitArguments]) -> OuterProgram:
+    """`function` compiled as `program` compiles it, through Dew's compile point, but kept by no cache of
+    Dew's: its caller holds it, and it goes with its caller's last reference. A closure or a bound method
+    a run makes (its placement's, its host phases') takes this one, as `program`'s process-wide cache
+    would keep it and the run it closes over (a trainer, its objective and their arrays) for good."""
+    return OuterProgram(function, compiler_options={**compiler_options(*models), **(step or {})},
+                        **arguments)
 
 
 _Structure = tuple[jax.tree_util.PyTreeDef]

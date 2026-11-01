@@ -31,7 +31,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.batch import Batch
 from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program
 from dew.optim import learning_rate
 from dew.state import REPLICA_FIELDS, Replicas, TrainState
 from dew.training.transaction import cleared, example_groups, window_dropped
@@ -178,11 +178,11 @@ def dropped(state: TrainState, size: int) -> TrainState:
     state's resident weights stay where they are."""
     if state.inner is None:
         fields = (state.microstep, state.accumulation)
-        microstep, window = program(functools.partial(window_dropped, size=size),
+        microstep, window = owned_program(functools.partial(window_dropped, size=size),
                                     out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
         return dataclasses.replace(state, microstep=microstep, accumulation=window)
     fields = (state.microstep, state.inner.microstep, state.inner.accumulation)
-    first, microstep, window = program(functools.partial(_groups_dropped, size=size),
+    first, microstep, window = owned_program(functools.partial(_groups_dropped, size=size),
                                        out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
     return dataclasses.replace(state, microstep=first, inner=dataclasses.replace(
         state.inner, microstep=microstep, accumulation=window))
@@ -251,8 +251,10 @@ def windowed(initialize: Callable, state: TrainState, batch,
     if place is None:
         return state.with_window(shapes)
     placement = place(state.with_window(shapes)).window
-    window = program(lambda: jax.vmap(cleared)(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype),
-                                                             shapes)), out_shardings=placement)()
+    # The zeros are made inside the program, so they are placed as `placement` places them, never whole.
+    def made():
+        return jax.vmap(cleared)(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), shapes))
+    window = owned_program(made, out_shardings=placement)()
     return state.with_window(window)
 
 

@@ -1872,29 +1872,24 @@ def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
 
 
 def test_a_scope_named_apart_compiles_as_many_bare_programs_as_it_names(tmp_path):
-    """SLOP025 in Dew itself: a scope `COMPILED_APART` names compiles as many bare programs as it names
-    and no finding is made of them, one more is reported, and a named scope that holds fewer is reported,
-    so the list never outlives its code."""
-    lint = load("lint_slop")
-    files = {"src/dew/nn/kernels/options.py": ("import jax\n"
-                                               "class OuterProgram:\n"
-                                               "    def _jitted(self, f):\n"
-                                               "        return jax.jit(f)\n"),
-             "src/dew/training/interval.py": ("import jax\n"
-                                              "def bookkeep(f):\n"
-                                              "    return jax.jit(f), jax.jit(f)\n"
-                                              "def _added_tokens(f):\n"
-                                              "    return jax.jit(f)\n"
-                                              "def held(f):\n"
-                                              "    return jax.jit(f)\n"),
-             "src/dew/nn/flops.py": "def traced_flops(f):\n    return f\n"}
-    for relative, text in files.items():
-        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / relative).write_text(text)
-    modules = list(lint.collect(["src/dew"], tmp_path, "dew"))
-    found = sorted((finding.path, finding.line, finding.code) for module in modules
-                   for finding in lint.check(module) if finding.code == "SLOP025")
-    assert found == [("src/dew/nn/flops.py", 1, "SLOP025"), ("src/dew/training/interval.py", 3, "SLOP025")]
+    """SLOP025: a scope `COMPILED_APART` names compiles as many bare programs as it names and no finding is
+    made of them, one more is reported, and a named scope that holds fewer is reported, so the list never
+    outlives its code."""
+    files = {"src/sparx/nn/kernels/options.py": ("import jax\n"
+                                                 "class OuterProgram:\n"
+                                                 "    def _jitted(self, f):\n"
+                                                 "        return jax.jit(f)\n"),
+             "src/sparx/training/interval.py": ("import jax\n"
+                                                "def bookkeep(f):\n"
+                                                "    return jax.jit(f), jax.jit(f)\n"
+                                                "def _added_tokens(f):\n"
+                                                "    return jax.jit(f)\n"
+                                                "def held(f):\n"
+                                                "    return jax.jit(f)\n"),
+             "src/sparx/nn/flops.py": "def traced_flops(f):\n    return f\n"}
+    found = [finding for finding in _linted(tmp_path, files) if finding[2] == "SLOP025"]
+    assert found == [("src/sparx/nn/flops.py", 1, "SLOP025"),
+                     ("src/sparx/training/interval.py", 3, "SLOP025")]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):

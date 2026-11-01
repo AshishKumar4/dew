@@ -1976,13 +1976,12 @@ def compile_points(module: Module) -> Iterator[Finding]:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP025",
                           f"compiles by a bare {compiler}; compile through `dew.nn.kernels.options.program`, "
                           "Dew's one compile point, or name the scope in COMPILED_APART with why")
-    if module.package == "dew":
-        for key, (count, _) in COMPILED_APART.items():
-            scope_path, scope = key.split("::")
-            if scope_path == path and len(found.get(key, [])) < count:
-                yield Finding(module.relative, 1, 1, "SLOP025",
-                              f"COMPILED_APART names {count} bare compile(s) in {scope}, which holds "
-                              f"{len(found.get(key, []))}; drop or correct its entry")
+    for key, (count, _) in COMPILED_APART.items():
+        scope_path, scope = key.split("::")
+        if scope_path == path and len(found.get(key, [])) < count:
+            yield Finding(module.relative, 1, 1, "SLOP025",
+                          f"COMPILED_APART names {count} bare compile(s) in {scope}, which holds "
+                          f"{len(found.get(key, []))}; drop or correct its entry")
 
 
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",

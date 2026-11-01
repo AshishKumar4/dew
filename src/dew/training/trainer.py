@@ -78,7 +78,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, Logi
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -867,7 +867,7 @@ class Trainer(Generic[Loss, Effects]):
         if not shape_only:
             placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
             # Allocate on the final shards, without a replicated window-sized temporary.
-            pending = program(allocate, out_shardings=placement)()
+            pending = owned_program(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
 
     @functools.cached_property
@@ -1022,8 +1022,9 @@ class Trainer(Generic[Loss, Effects]):
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
                 elif current.compute is None:
-                    narrowing = program(lambda variables: narrowed(variables, candidate.copies),
-                                        *self.objective.towers(), out_shardings=candidate.shardings.compute)
+                    narrowing = owned_program(lambda variables: narrowed(variables, candidate.copies),
+                                              *self.objective.towers(),
+                                              out_shardings=candidate.shardings.compute)
                     current = dataclasses.replace(current, compute=narrowing(current.variables))
                 held, staged = current.window, self._ramp or self._stage_starts
                 if window > 1 and self.step is None and (held is None or (staged and not held.replays(

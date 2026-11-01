@@ -13,7 +13,7 @@ from jax.typing import ArrayLike
 
 from dew.artifacts import Artifact, ImageGrid, VideoGrid
 from dew.batch import Batch
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program
 from dew.objectives.base import Shown, mean_of_totals, merge_totals
 
 
@@ -95,7 +95,7 @@ def _jitted_total(charge: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
     def total(metric: Hashable, held: jax.Array, *arrays: jax.Array) -> jax.Array:
         return jnp.sum(jnp.where(held, charge(metric, *arrays), 0.0))
 
-    return program(total, static_argnums=0)
+    return owned_program(total, static_argnums=0)
 
 
 def frames(artifact: ImageGrid | VideoGrid) -> jax.Array:

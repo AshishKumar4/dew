@@ -48,7 +48,7 @@ from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
@@ -523,9 +523,9 @@ class CLIPModel:
         self.module = module
         self.variables = variables
         self.config = config
-        self._image_features = program(
+        self._image_features = owned_program(
             functools.partial(module.apply, method=CLIP.get_image_features))
-        self._text_features = program(
+        self._text_features = owned_program(
             functools.partial(module.apply, method=CLIP.get_text_features))
 
     @classmethod

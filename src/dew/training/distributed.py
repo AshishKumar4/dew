@@ -27,7 +27,7 @@ from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology
 from dew.files import write_atomically
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
-from dew.nn.kernels.options import Placements, program
+from dew.nn.kernels.options import Placements, owned_program
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Initializer
 from dew.state import TrainState, apart, together
@@ -101,7 +101,7 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     sharding = NamedSharding(mesh, P(axis))
     source = jax.make_array_from_callback(
         (count,), sharding, lambda index: np.zeros(sharding.shard_shape((count,)), np.float32))
-    gather = program(jax.shard_map(
+    gather = owned_program(jax.shard_map(
         lambda shard: jax.lax.all_gather(shard, axis, tiled=True), mesh=mesh,
         in_specs=P(axis), out_specs=P(), axis_names={axis}, check_vma=False))
     seconds = samples(gather, source, warmup=2, repeats=5)
@@ -343,7 +343,7 @@ def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], tak
         return function(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
                                      is_leaf=lambda leaf: leaf is None), key)
 
-    return functools.partial(program(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
+    return functools.partial(owned_program(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
 
 
 def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,

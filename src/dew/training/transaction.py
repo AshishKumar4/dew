@@ -43,7 +43,7 @@ from dew.nn.inspection import (
     probes_of,
     unscaled,
 )
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
@@ -902,7 +902,7 @@ class Transaction:
         # Each host phase is a program over the objective's modules, compiled through Dew's compile point
         # with their options as the step's own compile takes them (`program`).
         towers = self.objective.towers()
-        compile_phase = (lambda phase: program(phase, *towers)) if host else (lambda phase: phase)
+        compile_phase = (lambda phase: owned_program(phase, *towers)) if host else (lambda phase: phase)
         reduce = compile_phase(self.local_reduction)
         prepare = compile_phase(self.prepare_attempt)
         pooled = compile_phase(self.pooled_cotangent)
