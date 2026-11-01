@@ -1213,11 +1213,7 @@ class Trainer(Generic[Loss, Effects]):
                                      batch_consumed(micro))
             return (apart(stepped)[0], *rest)
 
-        # The algebra pass rewrites the step where it is jitted, its backward included (§6.7 of
-        # docs/design/algebra.md), so the planner prices, lowers and compiles one program.
-        from dew import algebra
-
-        return jax.jit(algebra.rewritten(step), in_shardings=(moving, frozen, placement, replicated),
+        return jax.jit(step, in_shardings=(moving, frozen, placement, replicated),
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
 

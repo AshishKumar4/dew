@@ -253,19 +253,6 @@ a context JAX keys its trace and compile caches on, so a program lowered
 after picks change traces again. Made at `import dew`, as JAX makes a user
 context only beside no other JAX call."""
 
-@dataclasses.dataclass(frozen=True)
-class Passes:
-    """Whether the algebra pass rewrites the programs Dew compiles (`dew.algebra.passes`), and the GPU whose
-    facts it prices them for (a `GpuTarget` name; None for the process's own)."""
-
-    on: bool = True
-    target: str | None = None
-
-
-ALGEBRA = jax.make_user_context(default_value=Passes())
-"""The algebra pass's switch (`Passes`), keyed on as `KERNEL_TUNES` is: a program a switch traced is never run
-under another, and the accuracy gate opens it per arm (docs/design/algebra.md §6.7)."""
-
 KERNEL_LAUNCHES = jax.make_user_context(default_value=False)
 """Whether a traced kernel launch carries tokamax's description of itself
 (`dew.nn.kernels.tuning.launches`), keyed on as `KERNEL_TUNES` is. Only a

@@ -813,21 +813,6 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
-PROTECTED = "dew_protected"
-"""The name scope an error-free transform's equations carry, which survives autodiff in each traced equation's
-name stack: `dew.algebra` never rewrites them, as reassociation would cancel the residual they keep."""
-
-
-def _protected(transform: Callable) -> Callable:
-    """`transform` traced under `PROTECTED`'s name scope."""
-    @functools.wraps(transform)
-    def traced(*args, **kwargs):
-        with jax.named_scope(PROTECTED):
-            return transform(*args, **kwargs)
-    return traced
-
-
-@_protected
 def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
     total = left + right
@@ -835,7 +820,6 @@ def two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
-@_protected
 def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
                 rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
@@ -988,7 +972,6 @@ def divided(numerator, rate):
     return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 
-@_protected
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
@@ -1003,7 +986,6 @@ def compensated_add(left, right):
     return two_sum(total, dropped + left_lo + right_lo)
 
 
-@_protected
 def compensated_difference(later, earlier):
     """`later - earlier` of two double-float values, rounded once: the halves'
     differences summed, so the difference of two near values (a range of a
