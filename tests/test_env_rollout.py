@@ -305,6 +305,20 @@ def test_a_simulator_answering_arrays_laid_out_over_a_mesh_rolls_out_as_one_answ
         np.testing.assert_array_equal(getattr(sharded.following, name), getattr(plain.following, name))
 
 
+def test_a_simulators_policy_step_compiles_through_dews_compile_point():
+    """A simulator's rollout compiles its policy's step as an `OuterProgram`, whose every compile passes
+    where every program Dew compiles does (`report.compiled`, ledger 3314: its communicators admitted
+    against the pool's room, as the other rollouts' are), and runs its rollout through it."""
+    from dew.nn.kernels.options import OuterProgram
+    from dew.rl import simulator as simulated
+
+    assert isinstance(simulated._acted, OuterProgram)
+    simulator = HostWalks(5, 3)
+    _, record = simulated.simulator_rollout(simulator, heads_home, None,
+                                            simulated.simulator_start(simulator, jax.random.key(4)), 2)
+    np.testing.assert_array_equal(record.action[1], -0.5 * np.sign(record.observation[1]))
+
+
 def heads_home(params, observation, key, memory):
     """A policy pushing each point a step toward the origin, its key unread."""
     return -0.5 * jnp.sign(observation), {"seen": observation}, None
