@@ -99,14 +99,14 @@ def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, **fields)
                  for arm in arms)
 
 
-def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, seeds: int, *, stream: int,
-                           config: dict | None = None, **fields) -> None:
+def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, **fields) -> None:
     """Check 1 of `dew(ids)`, Dory's logits over drawn ids of the fixture's shape, against the
-    transcription's forward (`transcribed`) over `loaded`'s weights, its float64 run the truth."""
-    config = loaded.config if config is None else config
-    reference, truth = transcribed(config, tensors_of(loaded), lambda arm, ids: arm.forward(ids), **fields)
-    assert_as_exact(dew, reference, token_draw(stream, config['vocab_size'], REFERENCE['input_ids'].shape),
-                    label, seeds=seeds, truth_fn=truth)
+    transcription's forward (`transcribed`) over `loaded`'s weights, its float64 run the truth, over
+    `LOGITS_SEEDS`."""
+    reference, truth = transcribed(loaded.config, tensors_of(loaded), lambda arm, ids: arm.forward(ids),
+                                   **fields)
+    draw = token_draw(stream, loaded.config['vocab_size'], REFERENCE['input_ids'].shape)
+    assert_as_exact(dew, reference, draw, label, seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize('loops', [1, 2, 4])
@@ -165,9 +165,9 @@ def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop
         table = model.apply(loaded.variables, method='output_table')
         return table.logits(model.apply(loaded.variables, ids, method='hidden_states'))
 
-    assert_logits_as_vllms(logits, loaded, f'Dory logits at {loops} loops', LOGITS_SEEDS,
+    assert_logits_as_vllms(logits, loaded, f'Dory logits at {loops} loops',
                            stream=0xD01, loops=loops)
-    assert_logits_as_vllms(tabled, loaded, f"Dory's output table at {loops} loops", LOGITS_SEEDS,
+    assert_logits_as_vllms(tabled, loaded, f"Dory's output table at {loops} loops",
                            stream=0xD02, loops=loops)
 
 
@@ -230,7 +230,7 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
 
     def draw(seed):
         rng = np.random.default_rng([0xD04, seed])
-        return tuple(rng.integers(12, vocabulary, length, dtype=np.int32) for length in (6, 8))
+        return tuple(rng.integers(0, vocabulary, length, dtype=np.int32) for length in (6, 8))
 
     def decoded_by(arm, prompt, tokens):
         return arm.forced(prompt, tokens, prompt_rows=False)
@@ -462,7 +462,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
 
     def draw(seed):
         rng = np.random.default_rng(5 + seed)
-        ids = rng.integers(12, loaded.config['vocab_size'], REFERENCE['input_ids'].shape, dtype=np.int32)
+        ids = rng.integers(0, loaded.config['vocab_size'], REFERENCE['input_ids'].shape, dtype=np.int32)
         cotangent = rng.normal(size=REFERENCE['cotangent'].shape).astype(np.float32)
         order = rng.permutation(len(ids))
         return ids[order], cotangent[order]
@@ -672,8 +672,7 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
     vocabulary = adapted.model.vocab_size
 
-    def draw(seed):
-        return (np.random.default_rng([0xD0E, seed]).integers(0, vocabulary, ids.shape, dtype=np.int32),)
+    draw = token_draw(0xD0E, vocabulary, ids.shape)
 
     # The adapter as PEFT merges it, its consumer: the transcription over PEFT's merge computes the
     # adapted model's logits on par with its own fp32 run from its float64 one (check 1).
@@ -722,7 +721,7 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
         table = loaded.model.apply(loaded.variables, method='output_table')
         return loaded.model.apply(loaded.variables, ids, method='hidden_states') @ table.rows().T
 
-    assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", LOGITS_SEEDS, stream=0xD05)
+    assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", stream=0xD05)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
@@ -798,7 +797,7 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     def logits(ids):
         return loaded.model.apply(loaded.variables, ids)
 
-    assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', LOGITS_SEEDS, stream=0xD06)
+    assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', stream=0xD06)
 
 
 def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
