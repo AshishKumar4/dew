@@ -4,6 +4,7 @@ refused and the program lowered afresh, the launch's derivation taking its next 
 run keeps, its plan, its step compiled ahead and the executable it runs, is the program it lowered
 then. A program with no template launch compiles as jit compiles it."""
 
+import dataclasses
 import os
 import time
 
@@ -295,6 +296,36 @@ def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     with ThreadPoolExecutor(2) as pool:
         outputs = list(pool.map(run, (jnp.ones(2), jnp.ones(3))))
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass
+class Slots:
+    """A state of two arrays, as a server's resident slots are, placed by a tree of its own shape."""
+
+    rows: jax.Array
+    columns: jax.Array
+
+
+def test_a_program_donates_its_state_and_places_it_by_a_tree_of_formats():
+    """A program a server steps its state with (`program`, row 3327) donates the state it is handed
+    (`donate_argnums`), its executable aliasing the state's buffers to its results, and places its arguments
+    and results by a tree of formats of the state's own structure, each array in the layout its format
+    names."""
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    formats = Slots(Format(Layout((0, 1)), sharding), Format(Layout((1, 0)), sharding))
+
+    def stepped(slots: Slots, scale):
+        return Slots(slots.rows + scale, slots.columns * scale)
+
+    run = program(stepped, donate_argnums=0, in_shardings=(formats, None), out_shardings=formats)
+    slots = Slots(jax.device_put(jnp.ones((2, 3)), formats.rows),
+                  jax.device_put(jnp.ones((2, 3)), formats.columns))
+    assert "input_output_alias" in run.executable(slots, 2.0).as_text()
+    stepped_slots = run(slots, 2.0)
+    assert [leaf.format.layout.major_to_minor for leaf in (stepped_slots.rows, stepped_slots.columns)] == [
+        (0, 1), (1, 0)]
+    np.testing.assert_array_equal(np.asarray(stepped_slots.rows), np.full((2, 3), 3.0))
 
 
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
