@@ -220,9 +220,9 @@ class TokenFiles(Dataset):
         """Tokens and metadata, by the export's committed manifest and the files it names, each by its
         content and place in the manifest, not the name its writer gave it (`export_content`), so two
         exports of the same documents agree: the documents are the producer's records, which its length
-        index states. The keys an export's fingerprint has always had (`_SPLIT`), and, where a Dew before
-        row 3028 read other documents of it (`_read_alike`), how its documents are read, so a plan that
-        Dew saved, which counted those, is not this store's."""
+        index states, as `documents` says, which no Dew before row 3028 did: a plan it saved names the
+        store otherwise, and resumes where it read the same documents (`read_alike`,
+        `dew.data.plan.earlier_plan`). The keys an export's fingerprint has always had (`_SPLIT`)."""
         store, _ = Store(self.url, self.storage_options).resolve()
         # A local store is named by its content, so hosts that mounted it at different paths agree.
         place = {} if local(store) else {"url": self.url}
@@ -238,16 +238,20 @@ class TokenFiles(Dataset):
             "index": None,
             "shard_rows": None,
             "producer": export_content(self.committed),
-            **({} if self._read_alike else {"documents": "records"}),
+            "documents": "records",
         }
 
-    @cached_property
-    def _read_alike(self) -> bool:
+    def read_alike(self) -> bool:
         """Whether a Dew before row 3028, which read a token store's documents by its EOS, read this store's
         as its producer's records: stating no EOS, one record holding every token; stating one, each record
         ended by that EOS and holding no other (`_earlier_ends`), a scan of every token of the field read,
         kept in Dew's cache under the export's content (`export_content`), which no write changes, and that
-        field. Carried to 1.0 (ledger 1552)."""
+        field. Read only to resume a plan that Dew saved (`dew.data.plan.earlier_plan`). Carried to 1.0
+        (ledger 1552)."""
+        return self._read_alike
+
+    @cached_property
+    def _read_alike(self) -> bool:
         tokens, ends = self.tokens, self.document_ends()
         if tokens.eos_id is None:
             return np.array_equal(ends, [len(tokens)] if len(tokens) else [])
