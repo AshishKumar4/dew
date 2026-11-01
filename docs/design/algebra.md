@@ -106,7 +106,8 @@ inferred. A bare custom derivative in `src/dew` fails a slop check, not a defaul
   - its shape and dtype;
   - the axes it is constant along;
   - whether each axis is local or sharded (a sum over a sharded axis is a collective);
-  - its range where cheap, and the rounding class and error estimate of the forms that produce it.
+  - its range where cheap, and the rounding class of the forms that produce it (error is measured per candidate,
+    never held as a fact; §1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
   - **linear algebra** (compile time and dev time): linearity of sums, scalars hoisted out of reductions along
     constant axes, distributivity, `dot_general` ⇄ multiply and sum, inner products moved across linear maps
@@ -286,7 +287,7 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
 | `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets: `linear`, `identities`, `reuse`, `decoupled`, `stable`, `linear_scan`, `error_free` |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
-| `dew.algebra.error` | Error estimates: sampled on the gate's families (dev time), static from rounding classes (compile time) |
+| `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
 | `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`kernel_derivative`, `numerics_derivative`, `numerics_tangent`, `surrogate`, row 3271) |
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
 | `dew.algebra.derive` | Template declarations and their derived forms |
