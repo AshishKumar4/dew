@@ -295,24 +295,29 @@ _SPLIT = {
     "overlap": (lambda chain: chain.pack(8, fields=("id",), policy="concat", overlap=2)
                 .shuffle(seed=2, window=3), "streamed"),
     "windows": (lambda chain: chain.windows(4, fields=("id",)).shuffle(seed=3, window=5), "streamed"),
-    "held": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4), "memory"),
+    "strided": (lambda chain: chain.windows(4, stride=2, fields=("id",)).shuffle(seed=8, window=5),
+                "streamed"),
     "twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=1, window=4)
               .shuffle(seed=5, window=3), "streamed"),
+    "held": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4), "memory"),
+    "held windows": (lambda chain: chain.windows(4, stride=2, fields=("id",)).shuffle(seed=7), "memory"),
     "held twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4)
-                   .shuffle(seed=6), "memory"),
+                   .shuffle(seed=6, window=5), "memory"),
 }
 """Layouts that cut documents across windows, each with a shuffle after it, or two: read as a stream, its
-window shuffled, or held by a memory read, which shuffles them all."""
+window shuffled, or by a memory read, which shuffles them all; windows `stride` apart overlap."""
 
 
 def _drawn(loader, share, shares):
-    """Each batch's tokens and the examples it consumes, as share `share` of `shares` reads them."""
+    """Each batch's tokens, each as often as the batch holds it, and the examples it consumes, as share
+    `share` of `shares` reads them."""
     stream = loader.train(DataPartition(index=share, count=shares))
     read = []
     try:
         for batch in stream:
             real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
-            tokens = {int(token) for token in np.asarray(batch["id"])[real].ravel() if token}
+            held = np.asarray(batch["id"])[real].ravel()
+            tokens = collections.Counter(int(token) for token in held if token)
             read.append((tokens, int(np.sum(batch[EXAMPLES_CONSUMED]))))
     finally:
         if isinstance(stream, Closeable):
@@ -326,40 +331,42 @@ def _drawn(loader, share, shares):
 def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_window_is_drawn(layout, shares,
                                                                                             expands):
     """Twelve documents of unique tokens, a run bounded to all twelve, laid across windows that cut them (a
-    concatenating pack, one that starts each cut 2 tokens back, or windows over the stream) and shuffled
-    after, read as a stream or held by a memory read, by one share or two, alone or through an objective
-    that makes two rows of each window: no step's batches take a document's count before the shares have
-    drawn every token of it by that step, and the read takes every count it draws whole, none twice. A read
-    whose shares each read their own order holds each document's windows in one of them (row 1902)."""
+    concatenating pack, one that starts each cut 2 tokens back, or windows over the stream, overlapping
+    where they stand 2 tokens apart) and shuffled after, once or twice, read as a stream or by a memory
+    read, by one share or two, alone or through an objective that makes two rows of each window: no step's
+    batches take a document's count before the shares have drawn every window that holds a token of it,
+    each token as often as the whole read draws it, and the read takes every count it draws whole, none
+    twice. Each share lays its own documents, so each document's windows are one share's, and two shares
+    each lay some (row 1902)."""
     laid, read = _SPLIT[layout]
     chain = laid(Pipeline(Memory(_pieces(), shard_rows=3))).read(read).batch(2 * shares)
     objective = ObjectiveData(train=(Twice(),)) if expands else None
     loader = compile(chain, read=read, examples=len(_LENGTHS), objective=objective)
     drawn = [_drawn(loader, share, shares) for share in range(shares)]
-    seen, consumed, whole = set(), 0, 0
-    for step in itertools.zip_longest(*drawn, fillvalue=(set(), 0)):
+    total = sum((tokens for batches in drawn for tokens, _ in batches), collections.Counter())
+    seen, consumed, whole = collections.Counter(), 0, 0
+    for step in itertools.zip_longest(*drawn, fillvalue=(collections.Counter(), 0)):
         for tokens, examples in step:
-            seen |= tokens
+            seen += tokens
             consumed += examples
-        whole = sum(all(1000 * (index + 1) + token in seen for token in range(length))
+        whole = sum(all(seen[token] and seen[token] == total[token]
+                        for token in range(1000 * (index + 1), 1000 * (index + 1) + length))
                     for index, length in enumerate(_LENGTHS))
         assert consumed <= whole
     assert consumed == whole
-    if layout != "windows":
+    if not layout.endswith(("windows", "strided")):
         # Every token of a pack's documents is laid in a window; windows leave the stream's last tokens
         # past every window out.
         assert consumed == len(_LENGTHS)
-    if read == "memory":
-        # Held windows read in one order deal each batch's rows to the shares; through an objective's rows
-        # each share reads its own order, its windows whole examples (`whole_examples`).
-        assert (loader.order_records is None) == expands
-    if loader.order_records is None:
-        owners = collections.defaultdict(set)
-        for share, batches in enumerate(drawn):
-            for tokens, _ in batches:
-                for token in tokens:
-                    owners[token // 1000].add(share)
-        assert all(len(held) == 1 for held in owners.values())
+    assert loader.order_records is None
+    owners = collections.defaultdict(set)
+    for share, batches in enumerate(drawn):
+        for tokens, _ in batches:
+            for token in tokens:
+                owners[token // 1000].add(share)
+    assert all(len(held) == 1 for held in owners.values())
+    if shares > 1:
+        assert all(sum(held == {share} for held in owners.values()) >= 3 for share in range(shares))
 
 
 @pytest.mark.parametrize("layout", ["concat", "held"])

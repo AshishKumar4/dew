@@ -935,8 +935,9 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     does (`_bounded`), its bound standing among the steps the read runs over its whole source (`_EAGER`):
     "expansion" where the read would make rows of its source examples as it holds them, the bound then
     ahead of that step, its count set once the read holds the rest (`_UNCOUNTED`, `_rebound`); "layout"
-    where it would pack them as it holds them and reads the windows per share after (an objective's rows),
-    the bound held with the pack, its passes counted as the read holds the documents (`Limit.passes`).
+    where it would pack or window them as it holds them and reads the windows per share after (an
+    objective's rows), the bound held before the layout, its passes counted as the read holds the documents
+    (`Limit.passes`).
     None for any other read, whose pass is counted once it is prepared (`_staged`)."""
     if read != "memory" or isinstance(train.source, (Mixture, Phases)):
         return None
@@ -954,7 +955,8 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     if _expands(train.stages[at]):
         return "expansion"
     after = dataclasses.replace(train, stages=train.stages[eager:])
-    return "layout" if isinstance(train.stages[at], Pack) and _analyzed(after, read).per_share else None
+    laid = isinstance(train.stages[at], (Pack, Windows))
+    return "layout" if laid and _analyzed(after, read).per_share else None
 
 
 def _held_once_bound(stage: Stage) -> bool:

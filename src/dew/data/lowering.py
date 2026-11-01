@@ -55,7 +55,7 @@ from dew.data.analysis import (
     ends,
 )
 from dew.data.cache import _Mapped
-from dew.data.completion import Completed, Numbered, Released, cuts, whole_examples
+from dew.data.completion import Completed, Numbered, cuts, reach, released
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import (
     SHARED_BYTES,
@@ -458,19 +458,22 @@ def _completes(pipeline: Pipeline, at: int) -> bool:
     return _consumes(pipeline) and cuts(laid)
 
 
-def _reshuffled(pipeline: Pipeline, at: int) -> bool:
-    """Whether a shuffle before the one at `at` in `pipeline` already drew the windows a layout cut its
-    examples across (`_completes`), so they reach it out of their layout's order (`Numbered.prefix`)."""
-    return any(isinstance(stage, Shuffle) and _completes(pipeline, index)
-               for index, stage in enumerate(pipeline.stages[:at]))
-
-
-def _held_whole(pipeline: Pipeline) -> bool:
-    """Whether a memory read holds the windows a layout laid its counted examples across, and a shuffle
-    draws them after (`_completes`): its shares then take whole examples (`whole_examples`), so each
-    example's windows are one share's to release its count after."""
-    shuffled = next((at for at, stage in enumerate(pipeline.stages) if isinstance(stage, Shuffle)), None)
-    return shuffled is not None and _completes(pipeline, shuffled) and not cuts(pipeline.stages[:shuffled])
+def _reach(pipeline: Pipeline, at: int) -> int | None:
+    """How far back from a count a shuffle at `at` in `pipeline` finds its example's first window
+    (`completion.reach`): from the last layout that cut its examples across windows, where the shuffle draws
+    them in that layout's order; None where a shuffle before it drew them, or a step after the layout may
+    make several rows of a window, so a count waits for every window before its own."""
+    stages = pipeline.stages[:at]
+    laid = max((index for index, stage in enumerate(stages) if cuts((stage,))), default=None)
+    if laid is None:
+        return None
+    layout = stages[laid]
+    after = stages[laid + 1:]
+    if any(isinstance(stage, Shuffle) for stage in after) or not isinstance(layout, (Pack, Windows)):
+        return None
+    reaching = reach(layout)
+    expands = any(isinstance(stage, (FlatMap, MapBatch, Native)) for stage in after)
+    return None if reaching and expands else reaching
 
 
 def _bound(pipeline: Pipeline, at: int) -> int:
@@ -1747,8 +1750,7 @@ class _Build:
         cache under them still keys each row by its place in the source."""
         if self.global_order or not self.training:
             return rows
-        rows = (whole_examples(rows, partition.first(), partition.count) if _held_whole(pipeline)
-                else rows[partition.cut()])
+        rows = rows[partition.cut()]
         if not self.lowering.repeated:
             rows = _repeated(rows, None, _name(pipeline), self.loading)
         return rows
@@ -1893,13 +1895,12 @@ class _Build:
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
         if isinstance(stage, Shuffle) and _completes(pipeline, at):
             # Each example's count waits for every window holding a piece of it (`dew.data.completion`).
-            prefix = _reshuffled(pipeline, at)
-            if isinstance(rows, pygrain.MapDataset):
-                return Released(rows, _reordered(stage, pygrain.MapDataset.range(len(rows))), prefix=prefix)
+            units = Numbered(_as_iter(rows, self.loading), reach=_reach(pipeline, at))
+            if self.read == "memory":
+                return released(units, stage.window, stage.seed)
             if stage.window is not None:
-                numbered = Numbered(_as_iter(rows, self.loading), prefix=prefix)
-                return Completed(gx.WindowShuffleIterDataset(numbered, window_size=stage.window,
-                                                             seed=stage.seed))
+                drawn = gx.WindowShuffleIterDataset(units, window_size=stage.window, seed=stage.seed)
+                return Completed(drawn)
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:

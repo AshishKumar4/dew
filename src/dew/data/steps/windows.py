@@ -116,15 +116,25 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         self._credited = 0
 
     def __next__(self) -> Batch:
+        stride = self._windows.stride or self._windows.seq_len
+        # Windows that overlap credit each token to the last of them that holds it, so a counted read
+        # reads on until it knows whether another window follows this one.
+        overlapping = CONSUMED in self._held and stride < self._windows.seq_len + 1
+        ahead = 2 if overlapping else 1
         while True:
             windows = IndexedWindows(
                 {name: value[self._skip :] for name, value in self._held.items()},
                 self._windows.seq_len,
-                self._windows.stride or self._windows.seq_len,
+                stride,
             )
-            if len(windows):
+            if len(windows) >= ahead:
                 break
-            row = aligned(next(self._read), self._windows.fields)
+            try:
+                row = aligned(next(self._read), self._windows.fields)
+            except StopIteration:
+                if not len(windows):
+                    raise
+                break
             self._held = {
                 name: np.concatenate([self._held[name], row[name]])
                 for name in self._windows.fields
@@ -133,11 +143,14 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         # The window holds its view's first `length + 1` tokens, its inputs and their targets.
         end, kept = self._skip + windows.length + 1, self._skip + windows.stride
         if CONSUMED in self._held:
-            # Each token's counts go to the first window that holds it, the tokens a stride skips going
-            # to the window after them; a token past every window the stream makes is consumed by none.
-            emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : end]))
+            # Each token's counts go to the last window that holds it, where windows overlap (a stride
+            # short of a window), so its example counts once every window holding a piece of it is read;
+            # else to the window that holds it, the tokens a stride skips going to the window after them.
+            # A token past every window the stream makes is consumed by none.
+            upto = kept if overlapping and len(windows) > 1 else end
+            emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : upto]))
                                      for name in ACCOUNTS if name in self._held}}
-            self._credited = max(0, end - kept)
+            self._credited = max(0, upto - kept)
         self._held = {name: value[kept:] for name, value in self._held.items()}
         self._skip = max(0, windows.stride - windows.size)
         return emitted

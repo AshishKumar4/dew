@@ -27,7 +27,6 @@ import numpy as np
 from dew._records import JSON, integer, json_value, record
 from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name, written
-from dew.data.completion import CLOSES, closes
 from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
@@ -332,7 +331,7 @@ def _memory_pack(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], source
         packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
         derived["packing"] = fingerprint(sizes)
         rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
-                                  stage.fields[0], rule, cuts=stage.policy == "concat")
+                                  stage.fields[0], rule)
     ids = f"{stage.fields[0]}_segment_ids"
     most = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0)) for _, value in rows),
                default=0)
@@ -410,8 +409,7 @@ def _documents(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], *, marke
 
 
 def _targeted(
-    rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str, rule: CountRule | None,
-    *, cuts: bool = False,
+    rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str, rule: CountRule | None
 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
     """The windows a pack or windows stage made that hold a valid target of
     their token `field`, each counted by the rule their documents were (`counted_window`),
@@ -419,15 +417,13 @@ def _targeted(
     examples marked (`ACCOUNTS`, at each document's last token) hold their sums, one count a window, and
     a window left out owes the examples it ends to the next kept, each refused as a row a step drops
     owes them (`Owed`), the last kept taking what none after holds, so the kept windows consume every
-    example the bound read. Where the layout `cuts` examples across windows, each such window says
-    whether it ends with one (`CLOSES`), as a read's shares take whole examples by (`whole_examples`)."""
+    example the bound read."""
 
     kept, total, owed = [], 0, Owed()
     for identifier, value in rows:
         window = counted_window(record(value, "packed window"), rule, field)
         if CONSUMED in window:
-            ends = {CLOSES: closes(window)} if cuts else {}
-            window = {**window, **{name: int(np.sum(window[name])) for name in ACCOUNTS}, **ends}
+            window = {**window, **{name: int(np.sum(window[name])) for name in ACCOUNTS}}
         count = ValidTargets(field)(window)
         if count:
             kept.append((identifier, owed.paid(window) if CONSUMED in window else window))

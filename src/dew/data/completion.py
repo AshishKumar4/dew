@@ -1,44 +1,38 @@
 """A run bounded in examples counts each source example where the last row it trains in is delivered
 (`dew.data.pipeline.CONSUMED`). A concatenating pack or windows over a stream lay one example across
-several windows, its count at the window holding its last token; a shuffle after them draws the windows in
-another order, which could deliver that window before the rest of the example. Here each count waits until
-every window holding a piece of its example is delivered.
+several windows, its count at the last window holding a piece of it; a shuffle after them draws the windows
+in another order, which could deliver that window before the rest of the example. Here each count waits
+until every window holding a piece of its example is drawn.
 
-The windows a share reads, in the order the layout made them, are its units. An example's pieces lie in the
-units from the last one before its count that carried a count of its own (where the example before it
-ended) through the one carrying its count, so a unit's count is released once every unit of that span is
-drawn. A later shuffle draws units no layout ordered, so a count it draws waits for every unit before its
-own (`prefix`). A stream's units are numbered before the shuffle and released after it (`Numbered`,
-`Completed`), holding no more than the shuffle's window of them; an indexed read's are released at the
-place its order draws the span's last unit, which a table of that order states (`Released`). A memory read
-whose shares each read their own order of the windows it holds deals them by whole examples
-(`whole_examples`), so no example lies across two."""
+The windows a share lays, in the layout's order, are its units, and each example's windows are one share's:
+a share lays its own examples (a memory read holds the bound before the layout, `analysis._held_bound`). An
+example's pieces lie in the units from the last one before its count that carried a count of its own (where
+the example before it ended), less the units windows that overlap reach back (`reach`), through the one
+carrying its count, so a unit's count is released once every unit of that span is drawn. A later shuffle,
+or a step after the layout that may make several rows of a window, leaves no such order, so a count waits
+for every unit before its own (`reach` None). A stream's units are numbered before the shuffle and released
+after it (`Numbered`, `Completed`), holding no more than the shuffle's window of them; a memory read's,
+which it can read twice, by a table of the place its shuffle draws each unit (`released`)."""
 
 from __future__ import annotations
 
 import dataclasses
 import heapq
 from collections.abc import Mapping, Sequence
-from typing import overload
 
+import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, integers, listed, record
+from dew._records import integer, integers, listed, record
 from dew.batch import Batch
-from dew.data.pipeline import CONSUMED, REFUSED, Pack, Record, Rejected, Stage, Windows
+from dew.data.pipeline import CONSUMED, REFUSED, Pack, Rejected, Stage, Windows
 
 UNIT = "_dew_unit"
 """A window's place among the units its share's layout made, in their order (`Numbered`)."""
 
 SINCE = "_dew_since"
-"""The first unit that can hold a piece of the examples a unit counts: the last one before it that carried
-a count, or the stream's first, which every unit after a shuffle the layout did not order counts from
-(`Numbered`)."""
-
-CLOSES = "_dew_closes"
-"""Whether a window a memory read holds ends where an example ends, so the window after it holds none of the
-examples it holds (`whole_examples`)."""
+"""The first unit that can hold a piece of the examples a unit counts (`Numbered`)."""
 
 
 def accounts(row: Batch | Rejected) -> tuple[int, int]:
@@ -58,75 +52,41 @@ def cuts(stages: Sequence[Stage]) -> bool:
                for stage in stages)
 
 
-def closes(window: Batch) -> bool:
-    """Whether `window`, a layout's window holding its tokens' counts of examples token by token (each at
-    its example's last token), ends with an example: its last token holds a count."""
-    return any(int(np.asarray(window[name])[-1]) for name in (CONSUMED, REFUSED) if len(window[name]))
-
-
-def whole_examples(rows: pygrain.MapDataset, share: int, count: int) -> pygrain.MapDataset:
-    """The windows a memory read holds (`rows`, each saying whether it closes, `CLOSES`) that share `share`
-    of `count` reads: the runs of windows that hold whole examples, each ending at a window that closes,
-    dealt to the shares in turn, so each example's windows are one share's, in their order."""
-    closed = [boolean(record(rows[index], "a held window")[CLOSES], "whether a window closes")
-              for index in range(len(rows))]
-    held, run, start = [], 0, 0
-    for index, ends in enumerate(closed):
-        if ends or index == len(closed) - 1:
-            if run % count == share:
-                held.extend(range(start, index + 1))
-            run, start = run + 1, index + 1
-    return _Selected(rows, held)
-
-
-class _Selected(pygrain.MapDataset):
-    """The records of `records` at `indices`, in their order: a view by index, as a slice of them is."""
-
-    def __init__(self, records: pygrain.MapDataset, indices: Sequence[int]):
-        super().__init__(records)
-        self._records, self._indices = records, tuple(indices)
-
-    def __len__(self) -> int:
-        return len(self._indices)
-
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
-
-    @overload
-    def __getitem__(self, index: int) -> Record: ...
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return self.slice(index)
-        return self._records[self._indices[index % len(self._indices)]]
+def reach(layout: Pack | Windows) -> int:
+    """How many units before the last one holding a count of its own the next example's pieces can start
+    in: none for a pack, whose windows share no token; for windows `stride` apart, each holding
+    `seq_len + 1` tokens, the others that can hold a token with the window after that count."""
+    if isinstance(layout, Pack):
+        return 0
+    stride = layout.stride or layout.seq_len
+    return max(0, -(-(layout.seq_len + 1) // stride) - 1)
 
 
 class Numbered(pygrain.IterDataset):
     """A share's windows, each with its place among them (`UNIT`) and the first unit its examples' pieces
-    can lie in (`SINCE`), for `Completed` to read after a shuffle: the stream's first for every unit where
-    the windows are not in their layout's order (`prefix`)."""
+    can lie in (`SINCE`): `reach` units before the last one that held a count, or the stream's first unit
+    where the windows reach the shuffle out of their layout's order (`reach` None)."""
 
-    def __init__(self, parent: pygrain.IterDataset, *, prefix: bool = False):
+    def __init__(self, parent: pygrain.IterDataset, *, reach: int | None):
         super().__init__(parent)
-        self._rows, self._prefix = parent, prefix
+        self._rows, self._reach = parent, reach
 
     def __iter__(self) -> pygrain.DatasetIterator:
-        return _NumberedIterator(self._rows.__iter__(), prefix=self._prefix)
+        return _NumberedIterator(self._rows.__iter__(), reach=self._reach)
 
 
 class _NumberedIterator(pygrain.DatasetIterator):
-    def __init__(self, parent: pygrain.DatasetIterator, *, prefix: bool):
+    def __init__(self, parent: pygrain.DatasetIterator, *, reach: int | None):
         super().__init__(parent)
-        self._rows, self._next, self._since, self._prefix = parent, 0, 0, prefix
+        self._rows, self._next, self._since, self._reach = parent, 0, 0, reach
 
     def __next__(self) -> Batch:
         row = record(next(self._rows), "a laid-out window")
         unit, since = self._next, self._next
         self._next += 1
         if any(accounts(row)):
-            since = self._since
-            if not self._prefix:
-                self._since = unit
+            since = 0 if self._reach is None else max(0, self._since - self._reach)
+            self._since = unit
         return {**row, UNIT: unit, SINCE: since}
 
     def get_state(self) -> Mapping[str, object]:
@@ -238,78 +198,39 @@ class _CompletedIterator(pygrain.DatasetIterator):
         self._rows.close()
 
 
-class Released(pygrain.MapDataset):
-    """Indexed windows `rows`, a share's units in the order its layout made them (or in another, `prefix`),
-    read in `order`, the same reorder of their indices (`order[i]` the unit read at place `i`): each
-    example's counts at the first kept row from the place where its span's last unit is read, a rejected
-    row carrying none of its own. Each pass of the order (`len(rows)` places) is tabled once, as it is
-    first read."""
+def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterDataset:
+    """`units`, a memory read's numbered windows (`Numbered`), shuffled `window` at a time with `seed` (all
+    of them, `window` None), each with the counts released where it is drawn. The read can draw its units
+    twice, so a first pass reads each unit's counts and span (`SINCE`), and the shuffle's draws of as many
+    numbers, which depend on its seed and how many it draws and not on what they are, place each unit: a
+    unit's counts are released with the unit drawn where its span's last unit is. No position holds more
+    than the shuffle's own."""
+    rows = (record(row, "a numbered window") for row in units)
+    held = [(integer(row[UNIT], "a window's unit"), integer(row[SINCE], "a window's first unit"),
+             *accounts(row)) for row in rows]
+    units_count = len(held)
+    size = window or max(units_count, 1)
+    drawn = np.fromiter(gx.WindowShuffleIterDataset(pygrain.MapDataset.range(units_count).to_iter_dataset(),
+                                                    window_size=size, seed=seed), np.int64, units_count)
+    place_of = np.empty(units_count, np.int64)
+    place_of[drawn] = np.arange(units_count)
+    table = np.zeros((units_count, 2), np.int64)
+    for unit, since, consumed, refused in held:
+        if consumed or refused:
+            table[drawn[place_of[since:unit + 1].max()]] += (consumed, refused)
+    shuffled = gx.WindowShuffleIterDataset(units, window_size=size, seed=seed)
+    return shuffled.map(_Release(table))
 
-    def __init__(self, rows: pygrain.MapDataset, order: pygrain.MapDataset, *, prefix: bool = False):
-        super().__init__(rows)
-        self._rows, self._order, self._prefix = rows, order, prefix
-        self._spans: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        # The passes tabled, the one read last and the one before, as a read ahead crosses between them.
-        self._tables: dict[int, np.ndarray] = {}
 
-    def __len__(self) -> int:
-        return len(self._order)
+@dataclasses.dataclass(frozen=True)
+class _Release:
+    """A drawn unit with the counts its draw releases (`released`), in place of its own."""
 
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+    table: np.ndarray
 
-    @overload
-    def __getitem__(self, index: int) -> Record: ...
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return self.slice(index)
-        row = self._rows[int(self._order[index])]
-        if isinstance(row, Rejected):
-            return dataclasses.replace(row, consumed=0)
-        if not isinstance(row, Mapping):
-            return row
-        epoch, place = divmod(index, len(self._rows))
-        table = self._tables.get(epoch)
-        if table is None:
-            table = self._released(epoch)
-            self._tables = {held: tabled for held, tabled in self._tables.items() if held == epoch - 1}
-            self._tables[epoch] = table
-        return {**row, CONSUMED: int(table[0, place]), REFUSED: int(table[1, place])}
-
-    def _units(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Each unit's counts, consumed and refused, and whether its row is kept."""
-        if self._spans is None:
-            rows = [self._rows[unit] for unit in range(len(self._rows))]
-            counts = np.asarray([accounts(row) if isinstance(row, (Mapping, Rejected)) else (0, 0)
-                                 for row in rows], np.int64).reshape(-1, 2)
-            self._spans = counts[:, 0], counts[:, 1], np.asarray([isinstance(row, Mapping) for row in rows])
-        return self._spans
-
-    def _released(self, epoch: int) -> np.ndarray:
-        """The counts each place of pass `epoch` of the order releases, consumed and refused: a counting
-        unit's at the place its span's last unit is read, each span running from the counting unit before
-        it (or the first unit, `prefix`) through it. A count with no kept row from its place on is the
-        stream's last, which its end credits (`dew.training._fit.drained`)."""
-        consumed, refused, kept = self._units()
-        units = len(consumed)
-        drawn = np.asarray([self._order[epoch * units + place] for place in range(units)], np.int64)
-        place_of = np.empty(units, np.int64)
-        place_of[drawn] = np.arange(units)
-        counting = np.flatnonzero((consumed != 0) | (refused != 0))
-        released = np.zeros((2, units), np.int64)
-        if not len(counting):
-            return released
-        if self._prefix:
-            last = np.maximum.accumulate(place_of)[counting]
-        else:
-            # Span k runs from counting unit k - 1 (the first unit for k = 0) through counting unit k.
-            starts = np.concatenate([[0], counting[:-1]])
-            last = np.maximum(np.maximum.reduceat(place_of[:counting[-1] + 1], starts), place_of[counting])
-        kept_places = np.flatnonzero(kept[drawn])
-        at = np.searchsorted(kept_places, last)
-        placed = at < len(kept_places)
-        targets = kept_places[at[placed]]
-        np.add.at(released[0], targets, consumed[counting][placed])
-        np.add.at(released[1], targets, refused[counting][placed])
-        return released
+    def __call__(self, row: Batch) -> Batch:
+        window = dict(row)
+        unit = integer(window.pop(UNIT), "a window's unit")
+        window.pop(SINCE)
+        consumed, refused = self.table[unit]
+        return {**window, CONSUMED: int(consumed), REFUSED: int(refused)}

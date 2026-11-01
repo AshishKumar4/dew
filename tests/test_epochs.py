@@ -474,11 +474,13 @@ def _jittered(metadata):
     return Jittered()
 
 
+@pytest.mark.parametrize("layout", ["pack", "windows"])
 @pytest.mark.parametrize("read", ["memory", "streamed"])
-def test_epochs_of_a_concatenating_pack_a_shuffle_draws_count_each_example_once_its_windows_are_drawn(read):
-    """Ten documents a concatenating pack cuts across windows, shuffled after (all of them where a memory
-    read holds the windows, four at a time in a stream) and read through an objective's two rows of each
-    window: an epoch is a pass over the 10 documents, so two epochs bound the run to 20, and its clock
+def test_epochs_of_a_concatenating_pack_a_shuffle_draws_count_each_example_once_its_windows_are_drawn(read,
+                                                                                                    layout):
+    """Ten documents a concatenating pack, or windows 2 tokens apart, cut across windows, shuffled after
+    (all of them by a memory read, four at a time in a stream) and read through an objective's two rows of
+    each window: an epoch is a pass over the 10 documents, so two epochs bound the run to 20, and its clock
     counts each once every window holding a piece of it is drawn, at 20 when the run ends (row 1902)."""
     import optax
 
@@ -493,7 +495,9 @@ def test_epochs_of_a_concatenating_pack_a_shuffle_draws_count_each_example_once_
             return (element, element)
 
     documents = [{"id": np.full(index % 5 + 3, index + 1, np.int32)} for index in range(10)]
-    chain = Pipeline(Memory(documents, shard_rows=5)).pack(8, fields=("id",), policy="concat")
+    chain = Pipeline(Memory(documents, shard_rows=5))
+    chain = (chain.pack(8, fields=("id",), policy="concat") if layout == "pack"
+             else chain.windows(4, stride=2, fields=("id",)))
     chain = chain.shuffle(seed=1, window=None if read == "memory" else 4).read(read).batch(8)
     loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
     assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
