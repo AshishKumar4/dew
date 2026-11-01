@@ -5,7 +5,7 @@ trains with every layer whole on every stage (`Layout.stage_local`), through eac
 their per-layer rules, and a LoRA adapter's; a checkpoint it writes holds every layer as one device's
 would and resumes onto another stage count; and an optax transformation that may read a stacked leaf
 whole is refused by name, naming the replicated layout that takes it. The pipeline's own parity with one
-device is the pipeline's (ledger 3370), whatever its state's storage."""
+device is the pipeline's (ledger 3369), whatever its state's storage."""
 
 import dataclasses
 
