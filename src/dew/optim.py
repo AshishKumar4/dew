@@ -2383,11 +2383,10 @@ class OptimConfig:
         if make is gauss_newton and self.clip_grads > 0:
             opts['clip'] = self.clip_grads
         if make is gauss_newton and self.param_groups:
-            damping = opts.pop('damping', 0.0)
-            opts.pop('clip', None)
-            if not isinstance(damping, int | float):
-                raise ValueError(f"Gauss-Newton's damping is a number, got {damping!r}")
-            solved = solved_directions(float(damping), self.clip_grads if self.clip_grads > 0 else None)
+            damping, clip = opts.pop('damping', 0.0), opts.pop('clip', None)
+            if not isinstance(damping, int | float) or not (clip is None or isinstance(clip, int | float)):
+                raise ValueError(f"Gauss-Newton's damping and clip are numbers, got {damping!r} and {clip!r}")
+            solved = solved_directions(float(damping), None if clip is None else float(clip))
             make = _rate_only
         if self.param_groups:
             names = [group.name for group in self.param_groups]
