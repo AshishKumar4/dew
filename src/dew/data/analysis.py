@@ -639,7 +639,8 @@ def _held_bound(stages: Sequence[Stage], at: int) -> int:
     marks): the memory read runs them as it holds the rest, the source examples cycled to the limit and
     marked before the pack lays them out, so the pack's windows carry the examples they consume. None (0)
     where no such bound stands there."""
-    repeats = int(at < len(stages) and isinstance(stages[at], Repeat) and stages[at].epochs is None)
+    first = stages[at] if at < len(stages) else None
+    repeats = int(isinstance(first, Repeat) and first.epochs is None)
     bound = stages[at + repeats:at + repeats + 3]
     marked = (len(bound) == 3 and isinstance(bound[0], Limit) and isinstance(bound[1], Map)
               and isinstance(bound[1].step, MarkConsumed) and isinstance(bound[2], Pack))
@@ -899,7 +900,8 @@ def _analyzed(
     lowered = tuple(_cut(child, per_share, validation) for child in lowered)
     # The stages a memory read already ran over its rows read its order too: a bound it held with its
     # pack (`_held_bound`) repeats and ends it before the rows it holds.
-    steps = (*ancestry, *_written(source, ()), *stages)
+    held = () if isinstance(source, (Mixture, Phases)) else _written(source, ())
+    steps = (*ancestry, *held, *stages)
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
     parts_unending, unending, records_unending, onward = _finiteness(
         stages, lowered, per_share and not validation and not repeats)

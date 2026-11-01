@@ -24,9 +24,9 @@ from typing import overload
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import integer, integers, listed, record
+from dew._records import boolean, integer, integers, listed, record
 from dew.batch import Batch
-from dew.data.pipeline import CONSUMED, REFUSED, Record, Rejected
+from dew.data.pipeline import CONSUMED, REFUSED, Pack, Record, Rejected, Stage, Windows
 
 UNIT = "_dew_unit"
 """A window's place among the units its share's layout made, in their order (`Numbered`)."""
@@ -41,15 +41,21 @@ CLOSES = "_dew_closes"
 examples it holds (`whole_examples`)."""
 
 
-def accounts(row: Record) -> tuple[int, int]:
+def accounts(row: Batch | Rejected) -> tuple[int, int]:
     """The source examples `row` consumes and the part of them refused (`CONSUMED`, `REFUSED`): a rejected
     row's are all refused, as the row kept after it is paid them (`dew.data.pipeline.Owed`)."""
     if isinstance(row, Rejected):
         return row.consumed, row.consumed
-    if isinstance(row, Mapping):
-        return (integer(row.get(CONSUMED, 0), "a row's consumed examples"),
-                integer(row.get(REFUSED, 0), "a row's refused examples"))
-    return 0, 0
+    return (integer(row.get(CONSUMED, 0), "a row's consumed examples"),
+            integer(row.get(REFUSED, 0), "a row's refused examples"))
+
+
+def cuts(stages: Sequence[Stage]) -> bool:
+    """Whether `stages` lay a source example across windows: a concatenating pack, which cuts documents
+    where its windows end, or windows over a stream of them. A first-fit or best-fit pack places each whole
+    in one window."""
+    return any(isinstance(stage, Windows) or (isinstance(stage, Pack) and stage.policy == "concat")
+               for stage in stages)
 
 
 def closes(window: Batch) -> bool:
@@ -58,17 +64,41 @@ def closes(window: Batch) -> bool:
     return any(int(np.asarray(window[name])[-1]) for name in (CONSUMED, REFUSED) if len(window[name]))
 
 
-def whole_examples(closed: Sequence[bool], share: int, count: int) -> list[int]:
-    """The windows of share `share` of `count`, as their indices among `closed`, each saying whether its
-    window closes (`CLOSES`): the runs of windows that hold whole examples, each ending at a window that
-    closes, dealt to the shares in turn, so each example's windows are one share's, in their order."""
+def whole_examples(rows: pygrain.MapDataset, share: int, count: int) -> pygrain.MapDataset:
+    """The windows a memory read holds (`rows`, each saying whether it closes, `CLOSES`) that share `share`
+    of `count` reads: the runs of windows that hold whole examples, each ending at a window that closes,
+    dealt to the shares in turn, so each example's windows are one share's, in their order."""
+    closed = [boolean(record(rows[index], "a held window")[CLOSES], "whether a window closes")
+              for index in range(len(rows))]
     held, run, start = [], 0, 0
     for index, ends in enumerate(closed):
         if ends or index == len(closed) - 1:
             if run % count == share:
                 held.extend(range(start, index + 1))
             run, start = run + 1, index + 1
-    return held
+    return _Selected(rows, held)
+
+
+class _Selected(pygrain.MapDataset):
+    """The records of `records` at `indices`, in their order: a view by index, as a slice of them is."""
+
+    def __init__(self, records: pygrain.MapDataset, indices: Sequence[int]):
+        super().__init__(records)
+        self._records, self._indices = records, tuple(indices)
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Record: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        return self._records[self._indices[index % len(self._indices)]]
 
 
 class Numbered(pygrain.IterDataset):
@@ -251,7 +281,8 @@ class Released(pygrain.MapDataset):
         """Each unit's counts, consumed and refused, and whether its row is kept."""
         if self._spans is None:
             rows = [self._rows[unit] for unit in range(len(self._rows))]
-            counts = np.asarray([accounts(row) for row in rows], np.int64).reshape(-1, 2)
+            counts = np.asarray([accounts(row) if isinstance(row, (Mapping, Rejected)) else (0, 0)
+                                 for row in rows], np.int64).reshape(-1, 2)
             self._spans = counts[:, 0], counts[:, 1], np.asarray([isinstance(row, Mapping) for row in rows])
         return self._spans
 
