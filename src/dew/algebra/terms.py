@@ -143,8 +143,25 @@ def region(closed: jcore.Jaxpr) -> Region:
             return term
         return env[atom]
 
+    # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
+    # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
+    laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
     opaque: list[Opaque] = []
     for equation in jaxpr.eqns:
+        if (equation.primitive is jax.lax.broadcast_in_dim_p and not protected(equation)
+                and not isinstance(equation.invars[0], jcore.Literal) and equation.invars[0] in laid):
+            source, inner = laid[equation.invars[0]]
+            outer = tuple(equation.params["broadcast_dimensions"])
+            composed = {**equation.params, "broadcast_dimensions": tuple(outer[axis] for axis in inner)}
+            out = equation.outvars[0]
+            env[out] = read(source).shaped("broadcast_in_dim", param(equation.primitive, composed))
+            shapes.append((env[out], _shape(out)))
+            laid[out] = (source, composed["broadcast_dimensions"])
+            depths[out] = depths.get(source, 0) + 1
+            continue
+        if (equation.primitive is jax.lax.broadcast_in_dim_p and not protected(equation)
+                and not isinstance(equation.invars[0], jcore.Literal)):
+            laid[equation.outvars[0]] = (equation.invars[0], tuple(equation.params["broadcast_dimensions"]))
         term = None if protected(equation) else _term(equation, read, param)
         if term is not None:
             out = equation.outvars[0]
