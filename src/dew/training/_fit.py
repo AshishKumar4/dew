@@ -31,12 +31,12 @@ from dew.data.dataset import (
     Checkpointable,
     Closeable,
     DataPartition,
+    Ends,
     Loader,
     PhasedStream,
     Reader,
     rows_of,
-    stream_endless,
-    stream_together,
+    stream_ends,
 )
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
@@ -338,9 +338,8 @@ class FitRun:
     preempted: int | None = None
     paused: int | None = None
     notice: PreemptionNotice | None = None
-    endless: bool = False
-    together: bool = False
-    """Whether every share of the training stream runs out at the same read (`stream_together`)."""
+    ends: Ends = "apart"
+    """Where the training stream ends (`stream_ends`)."""
     taken: Taken | None = None
     writer: LogWriter = dataclasses.field(default_factory=LogWriter)
     """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
@@ -404,10 +403,10 @@ class FitRun:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
         read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
         position the step saves taken before it. A run whose stream is closed (`Trainer._wind_down`)
-        ends on this step without another read, and an endless stream never ends here otherwise."""
+        ends on this step without another read, and a stream that never ends never ends here otherwise."""
         if self.ahead is None and self.train is None:
             return True
-        if self.endless:
+        if self.ends == "never":
             return False
         if self.ahead is None:
             self.ahead = (waited_read(self, interval, agree=self.agrees(first=False)),)
@@ -456,18 +455,18 @@ class FitRun:
         return read
 
     def opened(self, source: Iterator[Batch], examples: int | None) -> None:
-        """Take what the training stream `source` says of its reads (`stream_endless`, `stream_together`)
+        """Take where the training stream `source` says it ends (`stream_ends`)
         and whether the run reads it as a pool on the examples clock (`pooled`, bounded to `examples`)."""
-        self.endless, self.together = stream_endless(source), stream_together(source)
+        self.ends = stream_ends(source)
         self.pooled = pooled(examples)
 
     def agrees(self, *, first: bool) -> bool:
         """Whether a read of the training stream is agreed over the pool (`agreed_next`): its `first`,
-        and every read of a stream that may run out on some processes and not others. An endless
-        stream's later reads are not, nor those of one whose every share runs out at the same read
-        (`together`): a read that fails on one process stops its peers by the failure it publishes
+        and every read of a stream that may run out on some processes and not others (`ends`). Later
+        reads of one that never ends, or ends on every share at the same read, are not: a read that
+        fails on one process stops its peers by the failure it publishes
         (`dew._coordination.end_pool_on_failure`), as any error outside an agreement does."""
-        return first or not (self.endless or self.together)
+        return first or self.ends == "apart"
 
     def read(self) -> Batch | None:
         """The training stream's next batch, or None where it ran out, read through this run each

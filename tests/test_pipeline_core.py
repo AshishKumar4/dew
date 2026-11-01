@@ -2166,7 +2166,7 @@ def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_ou
     reader = compile(Pipeline(source(8)).random_map(WideDraw()).batch(4), read="streamed",
                      loading=READ).train(DataPartition())
     try:
-        assert reader.endless and len(listed(reader, 6)) == 6
+        assert reader.ends == "never" and len(listed(reader, 6)) == 6
     finally:
         reader.close()
 

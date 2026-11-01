@@ -69,8 +69,9 @@ AVERAGING = Path(__file__).with_name("averaging_worker.py")
 PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
 """The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
-READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pools that run on the examples clock."""
+READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
+"""The worker of the pool that counts the rounds a fit agrees its reads in."""
 CLOCKED = 17
 """The examples a pool's run bounded in examples is bounded to: of ten records, seven read twice, and in
 one global order a last global batch of one row, which one share holds and the other does not."""

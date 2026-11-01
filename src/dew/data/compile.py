@@ -61,6 +61,7 @@ from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
+    Ends,
     FilledBatch,
     Forwarding,
     GlobalReader,
@@ -1402,10 +1403,10 @@ elements, or arrays whole."""
 
 class _Whole:
     """The same batch every step, the arrays a run was handed whole; its position the steps read. It
-    never runs out (`Identified.endless`), and names what it reads as a stream Dew names no further does:
+    never runs out (`Identified.ends`), and names what it reads as a stream Dew names no further does:
     by its type (`stream_identity`)."""
 
-    endless = True
+    ends: Ends = "never"
 
     def __init__(self, batch: Batch):
         self.batch, self.read = batch, 0
@@ -1443,16 +1444,16 @@ def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
 
 class _Shared(Forwarding):
     """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
-    the stream's; `endless` where it reads a map dataset repeated without end (`native`), which says
-    so of nothing it reads."""
+    the stream's; it never ends where it reads a map dataset repeated without end (`native`, `endless`),
+    which says so of nothing it reads."""
 
     def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool,
                  endless: bool = False):
         self._source, self.partition, self.held, self._endless = batches, partition, held, endless
 
     @property
-    def endless(self) -> bool:
-        return self._endless or super().endless
+    def ends(self) -> Ends:
+        return "never" if self._endless else super().ends
 
     def __iter__(self):
         return self

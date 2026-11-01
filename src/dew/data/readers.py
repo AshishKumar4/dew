@@ -17,6 +17,7 @@ from dew.batch import EXAMPLES_CONSUMED, Batch
 from dew.data.dataset import (
     Closeable,
     DataPartition,
+    Ends,
     FilledBatch,
     Forwarding,
     GlobalReader,
@@ -131,8 +132,10 @@ class _PerShare(Forwarding):
     """Lazy Grain reader with owner-published positions and counters."""
 
     @property
-    def endless(self) -> bool:
-        return self._endless
+    def ends(self) -> Ends:
+        """Never where its order repeats without end, else on any share apart: its shares cut the
+        order each its own."""
+        return "never" if self._endless else "apart"
 
     @property
     def stop_seconds(self) -> float:
