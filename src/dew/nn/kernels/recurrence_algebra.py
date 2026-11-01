@@ -1260,10 +1260,14 @@ def key_diagonal_pairs_back(d_pairs: list, own: list, prefix: tuple, behind: Cal
     def offset(e, carried):
         d_rows, d_keys = carried
         keys, *earlier = behind(e)
-        decay = jnp.where(index % sub >= e, between(prefix, tuple(earlier)), 0.0)
+        # Selected, never scaled by zero: a row before its offset reads past the shifted tile's start, any
+        # value (an interpreter's NaN in shared memory left unwritten).
+        within = index % sub >= e
+        decay = jnp.where(within, between(prefix, tuple(earlier)), 0.0)
         band = (columns_index == rows_index - e) & (rows_index % sub >= e)
         bands = [jnp.sum(jnp.where(band, d_pair, 0.0), axis=1)[:, None] for d_pair in d_pairs]
-        d_rows = tuple(total + strip * keys * decay for total, strip in zip(d_rows, bands, strict=True))
+        d_rows = tuple(total + jnp.where(within, strip * keys * decay, 0.0)
+                       for total, strip in zip(d_rows, bands, strict=True))
         weighted = functools.reduce(jnp.add, (strip * row for strip, row in zip(bands, own, strict=True)))
         return d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * decay), 0.0)
 
