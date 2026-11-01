@@ -228,30 +228,28 @@ def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
 
 
 def test_a_value_row_split_by_its_blocks_takes_every_column_interpreted():
-    """The fast backward planned for an A100 (assumed, its launches interpreted off a GPU) over one sequence
-    in fp32 under the fast forms, at Qwen3.5-27B's widths: its query/key launch's streams over the whole
-    value row, an fp32 call's two parts, pass an A100's block (237824 bytes against its 166912,
-    `mainloop_backward._query_key_split`), so the row splits by the blocks dividing it, its every gradient on
-    par from float64 with recorded fla-core's (`fla_sites`). Halved instead, 192 columns took 96, a block and
-    a half, and the split's programs read no column past their first block's."""
+    """The fast backward planned for an sm86 GPU (an A10's or an RTX 3090's 99 KiB block; assumed, its
+    launches interpreted off a GPU) over one sequence in bf16: its query/key launch's streams over the whole
+    128-wide value row pass the block (`mainloop_backward._query_key_split`), so the row splits by the blocks
+    dividing it, its every gradient on par from float64 with recorded fla-core's (`fla_sites`). Halved
+    instead, 192 columns took 96, a block and a half, and the split's programs read no column past their first
+    block's (an A100's fp32 call's two parts at Qwen3.5-27B's widths, 237824 bytes against its 166912)."""
     if mainloop.family_of() is not None:
-        pytest.skip("an A100's plan interpreted off a GPU: a GPU plans for its own")
-    case, dtype = 'one sequence', jnp.float32
+        pytest.skip("an sm86's plan interpreted off a GPU: a GPU plans for its own")
+    case, dtype = 'one sequence', jnp.bfloat16
     hooks = case_hooks(case)
     (sample,) = draw(dtype, 0, **geometry(case))
-    fast = generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast'))
-    with fast, generation.assumed('sm80'):
+    with generation.assumed('sm86'):
         assert trained(sample, hooks)
-        tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm80'))
+        tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm86'))
 
     def planned(given: Chunk):
-        # The A100's own tiles and plan, its launches interpreted.
-        with generation.assumed('sm80'):
+        # The sm86's own tiles and plan, its launches interpreted.
+        with generation.assumed('sm86'):
             return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                                tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound, rounded=True,
                                family=mainloop.family_of(dtype), interpret=True)
 
-    with fast:
-        the_template_is_as_exact_as_fla(planned, recorded_site(case, dtype),
-                                        label="the template's gradient over a value row split by its blocks, "
-                                              "an A100's plan")
+    the_template_is_as_exact_as_fla(planned, recorded_site(case, dtype),
+                                    label="the template's gradient over a value row split by its blocks, "
+                                          "an sm86's plan")
