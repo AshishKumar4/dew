@@ -273,9 +273,11 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
             shapes.append((term, _shape(out)))
             operands = [magnitude_of(atom) for atom in equation.invars]
             name = equation.primitive.name
-            if name in KEEPING_SIGN and equation.invars[0] in nonpositive:
+            source = equation.invars[0]
+            held = isinstance(source, jcore.Var) and source in nonpositive
+            if name in KEEPING_SIGN and held:
                 nonpositive.add(out)
-            exponentiated = name in ("exp", "exp2") and equation.invars[0] in nonpositive
+            exponentiated = name in ("exp", "exp2") and held
             _typed(dtypes, magnitudes, term, out, UNIT if exponentiated else _bounded(equation, operands))
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
