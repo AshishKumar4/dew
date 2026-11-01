@@ -3,7 +3,7 @@
 `chunk_gated_delta_rule` and `chunk_kda` (its Triton kernels) on a CUDA GPU, forward and every gradient, at
 each site tests/fla_sites.py names, over the tests' own seeded draws.
 
-    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> <unit> <site>..
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla> <unit> <site>...
     PYTHONPATH=src:tests:tools python tools/fla_gdn_reference.py --merge <unit>...
 
 on a GPU, Dew's environment recording and a second Python with torch, fla-core and tilelang (`--serve`, the
