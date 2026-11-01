@@ -321,24 +321,33 @@ class KernelReport:
     """Each kernel call the lowered program makes, once, with the times it runs (`kernel_launches`)."""
 
     def record(self) -> dict:
-        """Its JSON: each distinct route with its count, each kernel's launches, configs and stated FLOPs
-        (None where any of its launches states none), and `unsized`, the launches whose work the FLOP
-        count cannot size (`instrumentation.sizes`); a count a loop of no static trip count leaves
-        unknown is None, as the FLOP count's is."""
+        """Its JSON: each distinct route with its count, each kernel's launches, configs, stated FLOPs
+        (None where any of its launches states none) and `padded`, the share of its launches' tile grids
+        their tails pad, over its calls (`report.Launch.padded`; None where any states none), and
+        `unsized`, the launches whose work the FLOP count cannot size (`instrumentation.sizes`); a count
+        a loop of no static trip count leaves unknown is None, as the FLOP count's is."""
         routes = Counter(self.routes)
         launches: dict[tuple[str, str], dict] = {}
         for call, runs in self.calls:
             entry = launches.setdefault((call.kind or "", call.name), {
-                "kind": call.kind, "name": call.name, "calls": 0.0, "configs": [], "flops": 0.0})
+                "kind": call.kind, "name": call.name, "calls": 0.0, "configs": [], "flops": 0.0,
+                "padded": 0.0})
             entry["calls"] += runs
             if call.config not in entry["configs"]:
                 entry["configs"].append(call.config)
             stated, flops = entry["flops"], call.flops
             entry["flops"] = stated + flops * runs if stated is not None and flops is not None else None
+            traced = None if call.launch is None else report.traced(call.launch)
+            share = None if traced is None else traced.padded
+            held = entry["padded"]
+            entry["padded"] = None if held is None or share is None else held + share * runs
         for entry in launches.values():
             entry["calls"] = int(entry["calls"]) if math.isfinite(entry["calls"]) else None
             if entry["flops"] is not None and not math.isfinite(entry["flops"]):
                 entry["flops"] = None
+            # The padded share over the kernel's calls, each by its runs.
+            padded, calls = entry["padded"], entry["calls"]
+            entry["padded"] = padded / calls if padded is not None and calls else None
 
         def order(counted) -> tuple:
             route, _ = counted

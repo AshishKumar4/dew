@@ -72,7 +72,9 @@ class Book(NamedTuple):
     streak of non-finite losses and `worst_bad_run` the longest since the last
     check. `training` and `tokens` sum the objective's analytical training FLOPs
     and real tokens, and `norms` and `commits` the committed gradient norms
-    and their count, since the last log.
+    and their count, since the last log. `scored` sums the real tokens every step
+    since the last log scored, committed or not: the steps' share of the tokens
+    they computed (`Interval.computed`) is that.
     """
 
     loss: jax.Array
@@ -82,6 +84,7 @@ class Book(NamedTuple):
     tokens: jax.Array
     norms: jax.Array
     commits: jax.Array
+    scored: jax.Array
 
 
 def fresh_book(loss: jax.Array) -> Book:
@@ -92,13 +95,14 @@ def fresh_book(loss: jax.Array) -> Book:
     """
     dtype = at_least_fp32(loss.dtype)
     zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
-             np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32))
+             np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32),
+             np.zeros((2,), np.uint32))
     return Book(*jax.device_put(zeros, loss.sharding))
 
 
 @jax.jit
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, training=0.0,
-             tokens=(0, 0)) -> Book:
+             tokens=(0, 0), scored=(0, 0)) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
 
     Loss counters and commit telemetry advance together, without reading
@@ -110,7 +114,8 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
     return Book(book.loss + loss.astype(dtype), bad_run, jnp.maximum(book.worst_bad_run, bad_run),
-                book.training + training, _TokenCount.add(book.tokens, tokens), norms, commits)
+                book.training + training, _TokenCount.add(book.tokens, tokens), norms, commits,
+                _TokenCount.add(book.scored, scored))
 
 
 @dataclasses.dataclass
@@ -148,6 +153,9 @@ class Interval:
     steps: int = 0
     since_log: int = 0
     samples: int = 0
+    computed: int | None = 0
+    """The tokens the steps since the last log computed, each its rows' (`Objective.row_tokens`, read from
+    the batch's shape), padding included; None where a step's rows declare none."""
     flops: StepFlops | None = NO_FLOPS
     model_counted: bool = False
     tokens_counted: bool = False
@@ -195,14 +203,17 @@ class Interval:
             return time.time() if seen is None else min(time.time(), seen)
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
-              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
-        """Add one step: its records, its FLOPs, its loss, its optimizer commit and its consumed examples."""
+              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None,
+              computed: int | None = None) -> None:
+        """Add one step: its records, its FLOPs, its loss, its optimizer commit, its consumed examples and
+        the tokens it `computed` (`TokenClock.stepped`), None where its rows declare none."""
         held = batch.get(CONSUMED_COUNT)
         self.consumed_before = self.consumed
         self.consumed += held.examples if isinstance(held, ConsumedCount) else 0
         self.since_log += 1
         self.steps += 1
         self.samples += rows_of(batch)
+        self.computed = None if self.computed is None or computed is None else self.computed + computed
         self.flops = None if self.flops is None or flops is None else self.flops + flops
         if self.book is None:
             self.book = self.fresh = fresh_book(loss)
@@ -224,7 +235,8 @@ class Interval:
                 self.inspected = (jnp.where(fresh, committed.count, count), jax.tree.map(
                     lambda new, old: jnp.where(fresh, new, old), committed.inspected, held))
         self.book = bookkeep(self.book, loss, finite, committed,
-                             aux.get(TRAINING_FLOPS, self.fresh.training), tokens)
+                             aux.get(TRAINING_FLOPS, self.fresh.training), tokens,
+                             aux.get(TOKENS, self.fresh.scored))
 
     def streak(self) -> jax.Array | None:
         """The longest streak of non-finite losses since the last call, on
@@ -294,7 +306,7 @@ class Interval:
                           None if book is None else (book.norms, book.commits),
                           book.training if self.model_counted and book is not None else None,
                           book.tokens if self.tokens_counted and book is not None else None, statistics,
-                          self.inspected)
+                          self.inspected, book.scored if self.tokens_counted and book is not None else None)
         # The copies to the host begin now, so the log's read waits on nothing but the step itself.
         for leaf in jax.tree.leaves(reading):
             if isinstance(leaf, jax.Array):
@@ -312,13 +324,14 @@ class Interval:
         if self.tokens_counted and book is not None:
             self.logged_tokens = book.tokens if self.logged_tokens is None else _added_tokens(
                 self.logged_tokens, book.tokens)
-        self.since_log, self.samples = 0, 0
+        self.since_log, self.samples, self.computed = 0, 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
         self.model_counted = self.tokens_counted = False
         self.inspected = None
         if book is not None and self.fresh is not None:
             self.book = book._replace(training=self.fresh.training, tokens=self.fresh.tokens,
-                                      norms=self.fresh.norms, commits=self.fresh.commits)
+                                      norms=self.fresh.norms, commits=self.fresh.commits,
+                                      scored=self.fresh.scored)
         return taken
 
     def saved(self, step: int, *, resumable: bool = True) -> None:
@@ -354,10 +367,12 @@ class TokenClock:
         """The most the committed tokens can be after the latest step, or None where unknown."""
         return None if self.held is None else self.read + self.held
 
-    def stepped(self, per_row: int | None, rows: int) -> None:
+    def stepped(self, per_row: int | None, rows: int) -> int | None:
         """Count a step of `rows` rows, each committing at most `per_row` tokens, None where they declare
-        none."""
-        self.held = None if self.held is None or per_row is None else self.held + per_row * rows
+        none; the tokens the step computes, those rows' (`Interval.count`), or None."""
+        computed = None if per_row is None else per_row * rows
+        self.held = None if self.held is None or computed is None else self.held + computed
+        return computed
 
     def reread(self, read: int, pending: int) -> None:
         """Take `read`, the committed tokens off the devices after the latest step, and `pending`, those
@@ -414,6 +429,8 @@ class Reading(NamedTuple):
     statistics: Mapping[str, float]
     inspected: tuple[Number, Summaries] | None = None
     """The latest sampled commit since the last log, its commit count and summaries, or None."""
+    scored: Number | None = None
+    """The real tokens every step since the last log scored, committed or not (`Book.scored`), or None."""
 
 
 class Taken(NamedTuple):
@@ -485,7 +502,9 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
     scalars = {"train/loss": float(read.loss), **{f"train/{k}": float(v) for k, v in read.aux.items()},
                **throughput(elapsed, counts.since_log, counts.samples, counts.flops, devices,
                             waited=counts.waited, compiling=counts.compiling, training_flops=work,
-                            tokens=None if read.tokens is None else _TokenCount.host(read.tokens))}
+                            tokens=None if read.tokens is None else _TokenCount.host(read.tokens)),
+               **real_token_share(None if read.scored is None else _TokenCount.host(read.scored),
+                                  counts.computed)}
     scalars["train/accepted"] = float(read.accepted)
     if read.committed is not None:
         norms, commits = read.committed
@@ -607,6 +626,17 @@ def checked_streak(streak: int, step: int, display: TrainingDisplay) -> None:
             f"ending near step {step}, stopping")
     if streak:
         display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
+
+
+def real_token_share(scored: int | None, computed: int | None) -> dict[str, float]:
+    """train/real_token_share: of the tokens an interval's steps computed (`computed`, each its rows'
+    `Objective.row_tokens`, padding and a batch's filler rows included), the share their loss scored
+    (`scored`, `Objective.scored_tokens`, committed or not), so the MFU a run's padding costs reads off
+    the log: real-token MFU over that share is the MFU of every token computed. None where the steps
+    count no tokens or their rows declare none."""
+    if scored is None or not computed:
+        return {}
+    return {"train/real_token_share": scored / computed}
 
 
 def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None, devices: int, *,

@@ -463,8 +463,9 @@ class Trainer(Generic[Loss, Effects]):
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
         """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
         self._device, self._prefetch = loader.device, prefetch
-        self._examples = clocked(examples, steps, custom=self.step is not None,
-                                 rollout=self.rollout is not None, bound_ends=loader.bound_ends)
+        progress = self._config is not None and self._config.reads_progress()
+        self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
+                                 custom_progress=self.step is not None and progress)
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1470,8 +1471,8 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, ahead = run.closing(interval, batch, self._examples)
-                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval, run)
+                batch, ahead = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked,
+                                          interval, run, examples=self._examples, closes=True)
                 device, _ = split_fields(batch)
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
@@ -1513,8 +1514,8 @@ class Trainer(Generic[Loss, Effects]):
                 position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
-                interval.count(batch, measured_flops, loss, finite, committed, aux)
-                run.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                interval.count(batch, measured_flops, loss, finite, committed, aux,
+                               run.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
@@ -1754,7 +1755,8 @@ class Trainer(Generic[Loss, Effects]):
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
         run.opened(source, self._examples)
         self._marked = marked(run.partition, self._counted_batch)
-        prepare = self._marked if self.rollout is None else None
+        prepare = self._marked if self.rollout is None else functools.partial(
+            consumption_counted, clocked=self._examples is not None, marks_rows=False)
         if run.pooled:
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
@@ -1921,16 +1923,16 @@ class Trainer(Generic[Loss, Effects]):
                                         phase="cooldown read")
                     if batch is None:
                         break
-                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
-                                       branched)
+                    batch, _ = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
+                                          counted, branched)
                     device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                     cooled, loss, aux, finite, _, committed = step(
                         rates_set(cooled, functools.partial(scaled_rates, held=held, factor=factor)), device)
-                    counted.count(batch, None, loss, finite, committed, aux)
-                    branched.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                    counted.count(batch, None, loss, finite, committed, aux,
+                                  branched.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                     done, branched.current = done + 1, branched.current + 1
             finally:
                 self._stage_starts = starts
