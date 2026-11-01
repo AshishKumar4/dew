@@ -97,7 +97,8 @@ def test_a_directory_made_where_one_is_changes_nothing(followed, tmp_path):
 
 
 def test_the_recorders_own_hook_beside_the_packages_is_its_own(followed):
-    assert followed.written(f"{sys.prefix}/lib/python3/site-packages/.dew_followed.pth.318") is None
+    for name in (".dew_followed.pth.318", "dew_followed.pth"):
+        assert followed.written(f"{sys.prefix}/lib/python3/site-packages/{name}") is None
 
 
 def test_wandbs_service_may_write_anywhere(followed):

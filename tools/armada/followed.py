@@ -254,8 +254,8 @@ def own(name: str) -> bool:
     called within it, would wait on for ever."""
     if name.startswith(("/dev/", "/proc/")) or "__pycache__" in name.split(os.sep):
         return True
-    # The recorder's own hook beside the interpreter's packages (`installed`), as it writes it.
-    if os.path.basename(name).startswith(".dew_followed.pth"):
+    # The recorder's own hook beside the interpreter's packages (`installed`), and its temporary name.
+    if os.path.basename(name).lstrip(".").startswith("dew_followed.pth"):
         return True
     log = os.environ.get("DEW_EXECUTED_LOG")
     settled = getattr(sys.modules.get("tempfile"), "tempdir", None)
