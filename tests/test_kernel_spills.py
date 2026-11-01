@@ -329,8 +329,7 @@ def test_a_program_donates_its_state_and_places_it_by_a_tree_of_formats():
                   jax.device_put(jnp.ones((2, 3)), formats.columns))
     stepped_slots = run(slots, 2.0)
     assert slots.rows.is_deleted() and slots.columns.is_deleted()
-    named = program(lambda scale, slots: stepped(slots, scale), donate_argnames="slots",
-                    in_shardings=(None, formats), out_shardings=formats)
+    named = program(lambda scale, slots: stepped(slots, scale), donate_argnames="slots", out_shardings=formats)
     again = named(2.0, slots=stepped_slots)
     assert stepped_slots.rows.is_deleted()
     np.testing.assert_array_equal(np.asarray(again.columns), np.full((2, 3), 4.0))
