@@ -194,7 +194,7 @@ def test_a_programs_communicators_kept_by_another_reader_are_read_again(tmp_path
     again."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     kept = tmp_path / "dew" / "communicators" / "programs"
-    assert communicators.READER == communicators.reader_digest()
+    assert communicators.reader_digest() == communicators.READER
     for earlier in (kept / f"{b'step'.hex()}.json", kept / ("0" * 16) / f"{b'step'.hex()}.json"):
         earlier.parent.mkdir(parents=True, exist_ok=True)
         earlier.write_text(json.dumps(Collectives(groups=frozenset({(0, 1, 2, 3)})).to_json()))
