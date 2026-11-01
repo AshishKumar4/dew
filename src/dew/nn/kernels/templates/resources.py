@@ -31,14 +31,15 @@ products. The relocatable compile's needs at sm90 (FS-K01 model2 and CAUSE-VECTO
 cap): a plain mainloop the accumulator and 32 (its step's descriptors too), exact sums two accumulators and
 16, an epilogue with a column vector the accumulator, the vector and 16."""
 
-PRODUCER_REGISTERS = 40
-"""The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`): a
-measured bound, not yet the rule. A producer's rule is the least of setmaxnreg's steps of 8 (its floor 24,
-PTX ISA) holding its own issue code's live set, computed per launch once a liveness model prices the
-producer's branch, beside `Family.held_registers` and `CONTROL_REGISTERS`. The live sets vary (PRODFLOOR3,
-whole-program ptxas 12.9 and 13.4 with the raises honored): 24 holds the recurrence's training kernels' and
-the attention forward's and backward's producers at D64 and D128 but the natural training forward's at D128
-under 13.4, whose spill grows from 52 to 60 bytes below 40."""
+PRODUCER_REGISTERS = 24
+"""The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`):
+setmaxnreg's floor (PTX ISA), two consumers' raise 240 (FlashAttention 3's). A measured bound, not yet the
+rule: a producer's rule is the least of setmaxnreg's steps of 8 holding its own issue code's live set,
+computed per launch once a liveness model prices the producer's branch, beside `Family.held_registers` and
+`CONTROL_REGISTERS`. The live sets vary (PRODFLOOR3, whole-program ptxas 12.9 and 13.4 with the raises
+honored): 24 holds the recurrence's training kernels' and the attention forward's and backward's producers
+at D64 and D128 but the natural training forward's at D128 under 13.4, which spills 60 bytes at it (52 at
+40)."""
 
 
 THREADS = 128
@@ -194,13 +195,13 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
     return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
-RAISES_HONORED = False
-"""Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg). It
-does not today: jaxlib's Mosaic GPU compiles each kernel's PTX through nvJitLink wherever it is installed
-(jaxlib/mosaic/gpu/target.cc, NvJitLinkMode::kAuto; the pip wheels without libnvptxcompiler), which
-compiles it relocatably, and ptxas ignores setmaxnreg there (C7504): every warpgroup of a program holds its
-entry's registers (`entry_registers`). SAMECOMPILE1-h100: two consumers' attention dK/dV spilled 504 bytes
-at 168 registers where a whole-program compile holds its 232."""
+RAISES_HONORED = True
+"""Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg): a
+jaxlib with jax-ml/jax f365a65e3a (Mosaic GPU's nvJitLink disabled, jaxlib/mosaic/gpu/target.cc
+NvJitLinkMode::kDisabled; issue 42094) compiles each kernel whole, so a raise holds (this dev branch runs
+the nightly carrying it, owner 10-31; it lands with the release's pin). Before it, nvJitLink compiled
+relocatably and ptxas ignored setmaxnreg (C7504): SAMECOMPILE1-h100, two consumers' attention dK/dV spilled
+504 bytes at 168 registers where a whole-program compile holds its 232."""
 
 
 def entry_registers(warpgroups: int) -> int:

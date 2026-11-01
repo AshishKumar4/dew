@@ -606,7 +606,7 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                                         ) + statistics
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
-    if config.fused and not split:
+    if config.fused and not split and not config.shared_dq:
         # Queries first (`attention_mosaic_fused._fused_launch`), on either layout: its statistics row
         # vectors.
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
@@ -623,12 +623,14 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     held, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
     step = [(queries, block_k, jnp.float32)] * 2 + held
     pullback = step[1:] + [(queries, block_k, jnp.float32)] * slopes
-    # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`), read from
-    # global memory at each use, which ptxas staggers: one's column vector live at a time (an A100's
-    # keys-first launch at 64 x 64, width 128: 17 to 18 words at its peak, where all five's are 80); a fused
-    # launch's dQ tile of its share `[queries, D]` fp32 beside its score cotangents.
+    # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`), each read
+    # where it is used, from global memory or a shared dQ's stream (`STATISTICS`), one's column vector live
+    # at a time (an A100's keys-first launch at 64 x 64, width 128: 17 to 18 words at its peak, where all
+    # five's are 80); a fused launch's dQ tile of its share `[queries, D]` fp32 beside its score
+    # cotangents, a shared dQ's its share of the columns (`BackwardTiles.shared_dq`).
     statistics = family.column_registers(queries, jnp.float32)
-    added = [[step[0], (queries, width, jnp.float32)]] if config.fused else []
+    dq_width = width // config.consumers if config.shared_dq else width
+    added = [[step[0], (queries, dq_width, jnp.float32)]] if config.fused else []
     # Its products' fragments where they read registers (`_products`), keys first: the logits' and the
     # output cotangents' of the keys against the queries, then dV's and dK's of the weights and the score
     # cotangents in registers.
@@ -687,7 +689,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless and
         # undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's layout
         # or keys first on one whose consumers share a key block (`split_queries`), each consumer's share of
-        # a slot's queries a warpgroup MMA's rows (dQ's product's M).
+        # a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer its own
+        # keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`).
         hooked = (self.score_mod is not None or ba.arguments["initial"] is not None
                   or ba.arguments["drop"] is not None)
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
@@ -696,14 +699,26 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
-                keys_first and not (split_queries(dkv_family)
-                                    and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0))
+                keys_first and not ((split_queries(dkv_family)
+                                     and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0)
+                                    or (config.shared_dq and config.block_q % dkv_family.rows == 0)))
                 or (config.staged_logits and not keys_first)):
             return False
         if (config.fused and (self.accurate or hooked)) or not super().legal(ba, config, target):
             return False
         dtype = ba.arguments["query"].dtype
         family = bundle_of(config, dtype)
+        if config.producer_dq and not config.shared_dq:
+            # The producer adds a shared dQ's staged shares alone (`mosaic.Outbox`).
+            return False
+        if config.shared_dq:
+            # Keys first, each consumer its own keys (no layout whose consumers feed their rings), each its
+            # share of dQ's columns whole swizzled rows (`_fused_adds`).
+            dkv = config.dkv
+            share = _width(ba.arguments["query"].shape[-1], family, dtype) // dkv.consumers
+            return (config.fused and not config.queries_first and dkv.consumers > 1 and config.columns == 1
+                    and not split_queries(bundle_of(dkv, dtype))
+                    and share % family.column_unit(dtype) == 0)
         if config.shared_keys:
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
             # (`mosaic.swizzle_for`), its share of the columns whole swizzled rows (`attention_mosaic_coop`).

@@ -149,6 +149,16 @@ class BackwardTiles:
     """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
     step from the call's own in its consumers' shared memory, where a stream of them beside the call's
     passes the block (width 256's)."""
+    shared_dq: bool = False
+    """Whether the keys-first fused launch's consumers, each its own keys, exchange their score cotangents
+    for a cooperative dQ: each forms its half of dQ's columns over every key and adds it, one tile's dQ added
+    once a program (FlashAttention 3's width 128, run_mha_bwd_hdim128: AtomLayoutMdQ 1 over two MMA
+    warpgroups; each consumer adding a whole tile over its own keys adds twice, the measured bound,
+    ET-DQBOUND-h100)."""
+    producer_dq: bool = False
+    """Whether a shared dQ's adds are its producer's (`mosaic.Outbox`): each consumer stages its share of a
+    tile's dQ, which the producer adds by TMA's reduction a ring's depth behind its loads and frees once
+    read, the adds' waits off the consumers' walk (FlashAttention 3's dQ store warp)."""
     shared_keys: bool = False
     """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
     each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
@@ -219,8 +229,13 @@ def stagings(family: mosaic.Family) -> tuple[bool, ...]:
 
 def _block(config: Tiles | BackwardTiles) -> int:
     """The block a launch at `config` pads a call's queries and keys to: whole programs of query blocks and
-    key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs)."""
-    keys = config.consumers * config.block_k if isinstance(config, BackwardTiles) else config.block_k
+    key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs, a shared
+    dQ's dK/dV program a key block each of its consumers': padded to a block of the dQ launch's consumers,
+    its last program's last consumer read keys past the padded call, NaN interpreted)."""
+    if isinstance(config, BackwardTiles):
+        keys = (config.dkv.consumers if config.shared_dq else config.consumers) * config.block_k
+    else:
+        keys = config.block_k
     return math.lcm(config.consumers * config.block_q, keys)
 
 
