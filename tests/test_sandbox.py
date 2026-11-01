@@ -68,9 +68,10 @@ def test_a_measured_parent_measures_the_launcher_it_starts(tmp_path, monkeypatch
     combined = coverage.Coverage(config_file=str(config))
     combined.combine()
     measured = set(combined.get_data().lines(_sandbox_exec.__file__) or ())
-    # Coverage starts in main's first statement, so its statements after that are what it measures.
+    # Coverage starts in main's first statement and is saved in its last before the exec: the statements
+    # between, the first after its start and the save itself, are measured.
     statements = sorted({line for _, _, line in _sandbox_exec.main.__code__.co_lines() if line is not None})
-    assert set(statements[2:]) <= measured
+    assert {statements[2], statements[-2]} <= measured
 
 
 def test_parent_death_kills_the_worker(tmp_path):
