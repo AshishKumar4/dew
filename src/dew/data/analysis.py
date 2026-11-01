@@ -893,7 +893,9 @@ def _analyzed(
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in lowered)
     lowered = tuple(_cut(child, per_share, validation) for child in lowered)
-    steps = (*ancestry, *stages)
+    # The stages a memory read already ran over its rows read its order too: a bound it held with its
+    # pack (`_held_bound`) repeats and ends it before the rows it holds.
+    steps = (*ancestry, *_written(source, ()), *stages)
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
     parts_unending, unending, records_unending, onward = _finiteness(
         stages, lowered, per_share and not validation and not repeats)
