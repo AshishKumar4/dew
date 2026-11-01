@@ -3,6 +3,7 @@ rows its step makes of them or windows its pack lays them in, counted in the rea
 delivered row says (`CorpusCounts.examples`): read by workers, after every batch, and across a saved position
 (row 1890)."""
 
+import grain.python as pygrain
 import numpy as np
 import pytest
 from examples_clock_worker import Questioned
@@ -162,6 +163,76 @@ def test_a_corpus_counts_a_refused_last_example_its_batches_leave_to_the_streams
     assert read_whole(loader, "question")[1] == 19
     assert counted(loader) == [16]
     assert counted(loader, "data/rejected/") == [4]
+
+
+class DroppingLate(pygrain.RandomMapTransform):
+    """A later step of the objective, a draw of its own, that drops every row of the examples 6 and 11: the
+    first rows the objective kept after its refusals of 5 and 10, which carry those on."""
+
+    identity = "dropping-late@1"
+    rejects = True
+
+    def random_map(self, element, rng):
+        return Rejected("late") if int(element["id"]) in (6, 11) else element
+
+
+def test_examples_refused_by_two_steps_apart_are_counted_once():
+    """Twenty-one examples, every fifth refused whole by the objective's expansion and 6 and 11 dropped by a
+    later step of its own after the rows carrying 5's and 10's counts were kept: the corpus counts the fifteen
+    it kept, each refused example's count carried on once whatever step dropped the row carrying it, and the
+    batches consume all twenty-one."""
+    ids = np.arange(1, 22, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids})).batch(BATCH), read="memory",
+                     objective=ObjectiveData(train=(Refusing(), DroppingLate())), examples=21)
+    assert read_whole(loader, "question")[1] == 21
+    assert counted(loader) == [15]
+    assert sorted(counted(loader, "data/rejected/")) == [4, 4]
+
+
+def completed(batch) -> int:
+    """The examples a batch of `Refusing`'s rows completes: its real rows that are their example's last."""
+    real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+    last = np.asarray(batch["question"]) == np.asarray(batch["id"]) % 3
+    return int(np.sum(real & last))
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_each_batch_states_the_examples_it_kept_by_then_and_a_resumed_read_goes_on_from_them(workers):
+    """Twenty-one examples, every fifth refused whole, read eight rows a batch by `workers` loading workers:
+    after each batch the corpus states the examples whose last rows it delivered by then, never a refused
+    one, wherever in a worker's group a refusal fell; a read resumed from a position saved after the second
+    batch states the same counts after each later batch as the read it was saved from."""
+    ids = np.arange(1, 22, dtype=np.int32)
+
+    def stream():
+        loader = compile(Pipeline(Memory({"id": ids})).batch(BATCH), read="memory",
+                         objective=ObjectiveData(train=(Refusing(),)), examples=21,
+                         loading=Loading(workers=workers))
+        return loader, loader.train(DataPartition())
+
+    def stated(loader) -> int:
+        return int(counted(loader)[0]) if counted(loader) else 0
+
+    loader, whole = stream()
+    seen, kept, saved = [], 0, None
+    try:
+        for index, batch in enumerate(whole):
+            kept += completed(batch)
+            seen.append((kept, stated(loader)))
+            if index == 1:
+                saved = whole.get_state()
+    finally:
+        if isinstance(whole, Closeable):
+            whole.close()
+    assert [stated_then for _, stated_then in seen] == [kept_then for kept_then, _ in seen]
+    assert seen[-1][0] == 17
+    resumed_loader, resumed = stream()
+    resumed.set_state(saved)
+    try:
+        assert [stated(resumed_loader) for _ in resumed] == [stated_then for _, stated_then in seen[2:]]
+    finally:
+        if isinstance(resumed, Closeable):
+            resumed.close()
 
 
 @pytest.mark.parametrize("workers", [0, 2])
