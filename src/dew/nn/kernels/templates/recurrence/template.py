@@ -177,7 +177,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
           wide against 95 32 wide, the 27B's and Qwen3-Next's, SE-family-h100-b0980aaff), so one wave of the
           most programs (fla's chunk_fwd_h runs the 27B gated delta net's 192 programs a 32-wide block on an
           A100's 108, where 64 wide its 96 left twelve idle the whole walk, SE-rx-ncu-b106b18d8), and past one
-          wave the fewest programs; the widest where the device's multiprocessors are unknown;
+          wave the fewest programs; the widest where the device's multiprocessors are unknown. Narrower in
+          one wave only while the states ring holds one stage: a narrower program reloads the chunk's keys
+          and weights whole, which a ring two deep hides at the wider block, so of one wave the widest two
+          deep (keys and values 256 wide over 8 heads, one row: the states launch 0.200 ms 32 wide two deep
+          against 0.212 16 wide on an H100, 0.285 against 0.367 to 0.415 on an A100, and 0.332 and 0.636 at
+          64 wide one deep, batch-window-{h100,a100}-b2ad84c61);
         - output block: the widest legal beside it (`_staged`), the output launch's registers apart from the
           states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
@@ -250,9 +255,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return self._walked(ba, chosen, target,
                                 programs // (multiprocessors * self.states_held(ba, chosen, target)),
                                 training=training)
-        # Narrower only while the fast backward holds where it held at the block given way from.
+        # Narrower only while the fast backward holds where it held at the block given way from, and only
+        # while the block's states ring holds one stage: of one wave, the widest whose ring holds two.
         held = trains(trained)
         for index in range(trained + 1, len(blocks)):
+            if chosen.stages > 1:
+                break
             tiles = staged(index)
             if tiles is None or not one_wave(tiles) or (held and not trains(index)):
                 break
