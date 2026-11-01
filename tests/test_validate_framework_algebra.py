@@ -72,7 +72,7 @@ def leaf_read_control(region, schedule):
         if get_callable_args(node, terms.Term.reduce) is not None:
             work = dataclasses.replace(work, device_bytes=0)
         elif get_callable_args(node, terms.Term.leaf) is not None:
-            work = work + Work(device_bytes=math.prod(cost.shape_of(graph, node)) * 4)
+            work = work + Work(device_bytes=math.prod(region.shape(node)) * 4)
         return cost.Seconds(work, schedule)
     return DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
 
