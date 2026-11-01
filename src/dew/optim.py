@@ -772,11 +772,11 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
         return orthogonalized(moment, numbers, jnp.asarray(NEWTON_SCHULZ), ns_steps, 1e-8,
                               algorithm=dot_algorithm(ns_precision))
 
-    state = M3State if weight_dimension_numbers is None else M3GivenState
+    kind = M3State if weight_dimension_numbers is None else M3GivenState
 
     def init_fn(params) -> M3State:
         zeros = jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)
-        return state(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
+        return kind(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
 
     def update_fn(updates, state, params=None):
         del params
@@ -796,7 +796,7 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
         # The slow momentum and its orthogonalization run once a chunk, not every update.
         slow, chunk, slow_direction = jax.lax.cond(
             count % frequency == 0, closed, lambda chunk: (state.slow, chunk, state.slow_direction), chunk)
-        return direction, state(count, fast, second, slow, chunk, slow_direction)
+        return direction, kind(count, fast, second, slow, chunk, slow_direction)
 
     return optax.GradientTransformation(init_fn, update_fn)
 
