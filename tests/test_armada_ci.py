@@ -1994,7 +1994,8 @@ def test_a_kept_task_whose_lookups_spend_its_deadline_starts_no_file_and_returns
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {f"tests/test_c.py::test_{name}": 250.0 for name in "cde"}))
     held = "tests/test_c.py#1/3"
-    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={held}",
+    missed = f"{held}@GenuineIntel-6-143:0000"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={missed}",
                                       f"--out={verdict}", "--cache=on", "--deadline=600"])
     monkeypatch.setenv("ARMADA_FRESH", "1")
     assert ci.main() == 0
