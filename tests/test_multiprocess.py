@@ -1787,6 +1787,20 @@ def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_ex
 
 
 @pytest.mark.distributed
+def test_a_pools_reads_after_its_first_agree_nothing_where_no_share_can_run_out_alone(tmp_path):
+    """A pool agrees a read of its training stream after the first only where its shares may run out
+    apart: over a finite global order, which every share runs out of at the same read, over arrays
+    handed whole, over a Grain map dataset handed to read without end, and in a cooldown branch of an
+    endless order, a run of twice the steps takes no round more than the shorter one (a read agreed
+    at each step, as every one of these was, takes one a step: 1.4 ms on two loopback processes, 38 ms
+    on eight containers, docs/performance.md)."""
+    reports = run_pool("read_rounds", tmp_path / "rounds", 2, timeout=300, steps=4)
+    for report in reports:
+        assert {kind: longer - shorter for kind, (shorter, longer) in report.items()} == {
+            "global": 0, "whole": 0, "map": 0, "cooldown": 0}, report
+
+
+@pytest.mark.distributed
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):
     """Each process opens its own stream over its own copy of the corpus, reads
     its batches on its own prefetch thread and lists the checkpoints itself.
