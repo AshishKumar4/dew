@@ -467,7 +467,8 @@ class Trainer(Generic[Loss, Effects]):
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
                                  custom_progress=self.step is not None and progress,
-                                 pooled_draws=pooled(examples) and _draws_further(self.rollout))
+                                 pooled_draws=pooled(examples) and self.rollout is not None
+                                 and _draws_further(self.rollout))
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:

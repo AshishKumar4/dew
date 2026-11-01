@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from examples_clock_worker import Questioned
+from data_support import Fanned, Questioned
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
@@ -431,15 +431,6 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
     assert all(count % (record % 3 + 1) == 0 for record, count in read.items())
     assert sorted(count // (record % 3 + 1) for record, count in read.items()) == sorted(
         [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
-
-
-class Fanned:
-    """An objective's expansion of each record `id` into `id % 4` rows, none for some, each row's two
-    tokens naming it (`id * 10 + question`)."""
-
-    def flat_map(self, element):
-        record = int(element["id"])
-        return tuple({"text": np.full(2, record * 10 + question, np.int32)} for question in range(record % 4))
 
 
 class LastDropped(grain.MapTransform):
