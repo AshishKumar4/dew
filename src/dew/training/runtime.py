@@ -34,7 +34,6 @@ from dew.devices import (
     xla_flag,
 )
 from dew.logging import configure as configure_logging
-from dew.training.communicators import sized_pool
 from dew.pool import (
     PREEMPTED_EXIT,
     PROCESS_COUNT,
@@ -46,6 +45,7 @@ from dew.pool import (
     runs_on_gpu,
     slurm_tasks_here,
 )
+from dew.training.communicators import sized_pool
 
 _log = logging.getLogger(__name__)
 
