@@ -41,8 +41,8 @@ def apply_xla_flags(flags: str | None) -> None:
 
 _UNPARSED: str | None = None
 """XLA_FLAGS as Dew last saw or set them before the process loaded jaxlib, None where it had loaded it
-before Dew was imported: flags they carry hold for every runtime XLA loads, provided nothing writes
-XLA_FLAGS by hand after."""
+before Dew was imported: flags they carry hold for every runtime XLA loads, provided nothing rewrites
+XLA_FLAGS without them after."""
 
 _UNOPENED: str | None = None
 """XLA_FLAGS as Dew last saw or set them while JAX's backend was closed, None where it had opened before
@@ -64,17 +64,20 @@ def flags_hold(flags: str) -> bool:
     """Whether every flag of `flags` holds for each runtime XLA loads: carried by XLA_FLAGS while the
     process has not loaded jaxlib, or as Dew last saw them before it did (`_UNPARSED`); each read as XLA
     reads `flags` alone, its last occurrence's value, a bare flag's 'true'. A flag set after jaxlib loaded
-    is unproven: XLA may have parsed its flags before, with no public way to tell."""
+    is unproven: XLA may have parsed its flags before, with no public way to tell. Flags that held stay
+    certain while nothing rewrites XLA_FLAGS without them before a runtime XLA loads later parses them."""
     parsed = os.environ.get('XLA_FLAGS', '') if "jaxlib" not in sys.modules else _UNPARSED
     return parsed is not None and _carries(parsed, flags)
 
 
 def flags_set(flags: str) -> bool:
     """Whether XLA_FLAGS carried every flag of `flags` while JAX's backend was closed: now, while it is,
-    or as Dew last saw or set them before it opened (`_UNOPENED`). A backend that opened since may have
-    read them, which `flags_hold` proves where XLA_FLAGS carried them before jaxlib loaded."""
-    unopened = os.environ.get('XLA_FLAGS', '') if not backend_open() else _UNOPENED
-    return unopened is not None and _carries(unopened, flags)
+    recorded as Dew saw them (`_seen`), or as Dew last saw or set them before it opened (`_UNOPENED`). A
+    backend that opened since may have read them, which `flags_hold` proves where XLA_FLAGS carried them
+    before jaxlib loaded."""
+    if not backend_open():
+        _seen()
+    return _UNOPENED is not None and _carries(_UNOPENED, flags)
 
 
 def hold_xla_flags(flags: str | None) -> None:
@@ -126,8 +129,8 @@ def keep_roundings() -> None:
     """Keep declared narrow-dtype roundings unless the caller names XLA's policy.
 
     Fusion must not normalize an unrounded FP32 value where the program
-    produces a BF16 sum. `import dew` applies it before the process's first
-    JAX computation: XLA reads these flags when its backend opens. In an
+    produces a BF16 sum. `import dew` applies it before anything it imports
+    loads jaxlib, before which XLA parses no flag (`flags_hold`). In an
     already-used notebook, restart with
     `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
     """

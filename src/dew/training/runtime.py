@@ -156,9 +156,9 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
         apply_xla_flags(xla_flags)
     if xla_flags and not flags_hold(xla_flags) and xla_flags not in _UNPROVEN:
         _UNPROVEN.add(xla_flags)
-        _log.warning("XLA_FLAGS %r were set after the process loaded jaxlib, whose XLA may have parsed its "
-                     "flags before: they are unproven. Set XLA_FLAGS before the process starts, as "
-                     "`dew train` does, to make them certain", xla_flags)
+        _log.warning("XLA_FLAGS %r cannot be shown to have been set before the process loaded jaxlib, "
+                     "whose XLA may have parsed its flags since: they are unproven. Set XLA_FLAGS before "
+                     "the process starts, as `dew train` does, to make them certain", xla_flags)
     preallocate_gpu_pool()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
@@ -231,8 +231,8 @@ def _joined() -> None:
     # formed: jax.process_count() would open the backend.
     if pool_size() > 1:
         end_pool_on_failure()
-    # XLA reads its flags when the backend opens, which the first
-    # line below does. The watchdog is the CUDA plugin's, and a TPU
+    # XLA parses its flags by the time the backend opens, which the
+    # first line below does. The watchdog is the CUDA plugin's, and a TPU
     # host's libtpu need not know its flag.
     if cuda_plugin() and xla_flag("xla_gpu_execution_terminate_timeout") is None:
         apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")

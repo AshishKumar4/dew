@@ -52,9 +52,6 @@ from dew.devices import (
 _keep_roundings()
 _divide_exactly()
 _unpartition_gpu_pool()
-# `dew.cache` makes JAX's user contexts at `import dew`, before any thread starts, and its `import jax` loads
-# jaxlib: after Dew's flags are in XLA_FLAGS, where every runtime XLA loads parses them (`dew.devices`).
-_import_module("dew.cache")
 
 
 def _parse_absl_flags() -> None:
@@ -177,3 +174,11 @@ __all__ = [
     "pipeline",
     "sample",
 ]
+
+if TYPE_CHECKING:
+    from dew import cache as cache
+else:
+    # `dew.cache` makes JAX's user contexts at `import dew`, before any thread starts, and its `import jax`
+    # loads jaxlib: after Dew's flags are in XLA_FLAGS, where every runtime XLA loads parses them
+    # (`dew.devices`).
+    _import_module("dew.cache")
