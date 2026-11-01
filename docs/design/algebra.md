@@ -77,15 +77,13 @@ reference's error, past the gate's 1.5).
 
 ### 1.3 Custom derivatives and surrogate gradients
 
-Dew holds 58 custom-derivative sites (the inventory of 2026-11-01, by class: 24 kernel, 26 numerics, 8 surrogate),
-and two more since: nGPT's join and normed hidden (`ngpt.stepped`, `ngpt.normed_hidden`, row 1308), which reverse in
-two passes only to restructure the norm's algebra (§0's example) and are the algebra-only sites the engine retires
-first. The engine sees through every one: it rewrites inside each custom VJP's and JVP's forward and backward
-bodies, by the site's declared class:
+Dew holds 58 custom-derivative sites (the inventory of 2026-11-01, by class: 24 kernel, 26 numerics, 8 surrogate,
+0 algebra-only). The engine sees through every one: it rewrites inside each custom VJP's and JVP's forward and
+backward bodies, by the site's declared class:
 
 - **Kernel** (the norm and SwiGLU kernels, the GEMM and attention templates, the recurrence kernels, the paged and
   Splash attention kernels): the launches are opaque leaves and their XLA glue is `KernelGlue`, rewritten freely.
-  A kernel site's `linear_tangent` portable tangents are ordinary math and are rewritten as well.
+  `linear_tangent`'s portable tangents are ordinary math and are rewritten as well.
 - **Numerics** (`nn.categorical`'s label, soft-label and divergence tangents, `sampling.flow`'s range-safe KL,
   `nn.precision`'s compensated and correctly rounded functions, the recurrence algebra's decay prefix and readout,
   the chunked heads' logit tangents, `exact_gelu`, the grouped projection's widened sums, among them): both bodies
@@ -229,11 +227,11 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   - at a site running Dew's own programs (`dew_programs`, `as_given` trainer steps): the same arm under
     `dew.algebra.passes(on=True, target=…)` against `passes(on=False)`.
 
-  The truth is the unrewritten program at float64 in both. The gate holds `passes(on=False)` by default for the
-  reference arm and the float64 truth alone; the candidate runs as users run it, the pass on, priced at the gate's
-  lowering target, as an arm is measured as its users run it (testing.md). A site that compares a program with its
-  unrewritten self passes one function as both arms. The pass prices for the named target's facts (the generation
-  the gate's lowering traces for), so a CPU lane checks the form a GPU of that target extracts.
+  The truth is the unrewritten program at float64 in both. The gate's own arm compilation (`_arms`,
+  `without_ynn`) holds `passes(on=False)` by default, so a site that does not opt in compares an unrewritten
+  program with an unrewritten one, never a rewritten one with another. The pass prices for the named target's
+  facts (the generation the gate's lowering traces for), so a CPU lane checks the form a GPU of that target
+  extracts.
 - **Rewritten backwards:** `rewritten(jax.grad(fn))` at `tests/contract_support.py`'s edge draws, held to its
   finiteness rule against the unrewritten float64 gradient, and check 1 against `jax.grad(fn)`. A rule that only
   fires on backward patterns is caught there, as JAX's derivative of a rewritten forward never exercises it.
@@ -253,8 +251,7 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
 ## 4. What it replaces, and what it leaves
 
-- **It replaces** custom derivatives that exist only to restructure algebra (nGPT's join and normed hidden, §1.3),
-  and
+- **It replaces** custom derivatives that exist only to restructure algebra (the inventory found none today), and
   hand-derived template algebra and numeric forms wherever a generated form meets both bars:
   - bible §4: at least as efficient on every scoreboard row and GPU type the route serves, at the derived default,
     in operator rows and the `benchmark_step` step;
@@ -620,10 +617,8 @@ declaration, exported from there.
 class Protected: ...                  # error-free transforms and numerics bodies (§1.2, §1.3)
 class Surrogate: ...                  # a declared surrogate gradient's bodies
 class KernelGlue: ...                 # a kernel derivative's XLA around its launches
-class Algebra: ...                    # a derivative written only to restructure algebra: rewritten freely, and
-                                      # retired once the engine derives its form
 
-Kind = Protected | Surrogate | KernelGlue | Algebra
+Kind = Protected | Surrogate | KernelGlue
 
 marked_call_p: jax.extend.core.Primitive   # a call: params jaxpr (a ClosedJaxpr) and kind (a Kind instance)
 
@@ -653,9 +648,8 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 - `dew.nn.precision`'s error-free transforms are `marked(Protected(), …)`, replacing the name scope the first cut
   reads.
 - Every custom-derivative site declares itself through one of the four declarations, in place of a bare
-  `jax.custom_vjp` or `jax.custom_jvp`. `linear_tangent` takes its caller's declared kind: `KernelGlue` at a kernel
-  site, `Protected` at a numerics one (`sampling.flow`'s KL, the chunked heads, `nn.precision`'s products), and
-  `Algebra` at nGPT's join and normed hidden, which the compile-time sets rewrite until the engine retires them. A bare custom derivative in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
+  `jax.custom_vjp` or `jax.custom_jvp`; `linear_tangent` declares its bodies `KernelGlue`. A bare custom derivative
+  in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
 - `surrogate(forward, derivative)`: the forward runs as written and its tangent is `derivative`'s, both bodies
   `Surrogate`. No rule set holds a rule relating a `Surrogate` span to autodiff's derivative of its forward, so the
   engine optimizes inside each body and never replaces the rule.
