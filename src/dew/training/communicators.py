@@ -22,8 +22,9 @@ pool. The answer is kept in Dew's cache per configuration (`configuration`: the 
 version and settings), so a host pays for it once. The pool's share then leaves that room at NCCL's full
 speed, the user's share (or Dew's 95%) its upper bound (`pool_share`): the pool need hold only the compiled
 step, which the fit check holds to it, so no channel or buffer of NCCL's is cut to fit. Once the step is
-compiled, its collectives' kinds are read from its program and held to the room its GPUs have outside the
-pool (`checked_room`), so a step that would fail to connect is refused before it runs."""
+compiled, its communicators are read from its program and held to the room left outside the
+pool (`Resident.admit`), with the communicators earlier steps made, so a step that would fail to connect is
+refused before it runs."""
 
 from __future__ import annotations
 
@@ -39,6 +40,8 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
+import numpy as np
+
 from dew.cache import dew_cache_dir
 from dew.devices import cuda_driver_version, gpu_count, gpu_memory, gpu_name, nccl_version
 from dew.files import write_atomically
@@ -50,6 +53,10 @@ KINDS = {0: "collective", 1: "permute"}
 
 PERMUTES = re.compile(r"\b(collective-permute|send|recv)(-start)?\(")
 COLLECTIVES = re.compile(r"\b(all-gather|all-reduce|reduce-scatter|all-to-all|ragged-all-to-all)(-start)?\(")
+
+
+Clique = tuple[int, tuple[tuple[int, ...], ...]]
+"""A communicator as XLA keys it: its kind (`KINDS`) and its device groups, each a tuple of GPU ordinals."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,12 +88,16 @@ class Needs:
         larger = sorted(measured for measured in sizes if measured >= size)
         return sizes[larger[0]] if larger else max(sizes.values(), default=0)
 
-    def needed(self, cliques: frozenset[tuple[int, str, int]], gpus: Iterable[int], *,
-               runtime: bool) -> dict[int, int]:
-        """Each GPU's bytes outside the pool for `cliques` (`cliques_of`: kind, grouping, group size), every
-        GPU in one group of each grouping, with the runtime's where `runtime`."""
-        each = sum(self.taken(kind, size) for kind, _, size in cliques)
-        return {gpu: each + (self.runtime.get(gpu, 0) if runtime else 0) for gpu in sorted(gpus)}
+    def needed(self, cliques: Iterable[Clique], gpus: Iterable[int], *, runtime: bool) -> dict[int, int]:
+        """Each GPU's bytes outside the pool for `cliques` (`cliques_of`), each charged on the GPUs of its
+        groups at its group's size, with the runtime's where `runtime`."""
+        needed = {gpu: self.runtime.get(gpu, 0) if runtime else 0 for gpu in sorted(gpus)}
+        for kind, groups in cliques:
+            for group in groups:
+                for gpu in group:
+                    if gpu in needed:
+                        needed[gpu] += self.taken(kind, len(group))
+        return needed
 
 
 class CommunicatorRoom(ValueError):
@@ -149,7 +160,7 @@ def _child(configured: Mapping) -> Needs:
 
 
 def pool_share(needs: Needs, memory: Mapping[int, tuple[int, int]], requested: float | None,
-               cliques: frozenset[tuple[int, str, int]]) -> float:
+               cliques: frozenset[Clique]) -> float:
     """The share of each GPU XLA's pool takes: the user's (XLA_PYTHON_CLIENT_MEM_FRACTION, `requested`; Dew's
     0.95 where they named none) as an upper bound, held to leave each GPU the room its `cliques`'
     communicators and the runtime take outside it at NCCL's full speed, the tightest GPU deciding, to a
@@ -166,44 +177,64 @@ def pool_share(needs: Needs, memory: Mapping[int, tuple[int, int]], requested: f
 
 
 GROUPS = re.compile(r"replica_groups=(\{[{}0-9,]*\}|\[[0-9,]+\]<=\[[0-9,]+\](?:T\([0-9,]+\))?)")
+IOTA = re.compile(r"\[([0-9,]+)\]<=\[([0-9,]+)\](?:T\(([0-9,]+)\))?")
 
 
-def cliques_of(program: str, gpus: int) -> frozenset[tuple[int, str, int]]:
+def cliques_of(program: str, gpus: int) -> frozenset[Clique]:
     """The communicators a compiled program's collectives make over this host's `gpus`: each kind (`KINDS`)
-    and device grouping, with its group size, as XLA keys its cliques. A permute's spans every GPU."""
-    found: set[tuple[int, str, int]] = set()
+    and set of device groups, as XLA keys its cliques, the groups read alike however the program writes them
+    (`groups_of`). A permute's spans every GPU."""
+    every = (tuple(range(gpus)),)
+    found: set[Clique] = set()
     for line in program.splitlines():
         if PERMUTES.search(line):
-            found.add((1, "all", gpus))
+            found.add((1, every))
         elif COLLECTIVES.search(line):
-            grouping = GROUPS.search(line)
-            written = grouping.group(1) if grouping else "all"
-            found.add((0, written, _size(written, gpus)))
+            written = GROUPS.search(line)
+            found.add((0, groups_of(written.group(1), gpus) if written else every))
     return frozenset(found)
 
 
-def _size(grouping: str, gpus: int) -> int:
-    """The devices in each group of `grouping`, written as XLA's text writes it: listed (`{{0,1},{2,3}}`), as
-    an iota (`[2,2]<=[4]`, its last dimension's), or none (`all`, every GPU)."""
-    if grouping.startswith("{{"):
-        return len(grouping[2:].split("}")[0].split(","))
-    if grouping.startswith("["):
-        return int(grouping[1:].split("]")[0].split(",")[-1])
-    return gpus
+def groups_of(written: str, gpus: int) -> tuple[tuple[int, ...], ...]:
+    """The device groups XLA's text writes as a list (`{{0,1},{2,3}}`, `{}` for every device) or as an iota
+    (`[2,2]<=[4]`, `[2,2]<=[2,2]T(1,0)`: the devices counted out in the second shape, transposed, laid out
+    in the first, a group to a row), sorted."""
+    iota = IOTA.fullmatch(written)
+    if iota is not None:
+        shape, laid = ([int(size) for size in part.split(",")] for part in iota.groups()[:2])
+        order = [int(axis) for axis in iota.group(3).split(",")] if iota.group(3) else list(range(len(laid)))
+        devices = np.arange(int(np.prod(laid))).reshape(laid).transpose(order).reshape(-1, shape[-1])
+        return tuple(sorted(tuple(int(device) for device in row) for row in devices))
+    listed = [tuple(int(device) for device in group.split(","))
+              for group in re.findall(r"\{([0-9,]+)\}", written)]
+    return tuple(sorted(listed)) if listed else (tuple(range(gpus)),)
 
 
-def checked_room(cliques: frozenset[tuple[int, str, int]], needs: Needs, room: Mapping[int, int]) -> None:
-    """Refuse a compiled step whose `cliques`' communicators and the runtime need more than the room Dew left
-    outside XLA's pool on its GPUs (`room`, by ordinal, as `sized_pool` left it), naming the bytes, before it
-    runs. Held against the room Dew left, not what is free now, so communicators an earlier step made count
-    once."""
-    needed = needs.needed(cliques, room, runtime=True)
-    if any(needed[gpu] > room[gpu] for gpu in room):
-        made = sorted({KINDS[kind] for kind, _, _ in cliques})
-        raise CommunicatorRoom(f"the compiled step's collectives make {len(cliques)} {made} communicators, "
-                               "which the room left outside XLA's pool does not hold; lower "
-                               "XLA_PYTHON_CLIENT_MEM_FRACTION by the shortfall over the GPU's bytes", needed,
-                               room)
+class Resident:
+    """The communicators this process has made: XLA keeps each it creates, so every step's are admitted
+    together with those of the steps before it (`admit`)."""
+
+    def __init__(self) -> None:
+        self.cliques: frozenset[Clique] = frozenset()
+
+    def admit(self, cliques: frozenset[Clique], needs: Needs, room: Mapping[int, int]) -> None:
+        """Admit a compiled step's `cliques`, refusing it, naming the bytes, before it runs, where they and
+        the process's earlier communicators, each counted once, with the runtime need more than the room Dew
+        left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it). Held against the room Dew
+        left, not what is free now, which the earlier communicators already took."""
+        held = self.cliques | cliques
+        needed = needs.needed(held, room, runtime=True)
+        if any(needed[gpu] > room[gpu] for gpu in room):
+            made = sorted({KINDS[kind] for kind, _ in held})
+            raise CommunicatorRoom(f"the compiled step's collectives and the process's earlier ones make "
+                                   f"{len(held)} {made} communicators, which the room left outside XLA's "
+                                   "pool does not hold; lower XLA_PYTHON_CLIENT_MEM_FRACTION by the "
+                                   "shortfall over the GPU's bytes", needed, room)
+        self.cliques = held
+
+
+RESIDENT = Resident()
+"""This process's communicators, as the fit check admitted them."""
 
 
 NEEDS: Needs | None = None
@@ -237,8 +268,8 @@ def sized_pool(*, measure: Callable[[], Needs | None] = lambda: needs_of(),
     named = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")
     requested = None if named is None else float(named)
     # A collective's communicator and a permute's over every GPU, as a step's cliques are known only once it
-    # compiles; the fit check holds the compiled step's own to the room left (`checked_room`).
-    cliques = frozenset((kind, "all", len(memory)) for kind in KINDS)
+    # compiles; the fit check holds the compiled step's own to the room left (`Resident.admit`).
+    cliques = frozenset((kind, (tuple(sorted(memory)),)) for kind in KINDS)
     share = pool_share(NEEDS, memory, requested, cliques)
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(share)
     SIZED = {"requested": requested, "share": share, "needed": NEEDS.needed(cliques, memory, runtime=True),
