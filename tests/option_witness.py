@@ -442,15 +442,20 @@ def accepted(saved, name: str, value) -> bool:
     return True
 
 
+EVERY = slice(None)
+"""Every alternative of an option (`witnessed_by`'s `part`)."""
+
+
 def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]],
-                 consumed) -> dict[str, list[str]]:
+                 consumed, part: slice = EVERY) -> dict[str, list[str]]:
     """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
     task holds differs from the run that sets none by it alone, at each alternative in turn until one is
-    consumed (`consumed`: why the saved settings and the loaded task do not witness it, or None). Why
-    each alternative failed, for each option none witnesses."""
+    consumed (`consumed`: why the saved settings and the loaded task do not witness it, or None); of its
+    alternatives `part` alone, each named by its place among them all. Why each alternative failed, for
+    each option none witnesses."""
     failed: dict[str, list[str]] = {}
     for name, values in queued.items():
-        for index, value in enumerate(values):
+        for index, value in [*enumerate(values)][part]:
             try:
                 saved, task = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
             except ValueError as error:  # A reader refused it, which names what refused it: the next.
@@ -476,7 +481,7 @@ class Witnessed(typing.NamedTuple):
 
 
 def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere: frozenset[str] = frozenset(),
-                 chosen: frozenset[str] | None = None) -> Witnessed:
+                 chosen: frozenset[str] | None = None, part: slice = EVERY) -> Witnessed:
     """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
     witness is not: one with no path its settings do not declare derived, or derived from data the run
     leaves unfilled; one set alone to each alternative in turn (`witnessed_by`) none of which trains, saves
@@ -485,7 +490,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
     (`unread`), a released task's export too (`dew export`), where the run exports, which it says. An
     option another run witnessed already (`elsewhere`) is not set again here. Where `chosen` names some, it
     witnesses those of its options alone, so its options' witnesses can run apart (each beside the run's
-    own unset save); it holds the rest as ever."""
+    own unset save); it holds the rest as ever. Of each option's alternatives it sets `part` alone, so an
+    option of several can run its alternatives apart too (`witnessed_by`)."""
     import dew
     from dew.objectives.base import ReleasedTask
 
@@ -540,7 +546,7 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
             missed = unread(dew.pipeline(str(destination)), before, option)
             return None if missed is None else f"its export: {missed}"
         return missed
-    witnessing = witnessed_by(run, root, settings, flags, queued, consumed)
+    witnessing = witnessed_by(run, root, settings, flags, queued, consumed, part)
     failures.update({name: f"no alternative witnesses it: {why}" for name, why in witnessing.items()})
     return Witnessed(options, failures, exports, holding)
 

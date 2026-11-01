@@ -160,6 +160,11 @@ backbone that reads no blocks witnesses its layout's reads, order and framing; o
 blocks its segments, splits and the blocks it reads; a letter readout its labels; a tokenizer that merges its
 unit (the runs' turns: each option on the first run that witnessed it)."""
 
+ALTERNATIVE_UNITS = {"layout.split": 3}
+"""The options whose alternatives are witnessed apart, by how many units: each its own unit's but the last's,
+which takes the rest (`witnessed_on`'s `part`), so an option tried at several alternatives, each a run of its
+own, is a task's no longer than one alternative's (a blocked run's split took three in 191 s, row 2788)."""
+
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("settings",
@@ -195,26 +200,34 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.shards(units=16, per_task=1)
+@pytest.mark.shards(units=18, per_task=1)
 def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
     """`test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line`'s witness of
     DecideSettings, each option on the run that witnesses it (`WITNESSED_ON`), one option a unit of armada's
-    map tasks that records what its run witnessed (`map_judge.record_units`) and a judge that pools them
+    map tasks, or one of its alternatives (`ALTERNATIVE_UNITS`), that records what its run witnessed
+    (`map_judge.record_units`) and a judge that pools them
     (`pooled_units`) and holds every option the runs hold assigned and witnessed; run whole, the units in
     turn."""
     from dew.decision.task import DecideSettings
 
     runs = {builder.__name__: (builder, objective) for builder, objective in TASK_RUNS["DecideSettings"]}
-    units = [(name, option) for name, options in WITNESSED_ON["DecideSettings"].items() for option in options]
-    assert len(units) == 16, "the shards mark counts each option"
+
+    def parts(option: str) -> list[slice]:
+        count = ALTERNATIVE_UNITS.get(option, 1)
+        return [slice(index, index + 1 if index + 1 < count else None) for index in range(count)]
+
+    units = [(name, option, part) for name, options in WITNESSED_ON["DecideSettings"].items()
+             for option in options for part in parts(option)]
+    assert len(units) == 18, "the shards mark counts each option's units"
     label = "the options DecideSettings' runs witness"
 
     def witness(start: int, stop: int) -> list[tuple[list[str], dict[str, str], bool, list[str]]]:
         found = []
-        for name, option in units[start:stop]:
+        for name, option, part in units[start:stop]:
             builder, objective = runs[name]
             options, failures, exports, holding = witnessed_on(
-                builder, objective, DecideSettings, tmp_path / f"{name}-{option}", chosen=frozenset({option}))
+                builder, objective, DecideSettings, tmp_path / f"{name}-{option}-{part.start}",
+                chosen=frozenset({option}), part=part)
             found.append((sorted(options), failures, exports, sorted(holding)))
         return found
 
