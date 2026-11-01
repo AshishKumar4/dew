@@ -122,18 +122,26 @@ def per_key_refusal(dtype, floor: float | None) -> str | None:
 
 
 FAST_PARTS = 2
-"""The bf16 parts of an fp32 operand under the run's fast forms: 16 of its significand's 24 bits, past
-TF32's 10, JAX's default precision for an fp32 product (and fla's), their products the parts' three pairs
-whose orders sum under two. TF32 itself takes no transposed operand on a warpgroup MMA ('Only f16 WGMMA
-supports transposes', tf32-sm90 at the gaps' first head) and none at all on Mosaic's mma.sync."""
+"""The bf16 parts of an fp32 operand under the run's fast forms where its products take no transposed TF32
+operand (`_fast_parts`): 16 of its significand's 24 bits, past TF32's 10, JAX's default precision for an
+fp32 product (and fla's), their products the parts' three pairs whose orders sum under two. TF32 itself
+takes no transposed operand on a warpgroup MMA ('Only f16 WGMMA supports transposes', tf32-sm90 at the gaps'
+first head)."""
 
 
-def _parts(dtype, fast: bool = False) -> int:
-    """The parts a product takes an operand of `dtype` as: one for 16 bits; for fp32 `FAST_PARTS` under the
-    run's fast forms (`fast`), else three."""
+def _fast_parts(family: mosaic.Family) -> int:
+    """The parts an fp32 operand takes under the run's fast forms on `family`: itself, as TF32, where its
+    products take transposed TF32 operands (`Family.transposes_tf32`, mma.sync's), JAX's default precision for
+    an fp32 product and fla's (Triton's tf32 dot); else `FAST_PARTS` bf16 parts."""
+    return 1 if family.takes_tf32 and family.transposes_tf32 else FAST_PARTS
+
+
+def _parts(dtype, family: mosaic.Family, fast: bool = False) -> int:
+    """The parts a product takes an operand of `dtype` as on `family`: one for 16 bits; for fp32
+    `_fast_parts` under the run's fast forms (`fast`), else three."""
     if jnp.dtype(dtype) != jnp.float32:
         return 1
-    return FAST_PARTS if fast else PARTS
+    return _fast_parts(family) if fast else PARTS
 
 
 def _diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -345,13 +353,13 @@ def _merges(call: _Call) -> tuple:
 
 
 def _merged(call: _Call) -> _Operand:
-    """The form the doubling's merges take the inverse and its power in (`_merges`): an fp32 call's parts;
-    a `ranged` 16-bit call's fp32 in `FAST_PARTS` bf16 parts, fp32's range at TF32's precision and past it;
-    else one fp16 part."""
-    if call.held.parts > 1:
+    """The form the doubling's merges take the inverse and its power in (`_merges`): an fp32 call's; a
+    `ranged` 16-bit call's fp32 in its fast forms' parts (`_fast_parts`), fp32's range at TF32's precision or
+    past it; else one fp16 part."""
+    if call.held.dtype == jnp.float32:
         return call.held
     if call.ranged:
-        return _Operand(call.rows, FAST_PARTS, jnp.dtype(jnp.float32))
+        return _Operand(call.rows, _fast_parts(call.family), jnp.dtype(jnp.float32))
     return _Operand(call.rows, 1, jnp.dtype(jnp.float16))
 
 
@@ -1569,13 +1577,16 @@ def _output_held(call: _Call, bv: int) -> _Held:
         values = [_f32(CHUNK, bv), *_held(held, CHUNK, bv), _f32(CHUNK, CHUNK), *_held(held, CHUNK, CHUNK),
                   *products]
         return _Held(phases=(values, [_f32(CHUNK, call.block)] * 4))
-    values = [_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv) + products
+    values = [_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv)
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
-              + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
-              + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
+              + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []))
+    scored = _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK))
     if call.value_width // bv == 1:
-        return _Held(phases=(values, scores))
-    return _Held(phases=(values + scores,))
+        return _Held(phases=(values + products, scores + scored))
+    # One product's fragments at a time where both phases hold at once, the products issuing in turn: each
+    # phase's own beside the other stated an A100's fp32 call at 288 registers a 16-wide output block, where
+    # ptxas needed 248 (tf32-fp32c at 9f82d62c4).
+    return _Held(phases=(values + scores + _widest(products, scored),))
 
 
 @_lowered_once
@@ -1861,7 +1872,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
-    given = _Operand(rows, _parts(dtype, rounded), dtype)
+    given = _Operand(rows, _parts(dtype, family, rounded), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
     # port is its reference). Without it, a `rounded` call's (the SSD's under the run's fast forms, which its
     # route resolves, `recurrence_chunk.fast_rounding`) in the operands' dtype too, as mamba_ssm rounds its

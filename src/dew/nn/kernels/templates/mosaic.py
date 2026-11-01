@@ -934,8 +934,13 @@ class Issuer[Accumulator](abc.ABC):
 
     takes_tf32: bool = False
     """Whether its products take fp32 operands, as TF32 (warpgroup MMA's kind::tf32: Mosaic's wgmma issues
-    fp32 shared-memory operands so); where not (mma.sync, whose Mosaic lowering takes 16-bit, fp8, int
-    and f64 operands), a template splits fp32 operands into bf16 parts instead."""
+    fp32 shared-memory operands so; mma.sync's m16n8k8.tf32, the fork's from 0.12.0.1.post42); where not, a
+    template splits fp32 operands into bf16 parts instead."""
+
+    transposes_tf32: bool = False
+    """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads
+    load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so
+    a product of transposed fp32 operands there takes bf16 parts."""
 
     counts_hooks: bool = True
     """Whether its register model counts what a template's hooks and exact sums hold (side operands' tiles,
