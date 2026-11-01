@@ -1880,7 +1880,14 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores = None, None, v, k, None
-    if per_key and delta:
+    if per_key and delta and kept is not None:
+        # The forward's inverse, weights, memories and corrected values given (`kept`): its scores and gated
+        # keys alone formed again, by the intra and weighted launches without the delta rule's system.
+        alone = dataclasses.replace(call, delta=False)
+        (scores,) = _intra(q, k, hi, lo, beta, taken, alone, scale=scale)
+        (keys,) = _weighted(k, v, None, hi, lo, beta, taken, alone)
+        a = inverse
+    elif per_key and delta:
         system, scores = _intra(q, k, hi, lo, beta, taken, call, scale=scale)
         a = _intra_solve(system, taken, call)
         w, u, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
@@ -1899,7 +1906,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         a = inverse
         if kept is None:
             w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
-    if kept is not None and not per_key:
+    if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected), final = kept, None
     else:
