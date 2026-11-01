@@ -23,9 +23,8 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
 from dew.lora import LoRA
-from dew.mesh import LayoutRefused
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig, ParamGroup, scale_by_m3
+from dew.optim import OptimConfig, ParamGroup, scale_by_m3, weight_decay_mask
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.diloco import DiLoCo
@@ -127,6 +126,13 @@ OPTIMIZERS = {
         **SMOOTH, "per_head": {"layers_*/self_attn/q_proj/kernel": 8}}), {}),
     "normuon": (OptimConfig(optimizer="muon", learning_rate=1e-2,
                             optimizer_opts={**SMOOTH, "neuron_beta2": 0.95}), {}),
+    # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors.
+    "m3": (optax.multi_transform(
+        {"m3": optax.chain(scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=2),
+                           optax.scale_by_learning_rate(1e-2)),
+         "adam": optax.adam(1e-2)},
+        lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params))),
+        {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
     "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
                          optimizer_opts=SMOOTH),
@@ -316,22 +322,18 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
 
 
 @pytest.mark.mesh(devices=8)
-def test_an_optax_transform_that_may_read_a_leaf_whole_is_refused_over_stages():
-    """Over two stages, Adam given as optax builds it places its state, and Adafactor, whose factored
-    moments read a leaf's last two axes, is refused before anything is placed, given built or named by
-    its import path in an `OptimConfig`: over a stacked run it would factor the stages' layers as one
-    matrix. So is M3, whose matrices default to a leaf's first two axes. Over one stage, or over two with
-    every layer whole on every stage (`Layout.stage_local`), the replicated layout the refusal names,
-    Adafactor places."""
+def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
+    """Over two stages, Adam given as optax builds it keeps each run stage-local, and Adafactor, whose
+    factored moments and block clip read a leaf whole, keeps every layer whole on every stage, given built
+    or named by its import path in an `OptimConfig`: no per-layer view of a transform whose reductions
+    only its own code knows is exact short of each layer a leaf of its own, which one program can hold on
+    every stage alone, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
     model = decoder()
-    trainer(model, optax.adam(1e-3), STAGED, 8, ema=None).place()
-    trainer(model, optax.adafactor(1e-3), MeshSpec(fsdp=2), 2, ema=None).place()
-    trainer(model, optax.adafactor(1e-3), STAGED, 8, ema=None, stage_local=False).place()
-    for given in (optax.adafactor(1e-3), OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3),
-                  scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=4)):
-        refused = trainer(model, given, STAGED, 8, ema=None)
-        with pytest.raises(LayoutRefused):
-            refused.place()
+    assert trainer(model, optax.adam(1e-3), STAGED, 8, ema=None).staging.sites
+    for given in (optax.adafactor(1e-3), OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
+        whole = trainer(model, given, STAGED, 8, ema=None)
+        assert not whole.staging.sites
+        assert int(whole.fit(stream(), steps=1, log_every=1).step) == 1
 
 
 @pytest.mark.mesh(devices=8)
