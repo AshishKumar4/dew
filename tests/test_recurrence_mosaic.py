@@ -768,7 +768,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
             if training and not mainloop_backward.backward_holds(
                     *args, tiles=derived, family=family, shared=shared, starts=starts,
-                    max_segments=8 if packed else None, **unwide):
+                    max_segments=8 if packed else None, floor=FLOOR if per_key else None, **unwide):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
@@ -811,7 +811,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or mainloop_backward.backward_holds(
-                *args, tiles=tiles, family=family, shared=shared, starts=starts, **unwide)
+                *args, tiles=tiles, family=family, shared=shared, starts=starts,
+                floor=FLOOR if per_key else None, **unwide)
         if not held:
             # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`,
             # as at the derived tiles): the launches its model refuses held apart (`apart_failures`).
@@ -825,7 +826,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                           array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
             formed = {key: value for key, value in form(name, dtype).items() if key != 'wide' or not training}
             run = functools.partial(mainloop_backward.gradients if training else mainloop.forward, **formed,
-                                    **({} if training else {'floor': FLOOR if per_key else None}))
+                                    floor=FLOOR if per_key else None)
 
             def fn(*operands):
                 *operands, documents = operands if packed else (*operands, None)
