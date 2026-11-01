@@ -710,11 +710,13 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
 def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.DecoderFields,
                   variables: Variables, ids: np.ndarray) -> float:
     """How much farther the source's float32 logits over `ids` (`expected`) are from the float64 truth
-    than the candidate's float32 logits are: the root of the ratio of their summed squared errors, the
-    candidate's floored at the half ulp float32 carries of each element of the truth, the truth the
-    candidate's decoder of the same record and weights in float64, as `gradient_parity`'s. Two float32
-    roundings of one computation sit near one, whatever the probe's depth and width; a computation the
-    candidate does not share puts the source's logits as far from the truth as it differs."""
+    than the candidate's float32 logits are, element by element: the source's largest error over the
+    candidate's, the candidate's floored at the half ulp float32 carries of the truth's largest logit,
+    the truth the candidate's decoder of the same record and weights in float64, as `gradient_parity`'s.
+    Two float32 roundings of one computation sit near one, the candidate's rounding growing with the
+    probe's depth and width as the source's does; a computation the candidate does not share puts the
+    source as far from the truth as it moves any logit. A non-finite logit on either side is no
+    rounding: infinite."""
 
     def logits(dtype: str, network: nn.Module) -> np.ndarray:
         held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
@@ -727,11 +729,14 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
         wide = models.build('causal_transformer',
                             {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
         truth = logits('float64', wide)
+    expected = np.asarray(expected, np.float64)
+    if not all(np.isfinite(values).all() for values in (expected, ours, truth)):
+        return math.inf
     eps = float(np.finfo(np.float32).eps)
-    source_error = float(np.sum((np.asarray(expected, np.float64) - truth) ** 2))
-    dew_error = float(np.sum((ours - truth) ** 2))
-    floor = (eps / 2) ** 2 * float(np.sum(truth ** 2))
-    return math.sqrt(source_error / max(dew_error, floor, np.finfo(np.float64).tiny))
+    floor = eps / 2 * float(np.abs(truth).max())
+    return float(np.abs(expected - truth).max()) / max(float(np.abs(ours - truth).max()), floor,
+                                                       np.finfo(np.float64).tiny)
+
 
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
