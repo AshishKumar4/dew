@@ -2273,7 +2273,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     return count if length is None else min(count, length)
 
 
-def _pass_examples(train: Pipeline, build: _Build) -> int | None:
+def _pass_examples(train: Pipeline, read: Read) -> int | None:
     """The source examples one pass of a training read with no record count holds (`_epoch_records`,
     `Loader.pass_examples`): those reaching where a bound in examples stands (`dew.data.compile._bounded`:
     the first step that packs or windows them or makes several rows of each, else the batch), before any
@@ -2306,19 +2306,19 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
             # A mix by tokens draws each part as its tokens fall short (`TokenDeficit`), which no count of its
             # examples states ahead.
             return None
-        sizes = [_pass_examples(child, build.child(index)) for index, child in enumerate(source.pipelines)]
+        sizes = [_pass_examples(child, read) for child in source.pipelines]
         known = [size for size in sizes if size is not None]
         if len(known) != len(sizes):
             return None
         count = Proportions.of(_weights(source)).covering(known)
-    elif build.read == "streamed" and not _in_memory(source):
+    elif read == "streamed" and not _in_memory(source):
         stated = [shard.rows for shard in source.manifest().shards]
         held = [rows for rows in stated if rows is not None]
         if len(held) != len(stated):
             return None
         count = sum(held)
     else:
-        records = source.records(build.read)
+        records = source.records(read)
         present = _Present.of(records) if _in_memory(source) else None
         count = len(records) if present is None else len(present.positions)
     for stage in prefix:
