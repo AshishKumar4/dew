@@ -53,7 +53,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
 
                     @pl.loop(0, tile + 1)
                     def _(step):
-                        ring.load(first + step, x_gmem.at[pl.ds((first + step) * BLOCK[0], BLOCK[0])])
+                        block = x_gmem.at[pl.ds((first + step) * BLOCK[0], BLOCK[0])]
+                        ring.load(ring.turn(first + step), block)
 
                 ring.drain(jnp.int32(_first_step(TILES)))
 
@@ -64,9 +65,9 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     first = _first_step(tile)
 
                     def step_sum(step, total):
-                        slot = ring.acquire(first + step)
+                        slot = ring.acquire(ring.turn(first + step))
                         block = slot[:, pl.ds(wg * columns, columns)].astype(jnp.float32)
-                        ring.release(first + step)
+                        ring.release(ring.turn(first + step))
                         return total + block
 
                     zero = jnp.zeros((BLOCK[0], columns), jnp.float32)
