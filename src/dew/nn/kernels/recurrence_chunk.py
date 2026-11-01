@@ -1033,12 +1033,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 f"the recurrence template's fast backward takes no gradient of this call ({form}, or its "
                 "launches past the device's at these tiles): the delta rule's selector gives a training call "
                 "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
-        grads = mainloop_backward.gradients(query, key, value, g, beta, state, out_grad, final_grad,
-                                            starts=starts, firsts=firsts, max_segments=max_segments,
-                                            scale=scale, inverse=inverse, kept=kept, delta=delta,
-                                            rounded=rounded, skip=skip, **run)
-        dskip = grads[6] if len(grads) > 6 else None
-        return (*grads[:5], None if state is None else grads[5], None, None,
+        *grads, dh0, dskip = mainloop_backward.gradients(
+            query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
+            max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta, rounded=rounded,
+            skip=skip, **run)
+        return (*grads, None if state is None else dh0, None, None,
                 None if dskip is None else dskip.astype(skip.dtype))
 
     rule.defvjp(forward, backward)
