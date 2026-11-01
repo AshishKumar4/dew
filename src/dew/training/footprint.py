@@ -150,23 +150,79 @@ xla/debug_options_flags.cc); below it XLA's own emitters compute it (`IsMatrixMu
 ForRewriting`, xla/service/gpu/matmul_utils.cc)."""
 
 
+def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.Jaxpr, int, list]:
+    """One trace of `loss(params, *arguments)`'s forward and backward: the program `jax.vjp`'s pullback
+    runs on a cotangent of ones, returning the gradient's leaves and then the pullback's own, its
+    residuals; how many gradient leaves lead its outputs; and the residuals' traced shapes."""
+    def both(params, *arguments):
+        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
+        return pullback(jax.tree.map(jax.numpy.ones_like, outputs)), pullback
+    closed, (gradients, pullback) = jax.make_jaxpr(both, return_shape=True)(params, *arguments)
+    count = len(jax.tree.leaves(gradients))
+    return closed.jaxpr, count, jax.tree.leaves(pullback)
+
+
+def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: Workspace,
+                  lowering: str | None = None, consumed: bool = False) -> tuple[int, Peak]:
+    """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
+    backward (`traced_gradient`), as each derives it from its own."""
+    traced = traced_gradient(loss, params, arguments)
+    lowering = lowering or LOWERED.get(platform, platform)
+    return _kept(*traced, platform, lowering), _peak(*traced, platform, workspace, lowering, consumed)
+
+
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
                    lowering: str | None = None) -> int:
     """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share,
-    as XLA's fusion for `platform` keeps them: each value its traced program (`jax.make_jaxpr` of
-    `jax.vjp`'s pullback, as JAX lowers it for `lowering`, `platform`'s own name where none is given,
-    a GPU's CUDA's: `compiled`) closes over counts the values it is computed
-    from without a buffer (`Frontier.reading`), once, but those the program reads, which the state and
-    the batch already hold, and literals; a value in pinned host memory counts none. A value the
-    pullback closes over keeps its own traced sharding; one whose trace states none, and every other
-    value, count whole. Matching an axis's size to the batch size cannot identify its sharding: a weight
-    or a scan's layer axis can have that size too."""
-    def pullback(params, *arguments):
-        return jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)[1]
+    as XLA's fusion for `platform` keeps them: each value its traced program (`jax.vjp`'s pullback, its
+    residuals the outputs of `traced_gradient`'s program past the gradient, as JAX lowers it for
+    `lowering`, `platform`'s own name where none is given, a GPU's CUDA's: `compiled`) closes over counts
+    the values it is computed from without a buffer (`Frontier.reading`), once, but those the program
+    reads, which the state and the batch already hold, and literals; a value in pinned host memory counts
+    none. A value the pullback closes over keeps its own traced sharding; one whose trace states none, and
+    every other value, count whole. Matching an axis's size to the batch size cannot identify its
+    sharding: a weight or a scan's layer axis can have that size too."""
+    lowering = lowering or LOWERED.get(platform, platform)
+    return _kept(*traced_gradient(loss, params, arguments), platform, lowering)
 
-    closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
-    program = compiled(closed.jaxpr, lowering or LOWERED.get(platform, platform))
-    placed = {value: shape for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True)
+
+def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
+                  workspace: Workspace, lowering: str | None = None, consumed: bool = False) -> Peak:
+    """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
+    device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
+    `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
+    below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
+    forward and backward (`traced_gradient`, its outputs the gradient's), as JAX lowers it for `lowering`
+    (`compiled`; `platform`'s own name where none is given, a GPU's CUDA's). Each gradient is held to the
+    end, or, `consumed`, while it is made and no longer (`peak_bytes`'s): where the step reads it there
+    into the buffers the state donates (`consumed_where_made`), the optimizer's update or the
+    accumulator's sum written in place (the donated state's outputs alias its arguments,
+    `HloInputOutputAliasConfig`), and XLA's memory-minimizing schedule runs a consumer that frees its
+    operand as soon as it is ready (`ListScheduler::BytesFreedIfScheduled`,
+    xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
+    xla/service/gpu/gpu_hlo_schedule.cc)."""
+    return _peak(*traced_gradient(loss, params, arguments), platform, workspace,
+                 lowering or LOWERED.get(platform, platform), consumed)
+
+
+def _kept(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, lowering: str) -> int:
+    """`residual_bytes` of `traced_gradient`'s program, its outputs past the first `count` the residuals."""
+    return _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes, platform)
+
+
+def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, workspace: Workspace,
+          lowering: str, consumed: bool = False) -> Peak:
+    """`gradient_peak` of `traced_gradient`'s program, its first `count` outputs the gradient."""
+    del shapes
+    lowered = compiled(program.replace(outvars=program.outvars[:count]), lowering)
+    return Peak(peak_bytes(lowered, platform, workspace, consumed=consumed),
+                not bounded_below(lowered, platform))
+
+
+def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
+    """`residual_bytes` of `program`, a pullback's traced program whose outputs are its residuals, each of
+    the traced `shapes`."""
+    placed = {value: shape for value, shape in zip(program.outvars, shapes, strict=True)
               if not isinstance(value, jcore.Literal)}
     frontier = Frontier(program, platform, returned=False)
     total = 0
@@ -180,30 +236,6 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
         total += (math.prod(aval.shape) * aval.dtype.itemsize if shape is None or shape.sharding is None
                   else placed_bytes(shape))
     return total
-
-
-def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
-                  workspace: Workspace, lowering: str | None = None, consumed: bool = False) -> Peak:
-    """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
-    device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
-    `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
-    below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
-    forward and backward, as JAX lowers it for `lowering` (`compiled`; `platform`'s own name where none
-    is given, a GPU's CUDA's). Each gradient is held to the end, or, `consumed`, while it is made and no
-    longer (`peak_bytes`'s): where the step reads it there into the buffers the state donates
-    (`consumed_where_made`), the optimizer's update or the accumulator's sum written in place (the donated
-    state's outputs alias its arguments, `HloInputOutputAliasConfig`), and XLA's memory-minimizing schedule
-    runs a consumer that frees its operand as soon as it is ready (`ListScheduler::BytesFreedIfScheduled`,
-    xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
-    xla/service/gpu/gpu_hlo_schedule.cc)."""
-    def gradient(params, *arguments):
-        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
-        return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
-
-    program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
-    lowered = compiled(program, lowering or LOWERED.get(platform, platform))
-    return Peak(peak_bytes(lowered, platform, workspace, consumed=consumed),
-                not bounded_below(lowered, platform))
 
 
 def consumed_where_made(optimizer: optax.GradientTransformation | None, state: TrainState,
@@ -658,11 +690,10 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 np.asarray([device]).reshape((1,) * len(mesh.axis_names)), mesh.axis_names,
                 axis_types=mesh.axis_types)):
             lowering = lowering_platform(target)
-            residuals = residual_bytes(trained, arguments[0]["params"], arguments, platform=target.platform,
-                                       lowering=lowering)
-            peak = gradient_peak(trained, arguments[0]["params"], arguments, platform=target.platform,
-                                 workspace=gemm_workspace(target), lowering=lowering,
-                                 consumed=consumed_where_made(optimizer, prepared, window))
+            residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
+                                            platform=target.platform, workspace=gemm_workspace(target),
+                                            lowering=lowering,
+                                            consumed=consumed_where_made(optimizer, prepared, window))
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
