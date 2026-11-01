@@ -193,8 +193,9 @@ def private() -> bool:
     ci.py's `alone` gave this process (`PRIVATE`)."""
     if not (own := os.environ.get(PRIVATE)):
         return False
-    own = os.path.join(os.path.abspath(own), "")
-    beneath = lambda where: os.path.join(os.path.abspath(where), "").startswith(own)  # noqa: E731
+    own = os.path.join(os.path.realpath(own), "")
+    # Each store as it resolves: a link beneath the caches to a store elsewhere is that store (review).
+    beneath = lambda where: os.path.join(os.path.realpath(where), "").startswith(own)  # noqa: E731
     # The store JAX writes to now, which `jax.config.update` or `enable_compilation_cache` set whatever the
     # environment says, and beside which Dew keeps its rungs (`dew.cache.beside_compilation_cache`).
     jax = sys.modules.get("jax")
@@ -215,32 +216,69 @@ CREATED: set[str] = set()
 """The files this process opened to write: what it reads of them again is its own (`outside`)."""
 
 
-def outside(name: str, root: str) -> bool:
-    """Whether a read of file `name` reads what another process of the task may have left there, which no key
-    holds: an existing file in the machine's shared scratch (`SHARED_ROOTS`) or the user's home, made or
-    changed since the task began (`STARTED_AT`; its change time too, which a copy's mtime from its source
-    hides), outside the checkout `root`, this file's own scratch and caches (ci.py's `alone`: TMPDIR,
-    `PRIVATE`), the interpreter and its environment and compiled bytecode, and not one this process wrote
-    (`CREATED`): one file of a task writes /tmp/result and the next reads it, an edit to the first then
-    failing the second, whose record never named the first's code. What was there before the task began no
-    process of it left: the environment's files and the harness's own where a test runs these tools on a
-    checkout of its own (the venv's pyvenv.cfg, which Python 3.12's site reads before it sets sys.prefix to
-    the venv, its packages' metadata, the plugins), a tool or a fixture a test put in place ahead of it."""
+def beneath(name: str, where: str) -> bool:
+    """Whether absolute path `name` lies beneath directory `where`, as each resolves."""
+    return name.startswith(os.path.join(os.path.realpath(where), ""))
+
+
+def owned(name: str) -> bool:
+    """Whether `name` is this process's own to read whoever made it: in this file's own scratch and caches
+    (ci.py's `alone`: TMPDIR, `PRIVATE`), the interpreter and its environment, uv's cache of packages by their
+    digests, or compiled bytecode, or a file this process wrote (`CREATED`)."""
     import tempfile
 
-    beneath = lambda where: name.startswith(os.path.join(os.path.realpath(where), ""))  # noqa: E731
-    if not any(beneath(shared) for shared in (*SHARED_ROOTS, os.path.expanduser("~"))):
-        return False
-    own = [root, tempfile.gettempdir(), sys.prefix, sys.base_prefix, sys.exec_prefix,
+    own = [tempfile.gettempdir(), sys.prefix, sys.base_prefix, sys.exec_prefix,
            *(where for where in (os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR")) if where)]
-    if any(beneath(where) for where in own) or name in CREATED or "__pycache__" in name.split(os.sep):
-        return False
+    return any(beneath(name, where) for where in own) or name in CREATED \
+        or "__pycache__" in name.split(os.sep)
+
+
+def made_since(name: str) -> bool | None:
+    """Whether `name` was made or changed since the task began (`STARTED_AT`; its change time too, which a
+    copy's mtime from its source hides): None where no start is known, False where it is not there."""
+    started = os.environ.get(STARTED_AT)
+    if not started:
+        return None
     try:
         found = os.stat(name)
     except OSError:
         return False
-    started = os.environ.get(STARTED_AT)
-    return os.path.isfile(name) and (not started or max(found.st_mtime, found.st_ctime) >= float(started))
+    return max(found.st_mtime, found.st_ctime) >= float(started)
+
+
+def outside(name: str, root: str) -> bool:
+    """Whether a read of file `name` reads what another process of the task may have left there, which no key
+    holds: an existing file in the machine's shared scratch (`SHARED_ROOTS`), the user's home or the checkout
+    `root` (a hidden directory of it, which no record keys, or a file a test wrote there), made or changed
+    since the task began (`made_since`), and not this process's own (`owned`): one file of a task writes
+    /tmp/result, or .memo/result in the checkout, and the next reads it, an edit to the first then failing the
+    second, whose record never named the first's code. What was there before the task began no process of it
+    left: the checkout as it was checked out, the environment's files and the harness's own where a test runs
+    these tools on a checkout of its own (the venv's pyvenv.cfg, which Python 3.12's site reads before it sets
+    sys.prefix to the venv, its packages' metadata, the plugins), a tool or a fixture a test put in place
+    ahead of it. Where no start is known, every file in shared scratch or the home outside the checkout is."""
+    shared = any(beneath(name, where) for where in (*SHARED_ROOTS, os.path.expanduser("~")))
+    if not (shared or beneath(name, root)) or owned(name) or not os.path.isfile(name):
+        return False
+    since = made_since(name)
+    return shared and not beneath(name, root) if since is None else since
+
+
+def shared_scratch(name: str) -> bool:
+    """Whether `name` is the machine's shared scratch (`SHARED_ROOTS`) or beneath it, and not this process's
+    own (`owned`): a listing of it, or a probe of a path in it, answers by what another process of the task
+    may have left there (`leaving`)."""
+    return any(name == os.path.realpath(where) or beneath(name, where) for where in SHARED_ROOTS) \
+        and not owned(name)
+
+
+def leaving(name: str, root: str) -> bool:
+    """Whether a probe of path `name` (`probed`) answers by what another process of the task may have left:
+    one in shared scratch (`shared_scratch`) that is not there or was made since the task began, whose arrival
+    or absence another file's run decides; or one in the home or the checkout made since (`outside`)."""
+    if shared_scratch(name) and os.path.realpath(name) not in map(os.path.realpath, SHARED_ROOTS):
+        return made_since(name) is not False or not os.path.lexists(name)
+    return outside(name, root)
 
 
 def read(event: str, args: tuple, root: str) -> str | None:
@@ -259,7 +297,14 @@ def read(event: str, args: tuple, root: str) -> str | None:
         written = any(letter in mode for letter in "wax+") if mode is not None else (
             flags & os.O_ACCMODE != os.O_RDONLY)
         if written:
-            CREATED.add(os.path.abspath(os.fsdecode(path)))
+            opened = os.path.abspath(os.fsdecode(path))
+            # An open that keeps what was there (an append, a read and write) reads it on: another process's
+            # leaving before it is this process's own (review: a writer and an append-reader in scratch).
+            kept = "a" in mode or ("+" in mode and "w" not in mode) if mode is not None else not (
+                flags & os.O_TRUNC or (flags & os.O_CREAT and flags & os.O_EXCL))
+            if kept and outside(opened, root):
+                return f"{OUTSIDE}{opened}"
+            CREATED.add(opened)
         if written or (mode is None and getattr(placing, "relative", False)):
             return None
         # The source loader's read of the module's text on its way to compiling it (its get_code beneath
@@ -279,6 +324,9 @@ def read(event: str, args: tuple, root: str) -> str | None:
         return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
     if event == "open" and outside(name, root):
+        return f"{OUTSIDE}{name}"
+    # A listing of shared scratch names what other processes of the task left there.
+    if event != "open" and shared_scratch(name):
         return f"{OUTSIDE}{name}"
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
@@ -554,10 +602,14 @@ def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: 
         # A path relative to a directory descriptor (os.stat's dir_fd) is placed in the directory it names.
         at = keywords.get("dir_fd")
         base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
-        if not isinstance(path, int) and not listing_tool(sys._getframe(1).f_code.co_filename) and (
-                name := placed(os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))),
-                               root)) is not None:
-            recorded(PROBED + name)
+        if not isinstance(path, int) and not listing_tool(sys._getframe(1).f_code.co_filename):
+            asked_for = os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path))))
+            # A probe of what another process of the task may have left, or may yet leave, in shared scratch
+            # (`leaving`): its answer is no key's (review: a writer and an absolute-path prober).
+            if leaving(asked_for, root):
+                recorded(OUTSIDE + asked_for)
+            elif (name := placed(asked_for, root)) is not None:
+                recorded(PROBED + name)
         placing.probing = True
         try:
             return probe(path, *arguments, **keywords)

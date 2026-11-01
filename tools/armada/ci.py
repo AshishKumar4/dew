@@ -1600,7 +1600,8 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the process's group opens, held from before pytest starts until its group stopped
     # (`watched`): each is the file's input.
-    opens = watched.Opens(os.getcwd())
+    opens = watched.Opens(os.getcwd(), float(environment[followed.STARTED_AT]), followed.SHARED_ROOTS,
+                          (scratch, str(caches)))
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 

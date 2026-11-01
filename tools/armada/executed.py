@@ -139,7 +139,11 @@ def pytest_configure(config):
 
 
 def pytest_deselected(items):
+    """The tests a selection set aside, tallied; and their markers keyed as every collected test's: the marker
+    hook runs after the selection, and the file collected these too, so a registration one names is its input
+    (review: a helper's alias on a test `-m` set aside, its registration then removed)."""
     tally(deselected, items)
+    pytest_collection_modifyitems_markers(items)
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
