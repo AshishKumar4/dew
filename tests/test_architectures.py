@@ -514,10 +514,10 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
-    for (run, fitted), stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
+    for (_, fitted), stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
         ours = stepped(*own)
         for name, tree in ours.items():
-            held = jax.device_get(getattr(run._staging.saved(fitted), name))
+            held = jax.device_get(getattr(fitted, name))
             assert jax.tree.structure(tree) == jax.tree.structure(held), name
             for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
                 mine, theirs = np.asarray(mine), np.asarray(theirs)
@@ -534,21 +534,24 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     if mesh.fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return
-    sharded = fsdp_leaves(state.variables)
-    assert sharded, "no parameter was sharded over the fsdp axis"
-    for param in sharded:
-        # A pipelined run's leaf is stacked by stage, each stage's layers on its own devices.
-        stages = mesh.stage if "stage" in split_axes([param]) else 1
-        assert param.addressable_shards[0].data.size == param.size // (mesh.fsdp * stages), \
-            "shard is not the fsdp axis's part of the global parameter"
+    # The state fit returns, every layer whole, and the one the step holds (`place`), a pipelined run's
+    # leaf stacked by stage, each stage's layers on its own devices.
+    placed = make_trainer(case, tmp_path / "adam", mesh, optimizer=optax.adam(1e-3))[0].place()[0]
+    for held in (state, placed):
+        sharded = fsdp_leaves(held.variables)
+        assert sharded, "no parameter was sharded over the fsdp axis"
+        for param in sharded:
+            stages = mesh.stage if "stage" in split_axes([param]) else 1
+            assert param.addressable_shards[0].data.size == param.size // (mesh.fsdp * stages), \
+                "shard is not the fsdp axis's part of the global parameter"
     # The optimizer's state and the EMA copy follow the params they track,
     # without the optimizer or the model ever describing a layout.
     param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(state.variables["params"])]
     assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state[0].trace)]
     assert {leaf.sharding.spec for leaf in jax.tree.leaves(state.ema)} <= set(param_specs)
-    adam = make_trainer(case, tmp_path / "adam", mesh, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
-    for moment in (adam.mu, adam.nu):
-        assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
+    placed_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(placed.variables["params"])]
+    for moment in (placed.opt_state[0].mu, placed.opt_state[0].nu):
+        assert placed_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
 
 
 # --------------------------------------------------------------------------
