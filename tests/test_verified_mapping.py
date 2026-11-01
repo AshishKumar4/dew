@@ -280,7 +280,8 @@ SEED_OSS = {"architectures": ["SeedOssForCausalLM"], "attention_bias": True, "at
             "head_dim": 128, "hidden_act": "silu", "hidden_size": 5120, "initializer_range": 0.02,
             "intermediate_size": 27648, "max_position_embeddings": 524288, "mlp_bias": False,
             "model_type": "seed_oss", "num_attention_heads": 80, "num_hidden_layers": 64,
-            "num_key_value_heads": 8, "residual_dropout": 0.1, "rms_norm_eps": 1e-06, "rope_scaling": {"rope_type": "default"}, "rope_theta": 10000000.0,
+            "num_key_value_heads": 8, "residual_dropout": 0.1, "rms_norm_eps": 1e-06,
+            "rope_scaling": {"rope_type": "default"}, "rope_theta": 10000000.0,
             "tie_word_embeddings": False, "torch_dtype": "bfloat16", "transformers_version": "4.55.0",
             "use_cache": True, "vocab_size": 155136}
 """ByteDance-Seed/Seed-OSS-36B-Instruct's config.json."""
