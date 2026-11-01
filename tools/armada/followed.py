@@ -465,31 +465,24 @@ def _beneath_spawnv() -> bool:
     return False
 
 
+OPERANDS = ("-X", "-W", "--check-hash-based-pycs")
+"""The interpreter's options that take the argument after them as theirs (`sited`)."""
+
+
 def sited(argv) -> bool:
     """Whether Python started with command line `argv` makes its site, where the `.pth` that starts `follow`
-    runs (`installed`): no -S among the options before its program, read as the interpreter reads them, one
-    letter at a time within a group (`-BS`), an option that takes an argument (-X, -W) taking the group's rest
-    or, where the group ends with it, the next argument (`-X utf8`, `-BX utf8`: review), and -c or -m ending
-    the options."""
+    runs (`installed`): no -S among the options before its program, an option's own argument (`OPERANDS`:
+    `-X utf8`) read as the option's, not as the program (review)."""
     arguments = [os.fsdecode(argument) for argument in list(argv)[1:]]
-    operand = False
-    for argument in arguments:
-        if operand:
-            operand = False
+    for index, argument in enumerate(arguments):
+        if index and arguments[index - 1] in OPERANDS:
             continue
-        if argument == "-" or not argument.startswith("-"):
+        if argument in ("-c", "-m", "-") or not argument.startswith("-"):
             return True
-        if argument.startswith("--"):
-            operand = argument == "--check-hash-based-pycs"
+        if argument.startswith(("--", "-X", "-W")):
             continue
-        for at, letter in enumerate(argument[1:], start=2):
-            if letter == "S":
-                return False
-            if letter in "cm":
-                return True
-            if letter in "XW":
-                operand = at == len(argument)
-                break
+        if "S" in argument[1:]:
+            return False
     return True
 
 

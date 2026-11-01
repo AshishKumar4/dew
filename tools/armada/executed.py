@@ -145,9 +145,7 @@ def pytest_configure(config):
     pytest's own reads of them, at configure and at a mark's first use, are none. And each marker a lookup
     asks for (`pytest.mark.<name>`, which --strict-markers validates as it looks it up), its owner's input
     whether any test then carries it or not (review: a helper evaluating an unregistered marker it never
-    applies fails its importers' collection once the registration goes). Its settings read, a pytest that
-    configures after it in this process (a test's `pytest.main`) is another session (`lifetime.settled`)."""
-    lifetime.settled()
+    applies fails its importers' collection once the registration goes)."""
     marks_watched()
     getini = config.getini
 
