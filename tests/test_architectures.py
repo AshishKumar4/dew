@@ -391,9 +391,21 @@ LAYOUT_CELLS = [*((case, steps, layout) for index, case in enumerate(CASES)
                 *((case, PIPELINED[case.name], "2x2x2 stage") for case in CASES if case.name in PIPELINED)]
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), LAYOUT_CELLS,
-                         ids=[f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
-                              for case, steps, layout in LAYOUT_CELLS])
+SHARDED = "unet_3d"
+"""The case whose layout cells' draws run as armada's map tasks (`check1_shards`): its cells' fixed cost, 73 s
+a task on one core, leaves room for eight of its seeds' draws, 5 s each, within 120 s (row 2788)."""
+
+
+def cell_ids(cells) -> list[str]:
+    """Each layout cell's test id: its case, its steps and its layout's kind."""
+    return [f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}" for case, steps, layout in cells]
+
+
+UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell[0].name != SHARDED]
+SHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell[0].name == SHARDED]
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
     replicated, the batch split across every device), 2x4 fsdp (the
@@ -409,6 +421,20 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     orders of magnitude. The steps check 1 draws are `fit`'s own on the
     run's batch, bit for bit, each compiled once for every draw. Adam's two
     moments and its count follow the parameters' placement too."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), SHARDED_CELLS, ids=cell_ids(SHARDED_CELLS))
+@pytest.mark.check1_shards(seeds=32, per_task=8)
+def test_a_3d_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the 3D U-Net (`SHARDED`), its
+    declared draws as armada's map tasks and one judge (`check1_shards`, `LAYOUT_SEEDS`)."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """A cell of `test_architecture_trains_on_every_layout_as_on_one_device`: `case` trained `steps` steps
+    on `layout` as on one device (check 1)."""
     trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
     initial = trainer.initial_state()
 
