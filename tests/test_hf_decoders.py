@@ -1728,12 +1728,21 @@ def test_a_config_of_a_type_transformers_lacks_reads_its_layers_by_its_familys_c
 def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     """A tool that builds a checkpoint's decoder from its config reads it as a load of its language model
     does (`decoder_config`, ledger 3006): Qwen 3.5's wrapper unties its head at its own scope over a text
-    config that ties it, and states its modeling overrides there; a registered family that reads its whole
-    record (Kimi K2.5's) is read as it is."""
+    config that ties it, which tools/kernel_picks.py's decoder (`model_of`) unties as the load does, and
+    states its modeling overrides there; a registered family that reads its whole record (Kimi K2.5's) is
+    read as it is."""
+    import argparse
+
     from dew.interop.hf_decoders import decoder_config
+    from dew.interop.pretrained import Pretrained
+    from tools import kernel_picks
 
     native = json.loads((FIXTURES / "qwen35-native-tiny" / "config.json").read_text())
     assert native["text_config"]["tie_word_embeddings"] and not native["tie_word_embeddings"]
+    picked = kernel_picks.model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-native-tiny"),
+                                                      revision=None, dtype="float32"))
+    loaded = Pretrained.load(FIXTURES / "qwen35-native-tiny", text_only=True, dtype="float32")
+    assert not picked.tie_embeddings and picked.tie_embeddings == loaded.model.tie_embeddings
     assert not translate_config(decoder_config(native))["tie_embeddings"]
     assert translate_config(native["text_config"])["tie_embeddings"]
     blocks = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())

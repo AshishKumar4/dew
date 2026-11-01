@@ -292,11 +292,36 @@ def test_a_deep_release_verifies_at_its_probes_cut_depth_as_at_its_own():
     probe's widths, and verifies as Qwen2's convention there as at full depth: the probe holds the
     candidate's logits to the float64 truth on par with the source's (`verify.logits_parity`), which
     rounding meets at any depth and width, where a fixed rounding per layer measured on narrow fixtures
-    refused it at two layers."""
-    from dew.interop.verify import VerifiedMapping, verify_mapping
+    refused it at two layers. The load's route reads it so (`source_route`), before any weight downloads."""
+    from dew.interop.pretrained import VerifiedRoute, source_route
 
-    verified = verify_mapping(SEED_OSS)
-    assert isinstance(verified, VerifiedMapping) and verified.family == "qwen2"
+    route = source_route(SEED_OSS)
+    assert isinstance(route, VerifiedRoute) and route.verified.family == "qwen2"
+
+
+def test_a_source_computing_the_candidates_own_float32_as_users_run_it_sits_at_parity_one():
+    """The probe's candidate runs its float32 as a user's process runs it (`precision.FP32_SUMS`), not
+    under the test process's wide CPU sums (`precision.WIDE_CPU_ARITHMETIC`, on here): a source whose
+    logits are the candidate's own as users compute them rounds as the candidate does, so its distance to
+    the float64 truth is the candidate's, the ratio exactly one (`verify.logits_parity`)."""
+    import jax
+    import numpy as np
+    from interop_support import tiny_config
+
+    from dew.interop import decoder_parts, verify
+    from dew.interop.decoder_families import ENTRIES
+    from dew.nn.precision import FP32_SUMS, wide_cpu_arithmetic
+    from dew.registry import models
+
+    assert wide_cpu_arithmetic()
+    family = next(entry for entry in ENTRIES if "llama" in entry.model_types)
+    record = decoder_parts.translate_family_config(tiny_config("llama").to_dict(), family)[0]
+    model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
+    ids = verify.probe_ids(record["vocab_size"])
+    variables = model.init(jax.random.key(0), ids)
+    with jax.default_matmul_precision(FP32_SUMS):
+        users = np.asarray(model.apply(variables, ids))
+    assert verify.logits_parity(users, model, record, variables, ids) == 1.0
 
 
 def test_a_probe_keeps_the_depth_of_code_not_transformers_own():

@@ -51,6 +51,7 @@ from dew import _records
 from dew.cache import package_digest
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
+from dew.nn import precision
 from dew.nn.blocks import padded_row
 from dew.objectives.base import Variables
 from dew.registry import models
@@ -114,17 +115,18 @@ _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # gradient by more than about 3.5e-4 of itself, the square root of eps, is above it.
 _GRADIENT_PARITY = float(np.finfo(np.float32).eps) ** -0.5
 # How much farther the source's float32 logits on the probe may be from the float64 truth than the
-# candidate's, element by element (`logits_parity`: the largest errors' ratio). Two float32 roundings of
-# one computation measure 0.72 to 3.66: 0.73 to 1.34 over the released configs tier 2 verifies at their
-# probes' cut depths and widths (Hy3, LFM2.5-230M, Seed-OSS-36B, SmolLM3, Hunyuan-A13B, OLMo 2,
-# GLM-4.7-Flash, StableLM, ERNIE 4.5, Granite 4.1, OLMoE, LFM2-24B-A2B), and up to 3.66 over the tests'
-# sources (tests/test_tier2_parts.py's remote composition), whose wide CPU sums put the candidate nearer
-# the truth (armada IGPAR6). The bound is twice the largest. A computation the candidate does not share
-# moves it by its effect over the candidate's own rounding, which grows with the probe as the source's
-# does: logits scaled by 1 + 1e-5 put it at 6.6 to 10.6 and by 1 + 1e-4 at 65 to 111, one logit moved by
-# 1e-4 at 11 to 17 (tools/gradient_parity.py's Seed-OSS, Llama and Qwen3-MoE at logits up to 6.8, armada
-# IGSENS), where a fixed rounding per layer refused Seed-OSS's rounding at a 2-layer cut of its 64 layers.
-_LOGITS_PARITY = 7.31
+# candidate's, element by element (`logits_parity`: the largest errors' ratio), the candidate's float32 run
+# as users run it (`precision.FP32_SUMS`). Two float32 roundings of one computation measure 0.70 to 1.57
+# (armada IGPAR8): over the released configs tier 2 verifies at their probes' cut depths and widths (Hy3,
+# LFM2.5-230M, LFM2-24B-A2B, Seed-OSS-36B, SmolLM3, Hunyuan-A13B, OLMo 2, GLM-4.7-Flash, StableLM,
+# ERNIE 4.5, Granite 4.1, OLMoE), over tools/gradient_parity.py's types and composition, and over the
+# tests' sources, StableLM's tiny config the largest. The bound is twice the largest. A computation the
+# candidate does not share moves it by its effect over the candidate's own rounding, which grows with the
+# probe as the source's does: logits scaled by 1 + 1e-5 put it at 6.6 to 10.6, by 1 + 1e-4 at 65 to 111,
+# and one logit moved by 1e-4 at 11 to 17 (tools/gradient_parity.py's Seed-OSS, Llama and Qwen3-MoE at
+# logits up to 6.8, armada IGSENS), where a fixed rounding per layer refused Seed-OSS's own rounding at a
+# 2-layer cut of its 64 layers.
+_LOGITS_PARITY = 3.14
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
@@ -717,19 +719,21 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
     Two float32 roundings of one computation sit near one, the candidate's rounding growing with the
     probe's depth and width as the source's does; a computation the candidate does not share puts the
     source as far from the truth as it moves any logit. A non-finite logit on either side is no
-    rounding: infinite."""
+    rounding: infinite. The candidate's float32 runs as a user's process runs it: its products summed in
+    float32 (`precision.FP32_SUMS`), not in TF32 on a GPU, nor in float64 as a test process's wide CPU
+    arithmetic sums them (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than
+    users get and the ratio past what users' rounding reaches."""
 
-    def logits(dtype: str, network: nn.Module) -> np.ndarray:
+    def logits(dtype: str, network: nn.Module, algorithm: str) -> np.ndarray:
         held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
-        # A GPU's default runs fp32 matmuls in TF32, which is not the float32 the source runs.
-        with jax.default_matmul_precision('highest'):
+        with jax.default_matmul_precision(algorithm):
             return np.asarray(network.apply(held, ids), np.float64)
 
-    ours = logits('float32', model)
+    ours = logits('float32', model, precision.FP32_SUMS)
     with jax.enable_x64(new_val=True):
         wide = models.build('causal_transformer',
                             {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
-        truth = logits('float64', wide)
+        truth = logits('float64', wide, 'highest')
     expected = np.asarray(expected, np.float64)
     if not all(np.isfinite(values).all() for values in (expected, ours, truth)):
         return math.inf
