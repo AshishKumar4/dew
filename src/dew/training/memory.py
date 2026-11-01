@@ -362,34 +362,46 @@ def local_devices(mesh: Mesh) -> list:
     return [device for device in mesh.devices.flat if device.process_index == process]
 
 
-def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> None:
-    """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's,
-    with the check that said it fits (`fitted`, `memory_record`) and what `mesh`'s devices of this
-    process hold now, each GPU's bytes free outside XLA's pool (`outside_pool`) among it. A first run
-    that succeeds logs what it took outside the pool on each GPU: its collectives' communicators
-    (NCCL) take their buffers there as it first runs them."""
+class FirstRunFailed(RuntimeError):
+    """A newly compiled step's first run its devices refused: the record of the check that said it fits
+    (`fitted`, `memory_record`) and what this process's devices of its mesh hold now (`now`), each GPU's
+    bytes free outside XLA's pool (`outside_pool`) among it."""
+
+    def __init__(self, step: int, fitted: JSON, now: list[JSON]):
+        self.fitted, self.now = fitted, now
+        super().__init__(
+            f"the training step compiled for step {step} failed on its first run. It was checked to fit: "
+            f"{json.dumps(fitted)}; the devices now hold {json.dumps(now)}. 'outside' is a GPU's bytes free "
+            "outside XLA's pool, whose limit is its bytes_limit (XLA_PYTHON_CLIENT_MEM_FRACTION of the GPU): "
+            "a collective's communicators (NCCL) take their buffers there, beside cuBLAS's workspaces and "
+            "the kernels loaded, and a lower fraction leaves them more")
+
+
+def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str, dict[int, int]]:
+    """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's
+    (`FirstRunFailed`). A first run that succeeds returns, and logs, each GPU's bytes free outside XLA's
+    pool as the fit check read them (`fitted`) and now: what the devices took there since, every
+    process's and a pool's growth counted, the step's collectives' communicators (NCCL) among it."""
     devices = local_devices(mesh)
     try:
         loss.block_until_ready()
     except jax.errors.JaxRuntimeError as error:
-        now = [{"id": device.id, "outside": outside_pool(device),
-                **{key: value for key, value in (device.memory_stats() or {}).items()
-                   if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
-               for device in devices]
-        raise RuntimeError(
-            f"the training step compiled for step {step} failed on its first run. It was checked to "
-            f"fit: {json.dumps(fitted)}; the devices now hold {json.dumps(now)}. 'outside' is a GPU's "
-            "bytes free outside XLA's pool, whose limit is its bytes_limit (XLA_PYTHON_CLIENT_MEM_FRACTION "
-            "of the GPU): a collective's communicators (NCCL) take their buffers there, beside cuBLAS's "
-            "workspaces and the kernels loaded, and a lower fraction leaves them more") from error
+        now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
+                            **{key: value for key, value in (device.memory_stats() or {}).items()
+                               if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+                           for device in devices]
+        raise FirstRunFailed(step, fitted, now) from error
     listed = fitted.get("devices") if isinstance(fitted, dict) else None
     checked = {integer(device["id"], "id"): outside for device in (listed if isinstance(listed, list) else ())
                if isinstance(device, dict) and isinstance(outside := device.get("outside"), int)}
-    taken = {device.id: checked[device.id] - free for device in devices
-             if device.id in checked and (free := outside_pool(device)) is not None}
-    if taken:
-        _log.info("the step's first run took %s bytes outside XLA's pool on its GPUs, its collectives' "
-                  "communicators among them", taken)
+    current = {device.id: free for device in devices
+               if device.id in checked and (free := outside_pool(device)) is not None}
+    observed = {"checked": {device: checked[device] for device in current}, "now": current}
+    if current:
+        _log.info("the GPUs' free bytes outside XLA's pool: %s as the step's fit check read them, %s after "
+                  "its first run, which takes its collectives' communicators there", observed["checked"],
+                  current)
+    return observed
 
 
 def outside_pool(device) -> int | None:
