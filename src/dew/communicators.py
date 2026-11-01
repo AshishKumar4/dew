@@ -216,8 +216,10 @@ def configuration() -> dict:
 
 FORM = 6
 """The form of the measurements Dew keeps, which names their place in the cache: a change to what the child
-measures or how it writes it, or to how a program's communicators are read (`collectives_of`), takes the
-next, so a host measures and reads afresh rather than read an earlier one."""
+measures or how it writes it, or to how a program's communicators are read (`collectives_of`: the HLO parser
+`dew.telemetry.instrumentation.hlo_instructions` and the collective vocabulary
+`dew.telemetry.trace.COLLECTIVES`), takes the next, so a host measures and reads afresh rather than read an
+earlier one."""
 
 
 def measured(configured: Mapping, *, measure: Callable[[Mapping], Needs]) -> Needs:
@@ -302,7 +304,8 @@ def collectives_of(program: str, gpus: tuple[int, ...]) -> Collectives:
     (`dew.telemetry.trace.collective`): each distinct group of its collectives and of its all-to-alls,
     however XLA prints it, and its permutes' directed pairs on one clique of all its devices; a group whose
     positions lie past the assignment is taken as every device, and a send or a receive of no pairs read
-    as connecting every pair."""
+    as connecting every pair. A change to how it reads a program takes the next `FORM`, as the
+    communicators it kept are read again then (`collectives_kept`)."""
     groups: set[tuple[int, ...]] = set()
     exchanges: set[tuple[int, ...]] = set()
     pairs: set[tuple[int, int]] = set()
