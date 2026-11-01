@@ -455,9 +455,9 @@ def held() -> Sizing | None:
 
 def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...], text: Callable[[], str]) -> Collectives:
     """The communicators an executable makes on `gpus` (`collectives_of`), read from its `text` once per
-    executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, so a
-    warm start that loads it from the compilation cache reads no text."""
-    path = Path(dew_cache_dir()) / "communicators" / "programs" / f"{fingerprint.hex()}.json"
+    executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, in this
+    `FORM`, so a warm start that loads it from the compilation cache reads no text."""
+    path = Path(dew_cache_dir()) / "communicators" / f"form-{FORM}" / "programs" / f"{fingerprint.hex()}.json"
     if path.exists():
         return Collectives.of(json.loads(path.read_text()), gpus)
     positions = collectives_of(text(), tuple(range(len(gpus))))
