@@ -25,9 +25,11 @@ from dew.distributed.batches import shard_batch
 from dew.lora import LoRA
 from dew.mesh import LayoutRefused
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig, ParamGroup
+from dew.optim import OptimConfig, ParamGroup, scale_by_m3
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
+from dew.training.diloco import DiLoCo
+from dew.training.rollout import rolled_out
 
 pytestmark = pytest.mark.mesh
 
@@ -117,6 +119,14 @@ OPTIMIZERS = {
                            param_groups=(ParamGroup("mlp", ("*mlp*",), learning_rate_multiplier=0.5,
                                                     weight_decay=0.0),
                                          ParamGroup("rest", ("*",)))), {}),
+    # Muon's variants that read a matrix's own sums or its name: the dual norm of a layer's momentum, its
+    # projections' heads by their stored names, and NorMuon's neuron moments, each per stored layer.
+    "muon_adaptive": (OptimConfig(optimizer="muon", learning_rate=1e-2,
+                                  optimizer_opts={**SMOOTH, "adaptive": True}), {}),
+    "muon_per_head": (OptimConfig(optimizer="muon", learning_rate=1e-2, optimizer_opts={
+        **SMOOTH, "per_head": {"layers_*/self_attn/q_proj/kernel": 8}}), {}),
+    "normuon": (OptimConfig(optimizer="muon", learning_rate=1e-2,
+                            optimizer_opts={**SMOOTH, "neuron_beta2": 0.95}), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
     "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
                          optimizer_opts=SMOOTH),
@@ -308,13 +318,53 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
 @pytest.mark.mesh(devices=8)
 def test_an_optax_transform_that_may_read_a_leaf_whole_is_refused_over_stages():
     """Over two stages, Adam given as optax builds it places its state, and Adafactor, whose factored
-    moments read a leaf's last two axes, is refused before anything is placed: over a stacked run it
-    would factor the stages' layers as one matrix. Over one stage, or over two with every layer whole on
-    every stage (`Layout.stage_local`), the replicated layout the refusal names, Adafactor places."""
+    moments read a leaf's last two axes, is refused before anything is placed, given built or named by
+    its import path in an `OptimConfig`: over a stacked run it would factor the stages' layers as one
+    matrix. So is M3, whose matrices default to a leaf's first two axes. Over one stage, or over two with
+    every layer whole on every stage (`Layout.stage_local`), the replicated layout the refusal names,
+    Adafactor places."""
     model = decoder()
     trainer(model, optax.adam(1e-3), STAGED, 8, ema=None).place()
     trainer(model, optax.adafactor(1e-3), MeshSpec(fsdp=2), 2, ema=None).place()
     trainer(model, optax.adafactor(1e-3), STAGED, 8, ema=None, stage_local=False).place()
-    refused = trainer(model, optax.adafactor(1e-3), STAGED, 8, ema=None)
-    with pytest.raises(LayoutRefused):
-        refused.place()
+    for given in (optax.adafactor(1e-3), OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3),
+                  scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=4)):
+        refused = trainer(model, given, STAGED, 8, ema=None)
+        with pytest.raises(LayoutRefused):
+            refused.place()
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("name", ["muon", "muonclip"])
+def test_a_stage_local_run_reports_its_optimizers_groups_and_steps(name):
+    """A run over two stages trained by `fit` through Muon reports where its optimizer sent each
+    parameter as it starts (`OptimConfig.groups`), each stacked leaf read as its stored layers, and
+    steps: read whole, a stacked projection would take one axis too many for Muon's matrix."""
+    optimizer, fields = OPTIMIZERS[name]
+    run = trainer(decoder(**fields), optimizer, STAGED, 8)
+    assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
+
+
+def test_a_run_without_a_rollout_never_lays_its_state_out_whole():
+    """A stage-local state is laid out whole, every layer on every stage, for a rollout alone, which reads
+    it as a model outside the mesh does (`StageLocal.outside`): a batch with no rollout is the batch as it
+    is, the whole view never read, so a run that fits only stage-local gathers nothing a step."""
+    batch = {"tokens": np.zeros((2, 3), np.int32)}
+
+    def whole(state):
+        raise AssertionError("a run without a rollout laid its state out whole")
+
+    assert rolled_out(None, None, batch, None, None, None, None, view=whole) is batch
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
+    """DiLoCo's groups each hold an inner copy of the state on a first axis of their own, which a
+    stage-local run would stack apart from the outer state's: a DiLoCo run over a stage axis keeps every
+    pipelined layer whole on every stage, its outer and inner states alike, so its checkpoint holds each
+    layer as one device's would."""
+    run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer="adamw", learning_rate=1e-2),
+                  key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
+                  layout=Layout(min_shard=TINY_SHARD), diloco=DiLoCo(every=2, rate=0.7, momentum=0.9),
+                  tracker=None)
+    assert not run.staging.sites
