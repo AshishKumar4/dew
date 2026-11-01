@@ -135,3 +135,16 @@ class Exact:
     @property
     def shape(self) -> tuple:
         return self.value.shape
+
+
+class Scaled:
+    """A register operand stored scaled, its product taken back by `2**exponent` (a traced scalar: an fp16
+    part held at its tile's largest magnitude's scale): a mainloop issues its product into an accumulator of
+    its own, which no unscaled product shares, and restores it."""
+
+    def __init__(self, value: jax.Array, exponent: jax.Array):
+        self.value, self.exponent = value, exponent
+
+    @property
+    def shape(self) -> tuple:
+        return self.value.shape

@@ -17,8 +17,10 @@ The rows are a covering set, not the whole product: every pair of settings
 (read mode, cache, filter, packing, the count that saves and the other count
 the save is resumed on or refused) meets in some row, and the boundary rows
 hold the indexed read beside each single step that turns its global order
-into a per-share one. A pool that nobody stopped is run once per cell and
-count and read by every row that needs it.
+into a per-share one. A pool that nobody stopped, and the pool that saves a
+row's checkpoint, are each run once per cell and count and read by every
+test that needs them: each row resumes on its own count and on the other as
+two tests, each within its budget (row 2788).
 
 Run the matrix alone with `pytest tests/test_data_matrix.py`; `-k` picks rows.
 """
@@ -93,39 +95,52 @@ def uninterrupted(tmp_path_factory, prepared):
     return run
 
 
+@pytest.fixture(scope="module")
+def saved(tmp_path_factory, prepared):
+    """A pool of `processes` that trains `cell` for three steps and saves: its reports and the run
+    directory it saved to, run once a cell and count, which each resume copies."""
+    @functools.cache
+    def run(cell: str, processes: int):
+        directory = tmp_path_factory.mktemp("saved")
+        reports = run_pool("matrix", directory / "first", processes, run_dir=directory / "run", cell=cell,
+                           name="matrix", steps=STEPS, save_every=STEPS, **prepared(cell))
+        return reports, directory / "run"
+
+    return run
+
+
+@pytest.mark.parametrize("resumed_by", ["same", "other"])
 @pytest.mark.parametrize("cell, saved_by, other", ROWS,
                          ids=[f"{cell}-saved-by-{saved}-then-{other}" for cell, saved, other in ROWS])
-def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, uninterrupted, prepared, cell,
-                                                                    saved_by, other):
-    saved = tmp_path / "saved" / "run"
-    first = run_pool("matrix", tmp_path / "first", saved_by, run_dir=saved, cell=cell, name="matrix",
-                     steps=STEPS, save_every=STEPS, **prepared(cell))
+def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, uninterrupted, saved, prepared,
+                                                                    cell, saved_by, other, resumed_by):
+    first, checkpoint = saved(cell, saved_by)
     elastic = first[0]["lowering"] == "global"
     # A published generation is the preparation that makes a filtered or packed read global.
     assert elastic or ",published," not in cell
-    for processes in (saved_by, other):
-        directory = tmp_path / f"resumed{processes}" / "run"
-        shutil.copytree(saved, directory)
-        if not elastic and processes != saved_by:
-            # The checkpoint resumes the shares that saved it and refuses another count's.
-            checkpoints = Checkpoints(str(saved / "matrix"))
-            checkpoints.restore(share=DataPartition(0, saved_by))
-            with pytest.raises(ValueError):
-                checkpoints.restore(share=DataPartition(0, processes))
-            with pytest.raises(AssertionError):
-                run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
-                         cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
-            continue
-        resumed = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
-                           cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
-        whole, written = uninterrupted(cell, processes)
-        # On the count that saved it a resume reduces in the order the run it continues did, so it lands
-        # on that run's parameters bit for bit; on another count it reduces otherwise.
-        same = assert_identical_parameters if processes == saved_by else assert_same_parameters
-        for index, report in enumerate(resumed):
-            assert report["restored_step"] == STEPS
-            assert report["step"] == 2 * STEPS
-            assert report["batches"][:STEPS] == whole[index]["batches"][STEPS:2 * STEPS]
-            assert report["dataset_state"] == whole[index]["dataset_state"]
-            name = f"process{index}.json"
-            same(dumped_params(tmp_path / f"resumed{processes}-out" / name), dumped_params(written / name))
+    processes = saved_by if resumed_by == "same" else other
+    directory = tmp_path / f"resumed{processes}" / "run"
+    shutil.copytree(checkpoint, directory)
+    if not elastic and processes != saved_by:
+        # The checkpoint resumes the shares that saved it and refuses another count's.
+        checkpoints = Checkpoints(str(checkpoint / "matrix"))
+        checkpoints.restore(share=DataPartition(0, saved_by))
+        with pytest.raises(ValueError):
+            checkpoints.restore(share=DataPartition(0, processes))
+        with pytest.raises(AssertionError):
+            run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
+                     cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
+        return
+    resumed = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
+                       cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
+    whole, written = uninterrupted(cell, processes)
+    # On the count that saved it a resume reduces in the order the run it continues did, so it lands
+    # on that run's parameters bit for bit; on another count it reduces otherwise.
+    same = assert_identical_parameters if processes == saved_by else assert_same_parameters
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == STEPS
+        assert report["step"] == 2 * STEPS
+        assert report["batches"][:STEPS] == whole[index]["batches"][STEPS:2 * STEPS]
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        name = f"process{index}.json"
+        same(dumped_params(tmp_path / f"resumed{processes}-out" / name), dumped_params(written / name))

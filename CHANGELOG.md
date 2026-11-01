@@ -17,6 +17,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
   the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
   through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
+- Dew requires its JAX build 0.12.0.1.post42, and its `cuda12` and `cuda13` extras install Dew's builds of
+  the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
+  (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
+  strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
+  (docs/installation.md lists each fix).
 - Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md),
   and through it on black, graphviz, anywidget and opentelemetry-api.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
@@ -92,6 +97,17 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
     pillars and props (`tools/fpv_assets.py`, CC0 textures).
   - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
     DreamerV3 agent on the camera alone.
+- A run's watched activations (`Inspection.modules`) name a module by its class or its path, and a language
+  model's are summarized over its real tokens alone, its scorer's as it prepared them, through a pipelined
+  stack's microbatches too; a preference pair lays out each half's real tokens (`real_mask`).
+- `Inspection(cotangents=True)` logs the loss's cotangent at each watched output (`inspect/cotangents/...`),
+  from a probe's gradient, every objective's model calls carrying the probes.
+- A JEPA run's watched activations are named by the part that runs them, `context_encoder/...` (was
+  `encoder/...`) and `predictor/...`.
+- A step compiled ahead lists, past the plan it takes, each rung that recomputes more at the fewest
+  microbatches that fit (`compile_ahead(..., frontier=True)`, `--trainer.compile-ahead.frontier`), the plans
+  `tools/benchmark_step.py` times on the GPUs; a run names the fastest by its remat, `--trainer.split` and
+  `LMObjective.head_tile`.
 - A step compiled ahead lists, past the plan it takes, each rung that recomputes more and fits at fewer
   microbatches than every plan before it (`compile_ahead(..., frontier=True)`,
   `--trainer.compile-ahead.frontier`), the plans `tools/benchmark_step.py` times on the GPUs; a run names

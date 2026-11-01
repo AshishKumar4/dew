@@ -13,21 +13,29 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import mosaic
 
 
-class Wgmma(mosaic.RingFamily):
-    """wgmma's bundle: a warpgroup's 64 rows, TMA rings fed by a producer warpgroup (`mosaic.RingFamily`),
-    multicast across a pair of multiprocessors where a cluster shares a ring's blocks, products from shared
-    memory or registers into a warpgroup accumulator in the WGMMA layout, asynchronous until waited for.
-    Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA: interpreted, such a
-    product is the dot it would compute."""
+class WgmmaIssuer(mosaic.Issuer):
+    """wgmma's issuer and home: a warpgroup's 64 rows, products from shared memory or registers into a
+    warpgroup accumulator in the WGMMA layout, asynchronous until waited for, one step's in flight
+    (CUTLASS's sm90 `K_PIPE_MMAS`). Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a
+    warpgroup MMA: interpreted, such a product is the dot it would compute."""
 
     name = "wgmma"
     takes_tf32 = True
     rows = 64
-    consumers = 2
     role_rows = 64
     widest_product = 256
-    most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
-    cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
+    operands_in_registers = False
+    products_overlap = True
+    in_flight = 1
+
+    @property
+    def lane_columns(self) -> int:
+        # A thread holds two adjacent columns of each 8 (the WGMMA layout's lane % 4 times two).
+        return 6
+
+    def held(self, ref):
+        # An operand every step reads stays in shared memory, which its products read.
+        return ref
 
     @property
     def layout(self):
@@ -126,13 +134,9 @@ class Wgmma(mosaic.RingFamily):
                        ) -> tuple[C, tuple[jax.Array, ...]]:
         # Warpgroup accumulators scoped across the walk, read once its MMAs are done; interpreted, arrays
         # the walk carries.
-        initial = (None,) * len(shapes) if initial is None else initial
         if interpret:
-            both = (start, tuple(self.zeros(shape) if value is None else value
-                                 for shape, value in zip(shapes, initial, strict=True)))
-            for step, lo, hi in segments:
-                both = lax.fori_loop(lo, hi, lambda index, both, step=step: step(index, *both), both)
-            return both
+            return super().accumulated(segments, start, shapes, interpret, initial)
+        initial = (None,) * len(shapes) if initial is None else initial
 
         def run(*accumulators):
             for acc, value in zip(accumulators, initial, strict=True):
@@ -148,6 +152,16 @@ class Wgmma(mosaic.RingFamily):
             return carry, tuple(acc[...] for acc in accumulators)
 
         return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+
+
+class Wgmma(WgmmaIssuer, mosaic.RingFamily):
+    """wgmma's bundle: its issuer and home (`WgmmaIssuer`) on TMA rings fed by a producer warpgroup
+    (`mosaic.RingFamily`), multicast across a pair of multiprocessors where a cluster shares a ring's
+    blocks."""
+
+    consumers = 2
+    most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
+    cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
 
 WGMMA = Wgmma()

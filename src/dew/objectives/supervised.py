@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.batch import FROZEN, Batch, Variables
+from dew.batch import FROZEN, PROBES, Batch, Variables
 from dew.inputs import InputSpec
 from dew.nn import categorical
 from dew.nn.inspection import INSPECTED
@@ -118,7 +118,8 @@ class Supervised(Objective[Ratio]):
         """The batch's loss statistics and metrics with the losses they came from, one per example. The
         model's own collections besides its parameters, such as a BatchNorm's running statistics,
         update as it runs in training, and the trainer keeps the updates (`Aux.variables`)."""
-        held = [name for name in variables if name not in ("params", FROZEN)] if step.training else []
+        # A step's cotangent probes are read, not updated, as its parameters are.
+        held = [name for name in variables if name not in ("params", FROZEN, PROBES)] if step.training else []
         mode = {} if self.mode is None else {self.mode: step.training}
         outputs, updates = self.model.apply(variables, batch[self.field],
                                             rngs=model_rngs(step.key, training=step.training),

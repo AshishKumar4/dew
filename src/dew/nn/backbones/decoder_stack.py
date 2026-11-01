@@ -28,8 +28,9 @@ from dew.batch import merge
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 
 from ..hyper_connections import Carried
+from ..inspection import counted, current_positions, watched_positions
 from ..mla import INDEXER_COLLECTION
-from ..moe import ROUTER_COLLECTION
+from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name, run_period
@@ -80,6 +81,27 @@ def on_host(tree) -> bool:
     """Whether any leaf of `tree` sits in host memory."""
     return any(jax.typeof(leaf).memory_space is jax.memory.Space.Host
                for leaf in jax.tree.leaves(tree))
+
+
+def _apart(held: dict) -> tuple[dict, dict]:
+    """A run's read-only variables as its layers read them from their banks: the variables a layer is
+    fetched as, and the expert kernels it reads in place where they sit in device memory (`BANKED_EXPERTS`,
+    each the run's whole stack, `dew.nn.moe.experts_apart`), which fetching would copy out a layer at a
+    time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on an H100). Kernels in host memory
+    are fetched with the rest."""
+    params = held.get('params')
+    if params is None or not holds_experts(params):
+        return held, {}
+    apart = experts_apart({'params': params})
+    if on_host(apart[BANKED_EXPERTS]):
+        return held, {}
+    return {**held, 'params': apart['params']}, {BANKED_EXPERTS: apart[BANKED_EXPERTS]}
+
+
+def _with(read, in_place: dict, index):
+    """A layer's read-only variables: those fetched for it, and the expert kernels it reads in place at
+    its `index` in the run (`dew.nn.moe.at_iteration`)."""
+    return read if not in_place else {**read, **at_iteration(in_place, index)}
 
 
 def _layer_slice(tree, index):
@@ -390,7 +412,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         if reader is not None:
             return reader.fetch(0, dependency)
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
-        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
+        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(_apart(held)[0], 0)
 
     probed: list[tuple[LayerSpec, list[str]]] = []
     staged = first_of(0, x)
@@ -400,7 +422,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         state = held(run)
         cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
         first_slice = None if inputs is None else inputs.layer(0)
-        opened = _opened(run, specs[first], probed, staged, state if count == 1 else _layer_slice(state, 0),
+        in_place = {} if count == 1 else _apart({name: run.variables[name] for name in read_only(run)})[1]
+        opened = _opened(run, specs[first], probed, _with(staged, in_place, 0),
+                         state if count == 1 else _layer_slice(state, 0),
                          cached if count == 1 or cached is None else _layer_slice(cached, 0), x,
                          first_slice, store=store, train=train, decode=decode,
                          attention_metadata=attention_metadata)
@@ -412,11 +436,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             following = first_of(index + 1, x)
             x, changed = layer(staged, state, cached, x, first_slice)
         else:
-            banks = {name: run.variables[name] for name in read_only(run)}
+            banks = _apart({name: run.variables[name] for name in read_only(run)})[0]
             x, changed, following = _prefetched_run(
                 banks, staged, state, cached, x, inputs, layer, count,
                 following=functools.partial(first_of, index + 1),
-                reader=run.variables.get('streaming', {}).get('bank'))
+                reader=run.variables.get('streaming', {}).get('bank'), in_place=in_place)
         staged = following
         for collection, tree in changed.items():
             for name, value in tree.items():
@@ -465,11 +489,13 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         probed.append((spec, written))
     # Capture filters may select one module name but not another with the same layer spec. Keep
     # that collection open wherever the caller does, independently of the spec's write probe.
-    return sorted(name for name in {*written, *state, 'intermediates'} if name not in ('params', 'streaming')
-                  and run.is_mutable_collection(name))
+    # The parameters, a stream's reader and the expert kernels read in place (`_apart`) are only read.
+    return sorted(name for name in {*written, *state, 'intermediates'}
+                  if name not in ('params', 'streaming', BANKED_EXPERTS) and run.is_mutable_collection(name))
 
 
-def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None):
+def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None,
+                    in_place=None):
     """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
     `primed` is layer 0's read-only variables, already on the device. Iteration
@@ -480,13 +506,16 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     flax's scan hands them out. The carry is the hidden state, the staged
     variables and the cache, written in place one layer's slice per iteration
     so a decode step holds one banked cache; a cache the layers create comes
-    out stacked like `state`.
+    out stacked like `state`. `in_place` holds the expert kernels each layer
+    reads where they lie (`_apart`), handed to every iteration whole with its
+    index rather than staged.
     """
+    in_place = in_place or {}
     def body(carry, index):
         hidden, current, held = carry
         staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
-        hidden, changed = layer(current, _layer_slice(state, index),
+        hidden, changed = layer(_with(current, in_place, index), _layer_slice(state, index),
                                 None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
         if held is not None:
@@ -496,7 +525,7 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
     staged = following(x)
-    x, changed = layer(current, _layer_slice(state, last),
+    x, changed = layer(_with(current, in_place, last), _layer_slice(state, last),
                        None if cache is None else _layer_slice(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:
@@ -936,7 +965,9 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
     micro = functools.partial(microbatched, count=count)
     x = micro(x, batch_axis)
     inputs = None if layered is None else jax.tree.map(lambda value: micro(value, 0), layered)
-    held = jax.tree.map(lambda value: micro(value, 0), rows)
+    # A watched summary's real positions are held by row, each stage reading its microbatch's
+    # (`watched_positions`).
+    held = jax.tree.map(lambda value: micro(value, 0), (rows, current_positions()))
     slots = count // stages
     state_io = _on_stage_axis(x.reshape((stages, slots, *x.shape[1:])))
     shift = _on_stage_axis(jnp.zeros((stages, *x.shape[1:]), x.dtype))
@@ -964,8 +995,10 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
         return _on_stage_axis(jax.vmap(
             lambda index: jax.lax.dynamic_index_in_dim(values, index, 0, keepdims=False))(ids))
 
-    def call_stage(stage, x, layered, rows):
-        with pipeline_stage():
+    def call_stage(stage, x, layered, held, live):
+        rows, positions = held
+        # A bubble iteration's stage runs a microbatch no output keeps (`counted`).
+        with pipeline_stage(), watched_positions(positions), counted(live):
             return stage(x, layered, rows)
 
     def iteration(module, carry, step):
@@ -981,8 +1014,9 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
                 view.offset + stage * per_stage, per_stage, axis=2), inputs))(ids, stage_ids)))
         run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
                       in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS)
+        live = (step - stage_ids >= 0) & (step - stage_ids < count)
         out = _on_stage_axis(run(stage(module), stages_in, stage_inputs,
-                                 jax.tree.map(lambda value: gather(value, ids), held)))
+                                 jax.tree.map(lambda value: gather(value, ids), held), live))
         state_io = jax.lax.dynamic_update_index_in_dim(
             state_io, rotate_up(stream, out), slot, 1)
         return (state_io, shift_down(out)), None

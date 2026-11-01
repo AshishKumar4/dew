@@ -688,12 +688,33 @@ def owned_dicts[Tree](tree: Tree) -> Tree:
     return jax.tree.map(lambda leaf: leaf, dicts(tree))
 
 
+PROBES = "cotangent_probes"
+"""The collection a step's cotangent probes ride in, laid out by the model calls that read them
+(`dew.nn.inspection.tapped`)."""
+
+
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
     module's own tree out of an objective's that nests several under each
     collection, `params/policy` and `frozen/policy`, so an adapted module's
-    base comes with its factors."""
-    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
+    base comes with its factors. A step's cotangent probes, laid out as the
+    objective nests what its model calls sow, give `name`'s where it nests
+    them under `name`, else pass whole (`PROBES`)."""
+    cut = {collection: subtree[name] for collection, subtree in variables.items()
+           if collection != PROBES and name in subtree}
+    return cut if PROBES not in variables else {**cut, PROBES: probed(variables, name)[PROBES]}
+
+
+def probed(variables: Variables, name: str | None) -> Variables:
+    """`variables` with a step's cotangent probes cut to those its objective nests under `name`, what one
+    of its model calls sows (`dew.nn.inspection.probes_of`), all of them where it nests none there; none
+    with `name` None, for a call whose cotangent the step does not summarize (a pass under no gradient)."""
+    if PROBES not in variables:
+        return variables
+    rest = {collection: tree for collection, tree in variables.items() if collection != PROBES}
+    if name is None:
+        return rest
+    return {**rest, PROBES: variables[PROBES].get(name, variables[PROBES])}
 
 
 def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:

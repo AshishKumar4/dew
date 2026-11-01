@@ -21,6 +21,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    issued_into,
     reducing,
     stated,
     transposed_swizzles,
@@ -176,17 +177,17 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
-    dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
+    dv_acc = issued_into(family, dv_acc, (narrowed,), do_columns, walk.interpret)
     if not fused:
         # Each part formed as its product is issued (`algebra.formed_parts`).
         parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
-        dk_acc = family.register_products(dk_acc, parts, q_columns, walk.interpret)
+        dk_acc = issued_into(family, dk_acc, parts, q_columns, walk.interpret)
     else:
         # The fused launch's (the fast form's one part, `_weighed`'s): dK's left operand from the registers,
         # and staged, its transpose dQ's (`algebra.cotangent_product`'s `a @ b`), the tile's dQ added into
         # dQ, the query tile's other key blocks adding theirs (`_fused_adds`); a consumer's share of a
         # 128-query slot is 64 rows, warpgroup MMA's least (`MosaicBackward.legal`).
-        dk_acc = family.register_products(dk_acc, ((logits, None),), q_columns, walk.interpret)
+        dk_acc = issued_into(family, dk_acc, (logits,), q_columns, walk.interpret)
         add_dq(logits, q_first)
     if _grading(shares):
         store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
@@ -215,7 +216,8 @@ def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows
     exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows, masked=True)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
     if one_part:
-        ((logits, _),) = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
+        parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
+        logits = mosaic.unscaled_part(*parts)
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     if multiplier is not None:
         exponentials, weights = exponentials * multiplier, weights * multiplier

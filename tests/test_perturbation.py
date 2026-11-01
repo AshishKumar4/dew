@@ -553,3 +553,17 @@ def test_the_estimates_forward_derivative_is_its_reverse_estimate_transposed():
     assert_computes_the_oracle(np.concatenate([np.ravel(leaf) for leaf in forward]),
                                np.concatenate([np.ravel(leaf) for leaf in reverse]),
                                "the estimate's forward derivative", roundings=16 * 4 * 2)
+
+
+def test_a_node_perturbation_estimate_refuses_to_summarize_cotangents():
+    """A node perturbation step, which trains on its estimate of the gradient and backpropagates nothing,
+    refuses to summarize its watched modules' cotangents as it traces (row 2324 review): there is no loss
+    cotangent at a module to summarize, rather than one of no entries."""
+    from dew.nn.inspection import Watched
+    from dew.training.transaction import probed_loss
+
+    objective = Forward(Linear(), squared, inputs=InputSpec(Field("x", (3,))), draws=4)
+    variables = objective.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, watched=Watched(("Dense",), cotangents=True))
+    with pytest.raises(ValueError):
+        probed_loss(objective, variables, rows((3,)), step)

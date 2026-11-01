@@ -1200,8 +1200,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             loss = self.validation_loss(variables, batch, step)
         else:
             watched = step.watched
-            with (watching(watched.kinds, histogram=watched.histogram) if watched
-                  else contextlib.nullcontext()):
+            with (watching(watched.modules, histogram=watched.histogram, cotangents=watched.cotangents)
+                  if watched else contextlib.nullcontext()):
                 loss = self.loss(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss

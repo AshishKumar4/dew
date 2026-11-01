@@ -59,7 +59,7 @@ from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, product, resources
 from dew.nn.kernels.templates.gemm import cost
-from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
+from dew.nn.kernels.templates.operands import Issuer, Parts
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,

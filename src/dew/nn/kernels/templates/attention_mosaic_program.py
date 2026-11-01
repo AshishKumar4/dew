@@ -24,6 +24,7 @@ from dew.nn.kernels.templates import (
     layout,
     mosaic,
     mosaic_sm90,
+    operands,
     resources,
 )
 from dew.nn.kernels.templates.attention import (
@@ -227,6 +228,22 @@ def stagings(family: mosaic.Family) -> tuple[bool, ...]:
     return (False, True) if family.operands_in_registers else (False,)
 
 
+class _Issuing(NamedTuple):
+    """What an `operands.Issuer` reads of a launch: its family and whether it interprets."""
+
+    family: mosaic.Family
+    interpret: bool
+
+
+def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
+    """`acc` with each of `parts`' products with `rhs`, a tile in shared memory, issued into it in place
+    (`operands.Issuer`'s carried accumulator), each part's left operand in registers and formed as it is
+    taken (`algebra.formed_parts`)."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1})
+    right = operands.Parts((rhs,), rhs.dtype)
+    return issuer.summed((("part", part, right) for part in parts), into=acc)
+
+
 def _block(config: Tiles | BackwardTiles) -> int:
     """The block a launch at `config` pads a call's queries and keys to: whole programs of query blocks and
     key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs, a shared
@@ -249,8 +266,7 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 def _parts(accurate: bool, dtype) -> int:
     """The parts a backward tile's score cotangents take to their products in the form `accurate` names
     (`algebra.cotangent_parts`: one in the fast form's bf16, three in the accurate form's)."""
-    tile = jax.ShapeDtypeStruct((1, 1), jnp.float32)
-    return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
+    return len(algebra.cotangent_parts(jnp.zeros((1, 1), jnp.float32), dtype, accurate=accurate))
 
 
 DROPPING = Refusal('dropout_places',
@@ -838,12 +854,19 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     if q_pos is None:
         q_pos = (places(first, query_axis) if queries_read and not keys_first
                  else first + family.iota(shape, query_axis))
+    key_start = key_offsets = None
     if columns is not None and not keys_first:
         k_pos = k_first + columns
+    elif keys_read and not keys_first:
+        # A row's keys as the start its lane decides and the offsets its registers do (`Coords.key_start`).
+        base, key_offsets = family.column_offsets(shape)
+        key_start = k_first + base
+        k_pos = key_start + key_offsets
     else:
         k_pos = places(k_first, key_axis) if keys_read else k_first + family.iota(shape, key_axis)
     if spans is None:
-        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, key_start=key_start,
+                              key_offsets=key_offsets)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
     of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
                            else (family.rows_of, family.columns_of))

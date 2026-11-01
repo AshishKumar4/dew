@@ -6,9 +6,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
 
-from dew.nn import categorical
+from dew.nn import categorical, inspection
 from dew.nn.protocols import OutputTable
 from dew.objectives import base, residuals
 from dew.objectives.lm import chunked
@@ -205,3 +205,23 @@ def test_a_node_perturbation_estimate_holds_every_order(edge):
     direction = normal_draw(2709, *(leaf.shape for leaf in leaves), scale=EDGES[edge])
     (cotangent,) = normal_draw(2710, ())
     assert_contract(loss, primals, direction, cotangent, f"a node perturbation estimate {edge}")
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_probes_tap_holds_its_orders(edge):
+    """A watched activation's tap (`inspection.tapped`, a custom VJP: the activation itself, its cotangent
+    passed through, and the probe's the cotangent's sufficient statistics over the loss scale, its decade
+    histogram included), fp32 over 4 x 16 entries of which every other is held: the primal and every
+    reverse order finite wherever float64's are normal float32s, at activations and cotangents scaled to
+    the edge. Forward mode does not run (`FORWARD_ORDERS`, a custom VJP's)."""
+    scale = EDGES[edge]
+    x, direction, cotangent = normal_draw(3143, (4, 16), (4, 16), (4, 16), scale=scale)
+    where = jnp.arange(64).reshape(4, 16) % 2 == 0
+    probe = jnp.zeros(len(inspection.COTANGENT_TERMS) + len(inspection.HISTOGRAM_EDGES) + 1, jnp.float32)
+
+    def tapped(activation, probed):
+        return inspection.tapped(activation, probed, where, jnp.float32(2.0), histogram=True)
+
+    assert_contract(tapped, (x, probe), (direction, jnp.ones_like(probe)), cotangent, f"a probe's tap {edge}",
+                    without=FORWARD_ORDERS)
+

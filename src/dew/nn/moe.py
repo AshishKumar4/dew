@@ -32,6 +32,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew.batch import leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 
@@ -448,13 +449,72 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
     return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
 
 
-def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+BANKED_EXPERTS = 'banked_experts'
+"""The collection a run over a bank in device memory hands its experts' kernels in: each `ExpertLinear`'s
+kernel the bank's whole `[layers, experts, in, out]` and the layer read (`experts_apart`, `at_iteration`),
+read where it lies (`Layered`)."""
+
+
+class Layered(struct.PyTreeNode):
+    """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` and the
+    layer read, which the GEMM template reads where it lies (`template.gemm`'s `layer`) rather than as a
+    slice copied out a layer at a time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on
+    an H100)."""
+
+    stack: jax.Array
+    layer: jax.Array
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return self.stack.dtype
+
+
+def _expert_kernel(path: tuple[str, ...]) -> bool:
+    """Whether a run's parameter at `path` is an `ExpertMLP`'s expert kernel (`EXPERT_AXES`)."""
+    return len(path) >= 3 and path[-1] == 'kernel' and path[-2] in EXPERT_AXES and path[-3] == 'experts'
+
+
+def _layered(value) -> bool:
+    return isinstance(value, Layered)
+
+
+def holds_experts(params: Mapping) -> bool:
+    """Whether a banked run's `params` hold an `ExpertMLP`'s expert kernels (`experts_apart`)."""
+    return any(map(_expert_kernel, leaves_by_path(params)))
+
+
+def experts_apart(variables: Mapping[str, Mapping]) -> dict:
+    """A banked run's `params` and `BANKED_EXPERTS` collections with its experts' kernels moved from the
+    first to the second, at their paths, so the run reads the rest a layer at a time and hands the kernels
+    whole to every layer (`at_iteration`)."""
+    params: dict = {}
+    moved: dict = {}
+    for keys, leaf in leaves_by_path(variables.get('params', {})).items():
+        node = moved if _expert_kernel(keys) else params
+        for key in keys[:-1]:
+            node = node.setdefault(key, {})
+        node[keys[-1]] = leaf
+    return {'params': params, BANKED_EXPERTS: moved}
+
+
+def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
+    """The `BANKED_EXPERTS` collection with `layer`, the layer of the run read, beside each kernel, as
+    its `ExpertLinear` reads them (`Layered`)."""
+    def indexed(tree: Mapping) -> dict:
+        if 'kernel' in tree:
+            return {**tree, 'layer': layer}
+        return {key: indexed(value) for key, value in tree.items()}
+
+    return {BANKED_EXPERTS: indexed(variables.get(BANKED_EXPERTS, {}))}
+
+
+def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
-    dispatches.
+    dispatches. A `Layered` kernel is read at its layer of its stack, in place.
 
     Operands cast to `dtype` (flax's promotion when None), every contraction
     accumulates in at least fp32 and rounds once to the compute dtype, so a
@@ -482,11 +542,12 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
-    compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    resolved = precision
+    stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
+    compute = canonicalize_dtype(x, stack, dtype=dtype)
     xla = implementation == 'xla'
     with generation.chosen(grouped_matmul='xla') if xla else contextlib.nullcontext():
-        return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved)
+        return template.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
+                             layer=layer)
 
 
 
@@ -506,6 +567,11 @@ class ExpertLinear(nn.Module):
         return projection_flops(lengths, self.in_features, self.features)
 
     def setup(self):
+        if self.has_variable(BANKED_EXPERTS, 'kernel'):
+            # A scanned decode over a bank hands the run's stack and the iteration's layer.
+            self.kernel = Layered(self.get_variable(BANKED_EXPERTS, 'kernel'),
+                                  self.get_variable(BANKED_EXPERTS, 'layer'))
+            return
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching Dense of a dense MLP.
         self.kernel = self.param(
@@ -704,16 +770,26 @@ def _dispatched[Parameters](
     # binary reducer, and JAX wraps this one's add in a sharding constraint).
     if mesh.shape.get(STAGE_AXIS, 1) > 1 and STAGE_AXIS not in mesh.manual_axes:
         manual.add(STAGE_AXIS)
-    stored = []
-    for leaf, axes in zip(jax.tree.leaves(parameters), parameter_axes, strict=True):
+    def spec(leaf: jax.Array, axes: LogicalAxes) -> P:
         kept = [tuple(axis for axis in mesh_axes(entry) if axis in manual)
                 for entry in logical_spec(axes, leaf.shape)]
-        stored.append(P(*(entry if entry else None for entry in kept)))
+        return P(*(entry if entry else None for entry in kept))
+
+    # A kernel read in place from a bank (`Layered`) holds its experts on its stack's second dimension.
+    stored, experts = [], []
+    for parameter, axes in zip(jax.tree.leaves(parameters, is_leaf=_layered), parameter_axes, strict=True):
+        if _layered(parameter):
+            stack = spec(parameter.stack, (None, *axes))
+            stored += [stack, P()]
+            experts.append(stack[1:])
+        else:
+            stored.append(spec(parameter, axes))
+            experts.append(stored[-1])
     held = jax.tree.unflatten(jax.tree.structure(parameters), stored)
     if exchanging:
-        if any(not spec or EXPERT_AXIS not in mesh_axes(spec[0]) for spec in stored):
+        if any(not entry or EXPERT_AXIS not in mesh_axes(entry[0]) for entry in experts):
             raise LayoutRefused("exchange dispatch holds each device's own experts, so every "
-                             "expert parameter splits its first dimension over the expert "
+                             "expert parameter splits its expert dimension over the expert "
                              f"axis; the rule table places them {stored}")
         inner = functools.partial(_exchange_shard, project, num_experts=num_experts,
                                   shards=shards, output_dtype=output_dtype, capacity=capacity)
@@ -721,14 +797,27 @@ def _dispatched[Parameters](
         inner = functools.partial(_sorted_locally, project, num_experts=num_experts)
 
     def body(x, indices, parameters, input_weights):
-        def gathered(leaf: jax.Array, spec: P) -> jax.Array:
-            for dimension, entry in enumerate(spec):
-                axes = tuple(axis for axis in mesh_axes(entry)
-                             if not (exchanging and dimension == 0 and axis == EXPERT_AXIS))
-                if axes:
-                    leaf = jax.lax.all_gather(leaf, axes, axis=dimension, tiled=True)
-            return leaf
-        return inner(x, indices, jax.tree.map(gathered, parameters, held), input_weights)
+        def gathers(spec: P) -> list[tuple[int, tuple[str, ...]]]:
+            """The dimensions a parameter of `spec` gathers over the manual axes, but its experts under
+            the exchange."""
+            named = [(dimension, tuple(axis for axis in mesh_axes(entry)
+                                       if not (exchanging and dimension == 0 and axis == EXPERT_AXIS)))
+                     for dimension, entry in enumerate(spec)]
+            return [(dimension, axes) for dimension, axes in named if axes]
+
+        def gathered(parameter, spec):
+            if _layered(parameter):
+                layer_spec = P(*spec.stack[1:])
+                if not gathers(layer_spec):
+                    return parameter
+                # A gathered kernel is a new array whatever is read: its layer's alone is gathered.
+                parameter = jax.lax.dynamic_index_in_dim(parameter.stack, parameter.layer, keepdims=False)
+                spec = layer_spec
+            for dimension, axes in gathers(spec):
+                parameter = jax.lax.all_gather(parameter, axes, axis=dimension, tiled=True)
+            return parameter
+
+        return inner(x, indices, jax.tree.map(gathered, parameters, held, is_leaf=_layered), input_weights)
 
     # The kernels carry no manual-axis type, so this map does not check them;
     # MaxText hosts its gmm the same way.
@@ -959,7 +1048,8 @@ class ExpertMLP(nn.Module):
         kernels = tuple(getattr(self, name).kernel for name in names)
         # One compute dtype for every projection, named rather than
         # inferred inside the dispatch, where the parameters may be widened.
-        compute = expert_compute_dtype(x, *kernels, dtype=self.dtype)
+        compute = expert_compute_dtype(x, *(kernel.stack if isinstance(kernel, Layered) else kernel
+                                            for kernel in kernels), dtype=self.dtype)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute), x, indices, kernels,
             tuple(EXPERT_AXES[name] for name in names), num_experts=self.num_experts, dispatch=self.dispatch,

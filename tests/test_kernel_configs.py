@@ -20,7 +20,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, generations, lowers
 from jax.sharding import PartitionSpec
-from kernel_compile import compile_kernels, failures
+from kernel_compile import Uncounted, compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import bundles, report, resources
@@ -210,20 +210,46 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-class _Uncounted(grouped_matmul.MosaicGmm):
-    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
-    registers do not hold: a launch whose model misses."""
+@lowers("sm90")
+def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
+    """The dense GEMM's mainloop at a cluster pair's 128 x 256 tile, compiled for a compile-only H100 as the
+    GPU compiles it, has its HGMMAs left running while the next step's operands are awaited: ptxas
+    serializes none (its note C7514, a wait for each HGMMA). A guard on every step of a rotation, a cond
+    between a warpgroup's products, had it serialize the walk (K40's SASS: 16 waits for 16 HGMMAs), a loop
+    the gate's registers and spills called clean."""
+    from kernel_compile import _compiled, ptxas_notes
 
-    def registers(self, ba, config):
-        return 0
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    def call():
+        def gmm(lhs, rhs, sizes):
+            return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2,
+                                                                          cluster=2),
+                                  transpose_rhs=False, out_dtype=jnp.bfloat16, dense=True,
+                                  multiprocessors=generation.gpu_target("sm90").multiprocessors)
+
+        return gmm, (jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((1, 4096, 4096), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((1,), jnp.int32))
+
+    record = {"name": "dense gmm", "generation": "sm90", "limit": generation.gpu_target("sm90").shared_limit}
+    with tempfile.TemporaryDirectory(prefix="dew-dense-gemm-") as directory:
+        _compiled(support.KernelCase("dense gmm", call), "sm90", record, directory)
+        assert "error" not in record, record["error"]
+        (ptx,) = Path(directory).glob("*.ptx")
+        notes = ptxas_notes(ptx.read_text(), "sm90")
+    assert "bytes spill stores" in notes, notes
+    assert "serialized" not in notes, notes
 
 
-class _OnlyTile(_Uncounted):
-    """A launch with one tile shape, so refusing that shape exhausts its derivation."""
+class _OnlyTile(Uncounted):
+    """A launch with one tile, the wide one on a producer's layout, so refusing it exhausts its derivation
+    (a tile refused at the planner's first stage count, two, gives way to the next layout, which takes the
+    same shape: `wgmma.fed`)."""
 
     def candidate(self, ba, config, target):
-        return (config.block_m == 128 and config.block_n == 128 and config.warpgroups == 2
-                and super().candidate(ba, config, target))
+        return (config.block_m == 128 and config.block_n == 256 and config.warpgroups == 2
+                and config.family == "wgmma" and super().candidate(ba, config, target))
 
 
 def _spilling_forward(launch, rows: int, devices):
@@ -264,7 +290,7 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     traced = []
-    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else _Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else Uncounted(), 4096, devices), traced)
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -322,7 +348,7 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
             with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
                 while not stop.is_set():
                     rows += 64
-                    forward, shapes = _spilling_forward(_Uncounted(), rows, devices)
+                    forward, shapes = _spilling_forward(Uncounted(), rows, devices)
                     lowered = jax.jit(forward).trace(*shapes).lower()
                     started.set()
                     lowered.compile()
@@ -330,7 +356,7 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
             started.set()
 
     traced = []
-    lowered = _lowering(*_spilling_forward(_Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
 
     with ThreadPoolExecutor(1) as pool:
         other = pool.submit(others)

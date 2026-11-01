@@ -633,7 +633,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post41
+jax==0.12.0.1.post42
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -645,10 +645,11 @@ jax==0.12.0.1.post41
     #   tokamax
 jax-cuda12-pjrt==0.12.0.1
     # via jax-cuda12-plugin
-jax-cuda12-plugin==0.12.0.1
-    # via jax
+jax-cuda12-plugin==0.12.0.1.post42
+    # via dewml (pyproject.toml)
 jaxlib==0.12.0.1
     # via
+    #   dewml (pyproject.toml)
     #   jax
     #   optax
     #   qwix

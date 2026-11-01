@@ -647,7 +647,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post41
+jax==0.12.0.1.post42
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -660,7 +660,7 @@ jax-cuda12-pjrt==0.12.0.1 ; platform_machine == 'x86_64' and sys_platform == 'li
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda12-plugin
-jax-cuda12-plugin==0.12.0.1 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+jax-cuda12-plugin==0.12.0.1.post42 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1
     # via

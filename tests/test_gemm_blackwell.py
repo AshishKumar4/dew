@@ -27,6 +27,10 @@ SEEDS = 8
 """Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
 TILES = (mosaic_blackwell.Tiles(128, 128, 64, 2, 1), mosaic_blackwell.Tiles(128, 256, 64, 4, 2))
 """A tile of each accumulator width, its two accumulators within the 512 columns of tensor memory."""
+PAIRED = mosaic_blackwell.Tiles(128, 128, 64, 4, 1, cluster=2)
+"""A pair of CTAs' tile (256 x 256, each CTA's accumulators 256 columns). Mosaic GPU's interpreter models no
+collective tcgen05 product (its TcGen05Mma takes no collective axis), so it is compiled here and run on a
+B200 alone."""
 
 
 def biased(acc, bias):
@@ -98,7 +102,7 @@ def _plain(case: str, *, truth: bool = False):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}")
+@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}x{tiles.cluster}")
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_blackwell_gmm_holds_check_1(case, tiles):
     """Each case through the mainloop, interpreted: as exact as the plain program from float64 truth, the
@@ -112,7 +116,8 @@ ON_BLACKWELL = pytest.mark.skipif(generation.device_generation() not in ("sm100"
 
 
 @ON_BLACKWELL
-@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}")
+@pytest.mark.parametrize("tiles", (*TILES, PAIRED),
+                         ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}x{tiles.cluster}")
 @pytest.mark.parametrize("case", list(CASES))
 def the_blackwell_gmm_holds_check_1_on_blackwell(case, tiles):
     """Each case compiled and run on a B200 or a B300, its tiles over every multiprocessor, where the
@@ -123,9 +128,9 @@ def the_blackwell_gmm_holds_check_1_on_blackwell(case, tiles):
 
 
 def test_the_blackwell_gmm_compiles_for_a_b200_within_its_resources():
-    """The mainloop at each tile, with an epilogue, compiled by Mosaic for a compile-only B200 on this CPU
-    through ptxas (tests/kernel_compile.py): within the multiprocessor's shared memory and its 512 columns
-    of tensor memory, no register spilled."""
+    """The mainloop at each tile and a pair's, with an epilogue, compiled by Mosaic for a compile-only B200 on
+    this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's shared memory and its 512
+    columns of tensor memory, no register spilled."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     def case(tiles):
@@ -142,6 +147,6 @@ def test_the_blackwell_gmm_compiles_for_a_b200_within_its_resources():
 
         return support.KernelCase(f"blackwell gmm {tiles}", call)
 
-    found = compile_mosaic_kernels([case(tiles) for tiles in TILES], "sm100")
-    assert len(found) == len(TILES) and all(record.get("kernels") for record in found), found
+    found = compile_mosaic_kernels([case(tiles) for tiles in (*TILES, PAIRED)], "sm100")
+    assert len(found) == len(TILES) + 1 and all(record.get("kernels") for record in found), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
