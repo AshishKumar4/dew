@@ -328,7 +328,7 @@ class Pretrained:
         if self.processor is not None or not isinstance(self.tokenizer, str):
             return self.processor
         from dew.data.text import tokenizer_for
-        from dew.inference.loading import RunProcessor
+        from dew.inference.tasks import RunProcessor
         return RunProcessor(tokenizer_for(self.tokenizer, local_files_only=True))
 
     @classmethod
@@ -2174,8 +2174,9 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
         case WrapperRoute(wrapper=wrapper):
             depth = decoders.wrapper_source_depths(wrapper)
         case VerifiedRoute(verified=verified):
+            # The record alone: the names checked are the kept ones, which the load translates.
             family = verified.entry(config)
-            depth = decoders.source_depths(verified.translate(config, tuple(tensors), family), family)
+            depth = decoders.source_depths(verified.record(config, family), family)
         case _:
             return tensors
     specs = tensor_specs(tensors)

@@ -639,7 +639,7 @@ def test_a_named_mainloop_runs_or_is_refused(named):
 
 def test_a_dropping_call_traces_for_an_assumed_gpu():
     """A call that drops attention weights traces for an H100 (`generation.assumed`): Mosaic declines it and
-    the frozen Triton mainloop refuses its dropout (`attention_triton.refused`), which the route had read of
+    the Pallas-Triton mainloop refuses its dropout (`attention_triton.refused`), which the route had read of
     its spans alone, running Triton, which raised (review)."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, _ = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)(0)
@@ -713,7 +713,7 @@ def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output
 @pytest.mark.parametrize("generation_name", ["sm86", "sm120"])
 def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name):
     """An fp32 call of 256-wide heads on a GPU whose block holds 99 KB of shared memory, past the least any
-    frozen Triton config stages (100 KB), forward and backward: the route takes another mainloop and the
+    Pallas-Triton config stages (100 KB), forward and backward: the route takes another mainloop and the
     call lowers for that GPU, no launch that cannot run chosen (`attention_triton.unfitted`)."""
     from dew.nn.kernels import generation
     from dew.nn.kernels.templates import attention as template, attention_route

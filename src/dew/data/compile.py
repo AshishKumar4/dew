@@ -18,6 +18,7 @@ import functools
 import itertools
 import os
 import threading
+import typing
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
@@ -123,7 +124,6 @@ from dew.data.pipeline import (
     TokenGeometry,
     Windows,
     Workers,
-    chains,
     children,
     examples_bound,
     record_stage,
@@ -339,20 +339,6 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
-def _documented_packs(pipelines: Sequence[Pipeline], objective: ObjectiveData | None = None) -> None:
-    """Refuse to pack token documents from a store that states no document ends (neither an index of
-    them nor an EOS token), wherever it sits under the pack, its chain's own or the objective's, which
-    packs every branch (`_windowed`): its tokens would read as one document, whose pieces no producer
-    made. Checked as the chain is read, not as it is built, so a record names a store it never opens
-    (a run loaded where its data is not, to be pointed at it)."""
-    packs = objective is not None and objective.pack is not None
-    packed = (chain for pipeline in pipelines for chain in chains(pipeline)
-              if (packs and chain is pipeline) or any(isinstance(stage, Pack) for stage in chain.stages))
-    for source in (store for chain in packed for _, leaf in _leaves(chain) for store in _stores(leaf)):
-        if isinstance(source, TokenFiles) and not source.documented:
-            raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
-
-
 def _stores(source: Source) -> Iterator[Source]:
     """Every store `source` reads: a concatenation's parts, and the store each holdout selection
     selects from."""
@@ -362,6 +348,16 @@ def _stores(source: Source) -> Iterator[Source]:
                 yield from _stores(part)
         else:
             yield selected
+
+
+def _token_stores(source: Source) -> Iterator[TokenFiles]:
+    """The token stores `source` reads, through every view and a concatenation's parts."""
+    for each in beneath(source, typing.get_args(Rows.__value__)):
+        if isinstance(each, Concatenate):
+            for part in each.sources:
+                yield from _token_stores(part)
+        elif isinstance(each, TokenFiles):
+            yield each
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
@@ -499,7 +495,8 @@ members may be restored by key beneath them: a shuffle's window, a packer's rema
 expansion's tail holds rows of the mix that saved them."""
 
 
-def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, str]:
+def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
+                      ) -> dict[str, tuple[JSON, tuple[TokenFiles, ...]]]:
     """What each member of a streamed mix reads and makes, as one digest under its key
     (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
     order rests on and its caches; and under the empty key the same of the mixture's own stages
@@ -511,7 +508,8 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     Each member is read in `train`, the tree the plan's lowering describes (`build`), which a
     memory read made of the written pipeline and which holds no member that accepted no row; its
     caches are those of each of its corpora's stages as its pipeline wrote them (`_written`), the
-    ones a memory read already ran among them."""
+    ones a memory read already ran among them. Each member's manifest comes with the token stores it
+    reads (`Plan.earlier_members`)."""
     source = train.source
     if (not isinstance(source, Mixture) or build.global_order
             or not all(isinstance(stage, _KEYED_ABOVE) for stage in train.stages)):
@@ -528,22 +526,22 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in written(train.stages)
-                                                  if not isinstance(stage, (Workers, Prefetch))),
-                                                *(StepIdentity.of(step) for step in host)])})}
+    members: dict[str, tuple[JSON, tuple[TokenFiles, ...]]] = {"": ({"steps": steps([
+        *(_identity(stage) for stage in written(train.stages) if not isinstance(stage, (Workers, Prefetch))),
+        *(StepIdentity.of(step) for step in host)])}, ())}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
                                              strict=True)):
         sources = [read for _, read in _leaves(child)]
         identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
                       *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
-        members[key] = fingerprint({
+        members[key] = (json_value({
             "order": unplaced(json_value(corpora[index], "member order")),
             "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
             "cache": list(_cache_references(child, build.read)),
-        })
+        }, "member manifest"), tuple(store for read in sources for store in _token_stores(read)))
     return members
 
 
@@ -659,7 +657,6 @@ def _measure(
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
     _capabilities(branches, read, provision)
-    _documented_packs(branches, objective)
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
     branches = tuple(_automatic(branch, read, automatic) for branch in branches)
@@ -877,15 +874,18 @@ def _compiled(
             *(StepIdentity.of(step) for step in host),
         ),
     )
+    members = _member_manifests(train, build, host)
     plan = Plan(
         "global" if global_order else "per-share",
         manifest,
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
-        members=_member_manifests(train, build, host),
+        members={key: fingerprint(manifest) for key, (manifest, _) in members.items()},
+        earlier_members=members,
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
+        stores=tuple(store for source in sources for store in _token_stores(source)),
     )
     tuned = build.tuned(train)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
@@ -1718,8 +1718,6 @@ def publish(
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
         builder = PackingPlan(packing)
-        # The pack's stores are checked with it, which the prefix published without it is not.
-        _documented_packs((pipeline,))
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source

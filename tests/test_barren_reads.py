@@ -201,7 +201,7 @@ def test_a_grain_map_in_a_workers_read_reads_records_not_markers(before):
         rows = Pipeline(Memory([{"id": index} for index in range(12)])).filter_map(KeepsEven())
         kept = set(range(0, 12, 2))
     else:
-        rows = Pipeline(from_grain(grain.MapDataset.source(records), name="missing-thirds"))
+        rows = Pipeline(from_grain(grain.MapDataset.source(records), identity="missing-thirds"))
         kept = {index for index in range(12) if index % 3}
     chain = rows.grain(_grain_rename, identity="renamed@1").repeat().batch(1)
     reader = compile(chain, read="indexed", loading=WORKERS).train(DataPartition())
@@ -223,7 +223,7 @@ def test_a_workers_read_of_bytes_hands_them_on_before_a_prefetch():
     """A store of JSON bytes, prefetched and then parsed by a step that drops the odd ones, read by
     three loading workers: the workers hand the bytes on as they are, and the read parses them."""
     rows = from_grain(grain.MapDataset.source([json.dumps({"id": index}).encode() for index in range(12)]),
-                      name="json-bytes")
+                      identity="json-bytes")
     chain = Pipeline(rows).prefetch(1).filter_map(Parsed()).repeat().batch(1)
     reader = compile(chain, read="indexed", loading=WORKERS).train(DataPartition())
     assert set(_ids(reader, 12)) == set(range(0, 12, 2))

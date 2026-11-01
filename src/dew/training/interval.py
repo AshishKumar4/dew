@@ -26,7 +26,6 @@ import numpy as np
 from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
-from dew.state import Accumulation
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
     StepFlops,
@@ -272,12 +271,12 @@ class Interval:
         intervals' and the current interval's, read from the devices."""
         return self.clocked(None)[0]
 
-    def clocked(self, window: Accumulation | None) -> tuple[int, int]:
-        """The lifetime real tokens (`real_tokens`) and the tokens an update's open `window` holds
-        (`Accumulation.tokens`; 0 for none), in one read off the devices."""
+    def clocked(self, pending: jax.Array | None) -> tuple[int, int]:
+        """The lifetime real tokens (`real_tokens`) and the tokens an update's open window holds
+        (`pending`, `TrainState.pending_tokens`; 0 for none), in one read off the devices."""
         counted = [tokens for tokens in (self.logged_tokens, self.book.tokens if self.tokens_counted and
                                          self.book is not None else None) if tokens is not None]
-        read, held = jax.device_get((counted, None if window is None else window.tokens))
+        read, held = jax.device_get((counted, pending))
         return (self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in read),
                 0 if held is None else _TokenCount.host(held))
 
@@ -611,9 +610,10 @@ def checked_streak(streak: int, step: int, display: TrainingDisplay) -> None:
 
 
 def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None, devices: int, *,
-               waited: float = 0.0, compiling: float = 0.0,
-               training_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
-    """Compute the interval's rates from the records it read and its FLOPs, on a mesh of `devices`.
+               waited: float = 0.0, compiling: float = 0.0, training_flops: float | None = None,
+               tokens: float | None = None, peak: float | None = None) -> dict[str, float]:
+    """Compute the interval's rates from the records it read and its FLOPs, on a mesh of `devices`, each
+    device's dense `peak` its kind's bf16 peak by default (`model_flops_utilization`).
 
     The FLOPs are the ones the compiler measured for each step's own
     shape; `flops` is None when a shape's measurement was unavailable.
@@ -661,7 +661,7 @@ def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None
         scalars["train/tokens_per_s"] = float(tokens) / stepping
     if work is not None:
         per_device = float(work) / devices
-        utilization = model_flops_utilization(per_device / steps, step_time)
+        utilization = model_flops_utilization(per_device / steps, step_time, peak)
         if utilization is not None:
             scalars["train/mfu"] = utilization
-    return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time)}
+    return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time, peak)}

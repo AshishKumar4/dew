@@ -339,17 +339,37 @@ def paired(name: str, left, right, decay, issue: Issue = portable):
     scales the product `name` after it (`_decayed_product`), one per key dimension weighs each term of it. A
     pair whose decay is zero (above the diagonal, across a document's start: `decays` masks its exponent)
     weighs nothing, its derivatives included: selected, not multiplied by zero, where its product's tangent
-    may overflow (ledger 2470)."""
+    may overflow (ledger 2470). Its depth is summed in two halves, then added (`_halved`): the chunk form's
+    solve and readout cancel what these sums carry where keys align, and one fp32 sum over the key width
+    put the portable math's output 1.52 times the token recurrence's distance from float64 where fp32
+    products sum in fp32 (1.34 in halves; ledger 2467)."""
     if decay.shape[-1] == 1:
         return _decayed_product(name, issue, left, right, decay[..., 0])
-    summed = float32_einsum('...sd,...td,...std->...st', left, right, decay, precision=exact_float32(None))
-    return jnp.where(jnp.any(decay != 0, axis=-1), summed, 0.0)
+
+    def summed(depth):
+        return float32_einsum('...sd,...td,...std->...st', left[..., depth], right[..., depth],
+                              decay[..., depth], precision=exact_float32(None))
+
+    return jnp.where(jnp.any(decay != 0, axis=-1), _halved(summed, left.shape[-1]), 0.0)
+
+
+def _halved(summed: Callable[[slice], jax.Array], depth: int) -> jax.Array:
+    """`summed(slice(None))`, a product's sum over its `depth`, as its two halves' sums added (`paired`)."""
+    half = depth // 2
+    return summed(slice(None, half)) + summed(slice(half, None))
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
 def _decayed_product(name: str, issue: Issue, left, right, decay):
-    """`(left @ right^T) * decay` of the pairs whose decay is nonzero, zero elsewhere (`paired`)."""
-    return jnp.where(decay != 0, issue(name, left, jnp.swapaxes(right, -1, -2)) * decay, 0.0)
+    """`(left @ right^T) * decay` of the pairs whose decay is nonzero, zero elsewhere (`paired`), its depth in
+    two halves (`_halved`)."""
+    return jnp.where(decay != 0, _product(name, issue, left, right) * decay, 0.0)
+
+
+def _product(name: str, issue: Issue, left, right) -> jax.Array:
+    """`left @ right^T`, the product `name`, summed over the depth in two halves (`paired`)."""
+    return _halved(lambda depth: issue(name, left[..., depth], jnp.swapaxes(right[..., depth], -1, -2)),
+                   left.shape[-1])
 
 
 @_decayed_product.defjvp
@@ -359,7 +379,7 @@ def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
     two terms 2.6e38 and 8.5e37 past 3.4e38 against a decay of 0.6; ledger 2470)."""
     left, right, decay = primals
     d_left, d_right, d_decay = tangents
-    product = issue(name, left, jnp.swapaxes(right, -1, -2))
+    product = _product(name, issue, left, right)
     weighed = (issue(name, d_left, jnp.swapaxes(right, -1, -2)) * decay
                + issue(name, left, jnp.swapaxes(d_right, -1, -2)) * decay + product * d_decay)
     kept = decay != 0
@@ -659,6 +679,14 @@ def doubled(a, issue: Issue):
         inverse = inverse + issue("merge", jnp.where(lower, issue("merge", inverse, a), 0.0), inverse)
         width *= 2
     return inverse
+
+
+def solved(system, issue: Issue):
+    """`(I + A)^-1 - I` `[C, C]` of a chunk's strictly lower system `A`: `doubled`'s inverse of `-A`, its unit
+    diagonal taken off after the last level, as `weighted` takes it (it adds the diagonal outside its
+    product)."""
+    rows, cols = _grid(system.shape)
+    return doubled(-system, issue) - jnp.where(rows == cols, 1.0, 0.0)
 
 
 def inverted(blocks: dict, issue: Issue, *, neighbours_first: bool = False) -> dict:
@@ -1003,6 +1031,12 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
+    """The write gate's gradient on a tile of values gated, `u = v beta`, from `u_grad`, fp32: the values'
+    own, `du beta`, and beta's, `sum(v du)` over the tile's columns."""
+    return u_grad * beta[:, None], jnp.sum(u_grad * values, axis=1)
+
+
 def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, beta, dtype, issue: Issue, *,
                     emit: Callable[[str, int, jax.Array], None]) -> jax.Array:
     """The WY representation's backward under a decay a head, its values' part: each value block's gradient
@@ -1012,8 +1046,9 @@ def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, bet
     for j in range(blocks):
         u_grad = u_grads(j).value().astype(jnp.float32)
         d_scaled = u_grad + issue("inverse_t", lower.T, u_grad.astype(dtype))
-        emit("values", j, d_scaled * beta[:, None])
-        d_betas.append(jnp.sum(d_scaled * values(j).value().astype(jnp.float32), axis=1))
+        d_values, d_beta = gated_values_back(d_scaled, values(j).value().astype(jnp.float32), beta)
+        emit("values", j, d_values)
+        d_betas.append(d_beta)
     return _summed(d_betas)
 
 

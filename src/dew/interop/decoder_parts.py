@@ -1073,6 +1073,16 @@ MOE_SHARED = ('gate_proj', 'up_proj', 'down_proj')
 type Leaves = Mapping[str, tuple[str, ...]]
 """A family's own tensors, by their dotted names, onto their paths."""
 
+SHORT_CONV_LEAVES: Leaves = {
+    **{f'conv.{projection}.{leaf}': ('self_attn', projection, 'kernel' if leaf == 'weight' else 'bias')
+       for projection in ('in_proj', 'out_proj') for leaf in ('weight', 'bias')},
+    'conv.conv.weight': ('self_attn', 'conv', 'weight'),
+    'conv.conv.bias': ('self_attn', 'conv', 'bias'),
+}
+"""A gated short convolution layer's tensors (LFM2's and LFM3's), by their names past `model.layers.N.`,
+under the mixer's slot (`dew.nn.mixers.short_conv.GatedShortConv`): its projections and its `[D, 1, K]`
+taps."""
+
 
 KDA_LEAVES: Leaves = {
     'self_attn.A_log': ('self_attn', 'A_log'), 'self_attn.dt_bias': ('self_attn', 'dt_bias'),
@@ -1277,6 +1287,23 @@ PREDICTION_LEAVES: Mapping[str, tuple[str, ...]] = {
     **PREDICTION_INPUTS, 'shared_head.norm.weight': ('final_norm', 'scale')}
 """A DeepSeek-V3 prediction depth's own leaves, by its tensor names after
 `model.layers.{num_layers + d}.` (`layer_depth_path`)."""
+PREDICTION_STEP_END: Mapping[str, tuple[str, ...]] = {'final_layernorm.weight': ('final_norm', 'scale')}
+"""A prediction depth's output norm where its release names it `final_layernorm` (Nemotron-H's last
+block of a step, HY-3's depth), the leaf DeepSeek-V3's `shared_head.norm` fills."""
+
+
+def prediction_copy_path(tail: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The trunk leaf a prediction depth's copy of the trunk's table or head fills, by its name `tail`
+    past `model.layers.{num_layers + d}.` (`embed_tokens.weight`, `shared_head.head.weight`), which
+    `translate_weights` checks against the trunk's: a tied trunk keeps the head in the embedding, which
+    stores the same [vocab, features] the copy does, an untied one the head's own kernel; None for any
+    other name."""
+    if tail == 'embed_tokens.weight':
+        return ('params', 'embed_tokens', 'embedding')
+    if tail == 'shared_head.head.weight':
+        return (('params', 'embed_tokens', 'embedding') if config['tie_embeddings']
+                else ('params', 'lm_head', 'kernel'))
+    return None
 
 
 def layer_depth(name: str, config: Mapping[str, object]) -> int | None:
@@ -1294,21 +1321,17 @@ def layer_depth_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
     share: prediction depth d at `model.layers.{num_layers + d}.*`, its own
     leaves (`PREDICTION_LEAVES`), a block named as a trunk layer's, and
     copies of the trunk's embedding and head, which map to the trunk's
-    leaves (`translate_weights` checks the copies). A tied trunk keeps the
-    head in the embedding, which stores the same [vocab, features] the copy
-    does; an untied one has the head's own kernel, which stores its
-    transpose. Any other name is the trunk's, `dew_path`'s."""
+    leaves (`prediction_copy_path`). Any other name is the trunk's,
+    `dew_path`'s."""
     index = layer_depth(name, config)
     if index is None:
         return dew_path(name, config)
     tail = '.'.join(name.split('.')[3:])
     depths = _records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
     depth = _declared_depth(name, index, depths)
-    if tail == 'embed_tokens.weight':
-        return ('params', 'embed_tokens', 'embedding')
-    if tail == 'shared_head.head.weight':
-        return (('params', 'embed_tokens', 'embedding') if config['tie_embeddings']
-                else ('params', 'lm_head', 'kernel'))
+    copy = prediction_copy_path(tail, config)
+    if copy is not None:
+        return copy
     return prediction_path(name, 'mtp', depth, depths, tail, PREDICTION_LEAVES,
                            lambda block: dew_path('model.layers.0.' + block, config))
 

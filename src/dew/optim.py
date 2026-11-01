@@ -34,9 +34,10 @@ import optax
 import tyro
 
 from dew._hashing import fmix32
+from dew._moments import bias_corrected
 from dew._records import share
 from dew.held_updates import refuse_untold, update_applied
-from dew.laprop import bias_corrected, laprop
+from dew.laprop import laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
     NEWTON_SCHULZ,
@@ -217,12 +218,14 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
     NorMuon's neuron-wise normalization of the orthogonal update at that second-moment decay
     (`scale_by_neuron_norm`).
 
-    Its Newton-Schulz runs once an update, whatever its microbatches, so it is timed per update: a
-    Qwen3.5-4B decision fine-tune on one H100 at 65536 tokens an update, eight microbatches accumulated,
-    takes each accumulating microbatch as AdamW does (about 470 ms) and its update's in 860 ms against
-    AdamW's 516, about 9.5% over AdamW summed over the update (the bfloat16 iteration); at 8192 tokens,
-    one microbatch an update, 844 ms against 495 (1.71x), the iteration's cost undivided (node job
-    LR-h100-muon-2752c at 699d038ca; `ns_operands` holds each precision's; ledger 2637, 2685, 2752)."""
+    Its Newton-Schulz runs once an update, whatever its microbatches: a Qwen3.5-4B decision fine-tune on
+    one H100 takes each accumulating microbatch of 8192 tokens about as AdamW does (471 ms against 469)
+    and its update's in 860 ms against AdamW's 516 (the bfloat16 iteration), so an update of eight
+    microbatches, 65,536 tokens, takes about 4156 ms against 3797, 9.4% over AdamW, and one of 32,
+    262,144 tokens, 15,529 against 15,145, 2.5%; at 8192 tokens, one microbatch an update, 844 ms against
+    495 (1.71x), the iteration undivided (node jobs LR-h100-muon-2752c at 699d038ca and
+    LR-h100-muon-262144 at 8ac4afe5d; `ns_operands` holds each precision's; ledger 2637, 2685, 2752). A
+    state partitioned over devices (FSDP) is untimed."""
     def labels(params):
         return jax.tree.map(lambda numbers: "adam" if numbers is None else "muon",
                             muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
@@ -1399,7 +1402,7 @@ def held_rates(opt_state: optax.OptState) -> dict[jax.tree_util.KeyPath, dict[st
     held: dict[jax.tree_util.KeyPath, dict[str, float]] = {}
 
     def read(path: jax.tree_util.KeyPath, rates: Mapping[str, jax.typing.ArrayLike], kind: str) -> None:
-        held[path] = {name: float(np.asarray(value)) for name, value in rates.items()}
+        held[path] = {name: float(np.asarray(value).reshape(-1)[0]) for name, value in rates.items()}
 
     _rated(opt_state, read)
     return held
@@ -1443,7 +1446,8 @@ def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
     injected = optax.InjectStatefulHyperparamsState
 
     def put(value, like):
-        return jax.device_put(np.asarray(value, like.dtype), like.sharding)
+        # A DiLoCo run's groups hold their rates stacked, each the same (`dew.training.diloco.rated`).
+        return jax.device_put(np.broadcast_to(np.asarray(value, like.dtype), like.shape), like.sharding)
 
     def walked(tree, prefix: jax.tree_util.KeyPath):
         def replaced(path: jax.tree_util.KeyPath, node):

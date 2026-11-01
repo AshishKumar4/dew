@@ -3,12 +3,16 @@ a computation held over exact symmetries of its sums, against the worst admitted
 reference's ensemble (`assert_elements_as_exact`, `assert_leaves_as_exact_over_orders`), and a kernel
 held where it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`)."""
 
+import dataclasses
+import functools
 
 import jax
 import numpy as np
 from reference_error import (
     FACTOR,
     ORDERS,
+    _arms_with,
+    _ynn_decided,
     assert_as_exact_over_orders,
     assert_rows_as_exact_over_orders,
     row_errors,
@@ -157,12 +161,14 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
     bundles = {"reference's parents": reference.replay(inputs), "dew's parents": dew.replay(inputs)}
     report = {}
     for name in names:
-        mine, theirs, true = dew.node(name), reference.node(name), truth.node(name)
-        assert type(mine.kind) is type(theirs.kind), f"{label} {name}: {mine.kind} against {theirs.kind}"
+        true = truth.node(name)
+        assert type(dew.node(name).kind) is type(reference.node(name).kind), (
+            f"{label} {name}: {dew.node(name).kind} against {reference.node(name).kind}")
         for bundle, values in bundles.items():
-            parents = {parent: values[parent] for parent in mine.parents}
+            parents = {parent: values[parent] for parent in dew.node(name).parents}
             wide = widened(parents)
             where = f"{label} {name} on {bundle}"
+            mine, theirs = _compiled_alike(dew.node(name), reference.node(name), parents, where)
             if isinstance(mine.kind, Pointwise) or not mine.kind.axes:
                 report[name, bundle] = _assert_node_once(mine, theirs, true, parents, wide, where)
             else:
@@ -170,6 +176,34 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
                     _node_draw(mine, theirs, true, parents, wide, mine.kind), where, rows=False)
     _assert_end_to_end(dew, reference, truth, inputs, orbit, label)
     return report
+
+
+def _compiled_alike(mine, theirs, parents: dict, label: str):
+    """A node's two sides as the gate holds them: compiled by check 1's own policy (`_arms`), Dew's node and
+    the reference's paired, each reference member paired with Dew's as `assert_as_exact` pairs its further
+    references (`_arms_with`, its refusal of mixed kinds too), and their mode decided once on the node's
+    parents (`_ynn_decided`): two Dew paths without YNNPACK's fusions on the CPU, a side run as given beside
+    Dew's as its users compile it, Dew's own programs through its seam (ledger 3048, 3113: a YNNPACK
+    fusion's float32-rounded products against a loop's contracted ones failed an equally exact sum on some
+    hosts). Each side is called with the parents by name, as a node's program is. The witness
+    (`Graph.fused`), the production path, keeps its own compile."""
+    names = mine.parents
+
+    def positional(fn):
+        @functools.wraps(fn)
+        def run(*values):
+            return fn(**dict(zip(names, values, strict=True)))
+        return run
+
+    def by_name(arm):
+        return lambda **given: arm(*(given[name] for name in names))
+
+    dew, reference, members = _arms_with(positional(mine.fn), positional(theirs.fn),
+                                         [positional(fn) for fn in theirs.members.values()], label)
+    _ynn_decided(label, [dew, reference, *members], [parents[name] for name in names])
+    return (dataclasses.replace(mine, fn=by_name(dew)),
+            dataclasses.replace(theirs, fn=by_name(reference),
+                                members=dict(zip(theirs.members, map(by_name, members), strict=True))))
 
 
 def _node_draw(mine, theirs, true, parents, wide, kind):

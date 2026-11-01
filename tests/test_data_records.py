@@ -5,6 +5,7 @@ reason."""
 import dataclasses
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import grain.python as grain
 import numpy as np
@@ -102,7 +103,7 @@ class Rows:
     pytest.param(lambda: _documents().map(lambda row: row), id="a lambda step"),
     pytest.param(lambda: Memory([{"image": np.zeros((2, 2), np.uint8)}]).batch(1), id="arrays in the store"),
     pytest.param(lambda: Memory([{"pair": (1, 2)}]).batch(1), id="a tuple read back a list"),
-    pytest.param(lambda: from_iter(Rows().opened, name="rows").batch(1), id="a bound method"),
+    pytest.param(lambda: from_iter(Rows().opened, identity="rows").batch(1), id="a bound method"),
     pytest.param(lambda: Memory([{"x": np.float64(1.5)}]).batch(1), id="a scalar JSON makes a float"),
 ])
 def test_a_chain_no_record_carries_whole_is_unrecorded_with_its_reason(unrecordable):
@@ -115,9 +116,52 @@ def test_a_chain_no_record_carries_whole_is_unrecorded_with_its_reason(unrecorda
 
 def test_a_chain_of_an_importable_iterator_is_recorded():
     """An iterator opened by a module-level function is recorded and read back."""
-    again = _read_back(from_iter(_rows, name="rows").batch(1))
+    again = _read_back(from_iter(_rows, identity="rows").batch(1))
     reader = iter(again)
     assert next(reader)["text"] == "a b"
+
+
+def test_a_run_recorded_while_its_iterators_identities_were_their_names_reads_its_chains_back(tmp_path):
+    """A run recorded while an iterator's content version was its `name` loads its chains with that version
+    its `identity` (`dew.config.earlier_chains`, row 3031), wherever a chain holds the iterator: a mix's
+    member, a concatenation's part, in its data and its validation."""
+    from dew.config import RunConfig
+    from dew.data.sources import Concatenate
+
+    mixed = mix([from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2")]).batch(1)
+    joined = Concatenate((from_iter(_rows, identity="rows@3"), from_iter(_rows, identity="rows@4"))).batch(1)
+    path = Path(RunConfig(data=mixed, validation={"val": joined}).save(str(tmp_path / "run")))
+    written = path.read_text()
+    path.write_text(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert path.read_text() != written
+    loaded = RunConfig.load(str(path))
+    assert [member.source.identity for member in loaded.data.source.pipelines] == ["rows@1", "rows@2"]
+    assert [part.identity for part in loaded.validation["val"].source.sources] == ["rows@3", "rows@4"]
+
+
+def test_a_saved_runs_data_shaped_like_an_earlier_iterators_record_loads_as_it_was_written(tmp_path):
+    """A store's data (a Memory's column) shaped like an iterator's earlier record is data, which a saved
+    run loads as it wrote it: the translation of earlier records reads stores alone (`earlier_chains`)."""
+    from dew.config import RunConfig
+
+    payload = {"class": "dew.data.sources.iterator:Iterated", "fields": {"name": "literal"}}
+    columns = Path(RunConfig(data=Memory({"payload": [payload]}).batch(1)).save(str(tmp_path / "columns")))
+    assert list(RunConfig.load(str(columns)).data.source.values["payload"]) == [payload]
+    rows = Path(RunConfig(data=Memory([payload]).batch(1)).save(str(tmp_path / "rows")))
+    assert list(RunConfig.load(str(rows)).data.source.values) == [payload]
+
+
+def test_a_run_recorded_while_a_held_out_iterators_identity_was_its_name_loads_its_view_renamed(tmp_path):
+    """An iterator an earlier record names by `name` beneath a view of it, a holdout's part, loads with that
+    version its `identity`: the view's source is a store its class declares (`earlier_chains`)."""
+    from dew.config import RunConfig
+
+    train, _ = from_iter(_rows, identity="rows@1").holdout(0.25)
+    path = Path(RunConfig(data=train.batch(1)).save(str(tmp_path / "run")))
+    written = path.read_text()
+    path.write_text(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert path.read_text() != written
+    assert RunConfig.load(str(path)).data.source.source.identity == "rows@1"
 
 
 def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():

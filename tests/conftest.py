@@ -15,6 +15,7 @@ os.environ.update(lane_environment.configured(os.environ))
 import jax
 import pytest
 import remote_cache
+from tool_support import load
 
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 
@@ -59,6 +60,26 @@ def bundle(node) -> str:
     """The shared cache's bundle of `node`'s test file in this execution partition (`remote_cache.bundle`)."""
     return remote_cache.bundle(node.nodeid, node.config.getoption("ci_group", None),
                                os.environ.get("PYTEST_XDIST_WORKER"))
+
+
+def _marks_named(config) -> bool:
+    """Whether the run names its marks (`-m EXPR` or `-mEXPR`, an empty expression among them), on its command
+    line, in PYTEST_ADDOPTS or in its configuration's addopts."""
+    import shlex
+
+    given = [*config.invocation_params.args, *shlex.split(os.environ.get("PYTEST_ADDOPTS", "")),
+             *config.getini("addopts")]
+    return any(arg.startswith("-m") and not arg.startswith("--") for arg in given)
+
+
+def pytest_configure(config):
+    """A run that names no marks selects as CI does (tools/armada/session.py's `SELECTION`): the
+    network-marked tests, which reach the Hub and a GPU node's memory and run on the network lane (`ci.py
+    gpu-lane --network`), set aside, counted as deselected. So a plain `pytest tests/test_x.py`, or an armada
+    map of it, grades what CI grades, never a real checkpoint's download on a container's disk (gpt-oss-20b's
+    filled one, 2026-10-31). A run that names its marks, an empty expression included, chooses."""
+    if not _marks_named(config):
+        config.option.markexpr = load("session", "tools/armada").SELECTION[1]
 
 
 def pytest_collectstart(collector):
@@ -136,31 +157,11 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture(autouse=True)
-def own_rung_records(monkeypatch, tmp_path_factory):
-    """Each test keeps its own rung records (`dew.training.rungs`). The suite
-    shares one compilation cache, beside which a run records its step's
-    rung, and a rung one test forces would be another's floor."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
-
-
-@pytest.fixture(autouse=True)
-def own_data_cache(monkeypatch, tmp_path_factory):
-    """Each test keeps its own automatic data cache (`dew.data.cache.automatic_root`): records one
-    test's maps made are not another's to read back."""
-    monkeypatch.setenv("DEW_DATA_CACHE", str(tmp_path_factory.mktemp("data-cache")))
-
-
-@pytest.fixture(autouse=True)
-def own_hub_answers(monkeypatch, tmp_path_factory, request):
-    """Each test keeps its own recorded Hub answers (`dew.cache.hub_answer`): a commit one test's
-    stand-in answered is not another's offline record. A test that reaches no network keeps its own
-    Hub cache too, whose refs its stand-ins' answers write (`dew.cache.hub_commit`), never the
-    runner's cache."""
-    monkeypatch.setenv("DEW_HUB_ANSWERS", str(tmp_path_factory.mktemp("hub-answers")))
-    if request.node.get_closest_marker("network") is None:
-        from huggingface_hub import constants
-
-        monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path_factory.mktemp("hub-cache")))
+def own_settings(monkeypatch, tmp_path_factory, request):
+    """Each test's own rung records, data cache, Hub answers and, reaching no network, Hub cache
+    (`lane_environment.per_test_settings`)."""
+    lane_environment.per_test_settings(monkeypatch, tmp_path_factory.mktemp,
+                                       network=request.node.get_closest_marker("network") is not None)
 
 
 MAPPINGS = Path("/proc/self/maps")
@@ -249,7 +250,6 @@ def rng():
 @pytest.fixture(scope="module")
 def lint():
     """tools/lint_slop.py, as the lint tests read it."""
-    from tool_support import load
 
     return load("lint_slop")
 

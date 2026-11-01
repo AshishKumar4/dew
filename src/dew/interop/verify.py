@@ -39,6 +39,7 @@ from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from types import NoneType
 from typing import TYPE_CHECKING
 
 import jax
@@ -219,9 +220,10 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
                          else noise * 4.0)
         # DeepSeek's balancing bias is a buffer the checkpoint carries, and
         # the reference selects on it: nonzero, or the load path that reads
-        # it would agree with one that drops it.
+        # it would agree with one that drops it. LFM2-MoE's and AFMoE's hold
+        # it as `expert_bias`.
         for name, tensor in model.named_buffers():
-            if name.endswith("e_score_correction_bias"):
+            if name.endswith(("e_score_correction_bias", "expert_bias")):
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
@@ -308,10 +310,11 @@ class _Sizes:
 def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -> Mapping[str, object]:
     """Return a config with the sizes the convention reads made small and the rest kept.
 
-    The layer count stays: a per-layer field the convention does not read
-    (SmolLM3's `no_rope_layers`, one entry per layer with every fourth
-    layer off) would read as all-on over two layers and hide the difference.
-    The query-to-key-head ratio stays, and so does whether the hidden width
+    The layer count stays here: a per-layer field the convention does not
+    read (SmolLM3's `no_rope_layers`, one entry per layer with every fourth
+    layer off) would read as all-on over two layers and hide the difference,
+    so `shallow` cuts it only to the layers that hold every kind the stated
+    depth builds. The query-to-key-head ratio stays, and so does whether the hidden width
     is the heads' total width; a stated window or chunk, and a rope ramp's
     stated original context, shrink below the probe's length so each acts,
     and a token id past the probe's vocabulary moves inside it. Each standard
@@ -488,6 +491,18 @@ class VerifiedMapping:
             return parts.family(self.model_type, _assembled(source, hf_config))
         return dict(CONVENTIONS)[self.family]
 
+    def record(self, hf_config: Mapping[str, object],
+               entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
+        """The real config's record through `entry` (`entry`'s family by default), its tensor names
+        unchecked: what a load's selection of the checkpoint's tensors (its prediction depths,
+        `DecoderFamily.prediction_depth`) reads before `translate` checks the selection's names."""
+        entry = self.entry(hf_config) if entry is None else entry
+        try:
+            record, _ = _translate(hf_config, self.family, entry)
+        except _Mismatch as error:
+            raise _refuse(self.model_type, str(error)) from error
+        return record
+
     def translate(self, hf_config: Mapping[str, object], tensor_names: Collection[str],
                   entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
         """Translate the real config and check the real tensor names, then warn once.
@@ -497,10 +512,7 @@ class VerifiedMapping:
         `entry` is the family `entry` gave for this config, where the caller holds it.
         """
         entry = self.entry(hf_config) if entry is None else entry
-        try:
-            record, _ = _translate(hf_config, self.family, entry)
-        except _Mismatch as error:
-            raise _refuse(self.model_type, str(error)) from error
+        record = self.record(hf_config, entry)
         unmapped = _unmapped(tensor_names, record, entry)
         if unmapped:
             raise _refuse(self.model_type, f"the tensors {unmapped[:8]} have no path in the {self.family!r} "
@@ -532,10 +544,14 @@ def _assembled(source: ModelSource, hf_config: Mapping[str, object]) -> parts.As
                       f"({error})") from error
 
 
-def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
-    """transformers' config for the type at the probe's sizes, the parameter
-    count of the model it builds (on torch's meta device, so an unshrunk
-    layer allocates nothing), and the class's name and release."""
+_LAYER_INDEXES = frozenset({'layer_idx', 'layer_id', 'layer_index', 'layer_number'})
+"""The attributes a layer's modules hold its own place under, which tell layers apart without telling
+their computations apart."""
+
+
+def _skeleton(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, PreTrainedModel]:
+    """transformers' config for the type at `fields` and the causal LM it builds on torch's meta device, so
+    an unshrunk layer allocates nothing; `ProbeUnavailable` where it builds none."""
     model_type = source.model_type
     try:
         import torch
@@ -548,10 +564,94 @@ def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tupl
     try:
         config = source.configured(fields)
         with torch.device('meta'):
-            skeleton = source.causal_lm(config)
+            return config, source.causal_lm(config)
     except Exception as error:
         raise _unavailable(model_type, f"transformers {__version__} builds no causal LM from its shrunken "
                            f"config ({type(error).__name__}: {error})") from error
+
+
+def _module_kind(path: str, module: torch.nn.Module) -> tuple:
+    """A module's kind: its place under its layer or model, its class, its public scalar attributes (a
+    layer's place aside, `_LAYER_INDEXES`) and its own parameters' and buffers' shapes."""
+    return (path, type(module).__module__, type(module).__qualname__,
+            tuple(sorted((key, value) for key, value in vars(module).items()
+                         if not key.startswith('_') and key not in _LAYER_INDEXES
+                         and isinstance(value, (bool, int, float, str, NoneType)))),
+            tuple((name, tuple(tensor.shape)) for name, tensor in (
+                *module.named_parameters(recurse=False), *module.named_buffers(recurse=False))))
+
+
+def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> tuple[list[tuple], tuple] | None:
+    """The kinds of the model `fields` builds (`_skeleton`): each decoder layer's, its entry in each of the
+    config's per-layer lists (one as long as the depth, stated or derived: SmolLM3's `no_rope_layers`,
+    HY-3's `mlp_layer_types`) and each of its modules' (`_module_kind`) across every module list as long
+    as the depth; and every module's outside those lists (its table, its rotary, its final norm). None
+    where no module list is as long as the depth, or where the model is not built by transformers' own
+    code of transformers' and torch's own classes (a remote source; a config class, or a causal LM class
+    the auto registry resolves it to, registered from elsewhere), whose layers differ only as their kinds
+    show: a source's own code may add what no kind shows (a hook on its later layers, a rotary built by
+    its depth)."""
+    import torch
+
+    config, model = _skeleton(source, fields)
+    depth = _records.integer(config.num_hidden_layers, 'num_hidden_layers')
+    # The code that built the model, a remote class's constructor or a class registered from elsewhere, is
+    # the source's own even where what it returns is transformers' classes.
+    from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
+
+    if source.remote is not None:
+        return None
+    builders = (type(config), MODEL_FOR_CAUSAL_LM_MAPPING[type(config)])
+    own = ('transformers.', 'torch.')
+    if any(not built.__module__.startswith('transformers.') for built in builders) or any(
+            not type(module).__module__.startswith(own) for module in model.modules()):
+        return None
+    stacks = [module for module in model.modules() if isinstance(module, torch.nn.ModuleList)
+              and len(module) == depth]
+    if not stacks:
+        return None
+    lists = sorted((name, tuple(value)) for name, value in vars(config).items()
+                   if isinstance(value, (list, tuple)) and len(value) == depth)
+    inside = {id(module) for stack in stacks for module in stack.modules()}
+    outside = tuple(_module_kind(path, module) for path, module in model.named_modules()
+                    if id(module) not in inside)
+    layers = [(tuple(json.dumps(values[index], sort_keys=True, default=str) for _, values in lists),
+               tuple(tuple(_module_kind(path, module) for path, module in stack[index].named_modules())
+                     for stack in stacks)) for index in range(depth)]
+    return layers, outside
+
+
+def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, object]:
+    """`fields` (`shrink`'s) cut to the fewest first layers that hold every kind of layer its stated depth
+    builds (`_layer_kinds`), at least two, each stated per-layer list cut alike: HY-3's 80 layers probe as
+    its dense first and a routed one, SmolLM3's 36 as its first four, the fourth without positions. The
+    cut holds only where its layers are the deep model's first ones kind for kind and every module
+    outside them is the deep model's; the depth stays otherwise, and where no kind is told
+    (`_layer_kinds` is None)."""
+    deep = _layer_kinds(source, fields)
+    if deep is None:
+        return fields
+    kinds, outside = deep
+    firsts = {}
+    for index, layer in enumerate(kinds):
+        firsts.setdefault(layer, index)
+    count = max(max(firsts.values()) + 1, min(2, len(kinds)))
+    if count == len(kinds):
+        return fields
+    key = _Sizes.of(fields, source).key('num_hidden_layers')
+    cut = {name: (list(value[:count]) if isinstance(value, (list, tuple)) and len(value) == len(kinds)
+                  and name != key else value) for name, value in fields.items()}
+    cut[key] = count
+    return cut if _layer_kinds(source, cut) == (kinds[:count], outside) else fields
+
+
+def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
+    """transformers' config for the type at the probe's sizes, the parameter
+    count of the model it builds (on torch's meta device, so an unshrunk
+    layer allocates nothing), and the class's name and release."""
+    config, skeleton = _skeleton(source, fields)
+    from transformers import __version__
+
     size = sum(parameter.numel() for parameter in skeleton.parameters())
     origin = f"transformers {__version__}'s" if source.remote is None else f"{source.remote.name}'s remote"
     return config, size, f"{origin} {type(skeleton).__name__}"
@@ -624,19 +724,33 @@ def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndar
     return logits.detach().numpy(), gradients
 
 
+def _as_stored(model: PreTrainedModel, tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """`tensors`, by `model`'s parameter names, as its `save_pretrained` stores them: through the reverse of
+    the checkpoint conversion its load applies (`revert_weight_conversion`; a routed type's fused experts
+    are stored one tensor per expert), so each lands where its parameter's stored tensor does."""
+    import torch
+    from transformers.core_model_loading import revert_weight_conversion
+
+    stored = revert_weight_conversion(model, {name: torch.from_numpy(np.asarray(value))
+                                              for name, value in tensors.items()})
+    return {name: tensor.numpy() for name, tensor in stored.items()}
+
+
 def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFamily,
                     record: decoder_parts.DecoderFields, variables: Variables) -> float:
     """How much farther the source's float32 gradient of a parameter is from the float64 truth than
     Dew's float32 gradient is, the largest over the parameters, each pooled over its elements on the
     probe's draw (the root of the ratio of their summed squared errors, Dew's floored at the half ulp
-    float32 carries of each element of the truth): the source's eval-mode gradients read into Dew's tree
-    as its weights are (`translate_weights`; a gradient rearranges as its parameter does), the truth
+    float32 carries of each element of the truth): the source's eval-mode gradients stored as
+    `save_pretrained` stores its weights (`_as_stored`) and read into Dew's tree as they are
+    (`translate_weights`; a gradient rearranges as its parameter does), the truth
     Dew's decoder of the same record and weights in float64. Per parameter, so a wrong gradient of a
     small one is not hidden by another's rounding."""
     ids = probe_ids(_VOCAB)
     cotangent = np.random.RandomState(11).standard_normal((BATCH, LENGTH, _VOCAB)).astype(np.float32)
     _, theirs = _probe_gradients(reference, ids, cotangent, train=False)
-    their_tree = flax_traverse.flatten_dict(decoders.translate_weights(theirs, record, family)['params'])
+    stored = _as_stored(reference, theirs)
+    their_tree = flax_traverse.flatten_dict(decoders.translate_weights(stored, record, family)['params'])
 
     def gradient(dtype: str) -> dict:
         model = models.build('causal_transformer', {**record, 'dtype': dtype, 'attention_impl': 'reference'})
@@ -807,13 +921,15 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             reasons[convention] = str(error)
     with _quiet():
         try:
-            fields = shrink(hf_config, source)
-            layers = _Sizes.of(hf_config, source).stated('num_hidden_layers')
+            shrunk = shrink(hf_config, source)
+            _Sizes.of(hf_config, source).stated('num_hidden_layers')
         except (KeyError, ValueError) as error:
             # A reader may take a config by its own names or its defaults (OPT's
             # defaults every size); the probe shrinks it by the standard names.
             raise _unavailable(model_type, f"its config states no {error.args[0]!r} the probe shrinks it "
                                "by") from error
+        fields = shallow(source, shrunk)
+        layers = _Sizes.of(fields, source).stated('num_hidden_layers')
         config, size, name = _reference_config(source, fields)
         # A candidate that builds another architecture is dismissed on its
         # parameter count before its own model is run.

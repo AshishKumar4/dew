@@ -8,7 +8,7 @@ can drift.
     python tools/gen_exports.py [--check] [PACKAGE]
 
 ruff orders and wraps the imports and `__all__` (I001, RUF022), so the written file is the one the ruff gate
-passes; `__all__` also names `__version__` where the package assigns it."""
+passes."""
 
 import argparse
 import ast
@@ -27,29 +27,33 @@ def ruffed(text: str, path: Path) -> str:
     return subprocess.run(command, input=text, capture_output=True, text=True, check=True).stdout
 
 
-def imports(exports: dict[str, str]) -> list[str]:
+def imports(package: str, exports: dict[str, str]) -> list[str]:
     """The `if TYPE_CHECKING:` block importing each export from its module, one statement a module, in
-    `_EXPORTS`' order; `ruffed` orders and wraps them."""
-    named = {module: [name for name, owner in exports.items() if owner == module]
-             for module in exports.values()}
+    `_EXPORTS`' order, a module the package exports as itself from the package; `ruffed` orders and wraps
+    them."""
+    owners = {name: package if module == f"{package}.{name}" else module
+              for name, module in exports.items()}
+    named = {module: [name for name, owner in owners.items() if owner == module]
+             for module in owners.values()}
     return ["if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)",
             *(f"    from {module} import {', '.join(names)}" for module, names in named.items())]
 
 
-def written(path: Path) -> str:
-    """`path` with its TYPE_CHECKING imports and `__all__` written from its `_EXPORTS`."""
+def written(path: Path, root: Path) -> str:
+    """`path`, a package's `__init__.py` under the import root `root`, with its TYPE_CHECKING imports and
+    `__all__` written from its `_EXPORTS`."""
     text = path.read_text()
     tree = ast.parse(text)
     assigned = {target.id: node for node in tree.body if isinstance(node, ast.Assign)
                 for target in node.targets if isinstance(target, ast.Name)}
     exports = ast.literal_eval(assigned["_EXPORTS"].value)
-    names = [*exports, *(["__version__"] if "__version__" in assigned else [])]
     checking = next(node for node in tree.body if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
                     and node.test.id == "TYPE_CHECKING")
     lines = text.splitlines()
-    spans = sorted([(checking.lineno, checking.end_lineno, imports(exports)),
+    package = ".".join(path.parent.relative_to(root).parts)
+    spans = sorted([(checking.lineno, checking.end_lineno, imports(package, exports)),
                     (assigned["__all__"].lineno, assigned["__all__"].end_lineno,
-                     ["__all__ = [", *(f'    "{name}",' for name in names), "]"])], reverse=True)
+                     ["__all__ = [", *(f'    "{name}",' for name in exports), "]"])], reverse=True)
     for start, end, block in spans:
         lines[start - 1:end] = block
     return ruffed("\n".join(lines) + "\n", path)
@@ -67,7 +71,7 @@ def main() -> None:
     args = parser.parse_args()
     stale = []
     for path in packages(args.package):
-        text = written(path)
+        text = written(path, args.package.parent)
         if text != path.read_text():
             stale.append(path.relative_to(args.package.parent))
             if not args.check:

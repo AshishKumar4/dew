@@ -30,7 +30,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#95f06182db1b5bfe010339c7fad98665385bcc88
+  ARMADA: github:AshishKumar4/armada#a8b23968a77c9c43d5868f027e43d2a1d245734c
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -95,9 +95,9 @@ jobs:
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
 
-  # What PyPI receives, installed the way a user installs it: the sdist and
-  # wheel build, pass twine, and name no requirement by URL, which PyPI
-  # refuses and twine passes; the wheel installs from PyPI alone into an
+  # What a release attaches and Dew's index serves, installed the way a user
+  # installs it: the sdist and wheel build, pass twine, and name no requirement
+  # by URL, which an index refuses and twine passes; the wheel installs into an
   # empty environment and runs; and the accelerator extras resolve.
   package:
     needs: proven

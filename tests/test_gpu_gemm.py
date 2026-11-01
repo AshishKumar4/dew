@@ -23,7 +23,7 @@ import test_gemm_template as gemm_template
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
-from gpu_flow import Cell, cells_of, run_cells
+from gpu_flow import Cell, cells_of, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import assert_as_exact
 
@@ -93,15 +93,12 @@ def a_fused_projection_trains_its_producer_and_epilogue():
 def test_the_gemm_kernels_run_on_this_gpu():
     """Every GEMM and toolkit cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all
     raised together; the toolkit's on an H100 alone."""
-    def on_triton():
-        if not generation.triton_runs():
-            pytest.skip("needs a GPU the Pallas kernels compile for")
-        gemm_template.a_dense_products_exact_sums_survive_one_row_tile()
-
     run_cells([
         Cell("a fused projection trains its producer and epilogue",
              a_fused_projection_trains_its_producer_and_epilogue, "sm90"),
-        Cell("a dense product's exact sums survive one row tile", on_triton),
+        Cell("a dense product's exact sums survive one row tile",
+             when(generation.triton_runs(), "needs a GPU the Pallas kernels compile for",
+                  gemm_template.a_dense_products_exact_sums_survive_one_row_tile)),
         *(Cell(f"CUTLASS runs the projection as exactly as XLA where chosen: {sizes}",
                functools.partial(grouped_gemm.cutlass_runs_the_projection_as_exactly_as_xla_where_chosen,
                                  sizes))

@@ -65,6 +65,9 @@ def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, co
                          ) -> tuple:
     del operands
     table, ids = saved
+    # The ids are integers: their cotangent is float0's zero, as the lookup's own pullback gives it, typed as
+    # the ids arrive, not as a reshard below holds them (an Explicit axis splitting them is in their type).
+    untouched = jax.custom_derivatives.zero_from_primal(ids)
     # The gradient adds each token's cotangent to its row. Under a batch
     # split GSPMD scattered each device's tokens into a table-sized buffer
     # and summed the buffers across devices: a table's worth of traffic
@@ -77,8 +80,6 @@ def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, co
         cotangent, ids = _whole(cotangent), _whole(ids)
     rows = cotangent.astype(table.dtype)
     placed = explicit_spec(ids)
-    # The ids are integers: their cotangent is float0's zero, as the lookup's own pullback gives it.
-    untouched = np.zeros(ids.shape, jax.dtypes.float0)
     if placed is None:
         return jnp.zeros_like(table).at[ids].add(rows), untouched
     # Each device scatters its own rows and the sums are added across the axis.
