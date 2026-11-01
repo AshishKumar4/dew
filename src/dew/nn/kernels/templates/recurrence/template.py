@@ -283,6 +283,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                   target: generation.GpuTarget) -> bool:
         """Whether the states launch's programs at `tiles` run in one wave of `target`'s multiprocessors, as
         many a multiprocessor as it holds (`states_held`)."""
+        assert target.multiprocessors is not None, "a wave counts the device's multiprocessors"
         held = target.multiprocessors * self.states_held(ba, tiles, target)
         return self._programs(ba, tiles, target) <= held
 
