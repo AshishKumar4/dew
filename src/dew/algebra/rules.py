@@ -274,7 +274,7 @@ def _linear() -> Ruleset:
     # A matrix product of an operand scaled along its kept axis (a row scale on the left, a column scale on
     # the right, constant along the contraction) as the product scaled: x@w new.
     s = var("s", Term)
-    result = var("result", Vec[i64])
+    product_extent = var("product_extent", Vec[i64])
     length2, row_lift, column_lift = vars_("length2 row_lift column_lift", i64)
     left = var("left", Vec[i64])
     contracted = (eq(left).to(shape(x)), eq(length2).to(log2_of(left[i64(1)])))
@@ -291,7 +291,8 @@ def _linear() -> Ruleset:
              column_lift)):
         sets.append(rule(
             eq(t).to(scaled()), matrix_product(params), plain(multiplied), matrix(x), matrix(y),
-            along(laid, i64(laid_axis)), eq(result).to(shape(t)), eq(lift).to(lifted(result, i64(lift_axis))),
+            along(laid, i64(laid_axis)), eq(product_extent).to(shape(t)),
+            eq(lift).to(lifted(product_extent, i64(lift_axis))),
             *contracted, *facts, *dominated(power, degrees, "new")).then(
             union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
             *made(product, power, degrees)))

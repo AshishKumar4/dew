@@ -8,7 +8,6 @@ takes (`walk`). Each shared value is priced once over the extracted DAG (egglog'
 from __future__ import annotations
 
 import dataclasses
-import functools
 import math
 from collections.abc import Callable
 
@@ -87,36 +86,28 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4) -> Wor
     return Work()
 
 
-@functools.total_ordering
-@dataclasses.dataclass(frozen=True, eq=False)
+@dataclasses.dataclass(frozen=True, order=True)
 class Seconds:
     """A form's work and the seconds its schedule gives it, as extraction adds and compares it (egglog's
     `ComparableAdd`): the work summed, compared by the seconds the schedule gives the sum, ties broken by
-    the schedule's `tiebreak` where it states one (`Walk`'s: its units' seconds in series); two works of one
-    key are equal, so every pair compares."""
+    the schedule's `tiebreak` where it states one (`Walk`'s: its units' seconds in series), held as `key`;
+    two works of one key are equal, so every pair compares."""
 
-    work: Work
-    schedule: Callable[[Work], float] = dataclasses.field(repr=False)
+    key: tuple[float, float] = dataclasses.field(init=False, repr=False)
+    work: Work = dataclasses.field(compare=False)
+    schedule: Callable[[Work], float] = dataclasses.field(compare=False, repr=False)
+
+    def __post_init__(self):
+        tiebreak = getattr(self.schedule, "tiebreak", None)
+        object.__setattr__(self, "key", (self.schedule(self.work),
+                                         0.0 if tiebreak is None else tiebreak(self.work)))
 
     @property
     def value(self) -> float:
-        return self.schedule(self.work)
+        return self.key[0]
 
     def __add__(self, other: Seconds) -> Seconds:
         return Seconds(self.work + other.work, self.schedule)
-
-    def key(self) -> tuple[float, float]:
-        tiebreak = getattr(self.schedule, "tiebreak", None)
-        return self.value, 0.0 if tiebreak is None else tiebreak(self.work)
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, Seconds) and self.key() == other.key()
-
-    def __lt__(self, other: Seconds) -> bool:
-        return self.key() < other.key()
-
-    def __hash__(self) -> int:
-        return hash(self.key())
 
 
 def fused(facts: generation.GpuTarget) -> Callable[[Work], float]:
