@@ -39,8 +39,9 @@ def imports(package: str, exports: dict[str, str]) -> list[str]:
             *(f"    from {module} import {', '.join(names)}" for module, names in named.items())]
 
 
-def written(path: Path) -> str:
-    """`path` with its TYPE_CHECKING imports and `__all__` written from its `_EXPORTS`."""
+def written(path: Path, root: Path) -> str:
+    """`path`, a package's `__init__.py` under the import root `root`, with its TYPE_CHECKING imports and
+    `__all__` written from its `_EXPORTS`."""
     text = path.read_text()
     tree = ast.parse(text)
     assigned = {target.id: node for node in tree.body if isinstance(node, ast.Assign)
@@ -49,7 +50,7 @@ def written(path: Path) -> str:
     checking = next(node for node in tree.body if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
                     and node.test.id == "TYPE_CHECKING")
     lines = text.splitlines()
-    package = ".".join(path.relative_to(REPO / "src").parent.parts)
+    package = ".".join(path.parent.relative_to(root).parts)
     spans = sorted([(checking.lineno, checking.end_lineno, imports(package, exports)),
                     (assigned["__all__"].lineno, assigned["__all__"].end_lineno,
                      ["__all__ = [", *(f'    "{name}",' for name in exports), "]"])], reverse=True)
@@ -70,7 +71,7 @@ def main() -> None:
     args = parser.parse_args()
     stale = []
     for path in packages(args.package):
-        text = written(path)
+        text = written(path, args.package.parent)
         if text != path.read_text():
             stale.append(path.relative_to(args.package.parent))
             if not args.check:
