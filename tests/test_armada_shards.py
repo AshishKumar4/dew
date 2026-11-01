@@ -95,7 +95,8 @@ def site_checkout(root: Path, site: str = SITE) -> Path:
 def entry_task(ci, monkeypatch, entry: dict, out: Path, artifacts: Path | None = None,
                inputs: Path | None = None) -> int:
     """Plan entry `entry`'s task as armada starts it: .armada.json's command filled from the entry, with the
-    directories armada names to every task (ARMADA_ARTIFACTS, ARMADA_INPUTS) here; its exit status."""
+    directories armada names to every task (ARMADA_ARTIFACTS, ARMADA_INPUTS) here, in a container no task ran
+    in where the entry asks (`fresh`, ARMADA_FRESH); its exit status."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     values = {**entry, "out": out}
     filled = [re.sub(r"\{(\w+)\}", lambda field, values=values: str(values[field[1]]), word)
@@ -105,6 +106,7 @@ def entry_task(ci, monkeypatch, entry: dict, out: Path, artifacts: Path | None =
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, str(path))
+    monkeypatch.setenv("ARMADA_FRESH", "1" if entry.get("fresh") else "0")
     monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
     return ci.main()
 

@@ -1819,10 +1819,11 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of `session.MARKS`, over every record of its rows,
     on every class, a split file's under each count of groups it was planned as. A file is out
-    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
+    only where every keyed record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
     (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
-    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
-    no green run of these tools has recorded."""
+    and one without a keyed record, or with one the Worker did not return, as "unrecorded": a new file,
+    one no green run of these tools has recorded, or one only a GPU lane ran, which keys none (`gpu_lane`).
+    A record without a key names no inputs to judge it by, so it is no evidence either way."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
@@ -1831,11 +1832,13 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     # One reading of the checkout, which every record's key reads its inputs from.
     reading = Reading()
 
-    def evidence_of(key: str) -> tuple[str, list[str]]:
+    def evidence_of(key: str) -> tuple[str, list[str] | None]:
         _, name, _ = key_parts(key)
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
+        if found.get("depends") is None:
+            return name, None
         current = any(fresh(found, name, common, reading) for common in inputs)
         return name, found["reads"] or ([] if current else ["changed"])
 
@@ -1847,7 +1850,8 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     evidence: dict[str, set[str]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         for name, found in pool.map(evidence_of, keys):
-            evidence.setdefault(name, set()).update(found)
+            if found is not None:
+                evidence.setdefault(name, set()).update(found)
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded

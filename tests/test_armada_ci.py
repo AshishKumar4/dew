@@ -331,14 +331,13 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     install_compiler(tmp_path.parent / "cuda/bin")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
-    # The session fixture's files in a task of their own, where it reads for every file, and the file whose
-    # helper changes below in one of its own, as what a process ran before a file is that file's input too.
-    fixtures, alone = ["tests/test_one.py", "tests/test_two.py"], ["tests/test_plain.py"]
+    # Each file a fresh task of its own, as the plan runs a file the cache lacks.
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    for tests in ([name for name in ran if name not in fixtures + alone], fixtures, alone):
-        ci.task("3.12", tests, "", out, 600.0)
-        assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
-            f"3.12:{name}": 0 for name in tests}
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    for name in ran:
+        ci.task("3.12", [name], "", out, 600.0)
+        rows = json.loads(out.read_text())["rows"]
+        assert {row["name"]: row["exitCode"] for row in rows} == {f"3.12:{name}": 0}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
     stored["/" + ci.record_key("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())] = None
@@ -574,8 +573,10 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert len(ran("test_red")) == 2, "a red row is never reused"
     assert ci.gpu_lane("3.12", names, out, cache="on", processes=4, deadline=600.0) == 0
     assert all(len(ran(Path(name).stem)) == 3 for name in names), "a lane's green rows are never reused"
-    # Their records, of these inputs as the lane keys them, read no backend: none is in the GPU tier.
-    assert not set(names) & set(ci.gpu_tier("3.12"))
+    # A lane keeps no key, so its records are no evidence the tier reads: its files are in as unrecorded until
+    # a CPU task's keyed record says otherwise.
+    tier = ci.gpu_tier("3.12")
+    assert {name: tier.get(name) for name in names} == {name: ["unrecorded"] for name in names}
 
 
 def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
@@ -1404,18 +1405,18 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     assert run() == 1
 
 
-@pytest.mark.parametrize("order", [("lone", "uses"), ("uses", "lone")], ids=["lone first", "lone after uses"])
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
-        ci, tmp_path, monkeypatch, cache_worker, order):
+        ci, tmp_path, monkeypatch, cache_worker):
     """A train that loses a head loses the test modules and modules the head added, and its other
     files keep their rows (the land queue's recompose after a pull): a test module, a module in a
     package no test imported, or one beside a module a file's tests executed under a name no run
     tried to import, added or taken away runs no file again (ledger 3220: a listing of every package
     above an executed module keyed 82% of rows, and each added module reran them). An __init__.py
     added to, or taken from, a namespace package on the way to a module a file imported, which that
-    import finds, runs that file again, and that one alone, whatever its order in the task: each file
-    runs in a process of its own (`alone`), so no file's key holds another's imports; a top-level
-    package added under src/, which may shadow any import, runs every file."""
+    import finds, runs that file again, and that one alone: each file runs in a process of its own
+    (`alone`), so no file's key holds another's imports; a top-level package added under src/, which may
+    shadow any import, runs every file. Each runs as the plan runs a file the cache lacks, in a fresh task
+    of its own."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
                          "src/pkg/space/sub/used.py": "def value(): return 1\n",
@@ -1438,8 +1439,10 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     out = tmp_path / "verdict.json"
 
     def run():
-        ci.task("3.12", [f"tests/test_{name}.py" for name in order], "", out, 600.0)
-        assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0, 0]
+        monkeypatch.setenv("ARMADA_FRESH", "1")
+        for name in ("uses", "lone"):
+            ci.task("3.12", [f"tests/test_{name}.py"], "", out, 600.0)
+            assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0]
         return [len((tmp_path / f"runs-{name}").read_text()) for name in ("uses", "lone")]
 
     changes = [(None, None, [1, 1]), ("tests/test_added.py", "def test_added(): pass\n", [1, 1]),

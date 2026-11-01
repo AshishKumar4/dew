@@ -7,7 +7,17 @@ import json
 import sys
 
 import pytest
-from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
+from armada_support import (
+    ON_SRC,
+    PASSING,
+    cached,
+    fresh_tasks,
+    interpreter,
+    lifetime_task,
+    loaded,
+    reusable_now,
+    written,
+)
 from tool_support import REPO_ROOT, load
 
 
@@ -68,7 +78,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     (tmp_path / "notes/page.md").write_text("page\n")
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    fresh_tasks(ci, monkeypatch, tests, tmp_path)
 
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
@@ -133,7 +143,7 @@ def test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs
     (tmp_path / "notes/page.md").write_text("page\n")
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    fresh_tasks(ci, monkeypatch, tests, tmp_path)
 
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
@@ -183,7 +193,7 @@ def test_a_native_media_binary_keeps_its_files_key_and_what_it_opened_is_that_ke
                                 "                   capture_output=True)\n"})
     interpreter(tmp_path, "3.12")
     tests = ["tests/test_media.py", "tests/test_shell_script.py"]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    fresh_tasks(ci, monkeypatch, tests, tmp_path)
     assert reusable_now(ci, tests) == [True, False]
     (tmp_path / "tests/clip.bin").write_text("more frames\n")
     assert reusable_now(ci, tests) == [False, False]
@@ -404,7 +414,7 @@ def test_a_module_imported_from_its_bytecode_alone_is_its_files_input(ci, tmp_pa
         source.unlink()
 
     placed(1)
-    ci.task("3.12", ["tests/test_bytecode.py"], "", tmp_path / "verdict.json", 600.0)
+    fresh_tasks(ci, monkeypatch, ["tests/test_bytecode.py"], tmp_path)
     assert reusable_now(ci, ["tests/test_bytecode.py"]) == [True]
     placed(2)
     assert reusable_now(ci, ["tests/test_bytecode.py"]) == [False]
@@ -571,8 +581,9 @@ def test_a_reused_row_runs_nothing_so_the_first_file_to_execute_after_it_keeps_i
     the snapshot's state and keeps its key."""
     keyed = one_task(ci, tmp_path, monkeypatch, cache_worker, {"test_a.py": PASSING["test_a.py"]}, fresh=True)
     assert keyed() == [True]
-    reused = one_task(ci, tmp_path, monkeypatch, cache_worker, {**PASSING}, fresh=True)
-    assert reused() == [True, True]
+    written(tmp_path, {"test_b.py": PASSING["test_b.py"]})
+    ci.task("3.12", ["tests/test_a.py", "tests/test_b.py"], "", tmp_path / "verdict.json", 600.0)
+    assert reusable_now(ci, ["tests/test_a.py", "tests/test_b.py"]) == [True, True]
 
 
 def test_a_marker_a_deselected_test_carries_is_its_files_input(ci, tmp_path, monkeypatch, cache_worker):

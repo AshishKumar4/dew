@@ -52,12 +52,19 @@ def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str]
         (tmp_path / "src" / name).write_text(source)
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    monkeypatch.setenv("ARMADA_FRESH", "1")
-    for index, name in enumerate(tests):
-        ci.task("3.12", [name], "", tmp_path / f"verdict-{index}.json", 600.0)
+    fresh_tasks(ci, monkeypatch, tests, tmp_path)
+    for index in range(len(tests)):
         rows = json.loads((tmp_path / f"verdict-{index}.json").read_text())["rows"]
         assert all(row["exitCode"] == 0 for row in rows), rows
     return lambda: reusable_now(ci, tests)
+
+
+def fresh_tasks(ci, monkeypatch, tests: list[str], root: Path) -> None:
+    """Each of `tests` run as the plan runs a file the cache does not hold: a 3.12 task of its own, in a
+    container no task ran in (armada's ARMADA_FRESH), its verdict under `root`."""
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    for index, name in enumerate(tests):
+        ci.task("3.12", [name], "", root / f"verdict-{index}.json", 600.0)
 
 
 def reusable_now(ci, tests: list[str]) -> list[bool]:
