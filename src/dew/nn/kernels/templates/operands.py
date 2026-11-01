@@ -147,7 +147,7 @@ class Issuer:
                 registered = self._registered(name, lhs)
                 if registered is not None:
                     (right,) = self._operand(rhs, name, lhs, read)
-                    acc = family.register_products(acc, registered, right, interpret)
+                    acc = family.register_products(acc, _unscaled(registered), right, interpret)
                 else:
                     left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
                     acc = family.issued(acc, left, right, interpret)
@@ -202,7 +202,8 @@ class Issuer:
             (right,) = self._operand(rhs, name, lhs)
             if len(registered) <= 2:
                 return family.summed(
-                    shape, lambda acc: family.register_products(acc, registered, right, interpret), interpret)
+                    shape, lambda acc: family.register_products(acc, _unscaled(registered), right, interpret),
+                    interpret)
             # Each part's product its own accumulator, smallest first (`product.terms`), as `Family.apart`.
             return functools.reduce(jnp.add, (family.registers_product(registered[i], right, interpret)
                                               for i, _ in product.terms(len(registered), 1)))
@@ -211,3 +212,9 @@ class Issuer:
         if max(len(left), len(right)) == 2:
             return family.summed(shape, lambda acc: family.issued(acc, left, right, interpret), interpret)
         return family.apart(shape, left, right, interpret)
+
+
+def _unscaled(parts: tuple) -> tuple:
+    """Register parts as a family's in-place products take them (`Family.register_products`): each with no
+    power of two back."""
+    return tuple((part, None) for part in parts)
