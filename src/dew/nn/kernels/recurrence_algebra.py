@@ -1006,8 +1006,8 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw') and the memory decay's `sum(h dh)`;
     then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log
     decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's on its last token
-    (`sum(h dh) exp2(g_last) + sum(k dk)`), and `(dA, dbeta)`, the inverse's gradient's part `dw (kg beta)^T` `[C, C]` and the write
-    gates' `sum(kg d(kg beta))`, fp32."""
+    (`sum(h dh) exp2(g_last) + sum(k dk)`), and `(dA, dbeta)`, the inverse's gradient's part
+    `dw (kg beta)^T` `[C, C]` and the write gates' `sum(kg d(kg beta))`, fp32."""
     decays = raised(*gates)
     to_last = range_decay(*(half[None, :] for half in last), *gates)
     products = [(issue("memory_dq", out_grads(j), entered(j).T),
