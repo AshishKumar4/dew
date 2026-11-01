@@ -421,21 +421,6 @@ def _native_after_bound(pipeline: Pipeline) -> bool:
     return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
 
 
-def _shuffles_windows(pipeline: Pipeline) -> bool:
-    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples),
-    among its stages or those a memory read ran as it held them (`_written`), and shuffles the rows after a
-    stage that lays an example across windows: a concatenating pack, which cuts documents where its windows
-    end, or windows over a stream of them. A first-fit or best-fit pack places each whole in one window,
-    which holds its count however the windows are drawn."""
-    stages = _written(pipeline.source, pipeline.stages)
-    if examples_bound(stages) is None:
-        return False
-    laid = next((index for index, stage in enumerate(stages)
-                 if isinstance(stage, Windows) or (isinstance(stage, Pack) and stage.policy == "concat")),
-                None)
-    return laid is not None and any(isinstance(stage, Shuffle) for stage in stages[laid:])
-
-
 def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
     reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
@@ -912,8 +897,9 @@ def _pass_examples(train: Pipeline, read: Read) -> int | None:
         return None
     # A memory read that laid its examples out as it held them (a pack before its shuffle) holds no source
     # example a bound before that layout could count, as a run bounded in examples refuses it too.
+    held = () if isinstance(source, Mixture) else _written(source, ())
     if any(isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)
-           for stage in _written(source, ())):
+           for stage in held):
         return None
     prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
     if isinstance(source, Mixture):
@@ -1081,14 +1067,6 @@ def _compiled(
         raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
                          "keeps no count of the examples its rows consume: run it before the bound, as a "
                          "step Dew names, or read the data in a global order")
-    if order_records is None and _shuffles_windows(train):
-        # A run no plan counts ahead reads its progress off the windows that end its examples
-        # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.
-        raise ValueError(f"{_name(train)} shuffles the windows a concatenating pack or windows lay its "
-                         "examples across, which a run bounded in examples and read in its own order reads "
-                         "in the order they end their examples: pack them first-fit or best-fit, which keeps "
-                         "each whole in one window, shuffle the records before the layout, or read it in a "
-                         "global order its plan counts ahead (a run of steps or epochs over it)")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,

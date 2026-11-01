@@ -55,6 +55,7 @@ from dew.data.analysis import (
     ends,
 )
 from dew.data.cache import _Mapped
+from dew.data.completion import CLOSES, Completed, Numbered, Released, whole_examples
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import (
     SHARED_BYTES,
@@ -227,6 +228,28 @@ class _Marked(pygrain.MapDataset):
             return self.slice(index)
         value = self._records[index]
         return Rejected(self._reason) if value is None else value
+
+
+class _Selected(pygrain.MapDataset):
+    """The records of `records` at `indices`, in their order: a view by index, as a slice of them is."""
+
+    def __init__(self, records: pygrain.MapDataset, indices: Sequence[int]):
+        super().__init__(records)
+        self._records, self._indices = records, tuple(indices)
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Record: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        return self._records[self._indices[index % len(self._indices)]]
 
 
 def prepared_rows(rows: Records, stages: Sequence[Stage]) -> list[Batch | bytes]:
@@ -444,6 +467,33 @@ def _consumes(pipeline: Pipeline) -> bool:
     source = pipeline.source
     stages = pipeline.stages if isinstance(source, (Mixture, Phases)) else _written(source, pipeline.stages)
     return examples_bound(stages) is not None
+
+
+def _splits(stages: Sequence[Stage]) -> bool:
+    """Whether `stages` lay a source example across windows: a concatenating pack, which cuts documents
+    where its windows end, or windows over a stream of them. A first-fit or best-fit pack places each whole
+    in one window."""
+    return any(isinstance(stage, Windows) or (isinstance(stage, Pack) and stage.policy == "concat")
+               for stage in stages)
+
+
+def _completes(pipeline: Pipeline, at: int) -> bool:
+    """Whether a shuffle at `at` in `pipeline` draws windows holding pieces of the examples a run bounded in
+    examples counts (`_consumes`): a layout before it lays them across windows (`_splits`), among its
+    stages or those a memory read ran as it held its rows (`_written`), so each count waits for its
+    example's every window (`dew.data.completion`)."""
+    source = pipeline.source
+    before = pipeline.stages[:at]
+    laid = before if isinstance(source, (Mixture, Phases)) else _written(source, before)
+    return _consumes(pipeline) and _splits(laid)
+
+
+def _held_whole(pipeline: Pipeline) -> bool:
+    """Whether a memory read holds the windows a layout laid its counted examples across, and a shuffle
+    draws them after (`_completes`): its shares then take whole examples (`whole_examples`), so each
+    example's windows are one share's to release its count after."""
+    shuffled = next((at for at, stage in enumerate(pipeline.stages) if isinstance(stage, Shuffle)), None)
+    return shuffled is not None and _completes(pipeline, shuffled) and not _splits(pipeline.stages[:shuffled])
 
 
 def _bound(pipeline: Pipeline, at: int) -> int:
@@ -1720,7 +1770,12 @@ class _Build:
         cache under them still keys each row by its place in the source."""
         if self.global_order or not self.training:
             return rows
-        rows = rows[partition.cut()]
+        if _held_whole(pipeline):
+            closed = [boolean(record(rows[index], "a held window")[CLOSES], "whether a window closes")
+                      for index in range(len(rows))]
+            rows = _Selected(rows, whole_examples(closed, partition.first(), partition.count))
+        else:
+            rows = rows[partition.cut()]
         if not self.lowering.repeated:
             rows = _repeated(rows, None, _name(pipeline), self.loading)
         return rows
@@ -1863,6 +1918,14 @@ class _Build:
         if isinstance(stage, Repeat):
             certain = not any(_drops(written) for written in pipeline.stages[:at])
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
+        if isinstance(stage, Shuffle) and _completes(pipeline, at):
+            # Each example's count waits for every window holding a piece of it (`dew.data.completion`).
+            if isinstance(rows, pygrain.MapDataset):
+                return Released(rows, _reordered(stage, pygrain.MapDataset.range(len(rows))))
+            if stage.window is not None:
+                numbered = Numbered(_as_iter(rows, self.loading))
+                return Completed(gx.WindowShuffleIterDataset(numbered, window_size=stage.window,
+                                                             seed=stage.seed))
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:
