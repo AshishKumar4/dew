@@ -539,7 +539,8 @@ class Base:
     teacher, demonstrations or imitation, at FlyDreamer's 30 Hz and its RSSM world model, on the simplest race
     the simulator holds, with none of the departures from the published pixel-based work (Dream to Fly, arXiv
     2501.14377; SkyDreamer, arXiv 2510.14783) that this race adds: one gate (`single`), the same every
-    episode; no command latency, no randomization (level 0) and the camera's mount fixed. Its stages
+    episode; no command latency and no randomization (level 0: the nominal drone, a neutral image, the
+    scene's first looks), the camera 30 degrees up and 100 across. Its stages
     (`BASE_STAGES`): `hover`, the gate's progress and bonus off and every start hovering, so the drone earns
     by staying up looking at the gate (the perception reward) and loses by crashing; then `gate`, from the
     hover's weights, flying through it (half the starts already flying). Races of `drones` drones over
@@ -560,11 +561,12 @@ class Base:
         return round(64 * self.hz / 30)
 
     def racing(self, stage: str) -> dict:
-        """The stage's race (`dew.rl.flight.Racing`'s arguments): one gate, no latency, the camera fixed, 10 s
-        episodes; the hover's without the gate's progress and bonus, every start hovering."""
+        """The stage's race (`dew.rl.flight.Racing`'s arguments): one gate, no latency, 10 s episodes, the
+        camera's one fixed geometry (`Racing`'s), every other randomization off with the level at 0; the
+        hover's without the gate's progress and bonus, every start hovering."""
         hovering = {"progress_scale": 0.0, "gate_bonus": 0.0, "flying_share": 0.0} if stage == "hover" else {}
-        return {**racing_record(self.hz, (("single", 1.0),)), "latency": [0.0, 0.0], "uptilt": [25.0, 25.0],
-                "fov_spread": 0.0, "mount_spread": 0.0, "episode_seconds": 10.0, **hovering}
+        return {**racing_record(self.hz, (("single", 1.0),)), "latency": [0.0, 0.0], "episode_seconds": 10.0,
+                **hovering}
 
     def race(self, stage: str):
         """A race of the stage's own, for scoring: its run's environment built from its record again."""

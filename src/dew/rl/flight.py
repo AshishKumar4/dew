@@ -109,7 +109,8 @@ class Racing:
     `radius` aligned with the gate it meets and as a sphere of `radius` with the ground and obstacles
     (`struck`). `rate_limit` is the nominal body-rate command's limit and `rate_spread` its randomization,
     `latency` the command latency's range in seconds; the camera's `uptilt` above the body's forward axis in
-    degrees, its horizontal field of view `fov` and `fov_spread`, its mount's `mount_spread`; the image's
+    degrees, its horizontal field of view `fov` and `fov_spread`, its mount's `mount_spread`, by default one
+    fixed geometry, 30 degrees up and 100 across, as a real FPV quadrotor's camera is mounted; the image's
     `exposure`, `white_balance`, `gamma`, `noise` (read noise's std, of full scale) and `shutter` (seconds)
     ranges; `highlight` whether the next gate is lit; `flying_share` the share of starts already flying and
     `start_speed` their fastest; and the `quadrotor` flown."""
@@ -137,10 +138,10 @@ class Racing:
     rate_limit: float = 10.0
     rate_spread: float = 0.2
     latency: tuple[float, float] = (0.01, 0.06)
-    uptilt: tuple[float, float] = (15.0, 35.0)
+    uptilt: tuple[float, float] = (30.0, 30.0)
     fov: float = 100.0
-    fov_spread: float = 5.0
-    mount_spread: float = 5.0
+    fov_spread: float = 0.0
+    mount_spread: float = 0.0
     exposure: tuple[float, float] = (0.5, 1.5)
     white_balance: float = 0.1
     gamma: tuple[float, float] = (0.8, 1.25)
@@ -436,7 +437,7 @@ def _gate_axes(facing: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def drawn_camera(racing: Racing, key: jax.Array, ramp: jax.Array) -> Camera:
     """A drone's camera for an episode (`Camera`), each quantity uniform in its range, the image's spreads
-    about neutral scaled by `ramp`."""
+    about neutral scaled by `ramp`; the scene's looks drawn where `ramp` is above none, else the first."""
     keys = iter(jax.random.split(key, 10))
 
     def within(low: float, high: float, shape: tuple[int, ...] = ()) -> jax.Array:
@@ -452,7 +453,7 @@ def drawn_camera(racing: Racing, key: jax.Array, ramp: jax.Array) -> Camera:
                   white_balance=1 + ramp * within(-racing.white_balance, racing.white_balance, (3,)),
                   gamma=about(*racing.gamma, neutral=1.0), noise=ramp * within(*racing.noise),
                   shutter=ramp * within(*racing.shutter),
-                  look=jax.random.randint(next(keys), (4,), 0, 1 << 16))
+                  look=jnp.where(ramp > 0, jax.random.randint(next(keys), (4,), 0, 1 << 16), 0))
 
 
 def _start(racing: Racing, course: Course, key: jax.Array, difficulty: jax.Array) -> tuple[
