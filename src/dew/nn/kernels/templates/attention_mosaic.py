@@ -582,10 +582,11 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     products = [logits] * 2 + [(block_q, block_k, jnp.int8)] + held
     pullback = products[1:] + [logits] * slopes
     if dq:
-        # dQ's anchor select priced as its SASS holds it (`_anchor_registers`); its hook's parameters and
+        # dQ's anchor select priced as its SASS holds it (`_anchor_registers`), within the family's held
+        # scalars where they are a measured whole (`Family.scalars_whole`); its hook's parameters and
         # gradients beside its pullback, not its products: they stream in and out of its entries (dQ under
         # a tile bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
-        anchor = _anchor_registers(family, block_q, block_k)
+        anchor = _anchor_registers(family, block_q, block_k) if not family.scalars_whole else 0
         products = products[:2]
         pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
@@ -600,6 +601,13 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                               (block_q, value_width, block_k, [logits] * 2, False, True),
                               (block_q, block_k, width // config.columns, cotangents[1:], True, False),
                               narrow=config.narrow)
+        if accurate and family.operands_in_registers:
+            # The accurate form's parts (`algebra.formed_parts`) issued against one right operand, the keys,
+            # whose fragments its family loads once and holds across them, two of its depth's loads ahead,
+            # beside the cotangents, the keyed sums' weights fp32 and the part (an A100's dQ at 64 x 64:
+            # one LDSM's registers read by four HMMAs over three parts, 218 to 221 live at its peak).
+            right = (2 * family.fragment_depth(block_k), width // config.columns * family.rhs_copies, dtype)
+            fragments.append([cotangents[0], (block_q, block_k, jnp.float32), cotangents[1], right])
         phases = resources.live_registers(family, carried, products, pullback, cotangents, *fragments)
         return phases + anchor + rows + vectors
     if config.shared_keys:
@@ -648,6 +656,13 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                           (block_k, value_width // columns, queries, step, False, True),
                           (block_k, queries, value_width // columns, [weights], True, False),
                           (block_k, queries, width // columns, [weights], True, False), narrow=config.narrow)
+    if accurate and family.operands_in_registers:
+        # The accurate form's dK parts issued against one right operand, the queries, held at its whole depth
+        # across them, beside the cotangents fp32, dV's weights and the part (an A100's dK/dV at 64 x 64:
+        # one LDSM's registers read by HMMAs of all three parts, 64 words of them at its peak; one part:
+        # ptxas's least 240 fell to 192).
+        right = (queries, width // columns * family.rhs_copies, dtype)
+        fragments.append([step[0], weights, weights, right])
     phases = resources.live_registers(family, carried, step, pullback, *added, *fragments)
     return phases + statistics + vectors
 

@@ -892,6 +892,12 @@ class Issuer[Accumulator](abc.ABC):
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
 
+    scalars_whole: bool = True
+    """Whether `held_registers` is a measured whole of a consumer thread's scalars, its addresses, indices
+    and a select's predicates among them, which a launch's own scalar terms do not add to (an A100's
+    attention dQ: 13 to 43 integers live at its peaks, places and addresses together, no predicate saved
+    to a register, within the 40)."""
+
     def scalar_registers(self, addressed=()) -> int:
         """The registers a consumer thread holds beside its tiles: its own scalars (`held_registers`), its
         addresses into the shared tiles it reads and writes through registers (`addressed`, each
