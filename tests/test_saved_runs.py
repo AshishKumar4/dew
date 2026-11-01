@@ -195,6 +195,31 @@ def test_a_packed_projections_products_count_at_each_of_its_members():
     assert unpacked(moved, packs) != unpacked(now, packs)
 
 
+def test_a_called_product_is_read_at_the_scope_that_called_it(tmp_path):
+    """A product in a called program (a wide sum's, `precision.accumulated`, one private function traced once
+    for its types) is read at the scope of the call that runs it, as XLA inlines it, not at the function's
+    own (row 3193)."""
+    import jax.numpy as jnp
+    from saved_run_products import SCOPE, products
+
+    from dew.nn.precision import accumulated
+
+    def program(x, first, second):
+        with jax.named_scope(SCOPE + "layer1"):
+            hidden = accumulated(jnp.dot, x, first)
+        with jax.named_scope(SCOPE + "layer2"):
+            return accumulated(jnp.dot, hidden, second)
+
+    x, w = jnp.ones((4, 8), jnp.float32), jnp.ones((8, 8), jnp.float32)
+    jax.config.update("jax_dump_ir_to", str(tmp_path))
+    try:
+        jax.jit(program)(x, w, w).block_until_ready()
+    finally:
+        jax.config.update("jax_dump_ir_to", "")
+    texts = [path.read_text() for path in sorted(tmp_path.glob("*.mlir"))]
+    assert products(texts) == {"layer1": ["float64"], "layer2": ["float64"]}
+
+
 def test_a_requests_products_are_named_by_their_variable_scopes():
     """The products the saved-run evidence compares (`saved_run_products`) are named by the variable scope
     of the module that runs them in the task's tree, whichever method or class runs them: a helper

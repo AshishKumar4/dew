@@ -103,22 +103,36 @@ def module_path(location: ir.Location) -> str:
 
 
 def products(modules: list[str]) -> dict[str, list[str]]:
-    """Each module path's dtypes its products' operands hold, over `modules`, StableHLO text."""
+    """Each module path's dtypes its products' operands hold, over `modules`, StableHLO text: a product in a
+    private function (a nested `jax.jit`'s, which XLA inlines; a wide sum's, `precision.accumulated`) at the
+    path of the call that runs it, where its own location names the function's scope alone (22 of
+    test_saved_runs red, row 3193)."""
     found: dict[str, set[str]] = {}
 
-    def walk(operation: ir.Operation) -> None:
+    def walk(operation: ir.Operation, functions: dict, at: str | None = None) -> None:
         for region in operation.regions:
             for block in region.blocks:
                 for inner in block.operations:
-                    if inner.operation.name == "stablehlo.dot_general":
-                        found.setdefault(module_path(inner.location), set()).update(
+                    name = inner.operation.name
+                    if name == "stablehlo.dot_general":
+                        found.setdefault(at or module_path(inner.location), set()).update(
                             DTYPES[str(ir.RankedTensorType(operand.type).element_type)]
                             for operand in inner.operands)
-                    walk(inner.operation)
+                    elif name == "func.call":
+                        callee = str(inner.operation.attributes["callee"]).lstrip("@").strip('"')
+                        walk(functions[callee], functions, at or module_path(inner.location))
+                    walk(inner.operation, functions, at)
 
     with mlir.make_ir_context():
         for text in modules:
-            walk(ir.Module.parse(text).operation)
+            module = ir.Module.parse(text)
+            functions = {str(function.operation.attributes["sym_name"]).strip('"'): function.operation
+                         for function in module.body.operations if function.operation.name == "func.func"}
+            # The module's public functions, from which the private ones are called.
+            for function in functions.values():
+                attributes = function.attributes
+                if not ("sym_visibility" in attributes and "private" in str(attributes["sym_visibility"])):
+                    walk(function, functions)
     return {path: sorted(dtypes) for path, dtypes in sorted(found.items())}
 
 
