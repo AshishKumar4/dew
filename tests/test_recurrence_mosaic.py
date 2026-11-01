@@ -398,7 +398,9 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         out, final = rule(*given)
         return out.astype(jnp.float32).sum() + final.sum()
 
-    with generation.assumed(target):
+    # Abstract devices stating the GPU's capability, which Mosaic GPU lowers cp.async's waits for.
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), target)
+    with generation.assumed(target), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
