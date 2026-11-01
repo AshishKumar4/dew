@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
+from test_algebra_derive import walked
 
 from dew.algebra import derive
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_portable
@@ -46,11 +47,7 @@ def derived_walk(base2: bool, mask: str, split: bool):
     count = KEYS // TILE
 
     def walk(values, steps):
-        first = tiles(values, 0)
-        state = forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
-        for tile in steps:
-            state = forms.step(state, tiles(values, tile))
-        return state
+        return walked(forms, [tiles(values, tile) for tile in steps])
 
     def run(logits, value):
         values = {"logits": logits, "seen": MASKS[mask](), "values": value}
@@ -160,21 +157,21 @@ def forward_rows(form: str):
     return run
 
 
-def derived_backward(form: str, walked: str):
-    """The backward declaration's derived forms walked over key tiles (queries first) or query tiles (keys
+def derived_backward(form: str, along: str):
+    """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`)."""
-    forms = derive.derive(algebra.backward_declaration(scale=SCALE, walked=walked))
+    forms = derive.derive(algebra.backward_declaration(scale=SCALE, walked=along))
     seen = seen_of(form)
     rows_of = forward_rows(form)
 
     def tile(values: dict, index: int) -> dict:
         part = slice(index * BLOCK, (index + 1) * BLOCK)
-        along = ("q", "dout", "peak", "total", "delta", "seen") if walked == "rows" else ("k", "values")
+        tiled = ("q", "dout", "peak", "total", "delta", "seen") if along == "rows" else ("k", "values")
 
         def part_of(name, value):
-            if walked == "keys" and name == "seen":
+            if along == "keys" and name == "seen":
                 return value[:, part]
-            return value[part] if name in along else value
+            return value[part] if name in tiled else value
 
         return {name: part_of(name, value) for name, value in values.items()}
 
@@ -182,14 +179,10 @@ def derived_backward(form: str, walked: str):
         _, peak, total, delta = rows_of(q, k, v, d)
         values = {"q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total, "delta": delta,
                   "seen": seen}
-        first = tile(values, 0)
-        state = forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
-        mapped = []
-        for index in range(LENGTH // BLOCK):
-            state = forms.step(state, tile(values, index))
-            mapped.append(forms.mapped(tile(values, index)))
-        dq, dk, dv = forms.finish(state, values)
-        if walked == "rows":
+        parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
+        mapped = [forms.mapped(part) for part in parts]
+        dq, dk, dv = forms.finish(walked(forms, parts), values)
+        if along == "rows":
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
         return (dq, jnp.concatenate([parts[1] for parts in mapped]),
                 jnp.concatenate([parts[2] for parts in mapped]))
