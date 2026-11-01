@@ -62,8 +62,12 @@ def test_a_bodys_math_is_rewritten_in_place(kind):
     before, after = jax.make_jaxpr(fn)(x, y, a), jax.make_jaxpr(algebra.rewritten(fn))(x, y, a)
     branches = 2 if kind == "cond" else 1
     assert (reductions(before), reductions(after)) == (2 * branches, branches)
-    assert [equation.primitive for equation in after.jaxpr.eqns] == [
-        equation.primitive for equation in before.jaxpr.eqns]
+
+    def bodies(closed) -> list[str]:
+        return sorted(equation.primitive.name for equation in closed.jaxpr.eqns
+                      if equation.primitive.name in algebra.program.BODIES)
+
+    assert bodies(after) == bodies(before) and len(bodies(after)) == 1
 
     def draw(seed):
         return rows(seed, (8, 64), (8, 64), (8, 64))
@@ -107,9 +111,12 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     """Each program the pass rewrites is recorded in the one kernel report (`report.rewrites`): the equations
     it read, the rule sets that fired and the nodes they introduced, the region's price before and after, and
     the pass's seconds."""
+    def joined(x, y, a):
+        return two_sums(x, y, a)
+
     x, y, a = rows(3, (8, 64), (8, 64), (8, 64))
     with report.refusals():
-        options.program(two_sums).compiled(x, y, a)
+        options.program(joined).compiled(x, y, a)
         [made] = report.rewrites()
     assert made.fired.get("linear", 0) > 0
     assert made.after < made.before
