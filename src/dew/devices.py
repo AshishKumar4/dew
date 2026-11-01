@@ -390,6 +390,13 @@ def gpu_free_bytes(ordinal: int) -> int | None:
     a pool that grows takes each new region from what is free when it asks,
     and another process on the same GPU may hold the rest. The read makes the
     device's primary context current on this thread for the call."""
+    memory = gpu_memory(ordinal)
+    return None if memory is None else memory[0]
+
+
+def gpu_memory(ordinal: int) -> tuple[int, int] | None:
+    """The bytes the CUDA driver reports free and in all on the visible GPU
+    `ordinal`, as `gpu_free_bytes` reads them, or None where no driver answers."""
     try:
         cuda, context, device = primary_context(ordinal)
     except (OSError, RuntimeError) as error:
@@ -400,11 +407,64 @@ def gpu_free_bytes(ordinal: int) -> int | None:
         if cuda.cuCtxPushCurrent_v2(context):
             return None
         try:
-            return None if cuda.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)) else free.value
+            if cuda.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)):
+                return None
+            return free.value, total.value
         finally:
             cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
     finally:
         cuda.cuDevicePrimaryCtxRelease_v2(device)
+
+
+def gpu_count() -> int:
+    """The GPUs visible to this process, as the CUDA driver counts them (CUDA_VISIBLE_DEVICES applied),
+    asked before the backend opens; 0 where no driver answers."""
+    cuda, count = _driver(), ctypes.c_int()
+    if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGetCount(ctypes.byref(count)):
+        return 0
+    return count.value
+
+
+def gpu_name(ordinal: int) -> str | None:
+    """The visible GPU `ordinal`'s name, as the CUDA driver reports it (`NVIDIA H100 80GB HBM3`)."""
+    cuda, device, name = _driver(), ctypes.c_int(), ctypes.create_string_buffer(256)
+    if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
+        return None
+    return None if cuda.cuDeviceGetName(name, len(name), device) else name.value.decode()
+
+
+def nccl_version() -> int | None:
+    """The version of the NCCL library this process would load (`ncclGetVersion`: 23203 for 2.32.3), from the
+    nvidia-nccl wheel JAX's CUDA plugin depends on, or the loader's path; None where none loads."""
+    spec = importlib.util.find_spec("nvidia.nccl")
+    places = [os.path.join(place, "lib", "libnccl.so.2") for place in (spec.submodule_search_locations or [])
+              ] if spec is not None else []
+    for place in [*places, "libnccl.so.2"]:
+        try:
+            library = ctypes.CDLL(place)
+        except OSError:
+            continue
+        version = ctypes.c_int()
+        return None if library.ncclGetVersion(ctypes.byref(version)) else version.value
+    return None
+
+
+def connect_at_creation() -> None:
+    """Have NCCL connect every peer as it creates a communicator, unless the
+    run named it (NCCL_RUNTIME_CONNECT=0).
+
+    NCCL connects peers lazily by default since 2.22, at a collective's first
+    launch, and allocates their buffers then. A rank that fails to allocate
+    there leaves its peer inside XLA's first-call rendezvous, which aborts the
+    process after 40 seconds (xla/service/rendezvous.cc, LOG(FATAL)): a
+    2xH100 LoRA run, whose first all-to-all one GPU entered and the other
+    never did (ledger 2901). Connected at creation, the buffers are allocated
+    as XLA acquires the step's communicators, before it runs, and XLA returns
+    a failure there to every rank as an error
+    (xla/backends/gpu/collectives/nccl_collectives.cc). The cost is every
+    peer's buffers at creation, whether or not the program sends to it.
+    NCCL reads the variable as it first starts, so `import dew` sets it."""
+    os.environ.setdefault("NCCL_RUNTIME_CONNECT", "0")
 
 
 

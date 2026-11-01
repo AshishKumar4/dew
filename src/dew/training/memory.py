@@ -31,6 +31,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
+from dew.training import communicators
 
 if TYPE_CHECKING:
     from dew.training.footprint import Footprint
@@ -417,7 +418,10 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
     """What the fit check read for a compiled step, as `step_headroom` reads
     it, and its answer `fits`: XLA's memory analysis of the step, `held`, and
     each of `devices`' allocator stats and free GPU bytes, in bytes. A step
-    the check passed and the devices then refused is read from it."""
+    the check passed and the devices then refused is read from it. A step
+    whose collectives' communicators its GPUs lack room for outside XLA's
+    pool, as this host measured them (`communicators.checked_room`), is
+    refused here, before it runs."""
     stats = executable.memory_analysis()
     analysis: JSON = None if stats is None else {
         name: int(getattr(stats, f"{name}_size_in_bytes", 0) or 0)
@@ -430,6 +434,10 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
                               "unclaimed": None if not memory else unclaimed(device, memory),
                               "outside": outside_pool(device),
                               "strands": bool(memory) and strands_temporaries(device.platform, memory)})
+    if communicators.NEEDS is not None:
+        outside = {int(device.local_hardware_id): outside_pool(device) for device in devices}
+        communicators.checked_room(outside, communicators.NEEDS,
+                                   communicators.kinds_of(executable.as_text() or ""))
     return {"analysis": analysis, "held": int(held), "devices": devices_stats, "fits": fits}
 
 
