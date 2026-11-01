@@ -40,7 +40,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -110,15 +110,16 @@ def _at(table: Mapping[int, int], size: int) -> int:
 class Needs:
     """What a child measured on a group of each size, each GPU's bytes: a collective's communicator
     (`collective`), an all-to-all's connections to every peer beside it (`exchanged`), and a permute's
-    communicator's base on every member (`permuted`); each directed pair's connection, by the GPUs that gave
-    bytes as it connected, by ordinal, the most of any size (`connections`, `peer_costs`); the runtime's own
+    communicator's base on every member (`permuted`); each directed pair's connection, its bytes on its
+    source, on its target and the most on any other GPU, the most of any clique it was measured in
+    (`connections`, `measured_connections`); the runtime's own
     bytes beside its pool on each GPU, by ordinal (cuBLAS's handles and workspaces, the kernels it loads);
     and the seconds the measurement took."""
 
     collective: Mapping[int, int]
     exchanged: Mapping[int, int]
     permuted: Mapping[int, int]
-    connections: Mapping[tuple[int, int], Mapping[int, int]]
+    connections: Mapping[tuple[int, int], tuple[int, int, int]]
     runtime: Mapping[int, int]
     seconds: float
 
@@ -126,8 +127,7 @@ class Needs:
         return {"collective": {str(size): taken for size, taken in self.collective.items()},
                 "exchanged": {str(size): taken for size, taken in self.exchanged.items()},
                 "permuted": {str(size): taken for size, taken in self.permuted.items()},
-                "connections": [[source, target, {str(gpu): given for gpu, given in gave.items()}]
-                                for (source, target), gave in self.connections.items()],
+                "connections": [[*pair, *gave] for pair, gave in self.connections.items()],
                 "runtime": {str(gpu): taken for gpu, taken in self.runtime.items()}, "seconds": self.seconds}
 
     @classmethod
@@ -135,8 +135,8 @@ class Needs:
         return cls({int(size): int(taken) for size, taken in written["collective"].items()},
                    {int(size): int(taken) for size, taken in written["exchanged"].items()},
                    {int(size): int(taken) for size, taken in written["permuted"].items()},
-                   {(int(source), int(target)): {int(gpu): int(given) for gpu, given in gave.items()}
-                    for source, target, gave in written["connections"]},
+                   {(int(source), int(target)): (int(at_source), int(at_target), int(beside))
+                    for source, target, at_source, at_target, beside in written["connections"]},
                    {int(gpu): int(taken) for gpu, taken in written["runtime"].items()},
                    float(written["seconds"]))
 
@@ -145,8 +145,8 @@ class Needs:
         """Each of `gpus`' bytes outside the pool for `held` beyond what `made` holds already
         (`Collectives.beyond`): every group's communicator and every exchange's connections on the GPUs of
         the group, at its size; every new permute clique's base on its members, and each new pair's
-        connection on every GPU that gave bytes as the child connected it, its source, its target and a GPU
-        it is routed through; with the runtime's where `runtime`."""
+        connection on its source and its target and, as NCCL may route it through any of them, the most a
+        GPU beside it took on every other member of its clique; with the runtime's where `runtime`."""
         made = Collectives() if made is None else made
         added = held.beyond(made)
         needed = {gpu: self.runtime.get(gpu, 0) if runtime else 0 for gpu in sorted(gpus)}
@@ -163,9 +163,13 @@ class Needs:
             if clique not in made.permutes:
                 for gpu in clique:
                     charge(gpu, _at(self.permuted, len(clique)))
-            for pair in pairs:
-                for gpu, given in self.connections.get(pair, {}).items():
-                    charge(gpu, given)
+            for source, target in pairs:
+                at_source, at_target, beside = self.connections.get((source, target), (0, 0, 0))
+                charge(source, at_source)
+                charge(target, at_target)
+                for gpu in clique:
+                    if gpu not in (source, target):
+                        charge(gpu, beside)
         return needed
 
 
@@ -193,7 +197,7 @@ def configuration() -> dict:
             "xla_nccl": [setting for setting in flags if "nccl" in setting], "jax": jax.__version__}
 
 
-FORM = 3
+FORM = 4
 """The form of the measurement Dew keeps, which names its place in the cache: a change to what the child
 measures or how it writes it takes the next, so a host measures afresh rather than read an earlier one."""
 
@@ -431,18 +435,52 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
                         _HELD.room, free)
 
 
-def peer_costs(runs: Iterable[tuple[int, int, Mapping[int, int]]]
-               ) -> tuple[int, dict[tuple[int, int], dict[int, int]]]:
-    """A permute communicator's base and each directed pair's connection on a clique, from `runs` connecting
-    each directed pair of it in turn (the source, the target and the bytes each GPU gave), the first making
-    the communicator. NCCL picks each peer's transport apart and may route one through a third GPU, whose
-    buffers it then holds (`P2P_INTERMEDIATE`), so each later pair keeps the bytes of every GPU that gave
-    any. The base is the most a GPU gave in the first run, which holds that pair's own connection, so the
-    first pair, on every clique the first GPUs make, costs nothing more."""
+type Run = tuple[int, int, Mapping[int, int]]
+"""A permute along one directed pair as the child ran it: its source, its target and each GPU's bytes."""
+
+
+def peer_costs(runs: Sequence[Run]) -> tuple[int, dict[tuple[int, int], tuple[int, int, int]]]:
+    """A permute communicator's base and each directed pair's connection on one clique, from `runs`
+    connecting each directed pair of it in turn, the first making the communicator. NCCL picks each peer's
+    transport apart and may route one through a third GPU, whose buffers it then holds
+    (`P2P_INTERMEDIATE`), so each later pair keeps its bytes on its source, on its target and the most on
+    any other GPU. The base is the most a GPU gave in the first run, which holds that pair's own
+    connection, so the first pair costs that clique nothing more."""
     (_, _, first), *later = runs
-    connections = {(source, target): {gpu: given for gpu, given in gave.items() if given > 0}
+
+    def beside(source: int, target: int, gave: Mapping[int, int]) -> int:
+        return max((given for gpu, given in gave.items() if gpu not in (source, target)), default=0)
+
+    connections = {(source, target): (max(0, gave.get(source, 0)), max(0, gave.get(target, 0)),
+                                      max(0, beside(source, target, gave)))
                    for source, target, gave in later}
     return max(0, *first.values()), connections
+
+
+def measured_connections(cliques: Iterable[Sequence[Run]]
+                         ) -> tuple[dict[int, int], dict[tuple[int, int], tuple[int, int, int]]]:
+    """The permute communicators' bases by clique size and each directed pair's connection, the most of
+    every clique the child measured it in (`peer_costs`): the cliques of the host's first GPUs and each pair
+    of GPUs alone, where NCCL routes the pair directly, as it must in a clique that holds no GPU to route
+    it through. A pair alone's first run is its communicator's, so it takes its reverse's direct route: a
+    direct transport's buffers are the same both ways."""
+    bases: dict[int, int] = {}
+    connections: dict[tuple[int, int], tuple[int, int, int]] = {}
+
+    def kept(pair: tuple[int, int], costs: tuple[int, int, int]) -> None:
+        held = connections.get(pair, (0, 0, 0))
+        connections[pair] = (max(held[0], costs[0]), max(held[1], costs[1]), max(held[2], costs[2]))
+
+    for runs in cliques:
+        size = len(runs[0][2])
+        base, measured = peer_costs(runs)
+        bases[size] = max(bases.get(size, 0), base)
+        for pair, costs in measured.items():
+            kept(pair, costs)
+        if size == 2:
+            (source, target, _), *_ = runs
+            kept((source, target), connections.get((target, source), (0, 0, 0)))
+    return bases, connections
 
 
 def main() -> None:
@@ -490,30 +528,32 @@ def main() -> None:
     def permuted_along(pair: tuple[int, int]) -> Callable:
         return lambda part: jax.lax.ppermute(part, "group", [pair])
 
-    collective, exchanged, permuted = {}, {}, {}
-    connections: dict[tuple[int, int], dict[int, int]] = {}
-    for size in (size for size in range(2, len(devices) + 1) if len(devices) % size == 0):
+    def connecting(group: list) -> list[Run]:
+        return [(group[source].local_hardware_id, group[target].local_hardware_id,
+                 taken(group, permuted_along((source, target))))
+                for source, target in itertools.permutations(range(len(group)), 2)]
+
+    collective, exchanged, cliques = {}, {}, []
+    sizes = [size for size in range(2, len(devices) + 1) if len(devices) % size == 0]
+    for size in sizes:
         group = devices[:size]
         collective[str(size)] = max(taken(group, gathered).values())
         exchanged[str(size)] = max(taken(group, exchanged_rows).values())
-        runs = [(group[source].local_hardware_id, group[target].local_hardware_id,
-                 taken(group, permuted_along((source, target))))
-                for source, target in itertools.permutations(range(size), 2)]
-        permuted[str(size)], measured = peer_costs(runs)
-        for pair, gave in measured.items():
-            held = connections.setdefault(pair, {})
-            for gpu, given in gave.items():
-                held[gpu] = max(held.get(gpu, 0), given)
+        cliques.append(connecting(group))
+    # Each pair alone, the first two GPUs' unless a group of two measured them already.
+    pairs = itertools.combinations(range(len(devices)), 2)
+    alone = [pair for pair in pairs if (*pair, sizes[0]) != (0, 1, 2)]
+    cliques += [connecting([devices[one], devices[other]]) for one, other in alone]
+    permuted, connections = measured_connections(cliques)
     for device in devices:
         square = jax.device_put(jnp.ones((512, 512), jnp.float32), device)
         jax.block_until_ready(square @ square)
     after = held_now()
     # The runtime's share on each GPU: what went that neither the pool's growth nor a communicator took.
     runtime = {gpu: before[gpu] - after[gpu][0] - after[gpu][1] - spent[gpu] for gpu in after}
-    written = [[source, target, {str(gpu): given for gpu, given in gave.items()}]
-               for (source, target), gave in connections.items()]
     sys.stdout.write(json.dumps({"collective": collective, "exchanged": exchanged, "permuted": permuted,
-                                 "connections": written, "runtime": runtime}) + "\n")
+                                 "connections": [[*pair, *gave] for pair, gave in connections.items()],
+                                 "runtime": runtime}) + "\n")
 
 
 if __name__ == "__main__":
