@@ -150,6 +150,10 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
 
         def step(index, slots, carry, accumulators):
             d_system, d_betas = carry
+            # Every slot acquired in the step's own trace: the values' is read on the last step alone, and
+            # first acquired under its `pl.when` the other steps' waits went untaken (the interpreter:
+            # "Barrier completed phase 1, but no threads observed phase 0", kda-cpu5 at b9450c237).
+            slots.acquire_all()
             column = functools.partial(_column, call, slots)
             betas = family.rows_of(beta_ref.at[h, span])
             at = pl.ds(h * width + index * keys, keys)
