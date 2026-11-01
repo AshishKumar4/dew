@@ -15,6 +15,11 @@ import jax.numpy as jnp
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100
 
+INTERPRETED = mosaic_sm90.WGMMA
+"""The bundle Mosaic GPU's interpreter runs a template's mainloop by off a GPU of a family a bundle claims (a
+CPU): wgmma's, whose producer role, TMA rings and barriers the interpreter models (its products the dots they
+compute)."""
+
 
 @dataclasses.dataclass(frozen=True)
 class MmaFed(mosaic_sm80.MmaIssuer, mosaic.ConsumerFed):

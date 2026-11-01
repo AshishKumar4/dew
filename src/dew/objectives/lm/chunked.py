@@ -46,9 +46,9 @@ from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
 from dew.nn.categorical import (
-    label_derivative,
     label_entry,
-    partition,
+    label_logit,
+    label_terms,
     rescaled,
     segment_log_partition,
     target_loss,
@@ -280,7 +280,7 @@ def _chunk_terms(hidden, head_chunk, targets, start: int,
     """One tile's `_ChunkTerms`, its columns from `start` on."""
     logits = _without(capped_logits(columns.logits(_tile_logits(hidden, head_chunk, precision)),
                                     softcap, temperature), start, excluded)
-    picked = _target_logits(logits, targets - start)
+    picked = label_logit(logits, targets - start)
     _, top, normalizer = _row_terms(logits, predict, targets - start)
     if top is None:
         return _ChunkTerms(picked, None, None, *normalizer)
@@ -615,7 +615,7 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     log_z, top, normalizer = _row_terms(logits, predict, labels)
     # The vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
-    picked_logits = _target_logits(logits, labels)
+    picked_logits = label_logit(logits, labels)
     best = None if top is None else top[1].reshape(targets.shape)
     first = picked_logits if picked else target_loss(normalizer[0], normalizer[1], picked_logits)
     return raw, normalizer, (first.reshape(targets.shape), best, log_z.reshape(targets.shape))
@@ -859,7 +859,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         # +inf, as the chunked heads score it, and its gradient moves no logit.
         kept = _without(logits, 0, excluded)
         log_z, top, (peaks, masses, rests) = _row_terms(kept, predict, targets)
-        values = [target_loss(peaks, masses, _target_logits(kept, targets)), log_z]
+        values = [target_loss(peaks, masses, label_logit(kept, targets)), log_z]
         if predict:
             assert top is not None
             values.append(top[1])
@@ -1041,51 +1041,17 @@ def head_cross_entropy(model, variables, read, targets, chunks: int, *, tile: tu
                                 predict=predict, temperature=temperature, excluded=excluded)
 
 
-def _target_logits(logits, targets):
-    """Each row of `logits`' entry at its target, 0 for a target outside its
-    columns, which picks none: a padding id past the vocabulary, whose weight
-    is 0, or another tile's or shard's column."""
-    vocab = logits.shape[-1]
-    inside = (targets >= 0) & (targets < vocab)
-    return jnp.where(inside, jnp.take_along_axis(
-        logits, jnp.clip(targets, 0, vocab - 1)[..., None], axis=-1)[..., 0], 0.0)
-
-
 def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: float = 1.0,
                          excluded: int | None = None):
     """`chunked_cross_entropy`'s per-token losses, top-1 columns and log
     partitions, of whole `[..., vocab]` logits, in fp32 or wider (a float64
     reference's), as the tiled head sums, and over `temperature`, with column
-    `excluded` given no mass. Its derivative is the tiled head's
-    (`_whole_losses_tangent`)."""
+    `excluded` given no mass. Its derivative is the categorical's own
+    (`dew.nn.categorical.label_terms`), the tiled head's rule."""
     logits = _without(logits.astype(at_least_fp32(logits.dtype)) / temperature, 0,
                       None if excluded is None else jnp.asarray(excluded, jnp.int32))
-    losses, log_z = _whole_losses(logits, targets)
+    losses, log_z = label_terms(logits, targets)
     return losses, jnp.argmax(logits, axis=-1) if predict else None, log_z
-
-
-@jax.custom_jvp
-def _whole_losses(logits, targets):
-    """Each row's cross entropy and log partition of whole logits, differentiated by `_whole_losses_tangent`.
-
-    Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, and these losses are differentiated
-    (a distilled student's prediction, a whole-logit model).
-    """
-    peak, mass, _ = partition(logits)
-    return target_loss(peak, mass, _target_logits(logits, targets)), peak + jnp.log(mass)
-
-
-@_whole_losses.defjvp
-def _whole_losses_tangent(primals, tangents):
-    """The derivatives of each row's loss, the categorical's own (`dew.nn.categorical.label_derivative`,
-    arXiv:2610.31642's eq. 7), and of its log partition, the row's probabilities."""
-    logits, targets = primals
-    losses, log_z = _whole_losses(logits, targets)
-    _, mass, shifted = partition(logits)
-    probability = shifted / mass[..., None]
-    d_losses = jnp.sum(label_derivative(probability, targets) * tangents[0], axis=-1)
-    d_log_z = jnp.sum(probability * tangents[0], axis=-1)
-    return (losses, log_z), (d_losses, d_log_z)
 
 
 @overload

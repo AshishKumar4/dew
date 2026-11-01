@@ -114,9 +114,9 @@ def the_template_is_as_exact_as_mamba_ssm(case: str):
 
 
 def test_the_training_forward_keeps_a_state_a_backward_block():
-    """What the template's training forward keeps for its backward over 8192 tokens, four backward blocks of
-    2048 (`selective.block_positions`): beyond its operands, the entering state of each block's first chunk,
-    not of every 32-token chunk, which kept 64 times the states the backward reads, 4.3 GB over Falcon
+    """What the template's training forward keeps for its backward over 8192 tokens, eight backward blocks of
+    1024 (`selective.block_positions`): beyond its operands, the entering state of each block's first chunk,
+    not of every 32-token chunk, which kept 64 times the states 2048-token blocks read, 4.3 GB over Falcon
     Mamba 7B's step (row 2970)."""
     rows, length, channels, states = 1, 8192, 128, 16
     operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (

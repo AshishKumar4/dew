@@ -241,11 +241,27 @@ def test_a_fence_no_products_value_crossed_keeps_the_products_together():
     assert 8 * (2 * 6 + 2) <= _peak(2, 6, fenced=True) <= used
 
 
-def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
-    """The H100's fused key and value backward of a causal attention 128 wide (the attention resource gate's
-    case, tests/test_attention_mosaic.py), whose products read each other (S, then P, then the value and key
-    products): the pass's registers a thread (its lowered model) no more than ptxas's least spill-free cap.
-    Holding every product of its body to its last read 307 against ptxas's 247 (row 3154)."""
+BACKWARD_LAUNCHES = {
+    "one-launch": ({"consumers": 2, "fused": True, "family": "wgmma.fed"}, "attention_dkv_fused"),
+    "two-launches-dq": ({"consumers": 1, "family": "wgmma", "dkv_family": "wgmma.fed", "dkv_consumers": 2},
+                        "attention_dq"),
+}
+"""The attention backward's pinned configs at 64 x 64 tiles and two stages (`BackwardTiles`) and the launch
+each checks: the one launch its two consumers feed (FlashAttention 3's), and the dQ launch of the two the
+derivation takes for a call the one launch does not hold (dQ's one consumer, dK/dV's two feeding themselves),
+pinned so the test does not move with the derivation. The two-launch dK/dV joins when the
+pass holds it (row 3311: 210 against ptxas's least cap 192, its elementwise chains held in the form's order
+where ptxas has consumed them)."""
+
+
+@pytest.mark.parametrize("launches", BACKWARD_LAUNCHES)
+def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward(launches):
+    """The H100's backward of a causal attention 128 wide (the attention resource gate's case,
+    tests/test_attention_mosaic.py), whose products read each other (S, then P, then the value and key
+    products), as one launch and as two: the pass's registers a thread (its lowered model) no more than
+    ptxas's least spill-free cap for the launch checked. Holding every product of its body to its last read
+    307 against ptxas's 247 (row 3154); the two-launch dQ's mask positions a register each 198 against 168
+    (row 3311)."""
     import jax
     import jax.numpy as jnp
     import test_attention_mosaic as attention
@@ -267,9 +283,9 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
 
     accurate = False
     op, ba, _ = attention._gated_backward("sm90", width, accurate, "none")
-    # The one launch its two consumers feed (FlashAttention 3's), pinned: the derivation takes it where the
-    # one launch is allowed (`attention_mosaic.ONE_LAUNCH`, held off for row 3180).
-    config = attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed")
+    # The pinned config of the launches asked for.
+    tiles, launch = BACKWARD_LAUNCHES[launches]
+    config = attention_mosaic.BackwardTiles(64, 64, 2, **tiles)
     with generation.assumed("sm90"), attention._pinned(backward=config):
         models = attention._backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
@@ -286,6 +302,7 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
     lowered = record.get("lowered_models", {})
     least = {kernel_compile.report.launch_name(kernel["kernel"], kernel["launch"]): kernel["least"]
              for kernel in record["kernels"]}
-    checked = [(name, model["registers"], least.get(name)) for name, model in lowered.items()]
+    checked = [(name, model["registers"], least.get(name)) for name, model in lowered.items()
+               if name.startswith(launch + "__")]
     assert checked and all(found is not None for _, _, found in checked), (checked, sorted(least))
     assert all(registers <= found for _, registers, found in checked), checked
