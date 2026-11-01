@@ -1410,12 +1410,12 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # program made since is no tool (followed.py's `tool`). What a file left where no key holds it, whichever
     # call ran it, leaves every file run after it without a key (`left_behind`).
     started = {followed.STARTED_AT: str(time.time())}
-    left: set[str] = set()
+    leavers: set[str] = set()
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
     code = tested(python, names, split, out, deadline, cache, grace, common, started, coverage, whole=whole,
-                  release=release, kept=whole_files, left=left)
+                  release=release, kept=whole_files, leavers=leavers)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = SITE.fullmatch(split)
@@ -1438,7 +1438,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             continue
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, remaining, cache, grace, common, started,
-                                coverage, whole=whole, release=release, kept={name: at}, left=left))
+                                coverage, whole=whole, release=release, kept={name: at},
+                                leavers=leavers))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return code
@@ -1504,14 +1505,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
            kept: Mapping[str, tuple[str, str]] | None = None,
-           held_back: dict[str, tuple] | None = None, left: set[str] | None = None) -> int:
+           held_back: dict[str, tuple] | None = None, leavers: set[str] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
     site's map task (`SITE`) is never reused: its draws, among its artifacts, are what its judge reads. Each
     file's record is written as it ends, but into `held_back` where one is given (its rows, log and watch,
     by its name), for a caller that runs files side by side to write once it knows what each left
-    (`gpu_lane`). `left`, the files of the task run before that may have left something a later one reads
+    (`gpu_lane`). `leavers`, the files of the task run before that may have left something a later one reads
     (`left_behind`), which the caller's later calls read on (`task`)."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
@@ -1531,7 +1532,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = {followed.STARTED_AT: str(time.time()), **environ}
     # The files run before that may have left something a later one reads where no key holds it
     # (`left_behind`): none run after one keeps a key, as its run may have read that.
-    left = set() if left is None else left
+    leavers = set() if leavers is None else leavers
     for index, name in enumerate(tests):
         left = deadline - (time.monotonic() - began)
         alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
@@ -1544,13 +1545,13 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         if coverage is None and not release:
             # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which
             # runs under its requirement's overlay and on the whole suite's run alone.
-            opened = None if left else alone_.opened
+            opened = None if leavers else alone_.opened
             if held_back is None:
                 record(python, ran[-1:], alone_.log, common, network, opened)
             else:
                 held_back[name] = (ran[-1:], alone_.log, opened)
         if left_behind(alone_.log):
-            left.add(name)
+            leavers.add(name)
     return 0
 
 
