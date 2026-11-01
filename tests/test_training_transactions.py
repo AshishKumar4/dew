@@ -297,7 +297,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
                                                       for entry in path) else leaf, pooled)
     zero = jax.tree.map(np.zeros_like, start)
     # The run's clip reads each layer its two stages hold stacked as that layer (`StageLocal.held`).
-    with train.staging.held():
+    with train._staging.held():
         updates, after = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
         expected = jax.tree.map(np.asarray, stepped(start, updates, opt_state, after))
     jax.tree.map(np.testing.assert_array_equal, final, expected)

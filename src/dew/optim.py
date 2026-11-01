@@ -1028,8 +1028,9 @@ OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
 STACKED_OPTIMIZERS: frozenset[str] = frozenset({'adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop'})
 """Dew's optimizers whose every rule reads a stage-local run's stacked leaf as its stored layers
 (`layers_of`): a run of one of these keeps its pipelined runs stage-local; any other optimizer's run is
-read by its state's transforms (`dew.training.stages.whole_reading`). Gauss-Newton's one solve over every
-parameter is not yet qualified over stacked leaves, so its run keeps every layer whole on every stage."""
+read by its state's transforms (`dew.training.stages.whole_reading`). Gauss-Newton forms its update's
+system over every parameter on each device (`dew.gauss_newton`), which holds each layer whole on every
+device whatever the storage, so its run keeps every layer whole on every stage."""
 
 optimizers: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(
     "optimizer", {name: f"{make.__module__}:{make.__qualname__}" for name, make in OPTIMIZER_MAP.items()},

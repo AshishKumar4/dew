@@ -118,25 +118,31 @@ class StageLocal:
     mesh: Mesh
 
     @classmethod
-    def of(cls, objective, variables, mesh: Mesh, *, local: bool = True,
+    def of(cls, objective, mesh: Mesh, *, local: bool = True,
            optimizer: optax.GradientTransformation | None = None) -> StageLocal:
-        """How a trainer over `mesh` keeps `objective`'s pipelined runs, from `variables` (their shapes
-        or the arrays): no run where the mesh has no stage axis, the objective declares none
-        (`Objective.stage_sites`), the layout keeps every layer whole on every stage (not `local`,
-        `Layout.stage_local`), or `optimizer`, a transformation Dew does not build, holds a transform
-        that may read a parameter whole (`whole_reading`): no per-layer view of a transform whose
-        reductions only its own code knows is exact short of each layer a leaf of its own, which one
-        program holds on every stage alone, so the run keeps every layer whole on every stage, as
-        `Layout(stage_local=False)` does. Dew's own optimizers read a stacked leaf as its layers."""
+        """How a trainer over `mesh` keeps `objective`'s pipelined runs, from its tree's shapes, traced only
+        where a run may keep them stage-local: no run where the mesh has no stage axis, the objective
+        declares none (`Objective.stage_sites`, which a log names), the run keeps every layer whole on
+        every stage (not `local`: `Layout.stage_local`, a CPU-owned state, a DiLoCo run), or `optimizer`,
+        a transformation Dew does not build, holds a transform that may read a parameter whole
+        (`whole_reading`): no per-layer view of a transform whose reductions only its own code knows is
+        exact short of each layer a leaf of its own, which one program holds on every stage alone, so the
+        run keeps every layer whole on every stage, as `Layout(stage_local=False)` does. Dew's own
+        optimizers read a stacked leaf as its layers."""
         stages = mesh.shape.get(STAGE_AXIS, 1)
-        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype), variables)
-        whole = whole_reading(optimizer, shapes.get("params", {})) if local and stages > 1 else ()
+        if not local or stages == 1:
+            return cls((), mesh)
+        shapes = jax.eval_shape(objective.initializer, jax.random.key(0))
+        whole = whole_reading(optimizer, shapes.get("params", {}))
         if whole:
             _log.info("the optimizer holds %s, transforms that may read a parameter whole, so each pipelined "
                       "run keeps every layer whole on every stage, without stage-local storage's 1/%d of "
                       "the run a device", whole, stages)
-        declared = (objective.stage_sites(shapes, stages) if local and stages > 1 and variables and not whole
-                    else ())
+            return cls((), mesh)
+        declared = objective.stage_sites(shapes, stages)
+        if not declared:
+            _log.info("%s declares no run a pipeline over %d stages stacks (Objective.stage_sites), so its "
+                      "state keeps every layer whole on every stage", type(objective).__name__, stages)
         # A run a collection holds in part (a stack frozen by layer index) stays on its stored layers in
         # every collection, which the pipeline restacks as it would any stored layers.
         return cls(tuple(site for site in declared if not any(

@@ -9,9 +9,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 - A pipelined run's state is stage-local: over a stage axis of S, each device holds its own stage's layers
   of each run a pipeline repeats, with their optimizer state and EMA, about 1/S of the run, and every rule
-  of Dew's optimizers reads a stacked leaf as its stored layers. A checkpoint holds every layer as one
-  device's would and resumes onto any stage count. `Layout(stage_local=False)` keeps every layer whole on
-  every stage, as does a run whose optax transformation may read a parameter whole, and a DiLoCo run.
+  of Dew's optimizers reads a stacked leaf as its stored layers. An LM's decoder, a decision's backbone,
+  PPO's policy and critic, a DiT's, a JEPA's and a UNet level's stacks are stage-local; an objective that
+  declares no stack logs that its run keeps every layer whole. `fit` returns, an `Observe` reads and
+  `initial_state` builds the state with every layer whole, as a model outside the mesh reads it. A
+  checkpoint holds every layer as one device's would and resumes onto any stage count.
+  `Layout(stage_local=False)` keeps every layer whole on every stage, as does a run whose optax
+  transformation may read a parameter whole, a Gauss-Newton run and a DiLoCo run.
 - `Residuals` no longer takes `damping`: it states its Gauss-Newton system where the run's optimizer asks
   (`Step.equations`), and Gauss-Newton is an optimizer, `dew.gauss_newton.gauss_newton(learning_rate,
   damping)` or `OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": ...})`. A config that

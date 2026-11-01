@@ -312,7 +312,9 @@ class Evaluation:
         from dew.nn.inputs import request_key
         key = request_key(key)
         if episodic(batches):
-            return cls._episodes(batches, averaged if averaged is not None else variables, key=key, step=step,
+            # A policy flies off the mesh, every layer whole (`outside`).
+            flown = averaged if averaged is not None else variables
+            return cls._episodes(batches, flown if outside is None else outside(flown), key=key, step=step,
                                  schedule_step=schedule_step, updates=updates, split=split, warm=warm,
                                  metrics=metrics or batches.metrics, training=training)
         if isinstance(batches, Dataset):

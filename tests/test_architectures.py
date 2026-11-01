@@ -334,14 +334,14 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
         start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order)
         # A copy each draw, as each step donates the state it is handed, held as the trainer holds it:
         # a pipelined run stacked by stage (`StageLocal.supplied`).
-        state, _ = trainer.staging.supplied(start, trainer.shardings)
+        state, _ = trainer._staging.supplied(start, trainer.shardings)
         batch = shard_batch(trainer.device_mesh, prepare_counts(
             trainer.objective, wide(case, raw) if exact else raw, count_model=False))
         if len(built) == 1:
             built.append(trainer.compile(state, batch))
         for _ in range(steps):
             state, *_ = built[1](state, batch)
-        saved = trainer.staging.saved(state)
+        saved = trainer._staging.saved(state)
         return in_identity_order(
             jax.device_get({name: getattr(saved, name) for name in ("variables", "opt_state", "ema")}), order)
 
@@ -517,7 +517,7 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     for (run, fitted), stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
         ours = stepped(*own)
         for name, tree in ours.items():
-            held = jax.device_get(getattr(run.staging.saved(fitted), name))
+            held = jax.device_get(getattr(run._staging.saved(fitted), name))
             assert jax.tree.structure(tree) == jax.tree.structure(held), name
             for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
                 mine, theirs = np.asarray(mine), np.asarray(theirs)

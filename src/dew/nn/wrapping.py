@@ -15,7 +15,7 @@ from flax import linen as nn
 from flax.typing import Dtype
 
 from dew.batch import Variables, part, thaw
-from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
+from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.protocols import (
     CrossAttending,
     HiddenStates,
@@ -179,6 +179,11 @@ class HeadedModel:
         if not isinstance(self.backbone, HiddenStates):
             raise TypeError(f"a head reads its backbone's final states (`HiddenStates`), which a "
                             f"{type(self.backbone).__name__} does not give")
+
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """The backbone's runs a pipeline over `stages` stacks, under `backbone` (`StagedStacks`); a head
+        has none."""
+        return part_stage_sites("backbone", self.backbone, store, stages)
 
     @property
     def context_length(self) -> int | None:

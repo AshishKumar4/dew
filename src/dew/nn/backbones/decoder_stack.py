@@ -24,8 +24,9 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.batch import merge
+from dew.batch import Variables, merge, part
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
+from dew.nn.protocols import StagedStacks
 
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
@@ -1149,6 +1150,14 @@ def block_sites(namespace: tuple[str, ...], prefixes: tuple[str, ...], kinds: Se
 def nested_sites(name: str, sites: Sequence[DecoderBank]) -> tuple[DecoderBank, ...]:
     """`sites` a module declares over its own tree, seen from the module holding it as `name`."""
     return tuple(dataclasses.replace(site, namespace=(name, *site.namespace)) for site in sites)
+
+
+def part_stage_sites(name: str, module, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+    """The runs a pipeline over `stages` stacks that `module`, held as `name` in every collection of
+    `store`, declares (`StagedStacks.stage_sites`), seen from its holder: a headed model's backbone, a
+    value head's, an actor's policy. A module that declares none has none."""
+    return (nested_sites(name, module.stage_sites(part(store, name), stages))
+            if isinstance(module, StagedStacks) else ())
 
 
 def stored_by_stage(variables: Mapping[str, Mapping]) -> tuple[str, ...]:
