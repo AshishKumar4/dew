@@ -117,7 +117,8 @@ def solved_directions(damping: float = 0.0,
                             lambda _: jnp.zeros(solved.shape, solved.dtype), damping)
         if clip is not None:
             # Optax's own cap of a global norm, which divides by the norm before it scales.
-            step, _ = optax.clip_by_global_norm(clip).update(step, optax.EmptyState())
+            capped, _ = optax.clip_by_global_norm(clip).update(step, optax.EmptyState())
+            step = jnp.asarray(capped)
         return unravel(step.astype(flat.dtype)), state
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
