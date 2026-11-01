@@ -44,15 +44,16 @@ CONTEXT = 64
 ROWS, LENGTH = 8, 48
 """Each draw's rows and tokens: past the original 16 positions, within the 64 the factor reaches."""
 
-YARN_SEEDS = {"qwen2-tiny": 8, "qwen2-moe-tiny": 8, "qwen3-moe-tiny": 8, "qwen3-next-tiny": 128,
-              "qwen35-tiny": 512, "glm4-moe-tiny": 8, "gpt-neox-tiny": 8, "falcon-tiny": 8,
+YARN_SEEDS = {"qwen2-tiny": 8, "qwen2-moe-tiny": 8, "qwen3-moe-tiny": 8, "qwen3-next-tiny": 64,
+              "qwen35-tiny": 8, "glm4-moe-tiny": 8, "gpt-neox-tiny": 8, "falcon-tiny": 8,
               "starcoder2-tiny": 8, "mistral-tiny": 8, "mixtral-tiny": 8, "ministral-tiny": 8,
               "gemma-tiny": 8, "gemma2-tiny": 8, "gemma3-tiny": 8, "gemma3n-tiny": 512,
-              "mimo-v2-flash-tiny": 8, "minimax-m2-tiny": 8, "qwen35-moe-text": 16}
-"""Each fixture's declared check-1 seeds for its YaRN logits, sized by `seeds_for` on armada: Gemma 3n's
-and Qwen 3.5 MoE's text decoder's paired with the reference (`seeds_for(dew_fn=...)`), their arms sharing
-the draw's weights and inputs, where the reference alone, heavy-tailed across draws, resolves within no
-512."""
+              "mimo-v2-flash-tiny": 8, "minimax-m2-tiny": 8, "qwen35-moe-text": 32}
+"""Each fixture's declared check-1 seeds for its YaRN logits, sized by `seeds_for` on armada paired with
+the reference (`seeds_for(dew_fn=...)`, the count check 1's paired verdict needs), the arms sharing the
+draw's weights and inputs: Qwen3-Next's at 64, Qwen 3.5 MoE's text decoder's at 32 and Qwen 3.5's at 8
+(2026-11-01), the rest at the fewest; Gemma 3n's at 512, whose pooled ratio sized at 64 stays
+inconclusive at the verdict's redraw (its draws' log ratios spread 0.42, armada IGLANE9)."""
 
 PADDED = {"llama-tiny", "mistral-tiny", "mixtral-tiny", "ministral-tiny",
                 "qwen2-tiny", "qwen2-moe-tiny", "qwen3-tiny", "qwen3-moe-tiny",

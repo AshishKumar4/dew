@@ -27,6 +27,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.batch import Batch, Variables
+from dew.nn.kernels.options import OuterProgram
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.rl.env import (
     Carry,
@@ -242,7 +243,7 @@ class ControlRollout:
     def __post_init__(self) -> None:
         if min(self.unroll_length, self.unrolls, self.epochs, self.minibatches) < 1:
             raise ValueError("a control rollout collects and serves at least one of each")
-        self._summarized = jax.jit(self._summary)
+        self._summarized = OuterProgram(self._summary)
 
     @property
     def metrics(self) -> Mapping[str, float]:
@@ -254,7 +255,7 @@ class ControlRollout:
         env = self.env
         if self._bound is None or self._bound[0] != env:
             collect = (functools.partial(self._simulated, env) if isinstance(env, Simulator)
-                       else jax.jit(functools.partial(self._unrolled, env)))
+                       else OuterProgram(functools.partial(self._unrolled, env)))
             self._bound = (env, collect)
         return self._bound[1]
 
@@ -339,7 +340,7 @@ def episode_return(objective: ControlPPOObjective, env: Env | Simulator, params:
         _, taken = simulator_rollout(env, policy, params, simulator_start(env, key), steps, reset=False)
         return float(_first_episodes_return(taken.following))
 
-    @jax.jit
+    @OuterProgram
     def run(params: Variables, key: jax.Array) -> jax.Array:
         _, taken = env_rollout(env, policy, params, start(env, key), steps, reset=False)
         return _first_episodes_return(taken.following)

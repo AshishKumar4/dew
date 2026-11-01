@@ -394,10 +394,10 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         if config.profile_dir:
             # After the timed windows, so the trace's own overhead is not in
             # them. Each process of a pool traces its own devices into a
-            # directory of its own (`Profiler`). The timeline reads the trace
-            # alone, which XProf opens as it is, so no reports are written.
-            with Profiler(os.path.join(config.profile_dir, case.label.replace(" ", "_")),
-                          reports=False) as capture:
+            # directory of its own (`Profiler`), with its reports, which
+            # tools/attribute_step.py reads (`--trace`); the timeline reads
+            # the trace alone.
+            with Profiler(os.path.join(config.profile_dir, case.label.replace(" ", "_"))) as capture:
                 for _ in range(config.profile_steps):
                     state, loss, is_finite = step(state)
                 loss.block_until_ready()

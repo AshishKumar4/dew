@@ -57,6 +57,11 @@ Scope is per rule, because the rules are not all about the same thing:
   rounded reciprocal, not correctly rounded (rows 1402, 1403); `precision.
   divided` divides as IEEE does. It reports only an operand it proves is an
   array (`_array`), so a Python number or a name it cannot prove passes.
+- SLOP025 is about the packages of `src/<package>` that own their programs'
+  compiles (`COMPILED_THROUGH`: RL's rollouts and simulators, serving's steps):
+  none compiles by a bare `jax.jit` or `jax.pmap`, by any name it is imported as; each program
+  is a `dew.nn.kernels.options.OuterProgram`, Dew's one compile point, whose
+  every compile admits its communicators and takes the algebra pass.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1894,6 +1899,27 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
+COMPILED_THROUGH = ("rl", "objectives/rl", "inference")
+"""The packages of `src/<package>` whose every program compiles through `OuterProgram` (SLOP025)."""
+
+BARE_COMPILERS = frozenset({"jax.jit", "jax.pmap"})
+"""JAX's own compiles of a program, which SLOP025 reports in `COMPILED_THROUGH`."""
+
+
+def compile_points(module: Module) -> Iterator[Finding]:
+    """SLOP025: a bare `jax.jit` or `jax.pmap` (`BARE_COMPILERS`), its name read through the imports of its
+    scope, in a package whose programs compile through Dew's one compile point (`COMPILED_THROUGH`)."""
+    owned = (f"src/{module.package}/{package}/" for package in COMPILED_THROUGH)
+    if not any(module.relative.startswith(prefix) for prefix in owned):
+        return
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        compiler = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
+        if compiler in BARE_COMPILERS:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP025",
+                          f"compiles by a bare {compiler}; compile through "
+                          "`dew.nn.kernels.options.OuterProgram`, Dew's one compile point")
+
+
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
                   "tests/certified.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
@@ -2177,7 +2203,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
                       f"{what} compares floats within a tolerance ({why}); {gate}")
 
 
-CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
+CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 

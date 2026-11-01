@@ -26,7 +26,7 @@ from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
-from dew.nn.kernels.options import Option, OuterProgram, compiler_options
+from dew.nn.kernels.options import Option, OuterProgram, compiler_options, program as outer_program
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
     POOLED,
@@ -490,20 +490,20 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
               options: Mapping[str, Option] | None = None) -> OuterProgram:
-    """Compile the step program over a state split into resident and carried halves.
+    """The step program over a state split into resident and carried halves, an outer program
+    (`dew.nn.kernels.options.program`, one for every layout, placement and options).
 
     The matrix half is donated so XLA updates the cache in place instead of
     copying it. `rows` places every leaf of an admission, whose rows come
     group by group, the way the slots are placed; None leaves them where they
-    are. `options` are the program's own XLA options (`decode_programs`, the
-    model's `dew.nn.kernels.options.compiler_options`); pass XLA_FLAGS to
-    change the backend's defaults. See docs/performance.md for
-    the measurements.
+    are. `options` are the program's own XLA options beside the run's
+    (`decode_programs`: the model's `dew.nn.kernels.options.compiler_options`,
+    and the admitting step's); pass XLA_FLAGS to change the backend's
+    defaults. See docs/performance.md for the measurements.
     """
-    return OuterProgram(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
-                   in_shardings=(None, resident, carried, rows, None, None, None, None),
-                   out_shardings=(None, (resident, carried, None)),
-                   compiler_options=None if options is None else dict(options))
+    return outer_program(_stepped, step=options, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
+                         in_shardings=(None, resident, carried, rows, None, None, None, None),
+                         out_shardings=(None, (resident, carried, None)))
 
 
 def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
@@ -602,26 +602,24 @@ def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Arr
     return jax.tree.map(captured, states, cache, is_leaf=lambda x: x is None)
 
 
-def state_programs(formats: Formats, states: Variables) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, OuterProgram]:
     """The programs that move row states between the resident state, kept in `formats`, and a store of
     them placed as `states` is: restoring a store's entries into slots, the resident matrices donated, and
-    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`)."""
+    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`). Each is an
+    outer program (`dew.nn.kernels.options.program`), one for every layout and placement."""
     resident, carried = split_donated(formats)
     placed = jax.tree.map(lambda leaf: leaf.sharding, states)
-    return (jax.jit(_restored, donate_argnums=(0,), in_shardings=(resident, carried, placed, None, None),
-                    out_shardings=(resident, carried)),
-            jax.jit(_captured, donate_argnums=(0,), in_shardings=(placed, resident, carried, None, None),
-                    out_shardings=placed))
+    restore, capture = (resident, carried, placed, None, None), (placed, resident, carried, None, None)
+    return (outer_program(_restored, donate_argnums=(0,), in_shardings=restore,
+                          out_shardings=(resident, carried)),
+            outer_program(_captured, donate_argnums=(0,), in_shardings=capture, out_shardings=placed))
 
 
-def opened_in(formats: Formats) -> jax.stages.Wrapped:
-    """`opened`, allocating its state in `formats`."""
-    return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+def opened_in(formats: Formats) -> OuterProgram:
+    """`opened`, allocating its state in `formats`: an outer program (`dew.nn.kernels.options.program`),
+    one for every layout."""
+    return outer_program(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
-
-_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, Option], ...]],
-                tuple[OuterProgram, OuterProgram]] = {}
-"""One pair of step programs per resident layout; see `decode_programs`."""
 
 ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
 """The admitting step's XLA options: no CUDA command buffers. Its inputs are
@@ -652,25 +650,15 @@ def dispatched(program: OuterProgram) -> Step:
 
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
                     ) -> tuple[OuterProgram, OuterProgram]:
-    """`_compiled` over `formats`, once per layout and model `options`
+    """`_compiled` over `formats` and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
     admission shape) serves every server that keeps its state in the same
-    layout, and a server whose layout-choosing compile reads the state as
-    it leaves it runs that compile as its decoding step instead
-    (`resident_formats`). The formats tree holds the cache mapping and is
-    not hashable itself, so its leaves and its structure's text key the
-    programs. Each compiles through the kernel templates' reports as every
-    outer program does (`dew.nn.kernels.options.OuterProgram`), but they stay
-    apart from `dew.nn.kernels.options.program`: they donate the cache they
-    step and take its formats as placements, neither of which that seam's
-    arguments carry."""
-    leaves, structure = jax.tree_util.tree_flatten(formats)
-    key = (tuple(leaves), str(structure), rows, tuple(sorted(options.items())))
-    programs = _PROGRAMS.get(key)
-    if programs is None:
-        halves = split_donated(formats)
-        admission = ADMISSION_OPTIONS if jax.default_backend() == "gpu" else {}
-        programs = _PROGRAMS[key] = (_compiled(*halves, rows, options or None),
-                                     _compiled(*halves, rows, {**admission, **options} or None))
-    return programs
+    layout (`dew.nn.kernels.options.program` keeps one program for every
+    layout and options), and a server whose layout-choosing compile reads the
+    state as it leaves it runs that compile as its decoding step instead
+    (`resident_formats`)."""
+    halves = split_donated(formats)
+    admission = ADMISSION_OPTIONS if jax.default_backend() == "gpu" else {}
+    return (_compiled(*halves, rows, options or None),
+            _compiled(*halves, rows, {**admission, **options} or None))

@@ -302,6 +302,10 @@ class Step:
     """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
     QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
     what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
+    equations: bool = struct.field(pytree_node=False, default=False)
+    """Whether the run's optimizer solves the objective's Gauss-Newton system (`dew.gauss_newton`): an
+    objective that states one (`dew.objectives.residuals.Residuals`) returns it as its statistics, which
+    the trainer pools and hands the update. Static, as stating it changes the program."""
     watched: Watched | None = struct.field(pytree_node=False, default=None)
     """The activations a sampled step watches (`dew.nn.inspection.watching`): the objective opens the
     `inspected` collection in the model call it trains through and returns what it sowed
@@ -1200,8 +1204,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             loss = self.validation_loss(variables, batch, step)
         else:
             watched = step.watched
-            with (watching(watched.kinds, histogram=watched.histogram) if watched
-                  else contextlib.nullcontext()):
+            with (watching(watched.modules, histogram=watched.histogram, cotangents=watched.cotangents)
+                  if watched else contextlib.nullcontext()):
                 loss = self.loss(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss

@@ -58,6 +58,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
+from dew.nn.kernels.options import OuterProgram
 from dew.nn.precision import divided
 from dew.rl.env import TimeStep, chosen
 from dew.rl.quadrotor import GRAVITY, Body, Flight, Quadrotor, drawn_body, flown, hovering, rotation
@@ -872,13 +873,13 @@ class GateRace:
         shown = tuple(view for view in views if view != "image")
         env = FlightEnv(racing, shown if shown else ("passed",))
         self._env = env
-        self._started = jax.jit(lambda env, key: jax.vmap(env.reset)(jax.random.split(key, self.count)))
-        self._stepped = jax.jit(lambda env, races, action: jax.vmap(env.step)(races, action))
+        self._started = OuterProgram(lambda env, key: jax.vmap(env.reset)(jax.random.split(key, self.count)))
+        self._stepped = OuterProgram(lambda env, races, action: jax.vmap(env.step)(races, action))
         aspect = 1.0 if renderer is None else renderer.aspect
-        self._shown = jax.jit(jax.vmap(lambda race, image, key: developed(image, race.camera, key)))
-        self._observe = jax.jit(jax.vmap(env._observed))
-        self._scene = jax.jit(jax.vmap(partial(_scene, racing)))
-        self._cameras = jax.jit(jax.vmap(lambda race: (cameras(race, aspect),
+        self._shown = OuterProgram(jax.vmap(lambda race, image, key: developed(image, race.camera, key)))
+        self._observe = OuterProgram(jax.vmap(env._observed))
+        self._scene = OuterProgram(jax.vmap(partial(_scene, racing)))
+        self._cameras = OuterProgram(jax.vmap(lambda race: (cameras(race, aspect),
                                                        cameras(race, aspect, race.camera.shutter))))
 
     def _env_now(self) -> FlightEnv:

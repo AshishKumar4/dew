@@ -604,13 +604,21 @@ def the_attention_forms_a_run_names_reach_its_step(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py): the attention forms a run's numerics name on the
     command line (`--set trainer.precision`, `Numerics.forms`) reach its step through the default route: a
     step in the accurate forms (IEEE fp32 products) and one in the fast (a GPU's TF32), the model's
-    compute float32 in both, score its batch apart, so the route reads the run's forms, not its record
-    alone (ledger 2350). A CPU multiplies fp32 one way in both, so only a GPU tells them apart."""
-    from process_support import logged_losses
-
+    compute float32 in both, differentiate its batch apart, so the route reads the run's forms, not its
+    record alone (ledger 2350). Their gradients' summaries tell them apart where the loss cannot: one step
+    from a fresh model scores every batch near the log of its vocabulary, and Adam's first update is the
+    rate times the gradient's sign, both blind to a product's last bits (ledger 3153). A CPU multiplies
+    fp32 one way in both, so only a GPU tells them apart."""
     from dew.nn.precision import Numerics
+    from dew.training import Inspection, LocalTracker
 
     run = lm(tmp_path, drawn=False)
-    losses = {forms: logged_losses(trained_by_cli(run, tmp_path, forms, {
-        "trainer.precision": flag(Numerics(forms=forms), Numerics)})) for forms in ("fast", "accurate")}
-    assert losses["fast"] and losses["fast"] != losses["accurate"]
+    watched = flag(Inspection(targets=("grads",), every=1), Inspection)
+    gradients = {}
+    for forms in ("fast", "accurate"):
+        trained = trained_by_cli(run, tmp_path, forms, {
+            "trainer.precision": flag(Numerics(forms=forms), Numerics), "trainer.inspection": watched})
+        gradients[forms] = {name: value for _, values in LocalTracker(trained / "tracking").scalars()
+                            for name, value in values.items() if name.startswith("inspect/grads/")}
+    assert gradients["fast"] and gradients["fast"].keys() == gradients["accurate"].keys()
+    assert gradients["fast"] != gradients["accurate"]

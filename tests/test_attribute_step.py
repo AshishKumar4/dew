@@ -377,3 +377,15 @@ def test_the_dump_reads_the_compile_the_capture_ran_from_an_archive(tmp_path):
                 gib, gib, {"parameter": gib})
         with pytest.raises(SystemExit), attribute.dump_files(source, "jit_step", "9"):
             pass
+
+
+@pytest.mark.gpu(reason="a profiled case reads its device timeline, which a CPU trace holds none of")
+def test_a_profiled_benchmark_case_writes_the_reports_attribute_step_reads(tmp_path):
+    """tools/benchmark_step.py's `--profile-dir` captures the case's steps as a `dew.Profiler` capture with
+    its reports, the `reports/hlo_stats.json` this tool reads (`--trace`, `capture_of`), beside the trace
+    the benchmark's timeline reads; on one device, as a person runs it."""
+    from test_benchmark_step import peak_row
+
+    peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
+    (case,) = [path for path in (tmp_path / "traces").iterdir() if path.name != "peak-run"]
+    assert (attribute.capture_of(case) / "reports" / "hlo_stats.json").is_file()

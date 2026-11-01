@@ -1729,7 +1729,8 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     """A tool that builds a checkpoint's decoder from its config reads it as a load of its language model
     does (`decoder_config`, ledger 3006): Qwen 3.5's wrapper unties its head at its own scope over a text
     config that ties it, which tools/kernel_picks.py's decoder (`model_of`) unties as the load does, and
-    states its modeling overrides there; a registered family that reads its whole record (Kimi K2.5's) is
+    states its modeling overrides there, which `model_of`'s decoder builds as the load does (its full
+    attention block-bidirectional); a registered family that reads its whole record (Kimi K2.5's) is
     read as it is."""
     import argparse
 
@@ -1747,6 +1748,11 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     assert translate_config(native["text_config"])["tie_embeddings"]
     blocks = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())
     assert decoder_config(blocks)["modeling_overrides"] == blocks["modeling_overrides"]
+    built = kernel_picks.model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-blocks-tiny"),
+                                                     revision=None, dtype="float32"))
+    blocked = Pretrained.load(FIXTURES / "qwen35-blocks-tiny", text_only=True, dtype="float32").model
+    assert built.kinds["full_attention"].mixer.bidirectional_blocks
+    assert built.kinds == blocked.kinds
     whole = json.loads((FIXTURES / "kimi-k25-tiny" / "config.json").read_text())
     assert decoder_config(whole) is whole
 

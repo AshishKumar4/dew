@@ -248,7 +248,8 @@ class Budgeted(Protocol):
 
 
 class Forwarding:
-    """Forwards a stream wrapper's stop signal, stop budget, close, identity and endlessness to its source.
+    """Forwards a stream wrapper's stop signal, stop budget, close, identity and where it ends to its
+    source.
 
     Subclasses keep the source at `_source` and override `close` for their own
     cleanup around `super().close()`.
@@ -285,8 +286,8 @@ class Forwarding:
         return stream_identity(self._forwarded())
 
     @property
-    def endless(self) -> bool:
-        return stream_endless(self._forwarded())
+    def ends(self) -> Ends:
+        return stream_ends(self._forwarded())
 
 
 _QUIET_STOP_SECONDS = 5.0
@@ -840,19 +841,27 @@ def restore_parent(parent: pygrain.DatasetIterator, state: Mapping[str, object],
     parent.set_state(record(state[key], what))
 
 
+type Ends = Literal["never", "together", "apart"]
+"""Where a training stream ends (`Identified.ends`): never; at the same read on every share, by
+construction, as one global order cut into shares each stepping as many batches of it does; or where
+it may run out on some processes and not others."""
+
+
 @runtime_checkable
 class Identified(Protocol):
-    """A training stream that names the records it reads and says whether it
-    ever runs out.
+    """A training stream that names the records it reads and says where it
+    ends (`Ends`).
 
     Each process of a pool opens its own stream, over its own copy of the
     corpus, and `Trainer.fit` refuses a pool whose streams name different
     records before any process reads one. It agrees every read of a stream
-    that may run out, so a process whose stream ran out stops its peers
-    before they step without it; an endless one is agreed at its first read.
+    that may run out on some processes and not others, so a process whose
+    stream ran out stops its peers before they step without it; one that
+    never ends, or ends on every share together, is agreed at its first
+    read (`dew.training._fit.FitRun.agrees`).
     """
 
-    endless: bool
+    ends: Ends
 
     def identity(self) -> str: ...
 
@@ -939,10 +948,10 @@ def stream_identity(stream: Iterator[Batch] | None) -> str:
     return stream.identity() if isinstance(stream, Identified) else type(stream).__name__
 
 
-def stream_endless(stream: Iterator[Batch] | None) -> bool:
-    """Whether `stream` says it never runs out (`Identified`), as Dew's
-    global streams do."""
-    return isinstance(stream, Identified) and stream.endless
+def stream_ends(stream: Iterator[Batch] | None) -> Ends:
+    """Where `stream` says it ends (`Identified.ends`); "apart" for one that says nothing, as a stream
+    of the caller's may run out on any process."""
+    return stream.ends if isinstance(stream, Identified) else "apart"
 
 
 def tapped(stream: Reader, on_batch: Callable[[Batch], None]) -> Reader:
@@ -1221,9 +1230,12 @@ class GlobalStream:
     it and a restore whose plan disagrees is refused (`Plan.check`).
     `dew.position` defines the format that both this class and
     `dew.checkpoints` read.
-    """
 
-    endless = True
+    Every share steps as many batches of the order, its whole batches where
+    it drops a remainder, and else a share past the order's last batch
+    reading on with batches of no real row (`dew.data.lowering._evened`), so
+    where it ends, the shares run out at the same read (`ends`).
+    """
 
     def __init__(
         self,
@@ -1236,7 +1248,7 @@ class GlobalStream:
         endless: bool = True,
     ):
         self._open = open_at
-        self.endless = endless
+        self.ends: Ends = "never" if endless else "together"
         self._batch = batch
         self._order = json.dumps(plan.order, sort_keys=True)
         self._records = 0
@@ -1413,7 +1425,7 @@ class PhasedStream:
     within one step ends where it starts, holding no record.
     """
 
-    endless = True
+    ends: Ends = "never"
 
     def __init__(self, phases: Sequence[tuple[Callable[[tuple[int, ...]], GlobalReader], int | None]],
                  stop_seconds: float, *, tokens: Sequence[int | None] | None = None):

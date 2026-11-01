@@ -70,6 +70,8 @@ PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
 """The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
 """The worker of the pools that run on the examples clock."""
+READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
+"""The worker of the pool that counts the rounds a fit agrees its reads in."""
 CLOCKED = 17
 """The examples a pool's run bounded in examples is bounded to: of ten records, seven read twice, and in
 one global order a last global batch of one row, which one share holds and the other does not."""
@@ -174,6 +176,30 @@ def assert_trained_once(reports: list[dict], *, clocked: bool = True) -> None:
     trained = {record: round(count, 4) for record, count in reports[0]["counts"].items()}
     assert trained == {record: round(count, 4) for record, count in reports[0]["dealt"].items()}
     assert sorted(trained.values()) == [1] * 3 + [2] * 7
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("refusing", [False, True])
+@pytest.mark.parametrize("deal", ["records", "shards"])
+def test_a_pools_rollout_drawing_further_on_the_examples_clock_ends_at_its_bound_and_resumes_as_it_ran(
+        tmp_path, deal, refusing):
+    """Two processes bounded to CLOCKED examples, each share reading its own, through a rollout that draws a
+    batch past each step's (`--further`), each draw a pooled read (`FitRun.further`), every fifth record's
+    rows refused or none: the pool ends at one step on both processes with its bound consumed once, its
+    clock the pool's, the look-ahead for its streams' end read after the rollout's last draw and what that
+    end leaves unconsumed credited to the pool's first row; paused at half its examples and resumed, it
+    ends where the run that never paused does, to its parameters (row 3329)."""
+    flags = {"deal": deal, "further": True, **({"refusing": True} if refusing else {})}
+    reports = clocked_pool(tmp_path / "whole", 2, **flags)
+    assert len({report["step"] for report in reports}) == 1
+    assert [report["consumed"] for report in reports] == [CLOCKED] * 2
+    logged = reports[0]["logged"]
+    assert logged == sorted(logged) and logged[-1] == CLOCKED
+    paused = clocked_pool(tmp_path / "paused", 2, pause=0.5, **flags)
+    assert [report["step"] for report in paused] == [report["step"] for report in reports]
+    for index in range(2):
+        assert_same_parameters(dumped_params(tmp_path / "paused" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
 @pytest.mark.distributed
@@ -633,6 +659,16 @@ def pool_checkpoint(tmp_path_factory):
         assert shard_of(report["dataset_state"]) == index
     return {"checkpoints": worker.checkpoint_dir(directory / "run", "pool"),
             "reports": reports}
+
+
+@pytest.mark.distributed
+def test_no_process_of_a_cpu_pool_traces_residuals_its_devices_never_judge(pool_checkpoint):
+    """A step's derived footprint judges each process's own device, so no process of a CPU pool, whose
+    devices state no memory, traces the residuals its loss's pullback keeps (row 3093): process 1 judged
+    process 0's device before, and traced them on every compile."""
+    for report in pool_checkpoint["reports"]:
+        assert report["derived_residuals"], "each process derives its step's footprint"
+        assert all(residuals is None for residuals in report["derived_residuals"])
 
 
 @pytest.mark.distributed
@@ -1784,6 +1820,20 @@ def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_ex
     assert all("profile stop" in (report["failed"] or "") for report in reports), reports
     assert reports[1]["manifests"] == 1
     assert all(report["recovered"] == 2 for report in reports)
+
+
+@pytest.mark.distributed
+def test_a_pools_reads_after_its_first_agree_nothing_where_no_share_can_run_out_alone(tmp_path):
+    """A pool agrees a read of its training stream after the first only where its shares may run out
+    apart: over a finite global order, which every share runs out of at the same read, over arrays
+    handed whole, over a Grain map dataset handed to read without end, and in a cooldown branch of an
+    endless order, a run of twice the steps takes no round more than the shorter one (a read agreed
+    at each step, as every one of these was, takes one a step: 1.4 ms on two loopback processes, 38 ms
+    on eight containers, docs/performance.md)."""
+    reports = run_pool("read_rounds", tmp_path / "rounds", 2, script=READ_ROUNDS, timeout=300, steps=4)
+    for report in reports:
+        assert {kind: longer - shorter for kind, (shorter, longer) in report.items()} == {
+            "global": 0, "whole": 0, "map": 0, "cooldown": 0}, report
 
 
 @pytest.mark.distributed

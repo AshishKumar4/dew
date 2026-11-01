@@ -567,12 +567,12 @@ def _selective_step(rows: int):
 
 PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "swiglu": _swiglu_step,
                    "short conv": _short_conv_step, "selective scan": _selective_step}
+"""Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
+ops here."""
 
 UNTAKEN = {("sm80", "selective scan")}
 """The steps whose template a GPU's kernel refuses whatever a call names: an A100's selective scan, its
 strided channel blocks' untiled copies wrong until the jax fork's post42 (`recurrence_chunk.SELECTIVE`)."""
-"""Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
-ops here."""
 
 
 def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
@@ -1367,3 +1367,47 @@ def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_pa
         for name, value in previous.items():
             jax.config.update(name, val=value)
         compilation_cache.reset_cache()
+
+
+def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails_pad():
+    """Each kernel of a step's report states `padded`, the share of its launches' tile grids outside
+    their operands (`KernelOp.padded`, row 2772), over its calls: a dense product's rows by its
+    `block_m` and columns by its `block_n`, a kernel gradient's its kernel's, an attention's queries by
+    its keys each to its blocks; None for a grouped call, whose groups' rows a step routes, and for a
+    call no launch traced."""
+    import tokamax
+
+    from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program, report
+    from dew.training._lowering import KernelCall
+
+    def spec(*shape):
+        return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
+
+    gemm, tile = grouped_matmul.Gmm(), grouped_matmul.Tile(128, 256, 64, 4, 3)
+    dense = tokamax.BoundArguments(gemm, {"tokens": spec(200, 64), "kernel": spec(1, 64, 300),
+                                          "trans_rhs": False, "dense": True})
+    assert gemm.padded(dense, tile) == 1 - 200 * 300 / (256 * 512)
+    grouped = tokamax.BoundArguments(gemm, {**dense.arguments, "dense": False})
+    assert gemm.padded(grouped, tile) is None
+    # A kernel gradient's grid is its kernel's, the tokens' width by the cotangent's.
+    gradient = grouped_matmul.Tgmm()
+    weights = tokamax.BoundArguments(gradient, {"tokens": spec(200, 64), "cotangent": spec(200, 300),
+                                                "dense": True})
+    assert gradient.padded(weights, tile) == 1 - 64 * 300 / (128 * 512)
+    attention = attention_mosaic.MosaicForward()
+    tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2)
+    scores = tokamax.BoundArguments(attention, {"query": spec(1, 100, 2, 64), "key": spec(1, 200, 2, 64)})
+    assert attention.padded(scores, tiles) == 1 - 100 * 200 / (128 * 256)
+
+    def call(op, arguments, config) -> KernelCall:
+        with report.launching(op, arguments, config):
+            return KernelCall("mosaic_gpu", f"{type(op).__name__}", b"", "c", None, report.launch_digest())
+
+    calls = ((call(gemm, dense, tile), 3.0), (call(attention, scores, tiles), 1.0),
+             (call(gemm, grouped, tile), 2.0), (KernelCall("triton", "plain", b"", "c", None), 1.0))
+    padded = {entry["name"]: entry["padded"] for entry in KernelReport((), calls).record()["launches"]}
+    assert padded == {"Gmm": None, "MosaicForward": 1 - 100 * 200 / (128 * 256), "plain": None}
+    dense_only = {entry["name"]: entry["padded"]
+                  for entry in KernelReport((), calls[:2]).record()["launches"]}
+    assert dense_only["Gmm"] == 1 - 200 * 300 / (256 * 512)

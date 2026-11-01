@@ -24,6 +24,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 from typing_extensions import CapsuleType
 
+from dew.nn.kernels.options import OuterProgram
 from dew.rl.env import (
     Carry,
     Env,
@@ -105,10 +106,11 @@ def received(tree: Handed | Tree) -> jax.Array | Tree:
     return jax.tree.map(taken, tree)
 
 
-@functools.partial(jax.jit, static_argnums=0)
+@functools.partial(OuterProgram, static_argnums=0)
 def _acted(policy: Policy, params: Params, carry: Carry) -> tuple[jax.Array, Tree, Memory, jax.Array]:
-    """A policy's step from a rollout's carry, compiled once for each policy: its action, extras and
-    memory, and the carry's next key."""
+    """A policy's step from a rollout's carry, compiled once for each policy through Dew's one compile
+    point (`OuterProgram`, which admits its communicators): its action, extras and memory, and the
+    carry's next key."""
     key, act_key = jax.random.split(carry.key)
     action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
     return action, extras, memory, key

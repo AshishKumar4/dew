@@ -301,18 +301,31 @@ CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH = 13, 36, 37
 kHz, and the device memory bus's width in bits."""
 
 
+def device_handle(ordinal: int) -> tuple[ctypes.CDLL, ctypes.c_int] | None:
+    """The CUDA driver (`dew.pool.cuda_driver`) started, and its handle of the visible GPU `ordinal`: the one
+    way every driver read here reaches a device. None where no driver library loads (a CPU host); a driver
+    error raises."""
+    cuda = cuda_driver()
+    if cuda is None:
+        return None
+    device = ctypes.c_int()
+    for status in (cuda.cuInit(0), cuda.cuDeviceGet(ctypes.byref(device), ordinal)):
+        if status:
+            raise RuntimeError(f"CUDA driver error {status}")
+    return cuda, device
+
+
 def gpu_attribute(ordinal: int, attribute: int) -> int | None:
     """The CUDA driver's `attribute` (a `CUdevice_attribute`) of the visible GPU `ordinal`: a device fact
     JAX's Device does not carry, a GPU's clocks above all. None where no driver library loads (a CPU
     host); a driver error raises."""
-    cuda = cuda_driver()
-    if cuda is None:
+    handle = device_handle(ordinal)
+    if handle is None:
         return None
-    device, value = ctypes.c_int(), ctypes.c_int()
-    for call in (lambda: cuda.cuInit(0), lambda: cuda.cuDeviceGet(ctypes.byref(device), ordinal),
-                 lambda: cuda.cuDeviceGetAttribute(ctypes.byref(value), attribute, device)):
-        if status := call():
-            raise RuntimeError(f"CUDA driver error {status}")
+    cuda, device = handle
+    value = ctypes.c_int()
+    if status := cuda.cuDeviceGetAttribute(ctypes.byref(value), attribute, device):
+        raise RuntimeError(f"CUDA driver error {status}")
     return value.value
 
 
@@ -398,12 +411,13 @@ def primary_context(ordinal: int) -> tuple[ctypes.CDLL, ctypes.c_void_p, ctypes.
     device, which the caller releases with `cuDevicePrimaryCtxRelease_v2`
     once it is done. Raises OSError where no driver is installed and
     RuntimeError on a driver error."""
-    cuda = ctypes.CDLL("libcuda.so.1")
-    device, context = ctypes.c_int(), ctypes.c_void_p()
-    for call in (lambda: cuda.cuInit(0), lambda: cuda.cuDeviceGet(ctypes.byref(device), ordinal),
-                 lambda: cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device)):
-        if status := call():
-            raise RuntimeError(f"CUDA driver error {status}")
+    handle = device_handle(ordinal)
+    if handle is None:
+        raise OSError("no CUDA driver library loads")
+    cuda, device = handle
+    context = ctypes.c_void_p()
+    if status := cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device):
+        raise RuntimeError(f"CUDA driver error {status}")
     return cuda, context, device
 
 
@@ -443,11 +457,15 @@ def gpu_memory(ordinal: int) -> tuple[int, int] | None:
 
 def _reported(ordinal: int, size: int, call: Callable[[ctypes.CDLL], Callable[..., int]]) -> str | None:
     """The text a CUDA driver `call` writes of the visible GPU `ordinal`, at most `size` bytes, None where no
-    driver answers."""
-    cuda, device, text = cuda_driver(), ctypes.c_int(), ctypes.create_string_buffer(size)
-    if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
+    driver library loads; a driver error raises."""
+    handle = device_handle(ordinal)
+    if handle is None:
         return None
-    return None if call(cuda)(text, len(text), device) else text.value.decode()
+    cuda, device = handle
+    text = ctypes.create_string_buffer(size)
+    if status := call(cuda)(text, len(text), device):
+        raise RuntimeError(f"CUDA driver error {status}")
+    return text.value.decode()
 
 
 def gpu_name(ordinal: int) -> str | None:
@@ -480,19 +498,21 @@ def nccl_version() -> int | None:
 
 
 def connect_at_creation() -> None:
-    """Have NCCL connect every peer as it creates a communicator, unless the
-    run named it (NCCL_RUNTIME_CONNECT=0).
+    """Have NCCL connect a communicator's rings, trees and NVLS peers as it
+    creates the communicator, unless the run named it (NCCL_RUNTIME_CONNECT=0).
 
-    NCCL connects peers lazily by default since 2.22, at a collective's first
+    NCCL connects them lazily by default since 2.22, at a collective's first
     launch, and allocates their buffers then. A rank that fails to allocate
     there leaves its peer inside XLA's first-call rendezvous, which aborts the
-    process after 40 seconds (xla/service/rendezvous.cc, LOG(FATAL)): a
-    2xH100 LoRA run, whose first all-to-all one GPU entered and the other
-    never did (ledger 2901). Connected at creation, the buffers are allocated
-    as XLA acquires the step's communicators, before it runs, and XLA returns
-    a failure there to every rank as an error
-    (xla/backends/gpu/collectives/nccl_collectives.cc). The cost is every
-    peer's buffers at creation, whether or not the program sends to it.
+    process after 40 seconds (xla/service/rendezvous.cc, LOG(FATAL)).
+    Connected at creation, those buffers are allocated as XLA acquires the
+    step's communicators, before it runs, and XLA returns a failure there to
+    every rank as an error (xla/backends/gpu/collectives/nccl_collectives.cc);
+    the cost is their buffers at creation, whether or not the program runs a
+    collective that uses them. Point-to-point peers, an all-to-all's and a
+    permute's, still connect as each is first sent to, whatever this setting:
+    `dew.communicators` holds their room, as the 2xH100 LoRA run whose first
+    all-to-all one GPU entered and the other never did needed (ledger 2901).
     NCCL reads the variable as it first starts, so `import dew` sets it."""
     os.environ.setdefault("NCCL_RUNTIME_CONNECT", "0")
 

@@ -11,17 +11,12 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 import pytest
+from torch_layout import node
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights, write_file
 
 FIXTURES = Path(__file__).parent / "fixtures"
-
-
-def leaf(variables, path):
-    for key in path:
-        variables = variables[key]
-    return variables
 
 
 def bf16_except(source: Path, directory: Path, kept: tuple[str, ...]) -> dict[str, np.ndarray]:
@@ -93,7 +88,7 @@ def test_auto_decodes_packed_weights_to_the_declared_dtype(tmp_path):
     loaded = Pretrained.load(directory, dtype="float32", param_dtype="auto")
     checked = 0
     for layout in loaded.weight_layouts:
-        dtype = leaf(loaded.variables, layout.paths[0]).dtype
+        dtype = node(loaded.variables, layout.paths[0]).dtype
         if layout.name in packed:
             assert dtype == ml_dtypes.bfloat16, layout.name
             checked += 1

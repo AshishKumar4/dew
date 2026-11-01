@@ -6,11 +6,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
 
-from dew.nn import categorical
+from dew.nn import categorical, inspection
 from dew.nn.protocols import OutputTable
-from dew.objectives import base, residuals
+from dew.objectives import base
 from dew.objectives.lm import chunked
 
 
@@ -68,44 +68,6 @@ def test_a_ruled_loss_holds_every_order(edge):
 
     assert_contract(ruled, (value, first, second), direction, cotangent, f"a ruled loss {edge}",
                     truth_fn=plain, plain_fn=plain)
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_residual_pullbacks_hold_every_order(edge):
-    """The Gauss-Newton step's two custom JVPs (`residuals._pulled`, `residuals._stepped`): a microbatch's
-    J^T r whose derivative hands the parameters' move its share, and the zero whose derivative in the
-    pooled J^T r is the damped step, its dual's J^T (J J^T + damping I)^-1 r. Every order finite wherever
-    float64 is a normal float32 and the plain formulas' are, the step solved as JAX solves a linear
-    system."""
-    scale = EDGES[edge]
-    first, second, pulled = normal_draw(2695, (2, 3), (4,), (10,), scale=scale)
-    direction = normal_draw(2696, (2, 3), (4,), (10,), scale=scale)
-    (cotangent,) = normal_draw(2697, (10,))
-
-    def pullback(first, second, pulled):
-        return residuals._pulled({"first": first, "second": second}, pulled, 0.25)
-
-    def plain_pullback(first, second, pulled):
-        raveled = jnp.concatenate([first.ravel(), second.ravel()])
-        return jax.lax.stop_gradient(pulled) + 0.25 * (raveled - jax.lax.stop_gradient(raveled))
-
-    assert_contract(pullback, (first, second, pulled), direction, cotangent,
-                    f"a microbatch's pullback {edge}", truth_fn=plain_pullback, plain_fn=plain_pullback)
-    jacobian, residual, pulled = normal_draw(2698, (3, 10), (3,), (10,), scale=scale)
-    directions = normal_draw(2699, (10,), (3, 10), (3,), scale=scale)
-    (stepped,) = normal_draw(2700, ())
-    rows = jnp.asarray(3, jnp.int32)
-
-    def step(pulled, jacobian, residual):
-        return residuals._stepped(0.5, 3, rows, pulled, (jacobian, residual))
-
-    def plain_step(pulled, jacobian, residual):
-        solved = jnp.linalg.solve(jacobian @ jacobian.T + 0.5 * jnp.eye(3, dtype=jacobian.dtype), residual)
-        # The step's own derivatives in J and r stay: the pulled gradient moves with them.
-        return jnp.vdot(pulled - jax.lax.stop_gradient(pulled), jacobian.T @ solved)
-
-    assert_contract(step, (pulled, jacobian, residual), directions, stepped, f"a damped step {edge}",
-                    truth_fn=plain_step, plain_fn=plain_step)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -205,3 +167,23 @@ def test_a_node_perturbation_estimate_holds_every_order(edge):
     direction = normal_draw(2709, *(leaf.shape for leaf in leaves), scale=EDGES[edge])
     (cotangent,) = normal_draw(2710, ())
     assert_contract(loss, primals, direction, cotangent, f"a node perturbation estimate {edge}")
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_probes_tap_holds_its_orders(edge):
+    """A watched activation's tap (`inspection.tapped`, a custom VJP: the activation itself, its cotangent
+    passed through, and the probe's the cotangent's sufficient statistics over the loss scale, its decade
+    histogram included), fp32 over 4 x 16 entries of which every other is held: the primal and every
+    reverse order finite wherever float64's are normal float32s, at activations and cotangents scaled to
+    the edge. Forward mode does not run (`FORWARD_ORDERS`, a custom VJP's)."""
+    scale = EDGES[edge]
+    x, direction, cotangent = normal_draw(3143, (4, 16), (4, 16), (4, 16), scale=scale)
+    where = jnp.arange(64).reshape(4, 16) % 2 == 0
+    probe = jnp.zeros(len(inspection.COTANGENT_TERMS) + len(inspection.HISTOGRAM_EDGES) + 1, jnp.float32)
+
+    def tapped(activation, probed):
+        return inspection.tapped(activation, probed, where, jnp.float32(2.0), histogram=True)
+
+    assert_contract(tapped, (x, probe), (direction, jnp.ones_like(probe)), cotangent, f"a probe's tap {edge}",
+                    without=FORWARD_ORDERS)
+

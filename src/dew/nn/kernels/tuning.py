@@ -532,6 +532,12 @@ class KernelOp(tokamax.Op):
                           else self.traced(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
 
+    def padded(self, ba: tokamax.BoundArguments, config) -> float | None:
+        """The share of the launch's tile grid at `config` outside its operands' extents, the work its
+        tiles' tails compute of nothing (`report.Launch.padded`, row 2772); None where the launch states
+        none, as a launch of no template's."""
+        return None
+
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The hook field or argument `name`'s value as this op's picks key it: what each function in it
         computes (`program`, at the arguments the template traces it at), the rest of it as it is. An op

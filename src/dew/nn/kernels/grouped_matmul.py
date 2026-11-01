@@ -233,6 +233,27 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
             accumulators=1 if ba.arguments.get('paired') is None else 2)
         return ba if stated == hooks else type(ba)(ba.op, {**ba.arguments, 'hooks': stated})
 
+    ROWS: ClassVar[tuple[str, ...]]
+    """The operands whose rows the launch's groups split: a product's `tokens`, a kernel gradient's
+    `tokens` and `cotangent`."""
+
+    def padded(self, ba, config: Config) -> float | None:
+        """A dense call's (`dense`) output grid, its rows tiled by `block_m` and its columns by `block_n`
+        (`tuning.KernelOp.padded`), the output's sides its launch's (`output_sides`); None for a grouped
+        call, whose groups' rows a step routes, for a tile of no such blocks (a TPU's), and for a launch
+        that states no sides."""
+        sides = self.output_sides(ba)
+        if not ba.arguments.get('dense') or not isinstance(config, Tile | mosaic_gpu.Tiles) or sides is None:
+            return None
+        rows, width = sides
+        grid = -(-rows // config.block_m) * config.block_m * -(-width // config.block_n) * config.block_n
+        return 1 - rows * width / grid if grid else None
+
+    def output_sides(self, ba) -> tuple[int, int] | None:
+        """The rows and columns of a dense call's output its tiles cover (`padded`): a product's (`Gmm`,
+        `MosaicGmm`) and a kernel gradient's (`Tgmm`, `MosaicTgmm`) each their own; None here."""
+        return None
+
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
         computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a
@@ -402,12 +423,27 @@ class _Triton(_GroupedLaunch[Tile]):
         """The elements of both operand tiles one depth step loads."""
 
 
+def _product_sides(ba) -> tuple[int, int]:
+    """A product's output: its tokens by its kernel's width."""
+    kernel = ba.arguments['kernel']
+    return ba.arguments['tokens'].shape[0], kernel.shape[1 if ba.arguments['trans_rhs'] else 2]
+
+
+def _gradient_sides(ba) -> tuple[int, int]:
+    """A kernel gradient's output: its tokens' width (its depth) by its cotangent's, the tokens the
+    contraction."""
+    return ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
+
+
 @dataclasses.dataclass(frozen=True)
 class Gmm(_Triton):
     """Each group's rows of `tokens` `[rows, in]` times its matrix of
     `kernel` `[groups, in, out]`, or of its transpose with `trans_rhs`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+
+    def output_sides(self, ba) -> tuple[int, int]:
+        return _product_sides(ba)
 
     @staticmethod
     def _dense_extents(ba) -> tuple[int, int]:
@@ -481,6 +517,9 @@ class Tgmm(_Triton):
     kernel gradient `[groups, in, out]`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+
+    def output_sides(self, ba) -> tuple[int, int]:
+        return _gradient_sides(ba)
 
     @staticmethod
     def _dense_extents(ba) -> tuple[int, int]:
@@ -843,6 +882,9 @@ class MosaicGmm(_Mosaic):
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
 
+    def output_sides(self, ba) -> tuple[int, int]:
+        return _product_sides(ba)
+
     def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         hooks = ba.arguments['hooks']
         return mosaic_gpu.gmm_allocations(
@@ -889,6 +931,9 @@ class MosaicTgmm(_Mosaic):
     `block_k` at a time."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+
+    def output_sides(self, ba) -> tuple[int, int]:
+        return _gradient_sides(ba)
 
     EXACT_SUMS: ClassVar[bool] = True
     STAGED_ROWS: ClassVar[bool] = True

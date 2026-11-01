@@ -2024,7 +2024,7 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
     transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
-    (`decoders.language_model_config`); a route that reads no `overrides` refuses them. `remote` and
+    (`decoders.decoder_config`); a route that reads no `overrides` refuses them. `remote` and
     `pinned` are `source_route`'s. Where `prediction_depths` is given, the config is the checkpoint's
     of that many depths (`_kept_depths`), which the load reads and saves. `inventory` gives the
     checkpoint's tensor names from their headers, which a quantized wrapper's selection patterns are

@@ -41,12 +41,14 @@ from dew.nn.backbones.z_image import ZImageTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("padded", "exact", "deep")
-CASE_SEEDS = {"padded": 512, "exact": 256, "deep": 512}
-"""Check 1's declared seeds for each case, sized by `seeds_for` on armada."""
-PAST_TARGET = {"test_the_flow_and_its_gradients_match_the_source": {"padded": 127.1, "deep": 117.8}}
+CASE_SEEDS = {"padded": 128, "exact": 256, "deep": 512}
+"""Check 1's declared seeds for each case, sized by `seeds_for` on armada: the padded case's paired with the
+source (`dew_fn`, the count check 1's paired verdict needs; 512 alone, 2026-11-01)."""
+PAST_TARGET = {"test_the_flow_and_its_gradients_match_the_source": {"deep": 117.8}}
 """The cases past a group's 120 s target, which the whole suite alone runs (`whole_suite.timed`), each
 timed alone on an armada 25/17 worker (IG2504M, 2026-10-30), about 1.35 times that on the fleet's 26/17
-workers. The exact case, 75.0 s, checks every parameter's gradient in every train's run (ledger 2504)."""
+workers. The exact case, 75.0 s, checks every parameter's gradient in every train's run (ledger 2504),
+and the padded case at its paired count, 33 s (IGRESIZE, 2026-11-01), runs in every group."""
 ROWS = 4
 HEIGHT = 3
 BUDGET = 64

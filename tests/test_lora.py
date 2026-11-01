@@ -36,6 +36,7 @@ from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, dew_programs, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
+from torch_layout import node
 
 from dew import lora
 from dew.batch import FROZEN, merge, thaw
@@ -502,9 +503,7 @@ def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimize
     updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
     moved = optax.apply_updates(factors, updates)
     for path, before in jax.tree_util.tree_leaves_with_path(factors):
-        after = moved
-        for key in path:
-            after = after[key.key]
+        after = node(moved, tuple(key.key for key in path))
         assert not np.array_equal(np.asarray(after), np.asarray(before)), jax.tree_util.keystr(path)
 
 

@@ -41,7 +41,7 @@ from dew.artifacts import (
     uint8_pixels,
 )
 from dew.cleanup import attempted
-from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value, reported_number
+from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, reported_number, tracker_json
 
 if TYPE_CHECKING:
     from mlflow.tracking import MlflowClient
@@ -256,12 +256,12 @@ class WandbTracker(_OwnedTracker):
         if self._closed:
             raise RuntimeError("WandbTracker is closed")
         if isinstance(value, RunRecord):
-            self.run.config.update({"run_record": json_value(value)}, allow_val_change=True)
+            self.run.config.update({"run_record": tracker_json(value)}, allow_val_change=True)
             return
         if isinstance(value, RECORD_TYPES):
-            self.run.summary[type(value).__name__] = json_value(value)
+            self.run.summary[type(value).__name__] = tracker_json(value)
             self.run.log({"train/step": step,
-                          "reporting/record": json.dumps(json_value(value), allow_nan=False),
+                          "reporting/record": json.dumps(tracker_json(value), allow_nan=False),
                           "reporting/type": type(value).__name__})
             if isinstance(value, FitEnded):
                 if value.status == "preempted":
@@ -309,7 +309,7 @@ class LocalTracker(_OwnedTracker):
 
     def _write(self, name: str, payload: Mapping[str, object]) -> None:
         self._check()
-        line = json.dumps(json_value(payload), allow_nan=False)
+        line = json.dumps(tracker_json(payload), allow_nan=False)
         if name not in self._files:
             self.directory.mkdir(parents=True, exist_ok=True)
             self._files[name] = (self.directory / name).open('a', buffering=1)
@@ -562,7 +562,7 @@ class MLflowTracker(_OwnedTracker):
     def artifact(self, value: Reported, step: int) -> None:
         client, run = self.run
         if isinstance(value, RECORD_TYPES):
-            client.log_dict(run, {'step': step, 'value': json_value(value)},
+            client.log_dict(run, {'step': step, 'value': tracker_json(value)},
                             f'records/{type(value).__name__}-{step}.json')
             if isinstance(value, FitEnded):
                 self._status = value.terminal_status
@@ -631,7 +631,7 @@ class TensorBoardTracker(_OwnedTracker):
             from tensorboard.compat.proto.summary_pb2 import Summary
 
             self._add(Summary(value=[_text(f'reporting/{type(value).__name__}',
-                                           json.dumps(json_value(value), allow_nan=False))]), step)
+                                           json.dumps(tracker_json(value), allow_nan=False))]), step)
             return
         self._add(_summarize(value), step)
 

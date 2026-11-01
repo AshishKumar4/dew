@@ -46,6 +46,8 @@ CONTRACTED = {
         "test_an_exact_gelu_holds_every_order",
     "src/dew/diffusion/schedules/flow.py::time_shift":
         "test_a_time_shift_holds_every_order",
+    "src/dew/nn/inspection.py::tapped":
+        "test_a_probes_tap_holds_its_orders",
     "src/dew/nn/categorical.py::_probabilities":
         "test_the_categorical_losses_hold_every_order",
     "src/dew/nn/categorical.py::_label_loss":
@@ -96,10 +98,6 @@ CONTRACTED = {
         "test_the_lm_heads_hold_every_order_of_their_gradient",
     "src/dew/objectives/lm/chunked.py::_whole_losses":
         "test_the_whole_logits_losses_hold_every_order",
-    "src/dew/objectives/residuals.py::_pulled":
-        "test_the_residual_pullbacks_hold_every_order",
-    "src/dew/objectives/residuals.py::_stepped":
-        "test_the_residual_pullbacks_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::stream_rms_norm.linear_tangent":
         "test_the_fused_norms_and_products_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::rms_norm.linear_tangent":

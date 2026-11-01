@@ -1,6 +1,6 @@
 """What the data suites share: Grain's flags parsed for its worker processes, a caption reader that
-hands the words back, the caption templates and host augmentation the image suites draw from, and a
-random step that draws a wide integer."""
+hands the words back, the caption templates and host augmentation the image suites draw from, a
+random step that draws a wide integer, and objectives' expansions of a record into rows of it."""
 
 import dataclasses
 import itertools
@@ -30,6 +30,29 @@ def keep_captions(captions):
     """A caption reader that hands the words back, so a test reads what the dataset wrote before a
     run's encoder tokenizes it."""
     return {"caption": np.asarray(captions)}
+
+
+class Questioned:
+    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
+    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`), its identity
+    stable, so a resumed run knows it for the step it saved."""
+
+    identity = "questioned@1"
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question)}
+                     for question in range(int(element["id"]) % 3 + 1))
+
+
+class Fanned:
+    """An objective's expansion of each record `id` into `id % 4` rows, none for some, each row's two
+    tokens naming it (`id * 10 + question`)."""
+
+    identity = "fanned@1"
+
+    def flat_map(self, element):
+        record = int(element["id"])
+        return tuple({"text": np.full(2, record * 10 + question, np.int32)} for question in range(record % 4))
 
 
 @dataclasses.dataclass(frozen=True)

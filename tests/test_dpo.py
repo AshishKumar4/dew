@@ -353,3 +353,14 @@ def test_parquet_without_sides_is_refused(tmp_path):
     with pytest.raises(ValueError):
         next(compile(Files(str(path), format="parquet").pipe(presets.preferences, seq_len=4, batch=1),
                      read="memory").train(DataPartition()))
+
+
+def test_a_preference_pair_marks_each_halfs_real_tokens():
+    """A preference pair's layout marks each half's ids as real (`REAL_KEY`) and its padding as not,
+    whatever its completion marks: a chosen half ending in an unmarked token, a rejected half of no
+    completion."""
+    from dew.data.preferences import REAL_KEY, PreferencePair
+
+    row = PreferencePair(5, pad_id=7).map(
+        {"chosen": [1, 2, 3, 4], "rejected": [1, 2], "chosen_mask": [0, 0, 1, 0], "rejected_mask": [0, 0]})
+    assert row[REAL_KEY].tolist() == [[1, 1, 1, 1, 0], [1, 1, 0, 0, 0]]

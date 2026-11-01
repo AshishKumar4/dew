@@ -26,7 +26,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, collective_host
-from dew.batch import Batch, Variables
+from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Denoiser, Process
@@ -279,6 +279,13 @@ type FlowReward = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequenc
 """A function that scores decoded [-1, 1] samples, given their repeated source rows, one scalar per sample."""
 
 
+def real_samples(context: Batch) -> np.ndarray | None:
+    """Which of a rollout's samples come of real source rows (`VALID_ROWS`, each source row's repeated
+    into its group as the context's are): a share of a pool whose read ran out partway fills its batch
+    with repeats of its rows that consume no example and train nothing. None where every row is real."""
+    return None if VALID_ROWS not in context else np.asarray(context[VALID_ROWS], bool)
+
+
 @dataclass(frozen=True)
 class GroupedRollout:
     """A rollout of complete prompt groups: each source row sampled `groups` times by a policy of the
@@ -330,6 +337,7 @@ class GroupedRollout:
     def _grouped(self, value, xp=jnp):
         """`value`'s rows each repeated into its group of samples, in the array namespace `xp`."""
         return xp.repeat(value, self.groups, axis=0)
+
 
     def _expanded(self, batch: Batch) -> tuple[Batch, slice | np.ndarray, int]:
         """Repeat every source row into its group of samples.
@@ -491,6 +499,9 @@ class FlowRollout(GroupedRollout):
             raise ValueError("flow group advantages must remain finite")
         selected = self.steps - 1 if self.train_steps is None else self.train_steps
         local_advantages = advantages[owned]
+        # A sample of a source row a partly read share repeated trains nothing (`real_samples`).
+        held = real_samples(context)
+        real = np.ones(local_advantages.shape[0], bool) if held is None else held[owned]
         shape = (local_advantages.shape[0], selected)
         prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
                                                  context[condition.field])
@@ -503,7 +514,7 @@ class FlowRollout(GroupedRollout):
             "rollout_steps": np.full(shape[:1], self.steps, np.int32),
             OLD_LOG_PROBS_KEY: np.asarray(generated.log_probs)[owned, :selected],
             "transition_mask": (np.asarray(generated.stochastic)[owned, :selected]
-                                & (local_advantages[:, None] != 0)),
+                                & (local_advantages[:, None] != 0) & real[:, None]),
             ADVANTAGES_KEY: local_advantages,
             REWARDS_KEY: rewards[owned],
         })

@@ -152,21 +152,27 @@ class Evaluation:
     elapsed_seconds: float
     previews: tuple[Artifact, ...]
     examples: int | None = None
+    real_token_share: float | None = None
+    """Of the tokens the split's batches computed (each row's `Objective.row_tokens`, padding and a
+    drained rank's repeats included), the share the loss scored (`Objective.scored_tokens` of its real
+    rows); None where the objective counts no tokens or its rows declare none."""
 
     @property
     def scalars(self) -> dict[str, float]:
         """Return the metric values, plus the split's counts if a batch was scored
         (`evaluation/counts/<split>/records`, each split's its own at a step that scores several, apart
-        from every summary's, `Summary.SPLIT`), and on the
+        from every summary's, `Summary.SPLIT`, and its `real_token_share` where known), and on the
         examples clock the examples the run had consumed (`EXAMPLES_SCALAR`), a cooldown branch's under its
         own name (`COOLDOWN`)."""
         named = f"{COOLDOWN}/examples_consumed" if self.split.startswith(f"{COOLDOWN}/") else EXAMPLES_SCALAR
         clocked = {} if self.examples is None else {named: float(self.examples)}
         if not self.coordinated_batches:
             return {**self.scores, **clocked}
+        share = ({} if self.real_token_share is None else
+                 {f"evaluation/counts/{self.split}/real_token_share": self.real_token_share})
         return {**self.scores,
                 f"evaluation/counts/{self.split}/coordinated_batches": float(self.coordinated_batches),
-                f"evaluation/counts/{self.split}/records": float(self.records), **clocked}
+                f"evaluation/counts/{self.split}/records": float(self.records), **share, **clocked}
 
     def branched(self) -> Evaluation:
         """This evaluation as a cooldown branch's: its split and every score named under `COOLDOWN`."""
@@ -245,12 +251,13 @@ class Evaluation:
         scores: dict[str, float] = {}
         previews: tuple[Artifact, ...] = ()
         scored = records = 0
+        share = None
         written = None if scored_to is None or warm else Path(scored_to) / split
         # Root writes what it is asked to keep, and every process scores the batches it writes, so each
         # runs the same collectives: root's ask is the pool's.
         kept = bool(broadcast_from_process_zero(root and written is not None))
         if batches is not None and (metrics or preview_enabled or loss or kept):
-            scores, previews, scored, records = _score_split(
+            scores, previews, scored, records, share = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
                 preview_key=preview_key, loss=loss, warm=warm, written=written if root else None,
@@ -258,7 +265,8 @@ class Evaluation:
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
-        return cls(event_step, split, scores, scored, records, event_words, elapsed, previews)
+        return cls(event_step, split, scores, scored, records, event_words, elapsed, previews,
+                   real_token_share=share)
 
 
 def _pick(artifacts: tuple[Artifact, ...], reads: type):
@@ -403,12 +411,13 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
                  warm: bool = False, written: Path | None = None, kept: bool = False
-                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
+                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int, float | None]:
     """Score every record of a validation split, or its first `WARM_BATCHES`
     batches unfinalized where `warm`.
 
-    Returns the finalized scores, root's previews, and the two counts every
-    rank agrees on: the batches scored and the real records they held.
+    Returns the finalized scores, root's previews, and what every rank agrees
+    on: the batches scored, the real records they held, and the share of the
+    tokens they computed their loss scored (`Evaluation.real_token_share`).
 
     Every rank walks these phases in the same order. The pass ends when no
     rank has a batch left; until then a rank that has drained scores a copy
@@ -424,6 +433,9 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     source = iterator = None
     last = None
     scored = records = 0
+    # The tokens the batches' loss scored and those they computed, on the host, for a split the loss
+    # scores, whose batches hold what it reads; None where undeclared.
+    tokens: list[int] | None = [0, 0] if objective.counts_tokens and loss else None
     seen: set = set()
     try:
         def open_source() -> None:
@@ -447,6 +459,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             # This rank's own real rows, counted on the host; the pool's count
             # is summed once after the split.
             records += int(np.sum(held[VALID_ROWS]))
+            tokens = _counted_tokens(objective, held, tokens)
             produced = None
             if evaluating or loss:
                 # The objective scores under the mesh, as the step trains
@@ -472,8 +485,13 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                 break
         # Processes on one data share (a replicated stage or sequence axis)
         # read the same rows, so the pool counts each share once.
-        shares = from_every_process([int(DataPartition.of(mesh).index), int(records)])
-        records = sum(dict(shares).values())
+        # Each share's records and tokens (-1 where its rows declare none), counted once a share.
+        shares = from_every_process([int(DataPartition.of(mesh).index), int(records),
+                                     *([-1, -1] if tokens is None else tokens)])
+        pooled = {index: counts for index, *counts in shares}.values()
+        records = sum(counts[0] for counts in pooled)
+        tokens = None if any(counts[1] < 0 for counts in pooled) else [
+            sum(counts[1] for counts in pooled), sum(counts[2] for counts in pooled)]
         if scored and warm:
             # The reduction compiles here; a part of the split's loss is no score to check.
             loss_sums.reduced(objective)
@@ -484,7 +502,21 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                 scores[f'{split}/loss'] = loss_value
     finally:
         _close_source(iterator if iterator is not None else source)
-    return scores, previews, scored, records
+    share = None if tokens is None or not tokens[1] else tokens[0] / tokens[1]
+    return scores, previews, scored, records, share
+
+
+def _counted_tokens(objective: Objective[Loss, Effects], held: Batch, tokens: list[int] | None
+                    ) -> list[int] | None:
+    """`tokens`, the split's scored and computed tokens so far, with `held`'s: its real rows' scored
+    tokens (`Objective.scored_tokens`) and every row's computed ones (`Objective.row_tokens`, from its
+    shape); None from the first batch whose rows declare none."""
+    per_row = None if tokens is None else objective.row_tokens(held)
+    if tokens is None or per_row is None:
+        return None
+    real = np.asarray(held[VALID_ROWS]).reshape(-1) > 0
+    scored = np.asarray(objective.scored_tokens(held), np.int64).reshape(-1)
+    return [tokens[0] + int(np.sum(np.where(real, scored, 0))), tokens[1] + rows_of(held) * per_row]
 
 
 def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> None:

@@ -38,6 +38,7 @@ from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
 from dew.nn.categorical import kl_divergence
+from dew.nn.kernels.options import OuterProgram
 from dew.nn.precision import at_least_fp32, divided
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.objectives.rl.tssm import TSSM, Cache
@@ -763,14 +764,14 @@ class DreamerRollout:
             driven = DrivenSimulator(env)
             self._begin = functools.partial(simulator_start, driven)
             # The replay is written in place, its buffer donated to the step that writes it.
-            recorded = jax.jit(self._kept, donate_argnames=("replay",))
+            recorded = OuterProgram(self._kept, donate_argnames=("replay",))
             self._roll = functools.partial(self._simulated, driven, recorded)
         else:
             stepped = Driven(env)
             self._begin = functools.partial(start, stepped)
-            self._roll = jax.jit(functools.partial(self._stepped, stepped),
+            self._roll = OuterProgram(functools.partial(self._stepped, stepped),
                                  static_argnames=("steps", "random"), donate_argnames=("live",))
-        self._sample = jax.jit(lambda replay, key: replay.sample(key, self.batch, self.length))
+        self._sample = OuterProgram(lambda replay, key: replay.sample(key, self.batch, self.length))
 
     @property
     def metrics(self) -> Mapping[str, float]:
@@ -925,7 +926,7 @@ def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variabl
     stepped = Driven(env)
     count = env.reset(key)[1].reward.shape[0]
 
-    @jax.jit
+    @OuterProgram
     def run(variables: Variables, key: jax.Array) -> jax.Array:
         carry = start(stepped, key, objective.memory(count))
         _, recorded = env_rollout(stepped, objective.act, variables, carry, steps, reset=False)

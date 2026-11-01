@@ -112,6 +112,35 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
                 if "train/tokens" in scalars] == logged
 
 
+class PaddedTokenRegression(TokenRegression):
+    """`TokenRegression` whose rows each hold four token positions (`row_tokens`, from the batch's shape),
+    of which a row of step `k` scores `k + 1`."""
+
+    def row_tokens(self, batch):
+        return 4
+
+
+@pytest.mark.parametrize(("accumulation", "log_every", "shares"), [
+    (1, 1, [0.25, 0.5, 0.75, 1.0]), (1, 2, [0.375, 0.875]), (2, 1, [0.25, 0.5, 0.75, 1.0])])
+def test_a_run_logs_the_share_of_the_tokens_it_computed_that_its_loss_scored(accumulation, log_every, shares):
+    """train/real_token_share (row 2772): of the tokens an interval's steps computed, every row's four
+    positions however few it scores, the share their loss scored, so padding's cost of MFU reads off the
+    log; every step's, an update's window committed or not; a validation split's its own; none for an
+    objective whose rows declare no tokens."""
+    tracker = RecordingTracker()
+    make_trainer(objective=PaddedTokenRegression(), tracker=tracker, accumulation=accumulation).fit(
+        dataset(val=val_batches(3)), steps=4, log_every=log_every, eval_every=4)
+    assert [scalars["train/real_token_share"] for _, scalars in tracker.scalars
+            if "train/real_token_share" in scalars] == shares
+    # A validation split's: its three batches score rows of 1, 2 and 3 of their four tokens.
+    assert [scalars["evaluation/counts/val/real_token_share"] for _, scalars in tracker.scalars
+            if "evaluation/counts/val/real_token_share" in scalars] == [0.5]
+    untokened = RecordingTracker()
+    make_trainer(objective=TokenRegression(), tracker=untokened).fit(dataset(val=val_batches(3)), steps=2,
+                                                                     log_every=1, eval_every=2)
+    assert not any(name.endswith("real_token_share") for _, scalars in untokened.scalars for name in scalars)
+
+
 def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
     """A run whose optimizer splits by Muon's rule records, as it starts, where the split sent each
     parameter and why (`FitStarted.groups`): the regression's kernel to Muon, its bias to AdamW. A run

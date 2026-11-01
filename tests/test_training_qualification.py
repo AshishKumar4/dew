@@ -16,6 +16,12 @@ in the persistent cache the first two filled. The
 baseline's fp32 loss and source-tensor gradients must match transformers', and
 each run's export must give its trained logits when transformers reads it.
 The runs use XLA attention, the path the README's CUDA bitwise claim names.
+
+The two runs that compile, the uninterrupted one and the interrupted one with
+its resume, are two units of armada's map tasks (`shards`), each recording what
+its runs wrote, and one judge holds every claim above over both (row 2788):
+each run compiles into a cache of its own, cold, so the pair together is
+longer than a task.
 """
 
 import json
@@ -30,7 +36,9 @@ import numpy as np
 import pytest
 import qualification_worker as worker
 import torch
+from map_judge import pooled_units, record_units
 from process_support import ProcessGroup
+from remote_cache import HOST
 from token_support import encoded_token_fixture
 from transformers import (
     AutoModelForCausalLM,
@@ -127,9 +135,10 @@ def source_model(kind: str, vocab: int):
         tie_word_embeddings=False))
 
 
-@pytest.fixture(scope="module", params=["dense", "moe"])
-def qualified(tmp_path_factory, request) -> Path:
-    directory = tmp_path_factory.mktemp(f"qualification-{request.param}")
+def prepared(directory: Path, kind: str) -> Path:
+    """`directory` holding what the runs read: the corpus's tokens, and a source of `kind` with its
+    tokenizer, the same from the same seed in any process."""
+    directory.mkdir(parents=True)
     # A text of its own, CONTRIBUTING.md as of 55c522529: the MoE source is
     # checked for near ties in its routing over these tokens, and an edit to
     # the live file failed that check.
@@ -138,22 +147,64 @@ def qualified(tmp_path_factory, request) -> Path:
                           tokenizer=str(TOKENIZER), val_fraction=0.1)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
     torch.manual_seed(13)
-    source_model(request.param, len(tokenizer)).save_pretrained(directory / "source")
+    source_model(kind, len(tokenizer)).save_pretrained(directory / "source")
     tokenizer.save_pretrained(directory / "source")
-    # The baseline and the interrupted run share nothing, each compiling into a cache of its own, so they
-    # run together; the resumed run reads the interruption's checkpoint, and every program from its
-    # cache, after both. A failure on the way stops both.
-    with ProcessGroup() as started:
-        started.running.append(baseline := spawn(directory, "baseline"))
-        started.running.append(interrupted := spawn(directory, "interrupted"))
-        kill_when_ready(interrupted, directory / "ready-to-kill")
-        finish(baseline, "baseline")
-    finish(spawn(directory, "resumed"), "resumed")
     return directory
 
 
+KEPT = ("result.json", "state.npz", "export_logits.npz", "reference.npz", "export")
+"""What a run's directory holds that the judge reads: its result, state, export and the export's logits,
+and the baseline's reference loss and gradients, not its checkpoints or its log."""
+
+
+def ran(directory: Path) -> dict[str, bytes]:
+    """The qualification's runs over `directory` (`prepared`), on one host, as XLA:CPU compiles for its
+    host's class and their states are compared bit for bit: the uninterrupted run beside the interrupted
+    run, SIGKILLed once blocked past its checkpoint, and then beside its resume. What they
+    wrote that the judge reads (`KEPT`), by path in `directory`, with the source the baseline's
+    reference was taken against and the CPU class they ran on (`HOST.cpu_class`)."""
+    with ProcessGroup() as started:
+        # The uninterrupted run beside the interrupted one and then its resume, each on a core of its own.
+        started.running.append(baseline := spawn(directory, "baseline"))
+        started.running.append(interrupted := spawn(directory, "interrupted"))
+        kill_when_ready(interrupted, directory / "ready-to-kill")
+        started.running.append(resumed := spawn(directory, "resumed"))
+        finish(resumed, "resumed")
+        finish(baseline, "baseline")
+    (directory / "cpu.txt").write_text(HOST.cpu_class())
+    files = [directory / "source", directory / "cpu.txt"] + [
+        directory / run / name for run in ("baseline", "restarted") for name in KEPT]
+    return {str(path.relative_to(directory)): path.read_bytes() for kept in files if kept.exists()
+            for path in ([kept] if kept.is_file() else sorted(kept.rglob("*"))) if path.is_file()}
+
+
 @pytest.mark.slow
-def test_a_run_killed_mid_accumulation_resumes_onto_every_leaf_of_the_uninterrupted_run(qualified):
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+@pytest.mark.shards(units=1, per_task=1)
+def test_a_loaded_source_resumes_mid_accumulation_and_exports_as_transformers_reads_it(kind, tmp_path):
+    """The module's claims for a source of `kind`: its runs (`ran`), one map task's unit
+    (`map_judge.record_units`), which its judge holds to transformers (`pooled_units`); run whole, the
+    runs then the judge."""
+    directory = prepared(tmp_path / "qualification", kind)
+    label = f"the {kind} source's qualification runs"
+    if record_units(label, lambda start, stop: [ran(directory) for _ in range(start, stop)]):
+        return
+    pooled = pooled_units(label, 1)
+    units = [ran(directory)] if pooled is None else [unit for _, _, payload in pooled for unit in payload]
+    for files in units:
+        for name, content in files.items():
+            (directory / name).parent.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_bytes(content)
+    assert_resumed_onto_every_leaf_of_the_uninterrupted_run(directory)
+    assert_the_loaded_sources_loss_and_gradients_are_transformers(directory)
+    for run in ("baseline", "restarted"):
+        assert_the_runs_export_reads_in_transformers_as_its_trained_logits(directory, run)
+
+
+def assert_resumed_onto_every_leaf_of_the_uninterrupted_run(qualified: Path) -> None:
+    """The run killed mid-accumulation resumes onto every leaf of the uninterrupted run, bit for bit, on the
+    host's CPU class (`cpu.txt`), its resume finding every program in the cache its interrupted run
+    filled."""
     baseline, resumed = (json.loads((qualified / run / "result.json").read_text())
                          for run in ("baseline", "restarted"))
     assert (resumed["restored_step"], resumed["restored_updates"]) == (worker.CHECKPOINT_STEP,
@@ -162,7 +213,7 @@ def test_a_run_killed_mid_accumulation_resumes_onto_every_leaf_of_the_uninterrup
         assert resumed[field] == baseline[field], field
     # A restored leaf that entered the step in another layout or sharding would be another program.
     assert baseline["cache_misses"] > 0 and resumed["cache_hits"] > 0 and resumed["cache_misses"] == 0, (
-        baseline, resumed)
+        baseline, resumed, (qualified / "cpu.txt").read_text())
     assert baseline["final_loss"] < baseline["initial_loss"], "training did not lower the probe's loss"
     with (np.load(qualified / "baseline" / "state.npz") as left,
           np.load(qualified / "restarted" / "state.npz") as right):
@@ -172,8 +223,8 @@ def test_a_run_killed_mid_accumulation_resumes_onto_every_leaf_of_the_uninterrup
             np.testing.assert_array_equal(left[name], right[name], err_msg=name)
 
 
-@pytest.mark.slow
-def test_the_loaded_sources_loss_and_gradients_are_transformers(qualified):
+def assert_the_loaded_sources_loss_and_gradients_are_transformers(qualified: Path) -> None:
+    """The baseline's fp32 loss and every source tensor's gradient are transformers'."""
     loss, gradients = source_gradients(qualified)
     with np.load(qualified / "baseline" / "reference.npz") as recorded:
         np.testing.assert_allclose(loss.numpy(), recorded["loss"], atol=1e-4, rtol=0)
@@ -183,9 +234,8 @@ def test_the_loaded_sources_loss_and_gradients_are_transformers(qualified):
             assert gap <= 1e-4, f"{name}: {gap}"
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize("run", ["baseline", "restarted"])
-def test_each_runs_export_reads_in_transformers_as_its_trained_logits(qualified, run):
+def assert_the_runs_export_reads_in_transformers_as_its_trained_logits(qualified: Path, run: str) -> None:
+    """Run `run`'s export, read by transformers, gives its trained logits."""
     exported = AutoModelForCausalLM.from_pretrained(qualified / run / "export", dtype=torch.float32,
                                                     attn_implementation="eager",
                                                     local_files_only=True).eval()
