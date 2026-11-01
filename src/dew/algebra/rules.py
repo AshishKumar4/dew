@@ -14,7 +14,22 @@ from typing import Literal
 
 import jax.numpy as jnp
 import numpy as np
-from egglog import Ruleset, Unit, Vec, birewrite, eq, function, i64, rewrite, rule, ruleset, set_, var, vars_
+from egglog import (
+    Ruleset,
+    String,
+    Unit,
+    Vec,
+    birewrite,
+    eq,
+    function,
+    i64,
+    rewrite,
+    rule,
+    ruleset,
+    set_,
+    var,
+    vars_,
+)
 
 from dew.algebra.terms import Term
 
