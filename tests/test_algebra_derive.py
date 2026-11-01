@@ -118,17 +118,22 @@ def walked(forms: derive.Derived, values: dict, tiles: range):
     return state
 
 
+def walked_whole(forms: derive.Derived):
+    """The declaration's derived step over every key tile in order, finished: a function of (q, k, v)."""
+    def run(q, k, v):
+        values = operands(q, k, v)
+        return forms.finish(walked(forms, values, range(KEYS // TILE)), values)
+
+    return run
+
+
 @pytest.mark.parametrize("name", list(DECLARED))
 def test_the_derived_walk_computes_the_declared_function(name):
     """The declaration's derived step over every key tile in order, finished: on par with the whole-operand
     function against the float64 truth (check 1)."""
     forms = derive.derive(declared(*DECLARED[name]))
-
-    def derived(q, k, v):
-        values = operands(q, k, v)
-        return forms.finish(walked(forms, values, range(KEYS // TILE)), values)
-
-    assert_as_exact(jax.jit(derived), jax.jit(whole(DECLARED[name][0])), draw, f"{name} walked", seeds=16)
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(DECLARED[name][0])), draw, f"{name} walked",
+                    seeds=16)
 
 
 @pytest.mark.parametrize("name", list(DECLARED))
@@ -158,15 +163,12 @@ def test_sums_no_maximum_scales_walk_as_plain_sums():
     """A declaration whose walked sums read no walked maximum derives plain sums: on par with the function."""
     forms = derive.derive(declared(unshifted))
 
-    def derived(q, k, v):
-        values = operands(q, k, v)
-        return forms.finish(walked(forms, values, range(KEYS // TILE)), values)
-
     def small(seed):
         q, k, v = draw(seed)
         return q / jnp.max(jnp.abs(q)), k, v
 
-    assert_as_exact(jax.jit(derived), jax.jit(whole(unshifted)), small, "unshifted walked", seeds=16)
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(unshifted)), small, "unshifted walked",
+                    seeds=16)
 
 
 def squared_shift(q, k, v, rows, keys):

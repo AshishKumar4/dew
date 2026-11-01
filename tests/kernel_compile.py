@@ -30,6 +30,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
+from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
 from dew.training._lowering import kernel_calls, triton_kernels
@@ -821,3 +822,20 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
             text = text if len(text) <= 1600 else f"{text[:800]} ... {text[-800:]}"
             record["error"] = f"{type(error).__name__}: {text}"
     return found
+
+
+class Uncounted(grouped_matmul.MosaicGmm):
+    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
+    registers do not hold: a launch whose model misses. Its first tile is a paired product's widest, 128 x
+    256, two accumulators of 128 registers a thread, which spills in every compile whatever its walk's
+    addresses take (the paired 128 x 128 tile this launch took first spilled 16 bytes in the process's own
+    compile only while its walk held a stage's addresses in registers, and none since the walk forms them
+    where it uses them: `mosaic.opaque`); a narrower tile comes once a compile has refused a tile of its
+    launch (`report.refused_launches`, the relowering's proposals included)."""
+
+    def registers(self, ba, config):
+        return 0
+
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and (
+            config.block_n == 256 or bool(report.refused_launches()))

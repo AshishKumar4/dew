@@ -170,26 +170,6 @@ def gated_tokenwise(update_fn):
     return run
 
 
-@pytest.mark.parametrize("update_fn", [gated_delta, gated_delta_written_as_error])
-def test_the_gated_delta_rules_derived_chunks_compute_its_token_scan(update_fn):
-    """The gated delta rule, written either way, walked in chunks through its derived WY form: on par with
-    the token-by-token scan, outputs and final state, against the float64 truth (check 1)."""
-    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, GATED, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)))
-
-    def derived(q, k, v, g, beta):
-        values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
-        state, outputs = forms.init({}), []
-        for index in range(TOKENS // CHUNK):
-            chunk = {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-            outputs.append(forms.mapped(chunk, state))
-            state = forms.step(state, chunk)
-        return jnp.concatenate(outputs), forms.finish(state, values)
-
-    assert_as_exact(jax.jit(derived), jax.jit(gated_tokenwise(update_fn)), gated_draw,
-                    f"gated delta {update_fn.__name__}", seeds=16)
-
-
 def kimi_delta(h, q, k, v, g, beta):
     """Kimi's delta attention: each key's row decayed by its own gate, then the key's old value corrected,
     `h = (I - beta k k^T) diag(exp(g)) h + beta k v^T`."""
@@ -214,11 +194,16 @@ def kimi_draw(seed):
     return q, k, v, jnp.asarray(-(10.0 ** rng.uniform(-3, 0, (TOKENS, KEY))), jnp.float32), beta
 
 
-@pytest.mark.parametrize("update_fn", [kimi_delta, kimi_delta_written_as_error])
-def test_kimi_delta_attentions_derived_chunks_compute_its_token_scan(update_fn):
-    """Kimi's delta attention, its decay each key's own, written either way, walked in chunks through its
-    derived form: on par with the token-by-token scan, outputs and final state (check 1)."""
-    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, KIMI, walked="time",
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (gated_delta_written_as_error, GATED, gated_draw),
+    (kimi_delta, KIMI, kimi_draw), (kimi_delta_written_as_error, KIMI, kimi_draw)],
+    ids=["gated_delta", "gated_delta_as_error", "kimi_delta", "kimi_delta_as_error"])
+def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, operands, draw_fn):
+    """The gated delta rule (a scalar decay) and Kimi's delta attention (each key's decay its own), each
+    written as a decayed corrected state and as an error correction, walked in chunks through the derived
+    WY form: on par with the token-by-token scan, outputs and final state, against the float64 truth (check
+    1), decays down to 1e-3 a token."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                        state=((KEY, VALUE), jnp.float32)))
 
     def derived(q, k, v, g, beta):
@@ -230,8 +215,8 @@ def test_kimi_delta_attentions_derived_chunks_compute_its_token_scan(update_fn):
             state = forms.step(state, chunk)
         return jnp.concatenate(outputs), forms.finish(state, values)
 
-    assert_as_exact(jax.jit(derived), jax.jit(gated_tokenwise(update_fn)), kimi_draw,
-                    f"kimi delta {update_fn.__name__}", seeds=16)
+    assert_as_exact(jax.jit(derived), jax.jit(gated_tokenwise(update_fn)), draw_fn, update_fn.__name__,
+                    seeds=16)
 
 
 def adjoint(forms, chunk_of_values, count: int):

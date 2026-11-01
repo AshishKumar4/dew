@@ -15,6 +15,7 @@ import optax
 import pytest
 from generation_support import lowers
 from jax.experimental.layout import Format, Layout
+from kernel_compile import Uncounted
 from process_support import fresh
 
 from dew.inputs import Field, InputSpec
@@ -30,24 +31,10 @@ from dew.training import Trainer
 ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
 
 
-class _Uncounted(grouped_matmul.MosaicGmm):
-    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
-    registers do not hold: a launch whose model misses, as the kernels' own step-down test makes one (its
-    first tile the paired 128 x 256, which spills in every compile whatever its walk's addresses take; a
-    narrower one once a compile has refused a tile of its launch, `report.refused_launches`)."""
-
-    def registers(self, ba, config):
-        return 0
-
-    def candidate(self, ba, config, target):
-        return super().candidate(ba, config, target) and (
-            config.block_n == 256 or bool(report.refused_launches()))
-
-
 class Experts(nn.Module):
     """An MoE layer's paired SwiGLU up projection, each expert taking an equal share of the rows,
-    through a launch whose register model misses (`_Uncounted`), and a trained scale over its outputs:
-    the launch is the forward kernel alone, so the step differentiates the scale, not the launch. Its
+    through a launch whose register model misses (`kernel_compile.Uncounted`), and a trained scale over its
+    outputs: the launch is the forward kernel alone, so the step differentiates the scale, not the launch. Its
     initialization, traced for the host, draws the weights without launching it. `nonce`, added to the
     rows, makes its step a program no compilation cache holds, whose compile runs ptxas and reports
     what it finds: a cached program reports nothing."""
@@ -63,7 +50,7 @@ class Experts(nn.Module):
         if self.is_initializing():
             return jnp.zeros((x.shape[0], WIDTH), jnp.bfloat16) * scale
         sizes = jnp.full((EXPERTS,), x.shape[0] // EXPERTS, jnp.int32)
-        projected = _Uncounted()(
+        projected = Uncounted()(
             jax.lax.stop_gradient((x + self.nonce).astype(jnp.bfloat16)), gate, sizes, paired=up,
             hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16",
             trans_rhs=False, interpret=False)
@@ -390,7 +377,6 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
     """Each Mosaic GPU call a thunk names has its binary (`report.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
     missing binary would read as a kernel that does not spill (row 2851)."""
-    from dew.nn.kernels.templates import report
 
     both = report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm__l0123456789", 168, 0),
                                            _kernel_proto("dew_tgmm", 255, 344)]))
@@ -412,7 +398,6 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
     from kernel_compile import staged_copy
 
     from dew.nn.kernels import generation
-    from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
     def added(x_ref, y_ref, o_ref):

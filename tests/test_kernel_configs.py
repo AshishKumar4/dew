@@ -20,7 +20,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, generations, lowers
 from jax.sharding import PartitionSpec
-from kernel_compile import compile_kernels, failures
+from kernel_compile import Uncounted, compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import bundles, report, resources
@@ -242,24 +242,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     assert "serialized" not in notes, notes
 
 
-class _Uncounted(grouped_matmul.MosaicGmm):
-    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
-    registers do not hold: a launch whose model misses. Its first tile is a paired product's widest, 128 x
-    256, two accumulators of 128 registers a thread, which spills in every compile whatever its walk's
-    addresses take (the paired 128 x 128 tile this launch took first spilled 16 bytes in the process's own
-    compile only while its walk held a stage's addresses in registers, and none since the walk forms them
-    where it uses them: `mosaic.opaque`); a narrower tile comes once a compile has refused a tile of its
-    launch (`report.refused_launches`, the relowering's proposals included)."""
-
-    def registers(self, ba, config):
-        return 0
-
-    def candidate(self, ba, config, target):
-        return super().candidate(ba, config, target) and (
-            config.block_n == 256 or bool(report.refused_launches()))
-
-
-class _OnlyTile(_Uncounted):
+class _OnlyTile(Uncounted):
     """A launch with one tile, the wide one on a producer's layout, so refusing it exhausts its derivation
     (a tile refused at the planner's first stage count, two, gives way to the next layout, which takes the
     same shape: `wgmma.fed`)."""
@@ -307,7 +290,7 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     traced = []
-    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else _Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else Uncounted(), 4096, devices), traced)
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -365,7 +348,7 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
             with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
                 while not stop.is_set():
                     rows += 64
-                    forward, shapes = _spilling_forward(_Uncounted(), rows, devices)
+                    forward, shapes = _spilling_forward(Uncounted(), rows, devices)
                     lowered = jax.jit(forward).trace(*shapes).lower()
                     started.set()
                     lowered.compile()
@@ -373,7 +356,7 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
             started.set()
 
     traced = []
-    lowered = _lowering(*_spilling_forward(_Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
 
     with ThreadPoolExecutor(1) as pool:
         other = pool.submit(others)

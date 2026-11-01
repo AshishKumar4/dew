@@ -40,7 +40,7 @@ from jax import lax
 from jax.extend import core as jcore
 
 from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
-from dew.nn.precision import float32_einsum, float32_matmul
+from dew.nn.precision import float32_einsum, float32_matmul, two_sum
 
 Axes = tuple[str, ...]
 Atom = jcore.Var | jcore.Literal
@@ -523,14 +523,6 @@ def _substituted_backward(residuals, d_solved):
 
 
 _substituted.defvjp(_substituted_forward, _substituted_backward)
-
-
-def two_sum(a, b):
-    """`a + b` and its rounding error, exactly (Knuth's two-sum): the error-free transformation the
-    compensated prefix carries."""
-    total = a + b
-    shifted = total - a
-    return total, (a - (total - shifted)) + (b - shifted)
 
 
 def _compensated(values, *, reverse: bool = False) -> tuple[jax.Array, jax.Array]:
