@@ -25,9 +25,9 @@ from test_recurrence_chunk import (
     FORMED,
     HOOKS,
     SEEDS as HOOK_SEEDS,
-    accurate,
     chunk_on,
     draw as hooked_draw,
+    formed,
     token_by_token,
 )
 
@@ -211,21 +211,20 @@ REFUSED = (Unfitted, NotImplementedError, KernelRefused)
 named template fails (`selection.KernelRefused`)."""
 
 
-def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
-    """The chunked op on the mainloop for `case`'s calls in `dtype`: through the template's route where it
-    takes them (`chunk_on('mosaic_gpu', ...)`, the template named to the selectors, at its derived tiles);
+def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fast'):
+    """The chunked op on the mainloop for `case`'s calls in `dtype` under the run's `forms` (`formed`):
+    through the template's route where it takes them (`chunk_on('mosaic_gpu', ...)`, the template named to
+    the selectors, at its derived tiles);
     else, the route refusing them (a launch's registers past a thread's), the mainloop's rule at its narrowest
     value block, one chunk in flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where
     the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension
     (`mainloop.per_key_refusal`); and on a GPU where its launches at those tiles pass the device's shared
     memory (an fp32 call's solve on an A100's block), whose arithmetic the CPU interprets."""
     (operands,) = draw(dtype, 0, **geometry(case))
-    if taken(operands, hooks):
-        on = functools.partial(chunk_on, 'mosaic_gpu', hooks)
-        # An fp32 call's bar the fp32 recurrence's: the accurate forms' three parts.
-        return accurate(on) if dtype == jnp.float32 else on
+    if formed(forms, taken)(operands, hooks):
+        return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
-        jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), operands)
+        jax.eval_shape(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)), operands)
     family = mainloop.family_of() or mainloop.INTERPRETED
     if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, hooks.floor):
         # The portable math's arm is test_recurrence_chunk's.
@@ -247,7 +246,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                            tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
-                           floor=hooks.floor, bound=hooks.inverse_bound)
+                           floor=hooks.floor, bound=hooks.inverse_bound, rounded=forms == 'fast')
 
     return rule
 
@@ -265,19 +264,15 @@ def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     per_key = SHAPES[case].get('per_key')
     hooks = recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
                              floor=FLOOR if per_key else None, write_bound=1.0)
-    on = on_the_mainloop(hooks, case, dtype)
-    if on is None:
-        return
     label = f'the mosaic forward, {case} in {jnp.dtype(dtype).name}'
-    if dtype == jnp.float32:
+    exact = on_the_mainloop(hooks, case, dtype, forms='accurate') if dtype == jnp.float32 else None
+    if exact is not None:
         truth = jax.jit(functools.partial(token_by_token, hooks))
-        assert_as_exact(jax.jit(on), truth, functools.partial(draw, dtype, **geometry(case)), label,
-                        seeds=SEEDS, truth_fn=truth)
-        fast = getattr(on, '__wrapped__', None)
-        if fast is None:
-            return
-        on, label = fast, f'{label} under the fast forms'
-    the_template_is_as_exact_as_fla(on, recorded_site(case, dtype), ('out', 'final'), label)
+        assert_as_exact(jax.jit(exact), truth, functools.partial(draw, dtype, **geometry(case)),
+                        f'{label} under the accurate forms', seeds=SEEDS, truth_fn=truth)
+    on = on_the_mainloop(hooks, case, dtype)
+    if on is not None:
+        the_template_is_as_exact_as_fla(on, recorded_site(case, dtype), ('out', 'final'), label)
 
 
 UNSEEN = generation.GpuTarget("sm87", "NVIDIA Jetson AGX Orin", 163 * 1024, multiprocessors=16,
