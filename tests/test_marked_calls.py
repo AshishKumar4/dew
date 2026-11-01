@@ -31,7 +31,10 @@ def test_a_marked_span_computes_as_its_body_and_stays_one_call_of_its_kind_throu
     spanned = marked(kind, body)
     x, y = jnp.linspace(0.1, 1.0, 8), jnp.linspace(1.0, 2.0, 8)
     np.testing.assert_array_equal(np.asarray(jax.jit(spanned)(x, y)), np.asarray(jax.jit(body)(x, y)))
-    loss = lambda x, y: jnp.sum(spanned(x, y))  # noqa: E731
+
+    def loss(x, y):
+        return jnp.sum(spanned(x, y))
+
     transformed = {
         "call": lambda x, y: spanned(x, y),
         "jvp": lambda x, y: jax.jvp(spanned, (x, y), (y, x))[1],
