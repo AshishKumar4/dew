@@ -975,11 +975,128 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
-    (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`).
+    (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
+    chain's store under the fields its class renamed since, by today's names (`earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return earlier_profile(earlier_newton_schulz(earlier_trainer(record)))
+    return earlier_chains(earlier_profile(earlier_newton_schulz(earlier_trainer(record))))
+
+
+RENAMED_FIELDS: Mapping[str, Mapping[str, str]] = {"dew.data.sources.iterator:Iterated": {"name": "identity"}}
+"""The fields a store's class renamed after runs recorded chains with them, by its import path, each earlier
+name by today's: an iterator's content version, `identity` as every opaque source names it (row 3031)."""
+
+
+def earlier_chains(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose chains (`_CHAINS`) hold a store under fields its class renamed since
+    (`RENAMED_FIELDS`), with them under today's names, wherever a chain holds the store: its source, a mix's
+    or a phase's member, a store's field that holds stores (a concatenation's parts, a view's source). Data a
+    store holds (a Memory's columns) is read as it was. Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping) or not any(name in fields for name in _CHAINS):
+        return record
+    return {**record, "fields": {name: _renamed_chain(field_value(value, name)) if name in _CHAINS else value
+                                 for name, value in fields.items()}}
+
+
+def _renamed_chain(chain: JSON) -> JSON:
+    """A chain's record (`dew.data.records`), or a run's named splits of them, as a saved run's record holds
+    it, read at that boundary: its stores' renamed fields under today's names (`_renamed_stores`)."""
+    if not isinstance(chain, dict):
+        return chain
+    splits = chain.get("splits")
+    if isinstance(splits, list):
+        pairs: list[JSON] = [[pair[0], _renamed_chain(pair[1])] if isinstance(pair, list) and len(pair) == 2
+                             else pair for pair in splits]
+        return {**chain, "splits": pairs}
+    stages = chain.get("stages")
+    if isinstance(stages, list):
+        chain = {**chain, "stages": [_renamed_call(stage) for stage in stages]}
+    source = chain.get("source")
+    if not isinstance(source, dict):
+        return chain
+    members = next((key for key in ("mix", "phases") if isinstance(source.get(key), list)), None)
+    if members is not None:
+        member_chains = source[members]
+        assert isinstance(member_chains, list)
+        return {**chain, "source": {**source, members: [_renamed_chain(member) for member in member_chains]}}
+    if "pipe" in source:
+        called = _renamed_call(source)
+        assert isinstance(called, dict)
+        return {**chain, "source": {**called, "input": _renamed_chain(source.get("input"))}}
+    return {**chain, "source": _renamed_stores(source)}
+
+
+def _renamed_call(call: JSON) -> JSON:
+    """A call of `pipe` a saved chain records (`{"pipe": ..., "settings": {...}}`), read at that boundary:
+    each setting its function declares a store (`_holds_store`) with its stores' renamed fields under today's
+    names (`_renamed_stores`); any other setting or entry as it is."""
+    if not isinstance(call, dict) or not isinstance(call.get("pipe"), str):
+        return call
+    settings, named = call.get("settings"), call["pipe"]
+    if not isinstance(settings, dict) or not isinstance(named, str) or not named.startswith("dew."):
+        return call
+    taken = parameters(registry.imported(named))[0]
+    hints = {name: registry.parameter_type(taken[name][1], name) if name in taken else None
+             for name in settings}
+    return {**call, "settings": {name: _renamed_stores(value) if _holds_store(hints[name]) else value
+                                 for name, value in settings.items()}}
+
+
+def _renamed_stores(value: JSON) -> JSON:
+    """`value`, a store's class record or a list of them as a saved chain holds them, read at that boundary:
+    each store's fields its class renamed (`RENAMED_FIELDS`) under today's names, and each of its fields its
+    class declares a store (`_store_fields`) the same; any other field, a store's data among them, as it
+    is."""
+    if isinstance(value, list):
+        return [_renamed_stores(part) for part in value]
+    named = _store_class(value)
+    if named is None:
+        return value
+    assert isinstance(value, dict)
+    fields = value["fields"]
+    assert isinstance(fields, dict)
+    renamed, holding = RENAMED_FIELDS.get(named, {}), _store_fields(named)
+    held = {renamed.get(name, name): _renamed_stores(field) if renamed.get(name, name) in holding else field
+            for name, field in fields.items()}
+    return {**value, "fields": held}
+
+
+def _store_class(value: JSON) -> str | None:
+    """The import path of the store whose class record `value` is, read from a saved chain at its boundary:
+    one of Dew's stores (`dew.data.pipeline.Dataset`) or views of one (`dew.data.sources.base.View`); else
+    None."""
+    from dew.data.sources.base import View
+
+    if not isinstance(value, dict) or not isinstance(value.get("fields"), dict):
+        return None
+    named = value.get("class")
+    if not isinstance(named, str) or not named.startswith("dew.") or ":" not in named:
+        return None
+    built = registry.imported(named)
+    return named if isinstance(built, type) and issubclass(built, Dataset | View) else None
+
+
+def _store_fields(named: str) -> frozenset[str]:
+    """The fields of the store class at import path `named` that its declared types say hold stores (a
+    concatenation's parts, a view's source)."""
+    built = registry.imported(named)
+    assert isinstance(built, type)
+    return frozenset(field.name for field in dataclasses.fields(built)
+                     if _holds_store(declared_type(built, field.name)))
+
+
+def _holds_store(hint: Annotation | typing.TypeVar) -> bool:
+    """Whether a declared type `hint` holds stores: Dew's store protocol (`Source`), a store or view class, or
+    any type made of one (a tuple of them, an optional one, a view's type variable bound to one)."""
+    from dew.data.sources.base import Source, View
+
+    if isinstance(hint, typing.TypeVar):
+        return hint.__bound__ is not None and _holds_store(hint.__bound__)
+    if hint is Source or (isinstance(hint, type) and issubclass(hint, Dataset | View)):
+        return True
+    return any(_holds_store(argument) for argument in typing.get_args(hint))
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:

@@ -1149,7 +1149,7 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower() if lowering else None, launches or "[]"
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held,
-            self.device_mesh.devices.flat[0], split, self.optimizer)
+            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split, self.optimizer)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)

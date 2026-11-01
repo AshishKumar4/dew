@@ -18,6 +18,7 @@ from decision_support import decision_rows
 from float64_terms import float64_terms
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
+from torch_layout import node
 
 from dew.batch import VALID_ROWS
 from dew.data.dataset import DataPartition
@@ -226,23 +227,16 @@ def located(tree, path: tuple[str, ...], held) -> tuple[str, ...]:
     backbone's and a head's scopes alike (`layers_0/self_attn` in both), so the one place whose
     parameters are `held`'s is its."""
     found = []
-    for root in ((), *((name,) for name, node in tree.items() if isinstance(node, dict))):
-        node = tree
+    for root in ((), *((name,) for name, child in tree.items() if isinstance(child, dict))):
+        reached = tree
         for name in (*root, *path):
-            node = node.get(name) if isinstance(node, dict) else None
-        if node is not None and jax.tree.structure(node) == jax.tree.structure(held) and all(
+            reached = reached.get(name) if isinstance(reached, dict) else None
+        if reached is not None and jax.tree.structure(reached) == jax.tree.structure(held) and all(
                 np.array_equal(np.asarray(mine), np.asarray(its))
-                for mine, its in zip(jax.tree.leaves(node), jax.tree.leaves(held), strict=True)):
+                for mine, its in zip(jax.tree.leaves(reached), jax.tree.leaves(held), strict=True)):
             found.append((*root, *path))
     assert len(found) == 1, f"{path} is at {len(found)} places of the parameters"
     return found[0]
-
-
-def at(tree, place: tuple[str, ...]):
-    """The node of `tree` at `place` (`located`)."""
-    for name in place:
-        tree = tree[name]
-    return tree
 
 
 READ = ("_heads", "__call__")
@@ -310,7 +304,7 @@ class AttentionTerms:
             queried = query_ids[:, None, :, None]
             keep = (queried == key_ids[:, None, None, :]) & (queried != 0)
             place = located(variables["params"], path, record["params"])
-            kernel = at(variables["params"], place)[out_name]["kernel"]
+            kernel = node(variables["params"], place)[out_name]["kernel"]
             heads, width = queries.shape[2:]
             dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
             _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
@@ -325,9 +319,9 @@ def with_attention_terms(sized, carried: dict):
     sized by at least the attention's terms carried to it (`AttentionTerms`)."""
     sized = jax.tree.map(np.array, sized)
     for place, projections in carried.items():
-        node = at(sized["params"], place)
+        placed = node(sized["params"], place)
         for name, (into, terms) in projections.items():
-            leaf = node[name]
+            leaf = placed[name]
             squares = np.asarray(terms, np.float64) ** 2
             leaf["bias"] = np.maximum(leaf["bias"], np.sqrt(squares.sum((0, 1))).reshape(leaf["bias"].shape))
             leaf["kernel"] = np.maximum(leaf["kernel"], np.sqrt(np.einsum(
