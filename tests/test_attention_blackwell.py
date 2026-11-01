@@ -71,14 +71,16 @@ def test_the_blackwell_forward_holds_check_1_interpreted(case, width, natural):
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
 @pytest.mark.parametrize("width", list(SHAPES))
-def test_the_blackwell_forward_compiles_for_a_b200_within_its_resources(width):
-    """The causal forward of heads `width` wide at the default tiles, compiled by Mosaic for a compile-only
-    B200 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's shared memory
-    and its 512 columns of tensor memory, no register spilled."""
+def test_the_blackwell_forward_compiles_for_a_b200_within_its_resources(width, causal):
+    """The causal or full forward of heads `width` wide at the default tiles, compiled by Mosaic for a
+    compile-only B200 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's
+    shared memory and its 512 columns of tensor memory, no register spilled. A full call reads no tile's
+    places, which lower all the same."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    spans = template.spans(1024, 1024, 2, causal=True)
+    spans = template.spans(1024, 1024, 2, causal=causal)
 
     def call():
         def forward(query, key, value):
@@ -89,7 +91,8 @@ def test_the_blackwell_forward_compiles_for_a_b200_within_its_resources(width):
                          jax.ShapeDtypeStruct((2, 1024, 2, width), jnp.bfloat16))
 
     with generation.assumed("sm100"):
-        found = compile_mosaic_kernels([support.KernelCase(f"blackwell attention {width}", call)], "sm100")
+        found = compile_mosaic_kernels([support.KernelCase(f"blackwell attention {width} {causal}", call)],
+                                       "sm100")
     assert len(found) == 1 and found[0].get("kernels"), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 

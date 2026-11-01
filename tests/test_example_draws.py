@@ -184,7 +184,10 @@ def few_step(kind, **fields):
 def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
     """MeanFlow's intervals and dropped conditions and a shortcut model's level grid, times and dropped
     conditions are each example's by its place among the update's examples: an update read as two
-    halves gives every example the draws and the role its whole batch gives it, to the bit."""
+    halves, drawing what its whole batch drew (the whole's tape of its draws), gives every example the
+    role its whole batch gives it, to the bit. The draws themselves are each example's own on any layout
+    by their bits, and their floats by check 1 (`test_each_example_draws_its_own_bits_under_any_key_
+    implementation`): a half's program may round a lane of a float draw otherwise (ledger 1364)."""
     objective = few_step(kind)
     params = objective.init(jax.random.PRNGKey(0))
     leaves, tree = jax.tree.flatten(params["params"])
@@ -196,21 +199,23 @@ def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
     batch = {"image": np.asarray(images, np.uint8),
              **objective.inputs.tokenize([str(row) for row in range(rows)])}
 
-    def recorded(*parts: slice) -> dict[str, np.ndarray]:
+    def recorded(*parts: slice, tape=None) -> tuple[dict[str, np.ndarray], dict[str, str]]:
         recorder = Recorder()
         for part in parts:
             step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
                         example_index=jnp.asarray(np.arange(rows)[part], jnp.int32), example_count=rows,
-                        recorder=recorder)
+                        recorder=recorder, tape=tape)
             objective.loss(params, jax.tree.map(lambda value, part=part: value[part], batch), step)
-        return recorder.tape(rows)
+        return recorder.tape(rows), recorder.kinds
 
-    whole, halves = recorded(slice(0, rows)), recorded(slice(0, rows // 2), slice(rows // 2, rows))
+    whole, kinds = recorded(slice(0, rows))
+    drawn = {name: value for name, value in whole.items() if kinds[name] == "sample"}
+    halves, _ = recorded(slice(0, rows // 2), slice(rows // 2, rows), tape=drawn)
     roles = {"meanflow": {"interval end", "interval start", "dropped conditions"},
              "shortcut": {"level grid", "data times", "dropped conditions"}}[kind]
     assert roles <= set(whole) and set(halves) == set(whole)
-    for name, value in whole.items():
-        np.testing.assert_array_equal(halves[name], value, err_msg=name)
+    for name in roles:
+        np.testing.assert_array_equal(halves[name], whole[name], err_msg=name)
 
 
 HALVES_ROWS, HALVES_SEEDS = 32, 128
@@ -298,8 +303,10 @@ def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batc
 
 
 def test_each_examples_posterior_draw_is_its_own():
-    """A latent objective draws each example's posterior noise by its place: a half of an update reads
-    the whole update's noise for its examples."""
+    """A latent objective draws each example's posterior noise by its place: a half of an update draws at
+    the whole update's places for its examples, exactly. The draw over a place is the example's own on
+    any batch by check 1 (`test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in`): a half's
+    program may round a lane of a float draw otherwise (ledger 1364)."""
     from test_autoencoder import tiny_vae
 
     from dew.objectives.diffusion import DiffusionObjective
@@ -312,16 +319,18 @@ def test_each_examples_posterior_draw_is_its_own():
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 8, 8, 3), 0, 256), np.uint8)}
 
-    def recorded(part: slice) -> np.ndarray:
+    def recorded(part: slice) -> tuple[np.ndarray, tuple[int, ...]]:
         recorder = Recorder()
         examples = jnp.asarray(np.arange(4)[part], jnp.int32)
         step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE, example_index=examples,
                     example_count=4, recorder=recorder)
         objective.loss(params, jax.tree.map(lambda value: value[part], batch), step)
-        (_, noise), = recorder.values["posterior"]
-        return noise
+        (places, noise), = recorder.values["posterior"]
+        return np.asarray(places), noise.shape[1:]
 
-    np.testing.assert_array_equal(recorded(slice(2, 4)), recorded(slice(0, 4))[2:])
+    (half, half_shape), (whole, whole_shape) = recorded(slice(2, 4)), recorded(slice(0, 4))
+    np.testing.assert_array_equal(half, whole[2:])
+    assert half_shape == whole_shape
 
 
 def test_a_posterior_noise_of_another_shape_is_refused():

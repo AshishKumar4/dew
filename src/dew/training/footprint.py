@@ -25,6 +25,7 @@ from typing import NamedTuple
 import jax
 import jax.extend.core as jcore
 import numpy as np
+import optax
 from jax.core import ShapedArray
 
 from dew._records import JSON
@@ -37,6 +38,7 @@ from dew.nn.kernels.generation import _compute_capability
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
+    CALLS,
     VIEWS,
     Slicing,
     bodies,
@@ -97,16 +99,17 @@ def device_bytes(tree) -> int:
 
 
 CHEAP = frozenset({
-    "add", "and", "bitcast_convert_type", "broadcast_in_dim", "ceil", "clamp", "clz", "eq", "ne", "lt", "le",
-    "gt", "ge", "complex", "concatenate", "convert_element_type", "copy", "copy_p", "dynamic_slice",
-    "dynamic_update_slice", "floor", "imag", "iota", "is_finite", "max", "min", "mul", "neg", "not", "or",
-    "xor", "pad", "population_count", "real", "reduce_precision", "reshape", "squeeze", "expand_dims", "rev",
-    "round", "select_n", "shift_left", "shift_right_arithmetic", "shift_right_logical", "slice", "sub",
-    "transpose", "integer_pow", "square", "name"})
+    "add", "add_any", "and", "bitcast_convert_type", "broadcast_in_dim", "ceil", "clamp", "clz", "eq", "ne",
+    "lt", "le", "gt", "ge", "complex", "concatenate", "convert_element_type", "copy", "copy_p",
+    "dynamic_slice", "dynamic_update_slice", "floor", "imag", "iota", "is_finite", "max", "min", "mul", "neg",
+    "not", "or", "xor", "pad", "population_count", "real", "reduce_precision", "reshape", "squeeze",
+    "expand_dims", "rev", "round", "select_n", "shift_left", "shift_right_arithmetic", "shift_right_logical",
+    "slice", "sub", "transpose", "integer_pow", "square", "name"})
 """The primitives XLA's CPU fusion takes for cheap, which it duplicates into each consumer rather than
 keep a buffer of (`InstructionFusion::IsExpensive`, xla/service/instruction_fusion.cc: every elementwise
 op but division, the transcendentals and their kin, and the layout ops), an integer power and a square
-lowering to its multiplies, and a checkpoint's name, which computes nothing."""
+lowering to its multiplies, a cotangent sum, which JAX lowers to one `add` (`add_jaxvals_lowering`,
+jax/_src/interpreters/mlir.py), and a checkpoint's name, which computes nothing."""
 
 REAL_CHEAP = frozenset({"abs", "sign", "sin", "cos", "tan", "sinh"})
 """The primitives XLA's CPU fusion takes for cheap over real elements alone (`IsExpensive`)."""
@@ -147,23 +150,79 @@ xla/debug_options_flags.cc); below it XLA's own emitters compute it (`IsMatrixMu
 ForRewriting`, xla/service/gpu/matmul_utils.cc)."""
 
 
+def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.Jaxpr, int, list]:
+    """One trace of `loss(params, *arguments)`'s forward and backward: the program `jax.vjp`'s pullback
+    runs on a cotangent of ones, returning the gradient's leaves and then the pullback's own, its
+    residuals; how many gradient leaves lead its outputs; and the residuals' traced shapes."""
+    def both(params, *arguments):
+        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
+        return pullback(jax.tree.map(jax.numpy.ones_like, outputs)), pullback
+    closed, (gradients, pullback) = jax.make_jaxpr(both, return_shape=True)(params, *arguments)
+    count = len(jax.tree.leaves(gradients))
+    return closed.jaxpr, count, jax.tree.leaves(pullback)
+
+
+def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: Workspace,
+                  lowering: str | None = None, consumed: bool = False) -> tuple[int, Peak]:
+    """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
+    backward (`traced_gradient`), as each derives it from its own."""
+    traced = traced_gradient(loss, params, arguments)
+    lowering = lowering or LOWERED.get(platform, platform)
+    return _kept(*traced, platform, lowering), _peak(*traced, platform, workspace, lowering, consumed)
+
+
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
                    lowering: str | None = None) -> int:
     """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share,
-    as XLA's fusion for `platform` keeps them: each value its traced program (`jax.make_jaxpr` of
-    `jax.vjp`'s pullback, as JAX lowers it for `lowering`, `platform`'s own name where none is given,
-    a GPU's CUDA's: `compiled`) closes over counts the values it is computed
-    from without a buffer (`Frontier.reading`), once, but those the program reads, which the state and
-    the batch already hold, and literals; a value in pinned host memory counts none. A value the
-    pullback closes over keeps its own traced sharding; one whose trace states none, and every other
-    value, count whole. Matching an axis's size to the batch size cannot identify its sharding: a weight
-    or a scan's layer axis can have that size too."""
-    def pullback(params, *arguments):
-        return jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)[1]
+    as XLA's fusion for `platform` keeps them: each value its traced program (`jax.vjp`'s pullback, its
+    residuals the outputs of `traced_gradient`'s program past the gradient, as JAX lowers it for
+    `lowering`, `platform`'s own name where none is given, a GPU's CUDA's: `compiled`) closes over counts
+    the values it is computed from without a buffer (`Frontier.reading`), once, but those the program
+    reads, which the state and the batch already hold, and literals; a value in pinned host memory counts
+    none. A value the pullback closes over keeps its own traced sharding; one whose trace states none, and
+    every other value, count whole. Matching an axis's size to the batch size cannot identify its
+    sharding: a weight or a scan's layer axis can have that size too."""
+    lowering = lowering or LOWERED.get(platform, platform)
+    return _kept(*traced_gradient(loss, params, arguments), platform, lowering)
 
-    closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
-    program = compiled(closed.jaxpr, lowering or LOWERED.get(platform, platform))
-    placed = {value: shape for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True)
+
+def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
+                  workspace: Workspace, lowering: str | None = None, consumed: bool = False) -> Peak:
+    """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
+    device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
+    `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
+    below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
+    forward and backward (`traced_gradient`, its outputs the gradient's), as JAX lowers it for `lowering`
+    (`compiled`; `platform`'s own name where none is given, a GPU's CUDA's). Each gradient is held to the
+    end, or, `consumed`, while it is made and no longer (`peak_bytes`'s): where the step reads it there
+    into the buffers the state donates (`consumed_where_made`), the optimizer's update or the
+    accumulator's sum written in place (the donated state's outputs alias its arguments,
+    `HloInputOutputAliasConfig`), and XLA's memory-minimizing schedule runs a consumer that frees its
+    operand as soon as it is ready (`ListScheduler::BytesFreedIfScheduled`,
+    xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
+    xla/service/gpu/gpu_hlo_schedule.cc)."""
+    return _peak(*traced_gradient(loss, params, arguments), platform, workspace,
+                 lowering or LOWERED.get(platform, platform), consumed)
+
+
+def _kept(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, lowering: str) -> int:
+    """`residual_bytes` of `traced_gradient`'s program, its outputs past the first `count` the residuals."""
+    return _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes, platform)
+
+
+def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, workspace: Workspace,
+          lowering: str, consumed: bool = False) -> Peak:
+    """`gradient_peak` of `traced_gradient`'s program, its first `count` outputs the gradient."""
+    del shapes
+    lowered = compiled(program.replace(outvars=program.outvars[:count]), lowering)
+    return Peak(peak_bytes(lowered, platform, workspace, consumed=consumed),
+                not bounded_below(lowered, platform))
+
+
+def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
+    """`residual_bytes` of `program`, a pullback's traced program whose outputs are its residuals, each of
+    the traced `shapes`."""
+    placed = {value: shape for value, shape in zip(program.outvars, shapes, strict=True)
               if not isinstance(value, jcore.Literal)}
     frontier = Frontier(program, platform, returned=False)
     total = 0
@@ -179,21 +238,62 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     return total
 
 
-def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
-                  workspace: Workspace, lowering: str | None = None) -> Peak:
-    """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
-    device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
-    `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
-    below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
-    forward and backward, as JAX lowers it for `lowering` (`compiled`; `platform`'s own name where none
-    is given, a GPU's CUDA's)."""
-    def gradient(params, *arguments):
-        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
-        return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
+def consumed_where_made(optimizer: optax.GradientTransformation | None, state: TrainState,
+                        window: int) -> bool:
+    """Whether the step reads each gradient where it is made into the buffers its state donates, so it
+    holds none beside another (`gradient_peak`'s `consumed`): with the state it commits (`COMMIT_FIELDS`,
+    the optimizer's and the EMA) in device memory, a window of several microbatches sums each into its
+    accumulator's gradient leaf in device memory, and a window of one updates each by `optimizer`, where
+    its update reads each gradient into its own leaf's results alone (`leaf_local`). A dynamically scaled
+    loss commits only once every gradient is known finite, a committed state fetched from the host is
+    fetched behind one barrier over every gradient (`Transaction.past`), a window
+    that replays its microbatches keeps their gradients for the replay, and an update that reads them
+    together (clipping by the global norm) holds them all until it has read the last."""
+    def in_device(tree) -> bool:
+        return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
 
-    program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
-    lowered = compiled(program, lowering or LOWERED.get(platform, platform))
-    return Peak(peak_bytes(lowered, platform, workspace), not bounded_below(lowered, platform))
+    if state.scale is not None or not in_device((state.opt_state, state.ema)):
+        return False
+    if window > 1:
+        accumulated = None if state.accumulation is None else state.accumulation.gradient
+        return accumulated is not None and in_device(accumulated)
+    params, opt_state = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
+                                     (state.variables["params"], state.opt_state))
+    return optimizer is not None and leaf_local(optimizer, params, opt_state)
+
+
+def leaf_local(optimizer: optax.GradientTransformation, gradients, state) -> bool:
+    """Whether `optimizer`'s update of `gradients` from `state`, over parameters of their shapes, reads each
+    leaf of `gradients` into results that read no other gradient's leaf: no reduction, product or
+    concatenation across them. An update taking extra arguments is handed the run's progress and no
+    statistics of attention logits, as a step without them hands it (`Transaction.commit`). An equation
+    running a program of its own (a call, a loop) is read as reading every operand into each result."""
+    def update(gradients, state, params, progress):
+        if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+            return optimizer.update(gradients, state, params, qk_stats=None, progress=progress)
+        return optimizer.update(gradients, state, params)
+
+    program = jax.make_jaxpr(update)(gradients, state, gradients, jax.ShapeDtypeStruct((), np.float32)).jaxpr
+    leaves = len(jax.tree.leaves(gradients))
+    read = [frozenset([index]) if index < leaves else frozenset() for index in range(len(program.invars))]
+    return all(len(leaves_read) <= 1 for leaves_read in gradients_read(program, read))
+
+
+def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:
+    """Which gradient leaves each result of `program` reads, its operands reading `read`: a call's
+    (`CALLS`, an optax tree helper's `jit` among them) through its program, any other equation each of its
+    results all its operands read."""
+    reads = dict(zip(program.invars, read, strict=True))
+    for equation in program.eqns:
+        operands = [reads.get(value, frozenset()) if computed(value) else frozenset()
+                    for value in equation.invars]
+        called = bodies(equation)
+        if equation.primitive.name in CALLS and len(called) == 1 and (
+                len(called[0].invars), len(called[0].outvars)) == (len(operands), len(equation.outvars)):
+            reads.update(zip(equation.outvars, gradients_read(called[0], operands), strict=True))
+        else:
+            reads.update(dict.fromkeys(equation.outvars, frozenset().union(*operands)))
+    return [reads.get(value, frozenset()) if computed(value) else frozenset() for value in program.outvars]
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
@@ -211,7 +311,8 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
 
 
 def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
-               slicing: Slicing | None = None, carried: frozenset = frozenset()) -> int:
+               slicing: Slicing | None = None, carried: frozenset = frozenset(), *,
+               consumed: bool = False) -> int:
     """The most bytes `program` holds at once beside its inputs, its equations run in their traced
     order. A value XLA keeps a buffer of (`Frontier`) is held from the equation that computes it to the
     last that reads it, an output to the end. An equation that takes its operands from memory
@@ -221,12 +322,20 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     it runs, its body read with what it slices of the loop it runs in (`slicing`). A loop's carried
     value is one buffer from its initial value, where that is a buffer of the program's the loop reads
     last, to its result, its body's returned value of it among them (`carry`; `carried`, the values
-    `program`, a loop's body, returns into it). No schedule XLA picks is modelled: a compile
-    confirms."""
+    `program`, a loop's body, returns into it). With `consumed`, an output is held while the equation
+    that makes it runs, as an update that reads it there holds it (`gradient_peak`). No schedule XLA
+    picks is modelled: a compile confirms."""
     frontier = Frontier(program, platform, returned=True)
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
-    last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
+    if consumed:
+        # The program's outputs are read where they are made, by an update that writes the buffers the
+        # state donates (the optimizer's, or the accumulator's): each is held while its equation runs.
+        made_at = {out: index for index, equation in enumerate(program.eqns) for out in equation.outvars}
+        for kept in frontier.reading(program.outvars):
+            last.setdefault(kept, made_at.get(kept, 0))
+    else:
+        last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
     sliced = (slicing or Slicing()).within(program)
     live, held, most = 0, set(), 0
     for index, equation in enumerate(program.eqns):
@@ -236,7 +345,10 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
-            operands = 0 if frontier.fusing(equation) else sum(
+            # A barrier's results are its operands' own storage: the buffers made for its fused operands
+            # are the ones it holds, not a second set read beside them.
+            barrier = equation.primitive.name == "optimization_barrier"
+            operands = 0 if frontier.fusing(equation) or barrier else sum(
                 device_share(value) for value in {value for value in equation.invars if computed(value)}
                 if frontier.made_for(value))
             products = 0 if not cublas_product(equation) else (
@@ -338,12 +450,25 @@ class Frontier:
                                            for value in {read for read in equation.invars if computed(read)})
         self.readers.update({value for value in program.outvars if computed(value)})
         self.reads: dict[jcore.Var, frozenset[jcore.Var]] = {}
+        # An optimization barrier defines no value: its results are its operands' own
+        # (`HloDataflowAnalysis::UpdateOptimizationBarrierValueSet`,
+        # xla/hlo/analysis/hlo_dataflow_analysis.cc).
+        self.forwards = {out: operand for equation in program.eqns
+                         if equation.primitive.name == "optimization_barrier"
+                         for out, operand in zip(equation.outvars, equation.invars, strict=True)}
+
+    def stored(self, operand) -> bool:
+        """Whether `operand` is held in a buffer: an input, a value computed into one, or a view of one."""
+        return computed(operand) and (operand in self.inputs or not self.fused(operand)
+                                      or self.view(operand))
 
     def view(self, value) -> bool:
         """Whether `value` is another value's storage: a shape primitive's of a value held or read
         (`VIEWS`), or a transpose's of a value the program computes into a buffer and reads nowhere
         else (`TRANSPOSES`)."""
         equation = self.producers.get(value)
+        if value in self.forwards:
+            return self.stored(self.forwards[value])
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
@@ -358,6 +483,8 @@ class Frontier:
         if not computed(value) or value in self.inputs:
             return False
         equation = self.producers.get(value)
+        if value in self.forwards:
+            return self.stored(self.forwards[value])
         if equation is None or not recomputed(equation, self.platform):
             return False
         return value not in self.outputs or self.view(value)
@@ -373,8 +500,12 @@ class Frontier:
 
     def fusing(self, equation: jcore.JaxprEqn) -> bool:
         """Whether `equation` computes its result within a fusion that recomputes its operands' fused
-        chains as it reads them: an elementwise one's (`recomputed`) or a reduction's."""
-        return recomputed(equation, self.platform) or equation.primitive.name.startswith(("reduce_", "arg"))
+        chains as it reads them: an elementwise one's (`recomputed`) or a reduction's, a variadic
+        `reduce` among them, which XLA fuses into its own kernel whatever its operands' number
+        (`PriorityFusion::ChooseKind`, `CanFuseWithNativeEmitter`,
+        xla/backends/gpu/transforms/priority_fusion.cc)."""
+        name = equation.primitive.name
+        return recomputed(equation, self.platform) or name == "reduce" or name.startswith(("reduce_", "arg"))
 
     def reading(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds: each value's own, or for one fused, those it is
@@ -384,8 +515,10 @@ class Frontier:
             if not computed(value) or value in self.inputs:
                 continue
             if value not in self.reads:
-                self.reads[value] = (frozenset(self.reading(self.producers[value].invars))
-                                     if self.fused(value) else frozenset([value]))
+                # A barrier's result reads its own operand alone, the rest of the barrier's not.
+                read = [self.forwards[value]] if value in self.forwards else self.producers[value].invars
+                self.reads[value] = (frozenset(self.reading(read)) if self.fused(value)
+                                     else frozenset([value]))
             found |= self.reads[value]
         return found
 
@@ -516,11 +649,15 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
 
 def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
-                                          held: int, target, split: int = 1) -> Footprint:
+                                          held: int, target, split: int = 1,
+                                          optimizer: optax.GradientTransformation | None = None
+                                          ) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
     device like `target` beside that state (`Footprint`): its loss's residuals and its gradient
     program's peak at one microbatch, as that device's compiler keeps them and its GEMMs' workspace
-    (`gemm_workspace`), its trained parameters' gradient, laid out as they are, and `held`. Over
+    (`gemm_workspace`), each gradient held while it is made where the step's `optimizer` or accumulator
+    reads it there (`consumed_where_made`), its trained parameters' gradient, laid out as they are, and
+    `held`. Over
     several devices that split the microbatch's rows alone (data and fully sharded data parallelism,
     `row_axes`) the residuals are one device's: the loss traced as one device's step, over a mesh of the
     run's axes each of one device, at that device's share of the microbatch (each leaf's shard,
@@ -553,12 +690,12 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 np.asarray([device]).reshape((1,) * len(mesh.axis_names)), mesh.axis_names,
                 axis_types=mesh.axis_types)):
             lowering = lowering_platform(target)
-            residuals = residual_bytes(trained, arguments[0]["params"], arguments, platform=target.platform,
-                                       lowering=lowering)
-            peak = gradient_peak(trained, arguments[0]["params"], arguments, platform=target.platform,
-                                 workspace=gemm_workspace(target), lowering=lowering)
+            residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
+                                            platform=target.platform, workspace=gemm_workspace(target),
+                                            lowering=lowering,
+                                            consumed=consumed_where_made(optimizer, prepared, window))
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
-        "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
+        "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
                      None if peak is None else peak.bytes, peak is None or peak.exact)

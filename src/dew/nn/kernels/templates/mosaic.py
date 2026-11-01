@@ -121,7 +121,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            reduction_scratch: int = 0) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
-    (`report.named`)."""
+    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
@@ -436,6 +436,18 @@ UNSWIZZLED = 0
 row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU indexes at any row."""
 
 
+def widest_swizzle(dtype, columns: int) -> int:
+    """The widest swizzle, in bytes, a row of `columns` elements of `dtype` fills (`plgpu.find_swizzle`): the
+    one a block staged at its rows' width takes, as layout inference and jax's Ampere examples stage it."""
+    return plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
+
+
+def swizzle_columns(dtype, swizzle: int) -> int:
+    """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
+    slice a load of a block swizzled along that axis takes."""
+    return swizzle // jnp.dtype(dtype).itemsize
+
+
 def swizzle_for(dtype, *contractions: int) -> int:
     """The widest swizzle, in bytes, a shared-memory block of `dtype` takes whose group of elements (the
     swizzle over the itemsize: Mosaic's wgmma issues a product's contraction in groups of it, one swizzle
@@ -444,9 +456,8 @@ def swizzle_for(dtype, *contractions: int) -> int:
     operands so stages them at 64 bytes, at which its partner block must stage too (K32SWZ3: S = K Qᵀ
     over a 128-wide head lowers with both at 64 and both at 128, not mixed; dV += P dO over 32 rows lowers
     at 64, not 128)."""
-    size = jnp.dtype(dtype).itemsize
     return next((swizzle for swizzle in (SWIZZLE_BYTES, SWIZZLE_BYTES // 2, NARROWEST_SWIZZLE_BYTES)
-                 if all(contraction % (swizzle // size) == 0 for contraction in contractions)),
+                 if all(contraction % swizzle_columns(dtype, swizzle) == 0 for contraction in contractions)),
                 NARROWEST_SWIZZLE_BYTES)
 
 
@@ -458,7 +469,7 @@ uninstantiable)."""
 
 def swizzle_transforms(dtype, swizzle: int) -> tuple:
     """A shared-memory tile's transforms at `swizzle` bytes: 8-row tiles a swizzle's row wide, swizzled."""
-    return TILING((8, swizzle // jnp.dtype(dtype).itemsize)), SWIZZLE(swizzle)
+    return TILING((8, swizzle_columns(dtype, swizzle))), SWIZZLE(swizzle)
 
 
 def staged(shape: tuple, dtype, swizzle: int | None = None):
@@ -568,6 +579,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+
+    def scalar_registers(self, addressed=()) -> int:
+        """The registers a consumer thread holds beside its tiles: its own scalars (`held_registers`), its
+        addresses into the shared tiles it reads and writes through registers (`addressed`, each
+        `(shape, dtype)`) among them where the family's count is a measured whole, as this one is."""
+        del addressed
+        return self.held_registers
     register_step: int = cost.REGISTER_STEP
     """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
     A compile gate tests admits at their actual cap, refusals one such step below it."""
@@ -697,7 +715,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, which both families' products read (wgmma's N in
         eights, mma.sync's n of 8 twice through ldmatrix). A template splitting its columns finer than its
         stores' `column_unit` to fill the multiprocessors (the recurrence's value blocks) steps by it."""
-        return NARROWEST_SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+        return swizzle_columns(dtype, NARROWEST_SWIZZLE_BYTES)
 
     @property
     @abc.abstractmethod
@@ -1052,10 +1070,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return resources.consumer_registers(consumers)
 
     def column_unit(self, dtype) -> int:
-        return SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+        return swizzle_columns(dtype, SWIZZLE_BYTES)
 
     def depths(self, dtype) -> tuple[int, ...]:
-        return (SWIZZLE_BYTES // jnp.dtype(dtype).itemsize,)
+        return (swizzle_columns(dtype, SWIZZLE_BYTES),)
 
     def warpgroups(self, consumers: int) -> int:
         return consumers + 1

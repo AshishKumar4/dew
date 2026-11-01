@@ -751,7 +751,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     depth_half = block_m // consumers
     # Each consumer zeroes whole swizzled rows of the cotangent's stage (`_zeroed_share`), as many each as
     # the stage's divide among them, the last's share short where they do not divide evenly.
-    atom = mosaic.SWIZZLE_BYTES // jnp.dtype(rhs.dtype).itemsize
+    atom = mosaic.swizzle_columns(rhs.dtype, mosaic.SWIZZLE_BYTES)
     atoms_each = -(-(block_n // atom) // consumers)
     part = (depth_half, block_n)
     grid = (m // block_m, n // block_n)
@@ -889,7 +889,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
         tiles_of = (dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
                     | read_refs)
         _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
-    atom = mosaic.SWIZZLE_BYTES // jnp.dtype(cotangent_stage.dtype).itemsize
+    atom = mosaic.swizzle_columns(cotangent_stage.dtype, mosaic.SWIZZLE_BYTES)
     atoms = cotangent_stage.shape[1] // atom
     # Its depth half's swizzled rows, each its own, and its share of the cotangent's, the last consumer's
     # past the stage's end held (`atoms_each` rounds the share up).

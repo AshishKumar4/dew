@@ -3,6 +3,7 @@
 import json
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from pathlib import Path
 
@@ -318,6 +319,30 @@ def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_
             assert actual.dtype == expected.dtype == jnp.float64
             np.testing.assert_array_equal(actual, expected)
             assert source.stats().misses >= len(model.bank_sites(resident.variables)[0].view.groups)
+
+
+@pytest.mark.parametrize("bank_layers", [1, None])
+def test_a_float64_bank_streams_on_a_thread_that_never_enabled_x64(bank_layers):
+    """`jax.enable_x64` is thread-local, and JAX narrows what a callback returns by it on the thread XLA
+    runs the callback on: one of XLA's workers where the graph before the fetch is wide (a recurrence's
+    pairs summed in halves put a decision release's fourth fetch on one, ledger 2467). A float64 forward
+    compiled under x64 and run on a thread without it streams its rows as it does where x64 is set, bit
+    for bit, whether a bank holds a layer or the stack whole."""
+    from dew.inference.banks import SafetensorsBanks
+
+    with SafetensorsBanks(FIXTURE, cache_bytes=0, param_dtype="float64", read_ahead=False) as source:
+        with jax.enable_x64(new_val=True):
+            model = decoder(source.config, bank_layers, "float64")
+            streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
+            tokens = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
+            compiled = jax.jit(model.apply).lower(streamed, tokens).compile()
+        with ThreadPoolExecutor(max_workers=1) as thread:
+            actual = thread.submit(compiled, streamed, tokens).result()
+        with jax.enable_x64(new_val=True):
+            expected = compiled(streamed, tokens)
+        assert actual.dtype == expected.dtype == jnp.float64
+        np.testing.assert_array_equal(actual, expected)
+        assert source.stats().misses >= 2 * model.num_layers
 
 
 def test_a_config_naming_expert_dtype_alone_streams_as_the_unquantized_load(tmp_path):

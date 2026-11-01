@@ -46,7 +46,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
-from dew.nn.precision import compensated_add, compensated_difference, float32_einsum, two_sum
+from dew.nn.precision import compensated_add, compensated_difference, compensated_sum, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -800,9 +800,11 @@ class ChunkScanChunkStateBwdDx(_Launch):
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_chunk_state_bwd_dx",
         )(x, cb, dout, dt, da, d, b, dstates, *([] if seq is None else [seq]))
-        # D's gradient each token's, summed over the tokens and the column blocks as Dew sums a sum
-        # (`float32_einsum`): the CPU's accumulation is the test lane's policy, not this launch's.
-        return (dx, jnp.sum(ddt, axis=0), float32_einsum('cbhl->h', dd)), None
+        # D's gradient each token's, summed over the tokens, rows and column blocks rounding once
+        # (`compensated_sum`): one fp32 sum of every token's put D 1.60 times mamba_ssm's distance from
+        # float64 (wide-state-documents, 1280 seeds), whose sum is a block's and then torch's over the
+        # blocks (ssd_combined.py:335-337).
+        return (dx, jnp.sum(ddt, axis=0), compensated_sum(dd, (0, 1, 3))), None
 
 
 def _heads_of(s, g, *, ratio: int, heads: int):

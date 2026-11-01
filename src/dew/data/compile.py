@@ -18,6 +18,7 @@ import functools
 import itertools
 import os
 import threading
+import typing
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
@@ -143,6 +144,7 @@ from dew.data.sources.base import (
     tokenizer_contract,
 )
 from dew.data.sources.concatenate import Concatenate
+from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 
 _DEFAULT_LOADING = Loading()
@@ -348,6 +350,16 @@ def _stores(source: Source) -> Iterator[Source]:
             yield selected
 
 
+def _token_stores(source: Source) -> Iterator[TokenFiles]:
+    """The token stores `source` reads, through every view and a concatenation's parts."""
+    for each in beneath(source, typing.get_args(Rows.__value__)):
+        if isinstance(each, Concatenate):
+            for part in each.sources:
+                yield from _token_stores(part)
+        elif isinstance(each, TokenFiles):
+            yield each
+
+
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     tokenizer_contract((f"corpus {_name(leaf)}", source.metadata())
                        for pipeline in pipelines for leaf, source in _leaves(pipeline))
@@ -483,7 +495,8 @@ members may be restored by key beneath them: a shuffle's window, a packer's rema
 expansion's tail holds rows of the mix that saved them."""
 
 
-def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, str]:
+def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
+                      ) -> dict[str, tuple[JSON, tuple[TokenFiles, ...]]]:
     """What each member of a streamed mix reads and makes, as one digest under its key
     (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
     order rests on and its caches; and under the empty key the same of the mixture's own stages
@@ -495,7 +508,8 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     Each member is read in `train`, the tree the plan's lowering describes (`build`), which a
     memory read made of the written pipeline and which holds no member that accepted no row; its
     caches are those of each of its corpora's stages as its pipeline wrote them (`_written`), the
-    ones a memory read already ran among them."""
+    ones a memory read already ran among them. Each member's manifest comes with the token stores it
+    reads (`Plan.earlier_members`)."""
     source = train.source
     if (not isinstance(source, Mixture) or build.global_order
             or not all(isinstance(stage, _KEYED_ABOVE) for stage in train.stages)):
@@ -512,22 +526,22 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in written(train.stages)
-                                                  if not isinstance(stage, (Workers, Prefetch))),
-                                                *(StepIdentity.of(step) for step in host)])})}
+    members: dict[str, tuple[JSON, tuple[TokenFiles, ...]]] = {"": ({"steps": steps([
+        *(_identity(stage) for stage in written(train.stages) if not isinstance(stage, (Workers, Prefetch))),
+        *(StepIdentity.of(step) for step in host)])}, ())}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
                                              strict=True)):
         sources = [read for _, read in _leaves(child)]
         identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
                       *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
-        members[key] = fingerprint({
+        members[key] = (json_value({
             "order": unplaced(json_value(corpora[index], "member order")),
             "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
             "cache": list(_cache_references(child, build.read)),
-        })
+        }, "member manifest"), tuple(store for read in sources for store in _token_stores(read)))
     return members
 
 
@@ -860,15 +874,18 @@ def _compiled(
             *(StepIdentity.of(step) for step in host),
         ),
     )
+    members = _member_manifests(train, build, host)
     plan = Plan(
         "global" if global_order else "per-share",
         manifest,
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
-        members=_member_manifests(train, build, host),
+        members={key: fingerprint(manifest) for key, (manifest, _) in members.items()},
+        earlier_members=members,
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
+        stores=tuple(store for source in sources for store in _token_stores(source)),
     )
     tuned = build.tuned(train)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.

@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import fla_gdn_support as support
@@ -137,23 +138,25 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
-CONFIG_CELLS = [(dtype, shape) for dtype in ("bfloat16", "float32")
-                for shape, case in support.COMPILED_SHAPES.items()
-                if not (dtype == "float32" and case["width"] > support.fla_gdn.WIDEST)]
-"""Each dtype beside each declared shape it compiles at: an fp32 call takes no keys past `fla_gdn.WIDEST`
-(`support.kernel_cases`)."""
+@functools.cache
+def _config_cases(target: str) -> dict:
+    """Each declared config's case at each declared shape `target` runs it at (`support.kernel_cases`), by
+    name."""
+    return {case.name: case for case in support.kernel_cases(target)}
 
 
-@pytest.mark.parametrize(("dtype", "shape"), CONFIG_CELLS)
-@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target, dtype, shape):
-    """Each declared config at each declared shape, of each dtype and shape apart (one test of a dtype's
-    every shape outlasted the suite's 240 s target, row 1849), lowered as on the GPU and compiled by XLA's
-    CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py): it compiles, to no more
-    shared memory than its GPU's block holds. A kernel that does not compile (a two-result inline asm, a
-    mixed-dtype dot) fails here and never reaches a GPU."""
-    cases = [case for case in support.kernel_cases(target, (dtype,)) if case.name.split("/")[4] == shape]
-    found = compile_kernels(cases, target)
+CONFIG_TESTS = [(target, name) for target in ("sm80", "sm89", "sm120") for name in _config_cases(target)]
+"""A test each declared config at each declared shape and dtype it compiles at (`support.kernel_cases`, an
+fp32 call's keys no wider than `fla_gdn.WIDEST`)."""
+
+
+@pytest.mark.parametrize(("target", "name"), CONFIG_TESTS)
+def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target, name):
+    """Each declared config at each declared shape and dtype, a test each, lowered as on the GPU and compiled
+    by XLA's CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py): it compiles, to
+    no more shared memory than its GPU's block holds. A kernel that does not compile (a two-result inline
+    asm, a mixed-dtype dot) fails here and never reaches a GPU."""
+    found = compile_kernels([_config_cases(target)[name]], target)
     assert found, "the compile gate must not be vacuous"
     assert not failures(found), "\n".join(failures(found))
 
@@ -539,13 +542,6 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
     return {form for form in forms if takes(form)}
 
 
-GATE_PARTS = 12
-"""The parts each generation's compile gate runs in apart (`test_each_gemm_mainloop_compiles_at_its_picks`),
-each within a test's 120 s: at six, sm90's parts took 125 to 159 s, at ten 73 to 115 s, each kernel
-lowered, compiled, read by the liveness pass that sets its decided caps and scanned for its least
-spill-free cap (GATE-PROFILE-SM90-0)."""
-
-
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
 def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
@@ -566,6 +562,7 @@ def _kernel_of(name: str) -> str:
     return f"{re.sub(r' x\d+$', '', form)} Tiles({re.sub(r'grid_block_n=\d+, ', '', tile)}"
 
 
+@functools.cache
 def _gate_cases(generation_name: str) -> list:
     """Every projection's cases (`_gemm_mainloop_cases`), each distinct kernel once (`_kernel_of`)."""
     found = {}
@@ -575,17 +572,25 @@ def _gate_cases(generation_name: str) -> list:
     return list(found.values())
 
 
-@pytest.mark.parametrize("part", range(GATE_PARTS))
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
-def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, part):
-    """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), at the
-    tile its launch derives from the generation's facts and at each tile the derivation refused for its
-    registers, compiled by Mosaic for a compile-only device of the generation on this CPU through ptxas, in
-    `GATE_PARTS` parts. Required launches must spill nothing. Rejected configurations supply model evidence;
-    their spills are refusals, never qualified launches. Compiler errors and missing reports fail either."""
+def _gated(names: tuple[str, ...], cases: Callable[[str], list]) -> list:
+    """A test each case `cases(generation)` gives for each generation of `names`, marked as `generations`
+    marks it: `(generation, case's index)`, each id the generation and the case's name."""
+    return [pytest.param(name, index, marks=param.marks, id=f"{name}-{case.name}")
+            for param in generations(*names) for name in param.values
+            for index, case in enumerate(cases(name))]
+
+
+@pytest.mark.parametrize(("generation_name", "index"),
+                         _gated(("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"), _gate_cases))
+def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, index):
+    """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), a test
+    each, at the tile its launch derives from the generation's facts and at each tile the derivation refused
+    for its registers, compiled by Mosaic for a compile-only device of the generation on this CPU through
+    ptxas. Required launches must spill nothing. Rejected configurations supply model evidence; their spills
+    are refusals, never qualified launches. Compiler errors and missing reports fail either."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    cases = _gate_cases(generation_name)[part::GATE_PARTS]
+    cases = _gate_cases(generation_name)[index:index + 1]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = failures(found)
     failed += mosaic_failures([record for case, record in zip(cases, found, strict=True) if case.required])
@@ -594,25 +599,22 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
                for record in found)
 
 
-FAMILY_PARTS = 3
-"""The parts the family contract compiles in apart, each within a CI group's time (sm90's whole, 294 s,
-train 270's CI)."""
+@functools.cache
+def _family_cases(generation_name: str) -> list:
+    """The family contract's cases (`_gemm_mainloop_cases(every_consumer_count=True)` at the first
+    projection) the compile gate does not already hold (`_gate_cases`)."""
+    held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
+    return [case for case in _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)),
+                                                  every_consumer_count=True)
+            if _kernel_of(case.name) not in held]
 
 
-@pytest.mark.parametrize("part", range(FAMILY_PARTS))
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, part):
-    """The whole contract a Mosaic GPU Family bundle offers its templates, compiled through ptxas for a
-    compile-only GPU of the generation on this CPU with the JAX this checkout pins, before any consumer
-    adopts a Family head: every launch form it emits (`_emitted_forms`: plain and transposed right
-    operands, 16-bit and fp32 stores, fixed and streamed side vectors and tiles, several outputs, the
-    running sum) at one consumer and at the family's most (`_gemm_mainloop_cases(every_consumer_count=
-    True)`). Every form and count must be present, and each the compile gate does not hold
-    (`test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources`) lower, within the block,
-    spilling nothing, in `FAMILY_PARTS` parts. No version guard skips it: a JAX that breaks the contract
-    fails here."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
+def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_name):
+    """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
+    emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
+    side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
+    (`_gemm_mainloop_cases(every_consumer_count=True)`)."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
     cases = _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)), every_consumer_count=True)
@@ -620,9 +622,18 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, part)
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
-    # A kernel the compile gate already holds (`_gate_cases`) is compiled there, not again.
-    held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
-    cases = [case for case in cases if _kernel_of(case.name) not in held][part::FAMILY_PARTS]
+
+
+@pytest.mark.parametrize(("generation_name", "index"), _gated(("sm80", "sm90"), _family_cases))
+def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, index):
+    """Each launch of the contract a Mosaic GPU Family bundle offers its templates that the compile gate
+    does not hold (`_family_cases`), a test each, compiled through ptxas for a compile-only GPU of the
+    generation on this CPU with the JAX this checkout pins, before any consumer adopts a Family head: it
+    lowers, within the block, spilling nothing. No version guard skips it: a JAX that breaks the contract
+    fails here."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    cases = _family_cases(generation_name)[index:index + 1]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = mosaic_failures(found)
     assert len(found) == len(cases) and not failed, "\n".join(failed)

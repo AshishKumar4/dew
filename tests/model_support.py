@@ -349,13 +349,14 @@ def stepped_decode(model, variables, ids):
     return jnp.moveaxis(steps, 0, 1), cache
 
 
+@jax.jit
 def moved(tree, key: jax.Array, scale: float):
     """`tree` with each floating leaf moved by `scale` times its own normal draw from `key`, its dtype
     kept, so no zero-initialized layer answers every input alike or takes no gradient; other leaves as
-    they are."""
+    they are. One program draws and moves every leaf, compiled once a tree's structure and shapes."""
     leaves, structure = jax.tree.flatten(tree)
     keys = jax.random.split(key, len(leaves))
     return jax.tree.unflatten(structure, [
-        (leaf + scale * np.asarray(jax.random.normal(each, np.shape(leaf)))).astype(leaf.dtype)
+        (leaf + scale * jax.random.normal(each, leaf.shape)).astype(leaf.dtype)
         if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
         for leaf, each in zip(leaves, keys, strict=True)])

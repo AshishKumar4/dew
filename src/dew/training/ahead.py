@@ -24,7 +24,8 @@ compiling its first step, where it is the very program the run compiles first (`
 A run's plan is the fewest microbatches at the least recomputation that fit, which memory decides; which
 plan steps fastest, a rung that recomputes more at fewer microbatches or the plan's own, the GPUs alone
 tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
-above it at its fewest microbatches that fit (`compile_ahead`'s `frontier`); tools/benchmark_step.py
+above it that fits at fewer microbatches than every plan before it, at the fewest that fit there
+(`compile_ahead`'s `frontier`, `FitSearch.above`); tools/benchmark_step.py
 times each on the GPUs, a case at its remat and head tile, a plan of s microbatches as its microbatch's
 rows accumulated s times (`accumulation`), the time it reports a microbatch's, s of them an update; and
 the run names the fastest by its model's remat, `--trainer.split` and `LMObjective.head_tile`. No run
@@ -317,7 +318,8 @@ class AheadTarget:
     path: str
     capacity_gib: float | None = None
     frontier: bool = False
-    """Whether the report lists every rung above the plan that fits too (`compile_ahead`)."""
+    """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
+    before it (`compile_ahead`, `FitSearch.above`)."""
 
     @property
     def capacity(self) -> int | None:
@@ -416,9 +418,9 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     (`Trainer._compiled_plan`) selects and compiles the step once; that executable is serialized, not compiled
     again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
     tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
-    time the search took, and with `frontier` each rung above it at its fewest microbatches that fit
-    (`FitSearch.frontier`), compiled and not saved: the plans a run's speed is chosen among (the module's
-    docstring). `capacity` states bytes per GPU; absent it, memory fit is unknown rather
+    time the search took, and with `frontier` each rung above it that fits at fewer microbatches than
+    every plan before it (`FitSearch.above`), compiled and not saved: the plans a run's speed is chosen
+    among (the module's docstring). `capacity` states bytes per GPU; absent it, memory fit is unknown rather
     than measured. Profiling, tuning and rollout require execution and are refused."""
     if capacity is not None and capacity <= 0:
         raise ValueError("compile-ahead capacity must be positive bytes per GPU")

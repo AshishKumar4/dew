@@ -650,7 +650,7 @@ def airframe(racing: Racing, race: Race) -> jax.Array:
                       race.camera.uptilt, race.camera.fov])
 
 
-def dynamics(racing: Racing, race: Race) -> jax.Array:
+def physics(racing: Racing, race: Race) -> jax.Array:
     """The drone's physics a teacher is shown and a world model learns to read off `[20]`, each over its
     nominal: its mass, inertia `[3]`, thrust and drag coefficients and top speed; its rotor, quadratic `[2]`
     and vertical drag; its ground effect's strength; its battery's voltage now over full and its charge drawn
@@ -678,11 +678,11 @@ def _over(value: jax.Array, nominal: float | tuple[float, ...] | np.ndarray, off
 
 def privileged(racing: Racing, race: Race) -> dict[str, jax.Array]:
     """The privileged views: the `state` `[13]` (position, velocity, orientation, body rates), the next two
-    `gates`' corners in the body frame `[24]`, the drone's `airframe` `[6]` and `dynamics` `[20]`, the
+    `gates`' corners in the body frame `[24]`, the drone's `airframe` `[6]` and `physics` `[20]`, the
     `obstacles` nearest `[12]`, the gates `passed` so far, whether the gate headed for is an open track's
     last (`finishing`), and the `teacher`'s observation `[80]`: the velocity and the direction of gravity in
     the body frame, the body rates, the corners, the last action and the airframe (the first 43, its
-    interface since FlyDreamer's first race), then the dynamics, the obstacles and the finishing flag, each
+    interface since FlyDreamer's first race), then the physics, the obstacles and the finishing flag, each
     about unit size."""
     flight = race.flight
     world_to_body = rotation(flight.orientation).T
@@ -690,16 +690,16 @@ def privileged(racing: Racing, race: Race) -> dict[str, jax.Array]:
     down = world_to_body @ jnp.asarray([0.0, 0.0, -1.0], velocity.dtype)
     gates = corners(racing, race)
     frame = airframe(racing, race)
-    physics = dynamics(racing, race)
+    drawn = physics(racing, race)
     obstacles = nearest(race)
     course = race.course
     finishing = (~course.closed & (race.index == course.count - 1)).astype(velocity.dtype)
     state = jnp.concatenate([flight.position, flight.velocity, flight.orientation, flight.angular_velocity])
     rates = flight.angular_velocity
     scaled = obstacles / jnp.asarray([10.0, 10.0, 10.0, 1.0] * NEAREST)
-    teacher = jnp.concatenate([velocity / 10, down, rates / 10, gates / 10, race.action, frame, physics,
+    teacher = jnp.concatenate([velocity / 10, down, rates / 10, gates / 10, race.action, frame, drawn,
                                scaled, finishing[None]])
-    return {"state": state, "gates": gates, "airframe": frame, "dynamics": physics, "obstacles": obstacles,
+    return {"state": state, "gates": gates, "airframe": frame, "physics": drawn, "obstacles": obstacles,
             "passed": race.passed, "finishing": finishing, "teacher": teacher}
 
 
@@ -707,7 +707,7 @@ TEACHER = 43 + 20 + 4 * NEAREST + 1
 """The width of the teacher's observation (`privileged`)."""
 INTERFACE = 43
 """The width of the teacher's observation in its first race: its first entries keep their meaning."""
-VIEWS = ("image", "state", "gates", "airframe", "dynamics", "obstacles", "passed", "finishing", "teacher")
+VIEWS = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed", "finishing", "teacher")
 """What a gate race can show: the camera's image, and the privileged views (`privileged`)."""
 
 
@@ -895,5 +895,5 @@ def _scene(racing: Racing, race: Race) -> Scene:
 __all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER",
            "VIEWS", "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene",
            "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
-           "drawn_course", "dynamics", "facings", "nearest", "privileged", "quaternion", "raced",
+           "drawn_course", "facings", "nearest", "physics", "privileged", "quaternion", "raced",
            "started", "struck"]

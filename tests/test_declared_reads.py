@@ -9,6 +9,7 @@ import importlib
 import io
 import json
 import os
+import pickle
 import tarfile
 import tempfile
 import threading
@@ -171,6 +172,78 @@ def test_a_token_exports_lengths_index_replaced_under_its_manifest_is_refused_wh
     (held / entry["lengths"]["path"]).write_bytes((other / swapped["lengths"]["path"]).read_bytes())
     with pytest.raises(Replaced):
         TokenFiles(str(held)).tokens[:]
+
+
+def test_a_token_exports_index_first_read_by_many_threads_at_once_reads_its_own_file(tmp_path):
+    """A token export's lengths index, checked and held open from the file its manifest declares, first
+    read by many threads at once, as a reader a worker unpickled reads it, while others open files on the
+    host, gives every thread the export's tokens: none maps a file another thread's check let go of (a
+    descriptor the host reused since)."""
+    from dew.data.sources import TokenFiles
+
+    exported = export_byte_tokens(tmp_path, [f"document {index}" for index in range(64)], "--format",
+                                  "array_record")
+    expected = TokenFiles(str(exported)).tokens[:]
+    other = tmp_path / "documents.jsonl"
+    found = []
+
+    def read(store, barrier) -> None:
+        barrier.wait()
+        try:
+            found.append(store[:].tolist() == expected.tolist())
+        except (OSError, ValueError, EOFError) as error:
+            found.append(type(error).__name__)
+
+    def open_others(barrier) -> None:
+        barrier.wait()
+        for _ in range(20):
+            other.open("rb").close()
+
+    for _ in range(40):
+        store, barrier = pickle.loads(pickle.dumps(TokenFiles(str(exported)).tokens)), threading.Barrier(8)
+        threads = [threading.Thread(target=read, args=(store, barrier)) for _ in range(6)]
+        threads += [threading.Thread(target=open_others, args=(barrier,)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert found == [True] * 240
+
+
+def test_an_index_whose_lease_waits_holds_no_other_index_back(tmp_path):
+    """An index whose first read waits on its lease (a declared file a slow mirror is fetching) keeps no
+    other index from mapping its own values meanwhile: each index takes its lease under a lock of its own
+    (row 3199)."""
+    import numpy as np
+
+    from dew.data.sources.index import ArrayIndex
+
+    np.save(tmp_path / "quick.npy", np.arange(8))
+    started, release = threading.Event(), threading.Event()
+
+    class Fetching:
+        """A declared file whose check waits until the test releases it."""
+
+        def leased(self):
+            started.set()
+            release.wait(60)
+            return str(tmp_path / "quick.npy"), None
+
+    slow, quick = ArrayIndex("slow", None, Fetching()), ArrayIndex(str(tmp_path / "quick.npy"))
+    waiting = threading.Thread(target=lambda: slow.values)
+    waiting.start()
+    started.wait(60)
+    read = []
+    reader = threading.Thread(target=lambda: read.append(quick.values.tolist()))
+    reader.start()
+    try:
+        reader.join(10)
+        # Read while the other index's lease still waits.
+        assert read == [list(range(8))]
+    finally:
+        release.set()
+        waiting.join(60)
+        reader.join(60)
 
 
 def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is_read():

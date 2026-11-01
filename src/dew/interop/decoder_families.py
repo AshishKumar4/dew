@@ -54,6 +54,50 @@ from dew.interop.families.qwen import (
 from dew.interop.families.qwen4_exp import QWEN4_EXP_TEXT
 from dew.interop.families.starcoder2 import STARCODER2
 
+MAMBA2 = DecoderFamily(
+    ("mamba2",),
+    mamba2.config_from_hf,
+    lambda fields: isinstance(fields.mixer, Mamba2Mixer),
+    "mamba2",
+    "Mamba2ForCausalLM",
+    lambda model: {},
+    weight_path=mamba2.weight_path,
+    export_path=mamba2.export_path,
+    preserve_source_layout=True,
+    tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
+)
+
+MINISTRAL = DecoderFamily(
+    ("ministral",),
+    ministral_config,
+    lambda fields: "sliding_attention" in (fields.layer_types or ()),
+    "ministral",
+    "MinistralForCausalLM",
+    lambda model: {},
+    preserve_source_layout=False,
+    # MinistralConfig's defaults for the fields its decoder reads.
+    defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
+    padding_idx=True,
+)
+
+LLAMA = DecoderFamily(
+    ("llama",),
+    llama_config,
+    lambda fields: True,
+    "llama",
+    "LlamaForCausalLM",
+    # LlamaMLP's projections carry biases where mlp_bias says so.
+    lambda model: {"mlp_bias": True} if model.mlp_bias else {},
+    preserve_source_layout=False,
+    # LlamaConfig's context (configuration_llama.py:71), which a YaRN record's omitted lengths read.
+    defaults={"max_position_embeddings": 2048},
+    # Megatron's names for its fields, which Nanbeige's releases repeat beside them.
+    repeated={"ffn_hidden_size": "intermediate_size", "num_query_groups": "num_key_value_heads",
+              "rotary_base": "rope_theta", "kv_channels": "head_dim",
+              "seq_length": "max_position_embeddings"},
+    padding_idx=True,
+)
+
 ENTRIES = (
     # Its convolution kind first: its gated attention and sliding layers are matched broadly below
     # (Qwen 3.5's output gate, Ministral's sliding layers).
