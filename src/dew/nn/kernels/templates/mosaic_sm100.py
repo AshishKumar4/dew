@@ -144,7 +144,7 @@ class Tcgen05:
         plgpu.wait_load_tmem()
 
     @staticmethod
-    def relaid(value: jax.Array, smem: Ref, layout) -> jax.Array:
+    def relaid(value: jax.Array, smem, layout) -> jax.Array:
         """`value` in `layout`, through the shared buffer `smem` (a row vector's tensor-memory layout to an
         epilogue's, which no register relayout reaches)."""
         smem[...] = value
