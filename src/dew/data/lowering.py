@@ -2290,10 +2290,12 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
     at = next((index for index, stage in enumerate(train.stages[:batched])
                if isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)),
               batched)
-    prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
+    # Every step before the bound's place reads the pass, a repeat's included; its slices and limits before
+    # the first repeat bound it.
     if any(_drops(stage) or isinstance(stage, Native)
-           or (isinstance(stage, Configured) and not stage.one_to_one) for stage in prefix):
+           or (isinstance(stage, Configured) and not stage.one_to_one) for stage in train.stages[:at]):
         return None
+    prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
     if isinstance(source, Mixture):
         if source.tokens is not None:
             # A mix by tokens draws each part as its tokens fall short (`TokenDeficit`), which no count of its

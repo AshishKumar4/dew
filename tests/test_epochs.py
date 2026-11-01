@@ -418,3 +418,22 @@ def test_epochs_of_a_mixture_whose_objective_makes_rows_are_passes_its_parts_com
     loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
     each = Proportions.of((1, 1)).covering([6, 4])
     assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 2 * each, each)
+
+
+def test_epochs_count_no_pass_where_a_step_after_a_repeat_drops_records():
+    """Twelve records repeated and then filtered, keeping 9 a pass, before an objective that makes rows of
+    each: the pass the bound would count reaches its rows through the filter, so no pass is stated ahead
+    and a run of epochs over it is refused, where counting the 12 would read past two passes (row 1902's
+    review)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids})).repeat().filter(_kept).shuffle(seed=3, window=12).batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.epochs, loader.pass_examples) == (None, None)
+    with pytest.raises(ValueError):
+        Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
