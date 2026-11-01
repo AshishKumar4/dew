@@ -42,6 +42,12 @@ def shape(term: Term) -> Vec[i64]: ...
 def along(params: i64, axis: i64) -> Unit: ...
 
 
+@function
+def plain(params: i64) -> Unit: ...
+"""Holds where an arithmetic equation's parameters are its defaults (no `out_dtype`): it computes in its
+operands' dtype, so a rule may move it past the arithmetic beside it (`program.rewrite` states it)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Rules:
     """A named set of rules: its rounding class (`exact`: each rewrite rounds as the form it replaces;
@@ -73,7 +79,8 @@ def _facts() -> Ruleset:
 
 def _linear() -> Ruleset:
     """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
-    distributivity over operands of one shape, and a value a broadcast lays along every axis but a sum's
+    distributivity over operands of one shape, each over arithmetic in its operands' dtype (`plain`), and a
+    value a broadcast lays along every axis but a sum's
     taken out of the sum where the other factor has the product's shape (the broadcast's extent along the axis
     the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
     x, y, a = vars_("x y a", Term)
@@ -81,12 +88,13 @@ def _linear() -> Ruleset:
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
     return ruleset(
         rewrite(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)).to(
-            x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y))),
+            x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y)), plain(added)),
         rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
-            a.binary("mul", x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y))),
+            a.binary("mul", x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y)),
+            plain(multiplied), plain(added)),
         rewrite(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce(
             "sum", axes, summed)).to(
-            a.binary("mul", x.reduce("sum", axes, summed), multiplied), along(laid, axis),
+            a.binary("mul", x.reduce("sum", axes, summed), multiplied), along(laid, axis), plain(multiplied),
             eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent),
             eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent)),
         name="linear")
