@@ -772,10 +772,11 @@ class DreamerRollout:
     each environment taken uniformly at random. A `replay` given (demonstrations recorded in the
     agent's convention from as many environments, `[capacity, envs, ...]`) is the replay it starts from
     and writes on, in place of the prefill. `metrics` reports the mean return of the episodes that ended
-    since the last update. Given a privileged `teacher` (`dew.rl.aggregation.Teacher`), every step the
-    rollout takes, the prefill's too, is written with the teacher's action at it, its label
-    (`dew.rl.aggregation.labelled`), which an objective that `imitates` it learns: DAgger, the replay
-    aggregating the student's steps beside the teacher's own flights it was given, labelled alike.
+    since the last update. Given a privileged `teacher` (`dew.rl.aggregation.Teacher`), a policy of the
+    environment's observation, every step the rollout takes, the prefill's too, is written with the
+    teacher's action at it, its label (`dew.rl.aggregation.labelled`), which an objective that `imitates`
+    it learns: DAgger, the replay aggregating the student's steps beside the teacher's own flights it
+    was given, labelled alike.
 
     The run's checkpoints hold the environment steps it has taken (`saved`), so a resumed run takes the
     steps it still owes; its environments begin again and its replay is made again, from `replay` or the
@@ -897,7 +898,15 @@ class DreamerRollout:
         by the teacher where there is one, the policy then reading the agent's and the teacher's
         variables (`_acting`)."""
         acting = self._uniform if random else self.objective.act
-        return acting if self.teacher is None else labelled(acting, self.teacher.policy)
+        if self.teacher is None:
+            return acting
+        teacher = self.teacher.policy
+
+        def taught(params: Params, observed: Observation, key: jax.Array, memory: Memory):
+            # The teacher acts in the environment: it reads the observation the driven step holds.
+            return teacher(params, views(observed)["observation"], key, memory)
+
+        return labelled(acting, taught)
 
     def _acting(self, variables: Variables) -> Variables:
         """What the collection's policy reads (`_policy`): the agent's variables, beside the teacher's
