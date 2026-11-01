@@ -1110,11 +1110,12 @@ def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted(
 
 @INTERPRETS
 @pytest.mark.parametrize("call", ["causal", "full"])
-def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
+def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call, monkeypatch):
     """The fast backward 256 wide, whose consumers' own keys' whole dK and dV sums pass their registers, at
-    its derived tiles: one launch whose two consumers share a key block, each its share of the columns
-    (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
-    interpreter."""
+    its derived tiles where the derivation takes one launch (`ONE_LAUNCH`, held off for row 3180): one launch
+    whose two consumers share a key block, each its share of the columns (`BackwardTiles.shared_keys`), every
+    gradient on par (check 1) with the reference's, under the interpreter."""
+    monkeypatch.setattr(attention_mosaic, "ONE_LAUNCH", True)
     with generation.assumed("sm90"):
         op, ba = _backward_call((1, 160, 2, 1), 256, accurate=False)
         assert op.derived(ba, generation.gpu_target()).shared_keys
