@@ -17,6 +17,7 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 """
 
 import abc
+import contextvars
 import dataclasses
 import functools
 import math
@@ -578,6 +579,22 @@ class Turn:
             return Turn(self.counter - steps, (self.slot - steps) % stages,
                         self.rotation if self.slot >= steps else self.rotation - 1)
         return Turn.of(self.counter - steps, stages)
+
+
+_COMMITTED = contextvars.ContextVar("committed", default=0)
+"""The product groups an asynchronous issuer has committed as a program traces (`committed`)."""
+
+
+def committed() -> None:
+    """One product group committed by an asynchronous issuer (a warpgroup MMA, which `Issuer.settled` waits
+    on by groups): counted as the program traces, so a walk knows a step's groups (`commits`)."""
+    _COMMITTED.set(_COMMITTED.get() + 1)
+
+
+def commits() -> int:
+    """The product groups committed so far in this trace (`committed`): a walk's completion tokens, the
+    difference across a step its groups."""
+    return _COMMITTED.get()
 
 
 def opaque(slot) -> jax.Array:
@@ -1691,7 +1708,12 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         def turned(step, lo, index, turn: Turn, carry, accumulators, *, before: int = 0):
             slots = Slots(streams, turn)
+            groups = commits()
             carry, accumulators = step(index, slots, carry, accumulators)
+            # The step's product groups (its completion tokens): a step `in_flight` back is done once no
+            # more than this step's groups times `in_flight` are pending, however many products a step
+            # issues (a walk's steps are one function each, their groups alike).
+            groups = commits() - groups
             if not in_flight:
                 # The step's products done before its slots are given back.
                 self.settled()
@@ -1701,7 +1723,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             # The step's products run on while the next steps' operands are waited for: the step
             # `in_flight` back, done now, gives back its slots.
             slots.held()
-            self.settled(in_flight)
+            self.settled(in_flight * groups)
             if before >= in_flight:
                 # The step `in_flight` back is the range's too: a rotation's, past its first steps.
                 given(turn.back(in_flight, stages), release=True)
