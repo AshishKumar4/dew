@@ -31,6 +31,7 @@ from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
+    _counts_rows,
     _fill,
     _Locality,
     _outputs,
@@ -306,8 +307,11 @@ def _memory_stages(
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
+    # Rows the memory read this one reads on from made of the corpus's source examples (`FlatMap.examples`)
+    # are not the corpus's rows: the count it took of those examples stands (`_counts_rows`).
+    counted = rows if examples is None else examples
     return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, documents,
-                         counted=rows if examples is None else examples)
+                         counted=counted if examples is not None or _counts_rows(pipeline, 0) else None)
 
 
 def _targeted(
@@ -384,7 +388,7 @@ def _memory_order(
     packed: Mapping[str, int] | None,
     documents: int | None,
     *,
-    counted: Sequence[tuple[tuple[int, ...], Record]],
+    counted: Sequence[tuple[tuple[int, ...], Record]] | None,
 ) -> Pipeline:
     rows = [
         (identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
@@ -399,9 +403,10 @@ def _memory_order(
     derived["fanouts"] = fingerprint(fanouts)
     if lengths is not None:
         derived["lengths"] = fingerprint(lengths)
-    counter.counted_anew()
-    for _, value in counted:
-        counter.delivered(value if isinstance(value, bytes) else record(value, "counted record"))
+    if counted is not None:
+        counter.counted_anew()
+        for _, value in counted:
+            counter.delivered(value if isinstance(value, bytes) else record(value, "counted record"))
     facts: Batch = _measured_bounds(
         [record(value, "measured row") for _, value in rows if not isinstance(value, bytes)]
     )
