@@ -498,7 +498,7 @@ def test_a_step_computes_in_the_widest_of_its_operands():
 
     def unit(x):
         # nGPT's justnorm: its eps under the root (`dew.nn.precision.l2norm`).
-        return x / np.sqrt(np.sum(np.square(x), axis=-1, keepdims=True) + L2NORM_EPS)
+        return x * (np.sum(np.square(x), axis=-1, keepdims=True) + L2NORM_EPS) ** -0.5
 
     start, end = unit(residual), unit(branch)
     oracle = unit(start + np.abs(alpha.astype(np.float64) * 0.3) * (end - start))

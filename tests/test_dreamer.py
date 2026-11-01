@@ -2,8 +2,6 @@
 (danijar/dreamerv3 at e01491fad6434b2245a3b8ca201dd7faedcc458c) transcribed here in NumPy float64,
 an episode driver's records against the steps it took, and an agent that learns its world."""
 
-import contextlib
-import copy
 import itertools
 import math
 
@@ -13,7 +11,9 @@ import numpy as np
 import optax
 import pytest
 from flax import struct
+from recording import bits
 from reference_error import assert_computes_the_oracle, chain_roundings
+from test_env_rollout import kept_as_left
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
 from dew.objectives.rl.tssm import TSSM
@@ -194,15 +194,9 @@ class HostTarget:
         self.steps = np.where(mask, 0, self.steps)
         return self.x[:, None].copy()
 
-    @contextlib.contextmanager
     def branch(self):
-        """A cooldown branch's steps, after which the targets, their steps and draws stand as the run left
-        them (`dew.rl.simulator.branched`)."""
-        kept = self.x.copy(), self.steps.copy(), copy.deepcopy(self.rng)
-        try:
-            yield
-        finally:
-            self.x, self.steps, self.rng = kept
+        """A cooldown branch's steps, after which the targets stand as the run left them (`kept_as_left`)."""
+        return kept_as_left(self)
 
 
 def walks(walk):
@@ -494,12 +488,6 @@ def dreamer_fit(directory, objective, rollout, steps, **options):
                       rollout=rollout, checkpoints=checkpoints)
     return trainer.fit(data, steps=steps, log_every=1, checkpoint_every=None if directory is None else 1,
                        **options)
-
-
-def bits(state) -> list[np.ndarray]:
-    """A run's state as arrays, a key's as its raw bits, for a bit-for-bit comparison."""
-    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-            for leaf in jax.tree.leaves(state)]
 
 
 @pytest.mark.parametrize("given", ["prefilled", "supplied"])

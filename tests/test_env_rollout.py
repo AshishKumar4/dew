@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from flax import struct
+from recording import bits
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.objectives.base import Shown
@@ -288,17 +289,22 @@ class HostWalks:
         return self.x[:, None].copy()
 
 
-class KeptWalks(HostWalks):
-    """`HostWalks` that a cooldown branch steps and then leaves as the run left them (`branch`): their
-    positions, steps and draws."""
+@contextlib.contextmanager
+def kept_as_left(walks):
+    """A host simulator's walks stepped in a cooldown branch, then put back as the run left them: their
+    positions, steps and draws (a simulator's `branch`, `dew.rl.simulator.Branching`)."""
+    kept = walks.x.copy(), walks.steps.copy(), copy.deepcopy(walks.rng)
+    try:
+        yield
+    finally:
+        walks.x, walks.steps, walks.rng = kept
 
-    @contextlib.contextmanager
+
+class KeptWalks(HostWalks):
+    """`HostWalks` that a cooldown branch steps and then leaves as the run left them (`kept_as_left`)."""
+
     def branch(self):
-        kept = self.x.copy(), self.steps.copy(), copy.deepcopy(self.rng)
-        try:
-            yield
-        finally:
-            self.x, self.steps, self.rng = kept
+        return kept_as_left(self)
 
 
 class ShardedWalks(HostWalks):
@@ -402,12 +408,6 @@ def test_a_driven_simulator_records_what_a_driven_env_records():
     assert np.asarray(expected.observation["first"])[1:].any()
 
 
-def resumed_bits(state) -> list[np.ndarray]:
-    """A run's state as arrays, a key's as its raw bits, for a bit-for-bit comparison."""
-    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-            for leaf in jax.tree.leaves(state)]
-
-
 @pytest.mark.parametrize("where", ["persistent", "local"])
 def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_stopped(tmp_path, where):
     """A PPO run on walks, checkpointed every update to its run's directory or to its local one, stopped at
@@ -444,7 +444,7 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
 
     whole = trained(tmp_path / "whole", 6, made())
     again = resumed(tmp_path / "stopped", made)
-    for one, other in zip(resumed_bits(whole), resumed_bits(again), strict=True):
+    for one, other in zip(bits(whole), bits(again), strict=True):
         np.testing.assert_array_equal(one, other)
 
     class Forgetting(ControlRollout):
@@ -458,7 +458,7 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
 
     afresh = resumed(tmp_path / "forgot", forgetting)
     assert not all(np.array_equal(one, other)
-                   for one, other in zip(resumed_bits(whole), resumed_bits(afresh), strict=True))
+                   for one, other in zip(bits(whole), bits(afresh), strict=True))
 
 
 def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path):
@@ -491,15 +491,15 @@ def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path)
                           rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
         return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
 
-    plain = resumed_bits(trained())
+    plain = bits(trained())
     cooldowns = Cooldowns(at=(4,), length=2)
-    for one, other in zip(plain, resumed_bits(trained(cooldowns=cooldowns)), strict=True):
+    for one, other in zip(plain, bits(trained(cooldowns=cooldowns)), strict=True):
         np.testing.assert_array_equal(one, other)
     with pytest.raises(Preempted):
         trained(tmp_path / "run", cooldowns=cooldowns, checkpoint_every=1, observe=preempting(3))
     assert Checkpoints(str(tmp_path / "run")).latest == 4
     again = trained(tmp_path / "run", cooldowns=cooldowns, checkpoint_every=1)
-    for one, other in zip(plain, resumed_bits(again), strict=True):
+    for one, other in zip(plain, bits(again), strict=True):
         np.testing.assert_array_equal(one, other)
 
 
@@ -527,10 +527,10 @@ def test_a_control_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it()
                           rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
         return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
 
-    plain = resumed_bits(trained(KeptWalks(16, 8, limit=50.0, drawn=True)))
+    plain = bits(trained(KeptWalks(16, 8, limit=50.0, drawn=True)))
     cooldowns = Cooldowns(at=(4,), length=2)
     cooled = trained(KeptWalks(16, 8, limit=50.0, drawn=True), cooldowns=cooldowns)
-    for one, other in zip(plain, resumed_bits(cooled), strict=True):
+    for one, other in zip(plain, bits(cooled), strict=True):
         np.testing.assert_array_equal(one, other)
     with pytest.raises(TypeError):
         trained(HostWalks(16, 8, limit=50.0, drawn=True), cooldowns=cooldowns)
