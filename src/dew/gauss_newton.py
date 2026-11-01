@@ -76,7 +76,7 @@ class GaussNewtonState(NamedTuple):
     """A Gauss-Newton update's state: the updates it has made, which its rate's schedule reads, and the
     mark of a run whose optimizer solves its objective's system (`solves_equations`)."""
 
-    count: jax.Array
+    steps: jax.Array
 
 
 def solves_equations(opt_state) -> bool:
@@ -100,9 +100,9 @@ def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0,
 
     def init_fn(params) -> GaussNewtonState:
         del params
-        return GaussNewtonState(count=jnp.zeros((), jnp.int32))
+        return GaussNewtonState(steps=jnp.zeros((), jnp.int32))
 
-    def update_fn(updates, state: GaussNewtonState, params=None, *, statistics=None, **extra_args):
+    def update_fn(updates, state, params=None, *, statistics=None, **extra_args):
         del params, extra_args
         if statistics is None:
             raise ValueError("a Gauss-Newton update was handed no statistics: a wrapper that hands its inner "
@@ -117,9 +117,10 @@ def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0,
         solved = jax.eval_shape(statistics.solved, damping)
         step = jax.lax.cond(statistics.rows >= statistics.update, statistics.solved,
                             lambda _: jnp.zeros(solved.shape, solved.dtype), damping)
-        rate = learning_rate(state.count) if callable(learning_rate) else learning_rate
+        rate = learning_rate(state.steps) if callable(learning_rate) else learning_rate
         scaled = unravel((jnp.asarray(rate, step.dtype) * step).astype(flat.dtype))
-        return jax.tree.map(jnp.negative, scaled), GaussNewtonState(count=optax.safe_increment(state.count))
+        return jax.tree.map(jnp.negative, scaled), GaussNewtonState(
+            steps=jnp.asarray(optax.safe_increment(state.steps)))
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 

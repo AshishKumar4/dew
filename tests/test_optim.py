@@ -6,12 +6,14 @@ Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
 import dataclasses
+import functools
 import importlib
 import json
 import typing
 from pathlib import Path
 
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -33,6 +35,7 @@ from test_nested_learning_optim import muon_orthogonalized, newton_schulz_refere
 from torch_layout import node
 
 from dew.batch import coordinates
+from dew.gauss_newton import RowEquations
 from dew.newton_schulz import NEWTON_SCHULZ, orthogonalized
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -1170,12 +1173,19 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
         return OptimConfig(optimizer=optimizer, learning_rate=rate if schedule is None else schedule,
                            param_groups=groups)
 
+    # Gauss-Newton solves its update's system, which a run hands it (`dew.gauss_newton`): four rows of it.
+    flat = jax.flatten_util.ravel_pytree(params)[0]
+    drawn = jax.random.normal(jax.random.key(1), (4, flat.size + 1))
+    system = {} if optimizer != "gauss_newton" else {"statistics": RowEquations(
+        total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(4), jacobian=drawn[:, :-1],
+        residual=drawn[:, -1], update=4)}
     programs, updates = [], []
     for rate in (1e-3, 4e-3):
         solver = config(rate).build(10)
         state = solver.init(params)
-        programs.append(program_of(jax.make_jaxpr(solver.update)(grads, state, params)))
-        updates.append(solver.update(grads, state, params)[0])
+        programs.append(program_of(jax.make_jaxpr(functools.partial(solver.update, **system))(grads, state,
+                                                                                            params)))
+        updates.append(solver.update(grads, state, params, **system)[0])
     assert programs[0] == programs[1]
     assert any(not np.array_equal(left, right) for left, right in
                zip(jax.tree.leaves(updates[0]), jax.tree.leaves(updates[1]), strict=True))

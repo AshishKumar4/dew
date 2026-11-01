@@ -21,6 +21,31 @@ SHARD_ROWS = 3
 """The rows of each physical shard a streamed read deals its shares, the last one short."""
 
 
+class FifthRefused:
+    """A step that refuses every fifth record's rows (`--refusing`)."""
+
+    identity = "fifth-refused@1"
+    rejects = True
+
+    def __call__(self, row):
+        from dew.data.pipeline import Rejected
+
+        return Rejected("fifth") if int(row["id"]) % 5 == 0 else row
+
+
+class DrawingFurther:
+    """A rollout that draws a batch past its step's (`--further`) and makes the step's of this process's
+    rows of its batch, as a rollout's host code reads a placed batch (`local_rows`)."""
+
+    draws_further = True
+
+    def __call__(self, state, batch, key, further):
+        from dew.nn.inputs import local_rows
+
+        further()
+        return {name: local_rows(column) for name, column in batch.items()}
+
+
 def examples_clock(args) -> dict:
     """A run bounded to `--examples` of RECORDS records, read as `--deal` deals them to the pool's shares:
     `order`, one global order; `records`, each share its own, an objective making `id % 3 + 1` rows of
@@ -43,8 +68,7 @@ def examples_clock(args) -> dict:
     from dew.data import Memory
     from dew.data.compile import fitted
     from dew.data.dataset import Closeable, DataPartition
-    from dew.data.pipeline import ObjectiveData, Pipeline, Rejected
-    from dew.nn.inputs import local_rows
+    from dew.data.pipeline import ObjectiveData, Pipeline
     from dew.objectives.base import Aux, Objective
     from dew.optim import Linear, OptimConfig
     from dew.training import Checkpoints, Cooldowns, MeshSpec, Pause, Trainer
@@ -69,23 +93,6 @@ def examples_clock(args) -> dict:
         def data(self):
             refused = (FifthRefused(),) if args.refusing else ()
             return ObjectiveData(train=(Questioned(), *refused)) if expands else ObjectiveData()
-
-    class FifthRefused:
-        identity = "fifth-refused@1"
-        rejects = True
-
-        def __call__(self, row):
-            return Rejected("fifth") if int(row["id"]) % 5 == 0 else row
-
-    class DrawingFurther:
-        """Draws a batch past its step's, and makes the step's of this process's rows of its batch, as a
-        rollout's host code reads a placed batch (`local_rows`)."""
-
-        draws_further = True
-
-        def __call__(self, state, batch, key, further):
-            further()
-            return {name: local_rows(column) for name, column in batch.items()}
 
     class Logged:
         def __init__(self):
