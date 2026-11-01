@@ -421,12 +421,15 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
                 return branch
         match node.get(COUNTER):
             case {"counts": {**counts}} as counter:
-                node[COUNTER] = {**counter, "counts": {"delivered_rows": counts.get("accepted", 0), **counts}}
+                kept: dict[str, JSON] = {"delivered_rows": counts.get("accepted", 0), **counts}
+                node[COUNTER] = {**counter, "counts": kept}
         match node:
             case {"parent": _, "skip": _, "held": {**held}} if CONSUMED in held and REFUSED not in held:
                 match held[CONSUMED]:
                     case {"dtype": dtype, "tokens": list(tokens)}:
-                        node["held"] = {**held, REFUSED: {"dtype": dtype, "tokens": [0] * len(tokens)}}
+                        none: dict[str, JSON] = {"dtype": dtype, "tokens": [0] * len(tokens)}
+                        carried: dict[str, JSON] = {**held, REFUSED: none}
+                        node["held"] = carried
         return node
 
     if written.get("version") == 7:

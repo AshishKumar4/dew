@@ -125,9 +125,9 @@ def _held(column) -> np.ndarray:
     lows = [min(bounds[axis][0] for bounds in shards) for axis in range(column.ndim)]
     highs = [max(bounds[axis][1] for bounds in shards) for axis in range(column.ndim)]
     held = np.empty([high - low for low, high in zip(lows, highs, strict=True)], column.dtype)
-    for bounds, data in shards.items():
+    for bounds, part in shards.items():
         at = tuple(slice(start - low, stop - low) for (start, stop), low in zip(bounds, lows, strict=True))
-        held[at] = np.asarray(data)
+        held[at] = np.asarray(part)
     return held
 
 
