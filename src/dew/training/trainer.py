@@ -2068,7 +2068,7 @@ class Trainer(Generic[Loss, Effects]):
             run.tracing = False
             # The window outlived the run, and a trace left running takes the next one down with it.
             assert profiler is not None
-            self._stop_trace(run, profile, profiler)
+            run.close_window(profiler)
         interval.check_finite(current, self._display)
         if loss is not None:
             # The last step has to land before the wall time is read.
