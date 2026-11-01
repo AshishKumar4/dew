@@ -83,7 +83,8 @@ def _linear() -> Ruleset:
             x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y))),
         rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
             a.binary("mul", x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y))),
-        rewrite(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce("sum", axes, summed)).to(
+        rewrite(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce(
+            "sum", axes, summed)).to(
             a.binary("mul", x.reduce("sum", axes, summed), multiplied), along(laid, axis),
             eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent),
             eq(shape(a.shaped("broadcast_in_dim", laid))).to(extent)),
