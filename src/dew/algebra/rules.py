@@ -79,7 +79,8 @@ def _facts() -> Ruleset:
 
 def _linear() -> Ruleset:
     """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
-    distributivity over operands of one shape, each over arithmetic in its operands' dtype (`plain`), and a
+    distributivity over operands of one shape, a product's bilinearity (two products sharing an operand, one
+    product of the summed others), each over arithmetic in its operands' dtype (`plain`), and a
     value a broadcast lays along every axis but a sum's
     taken out of the sum where the other factor has the product's shape (the broadcast's extent along the axis
     the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
@@ -92,6 +93,12 @@ def _linear() -> Ruleset:
         rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
             a.binary("mul", x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y)),
             plain(multiplied), plain(added)),
+        rewrite(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)).to(
+            a.dot(x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y)), plain(multiplied),
+            plain(added)),
+        rewrite(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)).to(
+            x.binary("add", y, added).dot(a, multiplied), eq(shape(x)).to(shape(y)), plain(multiplied),
+            plain(added)),
         rewrite(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce(
             "sum", axes, summed)).to(
             a.binary("mul", x.reduce("sum", axes, summed), multiplied), along(laid, axis), plain(multiplied),
