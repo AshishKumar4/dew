@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import jax
@@ -15,23 +16,29 @@ import pytest
 
 from dew import communicators
 from dew.communicators import Collectives, CommunicatorRoom, Needs
-from dew.devices import pool_bound
+from dew.devices import POOL_NAMES, pool_bound
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30
 
-NEEDS = Needs(collective={2: GIB}, exchanged={2: GIB // 4}, permuted={2: (2 * GIB, 2 * GIB)},
+NEEDS = Needs(collective={2: GIB}, exchanged={2: GIB // 4}, permuted={2: (GIB, GIB // 2, GIB // 2)},
               runtime={0: GIB // 2, 1: GIB // 2}, seconds=4.0)
 """Two GPUs' measurement: a collective's communicator over both takes 1 GiB on each, an all-to-all's
-connections to its peer a quarter more, a permute's communicator to its one peer 2 GiB, the runtime half."""
+connections to its peer a quarter more, a permute's communicator 1 GiB on each member and half a GiB for
+each send and each receive, the runtime half."""
 
 EVERY = Collectives(groups=frozenset({(0, 1)}), exchanges=frozenset({(0, 1)}),
-                    peers={0: frozenset({1}), 1: frozenset({0})})
+                    permutes={(0, 1): frozenset({(0, 1), (1, 0)})})
 """What Dew leaves room for before a program compiles: a collective's communicator over both GPUs, its
-all-to-all's connections to every peer, and a permute's to every peer."""
+all-to-all's connections to every peer, and a permute along every pair."""
 
 MEMORY = {0: (79 * GIB, 80 * GIB), 1: (76 * GIB, 80 * GIB)}
 """Each GPU's free and total bytes before the backend opens: 79 and 76 of 80 GiB free."""
+
+FOUR = Needs(collective={2: GIB, 4: 2 * GIB}, exchanged={2: GIB // 4, 4: GIB // 2},
+             permuted={4: (GIB, GIB // 4, GIB // 8)}, runtime=dict.fromkeys(range(4), GIB // 2), seconds=8.0)
+"""Four GPUs' measurement: a collective's communicator over two of them 1 GiB on each, over all four 2 GiB;
+a permute's over four 1 GiB on each member, a quarter for each send and an eighth for each receive."""
 
 
 def test_the_pool_takes_at_most_the_runs_share_and_leaves_the_communicators_room():
@@ -39,7 +46,7 @@ def test_the_pool_takes_at_most_the_runs_share_and_leaves_the_communicators_room
     room its communicators and the runtime take outside the pool at NCCL's full speed, the tightest GPU
     deciding, to a thousandth below, and NCCL is never slowed to fit. A pool the communicators leave no room
     for at all is refused, naming each side's bytes."""
-    tightest = 76 * GIB - (GIB + GIB // 4 + 2 * GIB + GIB // 2)
+    tightest = 76 * GIB - (GIB + GIB // 4 + GIB + GIB // 2 + GIB // 2 + GIB // 2)
     for bound in (0.95, 0.97):
         share = communicators.pool_share(NEEDS, MEMORY, bound, EVERY)
         assert share * 80 * GIB <= tightest < (share + 0.001) * 80 * GIB
@@ -47,20 +54,20 @@ def test_the_pool_takes_at_most_the_runs_share_and_leaves_the_communicators_room
     assert communicators.pool_share(NEEDS, roomy, 0.75, EVERY) == 0.75
     with pytest.raises(CommunicatorRoom) as refused:
         communicators.pool_share(NEEDS, {0: (3 * GIB, 80 * GIB)}, 0.97, EVERY)
-    assert refused.value.needed == {0: 3 * GIB + GIB // 4 + GIB // 2} and refused.value.room == {0: 3 * GIB}
+    assert refused.value.needed == {0: 3 * GIB + 3 * GIB // 4} and refused.value.room == {0: 3 * GIB}
 
 
 @pytest.mark.parametrize(("named", "bound"), [
     ({}, 0.95), ({"XLA_PYTHON_CLIENT_MEM_FRACTION": "0.97"}, 0.97),
+    ({"XLA_CLIENT_MEM_FRACTION": "0.5", "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}, 0.5),
     ({"XLA_PYTHON_CLIENT_PREALLOCATE": "true"}, 0.75), ({"XLA_PYTHON_CLIENT_ALLOCATOR": "bfc"}, 0.75),
     ({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, None), ({"XLA_PYTHON_CLIENT_ALLOCATOR": "platform"}, None)])
 def test_one_owner_reads_the_pools_bound_from_how_the_run_named_it(named, bound, monkeypatch):
     """The pool's upper bound, as the run names it: Dew's 95% where it names nothing, its fraction where it
-    names one, JAX's own 75% where it names preallocation or the allocator without one, and none where it
-    holds no fixed pool (a pool that grows, the platform's allocator), which Dew neither sizes nor admits
-    programs against."""
-    for name in ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE",
-                 "XLA_PYTHON_CLIENT_ALLOCATOR"):
+    names one under either of JAX's names, JAX's own 75% where it names preallocation or the allocator
+    without one, and none where it holds no fixed pool (a pool that grows, the platform's allocator), which
+    Dew neither sizes nor admits programs against."""
+    for name in POOL_NAMES:
         monkeypatch.delenv(name, raising=False)
     for name, value in named.items():
         monkeypatch.setenv(name, value)
@@ -68,25 +75,34 @@ def test_one_owner_reads_the_pools_bound_from_how_the_run_named_it(named, bound,
     assert pool_bound(cuda=False) is None
 
 
-def test_a_programs_communicators_are_charged_by_their_groups_exchanges_and_peers():
+def test_a_programs_communicators_are_charged_by_their_groups_exchanges_and_permute_pairs():
     """Each GPU is charged for every distinct group its collectives take, at that group's size; for the
-    connections an all-to-all makes to every peer of its group; and for the permute peers it sends to or
-    receives from, one peer's communicator and each further peer's connections, measured at one peer and at
-    every peer (each NCCL peer connection holds buffers of its own)."""
-    four = Needs(collective={2: GIB, 4: 2 * GIB}, exchanged={2: GIB // 4, 4: GIB // 2},
-                 permuted={4: (GIB, 3 * GIB)}, runtime=dict.fromkeys(range(4), 0), seconds=8.0)
-    held = Collectives(groups=frozenset({(0, 1), (2, 3), (0, 1, 2, 3)}), exchanges=frozenset({(0, 1)}),
-                       peers={0: frozenset({1, 2}), 1: frozenset({0})})
-    assert four.needed(held, range(4), runtime=False) == {
-        0: GIB + 2 * GIB + GIB // 4 + 2 * GIB, 1: GIB + 2 * GIB + GIB // 4 + GIB,
-        2: GIB + 2 * GIB, 3: GIB + 2 * GIB}
+    connections an all-to-all makes to every peer of its group; and, on each permute clique it is a member
+    of, the communicator's base, a send for each pair it sends along and a receive for each it receives
+    along. A permute clique already made adds only its new pairs; another clique over some of the same GPUs
+    is a communicator of its own."""
+    every = (0, 1, 2, 3)
+    held = Collectives(groups=frozenset({(0, 1), (2, 3), every}), exchanges=frozenset({(0, 1)}),
+                       permutes={every: frozenset({(0, 1), (0, 2), (1, 0)})})
+    assert FOUR.needed(held, range(4), runtime=False) == {
+        0: GIB + 2 * GIB + GIB // 4 + GIB + 2 * (GIB // 4) + GIB // 8,
+        1: GIB + 2 * GIB + GIB // 4 + GIB + GIB // 4 + GIB // 8,
+        2: GIB + 2 * GIB + GIB + GIB // 8,
+        3: GIB + 2 * GIB + GIB}
+    pair = Collectives(permutes={(0, 1): frozenset({(0, 1)})})
+    assert FOUR.needed(Collectives(permutes={every: frozenset({(0, 1)})}), range(4), runtime=False,
+                       made=pair) == {0: GIB + GIB // 4, 1: GIB + GIB // 8, 2: GIB, 3: GIB}
+    assert FOUR.needed(Collectives(permutes={every: frozenset({(0, 1), (2, 3)})}), range(4), runtime=False,
+                       made=Collectives(permutes={every: frozenset({(0, 1)})})) == {
+        0: 0, 1: 0, 2: GIB // 4, 3: GIB // 8}
 
 
 def test_a_compiled_programs_communicators_are_read_through_the_flop_counts_parser():
     """A compiled program's communicators, read by the parser that counts its FLOPs: each distinct group of
     its collectives however XLA prints it, listed, as an iota or over a mesh's named axes (an fsdp x
-    sequence step's two groupings are two), an all-to-all's groups, and each GPU's permute peers, the
-    module's positions read as the GPUs its device assignment names."""
+    sequence step's two groupings are two), its all-to-alls' and ragged all-to-alls' groups, and its
+    permutes' directed pairs on one clique of its devices, the module's positions read as the GPUs its
+    device assignment names."""
     program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
                "  %x = f32[8] parameter(0)\n"
                "  %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n"
@@ -94,31 +110,60 @@ def test_a_compiled_programs_communicators_are_read_through_the_flop_counts_pars
                "  %c = f32[8] all-reduce(f32[8] %x), replica_groups=mesh['fsdp'=2,'sequence'=2] {'fsdp'}, "
                "to_apply=%add\n"
                "  %d = f32[8] all-to-all(f32[8] %x), replica_groups={}, dimensions={0}\n"
+               "  %r = f32[8] ragged-all-to-all(f32[8] %x), replica_groups={{0,2},{1,3}}\n"
                "  ROOT %e = f32[8] collective-permute(f32[8] %x), source_target_pairs={{0,1},{1,2}}\n}\n")
     gpus = (3, 2, 1, 0)
     assert communicators.collectives_of(program, gpus) == Collectives(
-        groups=frozenset({(3, 2), (1, 0), (3, 1), (2, 0), (3, 2, 1, 0)}),
-        exchanges=frozenset({(3, 2, 1, 0)}),
-        peers={3: frozenset({2}), 2: frozenset({3, 1}), 1: frozenset({2})})
+        groups=frozenset({(3, 2), (1, 0), (3, 1), (2, 0), gpus}),
+        exchanges=frozenset({gpus, (3, 1), (2, 0)}),
+        permutes={gpus: frozenset({(3, 2), (2, 1)})})
 
 
 def test_a_processs_communicators_are_held_together_to_the_room_dew_left_outside_the_pool():
     """Every communicator a process has made stays made (XLA caches them), so each compiled program is
     admitted only if its communicators and those of the programs before it, each counted once, and the
-    runtime fit the room Dew left outside the pool; one beyond it is refused before it runs, naming the
-    bytes, never left to stall in a collective."""
-    four = Needs(collective={2: GIB, 4: 2 * GIB}, exchanged={2: GIB // 4, 4: GIB // 2},
-                 permuted={4: (GIB, 3 * GIB)}, runtime=dict.fromkeys(range(4), GIB // 2), seconds=8.0)
+    runtime fit the room Dew left outside the pool, and those it adds fit what its GPUs have free there now;
+    one beyond either is refused before it runs, naming the bytes, never left to stall in a collective."""
     room = dict.fromkeys(range(4), 3 * GIB + 3 * GIB // 4)
     every = (0, 1, 2, 3)
     resident = communicators.Resident()
-    resident.admit(Collectives(groups=frozenset({every, (0, 1), (2, 3)})), four, room)
-    resident.admit(Collectives(groups=frozenset({every})), four, room)
+
+    def roomy(gpu: int) -> int:
+        return 4 * GIB
+
+    resident.admit(Collectives(groups=frozenset({every, (0, 1), (2, 3)})), FOUR, room, roomy)
+    resident.admit(Collectives(groups=frozenset({every})), FOUR, room, lambda gpu: 0)
     with pytest.raises(CommunicatorRoom) as refused:
-        resident.admit(Collectives(exchanges=frozenset({every})), four, room)
+        resident.admit(Collectives(exchanges=frozenset({every})), FOUR, room, roomy)
     assert refused.value.needed == dict.fromkeys(range(4), 2 * GIB + GIB + GIB // 2 + GIB // 2)
-    assert refused.value.room == room
+    with pytest.raises(CommunicatorRoom):
+        resident.admit(Collectives(exchanges=frozenset({(0, 1)})), FOUR, room, lambda gpu: GIB // 8)
     assert resident.held == Collectives(groups=frozenset({every, (0, 1), (2, 3)}))
+
+
+def test_programs_admitted_at_once_are_held_together():
+    """Two programs compiled at once, each of whose communicators fits the room alone and not with the
+    other's, are admitted one at a time: one is admitted and the other refused."""
+    room = dict.fromkeys(range(4), 2 * GIB + GIB // 2 + GIB // 4)
+    resident = communicators.Resident()
+    outcomes = []
+    barrier = threading.Barrier(2)
+
+    def compile_one(group):
+        barrier.wait()
+        try:
+            resident.admit(Collectives(groups=frozenset({group})), FOUR, room, lambda gpu: None)
+        except CommunicatorRoom:
+            outcomes.append("refused")
+        else:
+            outcomes.append("admitted")
+
+    threads = [threading.Thread(target=compile_one, args=(group,)) for group in ((0, 1, 2, 3), (3, 2, 1, 0))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == ["admitted", "refused"]
 
 
 ADMITTED = """
