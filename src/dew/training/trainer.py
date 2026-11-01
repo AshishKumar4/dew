@@ -32,13 +32,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew._coordination import (
-    agree_process_phase,
-    agreed,
-    agreed_next,
-    agreed_same,
-    broadcast_from_process_zero,
-)
+from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking, Resume
@@ -53,7 +47,6 @@ from dew.data.dataset import (
     Reader,
     Stage,
     rows_of,
-    stream_endless,
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
@@ -127,9 +120,7 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
-    pooled,
     pooled_first,
-    pooled_read,
     restored,
     stage_reached,
     unrecorded_parts,
@@ -1471,7 +1462,7 @@ class Trainer(Generic[Loss, Effects]):
                 # The first read restores the stream's position and opens its reader on the prefetch
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
-                batch = waited_read(run, interval, agree=not (seen and run.endless))
+                batch = waited_read(run, interval, agree=run.agrees(first=not seen))
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
@@ -1757,7 +1748,7 @@ class Trainer(Generic[Loss, Effects]):
             # corpus, and none reads a record before all agree it is one.
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
-        run.endless, run.pooled = stream_endless(source), pooled(self._examples)
+        run.opened(source, self._examples)
         self._marked = marked(run.partition, self._counted_batch)
         prepare = self._marked if self.rollout is None else None
         if run.pooled:
@@ -1922,9 +1913,8 @@ class Trainer(Generic[Loss, Effects]):
                     if schedule_ended(ends, lambda: branched.clock.read) or (cut := run.notice.reached()):
                         break
                     self._scheduled(plan, branched)
-                    assert branched.train is not None
-                    batch = (pooled_read(branched, branched.train, phase="cooldown read") if branched.pooled
-                             else agreed_next("cooldown read", branched.train))
+                    batch = waited_read(branched, counted, agree=branched.agrees(first=not done),
+                                        phase="cooldown read")
                     if batch is None:
                         break
                     batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
