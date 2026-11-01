@@ -442,7 +442,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_mamba2.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_mamba2_interop.py": {
