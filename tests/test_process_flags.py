@@ -84,6 +84,35 @@ def test_a_process_started_with_its_runs_flags_is_prepared_again_after_its_backe
     assert done.returncode == 0, done.stderr
     kept = json.loads(done.stdout.strip().splitlines()[-1])
     assert kept == {"pass": "fusion=all", "text": "true", "cache": cache}
+    # jax came first, so the flags are unproven, and the process is told so, naming them, once however
+    # often it is prepared.
+    assert done.stderr.count(STATED) == 1
+
+
+BY_HAND = """
+import json, os, sys
+import dew
+from dew.training import prepare_process
+
+flags = sys.argv[1]
+os.environ["XLA_FLAGS"] = f"{os.environ.get('XLA_FLAGS', '')} {flags}".strip()
+for _ in range(2):
+    prepare_process(xla_flags=flags)
+print(json.dumps("prepared"))
+"""
+"""A fresh process that writes the run's flags into XLA_FLAGS by hand after importing Dew, then prepares
+with them twice, its backend opening in the first."""
+
+
+def test_flags_written_by_hand_before_the_backend_opened_are_prepared_with_again_after_it():
+    """Flags XLA_FLAGS carried while the backend was closed are what a backend that opened since may have
+    read: a process prepared with them before its backend opened is prepared with them again after."""
+    env = {**os.environ, "XLA_FLAGS": "",
+           "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
+    done = subprocess.run([sys.executable, "-c", BY_HAND, STATED], capture_output=True, text=True, env=env,
+                          cwd=ROOT, check=False)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == "prepared"
 
 
 SET_LATE = """
