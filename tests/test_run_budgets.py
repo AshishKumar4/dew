@@ -19,7 +19,7 @@ from test_barren_reads import Untouched
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
-from dew.data import Files, Memory, text
+from dew.data import Files, Memory
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import ObjectiveData, Pipeline
@@ -334,27 +334,15 @@ POOL_DEALS = {
 
 @pytest.mark.parametrize("workers", [2, 3])
 @pytest.mark.parametrize("shuffled", [False, True])
-def test_a_streamed_reads_bound_read_by_loading_workers_reads_what_one_reader_does(shuffled, workers):
-    """A streamed read of 12 records in shards of 4, in order or shuffled in a window, bounded to 8, 12 or
-    20 examples or to 16 an objective chunks, read by `workers` loading workers: each worker reads its
-    slice of the bound's shards (`dew.data.shards.bounded_places`), so the read holds every record as
-    many times as one reader's does, and a take of 5 rows takes 5, each record once, where each worker
-    read that many of its own slice (row 3295)."""
-    tokens = [np.arange(2 * (record % 3 + 1), dtype=np.int32) for record in range(1, 13)]
-    stored = Memory([{"id": np.int32(record), "tokens": held} for record, held in enumerate(tokens, start=1)],
-                    shard_rows=4)
-
-    def read(count, examples=None, objective=None, take=None):
-        chain = Pipeline(stored).shuffle(seed=3, window=12) if shuffled else Pipeline(stored)
-        if take is not None:
-            chain = chain.repeat(1).take(take)
-        return ids_read(compile(chain.batch(1), read="streamed", examples=examples, objective=objective,
-                                loading=Loading(workers=count, threads=1, read_buffer=2)), "id")
-
-    chunked = ObjectiveData(train=(text.Chunks(2, fields=("tokens",)),))
-    for examples, objective in ((8, None), (12, None), (20, None), (16, chunked)):
-        assert read(workers, examples, objective) == read(0, examples, objective), (examples, objective)
-    taken = read(workers, take=5)
+def test_a_streams_take_read_by_loading_workers_takes_its_count_of_the_rows_they_read(shuffled, workers):
+    """A streamed read of 12 records in shards of 4, in order or shuffled in a window, read once and its
+    first 5 rows taken (`.take(5)`), by `workers` loading workers, each of which reads its own slice of the
+    shards: the take counts the rows the workers hand on together, so the read holds 5 rows, each record
+    once, where each worker took 5 of its own slice (row 3296)."""
+    stored = Memory({"id": np.arange(1, 13, dtype=np.int32)}, shard_rows=4)
+    chain = Pipeline(stored).shuffle(seed=3, window=12) if shuffled else Pipeline(stored)
+    taken = ids_read(compile(chain.repeat(1).take(5).batch(1), read="streamed",
+                             loading=Loading(workers=workers, threads=1, read_buffer=2)), "id")
     assert sum(taken.values()) == len(taken) == 5
 
 

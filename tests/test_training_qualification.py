@@ -158,15 +158,17 @@ and the baseline's reference loss and gradients, not its checkpoints or its log.
 
 
 def ran(directory: Path) -> dict[str, bytes]:
-    """The qualification's runs over `directory` (`prepared`), one after the other on one host, as
-    XLA:CPU compiles for its host's class and their states are compared bit for bit: the uninterrupted
-    run, then the interrupted run, SIGKILLed once blocked past its checkpoint, then its resume. What they
+    """The qualification's runs over `directory` (`prepared`), on one host, as XLA:CPU compiles for its
+    host's class and their states are compared bit for bit: the uninterrupted run beside the interrupted
+    run, SIGKILLed once blocked past its checkpoint, then the interrupted run's resume. What they
     wrote that the judge reads (`KEPT`), by path in `directory`, with the source the baseline's
     reference was taken against and the CPU class they ran on (`HOST.cpu_class`)."""
-    finish(spawn(directory, "baseline"), "baseline")
     with ProcessGroup() as started:
+        # The uninterrupted run beside the interrupted one, each on a core of its own.
+        started.running.append(baseline := spawn(directory, "baseline"))
         started.running.append(interrupted := spawn(directory, "interrupted"))
         kill_when_ready(interrupted, directory / "ready-to-kill")
+        finish(baseline, "baseline")
     finish(spawn(directory, "resumed"), "resumed")
     (directory / "cpu.txt").write_text(HOST.cpu_class())
     files = [directory / "source", directory / "cpu.txt"] + [
@@ -200,8 +202,8 @@ def test_a_loaded_source_resumes_mid_accumulation_and_exports_as_transformers_re
 
 def assert_resumed_onto_every_leaf_of_the_uninterrupted_run(qualified: Path) -> None:
     """The run killed mid-accumulation resumes onto every leaf of the uninterrupted run, bit for bit, on the
-    host's CPU class (`cpu.txt`), its resume finding every program in the cache the runs before it filled:
-    each the uninterrupted run's."""
+    host's CPU class (`cpu.txt`), its resume finding every program in the cache its interrupted run
+    filled."""
     baseline, resumed = (json.loads((qualified / run / "result.json").read_text())
                          for run in ("baseline", "restarted"))
     assert (resumed["restored_step"], resumed["restored_updates"]) == (worker.CHECKPOINT_STEP,
