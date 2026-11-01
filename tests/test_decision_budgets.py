@@ -396,12 +396,13 @@ def _run(backbone: Path, count: int, *, stated: bool = False, **budgets) -> Fitt
 def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cut(backbone, count):
     """A fresh lettered run (a real tokenizer) over 77 or 151 intents lays out its questions whole at
     the run's own budgets: its layout holds every option's line as its text, and the run's data counters
-    count no cut of a question and refuse no example. The same run declaring each option's line its
-    shortest line's length less three tokens cuts the end every intent's name shares
-    ("_of_the_customer") from each, keeping the index that tells it apart: it counts that cut of every
-    example's options, in examples, rows and tokens, and refuses none. Declaring each line three tokens,
-    which keep its label alone, leaves every option alike: training leaves each example out under that
-    reason, counted."""
+    count no cut of a question and refuse no example. The same run declaring each option's line the
+    longest line's tokens before the end every intent's name shares ("_of_the_customer", the tokens every
+    line ends with) cuts some of that end from each, every line being longer, keeping the index that
+    tells it apart, however its tokenizer spells an index (GPT-2's "12" one token, Qwen3.5's a token a
+    digit): it counts that cut of every example's options, in examples, rows and tokens, and refuses
+    none. Declaring each line three tokens, which keep its label alone, leaves every option alike:
+    training leaves each example out under that reason, counted."""
     objective, dataset, summary = _run(backbone, count).prepare().train("x")
     [counts] = dataset.counts.values()
     assert counts.accepted == count and counts.refused == {}
@@ -417,9 +418,14 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
     # Each question budget whole, as the run states none.
     assert summary["capacities"]["question"] == {"tokens": None, "from": "whole"}
     assert summary["capacities"]["option"] == {"tokens": None, "from": "whole"}
-    shortest = min(end - start for start, end in row.questions[0].options)
-    _, declared, stated = _run(backbone, count, option_tokens=shortest - 3).prepare().train("x")
-    assert stated["capacities"]["option"] == {"tokens": shortest - 3, "from": "stated"}
+    spans = [tuple(row.tokens[start:end]) for start, end in row.questions[0].options]
+    shared = 0
+    while len({span[len(span) - shared - 1:] for span in spans}) == 1:
+        shared += 1
+    kept = max(map(len, spans)) - shared
+    assert kept < min(map(len, spans))
+    _, declared, stated = _run(backbone, count, option_tokens=kept).prepare().train("x")
+    assert stated["capacities"]["option"] == {"tokens": kept, "from": "stated"}
     [cut] = declared.counts.values()
     assert cut.accepted == count and cut.refused == {}
     assert cut.cut_examples["options"] == cut.cut_rows["options"] == count
