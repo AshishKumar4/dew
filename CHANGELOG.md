@@ -7,14 +7,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-- `Residuals` no longer takes `damping`: it states its Gauss-Newton system where the run's optimizer asks
-  (`Step.equations`), and Gauss-Newton is an optimizer, `dew.gauss_newton.gauss_newton(learning_rate,
-  damping)` or `OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": ...})`. A config that
-  sets no learning rate takes the optimizer's own, Gauss-Newton's whole step (1.0), the rest's 2.7e-4;
-  param groups scale their leaves of one solve, and `clip_grads` caps its step's norm. A run that set
-  `damping` on its objective steps by its optimizer's rule instead, so give it this optimizer.
-- A scoring server reports what its task's passes cost and what it admitted and refused
-  (`ScoringServer.metrics`); the decision serving example serves them at `GET /metrics`.
 - A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
   them out, a filter cuts them per share) counts an epoch as a pass over its source examples, and a
   memory read that packs them as it holds them bounds the passes with its pack. A run bounded in
