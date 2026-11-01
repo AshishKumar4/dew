@@ -191,7 +191,7 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 across the containers of an armada gang."""
 HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
-SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
+SHARED = ("constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
           "tools/armada/lifetime.py", "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
@@ -217,6 +217,41 @@ def armada_seen(text: str | None) -> str:
     task = config.get("task", {})
     return json.dumps({**{part: config.get(part) for part in ARMADA_SEEN},
                        "command": task.get("command"), "secrets": task.get("secrets")}, sort_keys=True)
+
+
+def pytest_settings(pyproject: Path) -> str:
+    """The part of `pyproject` every test process reads before its record starts: pytest's own settings
+    (`[tool.pytest]`: its markers, options and filters), as one text, or "missing". The rest of the file is
+    the input of each run that opens it (executed.py's `Opens`), not of every row's: a train that registered
+    two markers there and changed nothing pytest reads reran all 3,445 rows (ledger 3220, train 416)."""
+    if not pyproject.is_file():
+        return "missing"
+    settings = dict(tomllib.loads(pyproject.read_text()).get("tool", {}).get("pytest", {}))
+    # The markers it registers are the input of each file that uses one (`MARKER`), not of every file's.
+    options = {key: value for key, value in settings.pop("ini_options", {}).items() if key != "markers"}
+    return json.dumps({**settings, "ini_options": options}, sort_keys=True)
+
+
+MARKER = "marker:"
+"""How a key names a marker a test file uses (`marks`): its registration in pyproject.toml's pytest settings,
+or "missing" (`contents`)."""
+
+
+def marks(path: str) -> list[str]:
+    """The markers test file `path` names (`pytest.mark.<name>`, `mark.<name>`), each a `MARKER` input of its
+    key: a registration added, changed or removed changes what a run finds for those files alone."""
+    text = Path(path).read_text(errors="replace") if Path(path).is_file() else ""
+    return sorted({f"{MARKER}{name}" for name in re.findall(r"\bmark\.(\w+)", text)})
+
+
+def registered(name: str) -> bytes:
+    """Marker `name`'s registration line in pyproject.toml's pytest settings, or b"missing"."""
+    if not Path("pyproject.toml").is_file():
+        return b"missing"
+    lines = tomllib.loads(Path("pyproject.toml").read_text()).get("tool", {}).get("pytest", {}).get(
+        "ini_options", {}).get("markers", [])
+    found = [line for line in lines if line.split(":")[0].split("(")[0].strip() == name]
+    return hashlib.sha256("\n".join(found).encode()).digest() if found else b"missing"
 
 
 def environment_files() -> list[str]:
@@ -271,6 +306,7 @@ def shared(python: str) -> str:
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
+    digest.update(pytest_settings(Path("pyproject.toml")).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
@@ -307,6 +343,8 @@ def contents(name: str) -> bytes:
     where it is a directory, whose probe never reads its entries, and as read otherwise."""
     if name.startswith("limit:"):
         return hashlib.sha256(host().limit(name).encode()).digest()
+    if name.startswith(MARKER):
+        return registered(name.removeprefix(MARKER))
     if name.startswith("probe:"):
         probed = name.removeprefix("probe:")
         return b"directory" if Path(probed).is_dir() else contents(probed)
@@ -529,7 +567,7 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
     import of a test's, so their directories are none of its inputs (the maintainer, 2026-10-29: tools/'s
     entries keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
-    return sorted({name, *(path for path in depends if not built_input(path)),
+    return sorted({name, *(path for path in depends if not built_input(path)), *marks(name),
                    *(package for path in depends for package in packages(path.partition(followed.CODE)[0]))})
 
 
