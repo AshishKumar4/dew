@@ -267,11 +267,13 @@ def outside(name: str, root: str) -> bool:
     return shared and not beneath(name, root) if since is None else since
 
 
-def shared_scratch(name: str) -> bool:
-    """Whether `name` is the machine's shared scratch (`SHARED_ROOTS`) or beneath it, and not this process's
-    own (`owned`): a listing of it, or a probe of a path in it, answers by what another process of the task
-    may have left there (`leaving`)."""
+def shared_scratch(name: str, root: str) -> bool:
+    """Whether `name` is the machine's shared scratch (`SHARED_ROOTS`) or beneath it, outside the checkout
+    `root` (which a test of these tools may make there) and not this process's own (`owned`): a listing of it,
+    or a probe of a path in it, answers by what another process of the task may have left there
+    (`leaving`)."""
     return any(name == os.path.realpath(where) or beneath(name, where) for where in SHARED_ROOTS) \
+        and not beneath(name, root) and name != os.path.realpath(root).removesuffix(os.sep) \
         and not owned(name)
 
 
@@ -279,7 +281,7 @@ def leaving(name: str, root: str) -> bool:
     """Whether a probe of path `name` (`probed`) answers by what another process of the task may have left:
     one in shared scratch (`shared_scratch`) that is not there or was made since the task began, whose arrival
     or absence another file's run decides; or one in the home or the checkout made since (`outside`)."""
-    if shared_scratch(name) and os.path.realpath(name) not in map(os.path.realpath, SHARED_ROOTS):
+    if shared_scratch(name, root) and os.path.realpath(name) not in map(os.path.realpath, SHARED_ROOTS):
         return made_since(name) is not False or not os.path.lexists(name)
     return outside(name, root)
 
@@ -329,7 +331,7 @@ def read(event: str, args: tuple, root: str) -> str | None:
     if event == "open" and outside(name, root):
         return f"{OUTSIDE}{name}"
     # A listing of shared scratch names what other processes of the task left there.
-    if event != "open" and shared_scratch(name):
+    if event != "open" and shared_scratch(name, root):
         return f"{OUTSIDE}{name}"
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
