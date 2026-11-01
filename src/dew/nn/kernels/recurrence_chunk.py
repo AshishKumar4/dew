@@ -451,7 +451,7 @@ def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype)
         # trees agree): `starts` has no tangent space, its cotangent float0's zero, or none without it.
         starts = operands[6]
         cotangents = _chunk_delta_backward(chunk_size, delta, scale, dtype, saved, cotangent)[:6]
-        return (*cotangents, None if starts is None else np.zeros(starts.shape, jax.dtypes.float0))
+        return (*cotangents, None if starts is None else jax.custom_derivatives.zero_from_primal(starts))
 
     def portable(query, key, value, g, beta, state, starts):
         return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
@@ -793,12 +793,19 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     (`dew.nn.mixer_base.DELTA_RESIDUALS`) are a remat policy's to keep. The cells' products differ
     (`PORT_CELLS`, `SCAN_CELLS`, or a template that trains no such call), and a trace cannot tell them apart
     before its gradient is asked. A training kernel that refused the call refuses where a gradient is
-    traced, not a forward alone."""
+    traced, not a forward alone. Where both products are the portable math's (a CPU's, or a device no
+    kernel takes), the call is the portable math itself, whose own derivatives hold every order: traced
+    through the products' split it traced the portable math three times over, half of a gated delta net
+    layer's training step's trace on a CPU (row 3142)."""
     forward = kernel_of('forward')
     try:
-        training = functools.partial(run, kernel_of('training'))
+        trained = kernel_of('training')
     except KernelRefused as refusal:
         training = functools.partial(_refusing, refusal)
+    else:
+        if forward == trained == 'xla':
+            return run('xla', *operands)
+        training = functools.partial(run, trained)
     primal = functools.partial(run, forward)
 
     def portable(*operands):

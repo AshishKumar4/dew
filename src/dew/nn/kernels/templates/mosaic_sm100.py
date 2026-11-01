@@ -27,7 +27,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, resources
-from dew.nn.kernels.templates.mosaic import SWIZZLE, TILING, Ref
+from dew.nn.kernels.templates.mosaic import Ref
 
 ISSUE, READ = 0, 1
 """A program's warpgroups: the one issuing loads and products, and the one reading accumulators."""
@@ -35,8 +35,6 @@ LOAD_WARP, MMA_WARP = 0, 1
 """The issuing warpgroup's warps: the TMA loads' and the products'."""
 TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 """A tile's register layout as tensor memory loads it natively (a thread a row)."""
-ROW = TMEM.reduce(1)
-"""A per-row vector's layout in `TMEM`."""
 STORED = plgpu.Layout.TCGEN05
 """An accumulator's register layout for an epilogue, the one a swizzled shared-memory tile takes."""
 WARPGROUPS = 2
@@ -101,8 +99,7 @@ TCGEN05 = Tcgen05()
 def swizzled(dtype, contraction: int) -> tuple:
     """A stage's transforms for an operand block of `dtype` contracting `contraction` elements a step: 8-row
     tiles of the widest swizzle its rows take, swizzled (tcgen05 reads its shared operands so)."""
-    swizzle = plgpu.find_swizzle(contraction * jnp.dtype(dtype).itemsize * 8)
-    return TILING((8, swizzle // jnp.dtype(dtype).itemsize)), SWIZZLE(swizzle)
+    return mosaic.swizzle_transforms(dtype, mosaic.widest_swizzle(dtype, contraction))
 
 
 @dataclasses.dataclass(frozen=True)
