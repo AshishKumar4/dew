@@ -307,6 +307,18 @@ def main() -> None:
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 
+def released_model(configuration, modeling, config: dict, tensors: dict[str, torch.Tensor],
+                   dtype: torch.dtype) -> torch.nn.Module:
+    """The release (`configuration`, `modeling`: `remote_modules`' or `released_modules`') at `dtype`, its
+    attention eager as the release's own decode runs it, holding the fixture's `tensors`
+    (`load_weights`): the model `truth` and tools/kimi_worker.py build."""
+    model = modeling.KimiK3ForConditionalGeneration(configuration.KimiK3Config(**copy.deepcopy(config)))
+    model = model.to(dtype)
+    model.language_model.config._attn_implementation = "eager"
+    load_weights(model, tensors)
+    return model
+
+
 def truth(directory: Path) -> dict[str, np.ndarray]:
     """The float64 truth of the K3 fixture at `directory` (`float64_truth`): the released model built and
     run in float64 on the CPU (`torch_precision.float64`), fla's kernels answered by its own references at
@@ -322,10 +334,7 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
     # most 252, a power of two up to 2^125, since every E2M1 code times one is a bfloat16.
     assert max(int(value.max()) for name, value in tensors.items() if name.endswith(".weight_scale")) <= 252
     with installed(linear), float64():
-        model = modeling.KimiK3ForConditionalGeneration(
-            configuration.KimiK3Config(**copy.deepcopy(config))).double()
-        model.language_model.config._attn_implementation = "eager"
-        load_weights(model, tensors)
+        model = released_model(configuration, modeling, config, tensors, torch.float64)
         return float64_truth(model.eval(), directory, lambda name: name.startswith("language_model."))
 
 

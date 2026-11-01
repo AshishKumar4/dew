@@ -16,7 +16,7 @@ references (`fla_float64`); each holds the fixture's weights.
 from __future__ import annotations
 
 import contextlib
-import copy
+import importlib
 import json
 import sys
 from collections.abc import Callable
@@ -25,16 +25,13 @@ import numpy as np
 import torch
 from reference_worker import serve
 
-STEPPED_PREFILL = 40
-"""The prefill of the cached decode whose shapes `stepped` is scored at (tests/kimi_support.py's, the
-same)."""
-
 
 def outputs(model: torch.nn.Module, inputs: dict[str, np.ndarray], device: str,
             stepped: bool) -> dict[str, np.ndarray]:
     """`model`'s leaves over a batch: each valid position's logits of its forward (`logits`) and, where
-    `stepped`, its first row's first `STEPPED_PREFILL` positions from one forward over them and each later
-    one from a forward over the row up to it (`stepped`)."""
+    `stepped`, its first row's first `prefill` positions (the batch's, tests/kimi_support.py's
+    `STEPPED_PREFILL`) from one forward over them and each later one from a forward over the row up to
+    it (`stepped`)."""
     # 64-bit, as each tool's fixture batch hands them (`kimi_k3_reference.fixture_on_gpu`).
     ids = torch.tensor(inputs["input_ids"], dtype=torch.long, device=device)
     mask = torch.tensor(inputs["attention_mask"], dtype=torch.long, device=device)
@@ -45,8 +42,9 @@ def outputs(model: torch.nn.Module, inputs: dict[str, np.ndarray], device: str,
             def forward(length: int) -> np.ndarray:
                 return model(input_ids=ids[:1, :length], use_cache=False).logits[0].cpu().numpy()
 
-            found["stepped"] = np.concatenate([forward(STEPPED_PREFILL), *(
-                forward(length)[-1:] for length in range(STEPPED_PREFILL + 1, ids.shape[1] + 1))])
+            prefill = int(inputs["prefill"])
+            found["stepped"] = np.concatenate([forward(prefill), *(
+                forward(length)[-1:] for length in range(prefill + 1, ids.shape[1] + 1))])
     return found
 
 
@@ -57,26 +55,7 @@ def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], co
     from safetensors.torch import load_file
     from torch_precision import float64
 
-    if site == "kimi-k3":
-        import kimi_k3_reference as tool
-
-        def built(configuration, modeling, dtype):
-            held = configuration.KimiK3Config(**copy.deepcopy(config))
-            model = modeling.KimiK3ForConditionalGeneration(held).to(dtype)
-            model.language_model.config._attn_implementation = "eager"
-            tool.load_weights(model, tensors)
-            return model
-
-    else:
-        import kimi_linear_reference as tool
-
-        def built(configuration, modeling, dtype):
-            held = configuration.KimiLinearConfig(**copy.deepcopy(config))
-            model = modeling.KimiLinearForCausalLM(held).to(dtype)
-            model.config._attn_implementation = "eager"
-            tool.load_weights(model, tensors)
-            return model
-
+    tool = importlib.import_module("kimi_k3_reference" if site == "kimi-k3" else "kimi_linear_reference")
     # One import of the modules for both runs: each tool's `truth` builds its twin from the same modules
     # (K3's `remote_modules`, Kimi Linear's `patched`), which `released_modules` imports once, its own
     # change only to fla's GPU kernels.
@@ -86,7 +65,7 @@ def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], co
     # The twin holds K3's MXFP4 experts exactly (kimi_k3_reference.truth's condition).
     assert max((int(value.max()) for name, value in tensors.items() if name.endswith(".weight_scale")),
                default=0) <= 252
-    narrow = built(*released[:2], torch.float32).cuda().eval()
+    narrow = tool.released_model(*released[:2], config, tensors, torch.float32).cuda().eval()
 
     def wide_context() -> contextlib.ExitStack:
         stack = contextlib.ExitStack()
@@ -95,7 +74,7 @@ def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], co
         return stack
 
     with wide_context():
-        wide = built(*released[:2], torch.float64).eval()
+        wide = tool.released_model(*released[:2], config, tensors, torch.float64).eval()
     return narrow, wide, wide_context
 
 
@@ -107,7 +86,7 @@ def main() -> None:
     def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         out = {}
         for name in sorted({key.split(".", 1)[0] for key in cases}):
-            inputs = {key: cases[f"{name}.{key}"] for key in ("input_ids", "attention_mask")}
+            inputs = {key: cases[f"{name}.{key}"] for key in ("input_ids", "attention_mask", "prefill")}
             out |= {f"{name}.reference.{leaf}": value
                     for leaf, value in outputs(narrow, inputs, "cuda", stepped).items()}
             with wide_context():

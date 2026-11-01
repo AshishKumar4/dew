@@ -235,6 +235,18 @@ def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> No
             parameter.copy_(tensors[name].to(parameter))
 
 
+def released_model(configuration, modeling, config: dict, tensors: dict[str, torch.Tensor],
+                   dtype: torch.dtype) -> torch.nn.Module:
+    """The release (`configuration`, `modeling`: `patched`'s or `released_modules`') at `dtype`, its
+    attention eager, holding the fixture's `tensors` (`load_weights`): the model `truth` and
+    tools/kimi_worker.py build."""
+    model = modeling.KimiLinearForCausalLM(configuration.KimiLinearConfig(**copy.deepcopy(config)))
+    model = model.to(dtype)
+    model.config._attn_implementation = "eager"
+    load_weights(model, tensors)
+    return model
+
+
 def truth(directory: Path) -> dict[str, np.ndarray]:
     """The float64 truth of the Kimi Linear fixture at `directory` (`kimi_k3_reference.float64_truth`): the
     released model as `patched` changes it, built and run in float64 on the CPU (`torch_precision.float64`),
@@ -248,10 +260,7 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
     config = json.loads((directory / "config.json").read_text())
     tensors = load_file(str(directory / "model.safetensors"))
     with installed(modeling), float64():
-        model = modeling.KimiLinearForCausalLM(
-            configuration.KimiLinearConfig(**copy.deepcopy(config))).double()
-        model.config._attn_implementation = "eager"
-        load_weights(model, tensors)
+        model = released_model(configuration, modeling, config, tensors, torch.float64)
         return float64_truth(model.eval(), directory, lambda name: True)
 
 

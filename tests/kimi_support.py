@@ -36,17 +36,18 @@ RECORDING = "recording.npz"
 tools/venv_reference.py's `kimi-k3` and `kimi-linear` sites (tools/kimi_worker.py)."""
 
 STEPPED_PREFILL = 40
-"""The prefill of the cached decode `recorded_dew`'s `stepped` scores (tools/kimi_worker.py's, the
-same)."""
+"""The prefill of the cached decode `recorded_dew`'s `stepped` scores, which each drawn batch hands the
+reference's worker (`drawn_batch`'s `prefill`, tools/kimi_worker.py)."""
 
 
 def drawn_batch(seed: int) -> dict[str, np.ndarray]:
     """A seed's batch of the fixtures' geometry: two rows of 70 ids past the specials, past one 64-token KDA
-    chunk, the second left-padded by 9, a stream of its own for each seed."""
+    chunk, the second left-padded by 9, a stream of its own for each seed, and the prefill its cached
+    decode is scored at (`STEPPED_PREFILL`)."""
     ids = np.random.default_rng([0x3755, seed]).integers(3, 512, (2, 70)).astype(np.int32)
     mask = np.ones_like(ids)
     ids[1, :9], mask[1, :9] = 0, 0
-    return {"input_ids": ids, "attention_mask": mask}
+    return {"input_ids": ids, "attention_mask": mask, "prefill": np.asarray(STEPPED_PREFILL, np.int32)}
 
 
 VALID = drawn_batch(0)["attention_mask"].astype(bool)
@@ -76,8 +77,11 @@ def recorded_dew(directory: Path, leaves: tuple[str, ...]):
     def dew(dtype, inputs) -> dict[str, jax.Array]:
         name = jnp.dtype(dtype).name
         if name not in loaded:
-            loaded[name] = Pretrained.load(directory, dtype=name, param_dtype=name,
-                                           attention_impl="reference")
+            # Loaded where its weights stay concrete, though its first call traces: the cache outlives
+            # the trace, and the truth's arm traces it again (`reference_error`'s rounding count).
+            with jax.ensure_compile_time_eval():
+                loaded[name] = Pretrained.load(directory, dtype=name, param_dtype=name,
+                                               attention_impl="reference")
         model, variables = loaded[name].model, loaded[name].variables
         ids = jnp.asarray(inputs["input_ids"], jnp.int32)
         found = {"logits": model.apply(variables, ids,
