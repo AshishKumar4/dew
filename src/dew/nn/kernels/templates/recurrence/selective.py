@@ -349,7 +349,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
 def _parameters(A, D, channels: int):
     """`forward`'s parameter tile: the rates `A log2(e)` transposed, then the skip, padded to the stream's
     rows."""
-    return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)])
+    padding = jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)
+    return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(8,))
