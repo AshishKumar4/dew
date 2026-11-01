@@ -2,7 +2,8 @@
 shared value priced once over the extracted DAG (egglog's `DagCostModel` under its `greedy-dag` extractor).
 
 A reduction reads its operand in one pass over memory; elementwise work fuses into its consumer, as XLA fuses
-it, and costs its arithmetic alone, over the elements of the value it makes (`rules.shape`)."""
+it, and costs its arithmetic alone, over the elements of the value it makes, from its operands' shapes
+(`rules.shape`)."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import dataclasses
 import math
 
 import jax
+import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args, get_literal_value
 
 from dew.algebra.rules import shape
@@ -35,23 +37,33 @@ class Device:
         return cls(3.35e12, 6.7e13)
 
 
-def elements(graph: EGraph, term) -> int:
-    """The elements of the value `term` stands for, from its shape (`rules.shape`); 0 where none is known."""
+def shape_of(graph: EGraph, term) -> tuple[int, ...] | None:
+    """The shape of the value `term`, an e-class the extractor supplied, stands for (`rules.shape`)."""
     known = graph.lookup_function_value(shape(term))
-    return 0 if known is None else math.prod(int(get_literal_value(size)) for size in known.value)
+    return None if known is None else tuple(int(get_literal_value(size)) for size in known.value)
+
+
+def made(graph: EGraph, operands) -> int:
+    """The elements an elementwise node makes of `operands` (e-classes the extractor supplied), their shapes
+    broadcast together; 0 where one has none known."""
+    shapes = [shape_of(graph, operand) for operand in operands]
+    if any(known is None for known in shapes):
+        return 0
+    return math.prod(np.broadcast_shapes(*(known for known in shapes if known is not None)))
 
 
 def model(device: Device, bytes_per_element: int = 4) -> DagCostModel:
-    """The cost of each node alone, in seconds: a reduction its operand's bytes over memory bandwidth, every
-    other computed node its result's elements over the arithmetic rate; extraction adds them, once a shared
-    node."""
+    """The cost of each node alone, in seconds: a reduction its operand's bytes over memory bandwidth, an
+    elementwise node its result's elements over the arithmetic rate, a layout change none (XLA lays it out
+    within its consumer's fusion); extraction adds them, once a shared node. A node is priced from its
+    operands' shapes, the e-classes the extractor hands its callback."""
     def marginal(graph: EGraph, node) -> float:
         if (args := get_callable_args(node, Term.reduce)) is not None:
-            return elements(graph, args[0]) * bytes_per_element / device.memory_bandwidth
-        if any(get_callable_args(node, constructor) is not None
-               for constructor in (Term.binary, Term.compare, Term.unary, Term.convert, Term.shaped,
-                                   Term.select)):
-            return elements(graph, node) / device.arithmetic_rate
+            return made(graph, args[:1]) * bytes_per_element / device.memory_bandwidth
+        for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2)),
+                                      (Term.unary, (0,)), (Term.convert, (0,))):
+            if (args := get_callable_args(node, constructor)) is not None:
+                return made(graph, [args[index] for index in operands]) / device.arithmetic_rate
         return 0.0
 
     return DagCostModel(marginal_cost=marginal, identity=0.0)

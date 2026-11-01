@@ -101,10 +101,11 @@ def instances() -> Mapping[str, tuple[Callable, Callable, Callable]]:
     adversarial ones: a large and a small term together), for its accuracy test."""
     def draw(*shapes):
         def drawn(seed):
+            # Each element's magnitude drawn across six decades, a large and a small term together in every
+            # row, the same family each seed.
             rng = np.random.default_rng(seed)
-            scale = 10.0 ** rng.integers(-3, 4, size=len(shapes))
-            return tuple(jnp.asarray(rng.standard_normal(shape) * scale[index], jnp.float32)
-                         for index, shape in enumerate(shapes))
+            return tuple(jnp.asarray(rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape),
+                                     jnp.float32) for shape in shapes)
         return drawn
 
     rows, scaled = draw((8, 64), (8, 64), (8, 64)), draw((8, 64), (8,))
