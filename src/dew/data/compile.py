@@ -958,8 +958,7 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     # bind (after a cache it fills), and a configured step's after them, which binds to such a step unless
     # it draws (a random map).
     eager = _analyzed(train, read, bound=True).eager
-    while eager < len(train.stages) and (isinstance(train.stages[eager], _EAGER) or (
-            isinstance(train.stages[eager], Configured) and not train.stages[eager].random)):
+    while eager < len(train.stages) and _held_once_bound(train.stages[eager]):
         eager += 1
     batched = _until(train.stages, (BatchStage, TokenBudget))
     at = next((index for index, stage in enumerate(train.stages[:batched])
@@ -970,6 +969,12 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
         return "expansion"
     after = dataclasses.replace(train, stages=train.stages[eager:])
     return "layout" if isinstance(train.stages[at], Pack) and _analyzed(after, read).per_share else None
+
+
+def _held_once_bound(stage: Stage) -> bool:
+    """Whether a memory read holds what `stage` makes as it holds its rows: an eager step (`_EAGER`), or a
+    configured one, which binds to such a step unless it draws (a random map)."""
+    return isinstance(stage, _EAGER) or (isinstance(stage, Configured) and not stage.random)
 
 
 def _rebound(pipeline: Pipeline, examples: int, passes: int | None = None) -> Pipeline:
@@ -983,7 +988,8 @@ def _rebound(pipeline: Pipeline, examples: int, passes: int | None = None) -> Pi
 
 def _held_count(train: Pipeline) -> int:
     """The examples a memory read's held bound resolved to (`Limit.passes`), as the stages it ran state."""
-    ran = _written(train.source, ())
+    source = train.source
+    ran = () if isinstance(source, (Mixture, Phases)) else _written(source, ())
     at = examples_bound(ran)
     limit = None if at is None else ran[at - 1]
     assert isinstance(limit, Limit), "a held bound is among the stages it ran"
