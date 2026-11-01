@@ -127,8 +127,8 @@ def chunk_size_draw(seed):
 
 
 FORMS_SEEDS = 64
-"""The declared draws of the recurrent and cut forms against the 32-token XLA chunk scan (check 1), its
-chunk size's (`CHUNK_SIZE_SEEDS`): the same scan as the reference on the same draws."""
+"""The declared draws of the recurrent and cut forms against the 32-token XLA chunk scan (check 1), sized by
+`seeds_for` on armada: 64 for each, the reference compared with itself."""
 
 
 def test_the_chunked_and_recurrent_forms_agree():
