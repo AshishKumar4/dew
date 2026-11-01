@@ -306,7 +306,7 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
     config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
     only when a replacement compiles, so a later process derives the program kept here. A program loaded
     from the persistent compilation cache carries its kernels' binaries as one compiled here does. A
-    program whose block XLA refuses steps one of its Triton launches down (`_unblocked`)."""
+    program whose block XLA refuses steps its asking Triton launches down (`_unblocked`)."""
     try:
         executable, spilling = _compiled_reported(lowered, options)
     except jax.errors.JaxRuntimeError as error:
@@ -340,10 +340,13 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
                relower: Callable[[], jax.stages.Lowered], asked: int,
                error: Exception) -> jax.stages.Compiled:
     """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled with
-    one of its Triton launches' configs refused, as a spill refuses one (`kept`): XLA's refusal names no
-    kernel, so each launch the program's Triton kernels name (`kernel_of`, their launches' digests) is
-    tried alone, in the program's order, and the first whose step-down compiles is kept, its miss
-    recorded and logged; none compiling, the refusal stands, each a miss not stepped."""
+    its asking Triton launches' configs refused, as a spill refuses one (`kept`). XLA's refusal names no
+    kernel, so the launches the program's Triton kernels name (`kernel_of`, their launches' digests) are
+    tried in the program's order, each refused beside those kept so far: one whose refusal compiles the
+    program ends the search; one whose refusal leaves XLA asking other bytes asked those (another launch
+    asks the rest), so it is kept and the rest tried again; one whose refusal changes nothing asks nothing
+    past the block. Each kept launch's miss is recorded and logged at the bytes its refusal removed; none
+    compiling, the refusal stands, each a miss not stepped."""
     from dew.training._lowering import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
@@ -353,20 +356,33 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         launch = None if call.kind != "triton" or digest is None else traced(digest)
         if launch is not None:
             tried.setdefault((launch.identity, launch.config), (kernel, launch))
-    for refusal, (kernel, launch) in tried.items():
-        try:
-            with _proposing([(refusal, kernel)]):
-                replacement, spilling = _compiled_reported(relower(), options)
-        except Exhausted:
-            continue
-        except jax.errors.JaxRuntimeError as again:
-            if SHARED_REFUSED.search(str(again)) is None:
-                raise
-            continue
-        _record(refusal, None, frozenset({kernel}))
-        _missed_block(kernel, launch, asked, stepped=True)
-        _recorded(_misses_of(spilling), stepped=False)
-        return replacement
+    kept: list[tuple[tuple[str, Hashable], str, Launch, int]] = []
+    pending, asking = dict(tried), asked
+    while pending:
+        progressed = False
+        for refusal, (kernel, launch) in list(pending.items()):
+            try:
+                with _proposing([*((held, name) for held, name, _, _ in kept), (refusal, kernel)]):
+                    replacement, spilling = _compiled_reported(relower(), options)
+            except Exhausted:
+                del pending[refusal]
+                continue
+            except jax.errors.JaxRuntimeError as again:
+                left = SHARED_REFUSED.search(str(again))
+                if left is None:
+                    raise
+                if int(left.group(1)) != asking:
+                    kept.append((refusal, kernel, launch, asking))
+                    del pending[refusal]
+                    asking, progressed = int(left.group(1)), True
+                continue
+            for held, name, held_launch, removed in [*kept, (refusal, kernel, launch, asking)]:
+                _record(held, None, frozenset({name}))
+                _missed_block(name, held_launch, removed, stepped=True)
+            _recorded(_misses_of(spilling), stepped=False)
+            return replacement
+        if not progressed:
+            break
     for kernel, launch in tried.values():
         _missed_block(kernel, launch, asked, stepped=False)
     raise error
