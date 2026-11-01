@@ -9,7 +9,7 @@ value it makes is constant along `axis`, so a sum along that axis may take it ou
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
 import jax.numpy as jnp
@@ -130,14 +130,21 @@ register(Rules("identities", "exact", _identities(), receipt="docs/design/algebr
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
 
 
-def may_rewrite(primitives: Mapping[str, int]) -> bool:
-    """Whether a region holding `primitives` (each primitive's name, how many equations bind it) holds what a
-    rule's left side reads that may lower its price: a sum of two reductions, two products or two
-    contractions (`linear`), or a reduction of a product. Commutativity alone (`identities`) leaves every
-    price as it was, so a region of none is kept as traced, unsaturated."""
-    adds, sums = primitives.get("add", 0), primitives.get("reduce_sum", 0)
-    products, contractions = primitives.get("mul", 0), primitives.get("dot_general", 0)
-    return (adds > 0 and (sums > 1 or products > 1 or contractions > 1)) or (sums > 0 and products > 0)
+HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"})}
+"""What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
+products or two contractions of one kind (`linear`), or a reduction of a product. Commutativity alone
+(`identities`) leaves every price as it was."""
+
+
+def heads(primitive: str, operands: Sequence[str | None]) -> bool:
+    """Whether an equation binding `primitive` over operands made by `operands` (each producer's primitive, or
+    None for a value from outside) is a head a rule may lower the price at (`HEADS`)."""
+    kinds = HEADS.get(primitive)
+    if kinds is None:
+        return False
+    if primitive == "add":
+        return len(operands) == 2 and operands[0] == operands[1] and operands[0] in kinds
+    return any(operand in kinds for operand in operands)
 
 
 def admitted(accurate: bool) -> tuple[Rules, ...]:

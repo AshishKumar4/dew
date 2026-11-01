@@ -666,6 +666,18 @@ class _Pass:
             kept.append(self.registers[column])
         return kept
 
+    def _threaded(self, value, unpacked: bool) -> list:
+        """The registers of `value`, computed where it is read (not hoisted, `define`): one for each distinct
+        number its elements hold in the threads where it is made of thread ids and constants alone
+        (`Threads.columns`), shared by every value holding the same numbers, none for a number every thread
+        holds alike; a register for each part otherwise. ptxas compares a mask's positions against a few
+        registers and folds the rest into the compare (the two-launch dQ backward: 24 distinct `ISETP`
+        operands, where the pass held 48 index casts a register each, 198 against 168)."""
+        if self.threads.columns(value) is None:
+            return self.atoms.fresh(value.type, unpacked=unpacked)
+        kept = self._kept(value)
+        return [] if all(atom is None for atom in kept) else kept
+
     def define(self, op):
         """The atoms of `op`'s results: its operands' where it only regroups them, else new ones."""
         name = op.name.removeprefix(PREFIX)
@@ -723,7 +735,7 @@ class _Pass:
                        and not any(floating for _, floating in parts)
                        and not isinstance(value.type, ir.VectorType)
                        and not _general_register(value))
-            self.atoms.of[value] = [] if uniform else self.atoms.fresh(value.type, unpacked=unpacked)
+            self.atoms.of[value] = [] if uniform else self._threaded(value, unpacked)
 
     def _regrouped(self, op, name: str, produced) -> bool:
         """Whether this operation only names existing registers in another grouping or order."""

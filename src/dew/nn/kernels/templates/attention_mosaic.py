@@ -21,6 +21,8 @@ from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
+    DKV_GRADS,
+    DQ_GRADS,
     NATURAL,
     TRACED_TILE,
     AttentionLaunch,
@@ -437,7 +439,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and
     196). Where its family reads operands from registers, its products' fragments beside their tiles
     (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
-    weights."""
+    weights. A key tile whose indices do not fold (`Family.folds_indices`) holds the places its masks
+    compare, the queries' and the keys', an int32 tile each."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
@@ -445,6 +448,9 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     step = [logits, weights, *([weights] if residuals else [])]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
+    if not family.folds_indices(block_k):
+        # Its masks' query and key places, each entry's formed apart.
+        step += [bits, bits]
     phases = [step]
     if natural:
         phases.append([logits] * 2 + [bits])
@@ -671,9 +677,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     WALKED = "block_q"
     accurate: bool = ACCURATE
     rounded: bool = True
-    score_slopes: int = 0
-    """The tiles its score hook's pullback forms that vary (`varying_slopes`), as its builder reads them off
-    the hook (`_backward_call`): a keyed launch's hook is its fingerprint, which keeps no trace of them."""
+    score_slopes: tuple[int, int] = (0, 0)
+    """The tiles its score hook's pullback forms that vary in its dQ launch and its dK/dV launch
+    (`varying_slopes`), as its builder reads them off the hook (`_backward_call`): a keyed launch's hook is
+    its fingerprint, which keeps no trace of them."""
 
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,
              drop=None, *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
@@ -873,7 +880,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                                   for param in ba.arguments["score_params"]), strict=True))
             counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
                                               accurate=self.accurate, dq=dq, split=split, params=params,
-                                              slopes=self.score_slopes))
+                                              slopes=self.score_slopes[0 if dq else 1]))
         return counts[0], counts[1]
 
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
@@ -938,6 +945,7 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                         form=spans.form, keys=spans.keys,
                         scale=logit_scale(query.shape[3], scale), natural=natural,
-                        accurate=accurate, rounded=rounded, score_slopes=varying_slopes(hooks))
+                        accurate=accurate, rounded=rounded,
+                        score_slopes=(varying_slopes(hooks, DQ_GRADS), varying_slopes(hooks, DKV_GRADS)))
     return op, (query, key, value, dout, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params), hooks.initial, residuals, hooks.drop)

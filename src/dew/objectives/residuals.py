@@ -31,7 +31,6 @@ residuals near float64's roundoff that first-order steps do not.
 
 from __future__ import annotations
 
-import functools
 from abc import abstractmethod
 
 import jax
@@ -41,6 +40,7 @@ from jax.flatten_util import ravel_pytree
 from jax.scipy.linalg import cho_factor, cho_solve
 
 from dew.batch import Batch, Variables
+from dew.nn.derivatives import surrogate
 from dew.nn.precision import float32_einsum
 from dew.objectives.base import Objective, Ratio, Step
 
@@ -74,36 +74,21 @@ class RowEquations:
     update: int = struct.field(pytree_node=False)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
-def _pulled(params: Variables, pulled: jax.Array, share: float) -> jax.Array:
-    """`pulled`, a microbatch's J_i^T r_i, whose derivative takes the parameters' move to its `share`,
-    raveled, and leaves `pulled`'s own: a reverse derivative takes the step's cotangent c to the
-    parameters' `share` c, in their tree and each in its own dtype, as JAX hands every parameter its
-    cotangent, the microbatch's rows' share of the update's, so the shares of a whole update sum to its
-    step."""
-    return pulled
-
-
-@_pulled.defjvp
-def _pulled_jvp(share, primals, tangents):
-    pulled = primals[1]
+def _pulled_tangent(share, primals, tangents, value) -> jax.Array:
     moved, _ = ravel_pytree(tangents[0])
-    return pulled, share * moved.astype(pulled.dtype)
+    return share * moved.astype(value.dtype)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
-def _stepped(damping: float, update: int, rows: jax.Array, pulled: jax.Array,
-             system: tuple[jax.Array, ...]) -> jax.Array:
-    """Zero, whose derivative in the pooled `pulled` is the update's damped Gauss-Newton step: the normal
-    equations' solve against J^T r where `system` is (J^T J,), the dual's J^T (J J^T + damping I)^-1 r
-    where it is (J, r), once the statistics hold the update's every row, and zero before. Its move is
-    the step's inner product with `pulled`'s, which a reverse derivative transposes to the step times
-    the cotangent; the step's own derivatives in `system` are its later orders'."""
-    return jnp.zeros((), pulled.dtype)
+_pulled = surrogate(lambda params, pulled, share: pulled, _pulled_tangent, nondiff_argnums=(2,))
+"""`pulled`, a microbatch's J_i^T r_i, whose derivative takes the parameters' move to its `share`,
+raveled, and leaves `pulled`'s own: a reverse derivative takes the step's cotangent c to the
+parameters' `share` c, in their tree and each in its own dtype, as JAX hands every parameter its
+cotangent, the microbatch's rows' share of the update's, so the shares of a whole update sum to its
+step. A surrogate (`dew.nn.derivatives.surrogate`): Gauss-Newton's rule, not the identity's derivative."""
 
 
-@_stepped.defjvp
-def _stepped_jvp(damping, update, primals, tangents):
+def _stepped_tangent(damping, update, primals, tangents, value) -> jax.Array:
+    """The update's damped Gauss-Newton step's inner product with `pulled`'s tangent (`_stepped`)."""
     rows, pulled, system = primals
 
     def solved(_) -> jax.Array:
@@ -118,7 +103,17 @@ def _stepped_jvp(damping, update, primals, tangents):
 
     # A provisional reduction, of a microbatch the update has more of, steps nothing and solves nothing.
     step = jax.lax.cond(rows >= update, solved, lambda _: jnp.zeros_like(pulled), None)
-    return jnp.zeros((), pulled.dtype), jnp.sum(step * tangents[1])
+    return jnp.sum(step * tangents[1])
+
+
+_stepped = surrogate(lambda damping, update, rows, pulled, system: jnp.zeros((), pulled.dtype),
+                     _stepped_tangent, nondiff_argnums=(0, 1))
+"""Zero, whose derivative in the pooled `pulled` is the update's damped Gauss-Newton step: the normal
+equations' solve against J^T r where `system` is (J^T J,), the dual's J^T (J J^T + damping I)^-1 r
+where it is (J, r), once the statistics hold the update's every row, and zero before. Its move is
+the step's inner product with `pulled`'s, which a reverse derivative transposes to the step times
+the cotangent; the step's own derivatives in `system` are its later orders'. A surrogate
+(`dew.nn.derivatives.surrogate`): an optimizer's step injected as the zero's derivative."""
 
 
 class Residuals(Objective[Ratio | NormalEquations | RowEquations]):

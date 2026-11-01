@@ -7,7 +7,6 @@ region of its own, and kept bodies, never unrolled. Each rewrite is recorded in 
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import dataclasses
 import functools
@@ -65,15 +64,6 @@ class Rewrite:
     picked: Mapping[str, terms.Term]
     report: AlgebraReport
 
-    def outputs(self, closed: jcore.Jaxpr, arguments: list) -> list:
-        """The region's outputs over `arguments`: its chosen forms evaluated, or `closed` as traced where
-        none is cheaper."""
-        if not self.picked:
-            return eval_jaxpr(closed, closed.consts, *arguments)
-        given = [*closed.consts, *arguments]
-        values = given + [None] * (self.region.leaves - len(given))
-        return terms.evaluated(self.region, self.picked, values)
-
 
 @contextlib.contextmanager
 def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
@@ -118,19 +108,139 @@ def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation,
 
 def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> list:
     """The outputs of `closed` (a jaxpr and its constants) over `arguments` (flattened), its bodies rewritten
-    in place first (`_within`), then its own math (`_region`) where a rule may lower its price
-    (`rules.may_rewrite`); evaluated as traced where none may."""
-    closed = _within(closed, accurate, saturation)
-    if not rules.may_rewrite(_primitives(closed)):
-        return eval_jaxpr(closed, closed.consts, *arguments)
-    done = _region(closed, accurate=accurate, saturation=saturation)
+    in place first (`_within`), then its own math (`_windowed`)."""
+    rewritten = _windowed(_within(closed, accurate, saturation), accurate, saturation)
+    return eval_jaxpr(rewritten, rewritten.consts, *arguments)
+
+
+WINDOW = 3
+"""How deep a window reaches below the head a rule reads (`rules.heads`): a sum of two reductions of
+products under a broadcast, the deepest left side the rule sets hold."""
+
+CLUSTER = 64
+"""The most equations windows that share one join into, so no term is deeper than a few hundred frames of
+egglog's recursion however a program chains its heads: windows past it are held apart, the values one reads
+of another read from outside it."""
+
+
+def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
+    """`jaxpr` with the values its windows yield (`_windows`) computed in their cheapest forms, where those
+    are cheaper than the windows as traced: all windows saturated in one e-graph and extracted together,
+    each cheaper value's form traced and spliced in where its equation stood, the rest of the program kept
+    as traced, so a body is never traced again."""
+    windows = _windows(jaxpr)
+    if windows is None:
+        return jaxpr
+    combined, yielded = windows
+    done = _region(combined, accurate=accurate, saturation=saturation)
     kernel_report.record_rewrite(done.report)
-    return done.outputs(closed, arguments)
+    if not done.picked:
+        return jaxpr
+    leaves = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype, weak_type=var.aval.weak_type)
+              for var in combined.invars if isinstance(var.aval, ShapedArray)]
+    if len(leaves) != len(combined.invars):
+        return jaxpr
+    made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
+    spliced: dict[int, list[jcore.JaxprEqn]] = {}
+    for out, root in zip(yielded, done.region.outputs, strict=True):
+        form = None if root is None else done.picked.get(str(root))
+        if form is None or str(form) == str(root):
+            continue
+        traced = jax.make_jaxpr(lambda *values, form=form: terms.form_value(done.region, form, list(values)))(
+            *leaves)
+        made, = traced.jaxpr.outvars
+        if traced.consts or not isinstance(made, jcore.Var) or made in traced.jaxpr.invars or (
+                traced.out_avals[0].strip_weak_type() != out.aval.strip_weak_type()):
+            continue
+        renamed = {**dict(zip(traced.jaxpr.invars, combined.invars, strict=True)), made: out}
+
+        def renaming(atom, renamed=renamed):
+            return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
+
+        if id(made_by[out]) in spliced:
+            continue
+        spliced[id(made_by[out])] = [equation.replace(invars=[renaming(atom) for atom in equation.invars],
+                                                      outvars=[renaming(var) for var in equation.outvars])
+                                     for equation in traced.jaxpr.eqns]
+    if not spliced:
+        return jaxpr
+    return _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
+                                     for kept in spliced.get(id(equation), [equation])]))
 
 
-def _primitives(jaxpr: jcore.Jaxpr) -> collections.Counter[str]:
-    """How many of `jaxpr`'s own equations bind each primitive, by name, its bodies' apart."""
-    return collections.Counter(equation.primitive.name for equation in jaxpr.eqns)
+def _live(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`jaxpr` without the equations nothing reads: those a spliced form left behind, an equation with an
+    effect kept whatever reads it."""
+    wanted = {atom for atom in jaxpr.outvars if not isinstance(atom, jcore.Literal)}
+    kept: list[jcore.JaxprEqn] = []
+    for equation in reversed(jaxpr.eqns):
+        if equation.effects or any(var in wanted for var in equation.outvars):
+            kept.append(equation)
+            wanted.update(atom for atom in equation.invars if not isinstance(atom, jcore.Literal))
+    return jaxpr.replace(eqns=kept[::-1])
+
+
+def _windows(jaxpr: jcore.Jaxpr) -> tuple[jcore.Jaxpr, list[jcore.Var]] | None:
+    """`jaxpr`'s windows as one jaxpr: each head a rule may lower the price at (`rules.heads`) with the
+    equations of the language that make its operands, `WINDOW` deep, windows that share an equation joined up
+    to `CLUSTER` equations; its inputs each value a window reads from outside it, its outputs each value a
+    window makes that the program reads outside it (the values the rewrite may compute anew), in program
+    order; and those values as `jaxpr` names them. None where `jaxpr` holds no head."""
+    made = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
+
+    def maker(atom) -> jcore.JaxprEqn | None:
+        equation = None if isinstance(atom, jcore.Literal) else made.get(atom)
+        return equation if equation is not None and terms.spoken(equation) else None
+
+    heads = [equation for equation in jaxpr.eqns if terms.spoken(equation) and rules.heads(
+        equation.primitive.name,
+        [None if (operand := maker(atom)) is None else operand.primitive.name for atom in equation.invars])]
+    if not heads:
+        return None
+    order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
+    clusters: list[dict[int, jcore.JaxprEqn]] = []
+    for head in heads:
+        window, frontier = {id(head): head}, [(head, 0)]
+        while frontier:
+            equation, depth = frontier.pop()
+            for atom in equation.invars:
+                operand = maker(atom)
+                if operand is not None and depth + 1 < WINDOW and id(operand) not in window:
+                    window[id(operand)] = operand
+                    frontier.append((operand, depth + 1))
+        sharing = [cluster for cluster in clusters if cluster.keys() & window.keys()]
+        if sharing and len(set(window).union(*(cluster.keys() for cluster in sharing))) <= CLUSTER:
+            clusters = [cluster for cluster in clusters if all(cluster is not shared for shared in sharing)]
+            window = {key: member for cluster in [*sharing, window] for key, member in cluster.items()}
+        clusters.append(window)
+    read: dict[jcore.Var, set[int]] = {}
+    for equation in jaxpr.eqns:
+        for atom in equation.invars:
+            if not isinstance(atom, jcore.Literal):
+                read.setdefault(atom, set()).add(id(equation))
+    returned = {atom for atom in jaxpr.outvars if not isinstance(atom, jcore.Literal)}
+    outside: dict[jcore.Var, None] = {}
+    equations: list[jcore.JaxprEqn] = []
+    outputs: list[jcore.Var] = []
+    yielded: list[jcore.Var] = []
+    for cluster in clusters:
+        fresh: dict[jcore.Var, jcore.Var] = {}
+        members = sorted(cluster.values(), key=lambda member: order[id(member)])
+        for equation in members:
+            for atom in equation.invars:
+                if not isinstance(atom, jcore.Literal) and atom not in fresh:
+                    outside[atom] = None
+            invars = [atom if isinstance(atom, jcore.Literal) else fresh.get(atom, atom)
+                      for atom in equation.invars]
+            fresh.update({var: jcore.Var(var.aval) for var in equation.outvars})
+            outvars = [fresh[var] for var in equation.outvars]
+            equations.append(equation.replace(invars=invars, outvars=outvars))
+        for equation in members:
+            out = equation.outvars[0]
+            if out in returned or read.get(out, set()) - cluster.keys():
+                outputs.append(fresh[out])
+                yielded.append(out)
+    return jcore.Jaxpr([], list(outside), outputs, equations), yielded
 
 
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> Rewrite:
@@ -221,19 +331,7 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
-    inner = _within(closed, accurate, saturation)
-    if not rules.may_rewrite(_primitives(inner)):
-        # Nothing of its own a rule may lower: the body as traced, its own bodies rewritten, never traced
-        # again.
-        return inner
-    done = _region(inner, accurate=accurate, saturation=saturation)
-    kernel_report.record_rewrite(done.report)
-    if not done.picked:
-        return inner
-    shapes = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
-              for aval in inner.in_avals if isinstance(aval, ShapedArray)]
-    made = jax.make_jaxpr(lambda *arguments: done.outputs(inner, list(arguments)))(*shapes)
-    return inner if made.consts and not inner.consts else made
+    return _windowed(_within(closed, accurate, saturation), accurate, saturation)
 
 
 def _nodes(graph: EGraph) -> int:
