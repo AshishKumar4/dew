@@ -438,22 +438,26 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
     return [var in live for var in jaxpr.invars]
 
 
-def varying_slopes(hooks: Hooks | None) -> int:
-    """The tiles a backward step's score-hook pullback forms that vary with its inputs (`algebra.scored`):
-    its output and its slope along each input it differentiates, the logits and each floating parameter,
-    but a constant one (a hook linear in an input slopes 1 along it, which ptxas holds no tile of: the
-    fast dQ under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled where four slopes priced
-    258); traced, never run, on a tile, each slope along its own input alone, or where the hook takes no
-    forward derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
+def varying_slopes(hooks: Hooks | None, graded: tuple[Kind, ...]) -> int:
+    """The tiles a backward launch's score-hook pullback forms that vary with its inputs (`algebra.scored`):
+    its output and its slope along each input it differentiates, the logits and each floating parameter of
+    the kinds whose gradients the launch forms (`graded`, `DQ_GRADS` or `DKV_GRADS`: the dK/dV launch takes
+    no query's or head's slope, an A100's and an H100's dK/dV under a temperature, a softcap with sinks and
+    ALiBi, and ALiBi holding 3, 3 and 2 tiles at 64 x 64 where all their slopes priced 4, 4 and 3), but a
+    constant one (a hook linear in an input slopes 1 along it, which ptxas holds no tile of: the fast dQ
+    under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled where four slopes priced 258);
+    traced, never run, on a tile, each slope along its own input alone, or where the hook takes no forward
+    derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
     if hooks is None or not callable(hooks.score_mod):
         return 0
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
-    return _varying_slopes(hooks.score_mod, params)
+    return _varying_slopes(hooks.score_mod, params, graded)
 
 
 @functools.lru_cache(maxsize=256)
-def _varying_slopes(score_mod, params: tuple) -> int:
-    """`varying_slopes` of `score_mod` under parameters of `params`' kinds and dtypes."""
+def _varying_slopes(score_mod, params: tuple, graded: tuple[Kind, ...]) -> int:
+    """`varying_slopes` of `score_mod` under parameters of `params`' kinds and dtypes in a launch forming
+    the gradients of the kinds `graded`."""
     tile = (TILE_SIDES[0], TILE_SIDES[0])
     positions, logits = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.float32)
     values = [_entries(kind, dtype, tile) for kind, dtype in params]
@@ -468,7 +472,8 @@ def _varying_slopes(score_mod, params: tuple) -> int:
         return jax.jvp(along, (inputs[place],), (jnp.ones_like(inputs[place]),))[1]
 
     count = int(_varies(score_mod, logits, positions, positions, *values))
-    for place in (0, *(1 + index for index in floating_params(values))):
+    formed = [index for index in floating_params(values) if params[index][0] in graded]
+    for place in (0, *(1 + index for index in formed)):
         try:
             count += _varies(functools.partial(slope, place), logits, positions, positions, *values)
         except TypeError:
