@@ -215,8 +215,9 @@ def configuration() -> dict:
 
 
 FORM = 6
-"""The form of the measurement Dew keeps, which names its place in the cache: a change to what the child
-measures or how it writes it takes the next, so a host measures afresh rather than read an earlier one."""
+"""The form of the measurements Dew keeps, which names their place in the cache: a change to what the child
+measures or how it writes it, or to how a program's communicators are read (`collectives_of`), takes the
+next, so a host measures and reads afresh rather than read an earlier one."""
 
 
 def measured(configured: Mapping, *, measure: Callable[[Mapping], Needs]) -> Needs:
