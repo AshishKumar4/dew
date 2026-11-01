@@ -1125,6 +1125,11 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
+    feeds_itself: bool = False
+    """Whether its consumers issue their own rings' loads, no producer beside them (`ConsumerFed`): every
+    consumer walks every step, so a template may split a step's work between them (attention's dK and dV:
+    a key block shared, each slot's queries split) where with a producer each takes steps of its own."""
+
     @abc.abstractmethod
     def registers(self, consumers: int) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold."""
@@ -1726,6 +1731,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     whole (no `passed`: a consumer's steps are every consumer's); it takes no cluster (a multicast ring's
     loads are each program's producer's)."""
     cluster = 1
+    feeds_itself = True
     loader = 0
     """The consumer that issues the loads."""
 
