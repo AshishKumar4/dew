@@ -253,6 +253,18 @@ def test_a_lazy_packages_star_import_binds_its_modules_as_its_eager_one_did(pack
                    env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
 
 
+@pytest.mark.parametrize("package", ["dew", "dew.data", "dew.diffusion", "dew.eval", "dew.inference",
+                                     "dew.nn.autoencoders", "dew.nn.backbones", "dew.nn.vision",
+                                     "dew.sampling", "dew.training"])
+def test_a_lazy_packages_listing_names_what_it_exports(package):
+    """A lazily exporting package lists every name it exports to `dir()`, which an editor and an
+    interpreter complete from, though it has imported none of them (row 3206)."""
+    script = (f"import importlib\nmodule = importlib.import_module({package!r})\n"
+              "missing = sorted(set(module.__all__) - set(dir(module)))\nassert not missing, missing\n")
+    subprocess.run([sys.executable, "-c", script], check=True,
+                   env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
+
+
 def test_the_release_version_is_read_from_a_module_import_dew_does_not_run():
     """`dew.__version__` comes from `dew._version`, imported when the version is first read, and the package
     metadata takes it from there: a release's bump then changes no module `import dew` executes, whose top
