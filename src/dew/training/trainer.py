@@ -120,6 +120,7 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
+    pooled,
     pooled_first,
     restored,
     stage_reached,
@@ -466,7 +467,8 @@ class Trainer(Generic[Loss, Effects]):
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
                                  custom_progress=self.step is not None and progress,
-                                 draws_further=self.rollout is not None and _draws_further(self.rollout))
+                                 pooled_draws=pooled(examples) and self.rollout is not None
+                                 and _draws_further(self.rollout))
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1468,8 +1470,8 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, ahead = run.closing(interval, batch, self._examples)
-                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval, run)
+                batch, ahead = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked,
+                                          interval, run, examples=self._examples, closes=True)
                 device, _ = split_fields(batch)
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
@@ -1920,8 +1922,8 @@ class Trainer(Generic[Loss, Effects]):
                                         phase="cooldown read")
                     if batch is None:
                         break
-                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
-                                       branched)
+                    batch, _ = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
+                                          counted, branched)
                     device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
