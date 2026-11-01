@@ -198,10 +198,13 @@ fitted to them, and a rule set ships only with measured receipts.
 
 ## 3. Verification
 
-All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of their own. Check 1 holds a form's
-pooled RMS distance to the float64 truth to `PARITY` (1.5) times the reference's, and its worst row to
-`ROW_FACTOR` (4) times, or 90 and 11 at rows of one and two values (`tests/check1_statistics.py`), as
-`assert_as_exact` applies them.
+All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of their own:
+- check 1 is `assert_as_exact` as it applies `tests/check1_statistics.py` today: each tensor's pooled RMS distance
+  to the float64 truth against the reference's at `PARITY`, its worst row at `ROW_FACTOR`, and narrow rows at
+  `NARROW_FACTORS`. This doc names those constants and never restates them, so it cannot drift from the gate.
+- check 2 (bible §7, "never wrong"): where a rewritten operation has a certified bound (`tests/certified.py`),
+  every element holds within it, at each rule's site and wherever the gate already runs check 2 for a program
+  site.
 
 - **Each rule,** by its rounding class, on the gate's terms for that class (testing.md's fast and accurate forms):
   - `exact` and `bounded` sets: the accurate form's contract, check 1 on every drawn and adversarial family;
@@ -215,8 +218,11 @@ pooled RMS distance to the float64 truth to `PARITY` (1.5) times the reference's
   - at a site running Dew's own programs (`dew_programs`, `as_given` trainer steps): the same arm under
     `dew.algebra.passes(on=True, target=…)` against `passes(on=False)`.
 
-  The truth is the unrewritten program at float64 in both. The pass prices for the named target's facts (the
-  generation the gate's lowering traces for), so a CPU lane checks the form a GPU of that target extracts.
+  The truth is the unrewritten program at float64 in both. The gate's own arm compilation (`_arms`,
+  `without_ynn`) holds `passes(on=False)` by default, so a site that does not opt in compares an unrewritten
+  program with an unrewritten one, never a rewritten one with another. The pass prices for the named target's
+  facts (the generation the gate's lowering traces for), so a CPU lane checks the form a GPU of that target
+  extracts.
 - **Rewritten backwards:** `rewritten(jax.grad(fn))` at `tests/contract_support.py`'s edge draws, held to its
   finiteness rule against the unrewritten float64 gradient, and check 1 against `jax.grad(fn)`. A rule that only
   fires on backward patterns is caught there, as JAX's derivative of a rewritten forward never exercises it.
@@ -224,13 +230,13 @@ pooled RMS distance to the float64 truth to `PARITY` (1.5) times the reference's
   saturation and extraction; a `Surrogate` test requires its backward to stay the declared rule, not autodiff's.
 - **Generated modules:** each ships its gate sites and its stability suite (bible §6); `generate --check` holds the
   checked-in output to the generator's.
-- **Determinism:** two fresh processes with different `PYTHONHASHSEED` give the same rewritten program, compared as
-  its lowered StableHLO, for the same input, checked on the multi-process CPU lane. Multi-controller JAX needs every
+- **Determinism:** one jaxpr in gives a bytewise-identical rewritten program out, compared as its lowered
+  StableHLO, across fresh processes with different `PYTHONHASHSEED`s, checked on the multi-process CPU lane. Multi-controller JAX needs every
   process to compile the same program, and one process repeating itself cannot catch an ordering that follows
   object identity or string hashing. The e-graph is built in equation order and runs with one thread, and the
   prices read only pool-agreed facts (§1.6).
 - **Compile time:** the pass's seconds per program are recorded beside lowering and XLA compile, in perf_gate and
-  the eval.
+  the eval, and measured on the 4B and 9B steps' compiles. It is a reported measurement, not a gate.
 - **Report:** each program's rule classes that fired and the pass's seconds go in the one kernel report
   (`dew.nn.kernels.templates.report`, `report.compiled`).
 
