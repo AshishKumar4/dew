@@ -160,7 +160,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Summary, admit_split
+from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Split, Summary, admit_split, episodic
 from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
@@ -683,7 +683,7 @@ class Trainer(Generic[Loss, Effects]):
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
         state = restored(state, resume, self._examples)
-        _rollout_resumed(self.rollout, checkpoints, resume, shardings.key)
+        _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = rates_set(state, lambda held: with_rates(held, config.rates()))
@@ -2184,7 +2184,7 @@ class Trainer(Generic[Loss, Effects]):
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
         for name, suite in suites.items():
-            if loss and not any(metric.name == 'loss' for metric in suite.metrics):
+            if loss and not episodic(suite.data) and all(metric.name != 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
                 read = self.objective.defines_validation_loss or self.checkpoints is not None or loss
@@ -2413,7 +2413,7 @@ class Trainer(Generic[Loss, Effects]):
         self,
         state: TrainState,
         shardings: Placement[TrainState],
-        reader: Reader | None,
+        reader: Split | None,
         metrics: Sequence[Metric],
         preview: bool,
         *,

@@ -421,3 +421,69 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
     afresh = resumed(tmp_path / "forgot", Forgetting(objective, walks(), unroll_length=8, epochs=2,
                                                      minibatches=2))
     assert not all(np.array_equal(one, other) for one, other in zip(bits(whole), bits(afresh), strict=True))
+
+
+@struct.dataclass
+class Seen(Walk):
+    """`Walk` observed through named views: its `position`, and its `distance` from the origin."""
+
+    def reset(self, key):
+        x, _ = super().reset(key)
+        return x, TimeStep(self.seen(x), jnp.zeros(()), jnp.zeros((), bool), jnp.zeros((), bool))
+
+    def step(self, x, action):
+        x, stepped = super().step(x, action)
+        return x, TimeStep(self.seen(x), stepped.reward, stepped.terminated, stepped.truncated)
+
+    @staticmethod
+    def seen(x):
+        return {"position": x[None], "distance": jnp.abs(x)[None]}
+
+
+def test_a_split_scored_by_its_episodes_reports_the_flights_first_episodes(tmp_path):
+    """A PPO run on walks validated by its episodes (`EvalSuite(Episodes(dew.rl.evaluation.episodes(...)))`)
+    reports, at each evaluation, `flight/return`, `flight/steps` and `flight/distance` (the reached view
+    at each walk's first episode's end), each the mean over the walks' first episodes of what the same
+    greedy policy earns flown again from the evaluation's own key with the episode masks taken by hand.
+    A warming flight before the first step compiles the scorer and reports nothing."""
+    from dew.data.dataset import Loader, replayed
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite, Trainer
+    from dew.training.tracker import LocalTracker
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3,
+                                    reads=("position",))
+
+    def walks(count):
+        return Batched(TimeLimit(Seen(limit=50.0), episode_length=8), count)
+
+    flown = episodes(objective.greedy, walks(32), 12, reached=("distance",))
+    flights = []
+
+    def recorded(variables, key):
+        # The run donates its state to its next step: the flight's variables are kept as host copies.
+        flights.append((jax.device_get(variables), key))
+        return flown(variables, key)
+
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+    tracker = LocalTracker(str(tmp_path / "tracked"))
+    rollout = ControlRollout(objective, walks(16), unroll_length=8, epochs=2, minibatches=2)
+    Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout, tracker=tracker).fit(
+        data, steps=4, log_every=2, validation={"flight": EvalSuite(Episodes(recorded), every=2)})
+    logged = [scalars for _, scalars in tracker.scalars() if "flight/return" in scalars]
+    tracker.close()
+    # The run flies once before its first step to compile, keeping no score, then once an evaluation.
+    assert len(logged) == 2 and len(flights) == 3
+
+    for scalars, (variables, key) in zip(logged, flights[1:], strict=True):
+        env = walks(32)
+        taken = env_rollout(env, objective.greedy, variables, start(env, key), 12, reset=False)[1]
+        done = np.asarray(taken.following.done)
+        inside = (np.cumsum(done, 0) - done) == 0
+        reward = np.asarray(taken.following.reward)
+        distance = np.asarray(taken.following.observation["distance"]).reshape(12, 32)
+        last = inside.sum(0) - 1
+        assert scalars["flight/return"] == float(np.where(inside, reward, 0).sum(0).mean())
+        assert scalars["flight/steps"] == float(inside.sum(0).mean())
+        assert scalars["flight/distance"] == float(distance[last, np.arange(32)].mean())
