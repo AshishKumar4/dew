@@ -119,6 +119,19 @@ class Tcgen05:
         pl.when(lax.axis_index("wg") == READ)(read)
 
     @staticmethod
+    def product(acc, lhs, rhs, released, *, accumulate, topology: Topology = SINGLE) -> None:
+        """`acc` (`+`)= `lhs @ rhs`, issued by the product warp into tensor memory (onto `acc` where
+        `accumulate`), `released` (a stage's release barrier) arrived at once the product has read its
+        operands; over `topology`'s CTAs, the leader's product spanning both."""
+        plgpu.tcgen05_mma(acc, lhs, rhs, released, accumulate=accumulate, **topology.issued())
+
+    @staticmethod
+    def zeros(shape: tuple[int, int]) -> jax.Array:
+        """An fp32 accumulator chunk of zeros in an epilogue's layout (`STORED`): an output a tile that
+        multiplies nothing stores."""
+        return plgpu.layout_cast(jnp.zeros(shape, jnp.float32), STORED)
+
+    @staticmethod
     def issued(load: Callable[[], None], products: Callable[[], None]) -> None:
         """The issuing warpgroup's warps alone (a program's end, `drain`'s, and each tile's in `roles`): its
         load warp runs `load`, its product warp `products`."""

@@ -203,8 +203,8 @@ def _products(tile: _Tile, scratch: _Scratch, *, shape: _Shape) -> None:
 
     def step(index, at: mosaic.Turn):
         (a_smem, b_smem), consumed = scratch.ring.acquire(at)
-        plgpu.tcgen05_mma(acc, a_smem, b_smem.T if shape.transpose_rhs else b_smem, consumed,
-                          accumulate=index > tile.first, **topology.issued())
+        TCGEN05.product(acc, a_smem, b_smem.T if shape.transpose_rhs else b_smem, consumed,
+                        accumulate=index > tile.first, topology=topology)
 
     @pl.when(topology.leads())
     def _():
@@ -232,10 +232,8 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
                 epilogue, acc, sides, scratch.side_smems, scratch.side_full, epilogue_axes,
                 {'rows': rows_of.block_start + own, 'columns': column}, shape.side_extent)
             for o_smem, o_gmem, value in zip(scratch.o_smems, outs, values, strict=True):
-                o_smem[...] = value.astype(o_smem.dtype)
-                plgpu.commit_smem()
-                mosaic.store_rows(o_smem, o_gmem, rows_of.block_start + own, first, stored, column,
-                                  min(block_m, shape.rows))
+                mosaic.staged_rows(o_smem, value, o_gmem, rows_of.block_start + own, first, stored, column,
+                                   min(block_m, shape.rows))
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(tile.computes)
@@ -244,8 +242,7 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
         store(scratch.tensor.read(turn, chunk_n))
         scratch.tensor.release(turn)
 
-    pl.when(~tile.computes)(lambda: store(lambda chunk: plgpu.layout_cast(
-        jnp.zeros((tiles.block_m, chunk_n), jnp.float32), mosaic_sm100.STORED)))
+    pl.when(~tile.computes)(lambda: store(lambda chunk: TCGEN05.zeros((tiles.block_m, chunk_n))))
 
 
 def _epilogue(epilogue, acc, gmems, smems, barriers, axes_of, origins: dict, extent: dict) -> tuple:

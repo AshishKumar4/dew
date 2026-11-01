@@ -346,6 +346,16 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
             plgpu.wait_smem_to_gmem(0)
 
 
+def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column, most: int,
+                least: int = 1) -> None:
+    """`value` written to the shared buffer `smem` in its dtype, made visible to TMA, and its rows `first` to
+    `first + stored` stored to `o_gmem` at row `row_start + first` and `column` (`store_rows`); the copies
+    stay in flight (the caller waits before `smem` is written again)."""
+    smem[...] = value.astype(smem.dtype)
+    plgpu.commit_smem()
+    store_rows(smem, o_gmem, row_start, first, stored, column, most, least)
+
+
 def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, least: int = 1,
                copy: Callable = plgpu.copy_smem_to_gmem, widest: int | None = None) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
@@ -1440,9 +1450,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                         # The buffer's last store (the last tile's, at its first chunk) has read it.
                         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                     buffer = smem.at[chunk % buffers]
-                    buffer[...] = piece.astype(smem.dtype)
-                    plgpu.commit_smem()
-                    store_rows(buffer, ref, row_start, first, stored, column + start, *ladder)
+                    staged_rows(buffer, piece, ref, row_start, first, stored, column + start, *ladder)
 
             @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
             def ended(loop: plgpu.NDLoopInfo, carry):
