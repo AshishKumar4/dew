@@ -168,9 +168,10 @@ class Rules:
 def _facts() -> Ruleset:
     """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, or over
     an operand and a scalar the operand's, a layout-keeping one its operand's, a sum along one axis its
-    operand's without that axis."""
+    operand's without that axis, a matrix's transpose its axes swapped, a matrix product its left operand's
+    rows by its right's columns; and each value of two axes a matrix (`matrix`)."""
     term, x, y = vars_("term x y", Term)
-    shaped, axes = vars_("shaped axes", Vec[i64])
+    shaped, axes, left, right = vars_("shaped axes left right", Vec[i64])
     name = var("name", String)
     params = var("params", i64)
     scalar = Vec[i64].empty()
@@ -185,6 +186,12 @@ def _facts() -> Ruleset:
         rule(eq(term).to(x.convert(params)), eq(shaped).to(shape(x))).then(set_(shape(term)).to(shaped)),
         rule(eq(term).to(x.reduce(name, axes, params)), eq(shaped).to(shape(x)), eq(axes.length()).to(i64(1))
              ).then(set_(shape(term)).to(shaped.remove(axes[i64(0)]))),
+        rule(eq(term).to(x.shaped(String("transpose"), params)), eq(left).to(shape(x)),
+             eq(left.length()).to(i64(2))).then(set_(shape(term)).to(Vec[i64](left[i64(1)], left[i64(0)]))),
+        rule(eq(term).to(x.dot(y, params)), matrix_product(params), eq(left).to(shape(x)),
+             eq(right).to(shape(y)), eq(left.length()).to(i64(2)), eq(right.length()).to(i64(2))).then(
+            set_(shape(term)).to(Vec[i64](left[i64(0)], right[i64(1)]))),
+        rule(eq(shaped).to(shape(term)), eq(shaped.length()).to(i64(2))).then(matrix(term)),
         name="facts")
 
 

@@ -65,12 +65,11 @@ def swap_of(params: i64) -> i64: ...
 
 
 def _carrying():
-    """Which values read the state, and the shape of each transpose and product the rules make."""
+    """Which values read the state (`reads`)."""
     x, y, z, t = vars_("x y z t", Term)
     name = var("name", String)
     p = var("p", i64)
     one = i64(1)
-    left, right = vars_("left right", Vec[i64])
     marked = []
     for made, children in ((lambda: x.binary(name, y, p), (x, y)), (lambda: x.compare(name, y, p), (x, y)),
                            (lambda: x.unary(name, p), (x,)), (lambda: x.convert(p), (x,)),
@@ -78,15 +77,7 @@ def _carrying():
                            (lambda: x.select(y, z), (x, y, z))):
         marked += [rule(eq(t).to(made()), eq(reads(child)).to(one)).then(set_(reads(t)).to(one))
                    for child in children]
-    return ruleset(
-        *marked,
-        rule(eq(t).to(x.shaped(String("transpose"), p)), eq(left).to(rules.shape(x)),
-             eq(left.length()).to(i64(2))).then(
-            set_(rules.shape(t)).to(Vec[i64](left[i64(1)], left[i64(0)]))),
-        rule(eq(t).to(x.dot(y, p)), rules.matrix_product(p), rules.matrix(x), rules.matrix(y),
-             eq(left).to(rules.shape(x)), eq(right).to(rules.shape(y))).then(
-            set_(rules.shape(t)).to(Vec[i64](left[i64(0)], right[i64(1)]))),
-        name="carrying")
+    return ruleset(*marked, name="carrying")
 
 
 def _carried():
