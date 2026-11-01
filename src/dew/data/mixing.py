@@ -115,7 +115,7 @@ class CorpusCounts:
     def counted_anew(self) -> None:
         """Start over the counts of delivered rows, for a read that counts them again whole (a memory
         read's rows, read once more as it holds them)."""
-        self.accepted, self.truncated = 0, 0
+        self.accepted, self.truncated, self.delivered_rows = 0, 0, 0
         for counted in (self.cut_examples, self.cut_rows, self.cut_removed, self.left_out, self.left_out_cut,
                         self.declined):
             counted.clear()
