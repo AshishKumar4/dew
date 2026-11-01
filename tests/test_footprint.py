@@ -93,12 +93,11 @@ def test_a_gpu_pullback_counts_a_transcendental_chain_as_the_product_it_is_recom
     assert scores <= gpu < 2 * scores < residual_bytes(attended, keys, (queries,), platform="cpu")
 
 
-def test_a_gradients_peak_holds_each_gradient_while_it_is_made_beside_the_residuals_its_backward_reads():
-    """The most a gradient program holds at once, in its traced order: at the second weight's gradient, the
-    first layer's output and the second's product, which its backward reads, the product's cotangent made for
-    the matrix product that reads it, and the gradient as it is made, which the step updates where it is made
-    and holds no longer (`gradient_peak`, `peak_bytes`'s `consumed`); and beside each matrix product the
-    workspace the device gives its GEMMs, one at a time."""
+def test_a_gradients_peak_holds_the_gradient_beside_the_cotangent_each_residual_freed_after_its_read():
+    """The most a gradient program holds at once, in its traced order: through two products, the second
+    weight's gradient and the first layer's cotangent, then the first weight's gradient beside them, each
+    residual (the first layer's output, the second's) freed after its last read, which comes before; and
+    beside each matrix product the workspace the device gives its GEMMs, one at a time."""
     rows = jax.ShapeDtypeStruct((8, 16), jnp.float32)
     params = {"first": jax.ShapeDtypeStruct((16, 64), jnp.float32),
               "second": jax.ShapeDtypeStruct((64, 16), jnp.float32)}
@@ -106,9 +105,8 @@ def test_a_gradients_peak_holds_each_gradient_while_it_is_made_beside_the_residu
     def loss(params, rows):
         return jnp.sum(jnp.exp((rows @ params["first"]) @ params["second"])), ()
 
-    # The first layer's output, 8 x 64, the product and its cotangent, 8 x 16 each, and the second weight's
-    # gradient, 64 x 16.
-    held = (8 * 64 + 2 * 8 * 16 + 64 * 16) * 4
+    # Both gradients, 64 x 16 floats each, and the first layer's cotangent, 8 x 64.
+    held = (2 * 64 * 16 + 8 * 64) * 4
     for size in (0, 1 << 20):
         workspace = Workspace(size, size)
         assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=workspace).bytes == held + size

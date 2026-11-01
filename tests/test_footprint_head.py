@@ -18,7 +18,7 @@ from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import compile_ahead, compile_only_gpus
 from dew.training.compiled_program import compiled
-from dew.training.footprint import Workspace, gradient_peak, peak_bytes
+from dew.training.footprint import Workspace, gradient_peak, leaf_local, peak_bytes
 
 TOKENS, VOCAB, WIDTH = 256, 4096, 64
 PRODUCT = TOKENS * VOCAB * 4
@@ -85,6 +85,32 @@ def test_an_optimization_barrier_holds_the_storage_of_what_it_is_given():
     held = program_peak(rounded, HIDDEN, TABLE)
     assert held == PRODUCT + PRODUCT // 2
     assert held <= compiled_temporaries(rounded, HIDDEN, TABLE)
+
+
+def test_a_barrier_over_storage_holds_that_storage_alone():
+    """A barrier over a view of a product, and a barrier over that barrier, hold the product's storage and
+    no copy of it (`HloDataflowAnalysis::UpdateOptimizationBarrierValueSet`)."""
+    def nested(hidden, table):
+        kept = jax.lax.optimization_barrier(jax.lax.optimization_barrier(product(hidden, table).reshape(-1)))
+        return jnp.sum(jnp.square(kept))
+
+    held = program_peak(nested, HIDDEN, TABLE)
+    assert PRODUCT <= held < PRODUCT + PRODUCT // 2
+    assert held <= compiled_temporaries(nested, HIDDEN, TABLE)
+
+
+def test_each_result_of_a_barrier_holds_its_own_operand_to_its_own_last_read():
+    """Each result of a barrier is its own operand's storage, read where that result is read: the second
+    product, read last by its sum, is gone by the time a third product is made beside the first."""
+    def apart(hidden, table):
+        first, second = jax.lax.optimization_barrier((product(hidden, table), product(2 * hidden, table)))
+        early = jnp.sum(second)
+        third = product(3 * hidden, table) + first
+        return early + jnp.sum(third)
+
+    held = program_peak(apart, HIDDEN, TABLE)
+    assert 2 * PRODUCT <= held < 3 * PRODUCT
+    assert held <= compiled_temporaries(apart, HIDDEN, TABLE)
 
 
 def test_a_call_returns_the_buffers_of_its_program_as_the_program_holds_them():
@@ -171,9 +197,21 @@ def test_a_gradient_the_step_updates_where_it_is_made_is_held_while_it_is_made()
         gradient = jax.grad(lambda layers: loss(layers, rows)[0])(layers)
         return [weights - 0.1 * each for weights, each in zip(layers, gradient, strict=True)]
 
-    peak = gradient_peak(loss, layers, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
+    peak = gradient_peak(loss, layers, (rows,), platform="gpu", workspace=Workspace(0, 0),
+                         consumed=True).bytes
     assert peak < 8 * 512 * 512 * 4 // 2
     assert peak <= compiled_temporaries(step, layers, rows)
+
+
+def test_a_gradient_is_consumed_where_it_is_made_only_by_an_update_that_reads_it_alone():
+    """Adam reads each gradient into its own parameter's update and moments alone, so the step consumes
+    each where it is made; clipping by the global norm reads every gradient into each update, so the step
+    holds them all until it has read the last (`leaf_local`)."""
+    params = {"first": jax.ShapeDtypeStruct((16, 64), jnp.float32),
+              "second": jax.ShapeDtypeStruct((64, 16), jnp.float32)}
+    adam, clipped = optax.adam(1e-3), optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-3))
+    assert leaf_local(adam.update, params, jax.eval_shape(adam.init, params), params)
+    assert not leaf_local(clipped.update, params, jax.eval_shape(clipped.init, params), params)
 
 
 def test_a_whole_head_step_is_derived_at_most_what_xla_compiles_it_to(tmp_path, monkeypatch):
