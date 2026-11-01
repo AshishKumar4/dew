@@ -62,14 +62,18 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4) -> Wor
         return Work(operations=elements, device_bytes=elements * bytes_per_element)
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand) for operand in args[:2])
-        result = shape_of(graph, node)
-        if left is None or right is None or result is None:
+        if left is None or right is None:
             return Work()
         _, params = region.params[int(get_literal_value(args[2]))]
-        (contracted, _), _ = params["dimension_numbers"]
+        (contracted, right_contracted), (batch, right_batch) = params["dimension_numbers"]
         length = math.prod(left[axis] for axis in contracted)
+        # The result's elements: the batch, the left's free axes, the right's free axes.
+        free = (math.prod(size for axis, size in enumerate(left) if axis not in (*contracted, *batch))
+                * math.prod(size for axis, size in enumerate(right)
+                            if axis not in (*right_contracted, *right_batch)))
         read = (math.prod(left) + math.prod(right)) * bytes_per_element
-        return Work(flops=2.0 * math.prod(result) * length, device_bytes=read, shared_bytes=read)
+        return Work(flops=2.0 * math.prod(left[axis] for axis in batch) * free * length, device_bytes=read,
+                    shared_bytes=read)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1]))
     if (args := get_callable_args(node, Term.unary)) is not None:

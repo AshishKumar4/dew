@@ -488,11 +488,25 @@ class Extraction:
   pool-agreed `link_figure` for links, so every process prices with the same numbers. A fact no owner holds is
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
-- Two cost models implement the protocol:
-  - the program model, in passes over HBM, for a named target (`passes(target=…)`, §6.7);
-  - the kernel model, for derived template forms: `templates.cost`'s, with values per thread (registers),
-    instructions per tile and the dependent-reduction depth inside a step, read from the toolkit's register
-    model.
+- One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`:
+  an operation's work by unit (tensor-core FLOPs, CUDA-core fp32 operations, SFU exponentials, conversions) and
+  its bytes by level (device memory, shared memory). The algebra's terms price through it (`cost.work`: a
+  product's FLOPs and operand bytes, a reduction's operations and the bytes it reads, a special function's
+  exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing).
+  A template's instructions price through the same record. No per-operation price exists anywhere else.
+- A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts:
+  - XLA's fusion (`cost.fused`), for the compile-time pass over a program and error-aware extraction. Reductions
+    and products read their operands once from device memory, and elementwise work fuses into its consumer.
+    Each unit's work runs at the whole device's rate, in series with the memory traffic.
+  - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
+    takes (`derive`, `carry.split`). A tile's work runs on its program with its units overlapped, through the
+    toolkit's `program_seconds`. Its operands are staged by the walk, so its device bytes are the launch's,
+    which the template's own `cost` states.
+- Extraction for a template's interface prices candidates through the tile walk; the compile-time pass prices
+  them through XLA's fusion. Each shared term is priced once either way.
+- The tile walk does not yet read registers (the liveness pass) or the walk's rings when pricing a candidate.
+  Both are properties of a whole chosen DAG, not of a node, and the template's compile gate checks them on the
+  form chosen.
 
 ### 6.6 Saturation
 
