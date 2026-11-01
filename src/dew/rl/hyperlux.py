@@ -65,13 +65,13 @@ def fisheye_map(size: int, source: int, fov: float) -> tuple[np.ndarray, np.ndar
             c = np.clip(left + ox, 0, source - 1).astype(np.int32)
             corners.append(r * source + c)
             weights.append(np.where(held, wy * wx, 0.0))
-    return np.stack(corners, -1), np.stack(weights, -1).astype(np.float32), held
+    return np.stack(corners, -1), np.stack(weights, -1), held
 
 
 def fisheyed(images: jax.Array, corners: jax.Array, weights: jax.Array) -> jax.Array:
-    """Pinhole images `[B, S, S, C]` resampled to a fisheye `[B, N, N, C]` float32 by `fisheye_map`'s corners
-    and weights."""
-    flat = images.reshape(images.shape[0], -1, images.shape[-1]).astype(jnp.float32)
+    """Pinhole images `[B, S, S, C]` resampled to a fisheye `[B, N, N, C]` by `fisheye_map`'s corners and
+    weights, in the weights' dtype."""
+    flat = images.reshape(images.shape[0], -1, images.shape[-1]).astype(weights.dtype)
     sampled = jnp.einsum("bnkc,nk->bnc", flat[:, corners.reshape(-1, 4)], weights.reshape(-1, 4))
     size = corners.shape[0]
     return sampled.reshape(images.shape[0], size, size, -1)
@@ -105,7 +105,8 @@ class HyperLuxRenderer:
             raise ValueError("a fisheye lens samples a pinhole drawn at a source size: give both, or neither")
         self.fisheye = fisheye
         self._lens = None if fisheye is None else tuple(
-            jnp.asarray(part) for part in fisheye_map(size, int(source or 0), fisheye)[:2])
+            jnp.asarray(part, dtype) for part, dtype in zip(fisheye_map(size, int(source or 0), fisheye)[:2],
+                                                           (jnp.int32, jnp.float32), strict=True))
         drawn = size if source is None else source
 
         folder = Path(assets)

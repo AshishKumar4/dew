@@ -115,7 +115,7 @@ def test_a_race_rewards_and_ends_as_skydreamer_writes(track):
             got, want = [], []
             for t in range(200):
                 # A throttle of zero holds the hover's thrust.
-                wobble = 0.0 if straight else 0.05 * np.sin(t / 20 + drone) + drift[t, 1:]
+                wobble = np.zeros(3) if straight else 0.05 * np.sin(t / 20 + drone) + drift[t, 1:]
                 action = np.clip(np.r_[0.0 if straight else 0.05 + drift[t, 0], wobble], -1, 1)
                 before = np.asarray(lap.flight.position)
                 lap, taken = step(lap, jnp.asarray(action))
@@ -168,7 +168,7 @@ def test_a_race_starts_before_a_gate_at_rest():
     first = 0
     with jax.enable_x64(new_val=True):
         laps = jax.vmap(lambda key: race.reset(key)[0])(jax.random.split(jax.random.key(9), 512))
-        laps = jax.tree.map(np.asarray, laps)
+        laps = jax.tree.map(np.asarray, dataclasses.replace(laps, key=jax.random.key_data(laps.key)))
     for drone in range(512):
         lap = jax.tree.map(lambda leaf, drone=drone: leaf[drone], laps)
         center, heading, _ = CIRCLE[int(lap.index)]
@@ -274,11 +274,12 @@ def written_fisheye(image: np.ndarray, size: int, fov: float) -> np.ndarray:
 
 def test_a_fisheye_lens_samples_the_pinhole_at_each_pixels_direction():
     """A 48-pixel equidistant fisheye 120 degrees across, resampled from drawn 80-pixel pinholes of the same
-    field of view, is the fisheye written a pixel at a time, to the rounding of its float32 sums; its centre
-    is held by the pinhole and its corners, beyond the pinhole's reach, black."""
+    field of view, is the fisheye written a pixel at a time, run in float64; its centre is held by the
+    pinhole and its corners, beyond the pinhole's reach, black."""
     images = np.random.default_rng([532, 7]).integers(0, 256, (2, 80, 80, 3)).astype(np.uint8)
     corners, weights, held = fisheye_map(48, 80, 120.0)
-    got = np.asarray(fisheyed(jnp.asarray(images), jnp.asarray(corners), jnp.asarray(weights)))
+    with jax.enable_x64(new_val=True):
+        got = np.asarray(fisheyed(jnp.asarray(images), jnp.asarray(corners), jnp.asarray(weights)))
     written = np.stack([written_fisheye(image.astype(np.float64), 48, 120.0) for image in images])
     assert_computes_the_oracle(got, written, "the fisheye", roundings=8)
     assert held[24, 24] and not held[0, 0] and not held[-1, -1]
