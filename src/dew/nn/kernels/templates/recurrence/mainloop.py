@@ -111,14 +111,13 @@ class Tiles:
         return self.block_v if self.block_o is None else self.block_o
 
 
-def per_key_refusal(dtype, floor: float | None) -> str | None:
+def per_key_refusal(dtype) -> str | None:
     """Why the mainloop refuses a call of `dtype` under a decay a key dimension, None where it takes it: its
     intra launch factors each pair's decay over the chunk's sub-chunks (`algebra.key_decayed_pairs`), each
-    sub-chunk's own pairs too where the layer's declared `floor` bounds a sub-chunk's range
+    sub-chunk's own pairs too where the layer's declared floor bounds a sub-chunk's range
     (`algebra.factored_range`), else each its own decay (`algebra.key_diagonal_pairs`), and rounds each
     side's gate once, where the fp32 recurrence rounds each pair's (1.98 times its distance from float64 in
     an fp32 call, fam-t)."""
-    del floor
     if jnp.dtype(dtype) == jnp.float32:
         return "an fp32 call's decay a key dimension is the portable math's"
     return None
@@ -371,7 +370,7 @@ def _merged(call: _Call) -> _Operand:
 
 
 def _summing(call: _Call) -> tuple:
-    """`algebra.summed_back`'s staging: the fp32 operand's three bf16 parts its 'summed' product takes,
+    """`algebra.summed_pairs`' staging: the fp32 operand's three bf16 parts its 'summed' product takes,
     staged, none where the family's products read their left operands from registers
     (`Family.operands_in_registers`, `_summed`: `Issuer`'s register operand), the triangle's one part
     (`product.Exact`), and the scratch its columns' sums across warps take (`_columns`). Staged on an A100,
@@ -396,7 +395,7 @@ def _columns(call: _Call, reserved: tuple):
 
 
 def _summed(staging: tuple, call: _Call) -> tuple:
-    """`algebra.summed_back`'s issuer and column sums on `_summing`'s staging: its fp32 operand's parts
+    """`algebra.summed_pairs`' issuer and column sums on `_summing`'s staging: its fp32 operand's parts
     staged, or held in registers where the family's products read them there."""
     *staged, exact, scratch = staging
     parts = PARTS if call.family.operands_in_registers else staged[0]
@@ -532,6 +531,31 @@ so each call traced its own and a hybrid model's step lowered its layers' identi
 Planning (`mainloop_backward.planned`) traces every call, each launch recording itself (`_kernel`)."""
 
 
+def _allocated(call: _Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,
+               consumers: int = 1, swizzles: dict[str, int] | None = None, reduces: bool = True,
+               after: tuple = ()
+               ) -> tuple[Callable[[int], dict], Callable[[int], resources.Scope], tuple, dict]:
+    """A launch's shared memory at a ring depth, as `_kernel` lays it: its walked streams' and its streams
+    loaded once' allocations (each its own; a pipelined family's stages are its allocation's), which a program
+    opens with their views by name ('walked', 'once'), the scope they make with its staging and landing tiles
+    a role (`_roles_staged`, `_landed`), whose bytes `resources.shared_bytes` counts, and those staging tiles
+    (its landing's last) and landing tiles: the one account a launch's legality and its plan both read."""
+    family = call.family
+    staged, landed = _roles_staged(staging, landing, consumers)
+    staged = (*staged, _landed(landed, family))
+
+    def allocations(depth: int) -> dict:
+        opened = {"walked": family.streams(blocks, depth, consumers, swizzles=swizzles)}
+        if once:
+            opened["once"] = family.streams(once, 1, consumers)
+        return opened
+
+    def scope(depth: int) -> resources.Scope:
+        return _scope(family, allocations(depth), staged, reduces=reduces, after=after)
+
+    return allocations, scope, staged, landed
+
+
 def _scope(family: mosaic.Family, streams: dict, staged: tuple, *, reduces: bool = True,
            after: tuple = ()) -> resources.Scope:
     """A program's allocations by lifetime (`resources.Scope`, whose bytes `resources.shared_bytes` counts as
@@ -552,12 +576,6 @@ def _inverse_flops() -> float:
     """The tensor FLOPs of a chunk's inverse (`algebra.doubled`): two whole-tile products a doubling level,
     from two-wide blocks to the chunk's (`log2(CHUNK) - 1` levels), each `2 C^3`, masked after they issue."""
     return 4 * CHUNK ** 3 * (int(math.log2(CHUNK)) - 1)
-
-
-def _products(parts: int) -> int:
-    """The products an fp32 call's issue takes for one of its operands' (`Issuer`): its parts' pairs whose
-    orders sum under `parts`."""
-    return sum(1 for i in range(parts) for j in range(parts) if i + j < parts)
 
 
 def _walk_stores(family: mosaic.Family, stores: int):
@@ -665,21 +683,11 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     (`_roled`): one role's products' tiles are no other's to write while its products read them."""
     family = call.family
     registers = held.registers(family, _addressed(staging, landing or {}))
-    staging, landing = _roles_staged(staging, landing or {}, consumers)
-    staging = (*staging, _landed(landing, family))
+    allocations, scope, staging, landing = _allocated(call, blocks, staging, landing or {}, once=once,
+                                                      consumers=consumers, swizzles=swizzles, reduces=reduces,
+                                                      after=after)
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(consumers)
-
-    def allocations(depth: int) -> dict:
-        # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
-        # its allocation's), which a program opens with their views by name ('walked', 'once').
-        opened = {"walked": family.streams(blocks, depth, consumers, swizzles=swizzles)}
-        if once:
-            opened["once"] = family.streams(once, 1, consumers)
-        return opened
-
-    def scope(depth: int) -> resources.Scope:
-        return _scope(family, allocations(depth), staging, reduces=reduces, after=after)
 
     found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
                             consumers=consumers)
@@ -698,7 +706,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
             # A persistent program's work is its tiles' (`work` is a tile's), the most any program takes.
             each = -(-tiles // programs)
-            flops = work.flops * _products(call.held.parts) * each
+            # The products the issuer takes for its parts (`product.terms`).
+            flops = work.flops * len(product.terms(call.held.parts, call.held.parts)) * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     registers, work.steps * each, stages, stepped, flops,
                                     work.exponentials * each, moved, found.programs if found else 0,
@@ -896,21 +905,28 @@ def _solves_apart(call: _Call) -> bool:
     return _merged(call).parts > 1
 
 
-def _key_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple],
-               consumers: int = 1) -> int:
-    """A launch's key block under a decay a key dimension, whose prefix halves, decays and gated keys it
-    holds a block at a time in fp32: the widest of the family's depths for 16-bit operands
-    (`Family.depths`), halved down to the narrowest columns a staged operand takes
-    (`Family.narrowest_columns`), at which its register model (`held(block)`, `_Held`, beside its
-    addresses into its staging and landing tiles there, `staged(block)`) fits a consumer thread's
-    registers (`Family.registers`), as the launch states them; the narrowest where none does, which the
-    launch then refuses."""
+def _fitting_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple], widest: int,
+                   narrowest: int) -> int:
+    """A launch's block of a row it takes a block at a time: `widest` halved down to `narrowest` until its
+    register model (`held(block)`, `_Held`, beside its addresses into its staging and landing tiles there,
+    `staged(block)`) fits a consumer thread's registers (`Family.registers`), as the launch states them; the
+    narrowest where none does, which the launch then refuses."""
     family = call.family
-    block, narrowest = family.depths(jnp.bfloat16)[0], family.narrowest_columns(jnp.bfloat16)
+    block = widest
     while block > narrowest and (held(block).registers(family, _addressed(*staged(block)))
-                                 > family.registers(consumers)):
+                                 > family.registers(1)):
         block //= 2
     return block
+
+
+def _key_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple]) -> int:
+    """A launch's key block under a decay a key dimension, whose prefix halves, decays and gated keys it
+    holds a block at a time in fp32 (`_fitting_block`): from the widest of the family's depths for 16-bit
+    operands (`Family.depths`) down to the narrowest columns a staged operand takes
+    (`Family.narrowest_columns`)."""
+    family = call.family
+    return _fitting_block(call, held, staged, family.depths(jnp.bfloat16)[0],
+                          family.narrowest_columns(jnp.bfloat16))
 
 
 def _intra_held(call: _Call, block: int) -> _Held:
@@ -1878,7 +1894,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     per_key = g.ndim == 4
     if dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16), jnp.dtype(jnp.float32)):
         raise NotImplementedError(f"the mainloop takes 16-bit and fp32 operands, not {dtype}")
-    if per_key and (refused := per_key_refusal(dtype, floor)):
+    if per_key and (refused := per_key_refusal(dtype)):
         raise NotImplementedError(refused)
     scale = key_width ** -0.5 if scale is None else scale
     block = block_of(family)

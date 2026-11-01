@@ -583,14 +583,6 @@ class Turn:
                         self.rotation if self.slot >= steps else self.rotation - 1)
         return Turn.of(self.counter - steps, stages)
 
-    def ahead(self, stages: int) -> "Turn":
-        """The turn after it, its slot constant where this one's is."""
-        if isinstance(self.slot, int):
-            wrapped = self.slot + 1 == stages
-            return Turn(self.counter + 1, 0 if wrapped else self.slot + 1,
-                        self.rotation + 1 if wrapped else self.rotation)
-        return Turn.of(self.counter + 1, stages)
-
 
 _COMMITTED = contextvars.ContextVar("committed", default=0)
 """The product groups an asynchronous issuer has committed as a program traces (`committed`)."""
@@ -672,8 +664,8 @@ class Ring:
 
     def acquire(self, turn: Turn):
         """A consumer's wait for `turn`'s load: its slot. Each load is waited for by each consumer, as every
-        phase of a barrier is by each thread that waits on it; a wait again for the same turn (a step that
-        read it ahead, `Slots.ahead`) returns at once, its slot not refilled until released."""
+        phase of a barrier is by each thread that waits on it; a wait again for the same turn returns at
+        once, its slot not refilled until released."""
         slot = opaque(turn.slot)
         plgpu.barrier_wait(self.full.at[slot], parity=turn.parity)
         return self.smem.at[slot]
@@ -819,14 +811,6 @@ class Slots:
         if name not in self._held:
             self._held[name] = self._rings[name].acquire(self._turn)
         return self._held[name]
-
-    def ahead(self, name: str):
-        """Stream `name`'s slot of the next step, its load waited for here: a step that issues the next
-        step's product before its own algebra (FlashAttention 3's overlap within a warpgroup) reads it a step
-        early. The next step's own read of it returns at once, and it holds and releases it as its own;
-        nothing here releases it. A walk's last step has no next: its step reads none ahead."""
-        stages = self._rings[name].stages
-        return self._rings[name].acquire(self._turn.ahead(stages))
 
     def release(self, name: str) -> None:
         """Stream `name`'s slot given back now, its reads done (acquired first if the step read none)."""
@@ -1123,11 +1107,6 @@ class Issuer[Accumulator](abc.ABC):
         """`value` in `dtype` (fp32 unless given), a splat whose layout inference takes from its uses (the
         accumulator's or a row's)."""
         return jnp.full(shape, value, dtype)
-
-    def column_full(self, columns: int, value: float) -> jax.Array:
-        """`value` fp32 `[columns]`: a tile's per-column state where its rows are its keys (a keys-first
-        walk's maxima and denominators), a splat inference lays out as its uses read it."""
-        return jnp.full((columns,), value, jnp.float32)
 
     def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile or a row, laid out by inference from the values they meet. An

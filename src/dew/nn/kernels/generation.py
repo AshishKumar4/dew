@@ -2,9 +2,11 @@
 
 One key, read from the default device: `smXY` from a GPU's compute
 capability, `v5e`/`v5p`/`v6e`/`v4` from a TPU's device kind, and the
-platform name otherwise. A selector names the generations it was measured on
-and sends every other one to its portable path. The measurements are in
-docs/performance.md, "Kernel choices per generation".
+platform name otherwise. Each generation's facts (`GpuTarget`, its
+`Architecture`) are what a selector and a template's derivation read: a GPU
+no row names takes its family's facts, so a selector admits an unseen member
+of a known family by what its family takes, never by a list of measured
+generations.
 """
 
 from __future__ import annotations

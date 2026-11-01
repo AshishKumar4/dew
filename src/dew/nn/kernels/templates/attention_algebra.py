@@ -663,11 +663,10 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, largest: Callable[[], j
     return held.weights, alpha, held
 
 
-def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, held: Room | None = None, *,
-                      axis: int = -1) -> jax.Array:
-    """A row's denominator after a tile: the state's taken by `factor` (`carry_factor`) and the tile's
-    weights `p`, their keys along `axis`, added at the row's shift (`beyond_weights`)."""
-    return carry_factor(total, factor, held) + beyond_weights(p.sum(axis=axis), held)
+def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, *, axis: int = -1) -> jax.Array:
+    """A row's denominator after a tile on the plain walk: the state's taken by `factor` (`carry_factor`)
+    and the tile's weights `p` added, their keys along `axis` (the guarded walk's, `stepped`)."""
+    return carry_factor(total, factor, None) + p.sum(axis=axis)
 
 
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, products: tuple[jax.Array, ...],
@@ -2208,18 +2207,12 @@ def summed_products(parts: Parts, operand: jax.Array,
 
 
 def weights_parts(weights: jax.Array, dtype) -> Parts:
-    """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`weights_product`):
+    """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`summed_products`):
     fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`), which its product takes
     back."""
     if dtype == jnp.float16:
         return (product.Scaled(*_fp16_scaled(weights)),)
     return (weights.astype(dtype),)
-
-
-def weights_product(weights: jax.Array, operand: jax.Array,
-                    dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
-    """Weights `[bq, bk]` (fp32) times the queries or keys `operand` in its dtype, fp32 (`weights_parts`)."""
-    return summed_products(weights_parts(weights, operand.dtype), operand, dot)
 
 
 def narrowed(x: jax.Array, dtype) -> jax.Array:

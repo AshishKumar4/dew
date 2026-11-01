@@ -514,15 +514,6 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
 
 
-def forward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
-                  hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                  residuals: Kept = Kept.NONE) -> bool:
-    """Whether `forward` runs the call compiled on this device (`forward_declined`): its family has a
-    bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
-    return forward_declined(query, key, value, spans, hooks, scale=scale, natural=natural,
-                            residuals=residuals) is None
-
-
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
@@ -935,15 +926,6 @@ def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans:
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
                               accurate=accurate)
     return op.declined(op.bind(*args, interpret=False), generation.gpu_target())
-
-
-def backward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
-                  dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
-                  scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE) -> bool:
-    """Whether `backward` runs the call compiled on this device (`backward_declined`): its family has a
-    bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
-    return backward_declined(query, key, value, spans, hooks, dout, residuals=residuals, scale=scale,
-                             natural=natural, accurate=accurate) is None
 
 
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,

@@ -6,7 +6,7 @@ and backward (`planned`, `holds`), from which the template derives its tiles."""
 import contextlib
 import dataclasses
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +14,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates import mosaic, product, resources
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -23,13 +23,14 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Launch,
     Tiles,
     Work,
-    _addressed,
+    _allocated,
     _block_stored,
     _Call,
     _column,
     _diagonal,
     _f32,
     _final_landing,
+    _fitting_block,
     _fragments,
     _Held,
     _held,
@@ -99,18 +100,15 @@ def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> b
                for launch in launches)
 
 
-def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False,
-                       floor: float | None = None) -> bool:
+def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
     """Whether the fast backward takes a call's form: the delta rule, fla's DAG at fla's rounding, a decay a
     head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 `rounded` call without it and a decay a
     head (the SSD's under the run's fast forms, its route's), the same DAG without the delta rule's at
     mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
     delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
-    (the accurate forms) take none. A decay a key dimension's `floor`, where it bounds a sub-chunk's range
-    (`algebra.factored_range`), factors each sub-chunk's own pairs; without one they are each their own decay
-    (`algebra.key_diagonal_pairs_back`)."""
-    del floor
+    (the accurate forms) take none. A decay a key dimension's form takes either pair factoring its layer's
+    floor gives (`algebra.factored_range`, `algebra.key_diagonal_pairs_back`)."""
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
     if per_key:
@@ -147,15 +145,15 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     `(dq, dk, dv, dg, dbeta, dh0, dskip)` for the output's and final memory's gradients `do`, `dfinal`, fla's
     DAG (recomputing the forward's values, as fla does) through the algebra's backward tile functions:
     `_local_back`, `_reverse`, `_scores_back`, `_query_key`, `_system_back`, `_values_back`, `_keys_back`, the
-    decay's gradient summed token by token (`algebra.summed_back`) and the memory's decay's term added, a key
-    head's value heads summed; the forward's `inverse` and `kept` values where given (`kept_forward`'s) rather
-    than computed again, its states launch at the forward's `tiles` where they are not. Its rounding is fla's
-    (mamba_ssm's without the delta rule); the accurate backward is the portable math's token adjoint. Without
-    the delta rule there is no system: the corrected values are the values gated, `u = v beta`, whose gradient
-    `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no
-    `w^T dv`; a `skip` `[HV]` (Mamba2's `D`, `mainloop.forward`'s) adds `D do` to `dv`, its own gradient
-    `sum(v do)` (`dskip`, None without a skip)."""
-    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4, floor=floor):
+    decay's gradient summed token by token (`algebra.summed_pairs`, `algebra.summed_ranges`) and the memory's
+    decay's term added, a key head's value heads summed; the forward's `inverse` and `kept` values where given
+    (`kept_forward`'s) rather than computed again, its states launch at the forward's `tiles` where they are
+    not. Its rounding is fla's (mamba_ssm's without the delta rule); the accurate backward is the portable
+    math's token adjoint. Without the delta rule there is no system: the corrected values are the values
+    gated, `u = v beta`, whose gradient `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v
+    du)`, and the memory walks back with no `w^T dv`; a `skip` `[HV]` (Mamba2's `D`, `mainloop.forward`'s)
+    adds `D do` to `dv`, its own gradient `sum(v do)` (`dskip`, None without a skip)."""
+    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms, an fp32 call's under them alone")
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
@@ -198,12 +196,12 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     else:
         dv, dbeta, dskip = _gate_back(run, call, dv2, gated, laid_do, skip)
         dk_w, after_w, decay_w = None, 0.0, 0.0
-    # Each token's decay's gradient, the launches' (`algebra.summed_back` is linear in its terms) and the
+    # Each token's decay's gradient, the launches' (`algebra.summed_ranges` is linear in its terms) and the
     # memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from the
     # chunk's start, every token's.
     memory = memory.reshape(-1, heads, chunks, call.block).sum((0, 3))
     ending = (run.hi + run.lo).reshape(heads, chunks, CHUNK)[..., -1]
-    # The query/key launch's range terms each token's through them (`algebra.summed_back`'s ranges' part):
+    # The query/key launch's range terms each token's through them (`algebra.summed_ranges`):
     # `after` from each token to the chunk's end, `leaving` from its start to before it.
     after, leaving = (x.sum(0).reshape(heads, chunks, CHUNK) for x in (after, leaving))
     ranges = algebra.summed_ranges(after + after_w, leaving)
@@ -251,26 +249,13 @@ def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_d
 
 
 # The fast backward of a decay a head under the delta rule (fla's DAG through the algebra's backward tile
-# functions, `algebra.local_gradient` ... `algebra.summed_back`), a 16-bit call's: the memory's reverse
+# functions, `algebra.local_gradient` ... `algebra.summed_ranges`), a 16-bit call's: the memory's reverse
 # recurrence a sequence at a time (`_reverse`), each chunk's scores' gradient (`_scores_back`), the queries',
 # keys' and weights' gradients a key block of a chunk at a time (`_query_key`), and the WY representation's
 # (`_system_back`, `_values_back`, `_keys_back`); each launch writes its decay's terms a chunk and value
 # head, its pairs' summed token by token (`summed_pairs`) and its ranges' by XLA's cumulative sums, which
 # XLA adds.
 
-
-def _value_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple],
-                 consumers: int = 1) -> int:
-    """A launch's value block where it takes a value row a block at a time: the call's value width, halved
-    while its register model (`held(block)`, `_Held`, beside its addresses into its staging and landing
-    tiles there, `staged(block)`, as `mainloop._key_block` prices them) is past a consumer thread's registers
-    (`Family.registers`) and the block stays whole blocks (`_Call.block`); the narrowest where none holds,
-    which the launch then refuses."""
-    block, family = call.value_width, call.family
-    while block > call.block and (held(block).registers(family, _addressed(*staged(block)))
-                                  > family.registers(consumers)):
-        block //= 2
-    return block
 
 
 def _local_back_held(call: _Call, vb: int) -> _Held:
@@ -301,8 +286,9 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     bytes a thread on an H100's."""
     width, value_width, family = call.width, call.value_width, call.family
     given, grads = call.given, _value_grads(call)
-    vb = _value_block(call, functools.partial(_local_back_held, call),
-                      functools.partial(_local_back_staged, call))
+    # A value row a block at a time, from the whole width down to whole blocks (`_Call.block`).
+    vb = _fitting_block(call, functools.partial(_local_back_held, call),
+                        functools.partial(_local_back_staged, call), call.value_width, call.block)
 
     def program(at, q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
@@ -644,16 +630,12 @@ def _query_key_split(call: _Call) -> int:
     gradient's blocks) fit the block's shared memory (`generation.shared_budget`), a block where none does:
     an fp32 call's two parts at Qwen3.5-27B's widths took 237824 bytes and a 256-wide value row's 215040 on
     an A100, past its 166912 (fp32-plan-sm90 at cdcd620ef, wide-backward). Halved instead, 192 columns took
-    96, a block and a half, and the split's programs read no column past their first block's."""
-    held, memories, given = call.held, call.memories, call.given
-
+    96, a block and a half, and the split's programs read no column past their first block's. Each split's
+    bytes are the launch's own (`_allocated`, as `_kernel` lays it: its streams one deep, its landing)."""
     def streamed(vq: int) -> int:
-        operands = [(held, CHUNK, vq), (given, CHUNK, vq), *([(held, CHUNK, vq)] if call.delta else []),
-                    (memories, call.block, vq), (memories, call.block, vq), (given, CHUNK, call.block),
-                    (given, CHUNK, call.block), (_score_grads(call), CHUNK, CHUNK)]
-        landed = CHUNK * call.block * (jnp.dtype(held.stored).itemsize + 4)
-        return landed + sum(rows * columns * jnp.dtype(operand.stored).itemsize * operand.parts
-                            for operand, rows, columns in operands)
+        tiles, _ = _query_key_launched(call, vq)
+        _, scope, _, _ = _allocated(call, tiles, (), _query_key_landing(call, call.value_width // vq))
+        return resources.shared_bytes(call.family, scope(1))
 
     budget = generation.shared_budget(call.target)
     widths = [vq for vq in range(call.value_width, 0, -call.block) if call.value_width % vq == 0]
@@ -713,6 +695,14 @@ def _query_key_held(call: _Call) -> _Held:
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block), (memories, call.block,
                                                                                       call.block)),
         summed))
+
+
+def _query_key_landing(call: _Call, splits: int) -> dict:
+    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient (fp32 where there are two
+    splits or more) and the queries' and keys' sums."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    return {"weights": held.landing(CHUNK, call.block) if splits == 1 else ((CHUNK, call.block), jnp.float32),
+            "sums": ((CHUNK, call.block), jnp.float32)}
 
 
 def _query_key_launched(call: _Call, vq: int) -> tuple[dict, tuple]:
@@ -846,9 +836,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=_taken(10),
-        work=work, held=_query_key_held(call),
-        landing={"weights": held.landing(CHUNK, call.block) if splits == 1
-                 else ((CHUNK, call.block), jnp.float32), "sums": ((CHUNK, call.block), jnp.float32)})(
+        work=work, held=_query_key_held(call), landing=_query_key_landing(call, splits))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
     if splits > 1:

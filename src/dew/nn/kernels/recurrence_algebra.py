@@ -80,7 +80,7 @@ PRODUCTS = {
     "inverse_l": "the inverse's gradient through the inverse, `L^T dX L^T`",
     "keys_dl": "the system's gradient against the keys, `dL k`, and the keys against themselves, `k k^T`",
     "keys_dlt": "the system's gradient, its rows scaled by the write gates, transposed against the keys",
-    "summed": "a decay's range terms against a triangle or the identity, each token's sum (`summed_back`)",
+    "summed": "a decay's range terms against a triangle or the identity, each token's sum (`summed_pairs`)",
 }
 """The algebra's products by name. A decay a key dimension weighs each term of `intra`'s and `scores`'
 contractions (`paired`), which a mainloop issues as a product of the factored operands within the range its
@@ -163,7 +163,7 @@ def decays(g, documents=None):
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
     whole, part = (jnp.where(inclusive, x, 0.0) for x in (whole, part))
-    return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(whole) * jnp.exp(part), 0.0)
+    return grown_from(hi, lo), jnp.where(inclusive, jnp.exp(whole) * jnp.exp(part), 0.0)
 
 
 LOG2_E = math.log2(math.e)
@@ -269,12 +269,12 @@ def between(later, earlier):
     return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
 
 
-def grown_from(hi, lo, exp, unit: float = 1.0):
+def grown_from(hi, lo):
     """`exp(hi + lo)` of a compensated exponent `(hi, lo)`, rounded about once: `exp(hi)` corrected by its
     first-order term in `lo` (`|lo|` is under half an ulp of `hi`, so the second is far below fp32's
-    rounding), `exp` the base's exponential and `unit` the derivative of its log at one (ln 2 for `exp2`)."""
-    grown = exp(hi)
-    return grown + grown * (lo * unit)
+    rounding)."""
+    grown = jnp.exp(hi)
+    return grown + grown * lo
 
 
 def _ranged(decay, dg):
@@ -966,9 +966,9 @@ def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value,
 # `dew.nn.kernels.fla_gdn` backward kernels): the transposes of the forward launches' products, each taken as
 # a product of tiles a mainloop holds as they are or reads transposed, no register tile transposed. A
 # decay's gradient leaves as its terms, the pairs `[C, C]` (each `(i, j)` a term through the prefix's range
-# `(j, i]`) and each token's terms through the range from its chunk's start `[C]`, which `summed_back`
-# sums token by token. The accurate backward is the recurrence's own adjoint a token at a time
-# (`recurrence_chunk.chunk_delta_rule`'s).
+# `(j, i]`) and each token's terms through the range from its chunk's start `[C]`, which `summed_pairs`
+# and `summed_ranges` sum token by token. The accurate backward is the recurrence's own adjoint a token at a
+# time (`recurrence_chunk.chunk_delta_rule`'s).
 
 
 def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, out_grads: TileLoad,
@@ -1096,7 +1096,7 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     inference ran out of fuel laying (kda-lower5-sm90 at 6e03eb57e). Each sum over the value blocks issued
     into one accumulator (`summed`, `memory_gradients`'): a list of each block's products, their accumulators
     at once, spilled 744 bytes a thread on an H100 (kda-gate3 at ee3734584). `columns`, where given, sums a
-    tile's columns (the mainloop's, `summed_back`'s)."""
+    tile's columns (the mainloop's, `summed_pairs`')."""
     decays = raised(*gates)
     to_last = range_decay(*(half[None, :] for half in last), *gates)
     # Each sum in turn, the log decay's terms gathered as each one's term is formed, so one sum and its
@@ -1265,7 +1265,7 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     values' own `value_grads(j)` and the memories the chunk entered and left `entered(c, j)`, `leaving(c, j)`
     (key block `c`), then the gates and `dq += ds k`, `dk += ds^T q` (none where `ds` is None: a caller
     summing the scores' gradient over value heads first takes them once), each key block's to `emit('dq' |
-    'dk' | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
+    'dk' | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_ranges`'),
     `leaving` `[C]` each token's write into the memory the chunk leaves. `memory_decay` is the decay's
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
     summing key blocks apart adds it once). Without the delta rule (`value_grads` None) there are no weights
@@ -1401,7 +1401,7 @@ def keys_gradient(lower, keys: TileLoad, columns: int, w_grads: TileLoad, d_l, b
     `d_l` (`system_gradient`'s, a tile its products read as they are, in `dtype`): each key block's gradient,
     through `w` (`X^T dw` scaled, 'inverse_t') and through the system (`dL k` and `dL^T (k beta)`,
     'keys_dl', 'keys_dlt'), to `emit('keys', c, dk)` as it is final. Returns beta's gradient through `w` and
-    the system, the decay's range terms through `w` (`summed_back`'s `after`) and its pair terms
+    the system, the decay's range terms through `w` (`summed_ranges`' `after`) and its pair terms
     `dL (k k^T) beta` (`summed_pairs`'), fp32."""
     decay = raised(gate, low)
     narrow = d_l if isinstance(d_l, jax.Array) else d_l.value()
@@ -1439,41 +1439,28 @@ def _summed(terms) -> jax.Array:
     return functools.reduce(jnp.add, terms)
 
 
-def summed_back(pairs, after, leaving=None, issue: Issue = portable,
-                columns: Callable[[jax.Array], jax.Array] | None = None):
-    """The gradient of each of a chunk's per-token decays from the gradients of terms through ranges of its
-    prefix: `pairs` `[C, C]` fp32, each `(i, j)` a term through `(j, i]` (strictly lower), `after` `[C]`,
-    each `s` a term through the chunk's start to `s`, and `leaving` `[C]` where given, each `t` a term
-    through `(t, C - 1]`, a pair of the chunk's last row. Each token sums only the terms whose range holds it,
-    `sum_{j < t <= i} pairs + sum_{s >= t} after + sum_{j < t} leaving`: each row's pairs before `t` a
-    product with the strictly upper ones ('summed', an `Exact` triangle: no pair added and taken back), each
-    `leaving` term in its own row above the diagonal (a vector a row each, as a mainloop's registers lay
-    it), and each token's sum its column's (`columns`, a mainloop's own reduction across its rows' warps,
-    where given).
-    Linear in its terms: a sum of launches' terms sums the same as their sums, and it is its pairs' sum
-    (`summed_pairs`) and its ranges' (cumulative sums of `after` and `leaving`), which launches of their own
-    may each take."""
-    lag = _lags(pairs.shape)
-    through = issue("summed", pairs, Exact(jnp.where(lag < 0, 1.0, 0.0)))
-    above = 0.0 if leaving is None else leaving[:, None]
-    terms = jnp.where(lag >= 0, through + after[:, None], above)
-    return jnp.sum(terms, axis=0) if columns is None else columns(terms)
-
-
 def summed_ranges(after, leaving):
-    """`summed_back`'s ranges' part over the last axis, a chunk's tokens, from each token's terms summed
-    across launches: `sum_{s >= t} after + sum_{j < t} leaving` each token's, `after` from it to the chunk's
-    end and `leaving` from the chunk's start to before it, both cumulative sums. `leaving`'s sum before each
-    token takes no token's own term added and taken away: a token's own `leaving` is order one where the
-    terms before it are `exp(-30)`'s under steep decays, which the sum rounded away (an H100's decay gradient
-    under decays near zero 140 times the port's distance from float64, whose `leaving` enters its strictly
-    lower pairs, fla `chunk_bwd_dqkwg`; SE-numerics-h100-fd61e11eeb)."""
+    """A chunk's per-token decays' gradient from the terms through ranges of its prefix, its ranges' part
+    (beside `summed_pairs`; linear in its terms, so a sum of launches' terms sums the same as their sums),
+    over the last axis, a chunk's tokens, from each token's terms summed across launches: `after` `[C]` each
+    `s` a term through the chunk's start to `s`, `leaving` `[C]` each `t` a term through `(t, C - 1]`, a pair
+    of the chunk's last row: `sum_{s >= t} after + sum_{j < t} leaving` each token's, `after` from it to the
+    chunk's end and `leaving` from the chunk's start to before it, both cumulative sums. `leaving`'s sum
+    before each token takes no token's own term added and taken away: a token's own `leaving` is order one
+    where the terms before it are `exp(-30)`'s under steep decays, which the sum rounded away (an H100's decay
+    gradient under decays near zero 140 times the port's distance from float64, whose `leaving` enters its
+    strictly lower pairs, fla `chunk_bwd_dqkwg`; SE-numerics-h100-fd61e11eeb)."""
     before = jnp.concatenate((jnp.zeros_like(leaving[..., :1]), jnp.cumsum(leaving[..., :-1], -1)), -1)
     return jnp.flip(jnp.cumsum(jnp.flip(after, -1), -1), -1) + before
 
 
 def summed_pairs(pairs, issue: Issue = portable, columns: Callable[[jax.Array], jax.Array] | None = None):
-    """`summed_back`'s pairs' part, `sum_{j < t <= i} pairs` each token's."""
+    """A chunk's per-token decays' gradient from the terms through ranges of its prefix, its pairs' part
+    (beside `summed_ranges`): `pairs` `[C, C]` fp32, each `(i, j)` a term through `(j, i]` (strictly lower),
+    each token summing only those whose range holds it, `sum_{j < t <= i} pairs`: each row's pairs before
+    `t` a product with the strictly upper ones ('summed', an `Exact` triangle: no pair added and taken back),
+    and each token's sum its column's (`columns`, a mainloop's own reduction across its rows' warps, where
+    given)."""
     lag = _lags(pairs.shape)
     terms = jnp.where(lag >= 0, issue("summed", pairs, Exact(jnp.where(lag < 0, 1.0, 0.0))), 0.0)
     return jnp.sum(terms, axis=0) if columns is None else columns(terms)

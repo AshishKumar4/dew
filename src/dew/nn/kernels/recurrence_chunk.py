@@ -1067,7 +1067,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     run = {"family": issuing, "interpret": interpret, "tiles": tiles, "floor": floor,
            "ranged": template.ranged(dtype, delta, bound)}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, floor=floor)
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4)
             and mainloop_backward.backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=template.Mosaic.launched(), starts=starts,
@@ -1382,11 +1382,11 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
 (`ssd_kernel_runs`)."""
 
 
-def scan_case(x, B, chunk_size: int, *, tpu: bool = True, padded: bool = False, call: base.Call | None = None,
+def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
               product: str = 'forward') -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
-    (`_scan_widths`, `_rated_scan`); on a TPU where `tpu` asks, the platform its Pallas scan builds for
+    (`_scan_widths`, `_rated_scan`); on a TPU, the platform its Pallas scan builds for
     (`ssd_kernel_platform`); the template's `call` and the `product`."""
     widths = (x.shape[-1], B.shape[-1], chunk_size)
     if padded:
@@ -1395,7 +1395,7 @@ def scan_case(x, B, chunk_size: int, *, tpu: bool = True, padded: bool = False, 
     return ScanCase(varying=bool(jax.typeof(x).mat.varying),
                     dtype=jnp.dtype(x.dtype), widths=widths,
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
-                         if tpu and generation.backend() == 'tpu' else None),
+                         if generation.backend() == 'tpu' else None),
                     call=call, family=family, product=product)
 
 
@@ -1408,17 +1408,17 @@ def fast_rounding() -> bool:
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
-                max_segments: int | None = None, product: str = 'forward', report: bool = True) -> str:
+                max_segments: int | None = None, product: str = 'forward') -> str:
     """The kernel the scan's selector (`SCAN`) gives a rated scan over these operands (`_rated_scan`'s:
     `value` the SSD's `x`, `key` its `B`, `query` its `C`) for `product` ('forward', 'training'), the
     template's implementations bound to it, on the target (`generation`'s, an assumed one's within
-    `assumed`): reported as its route, or not where not `report` (`selected`)."""
+    `assumed`), reported as its route."""
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=1.0, delta=False, wide=True, rounded=fast_rounding())
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
-    return select(SCAN, case).kernel if report else selected(SCAN, case).name
+    return select(SCAN, case).kernel
 
 
 SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
@@ -1480,8 +1480,8 @@ class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
     (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
     its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
-    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`fast_rounding`),
-    its device's instruction family (None off a GPU) and the `product`."""
+    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`fast_rounding`)
+    and its device's instruction family (None off a GPU); the forward and the training step route alike."""
 
     varying: bool
     dtype: np.dtype
@@ -1491,7 +1491,6 @@ class SelectiveCase:
     states: int
     fast: bool
     family: str | None = None
-    product: str = 'forward'
 
 
 SELECTIVE_CHUNK = 32
@@ -1556,10 +1555,9 @@ it takes the call, else the portable math. On an H100 the template's training st
 8x2048x5120 against mamba_ssm's 7.21 (mamba1-scan2-h100-ac0dc3a9b)."""
 
 
-def selective_kernel(x, A, B, C, *, product: str = 'forward', report: bool = True) -> str:
+def selective_kernel(x, A, B, C) -> str:
     """The kernel the selective scan's selector (`SELECTIVE`) gives a scan over `x` `[B, S, D]` with rates
-    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]` for `product` ('forward', 'training'), on the
-    target: reported as its route, or not where not `report`."""
+    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]`, on the target, reported as its route."""
     from .templates import bundles
 
     # A GPU's family where a bundle claims it (consumer Blackwell's and tcgen05's have none yet).
@@ -1570,8 +1568,8 @@ def selective_kernel(x, A, B, C, *, product: str = 'forward', report: bool = Tru
                          state_dtype=min(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C)),
                                          key=lambda dtype: dtype.itemsize),
                          length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], fast=fast_rounding(),
-                         family=family, product=product)
-    return select(SELECTIVE, case).kernel if report else selected(SELECTIVE, case).name
+                         family=family)
+    return select(SELECTIVE, case).kernel
 
 
 def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
@@ -1601,5 +1599,5 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, B, C, product=product), run, x, dt, A, B, C, D,
+    return _per_product(lambda product: selective_kernel(x, A, B, C), run, x, dt, A, B, C, D,
                         state)

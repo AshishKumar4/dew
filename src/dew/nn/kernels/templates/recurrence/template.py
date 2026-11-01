@@ -124,8 +124,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         delta = arguments.get("delta", True)
         fast = backward and mainloop_backward.fast_backward_form(
-            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4,
-            floor=arguments.get("floor"))
+            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4)
         # The skip fused into the output and reverse walk where given (its tiles their registers').
         skip = arguments.get("skip")
         return _planned(shapes, config, family, target, arguments.get("max_segments"), delta, bool(fast),
@@ -321,8 +320,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
                                                      arguments.get("rounded", False), dtype,
-                                                     per_key=arguments["g"].ndim == 4,
-                                                     floor=arguments.get("floor"))
+                                                     per_key=arguments["g"].ndim == 4)
         if not forms:
             return False
         fits = self.fits(ba, target)
@@ -414,7 +412,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
             return False
-        taken = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
+        taken = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype) is None
         if not (taken and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))

@@ -78,13 +78,11 @@ def exchange_scratch(positions: int):
     return plgpu.SMEM((positions + positions // BANKS,), jnp.float32)
 
 
-def to_striped(values: jax.Array, staged, *, interpret: bool = False) -> jax.Array:
+def to_striped(values: jax.Array, staged) -> jax.Array:
     """`values`, fp32 `[T]` in `blocked(T)`'s layout, in `striped(T)`'s through `staged`
     (`exchange_scratch`): a thread's positions stored a word at a time, each `BANKS` words one more apart,
     and read back across the threads; unpadded, a thread's 64 bytes stored at once conflicted on 70% of
     an H100's shared stores (mamba1-scan-h100-7d3152837's ncu, 252M of 360M wavefronts)."""
-    if interpret:
-        return values
     positions = values.shape[0]
     moved: Callable[..., jax.Array] = plgpu.inline_mgpu(
         arg_types=(blocked(positions), plgpu.RefType()),

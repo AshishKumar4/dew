@@ -169,7 +169,7 @@ class Tcgen05:
 
 
 TCGEN05 = Tcgen05()
-"""The bundle (`bundles.tensor_memory`)."""
+"""The bundle, which the templates' Blackwell mainloops import (no route reaches them yet)."""
 
 
 def swizzled(dtype, contraction: int) -> tuple:

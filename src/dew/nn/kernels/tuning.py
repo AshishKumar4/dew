@@ -750,14 +750,12 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     return op.operands([leaves[index] for index in places], 0), fill
 
 
-def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timings:
+def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels, each run after `FLUSH_BYTES` are read, so every config starts
-    with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
-    reads the times, or a stand-in with its `Cupti`."""
-    if profiler is None:
-        from jax.experimental.mosaic.gpu import profiler
+    kernels (Mosaic GPU's profiler's `Cupti`), each run after `FLUSH_BYTES` are
+    read, so every config starts with its operands out of cache."""
+    from jax.experimental.mosaic.gpu import profiler
 
     arrays, fill = materialized(op, ba)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
@@ -985,13 +983,6 @@ def settled(launches: str) -> bool:
              if isinstance(op := ba.op, KernelOp)]
     with reading():
         return _settle(found, measure=False) == 0
-
-
-def missing(lowered: jax.stages.Lowered) -> int:
-    """How many launches of `lowered`, a program lowered under `launches`,
-    have no stored pick on this process."""
-    return sum(isinstance(op := ba.op, KernelOp) and _pick(op.keyed(ba)) is None
-               for ba in _bound_args(lowered))
 
 
 def _settle(found: list[Launch], *, measure: bool) -> int:

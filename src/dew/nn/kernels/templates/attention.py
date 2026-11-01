@@ -75,17 +75,9 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
     return seen if ids is None else seen & (ids[0] == ids[1])
 
 
-def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
-    """Whether each of `keys` (key indices, broadcasting) is visible to each of `queries` (query
-    indices) in batch row `row` (`within`)."""
-    ids = (None if spans.query_ids is None or spans.key_ids is None
-           else (spans.query_ids[row][queries], spans.key_ids[row][keys]))
-    return within(keys, spans.start[row][queries], spans.end[row][queries], ids)
-
-
 def dense(spans: KeySpans) -> jax.Array:
-    """`visible` over every query and key: `[B, Q, K]` boolean, by broadcasting alone (`within`), so a
-    batch-sharded call's spans take no gather."""
+    """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
+    alone, so a batch-sharded call's spans take no gather."""
     keys = jnp.arange(spans.keys)[None, None, :]
     ids = (None if spans.query_ids is None or spans.key_ids is None
            else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))

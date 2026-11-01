@@ -234,7 +234,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     with pytest.raises(REFUSED):
         jax.eval_shape(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)), operands)
     family = mainloop.family_of() or bundles.INTERPRETED
-    if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, hooks.floor):
+    if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
             jax.eval_shape(functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), floor=hooks.floor),

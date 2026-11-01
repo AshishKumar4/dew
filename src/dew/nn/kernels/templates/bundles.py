@@ -1,19 +1,19 @@
 """The Mosaic GPU Family bundles every template's launches derive their kernels on (`mosaic.Family`), one
 registry keyed by the device's instruction family (`generation.family`), each bundle an issuer composed with
 an execution policy: Hopper's warpgroup MMA's (`mosaic_sm90.WGMMA`, and its layout without a producer,
-`mosaic_sm90.FED`), Ampere's mma.sync's on cp.async (`mosaic_sm80.Mma`) and consumer Blackwell's mma.sync
-on TMA rings (`MmaFed`); a launch names its bundle by the bundle's `name` (`named`). Blackwell's tcgen05,
-whose products accumulate in tensor memory, has its own bundle for the templates' Blackwell mainloops
-(`tensor_memory`, `mosaic_sm100`), outside `of`. A device of a family with no bundle here (a TPU's) runs no
-Mosaic GPU mainloop: every template's Mosaic launch is ineligible there, and its call takes the next route by
-legality."""
+`mosaic_sm90.FED`), Ampere's mma.sync's on cp.async (`mosaic_sm80.Mma`) and consumer Blackwell's mma.sync on
+TMA rings (`MmaFed`); a launch names its bundle by the bundle's `name` (`named`). Blackwell's tcgen05, whose
+products accumulate in tensor memory, has its own bundle (`mosaic_sm100.TCGEN05`), which the templates'
+Blackwell mainloops, not yet in any route, import themselves. A device of a family with no bundle here (a
+TPU's) runs no Mosaic GPU mainloop: every template's Mosaic launch is ineligible there, and its call takes the
+next route by legality."""
 
 import dataclasses
 
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100
+from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs a template's mainloop by off a GPU of a family a bundle claims (a
@@ -50,14 +50,6 @@ def of(generation_name: str, dtype) -> mosaic.Family | None:
     return None
 
 
-def tensor_memory(generation_name: str) -> mosaic_sm100.Tcgen05 | None:
-    """The bundle a template's Blackwell mainloop runs on a device of `generation_name` whose products
-    accumulate in tensor memory (`generation.family` tcgen05: a B200's, a B300's; `mosaic_sm100`), apart
-    from `of`'s, whose threads hold their accumulators; None elsewhere."""
-    architecture = generation.architecture(generation_name)
-    if architecture is None or architecture.family != mosaic_sm100.TCGEN05.name:
-        return None
-    return mosaic_sm100.TCGEN05
 
 
 def layouts(generation_name: str, dtype) -> tuple[mosaic.Family, ...]:

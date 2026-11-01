@@ -19,7 +19,7 @@
 -> [g, k, n]`. They are the body of `jax/_src/lax/pallas_lowerings/gpu/
 ragged_dot.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801;
 license header above), which no jax wheel ships: `DEFAULT_BLOCK_M` through
-`_hyperparam_selection_rule`, restyled to this tree's lint gate and moved
+`tgmm` (its unused block-size heuristic dropped), restyled to this tree's lint gate and moved
 from `jax._src` imports to their public equivalents, with lines of logic
 changed and marked `# Dew:`: the prologue and epilogue hooks with their side
 operands (`_side_tile`), tgmm's output cast, and gmm's zeroing when every
@@ -35,7 +35,6 @@ without one. The kernels multiply in
 the GPU's TF32 rate.
 """
 
-import math
 import typing
 from functools import partial
 from types import SimpleNamespace
@@ -455,7 +454,7 @@ def _tgmm_ragged_dot_kernel(
 
 @partial(jax.jit, static_argnames=(
   "block_m", "block_n", "block_k", "interpret", "compute_dtype", "acc_dtype", "num_warps", "num_stages",
-  "chunk_m", "out_dtype", "prologue", "prologue_axes", "exact_sums"))
+  "out_dtype", "prologue", "prologue_axes", "exact_sums"))
 def tgmm(
   x: jax.Array,  # [m, k]
   y: jax.Array,  # [m, n]
@@ -468,7 +467,6 @@ def tgmm(
   acc_dtype: DTypeLike | None = np.float32,
   num_warps: int | None = None,
   num_stages: int | None = None,
-  chunk_m: int = CHUNK_M,
   out_dtype: DTypeLike | None = None,
   *,
   prologue=None,
@@ -481,7 +479,6 @@ def tgmm(
   Dew: `prologue(rows, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x`'s rows
   before its transposed product; side operands as `gmm`'s, along 'rows' and 'depth'. `exact_sums` as
   `gmm`'s."""
-  del chunk_m
   msg = "This tgmm kernel only supports (m, k) x (m, n) -> (g, k, n), but got "
   msg += f"{x.shape=} {y.shape=}"
   assert y.ndim == 2 and x.ndim == 2 and x.shape[0] == y.shape[0], msg
@@ -527,17 +524,3 @@ def tgmm(
       ),
       name="tgmm_ragged_dot",
     )(x, y, group_sizes, group_offsets, *prologue_operands)
-
-
-def _hyperparam_selection_rule(dtype: np.dtype):
-  smem_size = 100 * 1024  # 100 KiB
-  ideal_operand_size = smem_size / dtype.itemsize / 4
-  tile_m = 2 ** round(math.ceil(math.log2(math.sqrt(ideal_operand_size))))
-  tile_k, tile_n = tile_m // 2, tile_m
-  while tile_m > 16:
-    if tile_m * tile_k * 4 * dtype.itemsize <= smem_size:
-      return {"block_m": tile_m, "block_k": tile_k, "block_n": tile_n}
-    tile_m //= 2
-    tile_k, tile_n = tile_m // 2, tile_m
-  return {"block_m": tile_m, "block_k": tile_k, "block_n": tile_n}
-
