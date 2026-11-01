@@ -68,16 +68,13 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from jax.typing import DTypeLike
 
-    from dew.data.pipeline import DeviceStep, ObjectiveData
+    from dew.data.pipeline import ObjectiveData
     from dew.data.text import Tokenizer
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.images import TextToImage
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, SavedRun, TextGeneration
     from dew.inputs import InputSpec
-    from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
-    from dew.rl.env import Env
-    from dew.sampling.guidance import Guidance
     from dew.state import TrainState
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
@@ -1015,7 +1012,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 donate_argnames: tuple[str, ...] = (),
-                holds: tuple[DeviceStep | AutoEncoder | Guidance | Env, ...] = (),
+                holds: tuple[object, ...] = (),
                 modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
