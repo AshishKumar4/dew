@@ -319,7 +319,8 @@ def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
                 "num_local_experts": 4, "num_experts_per_tok": 2, "max_position_embeddings": 131072,
                 "original_max_position_embeddings": 4096,
                 "rope_scaling": {"type": "longrope", "long_factor": [1.0 + index / 64 for index in range(64)],
-                                 "short_factor": [1.0] * 64, "original_max_position_embeddings": 4096}}),
+                                 "short_factor": [1.0] * 64, "long_mscale": 1.243, "short_mscale": 1.243,
+                                 "original_max_position_embeddings": 4096}}),
     # CodeGen splits its fused qkv by four groups of heads (transformers' mp_num, ledger 3068).
     ("codegen", {"n_embd": 1024, "n_head": 16, "n_layer": 2, "rotary_dim": 32, "hidden_size": None,
                  "num_attention_heads": None, "num_hidden_layers": None, "num_key_value_heads": None,

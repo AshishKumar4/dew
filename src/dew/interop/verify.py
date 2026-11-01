@@ -383,6 +383,9 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     small_head_dim = _HEAD_DIM if key('head_dim') in hf_config else small_hidden // small_heads
     partial = _records.number(hf_config.get('partial_rotary_factor', 1.0), 'partial_rotary_factor')
     rotary_half = int(small_head_dim * partial) // 2
+    if isinstance(rotary := hf_config.get('rotary_dim'), int):
+        # A stated rotary width (CodeGen's, GPT-J's) keeps its share of the head (`_HEAD_DIM`'s).
+        fields['rotary_dim'] = max(2, rotary * small_head_dim // head_dim // 2 * 2)
     for record in ('rope_parameters', 'rope_scaling'):
         if isinstance(rope := hf_config.get(record), Mapping):
             fields[record] = _within_probe(rope, rotary_half)
