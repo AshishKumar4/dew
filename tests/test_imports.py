@@ -144,6 +144,38 @@ print(json.dumps("dew.training.trainer" in sys.modules))
     assert json.loads(run.stdout.splitlines()[-1]) is False
 
 
+FOREIGN = {
+    "dew.config": ("dew.data.images", "dew.data.audio", "dew.data.video"),
+    "dew.config.lm": ("dew.data.images", "dew.data.audio", "dew.data.video", "dew.diffusion.presets",
+                      "dew.nn.vision", "dew.nn.autoencoders", "dew.objectives.diffusion"),
+    "dew.config.diffusion": ("dew.nn.backbones.causal_transformer", "dew.nn.moe", "dew.nn.mla",
+                             "dew.objectives.lm", "dew.data.chat"),
+    "dew.decision.config": ("dew.data.images", "dew.data.video", "dew.diffusion.presets",
+                            "dew.nn.autoencoders", "dew.inference.images"),
+}
+"""Each run configuration's module and the modules outside its domain it must not import: an LM's no image
+diffusion, vision tower, autoencoder or media data; a diffusion model's no decoder language model or chat
+data; a decision task's no image generation or autoencoder (row 2042)."""
+
+
+@pytest.mark.parametrize("module", sorted(FOREIGN))
+def test_a_run_configuration_imports_its_own_domain_alone(module):
+    """A run configuration's module imports, in a fresh interpreter, none of the modules outside its
+    domain (`FOREIGN`): a change there re-runs none of its tests."""
+    script = f"""
+import json, sys
+import {module}
+print(json.dumps(sorted(sys.modules)))
+"""
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    loaded = json.loads(run.stdout.splitlines()[-1])
+    foreign = FOREIGN[module]
+    assert [name for name in loaded
+            if name in foreign or name.startswith(tuple(f"{prefix}." for prefix in foreign))] == []
+
+
 def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
     """Only `dew.rl` and `dew.objectives.rl` import `dew.rl`, and `dew.rl` imports nothing of
     `dew.training` (docs/design/architecture.md). The test reads every module's imports, absolute
