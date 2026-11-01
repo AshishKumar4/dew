@@ -36,6 +36,13 @@ class PoolRefused(AssertionError):
         self.held = held
 
 
+def drawing() -> bool:
+    """Whether this process is a map task (DRAWS): it records a site's units and judges nothing, so a site
+    leaves to its judge the work only a judge reads (its run's own checks beside its draws), which the judge
+    does in full."""
+    return bool(os.environ.get(DRAWS))
+
+
 def site_id(label: str) -> str:
     """A site's identity across its map tasks and its judge: the Python it runs on, its test's id (pytest's,
     the same test in each task) and its label, so neither two tests' sites of one label nor one site's runs

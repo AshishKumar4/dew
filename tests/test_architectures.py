@@ -28,6 +28,7 @@ from architecture_cases import CASES, IDS, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKE
 from diffusion_stubs import StubText
 from diffusion_support import images_of
 from jepa_cases import MASK
+from map_judge import drawing
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -467,14 +468,17 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
 
     seeds = LAYOUT_SEEDS[case.name]
     mesh = LAYOUTS[layout]
-    _, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)
-    _, state, _ = run_case(case, tmp_path, mesh, state=copied(), steps=steps)
     drawn = {"one device": drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps),
              layout: drawn_steps(case, tmp_path, mesh, None, initial, steps)}
+    # A map task of a sharded cell (`map_judge.drawing`) records its draws alone: the fits, their bits
+    # and their placement are its judge's, which runs the cell whole but for the draws it pools.
+    fits = () if drawing() else (
+        run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)[1],
+        run_case(case, tmp_path, mesh, state=copied(), steps=steps)[1])
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
-    for fitted, stepped in zip((alone, state), drawn.values(), strict=True):
+    for fitted, stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
         ours = stepped(*own)
         for name, tree in ours.items():
             held = jax.device_get(getattr(fitted, name))
@@ -488,6 +492,9 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
     assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
                     seeds=seeds, truth_fn=truth, orders=orders)
+    if drawing():
+        return
+    state = fits[1]
     if mesh.fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return
