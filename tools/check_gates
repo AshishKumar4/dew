@@ -18,7 +18,7 @@ api-pages	sh tools/base_history.sh && uv run --no-project --with-requirements si
 api-tests	uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
 # The committed public surface is what tools/api_report.py reads from the checkout: a change to a public signature
 # regenerates docs/api/report.txtar in the same commit, so a stale report fails a head's precheck, never its train.
-api-report	JAX_PLATFORMS=cpu "$PYTHON" tools/api_report.py | diff -u docs/api/report.txtar - || { echo 'the public surface moved: run python tools/api_report.py --write and commit docs/api/report.txtar'; exit 1; }
+api-report	JAX_PLATFORMS=cpu "$PYTHON" tools/api_report.py --check
 install-script	"$PYTHON" site/scripts/gen_install.py --check
 theme	"$PYTHON" site/scripts/gen_theme.py --check
 model-pin	"$PYTHON" site/scripts/gen_pin.py --check
