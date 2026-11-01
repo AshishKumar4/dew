@@ -84,7 +84,8 @@ def test_products_with_a_shared_operand_join_into_one():
     def draw(seed):
         return rows(seed, (8, 64), (8, 64), (8, 64))
 
-    assert_as_exact(jax.jit(algebra.rewritten(contracted)), jax.jit(contracted), draw, "two products", seeds=16)
+    assert_as_exact(jax.jit(algebra.rewritten(contracted)), jax.jit(contracted), draw, "two products",
+                    seeds=16)
 
 
 def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
