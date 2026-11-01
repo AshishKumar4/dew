@@ -224,19 +224,14 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
     steps = np.stack(steps)
     np.testing.assert_array_equal(steps.argmax(-1), expected[6:])
 
-    def decoded(prompt, tokens):
-        # The prompt's last row, then a row for each drawn token but the last, fed a step at a time.
-        written = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]
-        logits, written = model.apply({**variables, **written}, prompt[None], decode=True, mutable=['cache'])
-        rows = [logits[0, -1]]
-        for index in range(tokens.shape[0] - 1):
-            logits, written = model.apply({**variables, **written}, tokens[None, index:index + 1],
-                                          decode=True, mutable=['cache'])
-            rows.append(logits[0, -1])
-        return jnp.stack(rows)
+    # The prompt's last row, then a row for each drawn token but the last, fed a step at a time through
+    # the cache, each step's program compiled once for every draw (`decoding`), its logits unscored.
+    programs = (*decoding(model)[:3], lambda logits: logits)
+    decoded = as_given(lambda prompt, tokens: forced(programs, variables, prompt, tokens, prompt_rows=False))
+    forward = jax.jit(lambda ids: model.apply(variables, ids))
 
     def continuation(prompt, tokens):
-        return np.concatenate([prompt, tokens[:-1]])
+        return np.concatenate([prompt, tokens[:-1]])[None]
 
     tensors, vocabulary = tensors_of(loaded), loaded.config['vocab_size']
 
@@ -251,20 +246,15 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
     assert_as_exact(decoded, reference, draw, f"Dory's {tag} decoding", seeds=LOGITS_SEEDS,
                     truth_fn=truth)
     if mode == 'per_loop':
-        def whole(prompt, tokens):
-            return model.apply(variables, jnp.concatenate([prompt, tokens[:-1]])[None])[0, 5:]
+        whole = as_given(lambda prompt, tokens: forward(continuation(prompt, tokens))[0, 5:])
 
         def uncached(arm, prompt, tokens):
-            return arm.forward(continuation(prompt, tokens)[None])[0, 5:]
+            return arm.forward(continuation(prompt, tokens))[0, 5:]
 
         forward_reference, _ = transcribed(loaded.config, tensors, uncached, loops=loops)
         assert_as_exact(whole, forward_reference, draw, "Dory's forward over its continuation",
                         seeds=LOGITS_SEEDS, truth_fn=truth)
-        forward = jax.jit(lambda ids: model.apply(variables, ids))
-
-        def stepped(prompt, tokens):
-            return as_stepped(forward, jnp.concatenate([prompt, tokens[:-1]])[None], 6)[0, 5:]
-
+        stepped = as_given(lambda prompt, tokens: as_stepped(forward, continuation(prompt, tokens), 6)[0, 5:])
         assert_as_exact(decoded, stepped, draw, "Dory's per-pass cache against its forwards",
                         seeds=LOGITS_SEEDS, truth_fn=truth)
 
@@ -936,9 +926,9 @@ def decoding(model: CausalTransformer):
 
 
 def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Array:
-    """Dew's log-probabilities at each position of `prompt` followed by `tokens`, the prompt
-    prefilled and each token but the last decoded a step at a time through the cache (`programs`,
-    `decoding`'s), as a run that drew `tokens` computes them: the prompt's rows (its last alone, the
+    """Dew's rows at each position of `prompt` followed by `tokens`, scored by `programs`' last
+    (`decoding`'s, log-probabilities), the prompt prefilled and each token but the last decoded a step at
+    a time through the cache (`programs`), as a run that drew `tokens` computes them: the prompt's rows (its last alone, the
     vocabulary over that state alone, where `prompt_rows` is False), then a row a token."""
     opened, step, last, scored = programs
     ids = jnp.asarray(np.asarray(prompt, np.int32)[None])
