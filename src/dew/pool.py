@@ -12,6 +12,7 @@ jax's cluster detection when it is asked.
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import logging
 import os
@@ -115,12 +116,34 @@ def visible_gpus(visible: str) -> int:
     return sum(1 for device in visible.split(",") if device.strip())
 
 
+def cuda_driver() -> ctypes.CDLL | None:
+    """The CUDA user-mode driver library JAX's CUDA plugin loads, or None where none loads."""
+    try:
+        return ctypes.CDLL("libcuda.so.1")
+    except OSError as error:  # ctypes' answer for a library the loader does not find
+        _log.debug("no CUDA driver library loads: %s", error)
+        return None
+
+
+NO_DEVICE = 100
+"""`CUDA_ERROR_NO_DEVICE` (cuda.h): a driver that starts and finds no GPU this process may use."""
+
+
 def local_gpu_count() -> int | None:
     """GPUs this process may use: CUDA_VISIBLE_DEVICES when it is set,
-    since jax numbers only those, else every GPU nvidia-smi lists, None when
-    it cannot list them."""
+    since jax numbers only those, else every GPU the CUDA driver finds
+    (`cuDeviceGetCount`), whether or not the host ships nvidia-smi; None
+    where no driver library loads or it fails to start."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    return listed_gpus(("nvidia-smi", "-L")) if visible is None else visible_gpus(visible)
+    if visible is not None:
+        return visible_gpus(visible)
+    cuda = cuda_driver()
+    if cuda is None:
+        return None
+    started, count = cuda.cuInit(0), ctypes.c_int()
+    if started == NO_DEVICE:
+        return 0
+    return None if started or cuda.cuDeviceGetCount(ctypes.byref(count)) else count.value
 
 
 def slurm_tasks_here() -> int | None:
