@@ -91,7 +91,9 @@ def test_the_tool_runs_as_a_reader_runs_it_with_none_of_the_suites_settings(tmp_
     CPU arithmetic) reach it or its peak processes, whose context records what each saw (row 2784)."""
     from lane_environment import configured
 
-    suite = sorted(set(configured({})) - {"JAX_PLATFORMS"})
+    # XLA_FLAGS aside: Dew's own runtime sets its numerics flags in every process, and the suite's device
+    # count in it is the row's `devices`, which the peak test holds to one.
+    suite = sorted(set(configured({})) - {"JAX_PLATFORMS", "XLA_FLAGS"})
     (tmp_path / "marking.py").write_text(
         "import contextlib, json, os\n"
         "@contextlib.contextmanager\n"

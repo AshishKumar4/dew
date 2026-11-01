@@ -245,7 +245,7 @@ def test_a_step_row_times_the_optimizer_a_dew_train_run_of_its_case_steps():
 
     cases, models = load("benchmark_cases"), load("benchmark_models")
     [case] = [case for case in cases.cpu_smoke_cases() if case.architecture == "causal_transformer"]
-    case = dataclasses.replace(case, optimizer="adamw")
+    case = dataclasses.replace(case, optimizer="adamw", dtype="float32")
     params = {"dense": {"kernel": jnp.full((4, 3), 0.5), "bias": jnp.full((3,), 0.5)},
               "norm": {"scale": jnp.full((3,), 2.0)}}
     grads = jax.tree.map(lambda leaf: jnp.full_like(leaf, 0.25), params)
