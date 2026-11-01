@@ -17,6 +17,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
   the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
   through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
+- Dew requires its JAX build 0.12.0.1.post42, and its `cuda12` and `cuda13` extras install Dew's builds of
+  the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
+  (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
+  strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
+  (docs/installation.md lists each fix).
 - Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md),
   and through it on black, graphviz, anywidget and opentelemetry-api.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
