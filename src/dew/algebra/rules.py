@@ -172,5 +172,7 @@ def instances() -> Mapping[str, tuple[Callable, Callable, Callable]]:
         "linear: distributivity": (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y), rows),
         "linear: a row scalar out of a sum": (lambda x, s: jnp.sum(s[:, None] * x, -1),
                                               lambda x, s: s * jnp.sum(x, -1), scaled),
+        "linear: a scale through a contraction": (lambda x, y, a: jnp.dot(x, y.T) * 0.3,
+                                                  lambda x, y, a: jnp.dot(x * 0.3, y.T), rows),
         "identities: commutativity": (lambda x, y, a: x + y, lambda x, y, a: y + x, rows),
     }

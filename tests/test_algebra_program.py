@@ -183,3 +183,22 @@ def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rule
     assert_as_exact(jax.jit(algebra.rewritten(deep)), jax.jit(deep), draw, "two sums after a deep chain",
                     seeds=8)
 
+def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
+    """A contraction's result scaled by a scalar (a derived walk's `ds k * scale`, docs/design/algebra.md
+    §1.4) scales its smaller operand instead, the product being linear in each: the rewritten program
+    multiplies 4 x 4 values where it multiplied 4 x 16, on par with the program as written against the
+    float64 truth (check 1)."""
+    def scaled(g, i):
+        return jnp.dot(g, i) * 0.3
+
+    g, i = rows(6, (4, 4), (4, 16))
+    after = jax.make_jaxpr(algebra.rewritten(scaled))(g, i)
+    assert [equation.outvars[0].aval.shape for equation in equations(after)
+            if equation.primitive.name == "mul"] == [(4, 4)]
+
+    def draw(seed):
+        return rows(seed, (4, 4), (4, 16))
+
+    assert_as_exact(jax.jit(algebra.rewritten(scaled)), jax.jit(scaled), draw,
+                    "a scale through a contraction", seeds=16)
+
