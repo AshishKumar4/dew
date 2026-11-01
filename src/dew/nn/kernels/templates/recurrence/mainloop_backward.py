@@ -617,10 +617,12 @@ def _memory_sum(call: _Call, issue: Issuer, entered: Parts, leaving: Parts) -> j
 
 
 def _query_key_held(call: _Call) -> _Held:
-    """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum,
-    its memory product and its scores' product, and a block's queries or keys in fp32 for the range terms;
-    then `sum(S dS)` (`_memory_sum`): the memories' product and its diagonal's mask where products read
-    registers, with a block of each operand, else the memories in fp32."""
+    """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum
+    (one accumulator over the value blocks), that sum gated, its scores' product, and a block's queries or
+    keys in fp32 for the range terms; then `sum(S dS)` (`_memory_sum`): the memories' product and its
+    diagonal's mask where products read registers, with a block of each operand, else the memories in fp32.
+    An accumulator a value block, the SSD's spilled 168 bytes a thread on an A100, where one needed 249
+    registers (gateqk at c2808ebbe)."""
     held, memories, given = call.held, call.memories, call.given
     block = (memories, call.block, call.block)
     summed = ([_f32(call.block, call.block), *_masks(call.block, call.block), *_fragments(call, block, block)]
