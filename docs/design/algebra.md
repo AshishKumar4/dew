@@ -62,8 +62,10 @@ engine serves three uses: whole programs, the templates' algebra, and the search
   - attention's score function, mask and reduction;
   - a recurrence's state update.
 
-  The hand-written algebra modules are the oracle: a derived form replaces a hand-written one only after matching
-  it in float64 and in kernel speed. A new variant then needs only its declaration and its schedule.
+  The hand-written algebra modules are the reference a derived form is held to. It need not equal them; it replaces
+  one when it is equivalent within the [accuracy gate](testing.md), its distance to the float64 truth no worse than
+  the hand-written form's beyond the gate's derived factor, and it is at least as fast. A different form that is as
+  good or better is the point. A new variant then needs only its declaration and its schedule.
 - **Fusion:** a search over algebraic forms, fusion boundaries and template compositions for a region of a step
   (a norm, a projection and an activation, for example), built from the toolkit's composed primitives and its work
   scheduler. Applied to a whole decoder layer, its output is a generated megakernel.
@@ -79,8 +81,8 @@ engine serves three uses: whole programs, the templates' algebra, and the search
 
 ## 4. What it replaces, and what it leaves
 
-- **It replaces** custom derivatives that exist only to restructure algebra, and, once matched, hand-derived
-  template algebra.
+- **It replaces** custom derivatives that exist only to restructure algebra, and hand-derived template algebra
+  wherever a derived form passes the accuracy gate against it and is at least as fast.
 - **It leaves:**
   - the templates' schedules, the toolkit and the families;
   - custom derivatives that implement kernels;
@@ -279,5 +281,5 @@ def derive(declaration: Declaration, forms: Sequence[str]) -> Mapping[str, Calla
 ```
 
 - `forms` names the forms wanted, among `online`, `tiled`, `combine` and `backward`.
-- Each derived form has the signature of its oracle in `attention_algebra` or `recurrence_algebra`, so it replaces
-  that oracle in place once it matches it in float64 and in kernel speed (§2).
+- Each derived form has the signature of the hand-written form in `attention_algebra` or `recurrence_algebra`, so
+  it replaces that form in place once it passes the accuracy gate against it and is at least as fast (§2).
