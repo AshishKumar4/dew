@@ -119,6 +119,15 @@ def test_a_processs_communicators_are_held_together_to_the_room_dew_left_outside
     assert resident.cliques == frozenset({(0, every), (0, pairs)})
 
 
+def test_a_device_group_two_partitions_share_is_one_communicator():
+    """Two steps whose device groups partly agree share the communicator over each group they both take: on
+    six GPUs, {{0,1},{2,3},{4,5}} and {{0,1},{2,4},{3,5}} charge GPUs 0 and 1 for one communicator."""
+    six = Needs(communicators={0: {2: GIB}}, runtime=dict.fromkeys(range(6), 0), seconds=1.0)
+    first, second = ((0, 1), (2, 3), (4, 5)), ((0, 1), (2, 4), (3, 5))
+    needed = six.needed({(0, first), (0, second)}, range(6), runtime=False)
+    assert needed == {0: GIB, 1: GIB, 2: 2 * GIB, 3: 2 * GIB, 4: 2 * GIB, 5: 2 * GIB}
+
+
 def test_a_host_of_one_gpu_or_none_or_a_cpu_process_measures_nothing(monkeypatch):
     """A host with fewer than two GPUs makes no communicator, nor does a process that asks JAX for its CPU
     alone, so neither measures anything and its share stays Dew's own."""
