@@ -235,14 +235,16 @@ def layer_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
     its JVP along the drawn direction (`torch.func.jvp`)."""
     import ssd_support as support
 
-    layer = _mixer(inputs, torch.bfloat16 if site == "layer_bf16" else dtype)
-    hidden = torch.from_numpy(inputs["hidden"]).to(torch.bfloat16 if site == "layer_bf16" else dtype)
+    # The bf16 site's narrow run in bfloat16 end to end; its truth, as every site's, in `dtype` (float64).
+    dtype = torch.bfloat16 if site == "layer_bf16" and dtype == torch.float32 else dtype
+    layer = _mixer(inputs, dtype)
+    hidden = torch.from_numpy(inputs["hidden"]).to(dtype)
 
     def on(x):
         return layer(x).double().numpy()
 
     if site in ("layer", "layer_bf16"):
-        return {"output": layer(hidden).float().numpy() if site == "layer_bf16" else on(hidden)}
+        return {"output": layer(hidden).double().numpy()}
     if site == "decoded":
         return {"output": _stepped(lambda length: on(hidden[:, :length]), hidden.shape[1], support.PREFILL)}
     if site == "padded":
