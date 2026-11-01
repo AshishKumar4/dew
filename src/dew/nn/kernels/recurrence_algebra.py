@@ -925,23 +925,25 @@ def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, querie
 
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
-                    blocks: int, gate, low, scale: float, dtype, issue: Issue, *,
+                    blocks: int, gate, low, scale: float, dtype, summed: Callable[[list], jax.Array], *,
                     laid: tuple | None = None, column_scale=None) -> tuple[jax.Array, jax.Array]:
     """A chunk and value head's scores' gradient under a decay a head, `ds = do v^T` over the value blocks
     `j` gated by its pairs' decays, causal and scaled, in `dtype` (which `memory_gradients`' `dq += ds k`
     and `dk += ds^T q` take), and the decay's pair terms `ds (q k^T)` (strictly lower, fp32,
-    `summed_pairs`'): the part of fla's dqkwg the memory's products do not take, a launch of its own.
-    `column_scale` `[C]`, where given, scales each value token's column in fp32 after the products: the
-    write gate on the keys' side (`chunk_scores`'), mamba_ssm's `dCB = (dout x^T) dt`
-    (`_chunk_scan_bwd_dcb`)."""
+    `summed_pairs`'): the part of fla's dqkwg the memory's products do not take, a launch of its own. Each
+    of the two sums over blocks issued into one accumulator (`summed`, the mainloop's: a list of `(name,
+    left, right)`): an accumulator a block, held two at a time, an fp32 call's two parts spilled 32 bytes a
+    thread past 255 on an H100, where one each needed 216 (scores-ablate at a44dfe721). `column_scale`
+    `[C]`, where given, scales each value token's column in fp32 after the products: the write gate on the
+    keys' side (`chunk_scores`'), mamba_ssm's `dCB = (dout x^T) dt` (`_chunk_scan_bwd_dcb`)."""
     column_gate, column_low = (gate, low) if laid is None else laid
     pair_decay = decayed(gate, low, column_gate, column_low)
-    ds = functools.reduce(jnp.add, (issue("values_ds", out_grads(j), values(j).T) for j in range(blocks)))
+    ds = summed([("values_ds", out_grads(j), values(j).T) for j in range(blocks)])
     if column_scale is not None:
         ds = ds * column_scale[None, :]
     lag = _lags(ds.shape)
     ds = jnp.where(lag >= 0, ds * pair_decay, 0.0) * scale
-    scores = functools.reduce(jnp.add, (issue("local_t", queries(c), keys(c).T) for c in range(columns)))
+    scores = summed([("local_t", queries(c), keys(c).T) for c in range(columns)])
     return ds.astype(dtype), jnp.where(lag > 0, ds * scores, 0.0)
 
 
