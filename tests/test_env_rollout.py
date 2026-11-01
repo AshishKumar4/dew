@@ -517,7 +517,8 @@ def test_a_control_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it()
     unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
     data = Loader(train=unread, val=None, records=8, batch=8)
     flights = {"flight": EvalSuite(Episodes(episodes(objective.greedy, Batched(TimeLimit(
-        Walk(limit=50.0), episode_length=8), 8), 8), {"return": Shown(better="higher")}), every=8)}
+        Walk(limit=50.0), episode_length=8), 8), 8), {"return": Shown(better="higher"), "steps": Shown()}),
+        every=8)}
 
     def trained(walks, **options):
         # A cooldown scales the rate the optimizer's state holds.

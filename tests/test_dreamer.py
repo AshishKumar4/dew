@@ -586,8 +586,8 @@ def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it()
 
     objective = DreamerV3Objective(tiny())
     flights = {"flight": EvalSuite(Episodes(episodes(objective.act, Driven(Batched(TimeLimit(
-        Target(), episode_length=20), 4)), 20, memory=objective.memory), {"return": Shown(better="higher")}),
-        every=6)}
+        Target(), episode_length=20), 4)), 20, memory=objective.memory),
+        {"return": Shown(better="higher"), "steps": Shown()}), every=6)}
     options = {"optimizer": optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), "validation": flights}
 
     def simulated():
