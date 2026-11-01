@@ -16,6 +16,7 @@ directory, rung records and data cache of its own:
 - A clocked run with a cooldown trains from its step compiled ahead, compiling no other (test_compile_ahead);
   the attention forms a run names on its command line reach its step (option_witness, ledger 2639).
 - A program on this GPU is admitted against the room its pool left outside XLA's pool (test_communicators).
+- A program loaded from the compilation cache is admitted from its kept communicators (test_communicators).
 """
 
 import dataclasses
@@ -51,6 +52,7 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
         plan.a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further,
         plan.test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool)
     admitted = communicators.a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left
+    loaded = communicators.a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_communicators
     repeats, conv = (
         trainer.a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops,
         trainer.a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache)
@@ -81,6 +83,8 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(clocked, "clocked")),
         Cell("a program on this GPU is admitted against the room its pool left",
              in_own(admitted, "admitted")),
+        Cell("a program loaded from the compilation cache is admitted from its kept communicators",
+             in_own(loaded, "loaded")),
         # A fast form is a fast kernel on sm90 alone: on sm80 the default route computes IEEE fp32.
         Cell("the attention forms a run names reach its step",
              in_own(option_witness.the_attention_forms_a_run_names_reach_its_step, "forms"),
