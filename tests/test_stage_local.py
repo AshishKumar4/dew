@@ -390,7 +390,7 @@ def test_a_stage_local_runs_inspection_reports_each_stored_layer_by_its_name():
         logged.append(inspected(run, stream().train(None).__next__(), steps=1))
     local, replicated = logged
     assert sorted(local) == sorted(replicated)
-    named = {"params/layers_0/self_attn/q_proj/kernel/rms", "params/layers_3/mlp/up_proj/kernel/rms"}
+    named = {f"inspect/params/{layer}/kernel/rms" for layer in ("layers_0/self_attn/q_proj", "layers_3/mlp/up_proj")}
     assert named <= set(local)
     assert local == replicated
 
