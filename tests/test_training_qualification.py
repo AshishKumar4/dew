@@ -160,16 +160,17 @@ and the baseline's reference loss and gradients, not its checkpoints or its log.
 def ran(directory: Path) -> dict[str, bytes]:
     """The qualification's runs over `directory` (`prepared`), on one host, as XLA:CPU compiles for its
     host's class and their states are compared bit for bit: the uninterrupted run beside the interrupted
-    run, SIGKILLed once blocked past its checkpoint, then the interrupted run's resume. What they
+    run, SIGKILLed once blocked past its checkpoint, and then beside its resume. What they
     wrote that the judge reads (`KEPT`), by path in `directory`, with the source the baseline's
     reference was taken against and the CPU class they ran on (`HOST.cpu_class`)."""
     with ProcessGroup() as started:
-        # The uninterrupted run beside the interrupted one, each on a core of its own.
+        # The uninterrupted run beside the interrupted one and then its resume, each on a core of its own.
         started.running.append(baseline := spawn(directory, "baseline"))
         started.running.append(interrupted := spawn(directory, "interrupted"))
         kill_when_ready(interrupted, directory / "ready-to-kill")
+        started.running.append(resumed := spawn(directory, "resumed"))
+        finish(resumed, "resumed")
         finish(baseline, "baseline")
-    finish(spawn(directory, "resumed"), "resumed")
     (directory / "cpu.txt").write_text(HOST.cpu_class())
     files = [directory / "source", directory / "cpu.txt"] + [
         directory / run / name for run in ("baseline", "restarted") for name in KEPT]
