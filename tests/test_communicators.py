@@ -224,6 +224,50 @@ def test_every_program_dew_compiles_is_admitted_where_it_sized_the_pool():
     assert json.loads(done.stdout.strip().splitlines()[-1]) == [GIB, GIB]
 
 
+AHEAD = """
+import jax, jax.numpy as jnp, numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from dew import communicators
+from dew.communicators import Needs, Sizing
+from dew.nn.kernels import options
+from dew.training.ahead import compile_only_gpus
+
+mesh = Mesh(np.array(compile_only_gpus("sm90", 2)), ("pair",))
+summed = jax.shard_map(lambda part: jax.lax.psum(part, "pair"), mesh=mesh, in_specs=PartitionSpec("pair"),
+                       out_specs=PartitionSpec())
+tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, connections={}, runtime={0: 0, 1: 0},
+              seconds=1.0)
+communicators.hold(Sizing(tight, 0.95, 0.9, {0: 2**30, 1: 2**30}, {0: 2**29, 1: 2**29}))
+rows = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec("pair")))
+options.program(summed).compiled(rows)
+print("compiled ahead")
+"""
+"""A process holding a sizing too small for a pair's communicator, compiling an all-reduce ahead for two
+compile-only GPUs that this host does not have."""
+
+
+def test_a_program_compiled_ahead_for_absent_gpus_is_not_admitted_here():
+    """A program compiled ahead for GPUs this process has not (`compile_only_gpus`) is never loaded here, so its
+    communicators take none of this host's room: a process whose sizing would refuse the same program on its
+    own GPUs compiles it ahead."""
+    done = subprocess.run([sys.executable, "-c", AHEAD], capture_output=True, text=True, check=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
+    assert done.stdout.strip().splitlines()[-1] == "compiled ahead"
+
+
+def test_a_process_prepared_again_keeps_the_sizing_its_pool_was_made_with():
+    """Once the backend has opened, the pool keeps the share its first preparation sized, so a second
+    preparation (a sweep's next run, a profile after a run) keeps that sizing and admits every later program
+    against it, never holding nothing."""
+    sizing = communicators.Sizing(NEEDS, 0.95, 0.9, dict.fromkeys(range(2), GIB), dict.fromkeys(range(2), GIB))
+    held = communicators.held()
+    communicators.hold(sizing)
+    try:
+        assert communicators.sized_pool(cuda=True, opened=True) is sizing
+    finally:
+        communicators.hold(held)
+
+
 def test_the_sized_pool_is_recorded_with_what_it_left_room_for(monkeypatch):
     """A pool Dew sized states the run's bound, the share it took, each GPU's bytes its communicators need
     and the room it left them, which the fit check's record carries into the run record; the pool's share
