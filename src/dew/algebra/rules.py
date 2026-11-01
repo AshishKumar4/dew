@@ -114,17 +114,20 @@ def _stable() -> Ruleset:
     pass never runs them, and dev time takes a form of theirs only where its measured error asks it."""
     x, m, t, one = vars_("x m t one", Term)
     subbed, added, logged, exped = vars_("subbed added logged exped", i64)
+    # The stock primitives' indices are read in a rule's conditions, where egglog allows a lookup.
+    divided, plus_one, minus_one = vars_("divided plus_one minus_one", i64)
     return ruleset(
         rewrite(x.binary("sub", m.binary("add", t.unary("log", logged), added), subbed)
                 .unary("exp", exped)).to(
-            x.binary("sub", m, subbed).unary("exp", exped).binary("div", t, stock("div")),
-            eq(shape(m)).to(shape(x)), eq(shape(t)).to(shape(x)), plain(subbed), plain(added)),
+            x.binary("sub", m, subbed).unary("exp", exped).binary("div", t, divided),
+            eq(shape(m)).to(shape(x)), eq(shape(t)).to(shape(x)), plain(subbed), plain(added),
+            eq(divided).to(stock("div"))),
         rewrite(one.binary("add", x, added).unary("log", logged)).to(
-            x.unary("log1p", stock("log1p")), unit(one), plain(added)),
+            x.unary("log1p", plus_one), unit(one), plain(added), eq(plus_one).to(stock("log1p"))),
         rewrite(x.binary("add", one, added).unary("log", logged)).to(
-            x.unary("log1p", stock("log1p")), unit(one), plain(added)),
+            x.unary("log1p", plus_one), unit(one), plain(added), eq(plus_one).to(stock("log1p"))),
         rewrite(x.unary("exp", exped).binary("sub", one, subbed)).to(
-            x.unary("expm1", stock("expm1")), unit(one), plain(subbed)),
+            x.unary("expm1", minus_one), unit(one), plain(subbed), eq(minus_one).to(stock("expm1"))),
         name="stable")
 
 
