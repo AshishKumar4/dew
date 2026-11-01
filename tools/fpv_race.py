@@ -173,9 +173,9 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
 def in_view(gates: np.ndarray, mounts: np.ndarray, fov: np.ndarray) -> np.ndarray:
     """Whether the next gate's centre lies in each drone's camera's field of view `[steps, drones]`, from the
     `gates` view (its corners in the body frame), each drone's camera mount `[drones, 3, 3]`
-    (`dew.rl.flight.mounted`) and field of view `[drones]` (radians, a square image's): in front of the camera, its angles across and up from the
-    camera's axis within half the field of view. A drone's mount holds through its first episode, the
-    steps this scores."""
+    (`dew.rl.flight.mounted`) and field of view `[drones]` (radians, a square image's): in front of the
+    camera, its angles across and up from the camera's axis within half the field of view. A drone's mount
+    holds through its first episode, the steps this scores."""
     center = np.asarray(gates, np.float64)[..., :12].reshape(*np.shape(gates)[:-1], 4, 3).mean(-2)
     local = np.einsum("dji,sdj->sdi", np.asarray(mounts, np.float64), center)
     depth, half = local[..., 0], np.asarray(fov, np.float64) / 2
