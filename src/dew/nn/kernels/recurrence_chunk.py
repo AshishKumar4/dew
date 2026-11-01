@@ -1113,8 +1113,9 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                             starts=starts, firsts=firsts, max_segments=max_segments,
                                             scale=scale, inverse=inverse, kept=kept, delta=delta,
                                             rounded=rounded, skip=skip, **run)
+        dskip = grads[6] if len(grads) > 6 else None
         return (*grads[:5], None if state is None else grads[5], None, None,
-                None if skip is None else grads[6].astype(skip.dtype))
+                None if dskip is None else dskip.astype(skip.dtype))
 
     rule.defvjp(forward, backward)
     return rule(query, key, value, g, beta, state, starts, firsts, skip)

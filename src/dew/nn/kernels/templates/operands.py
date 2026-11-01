@@ -174,7 +174,9 @@ class Issuer:
         def summed_group() -> jax.Array:
             # The group at the held product: a scaled product's own accumulator, restored, or the unscaled
             # products from it to the next scaled one in one.
-            scaled = held[-1][1] if isinstance(held[-1][1], product.Scaled) else None
+            # A sum of blocks is unscaled (`product.Blocks`).
+            lhs = None if isinstance(held[-1], product.Blocks) else held[-1][1]
+            scaled = lhs if isinstance(lhs, product.Scaled) else None
             part = family.summed(shape, lambda acc: group(acc, alone=scaled is not None), interpret)
             if scaled is None:
                 return part
