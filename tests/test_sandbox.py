@@ -50,6 +50,30 @@ def test_worker_round_trip_and_process_group_cleanup():
     assert wait_gone(pids) == []
 
 
+def test_a_measured_parent_measures_the_launcher_it_starts(tmp_path, monkeypatch):
+    """A parent measured by coverage (its startup in `COVERAGE_PROCESS_START`) launches a command whose
+    launcher is measured too, its lines up to the exec saved, although `-I` and the launcher's minimal
+    environment would start no coverage of their own."""
+    import coverage
+
+    from dew.rl import _sandbox_exec
+    from dew.rl.sandbox import SandboxLimits, launched
+
+    config = tmp_path / "coverage.ini"
+    config.write_text(f"[run]\nparallel = true\ndata_file = {tmp_path / 'data'}\n"
+                      f"include = {_sandbox_exec.__file__}\n")
+    monkeypatch.setenv("COVERAGE_PROCESS_START", str(config))
+    with launched(("true",), SandboxLimits(), str(tmp_path)) as process:
+        assert process.wait(timeout=60) == 0
+    combined = coverage.Coverage(config_file=str(config))
+    combined.combine()
+    measured = set(combined.get_data().lines(_sandbox_exec.__file__) or ())
+    # Coverage starts in main's first statement and is saved in its last before the exec: the statements
+    # between, the first after its start and the save itself, are measured.
+    statements = sorted({line for _, _, line in _sandbox_exec.main.__code__.co_lines() if line is not None})
+    assert {statements[2], statements[-2]} <= measured
+
+
 def test_parent_death_kills_the_worker(tmp_path):
     """A SIGKILLed parent takes its worker with it through the death signal."""
     script = tmp_path / "parent.py"
