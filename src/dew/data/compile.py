@@ -622,9 +622,9 @@ class _Measured:
     branches: tuple[Pipeline, ...]
     metadata: Mapping[str, object] | None
     counts: tuple[dict[str, CorpusCounts], ...]
-    passes: int | None = None
-    """The source examples a pass of a training read bounded to its epochs ahead of its memory holding it
-    holds (`_held_passes`); None for one not bounded so."""
+    held: bool = False
+    """Whether its training read is bounded ahead of the expansion its memory would hold, to a count set
+    once it holds the examples (`_UNCOUNTED`, `_staged`)."""
 
 
 def _measure(
@@ -660,10 +660,10 @@ def _measure(
             _objective_branch(branch, objective, train=not scored, read=read)
             for branch, scored in zip(branches, held, strict=True)
         )
-    passes = None if epochs is None or not training else _held_passes(branches[0], read)
-    if passes is not None:
-        assert epochs is not None
-        examples = epochs * passes
+    # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
+    # a count set once it holds them (`_staged`).
+    held = epochs is not None and training and _holds_expansion(branches[0], read)
+    examples = _UNCOUNTED if held else examples
     if examples is not None and training:
         branches = (_bounded(branches[0], examples), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
@@ -681,8 +681,8 @@ def _measure(
             if training and not stored(branches[0]):
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
-        return _Measured(tuple(branches), metadata, tuple(counts or ()), passes)
-    return _Measured(tuple(branches), None, tuple(counts or ()), passes)
+        return _Measured(tuple(branches), metadata, tuple(counts or ()), held)
+    return _Measured(tuple(branches), None, tuple(counts or ()), held)
 
 
 def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
@@ -849,8 +849,14 @@ def _staged(
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
         validation = None
     build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
-    passes = measured.passes
-    if epochs is not None and passes is None:
+    passes = None
+    if epochs is not None and measured.held:
+        # Bounded before the expansion it would hold, it now holds the examples a pass reaches it with.
+        passes = _pass_examples(train, read)
+        if passes is not None:
+            original, train = _rebound(original, epochs * passes), _rebound(train, epochs * passes)
+            build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
+    elif epochs is not None:
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
         passes = None if _epoch_records(train, build) is not None else _pass_examples(train, read)
@@ -860,23 +866,31 @@ def _staged(
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes)
 
 
-def _held_passes(train: Pipeline, read: Read) -> int | None:
-    """The source examples a pass of a memory read holds where it would make rows of them as it holds
-    them (an objective's expansion among the steps it runs over its whole source, `_EAGER`): a bound in
-    examples stands before that step (`_bounded`), which the memory read then holds no rows of, so the read
-    is bounded to its epochs' passes before it holds anything, as a run bounded in examples is
-    (`_pass_examples` of the source's own records). None for any other read, whose pass is counted once it
-    is prepared (`_staged`), a layout held before its order among them, which no bound can stand before."""
+_UNCOUNTED = 1 << 62
+"""The bound in examples a memory read whose expansion it would hold takes before it holds them, past any
+count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
+
+
+def _holds_expansion(train: Pipeline, read: Read) -> bool:
+    """Whether a memory read would make rows of its source examples as it holds them (an objective's
+    expansion among the steps it runs over its whole source, `_EAGER`): a bound in examples stands before
+    that step (`_bounded`), so a run of epochs bounds it there before it holds anything."""
     if read != "memory" or isinstance(train.source, (Mixture, Phases)):
-        return None
+        return False
     eager = next((index for index, stage in enumerate(train.stages)
                   if not isinstance(stage, (*_EAGER, Configured))), len(train.stages))
     batched = _until(train.stages, (BatchStage, TokenBudget))
     at = next((index for index, stage in enumerate(train.stages[:batched])
                if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
-    if at >= eager or not _expands(train.stages[at]):
-        return None
-    return _pass_examples(train, read)
+    return at < eager and _expands(train.stages[at])
+
+
+def _rebound(pipeline: Pipeline, examples: int) -> Pipeline:
+    """`pipeline`, bounded (`_bounded`), its bound's limit `examples`."""
+    at = examples_bound(pipeline.stages)
+    assert at is not None and isinstance(pipeline.stages[at - 1], Limit)
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at - 1], Limit(examples),
+                                                 *pipeline.stages[at:]))
 
 
 def _output_batch(pipeline: Pipeline) -> int:
