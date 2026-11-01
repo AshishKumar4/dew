@@ -591,7 +591,8 @@ def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it()
     options = {"optimizer": optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), "validation": flights}
 
     def simulated():
-        return DreamerRollout(objective, HostTarget(), capacity=400, batch=8, length=16, train_ratio=32.0,
+        # Every update owes two steps of each target, so the branch's collect.
+        return DreamerRollout(objective, HostTarget(), capacity=400, batch=8, length=16, train_ratio=8.0,
                               prefill=24)
 
     plain = bits(dreamer_fit(None, objective, simulated(), 6, **options))
