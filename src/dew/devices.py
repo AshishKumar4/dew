@@ -15,10 +15,10 @@ import logging
 import os
 import shutil
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from dew.builds import CUDA_BUILDS, PACKAGE_INDEX, QUERY, listed_gpus, newest_build, runs_on
-from dew.pool import answered, runs_on_gpu
+from dew.pool import answered, cuda_driver, runs_on_gpu
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False
@@ -204,9 +204,44 @@ def divide_exactly() -> None:
     _gpu_default("xla_backend_extra_options", "--xla_backend_extra_options=-nvptx-prec-divf32=2")
 
 
+FRACTIONS = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
+"""The environment variables JAX reads a GPU pool's share from, its current name first; it refuses a run
+that sets both (jaxlib's `xla_client.generate_pjrt_gpu_plugin_options`)."""
+
+POOL_NAMES = (*FRACTIONS, "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
+"""The environment variables a run names its GPU pool by."""
+
+DEW_SHARE, JAX_SHARE = 0.95, 0.75
+"""The share of each GPU XLA's pool takes as Dew prepares a process (`preallocate_gpu_pool`), and as JAX
+takes it where a run names preallocation or the allocator without a fraction (docs.jax.dev,
+gpu_memory_allocation)."""
+
+
+def fraction_name() -> str:
+    """The variable this run names its pool's share by (`FRACTIONS`), the deprecated one where it names
+    none, as Dew's own share is written (`preallocate_gpu_pool`)."""
+    return next((name for name in FRACTIONS if name in os.environ), FRACTIONS[1])
+
+
+def pool_bound(*, cuda: bool) -> float | None:
+    """The share of each GPU XLA's pool takes as this run names it, which Dew may size it below and never
+    above (`dew.communicators`): its fraction where it names one (`fraction_name`); Dew's own where it
+    names nothing (`preallocate_gpu_pool`); JAX's where it names preallocation or the allocator without
+    one. None where the pool holds no fixed share: a process off CUDA, a pool that grows
+    (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) or another allocator than XLA's own BFC pool."""
+    allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
+    growing = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "true").lower() in ("false", "0")
+    if not cuda or growing or allocator not in ("default", "bfc"):
+        return None
+    named = os.environ.get(fraction_name())
+    if named is not None:
+        return float(named)
+    return JAX_SHARE if any(name in os.environ for name in POOL_NAMES) else DEW_SHARE
+
+
 def preallocate_gpu_pool() -> None:
-    """Preallocate 95% of each GPU as XLA's pool for a training process,
-    unless the run named its pool (fraction, preallocation or allocator).
+    """Preallocate 95% of each GPU (`DEW_SHARE`) as XLA's pool for a training process,
+    unless the run named its pool (fraction, preallocation or allocator, `POOL_NAMES`).
 
     A pool that grows takes a step's temporaries only in a new region from
     the part of its limit it has not taken (`dew.training.memory.placeable`),
@@ -222,9 +257,8 @@ def preallocate_gpu_pool() -> None:
     which its backend has already taken, and shares its GPU as that program chose."""
     if backend_open():
         return
-    named = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
-    if cuda_plugin() and not any(name in os.environ for name in named):
-        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+    if cuda_plugin() and not any(name in os.environ for name in POOL_NAMES):
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(DEW_SHARE)
 
 
 def cuda_builds() -> list[str]:
@@ -249,22 +283,13 @@ def nvidia_gpus() -> tuple[str, tuple[int, int]] | None:
     return listed_gpus(answered(QUERY, 10))
 
 
-def _driver() -> ctypes.CDLL | None:
-    """The CUDA user-mode driver library JAX's CUDA plugin loads, or None where none loads."""
-    try:
-        return ctypes.CDLL("libcuda.so.1")
-    except OSError as error:  # ctypes' answer for a library the loader does not find
-        _log.debug("no CUDA driver library loads: %s", error)
-        return None
-
-
 def cuda_driver_version() -> int | None:
     """The CUDA version the user-mode driver this process loads supports, as
     `cuDriverGetVersion` reports it (13.0 as 13000), the library JAX's CUDA
     plugin loads; None where no driver library loads. NVIDIA's
     forward-compatibility package raises it past what the kernel driver's
     major gives (`CUDA_BUILDS`)."""
-    cuda = _driver()
+    cuda = cuda_driver()
     if cuda is None:
         return None
     version = ctypes.c_int()
@@ -280,7 +305,7 @@ def gpu_attribute(ordinal: int, attribute: int) -> int | None:
     """The CUDA driver's `attribute` (a `CUdevice_attribute`) of the visible GPU `ordinal`: a device fact
     JAX's Device does not carry, a GPU's clocks above all. None where no driver library loads (a CPU
     host); a driver error raises."""
-    cuda = _driver()
+    cuda = cuda_driver()
     if cuda is None:
         return None
     device, value = ctypes.c_int(), ctypes.c_int()
@@ -390,6 +415,13 @@ def gpu_free_bytes(ordinal: int) -> int | None:
     a pool that grows takes each new region from what is free when it asks,
     and another process on the same GPU may hold the rest. The read makes the
     device's primary context current on this thread for the call."""
+    memory = gpu_memory(ordinal)
+    return None if memory is None else memory[0]
+
+
+def gpu_memory(ordinal: int) -> tuple[int, int] | None:
+    """The bytes the CUDA driver reports free and in all on the visible GPU
+    `ordinal`, as `gpu_free_bytes` reads them, or None where no driver answers."""
     try:
         cuda, context, device = primary_context(ordinal)
     except (OSError, RuntimeError) as error:
@@ -400,11 +432,69 @@ def gpu_free_bytes(ordinal: int) -> int | None:
         if cuda.cuCtxPushCurrent_v2(context):
             return None
         try:
-            return None if cuda.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)) else free.value
+            if cuda.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)):
+                return None
+            return free.value, total.value
         finally:
             cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
     finally:
         cuda.cuDevicePrimaryCtxRelease_v2(device)
+
+
+def _reported(ordinal: int, size: int, call: Callable[[ctypes.CDLL], Callable[..., int]]) -> str | None:
+    """The text a CUDA driver `call` writes of the visible GPU `ordinal`, at most `size` bytes, None where no
+    driver answers."""
+    cuda, device, text = cuda_driver(), ctypes.c_int(), ctypes.create_string_buffer(size)
+    if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
+        return None
+    return None if call(cuda)(text, len(text), device) else text.value.decode()
+
+
+def gpu_name(ordinal: int) -> str | None:
+    """The visible GPU `ordinal`'s name, as the CUDA driver reports it (`NVIDIA H100 80GB HBM3`)."""
+    return _reported(ordinal, 256, lambda cuda: cuda.cuDeviceGetName)
+
+
+def gpu_place(ordinal: int) -> str | None:
+    """The visible GPU `ordinal`'s PCI bus id, as the CUDA driver reports it (`0000:18:00.0`): where it sits,
+    which its links to the other GPUs follow."""
+    return _reported(ordinal, 32, lambda cuda: cuda.cuDeviceGetPCIBusId)
+
+
+def nccl_version() -> int | None:
+    """The version of the NCCL library this process would load (`ncclGetVersion`: 23203 for 2.32.3), from the
+    nvidia-nccl wheel JAX's CUDA plugin depends on, or the loader's path; None where none loads."""
+    # The wheel's directory, where its namespace package is installed, found without importing it.
+    namespace = importlib.util.find_spec("nvidia")
+    spec = importlib.util.find_spec("nvidia.nccl") if namespace is not None else None
+    places = [os.path.join(place, "lib", "libnccl.so.2") for place in (spec.submodule_search_locations or [])
+              ] if spec is not None else []
+    for place in [*places, "libnccl.so.2"]:
+        try:
+            library = ctypes.CDLL(place)
+        except OSError:
+            continue
+        version = ctypes.c_int()
+        return None if library.ncclGetVersion(ctypes.byref(version)) else version.value
+    return None
+
+
+def connect_at_creation() -> None:
+    """Have NCCL connect every peer as it creates a communicator, unless the
+    run named it (NCCL_RUNTIME_CONNECT=0).
+
+    NCCL connects peers lazily by default since 2.22, at a collective's first
+    launch, and allocates their buffers then. A rank that fails to allocate
+    there leaves its peer inside XLA's first-call rendezvous, which aborts the
+    process after 40 seconds (xla/service/rendezvous.cc, LOG(FATAL)): a
+    2xH100 LoRA run, whose first all-to-all one GPU entered and the other
+    never did (ledger 2901). Connected at creation, the buffers are allocated
+    as XLA acquires the step's communicators, before it runs, and XLA returns
+    a failure there to every rank as an error
+    (xla/backends/gpu/collectives/nccl_collectives.cc). The cost is every
+    peer's buffers at creation, whether or not the program sends to it.
+    NCCL reads the variable as it first starts, so `import dew` sets it."""
+    os.environ.setdefault("NCCL_RUNTIME_CONNECT", "0")
 
 
 
