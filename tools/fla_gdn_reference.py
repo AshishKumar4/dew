@@ -47,11 +47,13 @@ def sequences(arrays) -> list[tuple[int, int, int, bool]]:
     return found
 
 
-def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: bool) -> dict[str, np.ndarray]:
+def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: bool,
+        gradients: bool = True) -> dict[str, np.ndarray]:
     """`rule` (fla's chunked rule, or its naive reference with `per_sequence`) on a site's arrays: its rows'
     sequences flattened into one row (`cu_seqlens`), or each alone, the operands in `dtype` but the log decay
-    and memory fp32 (in float64 for the reference), the output's and final memory's gradients under the
-    drawn cotangents; leaves as `fla_sites.LEAVES`."""
+    and memory fp32 (in float64 for the reference), and with `gradients` the output's and final memory's
+    gradients under the drawn cotangents; leaves as `fla_sites.LEAVES`, the output and final memory alone
+    without them."""
     import torch
 
     wide = dtype == torch.float64
@@ -91,6 +93,9 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
     out = out.reshape(rows, -1, *out.shape[2:])
     last = {row: index for index, (row, _, _, _) in enumerate(spans)}
     final = torch.cat([finals[last[row]] for row in range(rows)], dim=0)
+    if not gradients:
+        return {name: value.detach().to(torch.float64).cpu().numpy()
+                for name, value in (("out", out), ("final", final))}
     grads = torch.autograd.grad((out, final), tuple(inputs[name] for name in GRADIENTS),
                                 (tensors["dy"].to(out.dtype), tensors["dfinal"].to(final.dtype)),
                                 allow_unused=True)
@@ -102,7 +107,8 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
 
 
 def serve() -> None:
-    """The torch side: each request a line naming a site's inputs (an npz), its dtype, rule and scale, and
+    """The torch side: each request a line naming a site's inputs (an npz), its dtype, rule, scale and leaves
+    ('all', or 'forward' for the output and final memory alone), and
     where to write fla's outputs and the reference's (`<path>.reference.npz`, `<path>.truth.npz`),
     answered with a line `done` on the process's own stdout, which the libraries' prints (stdout taken to
     stderr) never reach: a line tilelang or fla printed was read as a request's answer, and the recorder
@@ -127,22 +133,23 @@ def serve() -> None:
     found = f"fla-core-{version('fla-core')}+tilelang-{version('tilelang')}"
     print(f"ready {found} {torch.cuda.get_device_name()}", file=answers, flush=True)
     for line in sys.stdin:
-        path, dtype, kind, scale = line.split()
-        kda = kind == "kda"
+        path, dtype, kind, scale, leaves = line.split()
+        kda, gradients = kind == "kda", leaves == "all"
         with np.load(path) as stored:
             arrays = dict(stored)
         rule = chunk_kda if kda else chunk_gated_delta_rule
         began = time.perf_counter()
         np.savez(f"{path}.reference.npz", **run(arrays, kda=kda, scale=float(scale), rule=rule,
                                                 dtype=getattr(torch, dtype), device="cuda",
-                                                per_sequence=False))
+                                                per_sequence=False, gradients=gradients))
         referenced = time.perf_counter()
         # The truth in float64 on the GPU: on the CPU its token loop and autograd took most of a site's
         # 1432 s for 320 draws (fla-record3-h100-f8fbb058d, the worker at a core's whole time).
         with float64():
             naive = naive_recurrent_kda if kda else naive_recurrent_gated_delta_rule
             np.savez(f"{path}.truth.npz", **run(arrays, kda=kda, scale=float(scale), rule=naive,
-                                                dtype=torch.float64, device="cuda", per_sequence=True))
+                                                dtype=torch.float64, device="cuda", per_sequence=True,
+                                                gradients=gradients))
         print(f"timed fla {referenced - began:.3f} s truth {time.perf_counter() - referenced:.3f} s",
               file=sys.stderr, flush=True)
         print("done", file=answers, flush=True)
@@ -206,16 +213,18 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
         sample = site.arrays(0)
         dtype, kda = str(sample["q"].dtype), sample["g"].ndim == 4
 
-        def fla(arrays, dtype=dtype, kda=kda, scale=site.hooks.scale):
+        leaves = "all" if set(site.leaves) - {"out", "final"} else "forward"
+
+        def fla(arrays, dtype=dtype, kda=kda, scale=site.hooks.scale, leaves=leaves):
             path = os.path.join(requests, "inputs.npz")
             np.savez(path, **{key: np.asarray(value, np.float32) if key != "starts" else value
                               for key, value in arrays.items()})
-            worker.ask(f"{path} {dtype} {'kda' if kda else 'gdn'} {scale!r}")
+            worker.ask(f"{path} {dtype} {'kda' if kda else 'gdn'} {scale!r} {leaves}")
             with np.load(f"{path}.reference.npz") as reference, np.load(f"{path}.truth.npz") as truth:
                 return dict(reference), dict(truth)
 
-        exact_run = jax.jit(functools.partial(lambda hooks, arrays: ruled(
-            functools.partial(token_by_token, hooks), arrays), site.hooks))
+        exact_run = jax.jit(functools.partial(lambda hooks, arrays, leaves: ruled(
+            functools.partial(token_by_token, hooks), arrays, leaves), site.hooks, leaves=site.leaves))
         with jax.enable_x64(new_val=True):
             roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(sample)))
 
@@ -224,8 +233,8 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
             held_to_the_oracle(exact_run, arrays, truth, roundings, f"fla {name}")
             return reference, truth
 
-        portable = functools.partial(lambda hooks, arrays: ruled(functools.partial(chunk_on, 'xla', hooks),
-                                                                 arrays), site.hooks)
+        portable = functools.partial(lambda hooks, arrays, leaves: ruled(
+            functools.partial(chunk_on, 'xla', hooks), arrays, leaves), site.hooks, leaves=site.leaves)
         stored.update(record_case(name, site.arrays, evaluate, portable, truth_proxy=exact_run,
                                   store_inputs=False, summary=True))
         print(f"{name}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
