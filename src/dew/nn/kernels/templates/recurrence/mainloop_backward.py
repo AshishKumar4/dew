@@ -369,10 +369,12 @@ def _reverse_held(call: _Call, bv: int, *, gates: bool, skips: bool = False) -> 
     it (`algebra.reverse_carried`: the local one folds into it before the read forms), beside the output's
     gradient, a memory slice as an operand, and the stored tiles' casts; where the walk `gates` the values,
     the values beside the gradient for beta's sum, and where it `skips`, the output's gradient widened for
-    the skip's."""
+    the skip's; under a decay a key dimension a key slice of the memory entered, widened for the memory
+    decay's sum."""
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
     return _Held(carried=[_f32(call.width, bv)] * 2, phases=(
-        [_f32(CHUNK, bv)] * (2 + gates + skips) + _held(given, CHUNK, bv) * (1 + gates)
+        [_f32(CHUNK, bv)] * (2 + gates + skips) + [_f32(call.block, bv)] * call.per_key
+        + _held(given, CHUNK, bv) * (1 + gates)
         + _held(held, call.block, bv) + _held(call.memories, call.block, bv)
         + _held(_value_grads(call), CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
@@ -430,7 +432,7 @@ def _reverse_launched(call: _Call, batch: int, bv: int, walked_width: int, *, ga
 
 @_lowered_once
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, tiles: Tiles, *, scale: float,
-             skip=None):
+             skip=None, memory=None):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
     chunk leaves as `call.memories`, the corrected values' gradient in `_value_grads`' form (their own
     output's, `local`, `_local_back`'s, and the memory's, `algebra.reverse_carried`) and each row's initial
@@ -444,7 +446,11 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
     HV, R]` fp32 each value block's part of beta's, `sum(v du)` over its columns, from the tile the walk holds
     (mamba_ssm's `_chunk_scan_chunk_state_bwd_dx` forms its `ddt` so; `gradients` says where); with a `skip`
     `[HV]` fp32 there, `dv` takes `D do` too and a fifth output the skip's, `sum(v do)`, as that kernel forms
-    `dD`."""
+    `dD`. Under a decay a key dimension `memory` is the memories each chunk enters (`call.memories`), and a
+    fourth output `[Dv / BV, chunks * HV * Dk]` fp32 each value block's part of the memory decay's gradient
+    `sum(h dh)` (`algebra.key_memory_decay`), from the memory's gradient as the walk holds it, its key rows
+    in a tile's rows (in `key_backward._key_memory_back` they met the keys' columns, kda-lower5-sm90 at
+    6e03eb57e)."""
     width, value_width, family = call.width, call.value_width, call.family
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
@@ -455,10 +461,13 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
     chunks = call.chunks
     gates, skips = v is not None, skip is not None
     assert gates or not skips, "the walk adds a skip where it gates the values"
+    assert call.per_key == (memory is not None), "the walk takes the memories under a decay a key dimension"
 
     def program(q_ref, k_ref, w_ref, do_ref, local_ref, hi_ref, lo_ref, dht_ref, seq_ref, v_ref, beta_ref,
                 *refs, streams, staging, landing):
-        skip_ref, (dh_ref, dv_ref, dh0_ref, *gated_ref) = (refs[0], refs[1:]) if skips else (None, refs)
+        skip_ref, refs = (refs[0], refs[1:]) if skips else (None, refs)
+        entered_ref, (dh_ref, dv_ref, dh0_ref, *gated_ref) = (refs[0], refs[1:]) if call.per_key else (None,
+                                                                                                         refs)
         j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
         roled = _roled(staging, landing, walkers)
@@ -496,6 +505,10 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                 before_store()
                 memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
                                smem=lands[f"memory{i}"], wait=False)
+                if call.per_key:
+                    rows = pl.ds(memory(n, i), call.block)
+                    entered = family.tile_of(entered_ref.at[rows, pl.ds(column, bv)])
+                    gated_ref[0].at[column // bv, rows][...] = algebra.key_memory_decay(entered, part)
 
             def block(name, operand, i):
                 return _tile(slots, name, operand, columns=pl.ds(i * call.block, call.block))
@@ -538,6 +551,9 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                        landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
     out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates, skips=skips)
+    if call.per_key:
+        out_type = (*out_type, jax.ShapeDtypeStruct((value_width // bv, call.chunks * call.heads * width),
+                                                    jnp.float32))
     # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
     steps = chunks / sequences.shape[0]
     work = Work(2 * (2 + call.delta) * CHUNK * width * walked_width * steps, steps)
@@ -558,7 +574,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                    # that of values a walk gates none of: operands no step reads.
                    after=after)(q, k, k if w is None else w, do, local, hi, lo, dht, sequences,
                                 k if v is None else v, hi if beta is None else beta,
-                                *(() if skip is None else (skip.astype(jnp.float32),)))
+                                *(() if skip is None else (skip.astype(jnp.float32),)),
+                                *(() if memory is None else (memory,)))
 
 
 def _query_key_views(call: _Call, keyed: tuple, served: tuple, memory: tuple, *, row, key_columns, first,
