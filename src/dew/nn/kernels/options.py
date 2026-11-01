@@ -271,11 +271,13 @@ class OuterProgram:
 
     def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
-        ones dropped."""
+        ones dropped. It holds what jit keys on: the trace context, with its abstract mesh, and the
+        concrete mesh in place (`jax.sharding.get_mesh`), so a mesh of the same shape over other devices
+        compiles its own executable."""
         if not self.numbers and not self.names:
             leaves, structure = jax.tree.flatten((args, kwargs))
             return (len(args), ((), ()), structure, tuple(map(_signature, leaves)),
-                    jax_config.trace_context()), args, kwargs
+                    jax_config.trace_context(), jax.sharding.get_mesh()), args, kwargs
         numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
         named = {name: value for name, value in kwargs.items() if name not in self.names}
@@ -285,7 +287,7 @@ class OuterProgram:
                    tuple(sorted(((name, type(value), value) for name, value in kwargs.items()
                                  if name in self.names), key=lambda static: static[0])))
         return (len(args), statics, structure, tuple(map(_signature, leaves)),
-                jax_config.trace_context()), dynamic, named
+                jax_config.trace_context(), jax.sharding.get_mesh()), dynamic, named
 
 
 def _signature(leaf) -> Hashable:
