@@ -275,7 +275,7 @@ def _issued_sums(a, b, c, d, exponent, *, retired: bool):
     next is formed."""
     from dew.nn.kernels.templates import mosaic_sm90, operands, product
 
-    family = mosaic_sm90.WGMMA
+    family = mosaic_sm90.FED  # one warpgroup, no producer
     tile = ((ISSUED, ISSUED), jnp.bfloat16)
     call = types.SimpleNamespace(family=family, interpret=True)
 
@@ -289,7 +289,7 @@ def _issued_sums(a, b, c, d, exponent, *, retired: bool):
                              ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16))])
             out_gmem[...] = issuer.summed(products, retired=retired)
 
-        pl.run_scoped(scoped, *(plgpu.SMEM(*tile) for _ in range(3)))
+        pl.run_scoped(scoped, *(plgpu.SMEM(*tile) for _ in range(3)), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -316,7 +316,7 @@ def _carried_sums(a, b, c, d):
     register form), `c` staged into a shared buffer, `b` and `d` shared tiles, both products retired."""
     from dew.nn.kernels.templates import mosaic_sm90, operands
 
-    family = mosaic_sm90.WGMMA
+    family = mosaic_sm90.FED  # one warpgroup, no producer
     call = types.SimpleNamespace(family=family, interpret=True)
 
     def body(a_gmem, b_gmem, c_gmem, d_gmem, out_gmem):
@@ -327,7 +327,8 @@ def _carried_sums(a, b, c, d):
                         ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16)))
             out_gmem[...] = issuer.summed(products, retired=True, into=family.zeros((ISSUED, ISSUED)))
 
-        pl.run_scoped(scoped, *(plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16) for _ in range(3)))
+        pl.run_scoped(scoped, *(plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16) for _ in range(3)),
+                      collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
