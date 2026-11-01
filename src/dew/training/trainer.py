@@ -111,6 +111,7 @@ from dew.training._fit import (
     FitRun,
     HandedSplits,
     Start,
+    _rollout_admitted,
     _rollout_resumed,
     _rollout_saved,
     afresh,
@@ -315,7 +316,7 @@ class Trainer(Generic[Loss, Effects]):
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
-        self.tracker, self.step, self.rollout = tracker, step, rollout
+        self.tracker, self.step, self.rollout = tracker, step, _rollout_admitted(rollout)
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")

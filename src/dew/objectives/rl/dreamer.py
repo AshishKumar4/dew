@@ -23,9 +23,10 @@ in float32 where the code runs bfloat16.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
@@ -733,8 +734,8 @@ class DreamerV3Objective(Objective[Ratio]):
 
 class Saved(TypedDict):
     """What a `DreamerRollout` carries between calls, as a checkpoint holds it (`DreamerRollout.saved`):
-    the environment steps it took, those of them its prefills took, and with a checkpointed replay its
-    environments, replay and returns."""
+    the environment steps it took and those of them its prefills took (each two 32-bit words, `_words`),
+    and with a checkpointed replay its environments, replay and returns."""
 
     taken: np.ndarray
     prefilled: np.ndarray
@@ -757,9 +758,11 @@ class DreamerRollout:
 
     The run's checkpoints hold the environment steps it has taken (`saved`), so a resumed run takes the
     steps it still owes; its environments begin again and its replay is made again, from `replay` or the
-    prefill. With `checkpointed_replay`, they also hold its replay, its environments mid episode and their
-    running returns, and a resumed run samples what the uninterrupted run did, at the replay's size a
-    checkpoint (a JAX `Env`'s alone: a `Simulator`'s environments live outside JAX)."""
+    prefill. Resumed from a step that holds none of its state (one an earlier Dew saved), it owes the
+    steps of the updates after that step alone. A cooldown branch runs on copies of its environments and
+    replay (`branch`). With `checkpointed_replay`, its checkpoints also hold its replay, its environments
+    mid episode and their running returns, and a resumed run samples what the uninterrupted run did, at
+    the replay's size a checkpoint (a JAX `Env`'s alone: a `Simulator`'s environments live outside JAX)."""
 
     objective: DreamerV3Objective
     env: Env | Simulator
@@ -773,6 +776,7 @@ class DreamerRollout:
     _live: _Live | None = field(default=None, init=False, repr=False)
     _taken: int = field(default=0, init=False, repr=False)
     _prefilled: int = field(default=0, init=False, repr=False)
+    _restored: bool = field(default=False, init=False, repr=False)
     _ended: tuple[jax.Array | float, jax.Array | int] = field(default=(0.0, 0), init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -813,7 +817,7 @@ class DreamerRollout:
         live = self._live
         if live is None:
             return None
-        taken, prefilled = np.asarray(self._taken, np.int64), np.asarray(self._prefilled, np.int64)
+        taken, prefilled = _words(self._taken), _words(self._prefilled)
         if not self.checkpointed_replay:
             return Saved(taken=taken, prefilled=prefilled)
         return Saved(taken=taken, prefilled=prefilled, carry=live.carry, replay=live.replay,
@@ -821,7 +825,7 @@ class DreamerRollout:
 
     def saved_shapes(self) -> Mapping[str, object]:
         """`saved`'s leaves' shapes and dtypes, before any call."""
-        counted = jax.ShapeDtypeStruct((), np.int64)
+        counted = jax.ShapeDtypeStruct((2,), np.uint32)
         taken = {"taken": counted, "prefilled": counted}
         env = self.env
         if not self.checkpointed_replay or isinstance(env, Simulator):
@@ -831,14 +835,16 @@ class DreamerRollout:
         carry = jax.eval_shape(lambda key: self._begin(key, self.objective.memory(count)), key)
         action = jax.ShapeDtypeStruct((count, env.action_size), jnp.float32)
         example = {**views(carry.observation), "action": action}
-        replay = jax.eval_shape(lambda example: ReplayBuffer.empty(example, self.capacity), example)
+        # The replay the rollout was given, or the one its prefill fills.
+        replay = (jax.eval_shape(lambda: self.replay) if self.replay is not None
+                  else jax.eval_shape(lambda example: ReplayBuffer.empty(example, self.capacity), example))
         returns = jax.ShapeDtypeStruct((count,), jnp.float32)
         return {**taken, "carry": carry, "replay": replay, "returns": returns}
 
     def restored(self, tree: Saved) -> None:
         """The rollout carrying on from a `saved` tree: owing the steps after those it had taken, and with
         `checkpointed_replay` from its replay and its environments as they stood."""
-        self._taken, self._prefilled = int(np.asarray(tree["taken"])), int(np.asarray(tree["prefilled"]))
+        self._taken, self._prefilled, self._restored = _count(tree["taken"]), _count(tree["prefilled"]), True
         if "replay" in tree and "carry" in tree and "returns" in tree:
             self._live = _Live(tree["carry"], tree["replay"], tree["returns"])
 
@@ -906,8 +912,12 @@ class DreamerRollout:
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
+        if self._live is None and not self._restored:
+            # A run this rollout begins mid way (resumed from a step that holds no state of it) owes the
+            # steps of the updates after that step alone: those before it were taken by the run it resumes.
+            self._taken = self._owed(int(state.updates))
         live = self._started(variables, act_key) if self._live is None else self._live
-        owed = math.ceil((int(state.updates) + 1) * self.batch * self.length / self.train_ratio)
+        owed = self._owed(int(state.updates) + 1)
         envs = live.returns.shape[0]
         due = max(owed - (self._taken - self._prefilled), 0)
         if due:
@@ -916,6 +926,22 @@ class DreamerRollout:
         # The update's windows stay on the device the replay is held on, which the trainer places from: the
         # host does not wait to fetch them (a FlyDreamer update's 56 MB of images went there and back).
         return self._drawn(sample_key)
+
+    def _owed(self, updates: int) -> int:
+        """The environment steps `updates` updates train on at the rollout's train ratio, rounded up."""
+        return math.ceil(updates * self.batch * self.length / self.train_ratio)
+
+    @contextlib.contextmanager
+    def branch(self, name: str) -> Iterator[None]:
+        """A cooldown branch's calls (`Rollout`'s `branch`), on copies of the rollout's environments and
+        replay, after which the rollout stands as the run left it: its live state is donated to the steps
+        that advance it, so the run's is copied aside first, at the replay's size again for the branch."""
+        kept = (None if self._live is None else jax.tree.map(jnp.copy, self._live), self._taken,
+                self._prefilled, self._restored, self._ended)
+        try:
+            yield
+        finally:
+            self._live, self._taken, self._prefilled, self._restored, self._ended = kept
 
     def sample(self, key: jax.Array) -> Batch:
         """`batch` windows of `length` steps drawn from the replay as an update draws them, fetched to the
@@ -936,6 +962,18 @@ class DreamerRollout:
         # Read when the metrics are, so the host does not wait for each advance to finish.
         self._ended = (total, count)
         return live
+
+
+def _words(count: int) -> np.ndarray:
+    """A count of steps as two 32-bit words, high then low, which a checkpoint keeps exactly whether or
+    not JAX runs in 64 bits (`_count`)."""
+    return np.asarray([count >> 32, count & 0xFFFFFFFF], np.uint32)
+
+
+def _count(words) -> int:
+    """The count `_words` wrote."""
+    high, low = (int(word) for word in np.asarray(words, np.uint64))
+    return high << 32 | low
 
 
 @struct.dataclass

@@ -15,9 +15,10 @@ terminal state takes no value after it.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypedDict
 
@@ -257,6 +258,17 @@ class ControlRollout:
     @property
     def metrics(self) -> Mapping[str, float]:
         return {"episode_return": self._ended}
+
+    @contextlib.contextmanager
+    def branch(self, name: str) -> Iterator[None]:
+        """A cooldown branch's calls (`Rollout`'s `branch`), after which the rollout stands as the run left
+        it: its environments mid episode, the collection it serves and their order. Nothing it carries is
+        donated, so what the run left is kept as it is."""
+        kept = (self._carry, self._returns, self._collected, self._order, self._ended)
+        try:
+            yield
+        finally:
+            self._carry, self._returns, self._collected, self._order, self._ended = kept
 
     def saved(self) -> Saved | None:
         """What the rollout carries between calls, for the run's checkpoint (`Rollout`'s `saved`): every

@@ -3,6 +3,7 @@
 an episode driver's records against the steps it took, and an agent that learns its world."""
 
 import itertools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -454,49 +455,142 @@ def test_an_auxiliary_head_named_as_a_world_model_loss_is_refused(name):
         DreamerV3Objective(headed(name))
 
 
-def test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike(tmp_path):
-    """A DreamerV3 run on targets, checkpointed every update and resumed from its third by a fresh rollout:
-    the checkpoint holds the environment steps it took, so the resumed rollout takes, update by update, the
-    steps the uninterrupted one did, its environments and replay begun again (and its prefill taken again);
-    with `checkpointed_replay` it also holds the replay, the targets mid episode and their returns, so the
-    resumed run takes the very steps and its last state is the uninterrupted run's, every leaf bit for bit,
-    the key's as its raw bits."""
-    import shutil
+def dreamer_targets(objective, *, checkpointed, replay=None):
+    """A Dreamer rollout over eight targets, its replay the prefill's (400 steps) or `replay`."""
+    targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+    return DreamerRollout(objective, targets, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24,
+                          checkpointed_replay=checkpointed, replay=replay)
 
+
+def dreamer_fit(directory, objective, rollout, steps, **options):
+    """A Dreamer run of `steps` updates over `rollout`, checkpointed every update to `directory`."""
     from dew.checkpoints import Checkpoints, Keep
     from dew.data.dataset import Loader, replayed
     from dew.training import Trainer
 
     unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
     data = Loader(train=unread, val=None, records=8, batch=8)
+    checkpoints = None if directory is None else Checkpoints(str(directory), keep=Keep(latest=8))
+    trainer = Trainer(objective, options.pop("optimizer", optax.adam(1e-3)), key=jax.random.key(7),
+                      rollout=rollout, checkpoints=checkpoints)
+    return trainer.fit(data, steps=steps, log_every=1, checkpoint_every=None if directory is None else 1,
+                       **options)
 
-    def trained(directory, objective, rollout):
-        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout,
-                          checkpoints=Checkpoints(str(directory), keep=Keep(latest=8)))
-        return trainer.fit(data, steps=5, log_every=1, checkpoint_every=1)
 
-    def rollout(objective, checkpointed):
-        targets = Batched(TimeLimit(Target(), episode_length=20), 8)
-        return DreamerRollout(objective, targets, capacity=400, batch=8, length=16, train_ratio=32.0,
-                              prefill=24, checkpointed_replay=checkpointed)
+def bits(state) -> list[np.ndarray]:
+    """A run's state as arrays, a key's as its raw bits, for a bit-for-bit comparison."""
+    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
+            for leaf in jax.tree.leaves(state)]
 
-    def resumed(directory, objective, made):
-        copied = tmp_path / f"{directory.name}-resumed"
-        shutil.copytree(directory, copied)
-        for later in (4, 5):
-            shutil.rmtree(Checkpoints(str(copied)).path(later))
-        return trained(copied, objective, made), made
 
-    def bits(state):
-        return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
-                           else leaf) for leaf in jax.tree.leaves(state)]
-
+@pytest.mark.parametrize("given", ["prefilled", "supplied"])
+def test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike(tmp_path,
+                                                                                                  given):
+    """A DreamerV3 run on targets, checkpointed every update, stopped at its third and resumed by a fresh
+    rollout: the checkpoint holds the environment steps it took, so the resumed rollout takes, update by
+    update, the steps the uninterrupted one did, its environments and replay begun again (its prefill
+    taken again); with `checkpointed_replay` it also holds the replay (the prefill's, or one the rollout
+    was given, of another capacity), the targets mid episode and their returns, so the resumed run takes
+    the very steps and its last state is the uninterrupted run's, every leaf bit for bit."""
+    supplied = None
+    if given == "supplied":
+        # A replay of 300 steps, filled by another rollout's prefill: the rollout's own capacity is 400.
+        seed = DreamerRollout(DreamerV3Objective(tiny()), Batched(TimeLimit(Target(), episode_length=20), 8),
+                              capacity=300, batch=8, length=16, train_ratio=32.0, prefill=24)
+        dreamer_fit(None, seed.objective, seed, 1)
+        supplied = seed.held_replay
     for checkpointed in (False, True):
         objective = DreamerV3Objective(tiny())
-        uninterrupted = rollout(objective, checkpointed)
-        whole = trained(tmp_path / f"whole-{checkpointed}", objective, uninterrupted)
-        again, made = resumed(tmp_path / f"whole-{checkpointed}", objective, rollout(objective, checkpointed))
-        assert made.environment_steps == uninterrupted.environment_steps + (0 if checkpointed else 24 * 8)
+
+        def made(objective=objective, checkpointed=checkpointed):
+            replay = None if supplied is None else jax.tree.map(jnp.copy, supplied)
+            return dreamer_targets(objective, checkpointed=checkpointed, replay=replay)
+
+        uninterrupted = made()
+        whole = dreamer_fit(tmp_path / f"whole-{checkpointed}", objective, uninterrupted, 5)
+        dreamer_fit(tmp_path / f"stopped-{checkpointed}", objective, made(), 3)
+        resumed = made()
+        again = dreamer_fit(tmp_path / f"stopped-{checkpointed}", objective, resumed, 5)
+        prefilled = 0 if checkpointed or supplied is not None else 24 * 8
+        assert resumed.environment_steps == uninterrupted.environment_steps + prefilled
         if checkpointed:
             for one, other in zip(bits(whole), bits(again), strict=True):
                 np.testing.assert_array_equal(one, other)
+
+
+def test_a_dreamer_rollouts_step_counts_past_32_bits_come_back_from_its_checkpoint(tmp_path):
+    """A Dreamer rollout's counts of steps past 2**31 and 2**32, saved in a run's checkpoint with JAX in 32
+    bits, come back exact into a fresh rollout (`DreamerRollout.restored`)."""
+    from dew.checkpoints import Checkpoints
+    from dew.training._fit import _rollout_resumed, _rollout_saved
+
+    objective = DreamerV3Objective(tiny())
+    rollout = dreamer_targets(objective, checkpointed=False)
+    state = dreamer_fit(None, objective, rollout, 1)
+    rollout._taken, rollout._prefilled = 2**33 + 2**31 + 7, 2**31 + 5
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(1, state, rollout=_rollout_saved(rollout))
+    checkpoints.wait()
+    back = dreamer_targets(objective, checkpointed=False)
+    _rollout_resumed(back, checkpoints, 1, state.key.sharding)
+    assert (back.environment_steps, back._prefilled) == (2**33 + 2**31 + 7, 2**31 + 5)
+
+
+def test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps_after_it(tmp_path):
+    """A DreamerV3 run resumed at its third update from checkpoints written without its rollout's state
+    (as an earlier Dew wrote them) begins its targets and replay again and owes the steps of its fourth
+    and fifth updates alone: after its prefill it takes at least the steps those updates train on, and
+    less than one step of every target more, where taking the run's whole history again would take the
+    steps of all five."""
+    class Forgetting(DreamerRollout):
+        """The rollout saving nothing of what it carries, as one did before checkpoints held it."""
+
+        def saved(self):
+            return None
+
+    objective = DreamerV3Objective(tiny())
+    targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+
+    def forgetting():
+        return Forgetting(objective, targets, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
+
+    dreamer_fit(tmp_path / "run", objective, forgetting(), 3)
+    resumed = forgetting()
+    dreamer_fit(tmp_path / "run", objective, resumed, 5)
+    owed = [math.ceil(updates * 8 * 16 / 32.0) for updates in (3, 5)]
+    taken = resumed.environment_steps - 24 * 8 - owed[0]
+    assert owed[1] - owed[0] <= taken < owed[1] - owed[0] + 8
+
+
+def test_a_dreamer_runs_cooldown_leaves_its_replay_as_the_run_left_it(tmp_path):
+    """A DreamerV3 run with a checkpointed replay and a cooldown at its third update ends, every leaf bit
+    for bit, where the run with no cooldown does: the branch runs on copies of the rollout's targets and
+    replay (`DreamerRollout.branch`), the run's own donated buffers kept aside. Preempted as its branch
+    begins, the run saves its step's state with the rollout's as the run left it, and its resume runs the
+    branch again and ends there too."""
+    from recording import preempting
+
+    from dew.checkpoints import Checkpoints
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite, Preempted
+    from dew.training.cooldown import Cooldowns
+
+    objective = DreamerV3Objective(tiny())
+    # The agent acts on the steps its driver records (`Driven`).
+    flights = {"flight": EvalSuite(Episodes(episodes(objective.act, Driven(Batched(TimeLimit(
+        Target(), episode_length=20), 4)), 20, memory=objective.memory)), every=6)}
+    options = {"optimizer": optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), "validation": flights}
+    plain = bits(dreamer_fit(None, objective, dreamer_targets(objective, checkpointed=True), 6, **options))
+    cooldowns = Cooldowns(at=(3,), length=2)
+    cooled = dreamer_fit(None, objective, dreamer_targets(objective, checkpointed=True), 6,
+                         cooldowns=cooldowns, **options)
+    for one, other in zip(plain, bits(cooled), strict=True):
+        np.testing.assert_array_equal(one, other)
+    with pytest.raises(Preempted):
+        dreamer_fit(tmp_path / "run", objective, dreamer_targets(objective, checkpointed=True), 6,
+                    cooldowns=cooldowns, observe=preempting(2), **options)
+    assert Checkpoints(str(tmp_path / "run")).latest == 3
+    again = dreamer_fit(tmp_path / "run", objective, dreamer_targets(objective, checkpointed=True), 6,
+                        cooldowns=cooldowns, **options)
+    for one, other in zip(plain, bits(again), strict=True):
+        np.testing.assert_array_equal(one, other)

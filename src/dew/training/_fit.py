@@ -962,17 +962,39 @@ class Start:
     shardings: Placement[TrainState]
 
 
-def _rollout_saved(rollout: Rollout | None) -> Mapping[str, object] | None:
-    """The state a checkpoint holds of `rollout` (`Rollout`'s `saved`), which a rollout is any callable
-    and a plain function has none of, so the trainer reads it at this boundary; None for none. A run of
-    several processes refuses one: each holds its own environments, and a checkpoint the pool's tree."""
-    saved = getattr(rollout, "saved", None)
-    tree = None if saved is None else saved()
-    if tree is not None and jax.process_count() > 1:
+def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:
+    """`rollout`, refused where it checkpoints state (`Rollout`'s `saved_shapes` not None) in a run of
+    several processes: each process holds its own environments and a checkpoint holds the pool's tree,
+    so the run is refused as it is made, before it restores or steps. Read at this boundary, as the
+    trainer reads a rollout's optional members."""
+    shapes = getattr(rollout, "saved_shapes", None)
+    if jax.process_count() > 1 and shapes is not None and shapes() is not None:
         raise ValueError(f"{type(rollout).__name__} checkpoints the state it carries, which a run of "
                          f"{jax.process_count()} processes holds one of a process, and a checkpoint holds "
                          "the pool's; train it on one process")
-    return tree
+    return rollout
+
+
+def _rollout_saved(rollout: Rollout | None) -> Mapping[str, object] | None:
+    """The state a checkpoint holds of `rollout` (`Rollout`'s `saved`), read at this boundary, its host
+    leaves placed on the default device as every checkpoint's leaves are arrays; None for none. A 64-bit
+    host leaf is refused: JAX keeps it in 32 bits unless it runs in 64, so a rollout writes a wide count
+    as 32-bit words."""
+    saved = getattr(rollout, "saved", None)
+    tree = None if saved is None else saved()
+    if tree is None:
+        return None
+
+    def placed(leaf):
+        if isinstance(leaf, jax.Array):
+            return leaf
+        host = np.asarray(leaf)
+        if host.dtype.itemsize > 4 and not jax.config.read("jax_enable_x64"):
+            raise ValueError(f"{type(rollout).__name__} saves a {host.dtype} leaf, which a checkpoint keeps "
+                             "in 32 bits with JAX's 64-bit mode off: save it as 32-bit words")
+        return jax.device_put(host)
+
+    return jax.tree.map(placed, dict(tree))
 
 
 def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: int,

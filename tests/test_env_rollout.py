@@ -368,14 +368,20 @@ def test_a_driven_simulator_records_what_a_driven_env_records():
     assert np.asarray(expected.observation["first"])[1:].any()
 
 
-def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_stopped(tmp_path):
-    """A PPO run on walks, checkpointed every update, resumed from its third update's checkpoint by a fresh
-    rollout over fresh environments: the checkpoint holds the rollout's walks mid episode, the collection it
-    serves and its minibatches' order (`ControlRollout.saved`), so the resumed run's last state is the
-    uninterrupted run's, every leaf bit for bit, the key's as its raw bits; a run whose checkpoints were
-    written without the rollout's state resumes to another state, its walks begun again."""
-    import shutil
+def resumed_bits(state) -> list[np.ndarray]:
+    """A run's state as arrays, a key's as its raw bits, for a bit-for-bit comparison."""
+    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
+            for leaf in jax.tree.leaves(state)]
 
+
+@pytest.mark.parametrize("where", ["persistent", "local"])
+def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_stopped(tmp_path, where):
+    """A PPO run on walks, checkpointed every update to its run's directory or to its local one, stopped at
+    its third update and resumed from that checkpoint by a fresh rollout over fresh environments: the
+    checkpoint holds the rollout's walks mid episode, the collection it serves and its minibatches' order
+    (`ControlRollout.saved`), so the resumed run's last state is the uninterrupted run's, every leaf bit
+    for bit, the key's as its raw bits; a run whose checkpoints were written without the rollout's state
+    resumes to another state, its walks begun again."""
     from dew.checkpoints import Checkpoints, Keep
     from dew.data.dataset import Loader, replayed
     from dew.training import Trainer
@@ -388,26 +394,23 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
     data = Loader(train=unread, val=None, records=8, batch=8)
 
     def trained(directory, steps, rollout):
+        local = {"local_directory": str(directory / "local"), "local_every": 1} if where == "local" else {}
         trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
-                          checkpoints=Checkpoints(str(directory), keep=Keep(latest=8)))
-        return trainer.fit(data, steps=steps, log_every=1, checkpoint_every=1)
+                          checkpoints=Checkpoints(str(directory / "run"), keep=Keep(latest=8), **local))
+        # A local run keeps its local checkpoint alone, so the resume reads it.
+        every = {"checkpoint_every": 1} if where == "persistent" else {"checkpoint_final": False}
+        return trainer.fit(data, steps=steps, log_every=1, **every)
 
-    def resumed(directory, rollout):
-        copied = tmp_path / f"{directory.name}-resumed"
-        shutil.copytree(directory, copied)
-        for later in (4, 5, 6):
-            shutil.rmtree(Checkpoints(str(copied)).path(later))
-        return trained(copied, 6, rollout)
+    def resumed(directory, made):
+        trained(directory, 3, made())
+        return trained(directory, 6, made())
 
-    def bits(state):
-        return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
-                           else leaf) for leaf in jax.tree.leaves(state)]
+    def made():
+        return ControlRollout(objective, walks(), unroll_length=8, epochs=2, minibatches=2)
 
-    whole = trained(tmp_path / "whole", 6, ControlRollout(objective, walks(), unroll_length=8, epochs=2,
-                                                            minibatches=2))
-    again = resumed(tmp_path / "whole", ControlRollout(objective, walks(), unroll_length=8, epochs=2,
-                                                       minibatches=2))
-    for one, other in zip(bits(whole), bits(again), strict=True):
+    whole = trained(tmp_path / "whole", 6, made())
+    again = resumed(tmp_path / "stopped", made)
+    for one, other in zip(resumed_bits(whole), resumed_bits(again), strict=True):
         np.testing.assert_array_equal(one, other)
 
     class Forgetting(ControlRollout):
@@ -416,11 +419,53 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
         def saved(self):
             return None
 
-    forgot = Forgetting(objective, walks(), unroll_length=8, epochs=2, minibatches=2)
-    trained(tmp_path / "forgot", 6, forgot)
-    afresh = resumed(tmp_path / "forgot", Forgetting(objective, walks(), unroll_length=8, epochs=2,
-                                                     minibatches=2))
-    assert not all(np.array_equal(one, other) for one, other in zip(bits(whole), bits(afresh), strict=True))
+    def forgetting():
+        return Forgetting(objective, walks(), unroll_length=8, epochs=2, minibatches=2)
+
+    afresh = resumed(tmp_path / "forgot", forgetting)
+    assert not all(np.array_equal(one, other)
+                   for one, other in zip(resumed_bits(whole), resumed_bits(afresh), strict=True))
+
+
+def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path):
+    """A PPO run on walks with a cooldown at its fourth update ends, every leaf bit for bit, where the run
+    with no cooldown does: the branch's updates run on the rollout's walks and collection and leave them as
+    the run left them (`ControlRollout.branch`). Preempted as its branch begins, the run saves its step's
+    state with the rollout's as the run left it, and its resume runs the branch again and ends there too."""
+    from recording import preempting
+
+    from dew.checkpoints import Checkpoints, Keep
+    from dew.data.dataset import Loader, replayed
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite, Preempted, Trainer
+    from dew.training.cooldown import Cooldowns
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+    # A cooldown branch is scored by the run's validation: here the walks the greedy policy flies.
+    flights = {"flight": EvalSuite(Episodes(episodes(objective.greedy, Batched(TimeLimit(
+        Walk(limit=50.0), episode_length=8), 8), 8)), every=8)}
+
+    def trained(directory=None, **options):
+        walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16)
+        checkpoints = None if directory is None else Checkpoints(str(directory), keep=Keep(latest=8))
+        # A cooldown scales the rate the optimizer's state holds.
+        trainer = Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=3e-3),
+                          key=jax.random.key(5), checkpoints=checkpoints,
+                          rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
+        return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
+
+    plain = resumed_bits(trained())
+    cooldowns = Cooldowns(at=(4,), length=2)
+    for one, other in zip(plain, resumed_bits(trained(cooldowns=cooldowns)), strict=True):
+        np.testing.assert_array_equal(one, other)
+    with pytest.raises(Preempted):
+        trained(tmp_path / "run", cooldowns=cooldowns, checkpoint_every=1, observe=preempting(3))
+    assert Checkpoints(str(tmp_path / "run")).latest == 4
+    again = trained(tmp_path / "run", cooldowns=cooldowns, checkpoint_every=1)
+    for one, other in zip(plain, resumed_bits(again), strict=True):
+        np.testing.assert_array_equal(one, other)
 
 
 @struct.dataclass
@@ -487,3 +532,18 @@ def test_a_split_scored_by_its_episodes_reports_the_flights_first_episodes(tmp_p
         assert scalars["flight/return"] == float(np.where(inside, reward, 0).sum(0).mean())
         assert scalars["flight/steps"] == float(inside.sum(0).mean())
         assert scalars["flight/distance"] == float(distance[last, np.arange(32)].mean())
+
+
+def test_a_pool_is_refused_a_rollout_that_checkpoints_its_state_as_its_trainer_is_made(tmp_path):
+    """Every process of a pool of two is refused a trainer over a rollout that checkpoints the state it
+    carries, as the trainer is made, before it restores or steps (each process holds its own environments,
+    a checkpoint the pool's tree); a rollout that carries none, a plain function, is made there."""
+    from pathlib import Path
+
+    from process_support import run_pool
+
+    reports = run_pool("made", tmp_path, 2, script=Path(__file__).with_name("rollout_state_worker.py"),
+                       devices=1, timeout=300)
+    for report in reports:
+        assert report["processes"] == 2
+        assert report["stateful"] is not None and report["stateless"] is None
