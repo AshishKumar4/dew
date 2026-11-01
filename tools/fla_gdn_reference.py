@@ -235,8 +235,12 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
 
         portable = functools.partial(lambda hooks, arrays, leaves: ruled(
             functools.partial(chunk_on, 'xla', hooks), arrays, leaves), site.hooks, leaves=site.leaves)
+        # Sized paired with the template's own arm where the site's errors are heavy-tailed (`Site.paired`).
+        dew = jax.jit(functools.partial(lambda hooks, arrays, leaves: ruled(
+            functools.partial(chunk_on, 'mosaic_gpu', hooks), arrays, leaves), site.hooks,
+            leaves=site.leaves)) if site.paired else None
         stored.update(record_case(name, site.arrays, evaluate, portable, truth_proxy=exact_run,
-                                  store_inputs=False, summary=True))
+                                  store_inputs=False, summary=True, dew=dew))
         print(f"{name}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
     stored["provenance"] = provenance(
         version, version, device.strip(),

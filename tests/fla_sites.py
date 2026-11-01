@@ -41,6 +41,11 @@ class Site(NamedTuple):
     leaves: tuple[str, ...] = LEAVES
     """The leaves its tests read, which the recorder records: a forward's site its output and final memory
     alone, no gradient run."""
+    paired: bool = False
+    """Whether its recording sizes its seed count paired with the template's own arm (`record_case`'s
+    `dew`), as check 1's verdict pairs them: a site whose errors are heavy-tailed across draws alike in both
+    arms, where fla compared with itself on other draws resolved no count within 512 seeds (the final
+    memory under decays near zero, fla-unit14-6ac02f3ca, fla-unit15-6ac02f3ca)."""
 
     def arrays(self, seed: int) -> dict[str, np.ndarray]:
         """The seed's draw as host arrays, the recording's inputs."""
@@ -95,15 +100,21 @@ def _with_cotangents(draw: Callable[[int], Chunk]) -> Callable[[int], tuple[Chun
 
 def _mosaic_sites() -> dict[str, Site]:
     import test_recurrence_mosaic as mosaic
+    import test_recurrence_mosaic_gradient as gradient
 
     sites = {}
+    # The interpreted geometry's gradient only where the CPU interprets the case's gradient
+    # (`INTERPRETED_GRADIENT`): fla's packed per-key gradient there, which no test reads, resolved no count
+    # within 512 seeds at dbeta (fla-unit09-6ac02f3ca).
+    interpreted_gradients = {(case, label) for case, label, _ in gradient.INTERPRETED_GRADIENT}
     for case in mosaic.SHAPES:
         hooks = mosaic.case_hooks(case)
         for label, dtype in mosaic.DTYPES.items():
             for geometry, interpreted in (('cpu', True), ('gpu', False)):
                 at = mosaic.geometry_on(case, interpreted)
+                leaves = FORWARD if interpreted and (case, label) not in interpreted_gradients else LEAVES
                 sites[f"mosaic/{case}/{label}/{geometry}"] = Site(hooks, _with_cotangents(
-                    lambda seed, dtype=dtype, at=at: mosaic.draw(dtype, seed, **at)[0]))
+                    lambda seed, dtype=dtype, at=at: mosaic.draw(dtype, seed, **at)[0]), leaves)
     for geometry, interpreted in (('cpu', True), ('gpu', False)):
         at = {**mosaic.geometry_on('one sequence', interpreted), 'value_width': 64}
         hooks = recurrence.Hooks(decay='scalar', scale=at['key_width'] ** -0.5, write_bound=1.0)
@@ -130,7 +141,8 @@ def _stability_sites() -> dict[str, Site]:
                 restored = stability.restarting(lambda given: given, regime)(operands)
                 return template_stability.bf16(restored, hooks), (out.astype(jnp.bfloat16), final)
 
-            sites[f"stability/{name}/{regime}/forward"] = Site(hooks, _with_cotangents(forward), FORWARD)
+            sites[f"stability/{name}/{regime}/forward"] = Site(hooks, _with_cotangents(forward), FORWARD,
+                                                               paired=regime == "decays near zero")
             sites[f"stability/{name}/{regime}/gradient"] = Site(hooks, gradient)
     return sites
 
