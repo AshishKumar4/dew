@@ -15,7 +15,6 @@ file's input). Where a directory could not be watched (fs.inotify.max_user_watch
 overflowed, or a watched directory was deleted, moved or unmounted, taking its watch with it, the watch is
 blind: what was opened then is not known, and no record keeps a key (owner, 2026-10-27)."""
 
-import contextlib
 import ctypes
 import os
 import select
@@ -38,19 +37,13 @@ groups' input (`ci.py`'s `cache_key`), and no other file's."""
 
 class Opens:
     """The watch of every directory under `root`'s tests/ and src/, but hidden ones and __pycache__, read by a
-    thread of its own until it is `closed`; and, given the task's start (`started`), of each file another
-    process of the task left in shared scratch (`shared`, `private` aside): one any process opens, or whose
-    directory it lists, makes the watch blind, as its reader's input no key holds (review: a native tool
-    reading a file an earlier test file wrote to /tmp, which no audit hook sees)."""
+    thread of its own until it is `closed`."""
 
-    def __init__(self, root: str, started: float | None = None, shared: tuple[str, ...] = (),
-                 private: tuple[str, ...] = ()) -> None:
+    def __init__(self, root: str) -> None:
         self.root = root
         self.blind = False
         self.opened: set[str] = set()
         self.watched: dict[int, str] = {}
-        # Each watched directory of shared scratch holding a leaving, by its watch, with the leavings' names.
-        self.leavings: dict[int, set[str]] = {}
         libc = ctypes.CDLL(None, use_errno=True)
         self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
         if self.fd < 0:
@@ -68,33 +61,9 @@ class Opens:
                     self.fd = -1
                     return
                 self.watched[watch] = os.path.relpath(directory, root)
-        if started is not None:
-            self.leave(libc, started, shared, (os.path.realpath(root), *map(os.path.realpath, private)))
         self.stopped = threading.Event()
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
-
-    def leave(self, libc, started: float, shared: tuple[str, ...], apart: tuple[str, ...]) -> None:
-        """Each file of `shared` scratch made or changed since `started`, outside `apart` (the checkout and
-        this file's own scratch and caches), watched by its directory; blind where one cannot be."""
-        for top in shared:
-            for directory, names, files in os.walk(top):
-                names[:] = [name for name in names if name != "__pycache__"
-                            and not any(os.path.join(directory, name, "").startswith(os.path.join(where, ""))
-                                        for where in apart)]
-                left = set()
-                for name in files:
-                    with contextlib.suppress(OSError):
-                        found = os.lstat(os.path.join(directory, name))
-                        if max(found.st_mtime, found.st_ctime) >= started:
-                            left.add(name)
-                if not left:
-                    continue
-                watch = libc.inotify_add_watch(self.fd, directory.encode(), OPEN | DELETE_SELF | MOVE_SELF)
-                if watch < 0:
-                    self.blind = True
-                    return
-                self.leavings[watch] = left
 
     def read(self) -> None:
         while not self.stopped.wait(DRAIN_SECONDS):
@@ -112,9 +81,6 @@ class Opens:
                 name = data[start:start + length].split(b"\0", 1)[0].decode()
                 at += EVENT.size + length
                 if mask & LOST:
-                    self.blind = True
-                elif mask & OPEN and watch in self.leavings and (not name or name in self.leavings[watch]):
-                    # A leaving opened, or its directory listed.
                     self.blind = True
                 elif mask & OPEN and watch in self.watched and name and not mask & DIRECTORY \
                         and not name.endswith((".py", ".pyc")):

@@ -1406,15 +1406,16 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
     began = time.monotonic()
-    # The task's start, one for every call below (a heavy file's kept groups run after its whole files): what
-    # one file's process leaves for another's, whichever call runs it, is made after it (followed.py's
-    # `outside`).
+    # The task's start, one for every call below (a heavy file's kept groups run after its whole files): a
+    # program made since is no tool (followed.py's `tool`). What a file left where no key holds it, whichever
+    # call ran it, leaves every file run after it without a key (`left_behind`).
     started = {followed.STARTED_AT: str(time.time())}
+    left: set[str] = set()
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
     code = tested(python, names, split, out, deadline, cache, grace, common, started, coverage, whole=whole,
-                  release=release, kept=whole_files)
+                  release=release, kept=whole_files, left=left)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = SITE.fullmatch(split)
@@ -1426,8 +1427,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         return code
     rows = json.loads(out.read_text())["rows"]
     for index, (name, group, at) in enumerate(groups, start=1):
-        left = deadline - (time.monotonic() - began)
-        if left <= 0:
+        remaining = deadline - (time.monotonic() - began)
+        if remaining <= 0:
             # The task's deadline spent on the rows before it: this group is neither read nor run, and is red
             # as a row its task's deadline cut off is (review).
             rows.append({"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
@@ -1436,8 +1437,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                          "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
             continue
         part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, left, cache, grace, common, started, coverage,
-                                whole=whole, release=release, kept={name: at}))
+        code = max(code, tested(python, [name], group, part, remaining, cache, grace, common, started,
+                                coverage, whole=whole, release=release, kept={name: at}, left=left))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return code
@@ -1502,11 +1503,16 @@ def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselect
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
-           kept: Mapping[str, tuple[str, str]] | None = None) -> int:
+           kept: Mapping[str, tuple[str, str]] | None = None,
+           held_back: dict[str, tuple] | None = None, left: set[str] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
-    site's map task (`SITE`) is never reused: its draws, among its artifacts, are what its judge reads."""
+    site's map task (`SITE`) is never reused: its draws, among its artifacts, are what its judge reads. Each
+    file's record is written as it ends, but into `held_back` where one is given (its rows, log and watch,
+    by its name), for a caller that runs files side by side to write once it knows what each left
+    (`gpu_lane`). `left`, the files of the task run before that may have left something a later one reads
+    (`left_behind`), which the caller's later calls read on (`task`)."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
     site = SITE.fullmatch(group)
@@ -1521,9 +1527,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
     ran = []
     # The task's start (`task` names it; a call made on its own, its own), before which every program it may
-    # run as a tool was made and every file it reads in shared scratch or the home was (followed.py's `tool`,
-    # `outside`).
+    # run as a tool was made (followed.py's `tool`).
     environ = {followed.STARTED_AT: str(time.time()), **environ}
+    # The files run before that may have left something a later one reads where no key holds it
+    # (`left_behind`): none run after one keeps a key, as its run may have read that.
+    left = set() if left is None else left
     for index, name in enumerate(tests):
         left = deadline - (time.monotonic() - began)
         alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
@@ -1531,11 +1539,31 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         ran.append(file_row(python, name, group, site, alone_, deadline))
         # The verdict first, so no cache write that waits on the Worker keeps it from armada.
         out.write_text(json.dumps({"rows": rows + ran}))
-        if coverage is None and not release and alone_ is not None:
+        if alone_ is None:
+            continue
+        if coverage is None and not release:
             # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which
             # runs under its requirement's overlay and on the whole suite's run alone.
-            record(python, ran[-1:], alone_.log, common, network, alone_.opened)
+            opened = None if left else alone_.opened
+            if held_back is None:
+                record(python, ran[-1:], alone_.log, common, network, opened)
+            else:
+                held_back[name] = (ran[-1:], alone_.log, opened)
+        if left_behind(alone_.log):
+            left.add(name)
     return 0
+
+
+def left_behind(log: Path) -> bool:
+    """Whether the test file whose recorder's log is `log` may have left something a later file of its task
+    reads where no key holds it: a write outside its own (followed.py's `WROTE`: the home, shared scratch,
+    the checkout, a hidden directory of it among them), a process its record could not follow or an end its
+    log does not hold, whose writes no one saw; or a run that names no file at all. A later file that reads
+    what it left keyed by nothing would be reused after an edit to this file's code changed what it leaves
+    (reviews of the reuse-keys head: /tmp/result, .memo/result, ~/.cache/x, a native reader, a writer beside
+    it on a GPU lane): no file after it keeps a key, and this one keeps its own."""
+    files = followed.recorded(log)
+    return not files or any(ran["wrote"] for ran in files.values())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1565,7 +1593,7 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     # group has exited (`record`).
     log = base.with_name(f"{base.name}.lifetime.log")
     collection = base.with_name(f"{base.name}.collected.json")
-    report = base.parent / ".armada-reports" / f"{base.name}.junit.xml"
+    report = base.with_name(f"{base.name}.junit.xml")
     for stale in (report, log, collection):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
@@ -1594,15 +1622,19 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     environment = session.pytest_environment({
         **environ, **site_environment(site), "XDG_CACHE_HOME": str(caches), "TMPDIR": scratch,
         "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache" / "uv")),
-        followed.PRIVATE: str(caches), "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
+        followed.PRIVATE: str(caches), "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
+        "DEW_EXECUTED_REPORT": str(report),
+        # The stores a library keeps beside a run, in the file's own caches too: Hypothesis's example
+        # database, in the working directory where nothing names it, and Triton's kernels, in the home.
+        "HYPOTHESIS_STORAGE_DIRECTORY": str(caches / "hypothesis"),
+        "TRITON_CACHE_DIR": str(caches / "triton")})
     # A store elsewhere, inherited, would be one every file of the task shared.
     environment = {name: value for name, value in environment.items() if name not in followed.CACHES}
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the process's group opens, held from before pytest starts until its group stopped
     # (`watched`): each is the file's input.
-    opens = watched.Opens(os.getcwd(), float(environment[followed.STARTED_AT]), followed.SHARED_ROOTS,
-                          (scratch, str(caches)))
+    opens = watched.Opens(os.getcwd())
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
 
@@ -2000,9 +2032,13 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
-    # The lane's start, for every file's process alike (the files run at once): what one leaves for another is
-    # made after it (followed.py's `outside`).
+    # The lane's start, for every file's process alike (the files run at once): a program made since is no
+    # tool (followed.py's `tool`).
     started = str(time.time())
+    # Each file's record, written once every file has run: the files run side by side, so what one leaves
+    # where no key holds it (`left_behind`) another may read whenever it runs, and no other file of the lane
+    # keeps a key.
+    held_back: dict[str, tuple] = {}
 
     def run(names: list[str]) -> None:
         waiting = sorted(names, key=lambda name: -holds[name])
@@ -2019,7 +2055,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                                "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                                "OMP_NUM_THREADS": threads, followed.STARTED_AT: started}
                     running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
-                                        session.GRACE, common, environ, None, network)] = fits
+                                        session.GRACE, common, environ, None, network,
+                                        held_back=held_back)] = fits
                     continue
                 done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
@@ -2027,6 +2064,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                     del running[future]
 
     run(tests)
+    first = {name for name, (_, log, _) in held_back.items() if left_behind(log)}
     # Red under a share another class measured, its first failure an allocation's (`exhausted`): that red is
     # the borrowed share's, not the file's, and the file runs again alone with the lane's whole share, its row
     # saying so with the first failure, as packed work run again alone is interference. Any other first
@@ -2049,6 +2087,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                                                        for verdict in rows]}))
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
+    # A file run again alone may have left something on its first run too (`first`).
+    leavers = first | {name for name, (_, log, _) in held_back.items() if left_behind(log)}
+    for name, (ran, log, opened) in held_back.items():
+        record(python, ran, log, common, network, None if leavers - {name} else opened)
     return 0
 
 

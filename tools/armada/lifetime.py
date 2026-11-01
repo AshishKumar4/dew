@@ -12,8 +12,8 @@ file's last visit, its owner's and any earlier file's alike, as what ran before 
 cache or a module it left, everything `SHARED` did, whenever, and its own children's and `SHARED`'s
 children's records (followed.py). CI gives each test file a process of its own (ci.py's `alone`), so no
 file's record holds another's; a process that runs several, as a local run does, keeps the rule. A process
-whose log never closed, or one with a start no event follows, leaves the files it reached without a key. The standard library alone: it runs before site-packages are
-on the path."""
+whose log never closed, or one with a start no event follows, leaves the files it reached without a key. The
+standard library alone: it runs before site-packages are on the path."""
 
 import atexit
 import os
@@ -146,9 +146,11 @@ def started(code, offset):
 
 
 def audited(event, args):
-    """A read the audit names, kept as the run's input; a process start, kept as how its owner's child ran."""
-    if event in followed.READS:
-        kept(followed.read(event, args, root))
+    """A read the audit names, kept as the run's input; a write a later file may read, kept as its mark
+    (followed.py's `WROTE`); a process start, kept as how its owner's child ran."""
+    # `read` called here, as it reads its caller's frames.
+    kept(followed.read(event, args, root) if event in followed.READS else followed.heard(event, args))
+    if event in followed.PATHS:
         return
     if (taken := followed.coded(event, args, root)) is not None:
         write(owner(), taken)

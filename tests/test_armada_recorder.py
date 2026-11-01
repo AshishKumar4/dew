@@ -4,12 +4,7 @@ read, imported and started, for the process's whole life, and its children's."""
 
 import ast
 import json
-import os
-import shutil
 import sys
-import tempfile
-import time
-from pathlib import Path
 
 import pytest
 from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
@@ -526,11 +521,10 @@ def test_a_marker_registered_in_pyproject_reruns_the_files_that_use_it_and_its_o
 
 def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A file that reads a file another process of its task may have left in the machine's shared scratch
-    or the home directory, outside its own scratch and caches (a literal /tmp path), has no key, as no record
-    names the code that wrote it: one file writes the result its helper builds there, the next asserts on it,
-    and an edit to the helper would leave the second's green row standing (followed.py's `outside`); a file
-    reading back what its own process wrote there keeps its key."""
+    """A file run after one that wrote outside its own scratch and caches (a literal /tmp path) has no key,
+    as no record names the code that wrote what it may read: one file writes the result its helper builds
+    there, the next asserts on it, and an edit to the helper would leave the second's green row standing
+    (ci.py's `left_behind`); the writer, reading back what its own process wrote, keeps its key."""
     shared = tmp_path.parent / f"{tmp_path.name}-shared.txt"
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "build.py": "def build(): return 1\n",
@@ -541,6 +535,7 @@ def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
     assert reused() == [True, False]
 
 
+@pytest.mark.parametrize("where", ["shared", "home"])
 @pytest.mark.parametrize("reading", [
     "assert open({path!r}, 'a+').read() == '' or True",
     "import os\n    assert os.path.exists({path!r})",
@@ -548,15 +543,17 @@ def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
     "import subprocess\n    assert 'text' in subprocess.run(['file', '-b', {path!r}], capture_output=True,"
     " text=True, check=True).stdout",
 ], ids=["append", "probe", "listing", "native"])
-def test_a_file_that_takes_what_another_left_in_shared_scratch_by_any_way_has_no_key(
-        ci, tmp_path, monkeypatch, cache_worker, reading):
-    """A file that takes what another file of its task left in shared scratch has no key however it takes it
-    (review of the reuse-keys head): an open that keeps what was there (an append), a probe of whether it is
-    there, a listing of its directory, or a read by a native tool a file may run and keep its key (`file`,
-    one of followed.py's `TOOLS`), which no audit hook sees (watched.py's leavings); as a plain read has none,
-    an edit to the writer's helper would otherwise leave the second file's row standing. The writer keeps
-    its key."""
-    folder = tmp_path.parent / f"{tmp_path.name}-shared"
+def test_a_file_that_takes_what_another_left_by_any_way_has_no_key(
+        ci, tmp_path, monkeypatch, cache_worker, reading, where):
+    """A file that takes what another file of its task left in shared scratch or the home has no key
+    however it takes it (reviews of the reuse-keys head): an open that keeps what was there (an append), a
+    probe of whether it is there, a listing of its directory, or a read by a native tool a file may run and
+    keep its key (`file`, one of followed.py's `TOOLS`), which no audit hook sees: the writer's write left it
+    (ci.py's `left_behind`), however the reader then takes it. The writer keeps its key."""
+    if where == "home":
+        monkeypatch.setenv("HOME", str(tmp_path.parent / f"{tmp_path.name}-home"))
+    folder = (tmp_path.parent / f"{tmp_path.name}-home/.cache/left" if where == "home"
+              else tmp_path.parent / f"{tmp_path.name}-shared")
     shared = folder / "result.txt"
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "build.py": "def build(): return 1\n",
@@ -570,9 +567,8 @@ def test_a_file_that_takes_what_another_left_in_shared_scratch_by_any_way_has_no
 
 def test_a_file_reading_what_another_left_in_a_hidden_directory_of_the_checkout_has_no_key(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A file that reads what another file of its task wrote in a hidden directory of the checkout, which no
-    record keys by its content, has no key (review of the reuse-keys head: .memo/result); the writer keeps its
-    key."""
+    """A file run after one that wrote in a hidden directory of the checkout, which no record keys by its
+    content, has no key (review of the reuse-keys head: .memo/result); the writer keeps its key."""
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "build.py": "def build(): return 1\n",
         "test_writer.py": "import os\nfrom build import build\ndef test_writer():\n"
@@ -618,37 +614,6 @@ def test_a_store_linked_beneath_the_files_caches_to_one_elsewhere_is_no_private_
     assert not followed.private()
 
 
-def test_only_what_another_process_of_the_task_made_in_shared_scratch_is_read_outside_the_checkout(
-        ci, tmp_path, monkeypatch):
-    """A file in the machine's shared scratch or the user's home that was there before the task began no
-    process of it left (followed.py's `outside`): the harness's plugins, the venv and its metadata that a
-    task's pytest reads from the checkout the harness is in, which lies in the home as CI's does
-    (/home/ci/work/dew/dew) when these tests run it on a scratch checkout of its own, among them the venv's
-    pyvenv.cfg, which Python 3.12's site reads before it sets sys.prefix to the venv (the recorder runs before
-    the site), and a tool or fixture a test put beside the checkout ahead of the task. A file made since is,
-    and a copy of an old one, which keeps its mtime, is."""
-    monkeypatch.setenv("HOME", str(REPO_ROOT.parent))
-    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
-    monkeypatch.setattr(sys, "exec_prefix", sys.base_exec_prefix)
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "scratch"))
-    root = f"{tmp_path}{os.sep}"
-    ahead = tmp_path.parent / f"{tmp_path.name}-ahead.txt"
-    ahead.write_text("1")
-    time.sleep(0.05)
-    monkeypatch.setenv(ci.followed.STARTED_AT, str(time.time()))
-    time.sleep(0.05)
-    read = [path for path in (REPO_ROOT / "tools/armada/executed.py", REPO_ROOT / "tools/armada/followed.py",
-                              Path(sys.executable).parents[1] / "pyvenv.cfg") if path.is_file()]
-    assert len(read) >= 2
-    assert [ci.followed.outside(str(path), root) for path in read] == [False] * len(read)
-    made = tmp_path.parent / f"{tmp_path.name}-made.txt"
-    made.write_text("1")
-    copied = tmp_path.parent / f"{tmp_path.name}-copied.txt"
-    shutil.copy2(ahead, copied)
-    monkeypatch.setenv("HOME", str(made.parent))
-    assert [ci.followed.outside(str(path), root) for path in (ahead, made, copied)] == [False, True, True]
-
-
 @pytest.mark.parametrize("plugin", ["executed", "release", "split"])
 def test_each_hook_a_plugin_of_the_harness_defines_is_one_pytest_registers(plugin):
     """pytest registers a plugin's function as a hook only where its name starts with `pytest_` (its plugin
@@ -665,23 +630,23 @@ def test_each_hook_a_plugin_of_the_harness_defines_is_one_pytest_registers(plugi
 def test_a_copy_of_the_interpreter_under_a_tools_name_is_no_tool(ci, tmp_path, monkeypatch, cache_worker):
     """A program named for a tool that is a copy of the interpreter, or made since the task began, runs code
     no record follows (followed.py's `tool`): the file that starts one has no key, as one starting the
-    system's own native tool keeps it."""
+    system's own native tool, run before it, keeps it."""
     home = tmp_path.parent / f"{tmp_path.name}-home"
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_system.py": "import subprocess\ndef test_system():\n"
+                          "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n",
         "test_copied.py": "import os, shutil, subprocess, sys\ndef test_copied():\n"
                           f"    os.makedirs({str(home)!r}, exist_ok=True)\n"
                           "    program = shutil.copy(os.path.realpath(sys.executable),\n"
                           f"                          {str(home / 'git')!r})\n"
-                          "    subprocess.run([program, '-S', '-c', 'pass'], check=False)\n",
-        "test_system.py": "import subprocess\ndef test_system():\n"
-                          "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"}, {})
-    assert reused() == [False, True]
+                          "    subprocess.run([program, '-S', '-c', 'pass'], check=False)\n"}, {})
+    assert reused() == [True, False]
 
 
 def test_each_file_of_a_task_finds_its_cache_and_scratch_directories_empty(ci, tmp_path):
     """No record one file's process leaves in its caches (XDG_CACHE_HOME: Dew's, the compilation cache and
     a step's rungs beside it) or its scratch (TMPDIR, pytest's tmp_path among it) serves another file of its
-    task (`alone`), which no key would hold, as reads outside the checkout are none: what lets a file's key
+    task (`alone`), which no key would hold, as writes there are its own: what lets a file's key
     leave out what its taskmates ran, and the source digest those records are named by (followed.py's
     `DIGEST`, `private`)."""
     (tmp_path / "tests").mkdir(exist_ok=True)
