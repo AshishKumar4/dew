@@ -24,11 +24,10 @@ from dew.devices import POOL_NAMES, pool_bound
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30
 
-def connected(gpus: int, send: int, receive: int) -> dict[tuple[int, int], dict[int, int]]:
+def connected(gpus: int, send: int, receive: int) -> dict[tuple[int, int], tuple[int, int, int]]:
     """Each directed pair of `gpus` GPUs connected by `send` bytes on its source and `receive` on its
-    target, as NCCL's direct peer transports allocate."""
-    return {(source, target): {source: send, target: receive}
-            for source, target in itertools.permutations(range(gpus), 2)}
+    target and none on any other GPU, as NCCL's direct peer transports allocate."""
+    return dict.fromkeys(itertools.permutations(range(gpus), 2), (send, receive, 0))
 
 
 NEEDS = Needs(collective={2: GIB}, exchanged={2: GIB // 4}, permuted={2: GIB},
@@ -285,13 +284,15 @@ def test_a_measurement_kept_in_an_earlier_form_is_measured_afresh(tmp_path, monk
     assert taken == [configuration]
 
 
-def test_a_permutes_connections_are_charged_to_every_gpu_that_holds_their_buffers():
+def test_a_permutes_connections_are_charged_to_every_gpu_that_may_hold_their_buffers():
     """A permute's communicator is measured connecting every directed pair of its clique in turn, the first
     making the communicator, as NCCL picks each peer's transport apart: GPU buffers on a pair over NVLink or
     PCIe peer access, host memory for one through shared memory, and a third GPU's buffers for one it
-    routes through that GPU (`P2P_INTERMEDIATE`). Each later pair keeps the bytes every GPU gave as it
-    connected, so one routed through GPU 2 is charged there, as often as such pairs are made; the base is
-    the most a GPU gave as the first pair made the communicator, which holds that pair's own connection."""
+    routes through that GPU (`P2P_INTERMEDIATE`). Each later pair keeps its bytes on its source, on its
+    target and the most on any other GPU; the base is the most a GPU gave as the first pair made the
+    communicator, which holds that pair's own connection. A clique charges each new pair's source and
+    target theirs, and every other member the most a GPU beside the pair took, as NCCL may route the pair
+    through any of them, so pairs routed through GPU 2 accumulate there."""
     mib = 2**20
     runs = [(0, 1, {0: 65 * mib, 1: 65 * mib, 2: 64 * mib, 3: 64 * mib}),
             (1, 0, {0: 0, 1: 0, 2: 8 * mib, 3: 0}),
@@ -299,13 +300,33 @@ def test_a_permutes_connections_are_charged_to_every_gpu_that_holds_their_buffer
             (0, 3, {0: mib, 1: 0, 2: 8 * mib, 3: mib})]
     base, connections = communicators.peer_costs(runs)
     assert base == 65 * mib
-    assert connections == {(1, 0): {2: 8 * mib}, (2, 3): {2: 40 * mib, 3: 24 * mib},
-                           (0, 3): {0: mib, 2: 8 * mib, 3: mib}}
+    assert connections == {(1, 0): (0, 0, 8 * mib), (2, 3): (40 * mib, 24 * mib, 0),
+                           (0, 3): (mib, mib, 8 * mib)}
     needs = Needs(collective={}, exchanged={}, permuted={4: base}, connections=connections,
                   runtime={}, seconds=1.0)
     routed = Collectives(permutes={(0, 1, 2, 3): frozenset({(1, 0), (0, 3)})})
-    assert needs.needed(routed, range(4), runtime=False) == {0: 65 * mib + mib, 1: 65 * mib,
-                                                            2: 65 * mib + 16 * mib, 3: 65 * mib + mib}
+    assert needs.needed(routed, range(4), runtime=False) == {
+        0: 65 * mib + mib, 1: 65 * mib + 8 * mib, 2: 65 * mib + 16 * mib, 3: 65 * mib + 8 * mib + mib}
+
+
+def test_a_pair_is_charged_its_direct_route_where_its_clique_holds_no_gpu_to_route_it_through():
+    """A pair routed through a third GPU in a clique of every GPU is measured on its own too, in the
+    communicator of its two GPUs, where NCCL connects it directly, with a device FIFO on each end
+    (`NCCL_SHM_USE_CUDA_MEMCPY`): a clique of the two charges each end the more of its two routes, and
+    no other GPU anything."""
+    mib = 2**20
+    every = [(0, 1, {0: 9 * mib, 1: 9 * mib, 2: 8 * mib}), (0, 2, {0: mib, 1: 6 * mib, 2: mib}),
+             (1, 0, {0: mib, 1: mib, 2: 0}), (1, 2, {0: 0, 1: mib, 2: mib}),
+             (2, 0, {0: mib, 1: 6 * mib, 2: mib}), (2, 1, {0: 0, 1: mib, 2: mib})]
+    first = [(0, 1, {0: 9 * mib, 1: 9 * mib}), (1, 0, {0: mib, 1: mib})]
+    alone = [(0, 2, {0: 12 * mib, 2: 12 * mib}), (2, 0, {0: 4 * mib, 2: 4 * mib})]
+    bases, connections = communicators.measured_connections([every, first, alone])
+    assert bases == {3: 9 * mib, 2: 12 * mib}
+    assert connections[(0, 2)] == connections[(2, 0)] == (4 * mib, 4 * mib, 6 * mib)
+    needs = Needs(collective={}, exchanged={}, permuted=bases, connections=connections, runtime={},
+                  seconds=1.0)
+    assert needs.needed(Collectives(permutes={(0, 2): frozenset({(0, 2), (2, 0)})}), range(3),
+                        runtime=False) == {0: 12 * mib + 8 * mib, 1: 0, 2: 12 * mib + 8 * mib}
 
 
 def test_a_hosts_gpus_are_counted_by_its_cuda_driver_without_nvidia_smi(tmp_path):
