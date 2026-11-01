@@ -106,6 +106,7 @@ import collections
 import concurrent.futures
 import contextlib
 import dataclasses
+import fnmatch
 import functools
 import hashlib
 import heapq
@@ -123,7 +124,7 @@ import time
 import tomllib
 import types
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 
@@ -365,27 +366,7 @@ def contents(name: str) -> bytes:
         path, _, executed = name.partition(followed.CODE)
         return unit(path, executed) if Path(path).is_file() else b"missing"
     if name.startswith("import:"):
-        # A module a run imported or tried to (followed.py's `imports`), with the checkout's directories it
-        # was searched for in, in order: whether each holds a module, a package, a namespace or an extension
-        # of its name, any of which arriving ahead of what the import found shadows it.
-        module, searched, roots = name.removeprefix("import:").partition(followed.ROOTS)
-        if searched:
-            last = module.rpartition(".")[2]
-            return b"".join(b"1" if candidate.exists() else b"0" for root in roots.split(os.pathsep) if root
-                            for candidate in (Path(root, f"{last}.py"), Path(root, last, "__init__.py"),
-                                              Path(root, last), *sorted(Path(root).glob(f"{last}.*.so"))))
-        # A module the process held before its recorder ran (lifetime.py's `boot`, a child's start): a
-        # top-level one, whether a helper under tests/, which leads sys.path, would shadow it; a submodule,
-        # what its import finds under src/ or tools/.
-        if "." in module:
-            *parents, last = module.split(".")
-            return b"".join(b"1" if candidate.exists() else b"0" for root in ("src", "tools")
-                            for candidate in (Path(root, *parents, f"{last}.py"), Path(root, *parents, last,
-                                                                                         "__init__.py"),
-                                              Path(root, *parents, last),
-                                              *sorted(Path(root, *parents).glob(f"{last}.*.so"))))
-        return b"".join(b"1" if path.exists() else b"0"
-                        for path in (Path("tests", f"{module}.py"), Path("tests", module, "__init__.py")))
+        return b"".join(b"1" if path.exists() else b"0" for path in import_candidates(name, Path.glob))
     path = Path(name)
     manifest = path.parent / (path.name + FETCHED)
     if path.name and manifest.is_file():
@@ -397,6 +378,28 @@ def contents(name: str) -> bytes:
                          if not entry.name.startswith(".") and not built(entry))
         return hashlib.sha256("\n".join(entries).encode()).digest()
     return b"missing"
+
+
+def import_candidates(entry: str, matching: Callable[[Path, str], Iterable[Path]]) -> list[Path]:
+    """Each path whose presence an import input `entry` ("import:", `contents`) is keyed by, in order. A
+    module a run imported or tried to (followed.py's `imports`), with the checkout's directories it was
+    searched for in: in each, a module, a package, a namespace or an extension of its name (`matching` lists
+    a directory's by a glob), any of which arriving ahead of what the import found shadows it. A module the
+    process held before its recorder ran (lifetime.py's `boot`, a child's start): a top-level one, a helper
+    under tests/, which leads sys.path, that would shadow it; a submodule, what its import finds under src/
+    or tools/."""
+    module, searched, roots = entry.removeprefix("import:").partition(followed.ROOTS)
+    if searched:
+        last = module.rpartition(".")[2]
+        places = [Path(root) for root in roots.split(os.pathsep) if root]
+    elif "." in module:
+        *parents, last = module.split(".")
+        places = [Path(root, *parents) for root in ("src", "tools")]
+    else:
+        return [Path("tests", f"{module}.py"), Path("tests", module, "__init__.py")]
+    return [candidate for place in places
+            for candidate in (place / f"{last}.py", place / last / "__init__.py", place / last,
+                              *sorted(matching(place, f"{last}.*.so")))]
 
 
 def unit(path: str, name: str) -> bytes:
@@ -527,11 +530,18 @@ class Reading:
 @dataclasses.dataclass(frozen=True)
 class Standing:
     """The checkout as a run found it (`standing`): each file's change time (its ctime, which no process sets
-    back) and each directory's entries as a key lists them (`visible`), but a hidden directory's
-    (`HIDDEN_INPUTS` aside) and a build's (`built`)."""
+    back) and each directory's entries as a key lists them (`visible`), but a hidden directory's at its top
+    (`HIDDEN_INPUTS` aside) and a build's (`built`), which are no input."""
 
     changed: Mapping[str, int]
     entries: Mapping[str, tuple[str, ...]]
+
+    def exists(self, path: Path) -> bool:
+        return str(path) in self.changed or str(path) in self.entries
+
+    def matching(self, directory: Path, pattern: str) -> list[Path]:
+        return [directory / entry for entry in self.entries.get(str(directory), ())
+                if fnmatch.fnmatchcase(entry, pattern)]
 
 
 def visible(path: Path) -> tuple[str, ...]:
@@ -545,8 +555,9 @@ def standing() -> Standing:
     changed, entries = {}, {}
     for directory, folders, files in os.walk("."):
         here = Path(directory)
+        # The hidden directories at its top that are no input (followed.py's `HIDDEN_INPUTS`) and builds.
         folders[:] = [folder for folder in folders if not built(here / folder) and (
-            not folder.startswith(".") or str((here / folder).relative_to(".")) in followed.HIDDEN_INPUTS)]
+            here != Path(".") or not folder.startswith(".") or folder in followed.HIDDEN_INPUTS)]
         entries[str(here.relative_to("."))] = visible(here)
         for file in files:
             path = here / file
@@ -555,44 +566,37 @@ def standing() -> Standing:
     return Standing(changed, entries)
 
 
-def standing_paths(entry: str) -> list[str]:
-    """The checkout's paths input `entry` (`inputs`) reads, as `contents` reads it: a unit's or a probe's
-    file, a fetched payload's manifest, a marker's registration (pyproject.toml), the directories an import
-    searched; none for a host's limit."""
+def stood(entry: str, before: Standing | None) -> object:
+    """What of the checkout input `entry` (`inputs`) is keyed by (`contents`), as it stood `before` a run, or
+    as it stands now where `before` is None: where an import looks, what is there; a probed directory, that it
+    is one; a directory, its entries; a file (a unit's, a marker's registration in pyproject.toml, a fetched
+    payload's manifest), its change time; nothing for a host's limit."""
     if entry.startswith("limit:"):
-        return []
-    if entry.startswith(MARKER):
-        return ["pyproject.toml"]
+        return None
     if entry.startswith("import:"):
-        module, searched, roots = entry.removeprefix("import:").partition(followed.ROOTS)
-        if searched:
-            return [root for root in roots.split(os.pathsep) if root]
-        *parents, _ = module.split(".")
-        return [str(Path(root, *parents)) for root in ("src", "tools")] if parents else ["tests"]
-    path = Path(entry.removeprefix("probe:").partition(followed.CODE)[0])
+        candidates = import_candidates(entry, Path.glob if before is None else before.matching)
+        return [(str(path), path.exists() if before is None else before.exists(path)) for path in candidates]
+    probe = entry.startswith("probe:")
+    path = Path("pyproject.toml" if entry.startswith(MARKER) else
+                entry.removeprefix("probe:").partition(followed.CODE)[0])
+    if path.is_dir() if before is None else str(path) in before.entries:
+        return "directory" if probe else visible(path) if before is None else before.entries[str(path)]
     manifest = path.parent / (path.name + FETCHED)
-    return [str(manifest if path.name and manifest.is_file() else path)]
+    if path.name and (manifest.is_file() if before is None else before.exists(manifest)):
+        path = manifest
+    if before is not None:
+        return before.changed.get(str(path))
+    with contextlib.suppress(FileNotFoundError):
+        return path.lstat().st_ctime_ns
+    return None
 
 
 def moved(name: str, depends: list[str], before: Standing) -> bool:
-    """Whether an input test file `name`'s run read (`inputs`) no longer stands as it did `before` the run: a
-    file changed, made or removed, or a directory's entries other. A run that rewrote, made or removed its
-    own input read what no key of the checkout now holds (review: a test reads a fixture, overwrites it and
-    asserts on what it read), so it keeps no key."""
-    for entry in inputs(name, depends):
-        for path in standing_paths(entry):
-            found = Path(path)
-            if found.is_dir() or path in before.entries:
-                if before.entries.get(path) != (visible(found) if found.is_dir() else None):
-                    return True
-                continue
-            try:
-                now = found.lstat().st_ctime_ns
-            except FileNotFoundError:
-                now = None
-            if before.changed.get(path) != now:
-                return True
-    return False
+    """Whether an input test file `name`'s run read (`inputs`) no longer stands as it did `before` the run
+    (`stood`). A run that rewrote, made or removed its own input read what no key of the checkout now holds
+    (review: a test reads a fixture, overwrites it and asserts on what it read), so it keeps no key; what a
+    run writes that no key reads (its log, an output beside a directory an import searched) keeps it."""
+    return any(stood(entry, before) != stood(entry, None) for entry in inputs(name, depends))
 
 
 def cache_key(common: str, name: str, split: str, depends: list[str],
