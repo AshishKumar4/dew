@@ -51,6 +51,7 @@ from dew.data.analysis import (
     _steps,
     _until,
     _volatile,
+    _written,
     ends,
 )
 from dew.data.cache import _Mapped
@@ -337,8 +338,10 @@ def _counts_own_rows(pipeline: Pipeline) -> bool:
 def _counts_rows(pipeline: Pipeline, at: int) -> bool:
     """Whether a counter of `pipeline`'s rows before its stage at `at` counts those it keeps as the
     corpus's rows: not past an objective's step that makes rows of source examples, which the corpus
-    counted before it (`FlatMap.examples`, `CorpusCounts.rows`)."""
-    return not any(isinstance(stage, FlatMap) and stage.examples for stage in pipeline.stages[:at])
+    counted before it (`FlatMap.examples`, `CorpusCounts.rows`), a memory read's as it held them where it
+    ran the step (`_written`)."""
+    return not any(isinstance(stage, FlatMap) and stage.examples
+                   for stage in _written(pipeline.source, pipeline.stages[:at]))
 
 
 def _unplaced(value: Record) -> Record:
@@ -1798,7 +1801,8 @@ class _Build:
             rows = self.handed(rows, pipeline, partition, pool, carried,
                                certain_after=_barren_bound(pipeline.stages, passes, carried))
         if not self.global_order and counting:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            rows=_counts_rows(pipeline, len(pipeline.stages)))
         return rows
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:

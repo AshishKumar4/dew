@@ -269,7 +269,8 @@ class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
 
 
 class Chunked(pygrain.IterDataset[Record]):
-    """A chunk expansion counted at its fan-out, with counters in the iterator position."""
+    """A chunk expansion counted at its fan-out, with counters in the iterator position: its documents
+    and their chunks, and no row (`CorpusCounts.rows`), which the counters about it count."""
 
     def __init__(self, parent: pygrain.IterDataset[Record], name: str, label: str,
                  expand: Callable[[CorpusCounts], gx.FlatMapTransform]):
@@ -277,7 +278,7 @@ class Chunked(pygrain.IterDataset[Record]):
         self._records, self._name, self._label, self._expand = parent, name, label, expand
 
     def __iter__(self) -> pygrain.DatasetIterator[Record]:
-        counts = CorpusCounts(self._name, self._label)
+        counts = CorpusCounts(self._name, self._label, rows=False)
         return _CountedIterator(iter(gx.FlatMapIterDataset(self._records, self._expand(counts))), counts)
 
 
