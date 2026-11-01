@@ -966,8 +966,9 @@ def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:
     """`rollout`, refused where it checkpoints state (`Rollout`'s `saved_shapes` not None) in a pool of
     several processes: each process holds its own environments and a checkpoint holds the pool's tree.
     A run with a checkpointer reads this as its fit starts, before it restores or steps and after any
-    pool its program formed; the pool's size is read without opening the backend (`pool_size`). Read at
-    this boundary, as the trainer reads a rollout's optional members."""
+    pool its program formed, and again as it restores the rollout (`_rollout_resumed`), which `place`
+    does too; the pool's size is read without opening the backend (`pool_size`). Read at this boundary,
+    as the trainer reads a rollout's optional members."""
     shapes = getattr(rollout, "saved_shapes", None)
     if shapes is not None and pool_size() > 1 and shapes() is not None:
         raise ValueError(f"{type(rollout).__name__} checkpoints the state it carries, which a run of "
@@ -1004,7 +1005,9 @@ def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: in
     this boundary, as `saved_shapes` is: a rollout is any callable), a key read back typed, as the run's
     own key is (`request_key`); a rollout that saves none (its `saved_shapes` None, or absent) resumes as
     it starts, and one whose step holds none (a checkpoint written before rollouts saved theirs) starts
-    its state afresh, said."""
+    its state afresh, said. A pool of several processes is refused one that saves its state before it
+    restores any (`_rollout_admitted`): `place` restores here as `fit` does."""
+    _rollout_admitted(rollout)
     shapes, restored = getattr(rollout, "saved_shapes", None), getattr(rollout, "restored", None)
     if shapes is None:
         return

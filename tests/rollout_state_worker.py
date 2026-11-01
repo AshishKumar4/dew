@@ -1,6 +1,6 @@
 """A trainer over a rollout that checkpoints its state, made before its process joins its pool, then fit
-there; a split scored by its episodes evaluated in a pool, its scorer once failing, once reporting fewer
-scores than it declares, on one process alone."""
+there, or placed from a run one process checkpointed; a split scored by its episodes evaluated in a pool,
+its scorer once failing, once reporting fewer scores than it declares, on one process alone."""
 
 import itertools
 from collections.abc import Callable
@@ -16,15 +16,18 @@ from dew.rl.env import Batched, TimeLimit
 from dew.training import Trainer
 
 
-def unjoined(directory):
-    """A trainer over a ControlRollout, checkpointed to `directory`, made from an integer seed before this
-    process joins its pool, as a program that readies its process after making its trainer makes it."""
+def unjoined(directory, *, stateful: bool = True):
+    """A trainer over a ControlRollout, or where not `stateful` a plain function that keeps no state,
+    checkpointed to `directory`, made from an integer seed before this process joins its pool, as a program
+    that readies its process after making its trainer makes it."""
     from dew.checkpoints import Checkpoints
 
     objective = ControlPPOObjective(ActorCritic(1, (8,), (8,)), 1, discount=0.9)
     walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 4)
+    rollout = (ControlRollout(objective, walks, unroll_length=4) if stateful
+               else (lambda state, batch, key: batch))
     return Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(directory)),
-                   rollout=ControlRollout(objective, walks, unroll_length=4))
+                   rollout=rollout)
 
 
 def fitted(trainer) -> dict:
@@ -38,6 +41,19 @@ def fitted(trainer) -> dict:
         refused = None
     except ValueError as error:
         refused = type(error).__name__
+    return {"processes": jax.process_count(), "refused": refused}
+
+
+def placed(trainers) -> dict:
+    """The pool's size and, for each of `trainers` by name, the type of the ValueError its placement of
+    the run its checkpoints hold raised, or None."""
+    refused = {}
+    for name, trainer in trainers.items():
+        try:
+            trainer.place()
+            refused[name] = None
+        except ValueError as error:
+            refused[name] = type(error).__name__
     return {"processes": jax.process_count(), "refused": refused}
 
 
@@ -77,10 +93,14 @@ def flown(args):
 
 
 if __name__ == "__main__":
-    arguments = worker_parser({"fitted": fitted, "flown": flown}, __doc__).parse_args()
+    arguments = worker_parser({"fitted": fitted, "placed": placed, "flown": flown}, __doc__).parse_args()
     modes: dict[str, Callable] = {"flown": flown}
+    run = arguments.out.parent / "run"
+    # Made before serve_mode joins the pool, which it could not join had making a trainer opened JAX.
     if arguments.mode == "fitted":
-        # Made before serve_mode joins the pool, which it could not join had making the trainer opened JAX.
-        made = unjoined(arguments.out.parent / "run")
+        made = unjoined(run)
         modes["fitted"] = lambda arguments: fitted(made)
+    elif arguments.mode == "placed":
+        trainers = {"stateful": unjoined(run), "stateless": unjoined(run, stateful=False)}
+        modes["placed"] = lambda arguments: placed(trainers)
     serve_mode(modes, arguments)

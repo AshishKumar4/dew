@@ -663,7 +663,8 @@ def test_a_pool_is_refused_a_rollout_that_checkpoints_its_state_as_its_run_start
     """A trainer over a rollout that checkpoints the state it carries, made from an integer seed before
     its process joins a pool (made without opening JAX's backend, which a pool forms only before), is
     refused as its fit starts, before it restores or steps, on every process of a pool of two, and
-    trains on a pool of one: each process holds its own environments, a checkpoint the pool's tree."""
+    trains on a pool of one; a pool of two placing the one's checkpointed run is refused it too, before
+    its rollout restores: each process holds its own environments, a checkpoint the pool's tree."""
     from pathlib import Path
 
     from process_support import run_pool
@@ -673,6 +674,10 @@ def test_a_pool_is_refused_a_rollout_that_checkpoints_its_state_as_its_run_start
     alone = run_pool("fitted", tmp_path / "one", 1, script=script, devices=1, timeout=300)
     assert pooled == [{"processes": 2, "refused": "ValueError"}] * 2
     assert alone == [{"processes": 1, "refused": None}]
+    # The one process's run, its rollout's state checkpointed, placed by a pool of two: refused the
+    # rollout that would restore that state, where a trainer whose rollout keeps none places it.
+    placed = run_pool("placed", tmp_path / "one", 2, script=script, devices=1, timeout=300)
+    assert placed == [{"processes": 2, "refused": {"stateful": "ValueError", "stateless": None}}] * 2
 
 
 def test_a_pools_split_scored_by_its_episodes_agrees_and_fails_together(tmp_path):
