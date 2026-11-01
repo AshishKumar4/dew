@@ -529,23 +529,34 @@ def _paired(left, right, between):
 def _solved(overlaps, given):
     """`w` with `(I + overlaps) w = given`, `overlaps` strictly lower: the inverse by doubling (`_inverse`),
     then one product, each a Dew product (`float32_matmul`): the template's own form (recurrence_algebra's
-    `doubled`), log2(C) levels of products where a forward substitution took C dependent row steps (the
-    derived forward's every chunk 64 launches in sequence). Its derivative `back = X^T dw` and the
-    overlaps' cotangent `-back w^T` below the diagonal, products alike."""
-    return float32_matmul(_inverse(overlaps), given)
+    `doubled` and `weighted`), log2(C) levels of products where a forward substitution took C dependent row
+    steps (the derived forward's every chunk 64 launches in sequence). The unit diagonal is added outside
+    the product (`given + L given`, `L` the inverse less it), as `weighted` adds it, so the product rounds
+    the off-diagonal terms alone. Its derivative `back = X^T dw` alike and the overlaps' cotangent
+    `-back w^T` below the diagonal."""
+    return _applied(_below(_inverse(overlaps)), given)
+
+
+def _applied(lower, given):
+    """`(I + lower) @ given`, the identity outside the product."""
+    return given + float32_matmul(lower, given)
+
+
+def _below(square):
+    """`square`'s strictly lower part."""
+    return jnp.where(jnp.tril(jnp.ones(square.shape, bool), -1), square, 0.0)
 
 
 def _solved_forward(overlaps, given):
-    inverse = _inverse(overlaps)
-    solved = float32_matmul(inverse, given)
-    return solved, (inverse, solved)
+    lower = _below(_inverse(overlaps))
+    solved = _applied(lower, given)
+    return solved, (lower, solved)
 
 
 def _solved_backward(residuals, d_solved):
-    inverse, solved = residuals
-    back = float32_matmul(inverse.T, d_solved)
-    below = jnp.tril(jnp.ones(inverse.shape, bool), -1)
-    return jnp.where(below, -float32_matmul(back, solved.T), 0.0), back
+    lower, solved = residuals
+    back = _applied(lower.T, d_solved)
+    return _below(-float32_matmul(back, solved.T)), back
 
 
 _solved.defvjp(_solved_forward, _solved_backward)
