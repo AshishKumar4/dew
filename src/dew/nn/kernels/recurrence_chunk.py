@@ -995,7 +995,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
             and mainloop_backward.backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=template.Mosaic.launched(), starts=starts,
-                max_segments=max_segments, delta=delta, floor=floor, rounded=rounded, ranged=run["ranged"]))
+                max_segments=max_segments, delta=delta, floor=floor, rounded=rounded, ranged=run["ranged"],
+                skip=skip))
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
@@ -1169,10 +1170,11 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where no epilogue
             # reads it after (`hooks.output`'s norm): added after, its fp32 output's skip and cast took
             # 0.045 ms past an H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
-            # window-h100-c70aaa8-b8109ee). Under the accurate forms the values the template holds are
-            # gated (`mainloop._Call.gated_keys`), so the skip is added after.
+            # window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values ungated
+            # (`mainloop._Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast
+            # forms), the skip is added after.
             fast = fast_rounding()
-            fused = fast and hooks.skip
+            fused = fast and hooks.skip and jnp.dtype(jnp.result_type(query, key, value)).itemsize == 2
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        skip=skip if fused else None, max_segments=max_segments, scale=1.0,
                                        delta=False, wide=not fused or hooks.output is not None, rounded=fast)

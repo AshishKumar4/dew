@@ -1283,17 +1283,20 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
     `summed_pairs`'): the part of fla's dqkwg the memory's products do not take, a launch of its own. Each
     of the two sums over blocks issued into one accumulator (`summed`, the mainloop's: a list of `(name,
     left, right)`): an accumulator a block, held two at a time, an fp32 call's two parts spilled 32 bytes a
-    thread past 255 on an H100, where one each needed 216 (scores-ablate at a44dfe721). `column_scale`
-    `[C]`, where given, scales each value token's column in fp32 after the products: the write gate on the
-    keys' side (`chunk_scores`'), mamba_ssm's `dCB = (dout x^T) dt` (`_chunk_scan_bwd_dcb`)."""
-    column_gate, column_low = (gate, low) if laid is None else laid
-    pair_decay = decayed(gate, low, column_gate, column_low)
+    thread past 255 on an H100, where one each needed 216 (scores-ablate at a44dfe721). The scores' sum
+    first, ds's after it and then the pairs' decays, so no part of ds is live through the scores' blocks:
+    ds and its decays through them, an A100's launch at keys and values 256 wide spilled 192 bytes a thread
+    where first it needs 224 registers, an H100's at Qwen3.5-27B's widths the same 192 either way
+    (scores-order and scores-first at e43d62899). `column_scale` `[C]`, where given, scales each value
+    token's column in fp32 after the products: the write gate on the keys' side (`chunk_scores`'), mamba_ssm's
+    `dCB = (dout x^T) dt` (`_chunk_scan_bwd_dcb`)."""
+    scores = summed([Blocks("local_t", queries, lambda c: keys(c).T, columns)])
     ds = summed([Blocks("values_ds", out_grads, lambda j: values(j).T, blocks)])
     if column_scale is not None:
         ds = ds * column_scale[None, :]
+    column_gate, column_low = (gate, low) if laid is None else laid
     lag = _lags(ds.shape)
-    ds = jnp.where(lag >= 0, ds * pair_decay, 0.0) * scale
-    scores = summed([Blocks("local_t", queries, lambda c: keys(c).T, columns)])
+    ds = jnp.where(lag >= 0, ds * decayed(gate, low, column_gate, column_low), 0.0) * scale
     return ds.astype(dtype), jnp.where(lag > 0, ds * scores, 0.0)
 
 

@@ -188,6 +188,21 @@ def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted(form
                         seeds=FEWEST_SEEDS, truth_fn=functools.partial(token_by_token, hooks))
 
 
+@pytest.mark.parametrize('forms', forms_of(SITES['rated']))
+def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms):
+    """The rated scan's fp32 forward through the template under `forms`, interpreted off a GPU, finite
+    wherever the float64 recurrence's is: its skip added after the walk where the template holds no 16-bit
+    values (an fp32 call's two parts under the fast forms; fused there, its output launch failed the gated
+    keys' check)."""
+    hooks = SITES['rated']
+    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
+    drawn = stressed(hooks, 'the decay bound', 0)
+    with under(forms):
+        assert runs(mosaic, hooks, drawn[0], drawn, 'forward')
+        assert_finite(jax.jit(mosaic), jax.jit(functools.partial(token_by_token, hooks)), drawn,
+                      'the decay bound')
+
+
 @pytest.mark.parametrize('name', SITES)
 @pytest.mark.parametrize('regime', INTERPRETED)
 def test_each_form_the_template_takes_stays_finite_interpreted(name, regime):
