@@ -29,6 +29,7 @@ import tokamax
 from huggingface_hub import hf_hub_download
 
 from dew import cache
+from dew.interop import sources
 from dew.interop.hf_decoders import decoder_config, translate_config
 from dew.nn.backbones import CausalTransformer
 from dew.nn.kernels import generation, tuning
@@ -39,13 +40,22 @@ from dew.training._lowering import Lowered
 
 def model_of(arguments) -> CausalTransformer:
     """The decoder a checkpoint's config.json translates to, in `--dtype`: a
-    local directory's, or a Hub repo's, of which nothing else is read."""
+    local directory's, or a Hub repo's, of which nothing else is read but its
+    tensors' names, from their headers, where a quantized wrapper's selection
+    needs them."""
     local = Path(arguments.config) / "config.json"
     path = local if local.is_file() else hf_hub_download(arguments.config, "config.json",
                                                          revision=arguments.revision)
     config = json.loads(Path(path).read_text())
-    # A wrapper's decoder as its load reads it: the wrapper's head policy and overrides (ledger 3006).
-    fields = dict(translate_config(decoder_config(config)))
+    source = sources.SourceReference(arguments.config, arguments.revision)
+
+    def inventory():
+        stored = sources.stored_tensors(source, source.metadata())
+        return None if stored is None else stored.keys()
+
+    # A wrapper's decoder as its load reads it: the wrapper's head policy and overrides, its quantized
+    # selection renamed with its tensors (ledgers 3006, 3138).
+    fields = dict(translate_config(decoder_config(config, inventory)))
     return CausalTransformer(**{**fields, "dtype": jnp.dtype(arguments.dtype)})
 
 

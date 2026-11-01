@@ -379,23 +379,24 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     for positional in ('sliding_window', 'attention_chunk_size'):
         if isinstance(hf_config.get(positional), int):
             fields[positional] = _WINDOW
-    # The rotated pairs of a probe's head: its head width, a partial rotary's share of it, halved.
     small_head_dim = _HEAD_DIM if key('head_dim') in hf_config else small_hidden // small_heads
     partial = _records.number(hf_config.get('partial_rotary_factor', 1.0), 'partial_rotary_factor')
-    rotary_half = int(small_head_dim * partial) // 2
     if isinstance(rotary := hf_config.get('rotary_dim'), int):
         # A stated rotary width (CodeGen's, GPT-J's) keeps its share of the head (`_HEAD_DIM`'s).
         fields['rotary_dim'] = max(2, rotary * small_head_dim // head_dim // 2 * 2)
     for record in ('rope_parameters', 'rope_scaling'):
         if isinstance(rope := hf_config.get(record), Mapping):
-            fields[record] = _within_probe(rope, rotary_half)
+            fields[record] = _within_probe(rope, small_head_dim, partial)
     if 'mamba_n_heads' in hf_config:
         # A Mamba mixer's heads tile its expanded width, which GraniteMoeHybrid's config validates: two
         # heads, one group, a small state.
-        expand = _records.integer(hf_config.get('mamba_expand', 2), 'mamba_expand')
+        # A stated inner width (Falcon-H1's mamba_d_ssm) is the expanded hidden's, shrunk with it.
+        width = _records.integer(hf_config.get('mamba_expand', 2), 'mamba_expand') * small_hidden
         fields['mamba_n_heads'] = 2
         if isinstance(hf_config.get('mamba_d_head'), int):
-            fields['mamba_d_head'] = expand * small_hidden // 2
+            fields['mamba_d_head'] = width // 2
+        if isinstance(hf_config.get('mamba_d_ssm'), int):
+            fields['mamba_d_ssm'] = width
         fields.update({name: value for name, value in (('mamba_n_groups', 1), ('mamba_d_state', _HEAD_DIM))
                        if name in hf_config})
     if isinstance(hf_config.get('original_max_position_embeddings'), int):
@@ -409,16 +410,19 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     return fields
 
 
-def _within_probe(record: Mapping[str, object], half: int) -> Mapping[str, object]:
+def _within_probe(record: Mapping[str, object], head_dim: int, partial: float) -> Mapping[str, object]:
     """A rope record with the original context it states at `_CONTEXT`, and its per-frequency factors
-    (LongRoPE's `long_factor` and `short_factor`, one per rotated pair) cut to the probe's `half` pairs:
-    a record's own, or each layer type's of a record nested by layer type."""
+    (LongRoPE's `long_factor` and `short_factor`, one per rotated pair) cut to the pairs the probe's
+    `head_dim` rotates, the record's partial rotary share where it states one, else the config's
+    `partial`: a record's own, or each layer type's of a record nested by layer type."""
     if 'original_max_position_embeddings' in record or _FREQUENCY_FACTORS & set(record):
+        share = _records.number(record.get('partial_rotary_factor', partial), 'partial_rotary_factor')
+        half = int(head_dim * share) // 2
         cut = {name: factors[:half] for name in _FREQUENCY_FACTORS
                if isinstance(factors := record.get(name), list)}
         stated = 'original_max_position_embeddings' in record
         return {**record, **({'original_max_position_embeddings': _CONTEXT} if stated else {}), **cut}
-    return {key: _within_probe(value, half) if isinstance(value, Mapping) else value
+    return {key: _within_probe(value, head_dim, partial) if isinstance(value, Mapping) else value
             for key, value in record.items()}
 
 
