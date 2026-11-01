@@ -127,14 +127,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         delta = arguments.get("delta", True)
         fast = backward and mainloop_backward.fast_backward_form(
-<<<<<<< HEAD
             delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4,
             floor=arguments.get("floor"))
-=======
-            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4)
         # The skip fused into the output and reverse walk where given (its tiles their registers').
         skip = arguments.get("skip")
->>>>>>> origin/rows/recurrence-batch
         return _planned(shapes, config, family, target, arguments.get("max_segments"), delta, bool(fast),
                         arguments.get("floor"), arguments.get("rounded", False), arguments.get("wide", False),
                         ranged(dtype, delta, arguments.get("bound")),
