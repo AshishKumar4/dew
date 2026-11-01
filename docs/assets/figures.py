@@ -1353,6 +1353,77 @@ def architecture_cost_figure():
     svg.save(HERE / "architecture-cost.svg")
 
 
+def stacked(name: str, label: str, steps: list[tuple[str, list[str], bool]], note: list[str] = ()):
+    """A figure's narrow layout for a phone (`save_both`): its `steps`, each a title, its lines and whether it
+    is Dew's own part, one under another, an arrow between each, and a closing `note`."""
+    width, x, y = 360, 12, 12
+    heights = [36 + 19 * len(lines) for _, lines, _ in steps]
+    height = 12 + sum(heights) + 18 * (len(steps) - 1) + (22 * len(note) + 16 if note else 0) + 12
+    svg = Figure(width, height, label=label)
+    for k, ((title, lines, accent), h) in enumerate(zip(steps, heights, strict=True)):
+        box(svg, x, y, width - 2 * x, h, title, lines, accent=accent)
+        y += h
+        if k < len(steps) - 1:
+            svg.arrow(width / 2, y, width / 2, y + 16)
+            y += 18
+    for k, line in enumerate(note):
+        svg.text(x, y + 26 + 22 * k, line, size=12, color="muted")
+    save_both(svg, name, narrow=True)
+
+
+def architecture_narrow_figures():
+    """The architecture figures' narrow layouts, the same parts top to bottom."""
+    stacked("architecture-flow", "One training run through Dew, top to bottom: your code, Trainer.fit, the "
+            "compile (jax.jit, the algebra pass, lowering, XLA), the kernels and the GPU.", [
+                ("Trainer(…).fit(data)", ["a script or notebook; or dew train",
+                                          "run.json, the same Trainer"], False),
+                ("Trainer.fit", ["one step compiled per batch shape,", "run every micro-batch"], False),
+                ("jax.jit", ["traces the step"], False),
+                ("algebra pass", ["rewrites the jaxpr"], True),
+                ("lower, then XLA compile", ["StableHLO; fuses, runs ptxas"], False),
+                ("kernels", ["Dew's templates, vendor kernels", "(FlashAttention, cuDNN) or XLA"], True),
+                ("one executable per step", ["kernels in order; a Mosaic launch",
+                                             "may start the next early"], False)])
+    stacked("architecture-pass", "The compile-time algebra pass, top to bottom: the traced jaxpr, its terms, "
+            "windows, saturation, extraction and splicing, then the outer jit lowers the result.", [
+                ("traced jaxpr", ["the whole step, backward included"], False),
+                ("terms", ["language equations become terms;", "the rest stay opaque"], True),
+                ("windows", ["each cheapenable head with two", "producer levels; 64 equations"], True),
+                ("saturate", ["facts, identities, linear,", "round by round, in a budget"], True),
+                ("extract", ["greedy DAG, priced by cost.fused"], True),
+                ("splice", ["only where the new form costs less"], True),
+                ("outer jit lowers → XLA", [], False)],
+            note=["dew.algebra.passes(on, target), on by default;", "loop bodies rewritten in place"])
+    stacked("architecture-template", "A template's layers, top deciding: choice, mainloop, the toolkit's "
+            "Family and its bundles, structure, hooks and the algebra.", [
+                ("choice: Template.derived", ["one config from device facts, or none"], True),
+                ("mainloop", ["the order of the bundle's steps"], True),
+                ("toolkit: Family", ["Issuer + Transport; bundles WGMMA,",
+                                     "FED, Mma, MmaFed (TCGEN05 unrouted)"], True),
+                ("structure", ["block lists, groups, chunks, pages"], False),
+                ("hooks", ["score, mask and output callables"], False),
+                ("algebra", ["init, step, merge, finish on tiles"], True)],
+            note=["An attention forward call: attend, then", "MosaicForward.derived, bundles.of, the launch,",
+                  "and each consumer's walk."])
+    stacked("architecture-derived", "The derivation of a Reduction, top to bottom: the declaration, traced "
+            "at a tile, saturated and extracted into a Derived, which the switch dew.cache.DERIVED, off by "
+            "default, chooses over the hand-written forms.", [
+                ("declaration", ["a Reduction: softmax(s)·v by keys"], False),
+                ("traced at a tile", ["terms; facts mark walked sums, maxima"], True),
+                ("saturate", ["step, merge, finish; decoupled rules"], True),
+                ("extract", ["priced by the tile walk, or refused"], True),
+                ("Derived", ["init, step, merge, finish"], True),
+                ("dew.cache.DERIVED", ["one switch, off by default: Derived",
+                                       "or the hand-written forms"], False)])
+    stacked("architecture-cost", "One cost vocabulary, two schedules: GpuTarget's facts, "
+            "templates.cost.Work, then cost.fused for the compile pass and cost.walk for derived forms.", [
+                ("GpuTarget + Architecture", ["rates, bandwidth, clock, SMs"], False),
+                ("templates.cost.Work", ["tensor FLOPs, fp32 ops, SFU exp,",
+                                         "conversions, device and shared bytes"], True),
+                ("cost.fused: XLA's fusion", ["whole-device rates; prices the pass"], True),
+                ("cost.walk: the tile walk", ["one tile on one SM; derived forms"], True)])
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
@@ -1365,7 +1436,8 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "agent-lanes": agent_lanes_figure, "architecture-flow": architecture_flow_figure,
            "architecture-pass": architecture_pass_figure,
            "architecture-template": architecture_template_figure,
-           "architecture-derived": architecture_derived_figure, "architecture-cost": architecture_cost_figure}
+           "architecture-derived": architecture_derived_figure, "architecture-cost": architecture_cost_figure,
+           "architecture-narrow": architecture_narrow_figures}
 
 
 if __name__ == "__main__":

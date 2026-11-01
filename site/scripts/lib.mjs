@@ -60,9 +60,17 @@ function committed(repoPath, first) {
 /** The commit date of the last change to a repository file, or undefined outside git. */
 export const lastUpdated = (repoPath) => committed(repoPath, false);
 
+let whole;
+
 /** When a tutorial or post was published: the commit date of the change that added its file at its path, or
- * undefined for one git does not hold yet. A listing of the newest reads it, so no date is written by hand. */
-export const published = (repoPath) => committed(repoPath, true);
+ * undefined for one git does not hold yet. A listing of the newest reads it, so no date is written by hand. A
+ * shallow clone's oldest commit holds every file as added, so the dates need the whole history, and a build
+ * without it says how to fetch it rather than date old pages by that commit (review). */
+export function published(repoPath) {
+	whole ??= execFileSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoRoot, encoding: 'utf8' }).trim() === 'false';
+	if (!whole) throw new Error(`${repoPath}: publication dates need the repository's whole history: git fetch --unshallow`);
+	return committed(repoPath, true);
+}
 
 const IMAGE = /\.(png|jpe?g|gif|svg|webp|avif)$/i;
 
