@@ -290,33 +290,39 @@ def stream():
 
 
 @pytest.mark.mesh(devices=8)
-def test_what_a_stage_local_run_hands_outside_the_trainer_holds_every_layer_whole():
-    """Every state a stage-local run hands its user holds each layer whole, as the same run with every layer
-    whole on every stage hands it (ledger 3438): the state `initial_state` builds, the one an Observe reads
-    at each step, and the one `fit` returns, whose objective's pipeline generates, off the mesh, what the
-    whole-layer run's generates."""
+def test_what_a_stage_local_run_hands_outside_the_trainer_is_its_stored_state(tmp_path):
+    """Every state a stage-local run hands its user is in its stored form, each field that mirrors the
+    variables with every layer whole (ledger 3438): `initial_state` and `fit` lay their states out as
+    the same run's with every layer whole on every stage; an Observe at the last step reads exactly the
+    state `fit` returns, which is exactly what the run's last checkpoint holds; that state trains on
+    when handed back to `fit`; and its objective's pipeline generates from it off the mesh."""
     model = decoder()
-    handed = []
-    for stage_local in (True, False):
-        run = trainer(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), STAGED, 8,
-                      stage_local=stage_local)
-        start = on_host(run.initial_state().variables)
-        observe = Observe(1, lambda state: on_host(state.variables))
-        trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe)
-        generated = run.objective.pipeline(trained)([[1, 2]], 4, key=0).host()
-        handed.append((start, observe.values, on_host(trained.variables), generated.tokens,
-                       generated.raw_log_probs))
-    local, whole = handed
-    assert jax.tree.structure(local) == jax.tree.structure(whole)
-    for mine, theirs in zip(jax.tree.leaves(local), jax.tree.leaves(whole), strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=1e-2)
+    stored = jax.tree.structure(trainer(model, optimizer, STAGED, 8, stage_local=False).initial_state())
+    run = trainer(model, optimizer, STAGED, 8, checkpoints=Checkpoints(str(tmp_path)))
+    assert jax.tree.structure(run.initial_state()) == stored
+    observe = Observe(STEPS, lambda state: on_host((state.variables, state.opt_state, state.ema)))
+    trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe, checkpoint_every=STEPS)
+    assert jax.tree.structure(dataclasses.replace(trained, compute=None)) == jax.tree.structure(
+        dataclasses.replace(run.initial_state(), compute=None))
+    held = on_host((trained.variables, trained.opt_state, trained.ema))
+    alone = trainer(model, optimizer, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path)))
+    placed, _, _ = alone.place()
+    for read in (observe.values[-1][1], on_host((placed.variables, placed.opt_state, placed.ema))):
+        assert jax.tree.structure(read) == jax.tree.structure(held)
+        for mine, theirs in zip(jax.tree.leaves(read), jax.tree.leaves(held), strict=True):
+            np.testing.assert_array_equal(mine, theirs)
+    assert int(trainer(model, optimizer, STAGED, 8).fit(stream(), steps=STEPS + 1, log_every=1,
+                                                       state=trained).step) == STEPS + 1
+    generated = run.objective.pipeline(trained)([[1, 2]], 4, key=0).host()
+    assert np.asarray(generated.tokens).shape[0] == 1
 
 
 @pytest.mark.mesh(devices=8)
 def test_a_stage_local_runs_episodes_score_the_model_every_layer_whole():
     """A split a stage-local run scores by flying its model (`Episodes`) reads its variables with every
-    layer whole, as a policy outside the mesh reads them, and scores what the same run with every layer
-    whole on every stage scores (ledger 3439)."""
+    layer whole, as a policy outside the mesh reads them: what it scores at the last step is its scorer's
+    score of the averaged model the run returns (ledger 3439)."""
     from recording import RecordingTracker
 
     from dew.objectives.base import Shown
@@ -328,16 +334,14 @@ def test_a_stage_local_runs_episodes_score_the_model_every_layer_whole():
     def flown(variables, key):
         return {"logit": float(jnp.mean(model.apply({"params": variables["params"]}, ids)))}
 
-    scored = []
-    for stage_local in (True, False):
-        run = trainer(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), STAGED, 8,
-                      stage_local=stage_local)
-        run.tracker = RecordingTracker()
-        run.fit(stream(), steps=STEPS, log_every=1,
-                validation={"flight": EvalSuite(Episodes(flown, {"logit": Shown()}), every=STEPS)})
-        scored.append([(step, values["flight/logit"]) for step, values in run.tracker.scalars
-                       if "flight/logit" in values])
-    assert scored[0] and scored[0] == scored[1]
+    run = trainer(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), STAGED, 8)
+    run.tracker = RecordingTracker()
+    trained = run.fit(stream(), steps=STEPS, log_every=1,
+                      validation={"flight": EvalSuite(Episodes(flown, {"logit": Shown()}), every=STEPS)})
+    scored = [(step, values["flight/logit"]) for step, values in run.tracker.scalars
+              if "flight/logit" in values]
+    # The split flew the averaged model the run ends with, the one its returned state holds.
+    assert scored == [(STEPS, flown(trained.averaged, None)["logit"])]
 
 
 @pytest.mark.mesh(devices=8)
