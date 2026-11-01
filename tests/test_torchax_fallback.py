@@ -751,6 +751,35 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
                     seeds=BF16_SEEDS, truth_fn=truth_fn)
 
 
+def test_a_bf16_tier_3_model_takes_forward_mode_through_its_forward_and_its_gradient(tokens, tmp_path):
+    """A bf16 tier-3 model's forward takes forward mode, and so does the gradient of a loss over its
+    logits (ledger 2653, 3039): its broadcasts, which sum their gradient in fp32 as torch does, are JAX's
+    own between exact casts, which a jvp and a jvp of the gradient run through, where a custom VJP took
+    no tangent: each tangent is finite and nonzero. Their accuracy is the broadcast's contract's
+    (tests/test_contracts_gemm.py)."""
+    torch.manual_seed(0)
+    transformers.GPTNeoXForCausalLM(transformers.GPTNeoXConfig(**TINY)).to(torch.bfloat16).save_pretrained(
+        tmp_path)
+    with pytest.warns(UserWarning):
+        model = Pretrained.load(tmp_path, fallback="torchax", dtype="bfloat16", param_dtype="bfloat16")
+    ids = jnp.asarray(tokens[:, :SEQ])
+    cotangent = jnp.asarray(np.random.default_rng(0).standard_normal((ids.shape[0], SEQ, TINY["vocab_size"])),
+                            jnp.float32)
+
+    def loss(params):
+        logits = model.model.apply({**model.variables, "params": params}, ids)
+        return jnp.sum(jnp.asarray(logits, jnp.float32) * cotangent)
+
+    params = model.variables["params"]
+    direction = jax.tree.map(lambda leaf: jnp.ones_like(leaf) * jnp.asarray(1e-2, leaf.dtype), params)
+    value, tangent = jax.jvp(loss, (params,), (direction,))
+    _, curvature = jax.jvp(jax.grad(loss), (params,), (direction,))
+    assert np.isfinite(float(value)) and np.isfinite(float(tangent)) and float(tangent) != 0
+    leaves = jax.tree.leaves(curvature)
+    assert all(np.all(np.isfinite(np.asarray(leaf, np.float32))) for leaf in leaves)
+    assert any(np.any(np.asarray(leaf, np.float32) != 0) for leaf in leaves)
+
+
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
     """The saved directory is a transformers checkpoint of the given weights."""
     variables = {**loaded.variables, "params": {name: np.asarray(leaf) * 0.5

@@ -732,8 +732,6 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
                  params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None):
     """Build the published CLIP text towers, their tokenizers, their parameters, the layouts those
     parameters came from and the tokenizers' files, each pinned as it is loaded."""
-    from transformers import CLIPTokenizer
-
     from dew.data.text import pin_tokenizer
     from dew.nn.text_encoders import translate_config
 
@@ -751,7 +749,8 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
             bound = {**bound, name: tree}
         layouts += recorded
         pins.append(pin_tokenizer(str(directory / ("tokenizer" + name.removeprefix("text_encoder")))))
-        tokenizers.append(CLIPTokenizer.from_pretrained(pins[-1].directory))
+        # The slow CLIP tokenizer the pipeline's own loads (`CLIPTokenizer`), through the one loader.
+        tokenizers.append(pins[-1].transformers(cls="CLIPTokenizer"))
     return tuple(towers), tuple(tokenizers), bound, layouts, tuple(pins)
 
 

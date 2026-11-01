@@ -339,6 +339,21 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         assert not chosen(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
 
 
+def test_a_narrow_bias_beside_a_wide_product_sums_its_wide_cotangent_before_it_rounds():
+    """A bf16 bias added to fp32 products takes the fp32 cotangents' sum rounded once into its dtype
+    (`biased`, `broadcast_summed`, review of ledger 3038): cotangents 1 + 1/256 and -1, which bf16 holds
+    as 1 and -1, sum to 1/256, which a sum of the rounded cotangents makes zero."""
+    from dew.nn.precision import biased
+
+    product = jnp.zeros((2, 1), jnp.float32)
+    bias = jnp.zeros((1,), jnp.bfloat16)
+    cotangent = jnp.asarray([[1 + 1 / 256], [-1.0]], jnp.float32)
+    out, pull = jax.vjp(lambda bias: biased(product, bias), bias)
+    assert out.dtype == jnp.float32
+    (gradient,) = pull(cotangent)
+    assert gradient.dtype == jnp.bfloat16 and float(gradient[0]) == 1 / 256
+
+
 def test_a_contraction_bound_to_any_arguments_sums_as_it_is_called():
     """A float32 product's wide sum through each way a caller binds it (`accumulated`): dimension numbers
     given as lists, as JAX takes them, sum as the same numbers given as tuples; a `functools.partial`

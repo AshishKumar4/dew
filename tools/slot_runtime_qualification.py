@@ -262,13 +262,13 @@ class ObservedScoring:
         self.batch_rows = []
 
     def admit(self, body):
-        from dew.inference.scoring import Scored
+        from dew.inference.scoring import ScoringRequest
 
         admitted = self.task.admit(body)
         if len(admitted.rows) != len(body["questions"]):
             raise ValueError("the qualification pool has one question per row")
         asked = tuple((name, len(question["criteria"])) for name, question in body["questions"].items())
-        return Scored(admitted.rows, (asked, admitted.payload))
+        return ScoringRequest(admitted.rows, (asked, admitted.payload))
 
     def planned(self):
         return self.task.planned()

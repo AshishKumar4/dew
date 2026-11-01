@@ -337,6 +337,28 @@ def test_ppos_critic_reads_the_progress_its_step_passes():
     assert critic_loss(objective(), trained) != critic_loss(objective(), validated)
 
 
+def test_ppos_rollout_baseline_scores_the_critic_at_the_runs_committed_updates():
+    """PPO's rollout scores its baseline (`old_values`) with a critic that reads the run's progress at the
+    updates the run committed (`PPORollout`, ledger 3008), as its loss trains it: after three updates
+    they are the values of the critic offset by 3, not the run's end's."""
+    def objective(offset=None) -> PPOObjective:
+        return PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1, critic=ValueHead(OffsetFeatures(offset)),
+                            beta=.03)
+
+    reading = objective()
+    initial = Trainer(reading, optax.sgd(0.), key=jax.random.key(19)).initial_state()
+    episodes = EpisodeCollector(reading.policy(reading.init(jax.random.key(19))), Harness(), verify,
+                                PROMPT, RESPONSE, TURNS, sampling=SAMPLING)
+    rollout = PPORollout(reading, episodes, groups=GROUPS, gamma=.97, lam=.9)
+    state = replace(initial, updates=jnp.asarray(3, jnp.int32))
+    rolled = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    keep = rolled["response_mask"] != 0
+    committed = np.asarray(objective(3.0).values(state.variables, rolled), np.float32)
+    ended = np.asarray(objective(-1.0).values(state.variables, rolled), np.float32)
+    np.testing.assert_array_equal(rolled[OLD_VALUES_KEY][keep], committed[keep])
+    assert not np.array_equal(committed[keep], ended[keep])
+
+
 def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.optim import OptimConfig
