@@ -7,14 +7,17 @@ every window holding a piece of its example is delivered.
 The windows a share reads, in the order the layout made them, are its units. An example's pieces lie in the
 units from the last one before its count that carried a count of its own (where the example before it
 ended) through the one carrying its count, so a unit's count is released once every unit of that span is
-drawn. A stream's units are numbered before the shuffle and released after it (`Numbered`, `Completed`),
-holding no more than the shuffle's window of them; an indexed read's are released at the place its order
-draws the span's last unit, which a table of that order states (`Released`). A memory read that holds its
-windows cuts them into its shares by whole examples (`whole_examples`), so no example lies across two."""
+drawn. A later shuffle draws units no layout ordered, so a count it draws waits for every unit before its
+own (`prefix`). A stream's units are numbered before the shuffle and released after it (`Numbered`,
+`Completed`), holding no more than the shuffle's window of them; an indexed read's are released at the
+place its order draws the span's last unit, which a table of that order states (`Released`). A memory read
+whose shares each read their own order of the windows it holds deals them by whole examples
+(`whole_examples`), so no example lies across two."""
 
 from __future__ import annotations
 
 import dataclasses
+import heapq
 from collections.abc import Mapping, Sequence
 from typing import overload
 
@@ -30,7 +33,8 @@ UNIT = "_dew_unit"
 
 SINCE = "_dew_since"
 """The first unit that can hold a piece of the examples a unit counts: the last one before it that carried
-a count, or the stream's first (`Numbered`)."""
+a count, or the stream's first, which every unit after a shuffle the layout did not order counts from
+(`Numbered`)."""
 
 CLOSES = "_dew_closes"
 """Whether a window a memory read holds ends where an example ends, so the window after it holds none of the
@@ -69,27 +73,30 @@ def whole_examples(closed: Sequence[bool], share: int, count: int) -> list[int]:
 
 class Numbered(pygrain.IterDataset):
     """A share's windows, each with its place among them (`UNIT`) and the first unit its examples' pieces
-    can lie in (`SINCE`), for `Completed` to read after a shuffle."""
+    can lie in (`SINCE`), for `Completed` to read after a shuffle: the stream's first for every unit where
+    the windows are not in their layout's order (`prefix`)."""
 
-    def __init__(self, parent: pygrain.IterDataset):
+    def __init__(self, parent: pygrain.IterDataset, *, prefix: bool = False):
         super().__init__(parent)
-        self._rows = parent
+        self._rows, self._prefix = parent, prefix
 
     def __iter__(self) -> pygrain.DatasetIterator:
-        return _NumberedIterator(self._rows.__iter__())
+        return _NumberedIterator(self._rows.__iter__(), prefix=self._prefix)
 
 
 class _NumberedIterator(pygrain.DatasetIterator):
-    def __init__(self, parent: pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator, *, prefix: bool):
         super().__init__(parent)
-        self._rows, self._next, self._since = parent, 0, 0
+        self._rows, self._next, self._since, self._prefix = parent, 0, 0, prefix
 
     def __next__(self) -> Batch:
         row = record(next(self._rows), "a laid-out window")
         unit, since = self._next, self._next
         self._next += 1
         if any(accounts(row)):
-            since, self._since = self._since, unit
+            since = self._since
+            if not self._prefix:
+                self._since = unit
         return {**row, UNIT: unit, SINCE: since}
 
     def get_state(self) -> Mapping[str, object]:
@@ -135,8 +142,10 @@ class _CompletedIterator(pygrain.DatasetIterator):
         super().__init__(parent)
         self._rows, self._floor, self._drawn = parent, 0, set[int]()
         self._held: dict[int, _Held] = {}
-        # The units each held count waits for, by the unit it waits for.
+        # The units each held count waits for, by the unit it waits for; a count whose span starts at or
+        # below the floor waits for the floor to pass it (`_floored`), the units below it all drawn.
         self._waiting: dict[int, list[int]] = {}
+        self._floored: list[int] = []
 
     def __next__(self) -> Batch:
         window = dict(record(next(self._rows), "a numbered window"))
@@ -147,6 +156,8 @@ class _CompletedIterator(pygrain.DatasetIterator):
             self._drawn.remove(self._floor)
             self._floor += 1
         released = [0, 0]
+        while self._floored and self._floored[0] < self._floor:
+            self._release(heapq.heappop(self._floored), released)
         for waiting in self._waiting.pop(unit, ()):
             held = self._held[waiting]
             held.missing -= 1
@@ -155,18 +166,23 @@ class _CompletedIterator(pygrain.DatasetIterator):
         consumed, refused = accounts(window)
         if consumed or refused:
             self._held[unit] = _Held(since, consumed, refused)
-            self._wait(unit)
-            if not self._held[unit].missing:
+            if self._wait(unit):
                 self._release(unit, released)
         return {**window, CONSUMED: released[0], REFUSED: released[1]}
 
-    def _wait(self, unit: int) -> None:
-        """Hold `unit`'s counts until the units of its span not yet drawn are."""
+    def _wait(self, unit: int) -> bool:
+        """Hold `unit`'s counts until the units of its span not yet drawn are; whether none is left."""
         held = self._held[unit]
-        for missing in range(max(held.since, self._floor), unit):
+        if unit < self._floor:
+            return True
+        if held.since <= self._floor:
+            heapq.heappush(self._floored, unit)
+            return False
+        for missing in range(held.since, unit):
             if missing not in self._drawn:
                 self._waiting.setdefault(missing, []).append(unit)
                 held.missing += 1
+        return not held.missing
 
     def _release(self, unit: int, released: list[int]) -> None:
         held = self._held.pop(unit)
@@ -182,7 +198,7 @@ class _CompletedIterator(pygrain.DatasetIterator):
         self._rows.set_state(record(state["parent"], "completed windows"))
         self._floor = integer(state["floor"], "the units all drawn")
         self._drawn = set(integers(state["drawn"], "the units drawn"))
-        self._held, self._waiting = {}, {}
+        self._held, self._waiting, self._floored = {}, {}, []
         for unit, since, consumed, refused in listed(state["held"], "held counts", read=integers,
                                                      what="a list of held counts"):
             self._held[unit] = _Held(since, consumed, refused)
@@ -193,14 +209,15 @@ class _CompletedIterator(pygrain.DatasetIterator):
 
 
 class Released(pygrain.MapDataset):
-    """Indexed windows `rows`, a share's units in the order its layout made them, read in `order`, the
-    same reorder of their indices (`order[i]` the unit read at place `i`): each example's counts at the
-    first kept row from the place where its span's last unit is read, a rejected row carrying none of its
-    own. Each pass of the order (`len(rows)` places) is tabled once, as it is first read."""
+    """Indexed windows `rows`, a share's units in the order its layout made them (or in another, `prefix`),
+    read in `order`, the same reorder of their indices (`order[i]` the unit read at place `i`): each
+    example's counts at the first kept row from the place where its span's last unit is read, a rejected
+    row carrying none of its own. Each pass of the order (`len(rows)` places) is tabled once, as it is
+    first read."""
 
-    def __init__(self, rows: pygrain.MapDataset, order: pygrain.MapDataset):
+    def __init__(self, rows: pygrain.MapDataset, order: pygrain.MapDataset, *, prefix: bool = False):
         super().__init__(rows)
-        self._rows, self._order = rows, order
+        self._rows, self._order, self._prefix = rows, order, prefix
         self._spans: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
         # The passes tabled, the one read last and the one before, as a read ahead crosses between them.
         self._tables: dict[int, np.ndarray] = {}
@@ -240,7 +257,8 @@ class Released(pygrain.MapDataset):
             kept = np.asarray([keeps for _, keeps in counts], bool)
             since, last = np.arange(len(counts)), 0
             for unit in np.flatnonzero((consumed != 0) | (refused != 0)):
-                since[unit], last = last, int(unit)
+                since[unit] = last
+                last = last if self._prefix else int(unit)
             self._spans = consumed, refused, kept, since
         return self._spans
 

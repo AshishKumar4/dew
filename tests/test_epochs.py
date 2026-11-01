@@ -494,7 +494,7 @@ def test_epochs_of_a_concatenating_pack_a_shuffle_draws_count_each_example_once_
 
     documents = [{"id": np.full(index % 5 + 3, index + 1, np.int32)} for index in range(10)]
     chain = Pipeline(Memory(documents, shard_rows=5)).pack(8, fields=("id",), policy="concat")
-    chain = chain.shuffle(seed=1, window=None if read == "memory" else 4).read(read).batch(4)
+    chain = chain.shuffle(seed=1, window=None if read == "memory" else 4).read(read).batch(8)
     loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
     assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
     state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)

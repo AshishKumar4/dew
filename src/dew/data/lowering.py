@@ -488,6 +488,13 @@ def _completes(pipeline: Pipeline, at: int) -> bool:
     return _consumes(pipeline) and _splits(laid)
 
 
+def _reshuffled(pipeline: Pipeline, at: int) -> bool:
+    """Whether a shuffle before the one at `at` in `pipeline` already drew the windows a layout cut its
+    examples across (`_completes`), so they reach it out of their layout's order (`Numbered.prefix`)."""
+    return any(isinstance(stage, Shuffle) and _completes(pipeline, index)
+               for index, stage in enumerate(pipeline.stages[:at]))
+
+
 def _held_whole(pipeline: Pipeline) -> bool:
     """Whether a memory read holds the windows a layout laid its counted examples across, and a shuffle
     draws them after (`_completes`): its shares then take whole examples (`whole_examples`), so each
@@ -1920,10 +1927,11 @@ class _Build:
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
         if isinstance(stage, Shuffle) and _completes(pipeline, at):
             # Each example's count waits for every window holding a piece of it (`dew.data.completion`).
+            prefix = _reshuffled(pipeline, at)
             if isinstance(rows, pygrain.MapDataset):
-                return Released(rows, _reordered(stage, pygrain.MapDataset.range(len(rows))))
+                return Released(rows, _reordered(stage, pygrain.MapDataset.range(len(rows))), prefix=prefix)
             if stage.window is not None:
-                numbered = Numbered(_as_iter(rows, self.loading))
+                numbered = Numbered(_as_iter(rows, self.loading), prefix=prefix)
                 return Completed(gx.WindowShuffleIterDataset(numbered, window_size=stage.window,
                                                              seed=stage.seed))
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):

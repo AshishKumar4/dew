@@ -296,9 +296,13 @@ _SPLIT = {
                 .shuffle(seed=2, window=3), "streamed"),
     "windows": (lambda chain: chain.windows(4, fields=("id",)).shuffle(seed=3, window=5), "streamed"),
     "held": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4), "memory"),
+    "twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=1, window=4)
+              .shuffle(seed=5, window=3), "streamed"),
+    "held twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4)
+                   .shuffle(seed=6), "memory"),
 }
-"""Layouts that cut documents across windows, each with a shuffle after it: read as a stream, its window
-shuffled, or held by a memory read, which shuffles them all."""
+"""Layouts that cut documents across windows, each with a shuffle after it, or two: read as a stream, its
+window shuffled, or held by a memory read, which shuffles them all."""
 
 
 def _drawn(loader, share, shares):
@@ -345,7 +349,7 @@ def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_windo
         # Every token of a pack's documents is laid in a window; windows leave the stream's last tokens
         # past every window out.
         assert consumed == len(_LENGTHS)
-    if layout == "held":
+    if read == "memory":
         # Held windows read in one order deal each batch's rows to the shares; through an objective's rows
         # each share reads its own order, its windows whole examples (`whole_examples`).
         assert (loader.order_records is None) == expands
