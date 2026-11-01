@@ -43,6 +43,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.extend import core as jcore
 
+from dew.algebra import carry, program
 from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
 
@@ -127,10 +128,12 @@ class _Affine:
     free: tuple[_Term, ...]
 
 
-def derive_scan(declaration: Scan) -> Derived:
-    """`declaration`'s chunk forms (the module's account): `init(shapes)` a zero state and no decay,
-    `step(state, chunk)` the state after a chunk of tokens, `mapped(chunk, state)` the chunk's outputs from
-    the state entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's from zero),
+def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived:
+    """`declaration`'s chunk forms (the module's account), split into what every chunk computes at once and
+    what its carry computes in sequence (`carry.split`, under `saturation`'s limits): `init(shapes)` a zero
+    state and no decay, `prepare(chunk)` a chunk's values that read no state (`Prepared`), `step(state,
+    prepared)` the state after the chunk, `mapped(prepared, state)` the chunk's outputs from the state
+    entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's from zero),
     `finish(state, operands)` the final state; `backward` a chunk's adjoint, a cotangent for each operand
     but the reset's. Refused (`Refused`) where the update or the readout is not of the module's form."""
     names = tuple(name for name in declaration.operands if name != declaration.reset)
@@ -172,22 +175,26 @@ def derive_scan(declaration: Scan) -> Derived:
         del shapes
         return jnp.zeros((shape[0],), jnp.float32), jnp.zeros(shape, dtype)
 
-    def step(state, chunk):
-        affine, (exponent, B, U, s, C, _, _) = parts(chunk)
-        decay, h = state
-        decays = _decays(exponent, affine.base2)
-        w = _corrected(decays, B, U, s, C, h)
-        carried = float32_einsum("tk,tv->kv", B * decays.to_last, w)
-        natural = _scanned(exponent)[-1] * (math.log(2.0) if affine.base2 else 1.0)
-        return decay + natural, decays.whole[:, None] * h + carried
+    splits: dict = {}
 
-    def mapped(chunk, state):
-        affine, (exponent, B, U, s, C, Q, R) = parts(chunk)
-        _, h = state
-        decays = _decays(exponent, affine.base2)
-        w = _corrected(decays, B, U, s, C, h)
-        scores = _paired(Q, B, decays.between)
-        return float32_matmul(Q * decays.entering, h) + float32_matmul(scores, w) + R
+    def prepare(chunk):
+        affine, values = parts(chunk)
+        key = (affine.base2, bool(affine.corrections), *((value.shape, str(value.dtype)) for value in values))
+        if key not in splits:
+            h = jax.ShapeDtypeStruct(shape, dtype)
+            given = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in values]
+            splits[key] = carry.split(functools.partial(_chunk, affine.base2, bool(affine.corrections)), h,
+                                      given, (1, 2), saturation=saturation)
+        return Prepared(splits[key].prepare(*values), splits[key])
+
+    def step(state, prepared):
+        decay, h = state
+        leaving, natural = prepared.split.carry(prepared.values, h)
+        return decay + natural, leaving
+
+    def mapped(prepared, state):
+        (outputs,) = prepared.split.emit(prepared.values, state[1])
+        return outputs
 
     def merge(a, b):
         # A state's decay is its walk's exponent sum per key in natural units. A later walk from zero leaves
@@ -206,15 +213,37 @@ def derive_scan(declaration: Scan) -> Derived:
         # forward forms' derivative (their prefix, substitution and Dew products differentiated).
         # The reset's booleans held, no operand of the derivative.
         def forward(h, operands):
-            entering, tiles = (state[0], h), {**chunk, **operands}
-            return mapped(tiles, entering), step(entering, tiles)[1]
+            entering, prepared = (state[0], h), prepare({**chunk, **operands})
+            return mapped(prepared, entering), step(entering, prepared)[1]
 
         _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
         d_h, d_chunk = pullback((d_outputs, d_state))
         return d_h, d_chunk
 
     return Derived(init, step, merge, finish, mapped,
-                   {"rounding": "compensated prefix", "walked": declaration.walked}, backward)
+                   {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare)
+
+
+@functools.partial(jax.tree_util.register_dataclass, data_fields=["values"], meta_fields=["split"])
+@dataclasses.dataclass(frozen=True)
+class Prepared:
+    """A chunk's values that read no state (`carry.Split.prepare`), batched as a walk computes them for every
+    chunk at once, and the split that reads them (static)."""
+
+    values: tuple
+    split: carry.Split
+
+
+def _chunk(base2: bool, corrects: bool, h, exponent, B, U, s, C, Q, R):
+    """A chunk's outputs, the state it leaves and its exponents' sum in natural units, from the state `h`
+    entering it and its tokens' values (`_token`): the module's forms, the solve where a token corrects the
+    state, which `carry.split` splits."""
+    decays = _decays(exponent, base2)
+    w = _corrected(decays, B, U, s, C, h) if corrects else U
+    carried = float32_einsum("tk,tv->kv", B * decays.to_last, w)
+    natural = _scanned(exponent)[-1] * (math.log(2.0) if base2 else 1.0)
+    outputs = float32_matmul(Q * decays.entering, h) + float32_matmul(_paired(Q, B, decays.between), w) + R
+    return outputs, decays.whole[:, None] * h + carried, natural
 
 
 def _producer(jaxpr: jcore.Jaxpr, var):
@@ -511,8 +540,8 @@ def _corrected(decays: _Decays, B, U, s, C, h):
     corrections' decayed overlaps, from the state entering the chunk."""
     strictly = jnp.tril(jnp.ones(decays.between.shape[:2], bool), -1)[:, :, None]
     overlaps = s[:, None] * _paired(C, B, jnp.where(strictly, decays.between, 0.0))
-    given = U - s[:, None] * float32_matmul(C * decays.entering, h)
-    return _solved(overlaps, given)
+    given = U - float32_matmul(s[:, None] * C * decays.entering, h)
+    return _applied(_lowered(overlaps), given)
 
 
 def _paired(left, right, between):
@@ -526,15 +555,14 @@ def _paired(left, right, between):
 
 
 @jax.custom_vjp
-def _solved(overlaps, given):
-    """`w` with `(I + overlaps) w = given`, `overlaps` strictly lower: the inverse by doubling (`_inverse`),
-    then one product, each a Dew product (`float32_matmul`): the template's own form (recurrence_algebra's
-    `doubled` and `weighted`), log2(C) levels of products where a forward substitution took C dependent row
-    steps (the derived forward's every chunk 64 launches in sequence). The unit diagonal is added outside
-    the product (`given + L given`, `L` the inverse less it), as `weighted` adds it, so the product rounds
-    the off-diagonal terms alone. Its derivative `back = X^T dw` alike and the overlaps' cotangent
-    `-back w^T` below the diagonal."""
-    return _applied(_below(_inverse(overlaps)), given)
+def _lowered(overlaps):
+    """`(I + overlaps)^-1` less its unit diagonal, `overlaps` strictly lower: the inverse by doubling
+    (`_inverse`), each product a Dew product (`float32_matmul`), the template's own form (recurrence_algebra's
+    `doubled`), log2(C) levels of products where a forward substitution took C dependent row steps (the
+    derived forward's every chunk 64 launches in sequence). The solve applies it with the unit diagonal
+    outside the product (`_applied`, `given + L given`, as `weighted` adds it), so the product rounds the
+    off-diagonal terms alone. Its derivative, with `X = I + L`, `-X^T dL X^T` below the diagonal."""
+    return _below(_inverse(overlaps))
 
 
 def _applied(lower, given):
@@ -547,19 +575,17 @@ def _below(square):
     return jnp.where(jnp.tril(jnp.ones(square.shape, bool), -1), square, 0.0)
 
 
-def _solved_forward(overlaps, given):
-    lower = _below(_inverse(overlaps))
-    solved = _applied(lower, given)
-    return solved, (lower, solved)
+def _lowered_forward(overlaps):
+    lower = _lowered(overlaps)
+    return lower, lower
 
 
-def _solved_backward(residuals, d_solved):
-    lower, solved = residuals
-    back = _applied(lower.T, d_solved)
-    return _below(-float32_matmul(back, solved.T)), back
+def _lowered_backward(lower, d_lower):
+    back = _applied(lower.T, d_lower)
+    return (_below(-_applied(lower, back.T).T),)
 
 
-_solved.defvjp(_solved_forward, _solved_backward)
+_lowered.defvjp(_lowered_forward, _lowered_backward)
 
 
 def _inverse(overlaps):

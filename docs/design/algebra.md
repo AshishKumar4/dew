@@ -574,12 +574,20 @@ numerics admit saturate in the same e-graph, so a form is extracted from the lan
 together, under the program's cost. The readings cost without bound: a value no rule rewrites leaves its form
 unpriced, and the declaration is refused. Each tile shape's rewrite joins the kernel report (§6.8).
 
-**Drift to fix.** `scan.py` does not use the e-graph. It matches one update shape (affine in the state,
-rank-one corrections along the input's vector, a contraction readout) with its own symbolic matcher and emits
-one chunk algorithm. The equal-form choices this section expects extraction to make under a cost (a solve's
-factoring independent of the entering state, the chunk-parallel work outside the sequential carry, doubling
-against substitution, a per-key decay's sub-chunk factoring) are hard-coded or missing. The derived forms run
-at trace time (the generator is parked, §6.11).
+A scan's chunk forms are split by extraction (`carry.py`). The chunk function, traced at one chunk, enters
+the e-graph with the values that read the state marked. The products' linear algebra saturates over them: a
+transposed operand's product as a plain product of its transpose, a product distributed over a sum that reads
+the state, two products associated so the state is last, two products of one operand factored. The carried
+outputs are extracted under a two-part price, the work that reads the state first and the rest second, so the
+carry reads the state through the fewest products; the emitted outputs take the program's cost. The forms'
+largest terms that read no state are the walk's prepared values (`Derived.prepare`), computed for every chunk
+at once; the carry alone runs in sequence. The delta rule's carry is one product of the state by a matrix the
+chunk prepared, its solve against the state off the carry.
+
+**Drift to fix.** `scan.py` still matches its update with its own symbolic matcher and emits one chunk
+algorithm. Doubling against substitution, a per-key decay's sub-chunk factoring and the decays' hoisting are
+hard-coded rather than extracted under a kernel cost. The derived forms run at trace time (the generator is
+parked, §6.11).
 
 Derivation runs at dev time, in the generator (§6.11); its output is a checked-in module. A declaration states
 semantics only: plain JAX on whole operands, or token functions along a walked axis. It never states a

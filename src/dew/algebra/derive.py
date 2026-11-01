@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 import jax
@@ -54,13 +54,11 @@ from egglog import (
     vars_,
 )
 from egglog.bindings import EggSmolError
-from jax.extend import core as jcore
 
 from dew.algebra import cost, program, rules, terms
-from dew.algebra.forms import Derived, Refused
+from dew.algebra.forms import Derived, Refused, evaluated, inlined
 from dew.algebra.terms import Term
 from dew.nn.kernels.templates import report as kernel_report
-from dew.nn.precision import float32_dot_general
 
 Axes = tuple[str, ...]
 
@@ -391,10 +389,10 @@ def _plain():
         name="plain walked")
 
 
-DECOUPLED = _decoupled()
+DECOUPLED = rules.Rules("decoupled", "reorders", _decoupled(),
+                        receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py")
+"""The derivation's rules, run beside the engine's sets (`rules.admitted`) and never among them."""
 PLAIN = _plain()
-rules.register(rules.Rules("decoupled", "reorders", DECOUPLED, dev=True,
-                           receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py"))
 
 
 UNBOUNDED = cost.Seconds(math.inf)
@@ -455,39 +453,39 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     def init(shapes):
         made = forms(shapes)
         avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-        typed = jax.eval_shape(lambda *values: tuple(_evaluate(made.region, reduction,
+        typed = jax.eval_shape(lambda *values: tuple(evaluated(made.region, reduction,
                                                                [*made.consts, *values], {})
                                                      for reduction in made.reductions), *avals)
         return tuple(jnp.full(aval.shape, _identity(reduction, aval.dtype), aval.dtype)
                      for reduction, aval in zip(made.reductions, typed, strict=True))
 
     def carried(made: _Forms, *states) -> dict:
-        return {(index, side): state[index] for side, state in enumerate(states)
+        return {str(Term.state(i64(index), i64(side))): state[index] for side, state in enumerate(states)
                 for index in range(len(made.reductions))}
 
     def step(state, tiles):
         made = forms(shaped(tiles))
         leaves = [*made.consts, *(tiles[name] for name in names)]
-        return tuple(_evaluate(made.region, form, leaves, carried(made, state)) for form in made.steps)
+        return tuple(evaluated(made.region, form, leaves, carried(made, state)) for form in made.steps)
 
     def merge(a, b):
         if not cache:
             raise Refused("a merge before the walk's state was formed (`init`)")
         made = next(reversed(cache.values()))
-        return tuple(_evaluate(made.region, form, list(made.consts), carried(made, a, b))
+        return tuple(evaluated(made.region, form, list(made.consts), carried(made, a, b))
                      for form in made.merges)
 
     def finish(state, operands):
         made = forms(shaped(operands))
         leaves = [*made.consts, *(operands[name] for name in names)]
-        outputs = [None if form is None else _evaluate(made.region, form, leaves, carried(made, state))
+        outputs = [None if form is None else evaluated(made.region, form, leaves, carried(made, state))
                    for form in made.finishes]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def mapped(tiles):
         made = forms(shaped(tiles))
         leaves = [*made.consts, *(tiles[name] for name in names)]
-        outputs = [_evaluate(made.region, form, leaves, {}) if along and form is not None else None
+        outputs = [evaluated(made.region, form, leaves, {}) if along and form is not None else None
                    for form, along in zip(made.outputs, made.mapped, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
@@ -505,7 +503,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
 
     avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
     with jax.disable_jit():
-        closed = jax.make_jaxpr(_inlined(named))(*avals)
+        closed = jax.make_jaxpr(inlined(named))(*avals)
     region = terms.region(closed)
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
@@ -539,16 +537,16 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     _, before = graph.extract(declared, include_cost=True, cost_model=timed, extractor="greedy-dag")
     facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
     _decoupled_through(graph, region, facts)
-    saturated = program.saturate(graph, region, (*rules.admitted(accurate), rules.RULES["decoupled"]),
+    saturated = program.saturate(graph, region, (*rules.admitted(accurate), DECOUPLED),
                                  saturation, facts)
     chosen, after = program.extracted(graph, bundle, _priced(cost.Device.of()))
-    if not math.isfinite(after):
+    if not math.isfinite(after.value):
         unwritten = next(root for root, form in zip(roots, chosen, strict=True) if not _written(form))
         raise Refused(f"no rule writes {unwritten} in the language: a walked reduction read other than by a "
                       "monoid or a decoupled exponent")
     report = program.AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired,
                                    saturated.limits, saturated.iterations, program.node_count(graph),
-                                   saturated.limited, before.value, after, time.perf_counter() - began)
+                                   saturated.limited, before.value, after.value, time.perf_counter() - began)
     count = len(reductions)
     steps, merges, finished = chosen[:count], chosen[count:2 * count], iter(chosen[2 * count:])
     finishes = tuple(None if term is None or is_along else next(finished)
@@ -568,46 +566,9 @@ def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule) -> 
     the graph toward their limits, so a limit the engine reaches never stops a form."""
     for _ in range(4 * max(region.depth, 1) + 8):
         graph.run(facts)
-        if not graph.run(DECOUPLED).updated:
+        if not graph.run(DECOUPLED.ruleset).updated:
             break
     graph.run(facts)
-
-
-def _inlined(function: Callable) -> Callable:
-    """`function` with each choice by the platform a program lowers for (`lax.platform_dependent`, a `cond` on
-    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, so its product
-    enters the e-graph as one; the forms evaluate products as Dew's (`_evaluate`)."""
-    def run(*values):
-        closed = jax.make_jaxpr(function)(*values)
-        outputs = _evaluated_inline(closed.jaxpr, closed.consts, values)
-        return outputs[0] if len(outputs) == 1 else tuple(outputs)
-
-    return run
-
-
-def _evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
-    """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`_inlined`)."""
-    env: dict = {}
-
-    def read(atom):
-        return atom.val if isinstance(atom, jcore.Literal) else env[atom]
-
-    env.update(zip(jaxpr.constvars, consts, strict=True))
-    env.update(zip(jaxpr.invars, values, strict=True))
-    producers = {out: equation for equation in jaxpr.eqns for out in equation.outvars}
-    for equation in jaxpr.eqns:
-        branches = equation.params.get("branches") if equation.primitive.name == "cond" else None
-        index = equation.invars[0] if equation.invars else None
-        chooser = producers.get(index) if branches and isinstance(index, jcore.Var) else None
-        if branches and chooser is not None and chooser.primitive.name == "platform_index":
-            default = branches[-1]
-            operands = [read(atom) for atom in equation.invars[1:]]
-            outs = _evaluated_inline(default.jaxpr, default.consts, operands)
-        else:
-            outs = equation.primitive.bind(*[read(atom) for atom in equation.invars], **equation.params)
-            outs = outs if equation.primitive.multiple_results else [outs]
-        env.update(zip(equation.outvars, outs, strict=True))
-    return [read(atom) for atom in jaxpr.outvars]
 
 
 def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
@@ -767,72 +728,13 @@ def _identity(reduction: Term, dtype) -> float:
     return 0.0
 
 
-_LANGUAGE = (Term.binary, Term.compare, Term.unary, Term.convert, Term.shaped, Term.reduce, Term.dot,
-             Term.select)
-"""The language's constructors that read terms (`terms.Term`), a leaf's and a carried state's none."""
-
-
-def _subterms(form: Term) -> Iterator[Term]:
-    """Each distinct term `form` reads through the language, itself first."""
-    seen, pending = set(), [form]
-    while pending:
-        term = pending.pop()
-        if (key := str(term)) in seen:
-            continue
-        seen.add(key)
-        yield term
-        for constructor in _LANGUAGE:
-            if (args := get_callable_args(term, constructor)) is not None:
-                pending.extend(arg for arg in args if isinstance(arg, Term))
-
-
 def _reads_leaves(form: Term) -> set[int]:
     """The region's leaves `form` reads."""
-    return {int(get_literal_value(args[0])) for term in _subterms(form)
+    return {int(get_literal_value(args[0])) for term in terms.subterms(form)
             if (args := get_callable_args(term, Term.leaf)) is not None}
 
 
 def _written(form: Term) -> bool:
     """Whether `form` keeps none of the derivation's readings: a form in the language."""
-    return not any(get_callable_args(term, reading) is not None for term in _subterms(form)
+    return not any(get_callable_args(term, reading) is not None for term in terms.subterms(form)
                    for reading in _READINGS)
-
-
-def _evaluate(region: terms.Region, form: Term, leaves: list, carried: Mapping) -> jax.Array:
-    """A form's value: its leaves the given values (the tile's operands) and the outputs of the region's
-    equations outside the language over them, each carried state its value (`carried`, by the reduction and
-    side), each product Dew's (`float32_dot_general`), every other term the engine's (`terms.value_of`)."""
-    known: dict[str, jax.Array] = {}
-    outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
-    values = dict(enumerate(leaves))
-
-    def leaf(index: int):
-        if index not in values:
-            opaque = outside[index]
-            inputs = [literal if term is None else value(term)
-                      for term, literal in zip(opaque.inputs, opaque.literals, strict=True)]
-            outs = opaque.equation.primitive.bind(*inputs, **opaque.equation.params)
-            outs = outs if opaque.equation.primitive.multiple_results else [outs]
-            values.update(zip(opaque.outputs, outs, strict=True))
-        return values[index]
-
-    def value(term: Term) -> jax.Array:
-        key = str(term)
-        if key in known:
-            return known[key]
-        if (args := get_callable_args(term, Term.leaf)) is not None:
-            made = leaf(int(get_literal_value(args[0])))
-        elif (args := get_callable_args(term, Term.state)) is not None:
-            made = carried[(int(get_literal_value(args[0])), int(get_literal_value(args[1])))]
-        elif (args := get_callable_args(term, Term.dot)) is not None:
-            left, right, index = args
-            _, given = region.params[int(get_literal_value(index))]
-            made = float32_dot_general(value(left), value(right), given["dimension_numbers"],
-                                       precision=given.get("precision"),
-                                       preferred_element_type=given.get("preferred_element_type"))
-        else:
-            made = terms.value_of(term, value, region, [leaf(index) for index in range(len(leaves))])
-        known[key] = made
-        return made
-
-    return value(form)

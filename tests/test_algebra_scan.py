@@ -12,9 +12,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.extend import core as jcore
 from reference_error import assert_as_exact
 
-from dew.algebra import scan
+from dew.algebra import SATURATION, scan
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
 
@@ -73,15 +74,16 @@ def walk(forms, values, chunks: range, state):
     outputs = []
     for index in chunks:
         chunk = chunk_of(values, index)
-        outputs.append(forms.mapped(chunk, state))
-        state = forms.step(state, chunk)
+        prepared = forms.prepare(chunk)
+        outputs.append(forms.mapped(prepared, state))
+        state = forms.step(state, prepared)
     return outputs, state
 
 
 def test_the_derived_chunks_compute_the_token_scan():
     """The derived chunk outputs and step over every chunk in order: on par with the token-by-token scan,
     outputs and final state, against the float64 truth (check 1)."""
-    forms = scan.derive_scan(DECLARED)
+    forms = scan.derive_scan(DECLARED, saturation=SATURATION)
 
     def derived(x, dt, B, C):
         values = operands(x, dt, B, C)
@@ -94,7 +96,7 @@ def test_the_derived_chunks_compute_the_token_scan():
 def test_two_walks_merged_give_the_final_state():
     """The tokens walked in two halves, the second from a zero state, merged: the final state on par with
     the token-by-token scan's."""
-    forms = scan.derive_scan(DECLARED)
+    forms = scan.derive_scan(DECLARED, saturation=SATURATION)
     half = TOKENS // CHUNK // 2
 
     def merged(x, dt, B, C):
@@ -121,9 +123,9 @@ def test_an_update_no_chunk_form_holds_is_refused(refused):
     """A decay along the state's second axis (each value column its own) and a state read twice have no
     chunk form here: refused before a form is built."""
     forms = scan.derive_scan(scan.Scan(refused, readout, OPERANDS, walked="time",
-                                       state=((STATE, WIDTH), jnp.float32)))
+                                       state=((STATE, WIDTH), jnp.float32)), saturation=SATURATION)
     with pytest.raises(scan.Refused):
-        forms.step(forms.init({}), chunk_of(operands(*draw(0)), 0))
+        forms.prepare(chunk_of(operands(*draw(0)), 0))
 
 
 def gated_delta(h, q, k, v, g, beta, exponential=jnp.exp):
@@ -208,19 +210,50 @@ def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, ope
     WY form: on par with the token-by-token scan, outputs and final state, against the float64 truth (check
     1), decays down to 1e-3 a token."""
     forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)))
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
 
     def derived(q, k, v, g, beta):
         values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
         state, outputs = forms.init({}), []
         for index in range(TOKENS // CHUNK):
             chunk = {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-            outputs.append(forms.mapped(chunk, state))
-            state = forms.step(state, chunk)
+            prepared = forms.prepare(chunk)
+            outputs.append(forms.mapped(prepared, state))
+            state = forms.step(state, prepared)
         return jnp.concatenate(outputs), forms.finish(state, values)
 
     assert_as_exact(jax.jit(derived), jax.jit(gated_tokenwise(update_fn)), draw_fn, update_fn.__name__,
                     seeds=16)
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"),
+                         [(gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)],
+                         ids=["gated_delta", "kimi_delta"])
+def test_the_delta_rules_carry_reads_the_state_through_one_product(update_fn, operands, draw_fn):
+    """The delta rule's split (`carry.split`): its carry (`step` over a chunk's prepared values) reads the
+    state through one product, a matrix the chunk prepared times the state, the solve, the decays and every
+    other product among the prepared values."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    names = ("q", "k", "v", "g", "beta")
+    chunk = {name: value[:CHUNK] for name, value in zip(names, draw_fn(0), strict=True)}
+    prepared = forms.prepare(chunk)
+    carry = jax.make_jaxpr(lambda h: forms.step((jnp.zeros((KEY,), jnp.float32), h), prepared))(
+        jnp.zeros((KEY, VALUE)))
+    primitives = list(_primitives(carry.jaxpr))
+    assert primitives.count("dot_general") == 1, primitives
+    assert not any(name.startswith("custom_vjp") for name in primitives), primitives
+
+
+def _primitives(jaxpr):
+    """Each equation's primitive in `jaxpr` and in every jaxpr its equations hold (a jit's, a custom
+    derivative's), a cond's one branch (Dew's product a choice by platform, each branch one product)."""
+    for equation in jaxpr.eqns:
+        yield equation.primitive.name
+        inner = ([equation.params["branches"][-1].jaxpr] if equation.primitive.name == "cond"
+                 else jcore.jaxprs_in_params(equation.params))
+        for held in inner:
+            yield from _primitives(held)
 
 
 def adjoint(forms, chunk_of_values, count: int):
@@ -231,7 +264,7 @@ def adjoint(forms, chunk_of_values, count: int):
         d_outputs, d_final = cotangents
         states = [forms.init({})]
         for index in range(count):
-            states.append(forms.step(states[-1], chunk_of_values(values, index)))
+            states.append(forms.step(states[-1], forms.prepare(chunk_of_values(values, index))))
         d_state, grads = d_final, []
         for index in reversed(range(count)):
             chunk = chunk_of_values(values, index)
@@ -263,7 +296,7 @@ def cotangents_of(seed, outputs_shape, state_shape):
 def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
     """Mamba-2's chunk adjoint (`backward`), walked back over the chunks: each token operand's gradient on par
     with the token-by-token scan's against the float64 truth (check 1)."""
-    forms = scan.derive_scan(DECLARED)
+    forms = scan.derive_scan(DECLARED, saturation=SATURATION)
     names = ("x", "dt", "B", "C")
 
     def chunked(values, index):
@@ -317,7 +350,7 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
     """The gated delta rule's and Kimi's delta attention's chunk adjoints, walked back: each token operand's
     gradient on par with the token-by-token scan's against the float64 truth (check 1)."""
     forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)))
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
     assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint")
 
 
@@ -356,7 +389,7 @@ def resetting(rule: str):
     update_fn, readout_fn, declared, shape, _, names, constants = RESETTING[rule]
     operands = {**declared, "first": ("time",)}
     forms = scan.derive_scan(scan.Scan(update_fn, readout_fn, operands, walked="time",
-                                       state=(shape, jnp.float32), reset="first"))
+                                       state=(shape, jnp.float32), reset="first"), saturation=SATURATION)
 
     def values(first, tokens):
         return {**dict(zip(names, tokens, strict=True)), **constants, "first": first}
@@ -392,8 +425,9 @@ def test_a_reset_walk_in_chunks_computes_the_token_scan_of_each_document(rule):
         state, outputs = forms.init({}), []
         for index in range(TOKENS // CHUNK):
             chunk = chunked(given, index)
-            outputs.append(forms.mapped(chunk, state))
-            state = forms.step(state, chunk)
+            prepared = forms.prepare(chunk)
+            outputs.append(forms.mapped(prepared, state))
+            state = forms.step(state, prepared)
         return jnp.concatenate(outputs), forms.finish(state, given)
 
     assert_as_exact(jax.jit(derived), jax.jit(tokens_run),
@@ -413,7 +447,7 @@ def test_two_reset_walks_merged_give_the_final_state():
         for chunks in (range(half), range(half, 2 * half)):
             state = forms.init({})
             for index in chunks:
-                state = forms.step(state, chunked(given, index))
+                state = forms.step(state, forms.prepare(chunked(given, index)))
             states.append(state)
         return forms.finish(forms.merge(*states), given)
 

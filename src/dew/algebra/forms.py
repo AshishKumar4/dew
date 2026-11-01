@@ -1,6 +1,7 @@
-"""What every derivation shares (`derive`, `scan`): the forms a declaration derives (`Derived`), those forms
-with their math rewritten by the engine (`rewritten`), its refusal (`Refused`), and the reading of a
-declaration's jaxpr: what a value reads, an equation's evaluation, a value's array type."""
+"""What every derivation shares (`derive`, `scan`, `carry`): the forms a declaration derives (`Derived`),
+those forms with their math rewritten by the engine (`rewritten`), its refusal (`Refused`), the reading of a
+declaration's jaxpr (what a value reads, an equation's evaluation, a value's array type), a declaration
+traced with Dew's products as one each (`inlined`), and an extracted form's value (`evaluated`)."""
 
 from __future__ import annotations
 
@@ -8,10 +9,12 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
+from egglog import get_callable_args, get_literal_value
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew.algebra import program
+from dew.algebra import program, terms
+from dew.nn.precision import float32_dot_general
 
 
 class Derived(NamedTuple):
@@ -20,11 +23,13 @@ class Derived(NamedTuple):
     the whole of each other), `merge(a, b)` two states of disjoint walks joined, `finish(state, operands)`
     the declaration's outputs that the walk reduces, `mapped(tiles)` its outputs along the walked axis, a
     tile's own (each reads no walked reduction: a backward's dQ, walking queries), each form None in the
-    other's outputs' places; a scan's `mapped(tiles, state)` a chunk's outputs from the state entering it
-    (`scan.derive_scan`); `report` what the derivation decoupled and its rounding class. A scan's
-    `backward(tiles, state, d_state, d_outputs)` is a chunk's adjoint: the cotangent of the state entering it
-    and of each of its operands, from the state entering it and the cotangents of the state leaving it and of
-    its outputs (a reduction's backward is a declaration of its own, None here)."""
+    other's outputs' places; `report` what the derivation decoupled and its rounding class; `prepare(tiles)`
+    a tile's values that read no state, which a walk computes for every tile at once (a reduction's tiles as
+    they are). A scan's (`scan.derive_scan`) `step(state, prepared)` and `mapped(prepared, state)` read a
+    chunk's prepared values and the state alone (the carry, and a chunk's outputs from the state entering
+    it); its `backward(tiles, state, d_state, d_outputs)` is a chunk's adjoint: the cotangent of the state
+    entering it and of each of its operands, from the state entering it and the cotangents of the state
+    leaving it and of its outputs (a reduction's backward is a declaration of its own, None here)."""
 
     init: Callable
     step: Callable
@@ -33,6 +38,7 @@ class Derived(NamedTuple):
     mapped: Callable
     report: Mapping
     backward: Callable | None = None
+    prepare: Callable = lambda tiles: tiles
 
 
 class Program(Protocol):
@@ -68,9 +74,14 @@ def evaluate(closed, env: dict, needed: set) -> None:
         done = all(out in env for out in equation.outvars)
         if done or not any(out in needed for out in equation.outvars):
             continue
-        outs = equation.primitive.bind(*map(read, equation.invars), **equation.params)
-        outs = outs if equation.primitive.multiple_results else [outs]
-        env.update(zip(equation.outvars, outs, strict=True))
+        env.update(zip(equation.outvars, bound(equation, map(read, equation.invars)), strict=True))
+
+
+def bound(equation: jcore.JaxprEqn, inputs) -> list:
+    """`equation`'s outputs over `inputs`, bound as `jax.core.eval_jaxpr` binds it (a custom derivative's
+    parameters as its primitive takes them, `get_bind_params`)."""
+    outs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(equation.params))
+    return outs if equation.primitive.multiple_results else [outs]
 
 
 def environment(closed, values, known: dict) -> dict:
@@ -110,4 +121,79 @@ def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturatio
 
     return derived._replace(step=through(derived.step), merge=through(derived.merge),
                             finish=through(derived.finish), mapped=through(derived.mapped),
-                            backward=through(derived.backward))
+                            backward=through(derived.backward), prepare=through(derived.prepare))
+
+
+def inlined(function: Callable) -> Callable:
+    """`function` with each choice by the platform a program lowers for (`lax.platform_dependent`, a `cond` on
+    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, so its product
+    enters the e-graph as one; a form evaluates products as Dew's (`evaluated`)."""
+    def run(*values):
+        closed = jax.make_jaxpr(function)(*values)
+        outputs = evaluated_inline(closed.jaxpr, closed.consts, values)
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    return run
+
+
+def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
+    """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`)."""
+    env: dict = {}
+
+    def read(atom):
+        return atom.val if isinstance(atom, jcore.Literal) else env[atom]
+
+    env.update(zip(jaxpr.constvars, consts, strict=True))
+    env.update(zip(jaxpr.invars, values, strict=True))
+    producers = {out: equation for equation in jaxpr.eqns for out in equation.outvars}
+    for equation in jaxpr.eqns:
+        branches = equation.params.get("branches") if equation.primitive.name == "cond" else None
+        index = equation.invars[0] if equation.invars else None
+        chooser = producers.get(index) if branches and isinstance(index, jcore.Var) else None
+        if branches and chooser is not None and chooser.primitive.name == "platform_index":
+            default = branches[-1]
+            operands = [read(atom) for atom in equation.invars[1:]]
+            outs = evaluated_inline(default.jaxpr, default.consts, operands)
+        else:
+            outs = bound(equation, map(read, equation.invars))
+        env.update(zip(equation.outvars, outs, strict=True))
+    return [read(atom) for atom in jaxpr.outvars]
+
+
+def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
+              known: Mapping[str, jax.Array]) -> jax.Array:
+    """A form's value: its leaves the given values (`leaves`, by index; None for one no form reads) and the
+    outputs of the region's equations outside the language over them, each term `known` names (by its text)
+    its value there, each product Dew's (`float32_dot_general`), every other term the engine's
+    (`terms.value_of`)."""
+    values = dict(known)
+    outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
+    given = dict(enumerate(leaves))
+
+    def leaf(index: int):
+        if given.get(index) is None:
+            opaque = outside[index]
+            inputs = [literal if term is None else value(term)
+                      for term, literal in zip(opaque.inputs, opaque.literals, strict=True)]
+            given.update(zip(opaque.outputs, bound(opaque.equation, inputs), strict=True))
+        return given[index]
+
+    def value(term: terms.Term) -> jax.Array:
+        key = str(term)
+        if key in values:
+            return values[key]
+        if (args := get_callable_args(term, terms.Term.leaf)) is not None:
+            made = leaf(int(get_literal_value(args[0])))
+        elif (args := get_callable_args(term, terms.Term.dot)) is not None:
+            left, right, index = args
+            _, params = region.params[int(get_literal_value(index))]
+            made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
+                                       precision=params.get("precision"),
+                                       preferred_element_type=params.get("preferred_element_type"))
+        else:
+            # Every leaf is read above.
+            made = terms.value_of(term, value, region, ())
+        values[key] = made
+        return made
+
+    return value(form)

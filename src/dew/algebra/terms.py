@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -292,7 +292,7 @@ def _index(argument) -> int:
     return int(get_literal_value(argument))
 
 
-def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: list) -> jax.Array:
+def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: Sequence) -> jax.Array:
     """One term's value, its operands' from `value`."""
     if (args := get_callable_args(term, Term.leaf)) is not None:
         return leaves[_index(args[0])]
@@ -316,3 +316,22 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
             primitive, given = region_.params[_index(args[-1])]
             return primitive.bind(value(args[0]), **given)
     raise ValueError(f"a term of no known constructor: {term}")
+
+
+LANGUAGE = (Term.binary, Term.compare, Term.unary, Term.convert, Term.shaped, Term.reduce, Term.dot,
+            Term.select)
+"""The language's constructors that read terms, a leaf's and a literal's none."""
+
+
+def subterms(form: Term) -> Iterator[Term]:
+    """Each distinct term `form` reads through the language, itself first."""
+    seen, pending = set(), [form]
+    while pending:
+        term = pending.pop()
+        if (key := str(term)) in seen:
+            continue
+        seen.add(key)
+        yield term
+        for constructor in LANGUAGE:
+            if (args := get_callable_args(term, constructor)) is not None:
+                pending.extend(arg for arg in args if isinstance(arg, Term))

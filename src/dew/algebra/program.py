@@ -255,11 +255,11 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
     saturated = saturate(graph, region, rules.admitted(accurate), saturation)
     forms, after = extracted(graph, bundle, priced)
-    cheaper = after < before.value
+    cheaper = after.value < before.value
     picked = {str(root): form for root, form in zip(roots, forms, strict=True)} if cheaper else {}
     report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
-                           saturated.iterations, node_count(graph), saturated.limited, before.value, after,
-                           time.perf_counter() - began)
+                           saturated.iterations, node_count(graph), saturated.limited, before.value,
+                           after.value, time.perf_counter() - began)
     return Rewrite(region, picked, report)
 
 
@@ -340,13 +340,14 @@ def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, .
     return Saturated(fired, (nodes, steps), iterations, limited)
 
 
-def extracted(graph: EGraph, bundle: terms.Term, model) -> tuple[list[terms.Term], float]:
-    """The roots' forms `model` prices cheapest together, each shared value once, and their price."""
+def extracted(graph: EGraph, bundle: terms.Term, model):
+    """The roots' forms `model` prices cheapest together, each shared value once, and their price (the
+    model's cost: `cost.Seconds` for the program's)."""
     chosen, price = graph.extract(bundle, include_cost=True, cost_model=model, extractor="greedy-dag")
     forms = get_callable_args(chosen, terms.Term.bundle)
     if forms is None:
         raise ValueError(f"extraction chose no bundle of the program's roots: {chosen}")
-    return list(forms[0].value), price.value
+    return list(forms[0].value), price
 
 
 BODIES = frozenset({"jit", "pjit", "closed_call", "scan", "while", "cond", "remat2", "checkpoint",

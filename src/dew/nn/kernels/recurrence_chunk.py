@@ -770,13 +770,14 @@ portable math; the forms derived from the token update (`derived_rule`) where a 
 def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,
                  chunk_size: int, dtype):
     """The recurrence over chunks by the forms derived from its token update (`dew.algebra.scan`, the compact
-    WY form and its prefix derived, not written): each value head's update `h = D h - beta k (k^T D h) + beta
+    WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
+    carry alone in sequence): each value head's update `h = D h - beta k (k^T D h) + beta
     k v^T` with the delta rule (`recurrence.update`'s), `h = D h + beta k v^T` without it, `D = exp(g)` a
     head's or each key's own, read `scale q^T h`; `(output, final memory)` in `dtype`, the memory entering
     `state` (zero where None). A length off the chunk grid is padded with tokens that leave the memory as it
     was (zero keys and write gates, a unit decay). `starts` `[B, S]`, where given, marks packed documents'
     first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`)."""
-    from dew.algebra import scan
+    from dew.algebra import SATURATION, scan
 
     group = value.shape[2] // key.shape[2]
     if group > 1:
@@ -800,7 +801,7 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
     reset = None if starts is None else "first"
     declared = axes if reset is None else {**axes, reset: ("time",)}
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
-                                       state=((width, columns), dtype), reset=reset))
+                                       state=((width, columns), dtype), reset=reset), saturation=SATURATION)
     chunks = -(-length // chunk_size)
     padded = chunks * chunk_size - length
 
@@ -818,10 +819,15 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
     entering = (jnp.zeros((rows, heads, width, columns), dtype) if state is None else state.astype(dtype))
 
     def walked(operands, h):
-        def one(carried, chunk):
-            return forms.step(carried, chunk), forms.mapped(chunk, carried)
+        # Each chunk's values that read no memory at once; the memory alone in sequence; then each chunk's
+        # outputs from the memory entering it, at once.
+        prepared = jax.vmap(forms.prepare)(operands)
 
-        carried, outputs = jax.lax.scan(one, (jnp.zeros((width,), jnp.float32), h), operands)
+        def one(carried, chunk):
+            return forms.step(carried, chunk), carried
+
+        carried, entering = jax.lax.scan(one, (jnp.zeros((width,), jnp.float32), h), prepared)
+        outputs = jax.vmap(forms.mapped)(prepared, entering)
         return outputs.reshape(-1, columns), carried[1]
 
     out, final = jax.vmap(jax.vmap(walked))(operands, entering)

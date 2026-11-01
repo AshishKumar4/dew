@@ -34,8 +34,8 @@ def test_the_rewritten_walk_computes_the_declared_function(name, accurate):
 def test_the_rewritten_ssd_chunks_compute_the_token_scan(accurate):
     """Mamba-2's derived chunks, their forms' math rewritten by the engine: outputs and final state on par
     with the token-by-token scan (check 1)."""
-    derived = forms.rewritten(scan.derive_scan(scans.DECLARED), accurate=accurate,
-                              saturation=algebra.SATURATION)
+    derived = forms.rewritten(scan.derive_scan(scans.DECLARED, saturation=algebra.SATURATION),
+                              accurate=accurate, saturation=algebra.SATURATION)
 
     def chunked(x, dt, B, C):
         values = scans.operands(x, dt, B, C)
@@ -50,7 +50,8 @@ def test_the_rewritten_delta_rules_adjoint_is_the_token_scans_gradient():
     gradient on par with the token-by-token scan's (check 1)."""
     derived = forms.rewritten(
         scan.derive_scan(scan.Scan(scans.gated_delta, scans.gated_readout, scans.GATED, walked="time",
-                                   state=((scans.KEY, scans.VALUE), jnp.float32))),
+                                   state=((scans.KEY, scans.VALUE), jnp.float32)),
+                         saturation=algebra.SATURATION),
         accurate=False, saturation=algebra.SATURATION)
     scans.assert_delta_adjoint(derived, scans.gated_delta, scans.gated_draw, "gated delta rewritten", seeds=8)
 

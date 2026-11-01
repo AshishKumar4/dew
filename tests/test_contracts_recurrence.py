@@ -13,7 +13,7 @@ import pytest
 from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
-from dew.algebra import scan
+from dew.algebra import SATURATION, scan
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates import mosaic_sm90
 from dew.nn.kernels.templates.recurrence import mainloop, selective
@@ -414,7 +414,7 @@ def _read(h, q, k, v, g, beta):
 def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
     """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
     key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
-    derivatives (the decays' range sums, `_decays_of`; the corrected inputs' substitution, `_substituted`):
+    derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`):
     the primal, the reverse derivative and reverse over reverse finite wherever float64 is a normal float32
     and the token-by-token scan's are, at unit queries, keys and values and at ones whose products near
     float32's least normal. Forward mode does not run: both are custom VJPs (`FORWARD_ORDERS`)."""
@@ -428,15 +428,16 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
     axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
     forms = scan.derive_scan(scan.Scan(_gated, _read, axes, walked="time",
-                                       state=((keys_, values), jnp.float32)))
+                                       state=((keys_, values), jnp.float32)), saturation=SATURATION)
 
     def derived(q, k, v, g, beta):
         values_ = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
         state, outputs = forms.init({}), []
         for index in range(tokens // chunk):
             part = {name: value[index * chunk:(index + 1) * chunk] for name, value in values_.items()}
-            outputs.append(forms.mapped(part, state))
-            state = forms.step(state, part)
+            prepared = forms.prepare(part)
+            outputs.append(forms.mapped(prepared, state))
+            state = forms.step(state, prepared)
         return jnp.concatenate(outputs)
 
     def tokenwise(q, k, v, g, beta):
