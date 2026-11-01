@@ -7,13 +7,13 @@ reference and 2.9e-02 from the reference's own bfloat16 forward (which sits
 2.3e-02 from its fp32), tolerance 1e-1 on each.
 """
 
+import copy
 import json
 from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file, save_file
 
@@ -137,6 +137,8 @@ def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors
     assert config_from_hf(saved) == config_from_hf(json.loads((FIXTURE / "config.json").read_text()))
 
 
+INTEROP_SEEDS = 8
+"""The declared rows of tokens of the bf16 checkpoint against the port's own bf16 forward (check 1)."""
 MAMBA2_130M = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
 MAMBA2_130M_HF = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
 
@@ -151,8 +153,8 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     Observed on CPU: fp32 4.7e-4 on logits of magnitude 170, every argmax
     equal; tolerance 1e-3, about twice that. In bfloat16 Dew hands the scan
     the conv's bf16 output, as the reference's own bfloat16 forward does, and
-    is held to that forward's RMS distance from the fp32 logits
-    (`assert_as_exact_as_the_reference`).
+    is held on par with that forward from the port in float64 over seeded rows
+    of tokens (check 1).
     """
     import torch
     import transformers
@@ -174,7 +176,17 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     assert fp32.revision == "ea6060f68a4289e9c06f80effa896629ba519216"
     assert largest(logits, reference) < 1e-3
     assert np.array_equal(logits.argmax(-1), reference.argmax(-1))
-    with torch.no_grad():
-        theirs = port.to(torch.bfloat16)(torch.from_numpy(ids.astype(np.int64))).logits.float().numpy()
-    mine = np.asarray(bf16.model.apply(bf16.variables, ids), np.float32)
-    assert_as_exact_as_the_reference(mine, theirs, reference, "bf16 logits against the fp32 port's")
+    ports = {dtype: copy.deepcopy(port).to(dtype) for dtype in (torch.bfloat16, torch.float64)}
+
+    def logits_of(dtype):
+        @torch.no_grad()
+        def run(ids):
+            return ports[dtype](torch.from_numpy(np.asarray(ids, np.int64))).logits.to(torch.float64).numpy()
+        return as_given(run)
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, tokenizer.vocab_size, (2, 13)).astype(np.int32),)
+
+    assert_as_exact(lambda ids: bf16.model.apply(bf16.variables, ids).astype(jnp.float32),
+                    logits_of(torch.bfloat16), draw, "bf16 logits against the port's in bfloat16",
+                    seeds=INTEROP_SEEDS, truth_fn=logits_of(torch.float64))
