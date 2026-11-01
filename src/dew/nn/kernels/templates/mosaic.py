@@ -1078,9 +1078,10 @@ class Issuer[Accumulator](abc.ABC):
         beside the part its thread decides: Mosaic GPU's layouts (`TiledLayout.thread_idxs`) divide each
         register's linear index by the row's length and take its remainder, which split the constant off
         only where the length is a power of two. Elsewhere each entry's index is formed apart, an int32 tile
-        each index a step reads (an A100's forward at 64 x 192, width 64: its key places 96 adds a thread,
-        its causal mask 192 subtractions and compares, its indices 48 16-bit divisions; 255 registers and
-        1056 bytes spilled, its lowered live set 417, where 64 x 128 folded them at 206)."""
+        each index a step reads (a causal forward at 64 x 192 on one consumer: its key places 96 adds a
+        thread and its mask 192 subtractions and compares, on an A100 and an H100 alike; width 64 on an
+        A100 255 registers and 1056 bytes spilled, its lowered live set 417, where 64 x 128 folded them at
+        206; width 128 on an H100 816 bytes spilled, its live set 367 against 175 at 64 x 128)."""
         return columns & (columns - 1) == 0
 
     @property
