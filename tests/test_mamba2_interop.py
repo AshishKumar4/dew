@@ -160,6 +160,7 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     """
     import torch
     import transformers
+
     from tools.torch_precision import float64, float64_twin
     tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF)
     prompts = ["The capital of France is Paris, and the capital of Germany is",
