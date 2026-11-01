@@ -1,5 +1,5 @@
 """A decision ablation workflow as a standing scenario (row 1890): a scaled-down real base read
-by its real tokenizer (`real_tokenizers.backbone_reading`, GPT-2's), a task of ninety-six options whose
+by its real tokenizer (`real_tokenizers.backbone_reading`, GPT-2's), a task of sixty-four options whose
 examples each ask two questions, trained through `dew train` in each cell of a pairwise covering set of
 the workflow's decision axes (the head and its layout, context through cross-attention, consistency
 groups) and run bounds (an examples budget, a share of one). Each cell holds the conservation contract
@@ -31,7 +31,7 @@ from dew.decision.data import Group
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.registry import ModelConfig
 
-INTENTS = tuple(f"intent_{index}" for index in range(96))
+INTENTS = tuple(f"intent_{index}" for index in range(64))
 """The task's options, named as BANKING77's and CLINC150's intents are."""
 
 ASKED = Choice("Which intent does the customer's message express?", list(INTENTS))
