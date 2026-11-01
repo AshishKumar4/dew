@@ -10,9 +10,11 @@ from an equation states its shape (`rules.shape`), which rules read before they 
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Mapping
 
 import jax
+import jax.numpy as jnp
 from egglog import Expr, StringLike, Vec, get_callable_args, get_literal_value, i64, i64Like, method
 from jax.core import ShapedArray
 from jax.extend import core as jcore
@@ -85,8 +87,9 @@ class Region:
     equations outside the language), those equations in program order (`opaque`), each output's term (None
     for a literal output, kept in `literal_outputs`), the parameters terms refer to by index (`params`: a
     primitive and its parameters), its literals as the program holds them, value and weak type
-    (`literals`), each term's shape as its equation states it (`shapes`) and the longest chain of the
-    language's equations (`depth`)."""
+    (`literals`), each term's shape as its equation states it (`shapes`), the longest chain of the
+    language's equations (`depth`), and the index of each primitive a rule may write afresh at its defaults
+    (`stock`, `stocked`)."""
 
     leaves: int
     opaque: list[Opaque]
@@ -97,6 +100,7 @@ class Region:
     shapes: list[tuple[Term, tuple[int, ...]]]
     depth: int
     equations: int
+    stock: Mapping[str, int]
 
     def roots(self) -> list[Term]:
         """The terms extraction chooses forms for: each output and each input of an equation outside the
@@ -185,8 +189,19 @@ def region(closed: jcore.Jaxpr) -> Region:
                               for atom in equation.invars], outputs))
     outputs = [None if isinstance(atom, jcore.Literal) else env[atom] for atom in jaxpr.outvars]
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
+    stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
-                  max(depths.values(), default=0), len(jaxpr.eqns))
+                  max(depths.values(), default=0), len(jaxpr.eqns), stock)
+
+
+@functools.cache
+def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
+    """The primitives a stable rule writes where the program held none (`rules.stock`), each at the
+    parameters JAX binds it with by default, read from JAX's own trace of them."""
+    scalar = jnp.ones((), jnp.float32)
+    traced = jax.make_jaxpr(lambda a: (a / a, a - a, jnp.exp(a), jnp.log1p(a), jnp.expm1(a)))(scalar)
+    return {equation.primitive.name: (equation.primitive, dict(equation.params))
+            for equation in traced.jaxpr.eqns}
 
 
 def spoken(equation: jcore.JaxprEqn) -> bool:

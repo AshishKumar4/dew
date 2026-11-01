@@ -17,6 +17,7 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 """
 
 import abc
+import contextvars
 import dataclasses
 import functools
 import math
@@ -40,16 +41,19 @@ Operand = Ref | jax.Array
 """A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
 
 
-def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0) -> plgpu.CompilerParams:
+def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0,
+                    resident: int = 1) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
     exp2 and FlashAttention's are). A block's warpgroups reduce at once, so each takes its own scratch: a
     consumer's planned reductions its share of the kernel's allocations (`Family.column_sums`), the
     implicit ones its arithmetic forms (a unit row a hook slices) an equal share of `reduction_scratch`
     bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
-    lower rather than share one."""
+    lower rather than share one. `resident`, the programs a multiprocessor holds at once, caps each thread's
+    registers so that many fit its register file (CUDA's `__launch_bounds__` minimum blocks, Mosaic GPU's
+    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=reduction_scratch)
+                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident)
 
 
 CLUSTER = "cluster"
@@ -121,14 +125,14 @@ def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
-           reduction_scratch: int = 0) -> Callable:
+           reduction_scratch: int = 0, resident: int = 1) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(dependent(entry, interpret), out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
-                         compiler_params=compiler_params(approx_math=approx_math,
+                         compiler_params=compiler_params(approx_math=approx_math, resident=resident,
                                                          reduction_scratch=reduction_scratch),
                          interpret=interpreted(interpret),
                          kernel_name=report.named(name), cost_estimate=cost, **clustered)
@@ -579,6 +583,30 @@ class Turn:
                         self.rotation if self.slot >= steps else self.rotation - 1)
         return Turn.of(self.counter - steps, stages)
 
+    def ahead(self, stages: int) -> "Turn":
+        """The turn after it, its slot constant where this one's is."""
+        if isinstance(self.slot, int):
+            wrapped = self.slot + 1 == stages
+            return Turn(self.counter + 1, 0 if wrapped else self.slot + 1,
+                        self.rotation + 1 if wrapped else self.rotation)
+        return Turn.of(self.counter + 1, stages)
+
+
+_COMMITTED = contextvars.ContextVar("committed", default=0)
+"""The product groups an asynchronous issuer has committed as a program traces (`committed`)."""
+
+
+def committed() -> None:
+    """One product group committed by an asynchronous issuer (a warpgroup MMA, which `Issuer.settled` waits
+    on by groups): counted as the program traces, so a walk knows a step's groups (`commits`)."""
+    _COMMITTED.set(_COMMITTED.get() + 1)
+
+
+def commits() -> int:
+    """The product groups committed so far in this trace (`committed`): a walk's completion tokens, the
+    difference across a step its groups."""
+    return _COMMITTED.get()
+
 
 def opaque(slot) -> jax.Array:
     """A ring's `slot` (a Python int where a walk unrolls its steps, traced otherwise) as a value the compiler
@@ -643,8 +671,9 @@ class Ring:
                                 collective_axes=self.multicast)
 
     def acquire(self, turn: Turn):
-        """A consumer's wait for `turn`'s load: its slot. Each load is waited for once by each consumer, as
-        every phase of a barrier is by each thread that waits on it."""
+        """A consumer's wait for `turn`'s load: its slot. Each load is waited for by each consumer, as every
+        phase of a barrier is by each thread that waits on it; a wait again for the same turn (a step that
+        read it ahead, `Slots.ahead`) returns at once, its slot not refilled until released."""
         slot = opaque(turn.slot)
         plgpu.barrier_wait(self.full.at[slot], parity=turn.parity)
         return self.smem.at[slot]
@@ -791,6 +820,14 @@ class Slots:
             self._held[name] = self._rings[name].acquire(self._turn)
         return self._held[name]
 
+    def ahead(self, name: str):
+        """Stream `name`'s slot of the next step, its load waited for here: a step that issues the next
+        step's product before its own algebra (FlashAttention 3's overlap within a warpgroup) reads it a step
+        early. The next step's own read of it returns at once, and it holds and releases it as its own;
+        nothing here releases it. A walk's last step has no next: its step reads none ahead."""
+        stages = self._rings[name].stages
+        return self._rings[name].acquire(self._turn.ahead(stages))
+
     def release(self, name: str) -> None:
         """Stream `name`'s slot given back now, its reads done (acquired first if the step read none)."""
         self[name]
@@ -891,6 +928,12 @@ class Issuer[Accumulator](abc.ABC):
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+
+    scalars_whole: bool = True
+    """Whether `held_registers` is a measured whole of a consumer thread's scalars, its addresses, indices
+    and a select's predicates among them, which a launch's own scalar terms do not add to (an A100's
+    attention dQ: 13 to 43 integers live at its peaks, places and addresses together, no predicate saved
+    to a register, within the 40)."""
 
     def scalar_registers(self, addressed=()) -> int:
         """The registers a consumer thread holds beside its tiles: its own scalars (`held_registers`), its
@@ -1691,7 +1734,12 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         def turned(step, lo, index, turn: Turn, carry, accumulators, *, before: int = 0):
             slots = Slots(streams, turn)
+            groups = commits()
             carry, accumulators = step(index, slots, carry, accumulators)
+            # The step's product groups (its completion tokens): a step `in_flight` back is done once no
+            # more than this step's groups times `in_flight` are pending, however many products a step
+            # issues (a walk's steps are one function each, their groups alike).
+            groups = commits() - groups
             if not in_flight:
                 # The step's products done before its slots are given back.
                 self.settled()
@@ -1701,7 +1749,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             # The step's products run on while the next steps' operands are waited for: the step
             # `in_flight` back, done now, gives back its slots.
             slots.held()
-            self.settled(in_flight)
+            self.settled(in_flight * groups)
             if before >= in_flight:
                 # The step `in_flight` back is the range's too: a rotation's, past its first steps.
                 given(turn.back(in_flight, stages), release=True)

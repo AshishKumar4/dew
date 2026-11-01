@@ -12,6 +12,7 @@ from reference_error import assert_as_exact
 
 from dew import algebra
 from dew.algebra import derive, forms, scan
+from dew.nn.kernels.templates import report
 
 ACCURACY = {"fast": False, "accurate": True}
 
@@ -51,3 +52,28 @@ def test_the_rewritten_delta_rules_adjoint_is_the_token_scans_gradient():
                                    state=((scans.KEY, scans.VALUE), jnp.float32))),
         accurate=False, saturation=algebra.SATURATION)
     scans.assert_delta_adjoint(derived, scans.gated_delta, scans.gated_draw, "gated delta rewritten", seeds=8)
+
+
+def scaled_by_a_power_of_two(q, k, v, rows, keys):
+    """Attention whose logits' scale is a power of two (64 wide, 1/8): a scale the engine may move onto
+    either operand of its contraction exactly."""
+    del rows, keys
+    s = (q @ k.T) * 0.125
+    m = jnp.max(s, axis=-1)
+    p = jnp.exp(s - m[:, None])
+    return (p @ v) / jnp.sum(p, axis=-1)[:, None]
+
+
+def test_the_engine_rewrites_a_derived_walk_and_it_computes_the_declared_function():
+    """A derived walk whose logits' scale is a power of two, its forms rewritten by the engine: a rule fires
+    on a derived form (the scale moved onto an operand of the contraction, `report.rewrites`), and the walk
+    still computes the whole-operand function, against the float64 truth (check 1)."""
+    derived = forms.rewritten(derive.derive(walks.declared(scaled_by_a_power_of_two)), accurate=False,
+                              saturation=algebra.SATURATION)
+    q, k, v = walks.draw(0)
+    with report.refusals():
+        jax.make_jaxpr(walks.walked_whole(derived))(q, k, v)
+        fired = [made.fired for made in report.rewrites()]
+    assert any(sum(counts.values()) > 0 for counts in fired), fired
+    assert_as_exact(jax.jit(walks.walked_whole(derived)), jax.jit(walks.whole(scaled_by_a_power_of_two)),
+                    walks.draw, "power-of-two scale rewritten", seeds=8)

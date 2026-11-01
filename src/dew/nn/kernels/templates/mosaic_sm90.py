@@ -52,6 +52,7 @@ class WgmmaIssuer(mosaic.Issuer):
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
     held_registers = 4
+    scalars_whole = False
     """A consumer thread's own state beside its tiles: its lane's coordinates in its fragment and the walk's
     counters where they diverge. Descriptors, barriers and TMA coordinates are warp-uniform and live in the
     uniform registers (ET-BATCH1's dK/dV SASS: HGMMA gdesc[UR16], SYNCS.PHASECHK [UR17], TMA [UR48], the
@@ -81,6 +82,7 @@ class WgmmaIssuer(mosaic.Issuer):
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
+            mosaic.committed()
             if then is not None:
                 then()
             return acc_ref[...]
@@ -93,6 +95,7 @@ class WgmmaIssuer(mosaic.Issuer):
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
     def products(self, acc, lhs, rhs, interpret: bool):
+        mosaic.committed()
         if interpret:
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
         plgpu.wgmma(acc, lhs, rhs)
@@ -101,6 +104,7 @@ class WgmmaIssuer(mosaic.Issuer):
     def register_products(self, acc, parts, rhs, interpret: bool):
         for formed in parts:
             part = mosaic.unscaled_part(formed)
+            mosaic.committed()
             if interpret:
                 acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
             else:

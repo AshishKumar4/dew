@@ -6,9 +6,10 @@ name: CI
 
 on:
   push:
-    # ci/** is where a branch goes for its own run before it lands; base/kernels, where the template lanes push
-    # straight, runs on each push, its reds fixed forward by the lane that pushed (owner, 2026-10-26).
-    branches: [ "main", "ci/**", "base/kernels" ]
+    # ci/** is where a branch goes for its own run before it lands. base/kernels runs on no push while it
+    # consolidates (owner, 2026-11-01): one run there by hand (workflow_dispatch) and one review once it is
+    # declared complete, then its per-push run returns.
+    branches: [ "main", "ci/**" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
