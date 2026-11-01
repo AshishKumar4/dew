@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A corpus whose objective makes rows of its examples counts the examples it kept as `data/rows` and those it
+  refused, an expansion's examples of no rows (`empty_expansion`) included, apart under `data/rejected`; a
+  refused example's count carried on to a kept row is no longer counted as kept.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
   mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
   outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.

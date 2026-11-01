@@ -9,6 +9,7 @@ Design record. Tests run real use cases through public interfaces. Kernel math i
 | Dense language-model pretraining | Build a decoder, train, save, resume, evaluate, export, reload and generate. |
 | Pretrained fine-tuning | Load a published decoder, train full weights or LoRA, then export and reload both forms. |
 | Structured prediction | Train and serve a decision task (dew.decision) |
+| Decision ablation workflow | Train a decision task of many options through `dew train` in each cell of a pairwise set over head (joint, question, letters), context, consistency and bound (an examples budget, a share of one), and hold each cell to the conservation contract (`tests/test_decision_workflow.py`). |
 | Diffusion training | Train an image or video model, checkpoint, resume, sample and export. |
 | Published diffusion pipelines | Load a text-to-image pipeline and sample with its processor, guidance and solver settings. |
 | Distributed training | Train dense FSDP and expert-sharded MoE models on real meshes. |
@@ -28,7 +29,8 @@ The whole flow, once: load or build the model → train several steps on real-sh
 - sharded equals unsharded (on the device mesh of scenario 6 and on CPU multi-device);
 - export then reload is identical;
 - loaded checkpoints match their reference (HF transformers, diffusers) within the float64 gate.
-- a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling).
+- a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling);
+- conservation: a bound in examples counts source examples, whatever rows a layout makes of each; every input example is trained once, held out, or reported under the reason it was refused, never two of these and never silently dropped (`data/rows` counts the examples kept, `data/rejected` the ones refused); and the saved task holds every axis the run sets.
 
 An exact cache's decode agrees with full forward under the numerical rule below. A cache explicitly defined as approximate is compared with the reference implementation's own decode under that same cache. Approximate and exact cache claims remain distinct.
 
@@ -43,7 +45,8 @@ Each scenario runs a small covering set over the settings axes, chosen pairwise,
 - memory: no remat, the planner's rung;
 - devices: 1, 2 (CPU multi-device), the GPU mesh;
 - quantization: none, QAT, PTQ (scenarios 2, 9, 10);
-- data read: memory, indexed, streamed.
+- data read: memory, indexed, streamed;
+- decision runs: head, context, consistency, and bound kind (examples, a share of them).
 
 Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.
 
