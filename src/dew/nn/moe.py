@@ -32,6 +32,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew.batch import leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 
@@ -479,8 +480,7 @@ def _layered(value) -> bool:
 
 def holds_experts(params: Mapping) -> bool:
     """Whether a banked run's `params` hold an `ExpertMLP`'s expert kernels (`experts_apart`)."""
-    return any(_expert_kernel(tuple(entry.key for entry in path))
-               for path, _ in jax.tree_util.tree_leaves_with_path(params))
+    return any(map(_expert_kernel, leaves_by_path(params)))
 
 
 def experts_apart(variables: Mapping[str, Mapping]) -> dict:
@@ -489,8 +489,7 @@ def experts_apart(variables: Mapping[str, Mapping]) -> dict:
     whole to every layer (`at_iteration`)."""
     params: dict = {}
     moved: dict = {}
-    for path, leaf in jax.tree_util.tree_leaves_with_path(variables.get('params', {})):
-        keys = tuple(entry.key for entry in path)
+    for keys, leaf in leaves_by_path(variables.get('params', {})).items():
         node = moved if _expert_kernel(keys) else params
         for key in keys[:-1]:
             node = node.setdefault(key, {})

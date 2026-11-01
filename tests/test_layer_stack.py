@@ -408,6 +408,13 @@ def decoded(model, variables, ids):
     return steps, paths(cache)
 
 
+def drawn_ids(stream: int, length: int):
+    """A check-1 draw of two rows of `length` token ids from `stream`, a seed's own."""
+    def draw(seed):
+        return (np.random.default_rng([stream, seed]).integers(0, VOCAB, (2, length)).astype(np.int32),)
+    return draw
+
+
 def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
     """Under `scan_layers` a decode step over resident weights scans a stack whose layers repeat one
     period as one body of the period's layers (`scan_groups(periodic=True)`): the step is one scan
@@ -433,8 +440,7 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
     variables = plain.init(jax.random.key(0), ids)
     assert decoded(deep, variables, ids)[1] == decoded(plain, variables, ids)[1]
 
-    def draw(seed):
-        return (np.random.default_rng([0x9E, seed]).integers(0, VOCAB, (2, 10)).astype(np.int32),)
+    draw = drawn_ids(0x9E, 10)
 
     def truth(ids):
         with jax.enable_x64(new_val=True):
@@ -480,8 +486,7 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
               if equation.primitive.name in ("dynamic_slice", "slice", "gather")}
     assert any(stacks <= whole for whole in handed) and not stacks & slices
 
-    def draw(seed):
-        return (np.random.default_rng([0x1342, seed]).integers(0, VOCAB, (2, 8)).astype(np.int32),)
+    draw = drawn_ids(0x1342, 8)
 
     def truth(ids):
         with jax.enable_x64(new_val=True):
