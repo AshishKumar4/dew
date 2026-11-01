@@ -50,7 +50,7 @@ from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Varia
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn import categorical
 from dew.nn.inspection import INSPECTED, Watched, watching
-from dew.nn.kernels.options import Held, Option, compiler_options
+from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from dew.inputs import InputSpec
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
+    from dew.rl.env import Env
     from dew.sampling.guidance import Guidance
     from dew.state import TrainState
 
@@ -1015,7 +1016,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         return tree
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
-                holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
+                donate_argnames: tuple[str, ...] = (),
+                holds: tuple[DeviceStep | AutoEncoder | Guidance | Env, ...] = (),
                 modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
@@ -1025,16 +1027,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         change a tiled head, and `substitute` may quantize it at the same shapes. Argument shapes
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
-        fixes. `holds` are the objects `function` runs beyond the modules, as the device steps a host
-        step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
-        reused only while they are the same objects, and one over others replaces it. `modules` are
-        the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
-        it as `holds` do, and its options cover them. `step` are the XLA options of the training step
-        the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
-        so a host step's programs compile as the resident step does. Keep only the current
-        specialization, not a history of old models or steps. The cache is the objective's, so its
-        programs live as long as it does: the process-wide seam every other outer program shares
-        (`dew.nn.kernels.options.program`) would keep each objective alive with them.
+        fixes. `donate_argnames` are the arguments the program donates, as `jax.jit`'s are: a rollout's
+        live state, written in place. `holds` are the objects `function` runs beyond the modules, as the
+        device steps a host step runs, a sample's guidance and autoencoder or a rollout's environment,
+        whose numbers it bakes in: the program is reused only while they are the same objects, and one
+        over others replaces it. `modules` are the networks it runs beside the objective's own, an
+        autoguide's or an autoencoder's: they key it as `holds` do, and its options cover them. `step` are
+        the XLA options of the training step the program is part of
+        (`dew.training.memory.step_compiler_options`), beside its modules' own, so a host step's programs
+        compile as the resident step does. Keep only the current specialization, not a history of old
+        models or steps. The cache is the objective's, so its programs live as long as it does: the
+        process-wide seam every other outer program shares (`dew.nn.kernels.options.program`) would keep
+        each objective alive with them.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -1052,10 +1056,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
                 now is not was for now, was in zip(kept, held[0], strict=True)):
-            from dew.nn.kernels.options import OuterProgram
-
             # A program jits a fresh callable, so JAX traces it afresh even for the same bound method.
-            held = (kept, OuterProgram(function, static_argnames=static_argnames, compiler_options=options))
+            held = (kept, owned_program(function, *self.towers(), *modules, step=step,
+                                        static_argnames=static_argnames, donate_argnames=donate_argnames))
             cached[1][key] = held
         return held[1]
 

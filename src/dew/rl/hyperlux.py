@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import Fetched, owned_program, program
 from dew.rl.flight import ASPECTS, GATES, OBSTACLES, Scene
 
 SUNK = (0.0, 0.0, -1000.0)
@@ -143,8 +143,8 @@ class HyperLuxRenderer:
             self.renderer.attach(drone, drone)
             placements += [self.renderer.spawn(drone, asset) for asset in layout]
         self._placements = self.renderer.placement_batch(placements)
-        self._placed = OuterProgram(jax.vmap(self._poses))
-        self._fisheyed = OuterProgram(fisheyed)
+        self._placed = Fetched(owned_program(jax.vmap(self._poses)))
+        self._fisheyed = Fetched(program(fisheyed))
 
     def _layout(self) -> list[int]:
         """Each placement's asset in a drone's overlay, in `_poses`' order."""

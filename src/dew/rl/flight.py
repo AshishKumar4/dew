@@ -52,14 +52,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from collections.abc import Iterator
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import Fetched, owned_program
 from dew.nn.precision import divided
 from dew.rl.env import TimeStep, chosen
 from dew.rl.quadrotor import GRAVITY, Body, Flight, Quadrotor, drawn_body, flown, hovering, rotation
@@ -876,6 +876,17 @@ class Viewed(Protocol):
     def flight(self) -> Flight: ...
 
 
+class _Programs(NamedTuple):
+    """A `Seen`'s programs over one environment, each fetched once and run every step with no dispatch key
+    built (`dew.nn.kernels.options.Fetched`): a batch of episodes' start, a step, the views the environment
+    shows and the scene a renderer draws, over the batch's states."""
+
+    started: Fetched
+    stepped: Fetched
+    observe: Fetched
+    scene: Fetched
+
+
 class Seen:
     """A batch of drones of a JAX environment `env` (stepped on device), seen through `renderer`'s cameras,
     as a `dew.rl.simulator.Simulator`: actions `[B, A]`; observations a dict of the `views` asked for, some
@@ -903,18 +914,31 @@ class Seen:
         self.count = renderer.count if renderer is not None else int(count or 0)
         self.action_size = env.action_size
         self._env = env
-        self._started = OuterProgram(lambda env, key: jax.vmap(env.reset)(jax.random.split(key, self.count)))
-        self._stepped = OuterProgram(lambda env, states, action: jax.vmap(env.step)(states, action))
         aspect = 1.0 if renderer is None else renderer.aspect
-        self._shown = OuterProgram(jax.vmap(lambda state, image, key: developed(image, state.camera, key)))
-        self._observe = OuterProgram(lambda env, states: jax.vmap(env.observed)(states))
-        self._scene = OuterProgram(lambda env, states: jax.vmap(env.scene)(states))
-        self._cameras = OuterProgram(jax.vmap(lambda state: (cameras(state, aspect),
-                                                        cameras(state, aspect, state.camera.shutter))))
+        self._shown = Fetched(owned_program(jax.vmap(lambda state, image, key: developed(image, state.camera,
+                                                                                         key))))
+        self._cameras = Fetched(owned_program(jax.vmap(lambda state: (cameras(state, aspect),
+                                                                      cameras(state, aspect,
+                                                                              state.camera.shutter)))))
+        self._over: tuple[object, _Programs] | None = None
 
     def _env_now(self):
         """The environment the next episodes and steps run in."""
         return self._env
+
+    def _programs(self) -> _Programs:
+        """The programs over the environment it runs in now (`_env_now`), made again where a curriculum
+        changes the environment: its static fields are part of what they compile, and the programs of the
+        environment it left go with it."""
+        env = self._env_now()
+        if self._over is None or self._over[0] != env:
+            count = self.count
+            self._over = (env, _Programs(
+                started=Fetched(owned_program(lambda key: jax.vmap(env.reset)(jax.random.split(key, count)))),
+                stepped=Fetched(owned_program(lambda states, action: jax.vmap(env.step)(states, action))),
+                observe=Fetched(owned_program(jax.vmap(env.observed))),
+                scene=Fetched(owned_program(jax.vmap(env.scene)))))
+        return self._over[1]
 
     def _observed(self, observation: dict[str, jax.Array]) -> dict[str, jax.Array]:
         shown = dict(observation)
@@ -923,25 +947,26 @@ class Seen:
             if renderer is None:
                 raise ValueError("a race without a renderer shows no image")
             closed, opened = self._cameras(self._states)
-            image = received(renderer.render(self._scene(self._env_now(), self._states), closed, opened))
+            image = received(renderer.render(self._programs().scene(self._states), closed, opened))
             self._key, key = jax.random.split(self._key)
             shown["image"] = self._shown(self._states, image, jax.random.split(key, self.count))
         return {view: shown[view] for view in self.views}
 
     def reset(self, seed: int) -> dict[str, jax.Array]:
         self._key, key = jax.random.split(jax.random.key(seed))
-        self._states, step = self._started(self._env_now(), key)
+        self._states, step = self._programs().started(key)
         return self._observed(step.observation)
 
     def restart(self, mask: jax.Array) -> dict[str, jax.Array]:
         mask = jnp.asarray(mask, bool)
         self._key, key = jax.random.split(self._key)
-        fresh, _ = self._started(self._env_now(), key)
+        programs = self._programs()
+        fresh, _ = programs.started(key)
         self._states = chosen(mask, fresh, self._states)
-        return self._observed(self._observe(self._env_now(), self._states))
+        return self._observed(programs.observe(self._states))
 
     def step(self, action: jax.Array) -> TimeStep:
-        self._states, step = self._stepped(self._env_now(), self._states, jnp.asarray(action))
+        self._states, step = self._programs().stepped(self._states, jnp.asarray(action))
         return TimeStep(self._observed(step.observation), step.reward, step.terminated, step.truncated)
 
     @contextlib.contextmanager

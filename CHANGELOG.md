@@ -7,6 +7,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Every RL program compiles through Dew's compile point with the options its models and the run hold open
+  (`compiled_with`, a quantized model's int8 GEMM option): a Dreamer or control rollout over an environment is
+  its objective's program (`Objective.program`, which now takes `donate_argnames` and holds the environment it
+  runs), so it is built again when the objective's model is replaced, and a gate race's, a renderer's and a
+  simulator's programs take them too; `simulator_rollout` takes the `models` its policy runs. Their per-step
+  host loops (a simulator's policy step, a race's step, views and scene, a renderer's poses, a server's row
+  state moves) run the executable they fetched once (`dew.nn.kernels.options.Fetched`), building no dispatch
+  key a step; a race keeps its programs for the curriculum it is at and makes them again where it changes.
+  Source that builds an `OuterProgram` outside `dew.nn.kernels.options` is reported (SLOP025).
 - `Residuals` no longer takes `damping`: it states its Gauss-Newton system where the run's optimizer asks
   (`Step.equations`), and Gauss-Newton is an optimizer, `dew.gauss_newton.gauss_newton(learning_rate,
   damping)` or `OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": ...})`. A config that

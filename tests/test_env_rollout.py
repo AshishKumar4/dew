@@ -387,6 +387,19 @@ def test_a_simulator_outside_jax_rolls_out_as_its_env_does(policy, steps):
     assert np.asarray(simulated.following.done).any()
 
 
+def test_a_simulators_policy_step_compiles_under_the_options_the_run_holds_open():
+    """A simulator's policy step compiles through Dew's compile point, so under an option the run holds
+    open (`compiled_with`, the accuracy gate's seam) that XLA does not know it is refused, as any program
+    of Dew's is (row 3408: the step was a bare outer program, which took no option)."""
+    from dew.nn.kernels.options import compiled_with
+    from dew.rl.simulator import simulator_rollout, simulator_start
+
+    simulator = ShardedWalks(5, 3)
+    carry = simulator_start(simulator, jax.random.key(4))
+    with compiled_with({"xla_dew_no_such_option": True}), pytest.raises(jax.errors.JaxRuntimeError):
+        simulator_rollout(simulator, pushes, {}, carry, 3)
+
+
 def test_a_driven_simulator_records_what_a_driven_env_records():
     """A simulator driven for a world-model learner (`DrivenSimulator`), each ended episode answered as a
     step of its own and restarted a step later, records what `Driven` records of the same walks as a JAX
