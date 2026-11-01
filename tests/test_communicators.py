@@ -202,7 +202,8 @@ summed = jax.shard_map(lambda part: jax.lax.psum(part, "pair"), mesh=mesh, in_sp
                        out_specs=PartitionSpec())
 ids = [communicators.ordinal(device) for device in mesh.devices.flat]
 options.program(summed).compiled(jnp.ones(4))
-tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, connections={}, runtime=dict.fromkeys(ids, 0), seconds=1.0)
+tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, connections={}, runtime=dict.fromkeys(ids, 0),
+              seconds=1.0)
 communicators.hold(Sizing(tight, 0.95, 0.9, dict.fromkeys(ids, 2**30), dict.fromkeys(ids, 2**29)))
 try:
     options.program(summed).compiled(jnp.ones(4))
