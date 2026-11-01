@@ -278,8 +278,11 @@ def _memory_stages(
                 packed = _PackedRows(documents, plan)
                 counter.rejected.update(["zero_targets"] * plan.at("totals", 1))
                 # The plan counts every target a window holds; windows of documents counted by a
-                # rule are counted by it (`_targeted`), as an indexed or streamed read's are.
-                rows, targets = _targeted([((plan.at("accepted", index),), packed[index])
+                # rule are counted by it (`_targeted`), as an indexed or streamed read's are. A window the
+                # plan leaves out passes the examples its documents end to the next it keeps (`_owed`).
+                owed = _owed(planned, documents) if marked else None
+                rows, targets = _targeted([((plan.at("accepted", index),), packed[index] if owed is None
+                                            else _credited(packed[index], owed[index]))
                                            for index in range(len(packed))], counter, stage.fields[0], rule)
             else:
                 # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
@@ -346,6 +349,42 @@ def _limited(pipeline: Pipeline, at: int, rows: list[tuple[tuple[int, ...], Reco
     turns = -(-count // len(held)) if held else 0
     passes = [((*identifier, turn), value) for turn in range(turns) for identifier, value in held]
     return passes[:count], pipeline
+
+
+def _owed(planned: Mapping[str, np.ndarray], documents: Sequence[Record]) -> list[dict[str, int]]:
+    """For each window a first-fit plan keeps (`accepted`), the counts of the examples ended by the
+    documents of the windows it leaves out before it (`order`, `starts`), the last kept also taking those
+    of the windows it leaves out after every kept one, so the kept windows consume every example. A window
+    holds pieces (`order`), each a slice of one document (`documents`, `offsets`, `sizes`), whose counts
+    stand at its document's last token (`_ConsumedAt`)."""
+    kept = [int(window) for window in planned["accepted"]]
+    starts, order = planned["starts"], planned["order"]
+    pieces, offsets, sizes = planned["documents"], planned["offsets"], planned["sizes"]
+    owed, pending, at = [], dict.fromkeys(ACCOUNTS, 0), 0
+    for window in range(len(starts) - 1):
+        if at < len(kept) and window == kept[at]:
+            owed.append(pending)
+            pending, at = dict.fromkeys(ACCOUNTS, 0), at + 1
+            continue
+        for piece in order[int(starts[window]):int(starts[window + 1])]:
+            document, offset = documents[int(pieces[piece])], int(offsets[piece])
+            for name in ACCOUNTS:
+                pending[name] += int(np.sum(np.asarray(document[name])[offset:offset + int(sizes[piece])]))
+    if owed:
+        owed[-1] = {name: owed[-1][name] + pending[name] for name in ACCOUNTS}
+    return owed
+
+
+def _credited(window: Record, owed: Mapping[str, int]) -> Record:
+    """`window` holding `owed` more of each count at its last token (`_owed`)."""
+    if not any(owed.values()):
+        return window
+    credited = dict(window)
+    for name in ACCOUNTS:
+        held = np.array(window[name], copy=True)
+        held[-1] += owed[name]
+        credited[name] = held
+    return credited
 
 
 def _documents(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], *, marked: bool,

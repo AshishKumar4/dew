@@ -420,14 +420,18 @@ def _native_after_bound(pipeline: Pipeline) -> bool:
 
 
 def _shuffles_windows(pipeline: Pipeline) -> bool:
-    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples) and
-    shuffles in a window after a stage that packs or windows its rows."""
-    stages = pipeline.stages
+    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples),
+    among its stages or those a memory read ran as it held them (`_written`), and shuffles the rows after a
+    stage that lays an example across windows: a concatenating pack, which cuts documents where its windows
+    end, or windows over a stream of them. A first-fit or best-fit pack places each whole in one window,
+    which holds its count however the windows are drawn."""
+    stages = _written(pipeline.source, pipeline.stages)
     if examples_bound(stages) is None:
         return False
-    packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
-    return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
-                                      for stage in stages[packed:])
+    laid = next((index for index, stage in enumerate(stages)
+                 if isinstance(stage, Windows) or (isinstance(stage, Pack) and stage.policy == "concat")),
+                None)
+    return laid is not None and any(isinstance(stage, Shuffle) for stage in stages[laid:])
 
 
 def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
@@ -889,8 +893,10 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     None for any other read, whose pass is counted once it is prepared (`_staged`)."""
     if read != "memory" or isinstance(train.source, (Mixture, Phases)):
         return None
+    # A configured step binds to one the read runs as it holds its rows unless it draws (a random map).
     eager = next((index for index, stage in enumerate(train.stages)
-                  if not isinstance(stage, (*_EAGER, Configured))), len(train.stages))
+                  if not (isinstance(stage, _EAGER) or (isinstance(stage, Configured) and not stage.random))),
+                 len(train.stages))
     batched = _until(train.stages, (BatchStage, TokenBudget))
     at = next((index for index, stage in enumerate(train.stages[:batched])
                if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
@@ -1007,9 +1013,11 @@ def _compiled(
     if order_records is None and _shuffles_windows(train):
         # A run no plan counts ahead reads its progress off the windows that end its examples
         # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.
-        raise ValueError(f"{_name(train)} shuffles the windows it packs, which a run bounded in examples "
-                         "and read in its own order reads in the order they end their examples; shuffle "
-                         "the records before the pack, or read it in a global order")
+        raise ValueError(f"{_name(train)} shuffles the windows a concatenating pack or windows lay its "
+                         "examples across, which a run bounded in examples and read in its own order reads "
+                         "in the order they end their examples; shuffle the records before the layout, "
+                         "pack them first-fit or best-fit, which keeps each whole, or read it in a global "
+                         "order")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,

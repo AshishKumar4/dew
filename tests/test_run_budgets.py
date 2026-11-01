@@ -222,6 +222,56 @@ def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(e
                                           for index in range(1, 10) if reads[index]})
 
 
+def _jittered(metadata):
+    """A random step configured for the run, which binds to a random map (`RandomMap`)."""
+    class Jittered(grain.RandomMapTransform):
+        def random_map(self, element, rng):
+            return element
+
+    return Jittered()
+
+
+def _consumed_of(loader) -> int:
+    """The examples a read of `loader`'s training stream consumes, read to its end."""
+    stream = loader.train(DataPartition())
+    consumed = 0
+    try:
+        for batch in stream:
+            consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    return consumed
+
+
+def test_held_layout_bounds_take_every_example_whatever_steps_or_windows_stand_around_them():
+    """Bounds in examples over memory reads that pack: a configured random step before the pack, which no
+    memory read holds, so the bound streams before it (row 1902's review); a first-fit plan that leaves a
+    window out (two documents of one and two tokens, a window of a single segment, so the singleton's
+    window holds no target), which passes its document's count to the next window it keeps; and a
+    first-fit pack whose windows a shuffle draws in any order, each document whole in one window, while
+    a concatenating pack's windows, which cut documents, are refused a shuffle on the examples clock."""
+    from dew.data.pipeline import Configured
+
+    documents = [{"id": np.full(index % 3 + 2, index + 1, np.int32)} for index in range(10)]
+    configured = Configured(_jittered, needs=(), scope="run", random=True, one_to_one=True)
+    chain = (Pipeline(Memory(documents)).map(configured).pack(8, fields=("id",)).shuffle(seed=1, window=4)
+             .read("memory").batch(2))
+    assert _consumed_of(compile(chain, read="memory", examples=7,
+                                objective=ObjectiveData(train=(Twice(),)))) == 7
+    lone = [{"id": np.asarray([5], np.int32)}, {"id": np.asarray([6, 7], np.int32)}]
+    single = (Pipeline(Memory(lone)).pack(2, fields=("id",), segments=1).shuffle(seed=1).read("memory")
+              .batch(1))
+    assert _consumed_of(compile(single, read="memory", examples=2)) == 2
+    whole = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    twice = ObjectiveData(train=(Twice(),))
+    assert _consumed_of(compile(whole, read="memory", examples=10, objective=twice)) == 10
+    cut = (Pipeline(Memory(documents)).pack(8, fields=("id",), policy="concat").shuffle(seed=1).read("memory")
+           .batch(2))
+    with pytest.raises(ValueError):
+        compile(cut, read="memory", examples=10, objective=ObjectiveData(train=(Twice(),)))
+
+
 @pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
 @pytest.mark.parametrize("kind", ["memory", "parquet"])
 @pytest.mark.parametrize("examples", [15, 7, 20])
