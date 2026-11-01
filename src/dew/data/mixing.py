@@ -30,8 +30,7 @@ class CorpusCounts:
     """What one corpus's read counted, under its identity (`name`, which plans and saved positions
     key it by) and the short name its metrics go by (`label`). `accepted` counts the rows it
     delivered and `truncated` those of them cut short, its source examples where an objective makes
-    several rows of each (`examples`), counted as its step expands each (`FlatMap.examples`,
-    `dew.data.lowering._expanded`); `cut_examples`, `cut_rows` and
+    several rows of each, counted before it does (`FlatMap.examples`); `cut_examples`, `cut_rows` and
     `cut_removed` count, by what each cut (a decision row's instructions, options, state, or a context it
     did not read), the delivered rows a cut shortened, the rows it shortened of them, and the tokens it
     removed (characters, for a kind that names them: `state_characters`), as the delivered rows report
@@ -63,10 +62,6 @@ class CorpusCounts:
     """The tokens the cuts of the members delivered rows left out removed, by what each cut
     (`_dew_left_out_cut`), counted with them."""
     declined: Counter[str] = dataclasses.field(default_factory=Counter)
-    examples: bool = False
-    """Whether these counts are of the corpus's source examples, counted where an objective's step makes rows
-    of them: they then stand for the corpus's delivered rows, whatever counters after them count the rows
-    or windows its steps make (`_nested`)."""
 
     def delivered(self, element: Batch | bytes) -> None:
         """Count one row the corpus delivered: accepted, cut short where it says it was
@@ -145,7 +140,6 @@ class CorpusCounts:
             "rejected_cut": dict(self.rejected_cut),
             "left_out_cut": dict(self.left_out_cut),
             "declined": dict(self.declined),
-            "examples": self.examples,
         }
 
     def restore(self, state: Mapping[str, object]) -> None:
@@ -162,8 +156,6 @@ class CorpusCounts:
                      "declined"):
             setattr(self, name, Counter({kind: integer(value, kind)
                                          for kind, value in record(state.get(name, {}), name).items()}))
-        # A position saved before examples were counted apart holds rows' counts.
-        self.examples = boolean(state.get("examples", False), "examples")
 
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
@@ -265,20 +257,15 @@ class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
 
 
 class Chunked(pygrain.IterDataset[Record]):
-    """An expansion counted at its fan-out, with counters in the iterator position: a chunk expansion's
-    documents and chunks, or, with `examples`, each source example an objective's step makes rows of
-    (`CorpusCounts.examples`). Counted as each is expanded, a position saved after its last row holds it;
-    a counter before the flat map would not, as Grain's flat map keeps its parent's position before the
-    element it expands."""
+    """A chunk expansion counted at its fan-out, with counters in the iterator position."""
 
     def __init__(self, parent: pygrain.IterDataset[Record], name: str, label: str,
-                 expand: Callable[[CorpusCounts], gx.FlatMapTransform], *, examples: bool = False):
+                 expand: Callable[[CorpusCounts], gx.FlatMapTransform]):
         super().__init__(parent)
         self._records, self._name, self._label, self._expand = parent, name, label, expand
-        self._examples = examples
 
     def __iter__(self) -> pygrain.DatasetIterator[Record]:
-        counts = CorpusCounts(self._name, self._label, examples=self._examples)
+        counts = CorpusCounts(self._name, self._label)
         return _CountedIterator(iter(gx.FlatMapIterDataset(self._records, self._expand(counts))), counts)
 
 
@@ -830,8 +817,7 @@ def data_metrics(counts: Iterable[CorpusCounts]) -> dict[str, float]:
 
 def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts]) -> None:
     """Fold the counters of a corpus's inner stages into its outer ones', in one iterator: the
-    outermost delivered the rows and counted those cut short, unless an inner one counts the corpus's
-    source examples (`CorpusCounts.examples`), whose delivered counts then stand for the corpus's."""
+    outermost delivered the rows and counted those cut short."""
     for corpus, counts in inner.items():
         if corpus not in counted:
             counted[corpus] = counts
@@ -843,11 +829,6 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
         # Members a row left out travel with the row, as its cuts do: the outermost counts them.
         combined.rejected.update(counts.rejected)
         combined.rejected_cut.update(counts.rejected_cut)
-        if counts.examples and not combined.examples:
-            combined.examples = True
-            combined.accepted, combined.truncated = counts.accepted, counts.truncated
-            for name in ("cut_examples", "cut_rows", "cut_removed", "left_out", "left_out_cut", "declined"):
-                setattr(combined, name, Counter(getattr(counts, name)))
 
 
 def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
@@ -855,7 +836,6 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     if counts.name not in counted:
         counted[counts.name] = CorpusCounts(counts.name, counts.label)
     combined = counted[counts.name]
-    combined.examples = combined.examples or counts.examples
     combined.attempted += counts.attempted
     combined.accepted += counts.accepted
     combined.truncated += counts.truncated

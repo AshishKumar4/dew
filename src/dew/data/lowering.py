@@ -266,9 +266,7 @@ def _outputs(
     targets counted on the row as `recounted` keeps them. A marker passes
     through and a missing row is rejected. `position` is the row's source
     position, as `Pipeline.map_with_index` defines it. When `counts` is given,
-    a chunk expansion counts its document and fan-out as it runs, and, where
-    `counts` are of the corpus's source examples, an objective's step counts
-    each it expands (`FlatMap.examples`).
+    a chunk expansion counts its document and fan-out as it runs.
     """
     if isinstance(value, Rejected):
         return (value,)
@@ -282,8 +280,6 @@ def _outputs(
         outputs = tuple(outputs)
         if counts is not None and isinstance(stage.step, Chunks):
             counts.expanded(outputs)
-        if counts is not None and counts.examples and stage.examples:
-            counts.delivered(element)
         if not outputs:
             return (Rejected("empty_expansion"),)
         return tuple(_counted(element, output) for output in outputs)
@@ -511,13 +507,11 @@ class _Rows(gx.FlatMapTransform):
 
 def _expanded(rows: pygrain.IterDataset, stages: tuple[RecordStage, ...], name: str, label: str, *,
               unplaced: bool = False) -> pygrain.IterDataset:
-    """`rows` through a run of record stages that expands them, one Grain flat map; a chunk expansion's,
-    and an objective's that makes rows of the corpus's source examples (`FlatMap.examples`), counted at its
-    fan-out (`Chunked`), the latter as the corpus's examples."""
+    """`rows` through a run of record stages that expands them, one Grain flat map; a chunk
+    expansion's counted at its fan-out (`Chunked`)."""
     expand = functools.partial(_Rows, stages, unplaced=unplaced)
-    examples = any(isinstance(stage, FlatMap) and stage.examples for stage in stages)
-    if examples or any(isinstance(stage, FlatMap) and isinstance(stage.step, Chunks) for stage in stages):
-        return Chunked(rows, name, label, expand, examples=examples)
+    if any(isinstance(stage, FlatMap) and isinstance(stage.step, Chunks) for stage in stages):
+        return Chunked(rows, name, label, expand)
     return gx.FlatMapIterDataset(rows, expand())
 
 
@@ -1758,8 +1752,9 @@ class _Build:
             if isinstance(stage, Workers) and pool is not None:
                 continue
             if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
-                # The corpus's counts are of its source examples: they are taken where an objective's step
-                # makes rows of them (`FlatMap.examples`, at its fan-out, `_expanded`), and not again after.
+                # The corpus's counts are of its source examples: they are taken before an objective's
+                # step makes rows of them (`FlatMap.examples`), and not again after.
+                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
                 counting = False
             if isinstance(stage, _RECORD):
                 # The record steps from here run as one operator (`_run`), up to where the workers
