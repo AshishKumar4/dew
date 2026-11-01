@@ -14,6 +14,7 @@ from jax.sharding import Mesh
 
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.data.dataset import rows_of
+from dew.nn.inputs import local_rows
 from dew.objectives.base import Metric, Shown
 
 if TYPE_CHECKING:
@@ -82,7 +83,6 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
         return run.closing(interval, batch, examples) if closes else (batch, None)
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-    batch = _hosted(batch)
     consumed = _Consumed(batch)
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
@@ -106,35 +106,10 @@ def _unclocked(batch: Batch) -> Batch:
     return {name: value for name, value in batch.items() if name not in CLOCK}
 
 
-def _hosted(batch: Batch) -> Batch:
-    """`batch` as a rollout, host code, reads it: a column a pool's read placed over its processes
-    (`dew.training._fit.pooled_read`) as this process's rows of it, in order (`_held`), which the
-    rollout's batch is placed from again (`shard_batch`); a column one process holds whole as it is."""
-    return {name: _held(value) if isinstance(value, jax.Array) and not value.is_fully_addressable else value
-            for name, value in batch.items()}
-
-
-def _held(column) -> np.ndarray:
-    """This process's block of a `column`: a placed column's shards it holds, each part once, laid where
-    they stand in it (its rows, and a sequence its devices split), or a host column whole."""
-    if not isinstance(column, jax.Array):
-        return np.asarray(column)
-    shards = {tuple(index.indices(size)[:2] for index, size in zip(shard.index, column.shape, strict=True)):
-              shard.data
-              for shard in column.addressable_shards}
-    lows = [min(bounds[axis][0] for bounds in shards) for axis in range(column.ndim)]
-    highs = [max(bounds[axis][1] for bounds in shards) for axis in range(column.ndim)]
-    held = np.empty([high - low for low, high in zip(lows, highs, strict=True)], column.dtype)
-    for bounds, part in shards.items():
-        at = tuple(slice(start - low, stop - low) for (start, stop), low in zip(bounds, lows, strict=True))
-        held[at] = np.asarray(part)
-    return held
-
-
 class _Consumed:
     """The examples the batches a rollout reads consume, added as each arrives, none of them kept: this
-    process's rows' (`_held`, `EXAMPLES_CONSUMED`) and their counts (`ConsumedCount`); a run on another
-    clock's batches carry none."""
+    process's rows' (`local_rows`, `EXAMPLES_CONSUMED`) and their counts (`ConsumedCount`); a run on
+    another clock's batches carry none."""
 
     def __init__(self, first: Batch):
         self.clocked, self.rows, self.count = CONSUMED_COUNT in first, 0, 0
@@ -142,7 +117,7 @@ class _Consumed:
 
     def add(self, batch: Batch) -> None:
         if self.clocked:
-            self.rows += int(np.sum(_held(batch[EXAMPLES_CONSUMED])))
+            self.rows += int(np.sum(local_rows(batch[EXAMPLES_CONSUMED])))
             self.count += batch[CONSUMED_COUNT].examples
 
     def reading(self, read: Callable[[], Batch | None]) -> Callable[[], Batch | None]:
@@ -151,7 +126,6 @@ class _Consumed:
             batch = read()
             if batch is None:
                 return None
-            batch = _hosted(batch)
             self.add(batch)
             return _unclocked(batch)
         return drawn
@@ -173,7 +147,7 @@ def clocked_rollout(made: Batch, read: Batch, consumed: _Consumed) -> Batch:
     clocked = {**made, EXAMPLES_CONSUMED: held, CONSUMED_COUNT: ConsumedCount(consumed.count)}
     if CLOSES_WINDOW in read:
         clocked[CLOSES_WINDOW] = read[CLOSES_WINDOW]
-    if VALID_ROWS in read and not np.any(_held(read[VALID_ROWS])):
+    if VALID_ROWS in read and not np.any(local_rows(read[VALID_ROWS])):
         clocked[VALID_ROWS] = np.zeros(len(held), bool)
     return clocked
 

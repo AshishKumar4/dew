@@ -44,6 +44,7 @@ def examples_clock(args) -> dict:
     from dew.data.compile import fitted
     from dew.data.dataset import Closeable, DataPartition
     from dew.data.pipeline import ObjectiveData, Pipeline, Rejected
+    from dew.nn.inputs import local_rows
     from dew.objectives.base import Aux, Objective
     from dew.optim import Linear, OptimConfig
     from dew.training import Checkpoints, Cooldowns, MeshSpec, Pause, Trainer
@@ -77,11 +78,14 @@ def examples_clock(args) -> dict:
             return Rejected("fifth") if int(row["id"]) % 5 == 0 else row
 
     class DrawingFurther:
+        """Draws a batch past its step's, and makes the step's of this process's rows of its batch, as a
+        rollout's host code reads a placed batch (`local_rows`)."""
+
         draws_further = True
 
         def __call__(self, state, batch, key, further):
             further()
-            return batch
+            return {name: local_rows(column) for name, column in batch.items()}
 
     class Logged:
         def __init__(self):
