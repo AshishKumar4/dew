@@ -3,6 +3,10 @@ the resident training step jit their function rewritten, under the switch the ga
 the bodies of nested programs, scans, loops, conditionals and checkpoints are rewritten in place; products
 (`dot_general`) are terms the rules read; and each rewrite is recorded in the one kernel report."""
 
+import os
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -138,3 +142,34 @@ def test_a_program_the_rules_cannot_rewrite_is_kept_as_traced():
     [scan] = [equation for equation in after.jaxpr.eqns if equation.primitive.name == "scan"]
     [traced] = [equation for equation in before.jaxpr.eqns if equation.primitive.name == "scan"]
     assert str(scan.params["jaxpr"]) == str(traced.params["jaxpr"])
+
+PINNED = """
+import gc, weakref
+import dew
+
+
+def first_compile():
+    class Held:
+        pass
+
+    held = Held()
+    from dew.nn.kernels import options
+
+    options.program(lambda x: x + 1.0)(1.0)
+    return weakref.ref(held)
+
+
+reference = first_compile()
+gc.collect()
+print(reference() is None)
+"""
+"""A fresh process whose first program, compiled inside a call, imports the pass's e-graph library there."""
+
+
+def test_a_calls_locals_go_when_its_first_program_imports_the_pass():
+    """A call that compiles a process's first program, importing the pass and its e-graph library (egglog,
+    whose declarations hold the frame that first imports it), keeps none of its locals once it returns:
+    `import dew` imports the library on its own shallow frame first."""
+    done = subprocess.run([sys.executable, "-c", PINNED], capture_output=True, text=True, check=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert done.stdout.strip().splitlines()[-1] == "True"
