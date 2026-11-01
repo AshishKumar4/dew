@@ -38,6 +38,7 @@ from dew.nn.kernels.generation import _compute_capability
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
+    CALLS,
     VIEWS,
     Slicing,
     bodies,
@@ -211,14 +212,15 @@ def consumed_where_made(optimizer: optax.GradientTransformation | None, state: T
     holds none beside another (`gradient_peak`'s `consumed`): with the state it commits (`COMMIT_FIELDS`,
     the optimizer's and the EMA) in device memory, a window of several microbatches sums each into its
     accumulator's gradient leaf in device memory, and a window of one updates each by `optimizer`, where
-    its update reads each gradient into its own leaf's results alone (`leaf_local`). A committed state
-    fetched from the host is fetched behind one barrier over every gradient (`Transaction.past`), a window
+    its update reads each gradient into its own leaf's results alone (`leaf_local`). A dynamically scaled
+    loss commits only once every gradient is known finite, a committed state fetched from the host is
+    fetched behind one barrier over every gradient (`Transaction.past`), a window
     that replays its microbatches keeps their gradients for the replay, and an update that reads them
     together (clipping by the global norm) holds them all until it has read the last."""
     def in_device(tree) -> bool:
         return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
 
-    if not in_device((state.opt_state, state.ema)):
+    if state.scale is not None or not in_device((state.opt_state, state.ema)):
         return False
     if window > 1:
         accumulated = None if state.accumulation is None else state.accumulation.gradient
@@ -241,13 +243,25 @@ def leaf_local(optimizer: optax.GradientTransformation, gradients, state) -> boo
 
     program = jax.make_jaxpr(update)(gradients, state, gradients, jax.ShapeDtypeStruct((), np.float32)).jaxpr
     leaves = len(jax.tree.leaves(gradients))
-    reads: dict[jcore.Var, frozenset[int]] = {
-        value: frozenset([index]) for index, value in enumerate(program.invars[:leaves])}
+    read = [frozenset([index]) if index < leaves else frozenset() for index in range(len(program.invars))]
+    return all(len(leaves_read) <= 1 for leaves_read in gradients_read(program, read))
+
+
+def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:
+    """Which gradient leaves each result of `program` reads, its operands reading `read`: a call's
+    (`CALLS`, an optax tree helper's `jit` among them) through its program, any other equation each of its
+    results all its operands read."""
+    reads = dict(zip(program.invars, read, strict=True))
     for equation in program.eqns:
-        read = frozenset().union(*(reads.get(value, frozenset())
-                                   for value in equation.invars if computed(value)))
-        reads.update(dict.fromkeys(equation.outvars, read))
-    return all(len(reads.get(value, frozenset())) <= 1 for value in program.outvars if computed(value))
+        operands = [reads.get(value, frozenset()) if computed(value) else frozenset()
+                    for value in equation.invars]
+        called = bodies(equation)
+        if equation.primitive.name in CALLS and len(called) == 1 and (
+                len(called[0].invars), len(called[0].outvars)) == (len(operands), len(equation.outvars)):
+            reads.update(zip(equation.outvars, gradients_read(called[0], operands), strict=True))
+        else:
+            reads.update(dict.fromkeys(equation.outvars, frozenset().union(*operands)))
+    return [reads.get(value, frozenset()) if computed(value) else frozenset() for value in program.outvars]
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
