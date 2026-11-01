@@ -990,7 +990,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4)
             and mainloop_backward.backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
-                shared=generation.shared_budget(template.Mosaic.launched()), starts=starts,
+                target=template.Mosaic.launched(), starts=starts,
                 max_segments=max_segments, delta=delta, floor=floor, rounded=rounded, ranged=run["ranged"]))
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no

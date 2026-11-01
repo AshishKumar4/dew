@@ -112,20 +112,22 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
 
 
-def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, shared: int,
-                   starts=None, max_segments: int | None = None, delta: bool = True,
-                   floor: float | None = None, rounded: bool = False, ranged: bool = False) -> bool:
+def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family,
+                   target: generation.GpuTarget, starts=None, max_segments: int | None = None,
+                   delta: bool = True, floor: float | None = None, rounded: bool = False,
+                   ranged: bool = False) -> bool:
     """Whether the fast backward's launches (`gradients`'s, past the forward's) hold on `family`'s bundle at
-    `tiles` within a block of `shared` bytes (`holds`); where they do not, the rule's gradient is the
-    portable math's."""
+    `tiles` on `target`, planned there and within its block's shared memory (`holds`); where they do not, the
+    rule's gradient is the portable math's. Planned on the device's own target off a GPU, an interpreted
+    call's states launch held no program at the interpreted target's shared budget (`Launch.resident`)."""
     shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (q, k, v, g, beta, h0,
                                                                                     starts)]
     *operands, starts = shapes
     forward = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                      delta=delta, floor=floor, rounded=rounded, ranged=ranged)
+                      delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target)
     both = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged)
-    return holds(both[len(forward):], family, shared)
+                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target)
+    return holds(both[len(forward):], family, generation.shared_budget(target))
 
 
 def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,

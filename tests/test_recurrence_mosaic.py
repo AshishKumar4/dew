@@ -772,7 +772,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
             unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
             if training and not mainloop_backward.backward_holds(
-                    *args, tiles=derived, family=family, shared=shared, starts=starts,
+                    *args, tiles=derived, family=family, target=facts, starts=starts,
                     max_segments=8 if packed else None, floor=FLOOR if per_key else None, **unwide):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
@@ -816,7 +816,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or mainloop_backward.backward_holds(
-                *args, tiles=tiles, family=family, shared=shared, starts=starts,
+                *args, tiles=tiles, family=family, target=facts, starts=starts,
                 floor=FLOOR if per_key else None, **unwide)
         if not held:
             # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`,

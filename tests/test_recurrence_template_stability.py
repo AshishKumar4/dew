@@ -79,8 +79,8 @@ def fast_backward(operands: Chunk) -> bool:
     tiles = template.MOSAIC.derived(bound, target)
     return mainloop_backward.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
                                    operands.beta, operands.state, tiles=tiles,
-                                   family=mainloop.family_of() or bundles.INTERPRETED,
-                                   shared=generation.shared_budget(target), starts=operands.starts)
+                                   family=mainloop.family_of() or bundles.INTERPRETED, target=target,
+                                   starts=operands.starts)
 
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
