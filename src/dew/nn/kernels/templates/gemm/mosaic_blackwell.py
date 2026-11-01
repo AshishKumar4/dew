@@ -40,7 +40,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm100
+from dew.nn.kernels.templates import mosaic, mosaic_sm100, tail
 from dew.nn.kernels.templates.axes import named
 from dew.nn.kernels.templates.gemm.mosaic_gpu import GroupInfo, tile_groups
 from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
@@ -113,7 +113,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
 
         @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="sm", init_carry=jnp.int32(0))
         def computed(loop: plgpu.NDLoopInfo, carry):
-            mi, ni = plgpu.planar_snake(loop.index[0], grid, 1, tiles.grid_block_n)
+            mi, ni = tail.planar_snake(loop.index[0], grid, 1, tiles.grid_block_n)
             rows_of = GroupInfo.create(table_gmem, tile_m, mi)
             # The unrouted rows' group multiplies nothing, and a slot past the last tile has no rows; the
             # ring's turn is the steps the computed tiles before took, the accumulator's their count.
