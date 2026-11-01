@@ -344,6 +344,9 @@ def tool(path) -> str | None:
     if found is None:
         return None
     real = os.path.realpath(found)
+    # A tool's name on an interpreter (a link named git to Python) runs any code under it.
+    if os.path.basename(real).startswith("python") or real == os.path.realpath(sys.executable):
+        return None
     inside = lambda directory: real.startswith(os.path.join(os.path.realpath(directory), ""))  # noqa: E731
     checkout = os.environ.get("DEW_EXECUTED_ROOT") or os.getcwd()
     if (inside(checkout) and not inside(sys.prefix)) or inside(tempfile.gettempdir()):
