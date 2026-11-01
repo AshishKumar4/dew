@@ -217,11 +217,13 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
 
 def _key_memory_held(call: _Call, keys: int) -> _Held:
     """`_key_memory_back`'s consumer thread at key block `keys`: the system's gradient and the write gates'
-    carried; a key block's three memory products' sums beside a value block's fragments; then the key block's
-    decays, gated keys and their WY gradient."""
+    carried; a key block's three memory products' sums and the memories' product (`algebra.key_memory_block`'s
+    'memory_trace') beside a value block's fragments; then the key block's decays, gated keys and their WY
+    gradient."""
     held, given, memories = dataclasses.replace(call.held, rows=call.rows), call.given, call.memories
     return _Held(carried=[_f32(CHUNK, CHUNK), _f32(CHUNK, 1)], phases=(
-        [_f32(CHUNK, keys)] * 3 + _fragments(call, (given, CHUNK, call.block), (memories, keys, call.block)),
+        [_f32(CHUNK, keys)] * 3 + [_f32(keys, keys)]
+        + _fragments(call, (given, CHUNK, call.block), (memories, keys, call.block)),
         [_f32(CHUNK, keys)] * 6 + _held(held, CHUNK, keys) * 2))
 
 

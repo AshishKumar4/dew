@@ -1003,7 +1003,9 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     prefix halves from the chunk's start `gates` `[C, BK]` and the chunk's last token's `last` as a row's
     vectors, and each value block `j`'s memory entered `entered(j)` and its gradient leaving `leaving(j)`
     `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the
-    weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw') and the memory decay's `sum(h dh)`;
+    weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw') and the memory decay's `sum(h dh)`, a
+    key's row of each, the diagonal of `h dh^T` ('memory_trace'): its column sums lay it as the keys' columns
+    are, which the chunk's last prefix's terms meet;
     then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log
     decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's on its last token
     (`sum(h dh) exp2(g_last) + sum(k dk)`), and `(dA, dbeta)`, the inverse's gradient's part
@@ -1013,10 +1015,11 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     products = [(issue("memory_dq", out_grads(j), entered(j).T),
                  issue("memory_dk", corrected(j), leaving(j).T),
                  issue("memory_dw", value_grads(j), entered(j).T),
-                 jnp.sum(entered(j).value().astype(jnp.float32) * leaving(j).value(), axis=1))
+                 issue("memory_trace", entered(j), leaving(j).T))
                 for j in range(blocks)]
-    d_query, d_key, d_weight, d_memory = (functools.reduce(jnp.add, terms)
-                                          for terms in zip(*products, strict=True))
+    d_query, d_key, d_weight, traced = (functools.reduce(jnp.add, terms)
+                                        for terms in zip(*products, strict=True))
+    d_memory = jnp.sum(jnp.where(_lags(traced.shape) == 0, traced, 0.0), axis=0)
     d_query = d_query * decays * scale
     d_key = d_key * to_last
     keys = key.value().astype(jnp.float32)
