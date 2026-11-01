@@ -1031,25 +1031,28 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     mainloop's, `summed_back`'s)."""
     decays = raised(*gates)
     to_last = range_decay(*(half[None, :] for half in last), *gates)
-    d_query = summed([("memory_dq", out_grads(j), entered(j).T) for j in range(blocks)])
-    d_key = summed([("memory_dk", corrected(j), leaving(j).T) for j in range(blocks)])
-    d_weight = summed([("memory_dw", value_grads(j), entered(j).T) for j in range(blocks)])
-    d_query = d_query * decays * scale
-    d_key = d_key * to_last
+    # Each sum in turn, the log decay's terms gathered as each one's term is formed, so one sum and its
+    # terms are live at a time: the three sums at once, beside the terms every one fed, spilled 240 bytes a
+    # thread on an H100 (kda-gate5 at db546905d).
+    d_query = summed([("memory_dq", out_grads(j), entered(j).T) for j in range(blocks)]) * decays * scale
+    emit("dq", d_query)
+    d_decay = query.value().astype(jnp.float32) * d_query
     keys = key.value().astype(jnp.float32)
-    gated = keys * decays
-    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`.
-    d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
-    gated_rows = Transposed((gated * betas[:, None]).astype(dtype))
-    d_system = -issue("weights_merge", d_weight.astype(dtype), gated_rows)
-    rows, _ = _grid(d_query.shape)
+    d_key = summed([("memory_dk", corrected(j), leaving(j).T) for j in range(blocks)]) * to_last
     # The chunk's last prefix's term on its last token through the gated keys' `exp2(g_last - g)` every
     # token's.
-    at_last = jnp.sum(keys * d_key, axis=0) if columns is None else columns(keys * d_key)
-    emit("dq", d_query)
+    keyed = keys * d_key
+    at_last = jnp.sum(keyed, axis=0) if columns is None else columns(keyed)
+    rows, _ = _grid(d_key.shape)
+    d_decay = d_decay - keyed + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0)
+    d_weight = summed([("memory_dw", value_grads(j), entered(j).T) for j in range(blocks)])
+    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`.
+    d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
     emit("dk", d_key + d_gated * decays * betas[:, None])
-    emit("dg", query.value().astype(jnp.float32) * d_query - keys * d_key
-         + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0) + gated * d_gated * betas[:, None])
+    gated = keys * decays
+    gated_rows = Transposed((gated * betas[:, None]).astype(dtype))
+    d_system = -issue("weights_merge", d_weight.astype(dtype), gated_rows)
+    emit("dg", d_decay + gated * d_gated * betas[:, None])
     return d_system, jnp.sum(d_gated * gated, axis=1)
 
 
