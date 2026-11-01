@@ -59,12 +59,12 @@ class Issuer:
     name, a tile a part), an fp32 one as its parts, as many as its buffers (one, a cast to theirs). A product
     whose buffers are a list of such sets keeps each value it stages there for the products after it that
     take the same value, staging a new one into the set its last product read longest ago. A product whose
-    buffers are a count takes a register left operand in that many parts as they are, staged nowhere, on a
-    family whose products read their operands from registers (`Family.operands_in_registers`,
-    `register_operand`). Operands of three parts issue the products whose parts' orders sum under three,
-    smallest first; of two, under two. A scaled operand (`product.Scaled`) takes its product into an
-    accumulator of its own, restored by the algebra's `restored(value, exponent)` (attention's exact
-    power of two)."""
+    buffers are a count takes a register left operand in that many parts as they are, staged nowhere, where
+    the family's product takes its left operand in registers (`Family.register_products`: mma.sync's
+    fragments, wgmma's register form). Operands of three parts issue the products whose parts' orders sum
+    under three, smallest first; of two, under two. A scaled operand (`product.Scaled`) takes its product
+    into an accumulator of its own, restored by the algebra's `restored(value, exponent)` (attention's
+    exact power of two)."""
 
     def __init__(self, call: Issuing, buffers: dict | None = None, restored: Callable | None = None):
         self.call, self.buffers, self.restored = call, buffers or {}, restored
@@ -112,8 +112,8 @@ class Issuer:
             read.append(buffer)
         return self.call.family.staged(value, buffer)
 
-    def summed(self, products: Iterable, shape: tuple[int, int] | None = None, *,
-               retired: bool = False) -> jax.Array:
+    def summed(self, products: Iterable, shape: tuple[int, int] | None = None, *, retired: bool = False,
+               into=None):
         """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
         accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
         attention's output, `algebra.key_decayed_output`). Each product's operands are staged as it is
@@ -123,7 +123,10 @@ class Issuer:
         registers are free again (attention's parts, formed a part at a time). A product of a scaled operand
         (`product.Scaled`) takes an accumulator of its own and is restored (`restored`), the unscaled
         products before and after it each summed in one. An operand may be a callable forming it then, where
-        `shape`, the sum's, is given."""
+        `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
+        a count) is issued so (`Family.register_products`). `into`, an accumulator the walk carries (its home,
+        a warpgroup accumulator ref or a register array), takes every product in place and is returned, no
+        value read (a scaled operand takes none)."""
         products = iter(products)
         first = next(products)
         family, interpret = self.call.family, self.call.interpret
@@ -141,8 +144,13 @@ class Issuer:
                         return acc
                     lhs = lhs.value
                 held.pop()
-                left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
-                acc = family.issued(acc, left, right, interpret)
+                registered = self._registered(name, lhs)
+                if registered is not None:
+                    (right,) = self._operand(rhs, name, lhs, read)
+                    acc = family.register_products(acc, registered, right, interpret)
+                else:
+                    left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
+                    acc = family.issued(acc, left, right, interpret)
                 if retired:
                     family.settled(0)
                 held.extend(itertools.islice(products, 1))
@@ -154,13 +162,18 @@ class Issuer:
             # The group at the held product: a scaled product's own accumulator, restored, or the unscaled
             # products from it to the next scaled one in one.
             scaled = held[-1][1] if isinstance(held[-1][1], product.Scaled) else None
-            part = family.summed(shape, lambda acc: group(acc, scaled is not None), interpret)
+            part = family.summed(shape, lambda acc: group(acc, alone=scaled is not None), interpret)
             if scaled is None:
                 return part
             if self.restored is None:
                 raise ValueError("a scaled operand's product needs the algebra's restore (`restored`)")
             return self.restored(part, scaled.exponent)
 
+        if into is not None:
+            into = group(into, alone=False)
+            if held:
+                raise ValueError("a carried accumulator takes no scaled operand's product (`into`)")
+            return into
         total = summed_group()
         while held:
             total = total + summed_group()

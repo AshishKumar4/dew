@@ -308,3 +308,37 @@ def test_a_scaled_operands_product_is_summed_apart_and_restored(retired):
     summed = _issued_sums(a, b, c, d, exponent, retired=retired)
     f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
     np.testing.assert_array_equal(np.asarray(summed), 8 * f32[0] @ f32[1] + f32[2] @ f32[3])
+
+
+def _carried_sums(a, b, c, d):
+    """`a @ b + c @ d` issued in place into one accumulator a walk carries (`Issuer.summed`'s `into`),
+    interpreted: `a` a register left operand its product takes in registers (its buffers a count, wgmma's
+    register form), `c` staged into a shared buffer, `b` and `d` shared tiles, both products retired."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands
+
+    family = mosaic_sm90.WGMMA
+    call = types.SimpleNamespace(family=family, interpret=True)
+
+    def body(a_gmem, b_gmem, c_gmem, d_gmem, out_gmem):
+        def scoped(staged, b_smem, d_smem):
+            b_smem[...], d_smem[...] = b_gmem[...], d_gmem[...]
+            issuer = operands.Issuer(call, {"registered": 1, "plain": (staged,)})
+            products = (("registered", a_gmem[...], operands.Parts((b_smem,), jnp.bfloat16)),
+                        ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16)))
+            out_gmem[...] = issuer.summed(products, retired=True, into=family.zeros((ISSUED, ISSUED)))
+
+        pl.run_scoped(scoped, *(plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16) for _ in range(3)))
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=True, name="carried")(a, b, c, d)
+
+
+@INTERPRETS
+def test_products_issue_in_place_into_a_carried_accumulator():
+    """Interpreted: a register-operand product and a staged one, issued into one carried accumulator in
+    place: exactly `a @ b + c @ d`."""
+    keys = jax.random.split(jax.random.key(3), 4)
+    a, b, c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
+    f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
+    np.testing.assert_array_equal(np.asarray(_carried_sums(a, b, c, d)), f32[0] @ f32[1] + f32[2] @ f32[3])
