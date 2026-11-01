@@ -40,12 +40,20 @@ class Rules:
 
 
 def _facts() -> Ruleset:
-    """The shape of each form a rule makes, from the shape of the value it equals: every form of one value
-    has one shape, as each rule keeps it."""
-    term, other = vars_("term other", Term)
+    """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, a
+    layout-keeping one its operand's, a sum along one axis its operand's without that axis."""
+    term, x, y = vars_("term x y", Term)
     shaped = var("shaped", Vec[i64])
-    return ruleset(rule(eq(term).to(other), eq(shaped).to(shape(other))).then(set_(shape(term)).to(shaped)),
-                   name="facts")
+    name = var("name", String)
+    params, axis = vars_("params axis", i64)
+    return ruleset(
+        rule(eq(term).to(x.binary(name, y, params)), eq(shaped).to(shape(x)), eq(shape(y)).to(shaped)).then(
+            set_(shape(term)).to(shaped)),
+        rule(eq(term).to(x.unary(name, params)), eq(shaped).to(shape(x))).then(set_(shape(term)).to(shaped)),
+        rule(eq(term).to(x.convert(params)), eq(shaped).to(shape(x))).then(set_(shape(term)).to(shaped)),
+        rule(eq(term).to(x.reduce(name, Vec[i64](axis), params)), eq(shaped).to(shape(x))).then(
+            set_(shape(term)).to(shaped.remove(axis))),
+        name="facts")
 
 
 def _linear() -> Ruleset:
@@ -108,7 +116,7 @@ def instances() -> Mapping[str, tuple[Callable, Callable, Callable]]:
                                      jnp.float32) for shape in shapes)
         return drawn
 
-    rows, scaled = draw((8, 64), (8, 64), (8, 64)), draw((8, 64), (8,))
+    rows, scaled = draw((64, 1024), (64, 1024), (64, 1024)), draw((64, 1024), (64,))
     return {
         "linear: two sums along an axis": (lambda x, y, a: jnp.sum(x, -1) + jnp.sum(y, -1),
                                            lambda x, y, a: jnp.sum(x + y, -1), rows),
