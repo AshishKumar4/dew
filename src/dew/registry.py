@@ -238,15 +238,16 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         self.kind = kind
         self.paths = types.MappingProxyType(dict(paths))
         self.base = base
-        """The import path of the class every member derives from, or None
-        where the members share only a protocol."""
+        """The import path of the class every member derives from, or of the
+        protocol they share, whose members are then classes of Dew's or of a
+        trusted package, or functions declared to return one (`_derives`); None
+        where the members share only an unnamed protocol."""
         # What a lookup imported, untyped as an import is; typed on the way out.
         self._imported: dict[str, Any] = {}
 
     def __getitem__(self, name: str) -> T:
         """The member an alias or import path names. The table's own entries
-        are code's, named by their aliases or by the import paths a record holds them as;
-        any other path may come from a record, name anything imported, and
+        are code's; a path may come from a record, name anything imported, and
         be built, so its member must derive from `base` (or be a function
         declared to return one), and with no base be a class of Dew's or of a
         trusted package (`_owned`)."""
@@ -255,8 +256,7 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
                            f"or any class by its import path")
         if name not in self._imported:
             member = imported(self.paths.get(name, name))
-            own = name in self.paths or name in self.paths.values()
-            if not own and not self._holds(member):
+            if name not in self.paths and not self._holds(member):
                 raise ValueError(f"{name!r} names {member!r}, which is no {self.kind}")
             self._imported[name] = member
         return self._imported[name]
@@ -266,7 +266,7 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
             return _owned(member, called=False)
         module, _, qualified = self.base.partition(":")
         base = getattr(importlib.import_module(module), qualified)
-        return issubclass(member, base) if isinstance(member, type) else _returns(member, base)
+        return _derives(member, base) if isinstance(member, type) else _returns(member, base)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.paths)
@@ -1501,12 +1501,12 @@ runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
 
 
 # An environment's types live in `dew.rl`, which only `dew.rl` and `dew.objectives.rl` import
-# (docs/design/architecture.md), so the table's type names none.
+# (docs/design/architecture.md), so the table's type names none; its base is read by path.
 envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
     "flight": "dew.rl.flight:FlightEnv",
     "gate_race": "dew.rl.flight:GateRace",
     "playground": "dew.rl.playground:Playground.load",
-})
+}, base="dew.rl.env:Env")
 """The environments an environment run names (`dew.objectives.rl.config.EnvConfig`): a JAX `Env` class, a
 host `Simulator` class, or a function or classmethod that returns one; any other by its import path."""
 rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | ControlRollout] = Aliases(

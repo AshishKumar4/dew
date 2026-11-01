@@ -431,8 +431,9 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
     tenth, to 1, at each score whose crashes fall under a third, the stage's race and `races` drawn at it. The
     stage is prepared once and each chunk trains it on, its rollout's environments and replay kept between
     them. A chunk's checkpoint is written as it ends, then its score and the level the next chunk trains at
-    (world.json's `level`), where a stopped stage goes on; one stopped between the two scores the chunk again.
-    Returns the stage's last state, its agent and the level it ended at."""
+    (world.json's `level`), where a stopped stage goes on; one stopped between the two is restored at that
+    checkpoint and scored before the next chunk trains. Returns the stage's last state, its agent and the
+    level it ended at."""
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     done = _latest(world.out / stage)
@@ -443,7 +444,10 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
     began, before = time.perf_counter(), points[-1]["seconds"] if points else 0.0
     state = None
     while state is None or done < updates:
-        reached = updates if every is None else min(updates, (done // every + 1) * every)
+        # A chunk checkpointed and stopped before its score is restored there and scored before the next.
+        pending = (state is None and every is not None and done > 0 and done % every == 0
+                   and all(point["updates"] != done for point in points))
+        reached = done if pending else updates if every is None else min(updates, (done // every + 1) * every)
         prepared = dataclasses.replace(prepared, run=prepared.run.override(
             {"trainer.steps": reached, "env.difficulty": level, "env.ramp": level}))
         state = prepared.train(stage)

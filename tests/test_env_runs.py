@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from recording import bits
 from test_env_rollout import evaluation_key
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
@@ -89,12 +90,6 @@ def fitted(run: EnvRunConfig, objective, rollout, steps: int):
     with generation.run_precision(run.trainer.precision):
         return Trainer(objective, run.optim, key=0, rollout=rollout).fit(run.prepare().dataset, steps=steps,
                                                                          log_every=1)
-
-
-def bits(tree) -> list[np.ndarray]:
-    """A tree's leaves as arrays, a key's as its raw bits, for a bit-for-bit comparison."""
-    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-            for leaf in jax.tree.leaves(jax.device_get(tree))]
 
 
 def assert_bitwise(one, other) -> None:
@@ -300,12 +295,13 @@ def test_an_environment_run_refuses_a_setup_it_cannot_train(tmp_path, saved_teac
         dataclasses.replace(run, **fields).prepare()
 
 
-def test_an_environment_a_function_builds_is_named_again_by_its_record():
-    """An environment the registry builds with a function (`playground`, `Playground.load`), which its record
-    holds as the function's import path, is named by that record again, read back with its run."""
-    held = EnvConfig("playground", {"name": "CartpoleBalance"})
-    assert held.member is envs["playground"]
+@pytest.mark.parametrize("name", ["playground", "dew.rl.playground:playground"])
+def test_an_environment_a_function_builds_is_named_again_by_its_record(name):
+    """An environment a function builds, the table's (`playground`, `Playground.load`) or any other declared
+    to return one (`dew.rl.playground.playground`), which a record holds as the function's import path, is
+    named by that record again, read back with its run."""
+    held = EnvConfig(name, {"name": "CartpoleBalance"} | ({} if name == "playground" else {"count": 4}))
     run = EnvRunConfig(env=held)
     again = EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict())))
-    assert again.env is not None and again.env.member is envs["playground"]
+    assert again.env is not None and again.env.member is held.member is envs[name]
 
