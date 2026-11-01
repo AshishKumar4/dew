@@ -140,11 +140,11 @@ def test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs
     assert edited("notes/page.md", "page again\n") == [False, True, True, True, False]
     assert edited("tests/inner.py", "def inner(): return 3 - 1\n") == [True, False, True, True, False]
     assert edited("tests/plain.py", "def helper(): return 2 - 1\n") == [False, True, True, True, False]
-    # What only a forked child ran, and the files after it in the process, which take what ran before them.
+    # What only a forked child ran reruns its file alone, each file in a process of its own (ci.py's `alone`).
     assert edited("tests/forked.py", "def in_fork(): return 3\ndef in_mp_fork(): return 5 - 1\n") == [
         True, True, True, False, False]
     assert edited("tests/forked.py", "def in_fork(): return 4 - 1\ndef in_mp_fork(): return 4\n") == [
-        True, True, False, False, False]
+        True, True, False, True, False]
 
 
 def test_a_native_media_binary_keeps_its_files_key_and_what_it_opened_is_that_keys_input(
