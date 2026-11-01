@@ -811,9 +811,10 @@ class Trainer(Generic[Loss, Effects]):
         `jax.eval_shape` drops on a mesh whose other axes are Auto)."""
         if not self._device:
             return model_batch(batch)
+        traced, shapes = jax.make_jaxpr(self._model_batch, return_shape=True)(batch)
         return jax.tree.map(lambda aval: jax.ShapeDtypeStruct(
             aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
-            weak_type=aval.weak_type), jax.jit(self._model_batch).trace(batch).out_avals)
+            weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1):
         loss, (variables, *rest) = traced_loss(self.objective, state, window, split)
@@ -1209,9 +1210,9 @@ class Trainer(Generic[Loss, Effects]):
                                      batch_consumed(micro))
             return (apart(stepped)[0], *rest)
 
-        return jax.jit(step, in_shardings=(moving, frozen, placement, replicated),
-                       out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
-                       donate_argnums=0)
+        returned = (moving, replicated, replicated, replicated, replicated, replicated)
+        return owned_program(step, in_shardings=(moving, frozen, placement, replicated),
+                             out_shardings=returned, donate_argnums=0)
 
     def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one

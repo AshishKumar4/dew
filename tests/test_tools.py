@@ -1871,25 +1871,21 @@ def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
     assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
 
 
-def test_a_scope_named_apart_compiles_as_many_bare_programs_as_it_names(tmp_path):
-    """SLOP025: a scope `COMPILED_APART` names compiles as many bare programs as it names and no finding is
-    made of them, one more is reported, and a named scope that holds fewer is reported, so the list never
-    outlives its code."""
-    files = {"src/sparx/nn/kernels/options.py": ("import jax\n"
-                                                 "class OuterProgram:\n"
-                                                 "    def _jitted(self, f):\n"
-                                                 "        return jax.jit(f)\n"),
-             "src/sparx/training/interval.py": ("import jax\n"
-                                                "def bookkeep(f):\n"
-                                                "    return jax.jit(f), jax.jit(f)\n"
-                                                "def _added_tokens(f):\n"
-                                                "    return jax.jit(f)\n"
-                                                "def held(f):\n"
-                                                "    return jax.jit(f)\n"),
-             "src/sparx/nn/flops.py": "def traced_flops(f):\n    return f\n"}
-    found = [finding for finding in _linted(tmp_path, files) if finding[2] == "SLOP025"]
-    assert found == [("src/sparx/nn/flops.py", 1, "SLOP025"),
-                     ("src/sparx/training/interval.py", 3, "SLOP025")]
+def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
+    """SLOP025: the compile point's own class (`COMPILE_POINT`, `OuterProgram`) compiles by a bare jit and no
+    finding is made of it; the same jit in another class of its module, or in the class's name elsewhere,
+    is reported."""
+    point = ("import jax\n"
+             "class OuterProgram:\n"
+             "    def _jitted(self, f):\n"
+             "        return jax.jit(f)\n"
+             "class Other:\n"
+             "    def _jitted(self, f):\n"
+             "        return jax.jit(f)\n")
+    found = _linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point})
+    assert [finding for finding in found if finding[2] == "SLOP025"] == [
+        ("src/sparx/nn/kernels/options.py", 7, "SLOP025"), ("src/sparx/training/step.py", 4, "SLOP025"),
+        ("src/sparx/training/step.py", 7, "SLOP025")]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
