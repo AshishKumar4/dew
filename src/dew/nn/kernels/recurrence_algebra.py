@@ -42,6 +42,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels.generation import linear_map
+from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul, two_product
@@ -99,7 +100,7 @@ def portable(name: str, left, right):
     return float32_matmul(left, right, exact_float32(None))
 
 
-@jax.jit
+@program
 def _cumulated(g, documents=None):
     """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)` (`compensated_add`),
     restarting at each of packed `documents`' first positions: one program JAX traces once for their types,
@@ -170,7 +171,7 @@ LOG2_E = math.log2(math.e)
 """log2(e) to double precision, the prefix's base-2 scale (fla's RCP_LN2 is 1.93e-8 short of it)."""
 
 
-@jax.jit
+@program
 def prefix(g):
     """The decay's prefix within each chunk, compensated, in base 2: `g` `[..., C, H]` (natural log) to `(hi,
     lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,

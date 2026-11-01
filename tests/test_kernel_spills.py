@@ -5,8 +5,10 @@ run keeps, its plan, its step compiled ahead and the executable it runs, is the 
 then. A program with no template launch compiles as jit compiles it."""
 
 import dataclasses
+import gc
 import os
 import time
+import weakref
 
 import flax.linen as nn
 import jax
@@ -22,7 +24,7 @@ from process_support import fresh
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import compiled_with, owned_program, program
 from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
@@ -455,3 +457,56 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
     assert len(found) == 2 and all(binary.registers > 0 and not binary.frame for binary in found)
     launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
     assert launched == [("dew_added", "0123456789")]
+
+def test_a_program_its_caller_owns_is_released_with_its_caller():
+    """A program over a closure or a bound method its caller owns (`owned_program`), as a run's placement
+    and its host phases compile, keeps no reference of Dew's: once the caller lets it go, the owner the
+    closure holds (a trainer, its objective and their arrays) is released, as no process-wide cache holds
+    the closure. A program over a module's function (`program`) is kept for every caller alike."""
+
+    class Owner:
+        """A run's stand-in, holding an array its closure reads."""
+
+        def __init__(self):
+            self.held = jnp.arange(4.0)
+
+        def scaled(self, x):
+            return x * self.held
+
+    def reading(held: Owner):
+        return lambda x: x + held.held
+
+    owner = Owner()
+    released = weakref.ref(owner)
+    closure = owned_program(reading(owner))
+    bound = owned_program(owner.scaled)
+    np.testing.assert_array_equal(np.asarray(closure(jnp.ones(4))), np.arange(4.0) + 1)
+    np.testing.assert_array_equal(np.asarray(bound(jnp.ones(4))), np.arange(4.0))
+    del owner, closure, bound
+    gc.collect()
+    assert released() is None
+    assert program(jnp.sum) is program(jnp.sum)
+
+def test_a_program_within_another_takes_the_enclosing_programs_options():
+    """A program called within another trace (a kernel's own program inside a step) is the enclosing
+    program's part and compiles under its options, as JAX takes compiler options on the outermost jit
+    alone: a program opened with options is called inside another without refusal."""
+    with compiled_with({"xla_cpu_enable_fast_math": False}):
+        inner = owned_program(lambda x: x * 2.0)
+        outer = owned_program(lambda x: inner(x) + 1.0)
+        np.testing.assert_array_equal(np.asarray(outer(jnp.ones(3))), np.full(3, 3.0))
+
+def test_a_program_under_an_eager_transformation_compiles_under_its_own_options():
+    """A program called under an eager `jax.vmap` or `jax.grad`, which no enclosing program compiles,
+    compiles under its own options as a direct call does, so an option XLA does not know is refused
+    there too; within another program's trace it is that program's part and takes its options."""
+    with compiled_with({"xla_dew_no_such_option": True}):
+        unknown = owned_program(lambda x: x * 2.0)
+    rows = jnp.ones((2, 3))
+    for called in (lambda: unknown(rows), lambda: jax.vmap(unknown)(rows),
+                   lambda: jax.grad(lambda x: jnp.sum(unknown(x)))(rows)):
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            called()
+    enclosing = owned_program(lambda x: unknown(x) + 1.0)
+    np.testing.assert_array_equal(np.asarray(enclosing(rows)), np.full((2, 3), 3.0))
+

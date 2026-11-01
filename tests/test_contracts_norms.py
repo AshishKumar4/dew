@@ -157,8 +157,8 @@ def plain_hidden(gate, up, gate_gain, up_gain):
     """nGPT's normed hidden as its formula reads (`GatedMLP._ngpt_hidden` before its two-pass reverse):
     the gained gate and up rounded to their dtype, their SiLU product in at least fp32, unit-normed."""
     wide = precision.at_least_fp32(jnp.result_type(gate, up))
-    gated = (gate.astype(wide) * ngpt.gain(gate_gain, HIDDEN)).astype(gate.dtype)
-    upped = (up.astype(wide) * ngpt.gain(up_gain, HIDDEN)).astype(up.dtype)
+    gated = (gate.astype(wide) * ngpt.gain(gate_gain, HIDDEN, wide)).astype(gate.dtype)
+    upped = (up.astype(wide) * ngpt.gain(up_gain, HIDDEN, wide)).astype(up.dtype)
     product = gated_product("swiglu", implementation="xla")
     return precision.l2norm(product(gated.astype(wide), upped.astype(wide)).astype(gate.dtype))
 

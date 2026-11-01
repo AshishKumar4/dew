@@ -32,7 +32,6 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew import algebra
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, Variables, owned_dicts, select
@@ -45,7 +44,6 @@ from dew.data.dataset import (
     Loader,
     PhasedStream,
     RampedStream,
-    Reader,
     Stage,
     rows_of,
     stream_identity,
@@ -79,7 +77,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, Logi
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -112,6 +110,9 @@ from dew.training._fit import (
     FitRun,
     HandedSplits,
     Start,
+    _rollout_admitted,
+    _rollout_resumed,
+    _rollout_saved,
     afresh,
     check_inputs,
     clocked,
@@ -157,7 +158,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Summary, admit_split
+from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Split, Summary, admit_split, episodic
 from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
@@ -678,6 +679,7 @@ class Trainer(Generic[Loss, Effects]):
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
         state = restored(state, resume, self._examples)
+        _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = rates_set(state, lambda held: with_rates(held, config.rates()))
@@ -812,9 +814,10 @@ class Trainer(Generic[Loss, Effects]):
         `jax.eval_shape` drops on a mesh whose other axes are Auto)."""
         if not self._device:
             return model_batch(batch)
+        traced, shapes = jax.make_jaxpr(self._model_batch, return_shape=True)(batch)
         return jax.tree.map(lambda aval: jax.ShapeDtypeStruct(
             aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
-            weak_type=aval.weak_type), jax.jit(self._model_batch).trace(batch).out_avals)
+            weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1):
         loss, (variables, *rest) = traced_loss(self.objective, state, window, split)
@@ -868,7 +871,7 @@ class Trainer(Generic[Loss, Effects]):
         if not shape_only:
             placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
             # Allocate on the final shards, without a replicated window-sized temporary.
-            pending = jax.jit(allocate, out_shardings=placement)()
+            pending = owned_program(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
 
     @functools.cached_property
@@ -1023,9 +1026,9 @@ class Trainer(Generic[Loss, Effects]):
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
                 elif current.compute is None:
-                    narrowing = jax.jit(lambda variables: narrowed(variables, candidate.copies),
-                                        out_shardings=candidate.shardings.compute,
-                                        compiler_options=compiler_options(*self.objective.towers()) or None)
+                    narrowing = owned_program(lambda variables: narrowed(variables, candidate.copies),
+                                              *self.objective.towers(),
+                                              out_shardings=candidate.shardings.compute)
                     current = dataclasses.replace(current, compute=narrowing(current.variables))
                 held, staged = current.window, self._ramp or self._stage_starts
                 if window > 1 and self.step is None and (held is None or (staged and not held.replays(
@@ -1210,9 +1213,9 @@ class Trainer(Generic[Loss, Effects]):
                                      batch_consumed(micro))
             return (apart(stepped)[0], *rest)
 
-        return jax.jit(algebra.rewritten(step), in_shardings=(moving, frozen, placement, replicated),
-                       out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
-                       donate_argnums=0)
+        returned = (moving, replicated, replicated, replicated, replicated, replicated)
+        return owned_program(step, in_shardings=(moving, frozen, placement, replicated),
+                             out_shardings=returned, donate_argnums=0)
 
     def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
@@ -1388,7 +1391,7 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         return trained
 
-    def _plan(self, loader: Loader, held: Mapping[str, Reader | EvalSuite] | None,
+    def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
               written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
               checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,
@@ -2169,20 +2172,20 @@ class Trainer(Generic[Loss, Effects]):
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
                    preview: bool, stated: Dataset | Loader | Handed, loss: bool) -> None:
-        """The refusals `fit` makes before it places anything: validation
-        nothing reads, and a pipeline's batch, whose placement could take minutes or run out of memory before
-        the error. Every other mesh's batch is checked with its stream (`check_stream`), a ramp's at each of
-        its stages. The checkpoints learn why no record rebuilds a run of
-        this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
+        """The refusals `fit` makes before it places anything: validation nothing reads, a rollout that
+        checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
+        take minutes or run out of memory before the error. Every other mesh's batch is checked with its
+        stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
+        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
         if self.checkpoints is not None:
-            given = {"a custom step (step=)": self.step, "a rollout (rollout=)": self.rollout,
-                     "a tracker (tracker=)": self.tracker, "recording each step's draws (record=True)":
-                     self.record or None}
+            given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
+                     "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
+                     "recording each step's draws (record=True)": self.record or None}
             self.checkpoints.python_run(unrecorded_parts(
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
         for name, suite in suites.items():
-            if loss and not any(metric.name == 'loss' for metric in suite.metrics):
+            if loss and not episodic(suite.data) and all(metric.name != 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
                 read = self.objective.defines_validation_loss or self.checkpoints is not None or loss
@@ -2275,7 +2278,7 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
             ranking=ranking, control={**run.stop_control, **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
-            boxed=self._boxed_axes())
+            boxed=self._boxed_axes(), rollout=None if weights_only else _rollout_saved(self.rollout))
         with run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
@@ -2301,7 +2304,7 @@ class Trainer(Generic[Loss, Effects]):
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
             control={**run.stop_control, **interval.token_control}, rung=self._checkpoint_rung(),
-            artifact=self._artifact(), boxed=self._boxed_axes())
+            artifact=self._artifact(), boxed=self._boxed_axes(), rollout=_rollout_saved(self.rollout))
         with run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
@@ -2411,7 +2414,7 @@ class Trainer(Generic[Loss, Effects]):
         self,
         state: TrainState,
         shardings: Placement[TrainState],
-        reader: Reader | None,
+        reader: Split | None,
         metrics: Sequence[Metric],
         preview: bool,
         *,

@@ -47,6 +47,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from jax.typing import DTypeLike
 
+from dew.nn.kernels.options import program
+
 DEFAULT_BLOCK_M = 64
 DEFAULT_BLOCK_N = 64
 DEFAULT_BLOCK_K = 64
@@ -266,7 +268,7 @@ def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
     lax.fori_loop(0, pl.cdiv(size.m - last_offset, block.m), store_empty, None)
 
 
-@partial(jax.jit, static_argnames=(
+@partial(program, static_argnames=(
   "block_m", "block_k", "block_n", "trans_rhs", "interpret", "compute_dtype", "acc_dtype", "num_warps",
   "num_stages", "chunk_m", "out_dtype", "prologue", "prologue_axes", "epilogue", "epilogue_axes",
   "out_dtypes", "exact_sums"))
@@ -452,7 +454,7 @@ def _tgmm_ragged_dot_kernel(
                 mask=rmask[:, None] & cmask[None, :])
 
 
-@partial(jax.jit, static_argnames=(
+@partial(program, static_argnames=(
   "block_m", "block_n", "block_k", "interpret", "compute_dtype", "acc_dtype", "num_warps", "num_stages",
   "out_dtype", "prologue", "prologue_axes", "exact_sums"))
 def tgmm(

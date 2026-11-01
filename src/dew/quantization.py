@@ -75,6 +75,7 @@ from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import surrogate
 from dew.nn.kernels.generation import backend, linear_map
+from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
@@ -949,9 +950,12 @@ def _fp8_faster(shape: tuple[int, ...], tokens: int) -> bool:
         return (_fp8_rows(x, forward, forward_scale).astype(x.dtype),
                 _fp8_rows(cotangent, dgrad, dgrad_scale).astype(x.dtype))
 
-    timings = [statistics.median(samples(jax.jit(fn), *args, repeats=30))
-               for fn, args in ((bf16, (x, kernel.astype(jnp.bfloat16), cotangent)),
-                                (fp8, (x, cotangent, leaves)))]
+    # Each candidate's executable timed alone, past any dispatch of its own.
+    plain = owned_program(bf16).executable(x, kernel.astype(jnp.bfloat16), cotangent)
+    quantized = owned_program(fp8).executable(x, cotangent, leaves)
+    timings = [statistics.median(samples(executable, *args, repeats=30))
+               for executable, args in ((plain, (x, kernel.astype(jnp.bfloat16), cotangent)),
+                                        (quantized, (x, cotangent, leaves)))]
     return timings[1] < timings[0]
 
 
