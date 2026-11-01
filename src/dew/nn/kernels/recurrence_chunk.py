@@ -955,7 +955,7 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, floor: float | None = None, bound: float | None = None,
-                firsts=None, rounded: bool = False, skip=None, interpret: bool | None = None):
+                firsts=None, rounded: bool = False, skip=None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their common
@@ -968,18 +968,16 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     (`MOSAIC_SUPPORTS`' 'backward', `Mosaic.trains`), and a call that names the mainloop insists on it (ledger
     1926: no kernel falls back inside itself). Its states and output launches take `tiles` (`mainloop.Tiles`,
     the template's config, `templates.recurrence.template`); a `family` given is the bundle it issues by,
-    interpreted off a GPU of that family (a CPU's), and `interpret` given decides the interpreter, so an
-    assumed GPU's plan (`generation.assumed`, whose calls otherwise lower for it) runs off one. A decay a key
-    dimension takes the layer's declared `floor`, which the mainloop's intra launch reads
-    (`mainloop.per_key_refusal`), and a 16-bit delta rule the chunk inverse's `bound` its form proves, its
-    solve at fp32's range where it proves none (`template.ranged`); a `rounded` call takes the run's fast
-    forms' numbers (`fast_rounding`, `mainloop.forward`)."""
+    interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's declared
+    `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit delta rule the
+    chunk inverse's `bound` its form proves, its solve at fp32's range where it proves none
+    (`template.ranged`); a `rounded` call takes the run's fast forms' numbers (`fast_rounding`,
+    `mainloop.forward`)."""
     from .templates import bundles
     from .templates.recurrence import mainloop, mainloop_backward, template
 
     dtype = jnp.result_type(query, key, value)
-    device = mainloop.family_of(dtype)
-    interpret = generation.backend() != 'gpu' if interpret is None else interpret
+    device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
     issuing = family or device or bundles.INTERPRETED
     query, key, value = (x.astype(dtype) for x in (query, key, value))
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
