@@ -191,8 +191,8 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
                                                  "def test_ok(): pass\n")
     ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
-    assert {row["name"]: (row["exitCode"], row.get("kind")) for row in json.loads(out.read_text())["rows"]} == {
-        "3.12:tests/test_pass.py": (0, None), "3.12:tests/test_dies.py": (1, "whole")}
+    found = {row["name"]: (row["exitCode"], row.get("kind")) for row in json.loads(out.read_text())["rows"]}
+    assert found == {"3.12:tests/test_pass.py": (0, None), "3.12:tests/test_dies.py": (1, "whole")}
 
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
