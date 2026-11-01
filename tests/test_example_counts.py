@@ -106,14 +106,16 @@ class Refusing:
                      for question in range(int(element["id"]) % 3 + 1))
 
 
-@pytest.mark.parametrize("read", ["memory", "streamed"])
-def test_a_corpus_counts_the_examples_it_kept_apart_from_those_it_refused(read):
-    """Twenty-one examples, every fifth refused whole by the objective: the corpus counts the seventeen it
-    kept as `data/rows` and the four it refused under their reason, which together are the examples the
-    run's batches consume, whatever the refused examples' counts ride on to the next kept row."""
+@pytest.mark.parametrize(("read", "workers"), [("memory", 0), ("streamed", 0), ("streamed", 2)])
+def test_a_corpus_counts_the_examples_it_kept_apart_from_those_it_refused(read, workers):
+    """Twenty-one examples, every fifth refused whole by the objective, read by `workers` loading workers:
+    the corpus counts the seventeen it kept as `data/rows` and the four it refused under their reason,
+    which together are the examples the run's batches consume, whatever kept row carries a refused
+    example's count on, in the reading process or in a worker's group."""
     ids = np.arange(1, 22, dtype=np.int32)
-    loader = compile(Pipeline(Memory({"id": ids})).batch(BATCH), read=read,
-                     objective=ObjectiveData(train=(Refusing(),)), examples=21)
+    loader = compile(Pipeline(Memory({"id": ids}, shard_rows=3)).batch(BATCH), read=read,
+                     objective=ObjectiveData(train=(Refusing(),)), examples=21,
+                     loading=Loading(workers=workers))
     _, consumed = read_whole(loader, "question")
     assert consumed == 21
     assert counted(loader) == [17]
@@ -121,14 +123,16 @@ def test_a_corpus_counts_the_examples_it_kept_apart_from_those_it_refused(read):
 
 
 @pytest.mark.parametrize("read", ["memory", "streamed"])
-def test_a_run_whose_last_example_is_refused_consumes_it(read):
-    """A run bounded to twenty examples whose twentieth its objective refuses: its batches consume all
-    twenty, the last one's count carried by the short batch the bound ends inside, as a kept row would
-    carry it."""
+def test_a_corpus_counts_a_refused_last_example_its_batches_leave_to_the_streams_end(read):
+    """A run bounded to twenty examples whose twentieth its objective refuses: the corpus counts the sixteen
+    it kept and the four it refused, every example the bound read, while its batches consume nineteen, the
+    twentieth's count owed to the stream's end, which the run's last batch takes (`_fit.drained`)."""
     ids = np.arange(1, 21, dtype=np.int32)
     loader = compile(Pipeline(Memory({"id": ids})).batch(BATCH), read=read,
                      objective=ObjectiveData(train=(Refusing(),)), examples=20)
-    assert read_whole(loader, "question")[1] == 20
+    assert read_whole(loader, "question")[1] == 19
+    assert counted(loader) == [16]
+    assert counted(loader, "data/rejected/") == [4]
 
 
 @pytest.mark.parametrize("workers", [0, 2])

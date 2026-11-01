@@ -38,9 +38,11 @@ ASKED = Choice("Which intent does the customer's message express?", list(INTENTS
 AGAIN = Choice("Which of these does the message ask for?", list(reversed(INTENTS)))
 """The intent asked again, its options in another order: the consistency group's other member."""
 
-ALIKE = Choice("Which team handles it?", [f"please route this message to the team that handles {name}"
-                                          for name in ("billing", "refunds")])
-"""A question whose two options read alike once a question row cuts each to `OPTION_TOKENS`."""
+ALIKE = Choice("Which team handles it?", [
+    f"please route this message on to the one support team here that usually handles {name}"
+    for name in ("billing", "refunds")])
+"""A question whose two options read alike once a question row cuts each to `OPTION_TOKENS`: they part only
+past their fourteenth token."""
 
 LONG = Choice("Which intent does the customer's message express? " + "Read the message whole. " * 2000,
               list(INTENTS[:2]))
@@ -202,11 +204,16 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
     else:
         wanted = math.ceil(SHARE * len(TRAIN[0]))
         assert wanted <= consumed < wanted + BATCH
-    # Every example read is trained or reported, under the reason the layout refuses it for.
+    # Every example read is trained or reported, under the reason the layout refuses it for: all of them
+    # where the bound reads every one; where a share stops the run, its reading ahead holds at least the
+    # examples its steps consumed.
     refused = {key.rsplit("/", 1)[1]: int(value) for key, value in last.items()
                if key.startswith("data/rejected/")}
     delivered = sum(int(value) for key, value in last.items() if key.startswith("data/rows/"))
-    assert delivered + sum(refused.values()) == consumed
+    if cell.bound == "examples":
+        assert delivered + sum(refused.values()) == consumed
+    else:
+        assert consumed <= delivered + sum(refused.values()) <= len(TRAIN[0])
     if cell.bound == "examples":
         trained_planted = {reason: list(TRAIN[1].values()).count(reason) for reason in set(TRAIN[1].values())
                            if reason != "options_alike" or not cell.joint}
