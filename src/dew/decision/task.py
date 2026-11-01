@@ -1174,16 +1174,18 @@ class PassTokens:
 
     def metrics(self) -> dict[str, float]:
         """`served/real_token_share`, of every pass's tokens the share its rows held, and each shape's
-        under `served/passes/<rows>x<length>/` beside its passes; none before a pass."""
-        computed = {shape: held.windows * shape.length for shape, held in self.shapes.items()}
+        under `served/passes/<rows>x<length>/` beside its passes; none before a pass. Read from another
+        thread than the engine's that adds passes, it reads one moment's shapes (a copy taken at once)."""
+        shapes = dict(self.shapes)
+        computed = {shape: held.windows * shape.length for shape, held in shapes.items()}
         if not sum(computed.values()):
             return {}
         shares = {}
-        for shape, held in self.shapes.items():
+        for shape, held in shapes.items():
             named = f"served/passes/{shape.rows}x{shape.length}"
             shares.update({f"{named}/real_token_share": held.real / computed[shape],
                            f"{named}/passes": float(held.passes)})
-        return {"served/real_token_share": sum(held.real for held in self.shapes.values())
+        return {"served/real_token_share": sum(held.real for held in shapes.values())
                 / sum(computed.values()), **shares}
 
 
@@ -1297,7 +1299,13 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
     """What the task admitted and refused, as a run's data counters count its rows (`CorpusCounts`):
     each request it answers, cut short where any row's state was, and each cut's rows and tokens;
     each it refuses under its reason (`Refused`), `unfit`, `options_alike`, or `cut` under `whole`. A
-    server reads them as a run reads its own (`CorpusCounts.metrics`)."""
+    server reports them as a run reports its own (`CorpusCounts.metrics`, `metrics`)."""
+
+    def metrics(self) -> dict[str, float]:
+        """Its passes' share of their tokens its rows held (`PassTokens.metrics`) and what it admitted and
+        refused (`counts`, under `data/.../served`), as its server reports them
+        (`dew.inference.scoring.Metered`)."""
+        return {**self.passes.metrics(), **self.counts.metrics("served")}
 
     def admit(self, request: Mapping[str, object]) -> scoring.ScoringRequest[_Row, _Admitted]:
         decide = self.decide
