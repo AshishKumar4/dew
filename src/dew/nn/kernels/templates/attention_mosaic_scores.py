@@ -22,9 +22,10 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 
 def split_queries(family: mosaic.Family) -> bool:
     """Whether the dK/dV program's consumers share one key block and split each slot's queries between them:
-    on a layout whose consumers feed their own rings (`mosaic.ConsumerFed`), each consumer's step its share
-    of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own keys."""
-    return isinstance(family, mosaic.ConsumerFed)
+    on a layout whose consumers feed their own rings (`Transport.feeds_itself`), each consumer's step its
+    share of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own
+    keys."""
+    return family.feeds_itself
 
 @dataclasses.dataclass(frozen=True)
 class _Backward:
@@ -119,7 +120,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
                                                      functools.partial(scores, masked=True))
     else:
         exponentials, weights, cotangents = scores(masked=masked)
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+    part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
+                                                         accurate=False))
     return algebra.value_weights(exponentials, weights, do_slot.dtype), part
 
 
@@ -127,7 +129,8 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
             chosen, *, masked: bool):
     """A backward tile's weights unnormalized and over `total`, its score cotangents (`algebra.grad_scores`)
     and the score hook's slopes (`algebra.tile_logits`), from its products `s` and `dp`, its coordinates, its
-    hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics."""
+    hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics, each a
+    vector or a function reading it where it is used (a stream's stage, `_dkv_step`)."""
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
     logits, slopes = algebra.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
@@ -136,28 +139,32 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     # Each query's statistics along a keys-first tile's query axis (`algebra.Coords.queries`); a queries-first
     # tile's the algebra broadcasts at each use, so no broadcast tile stays live across the step (a fused
     # launch at 128 x 64 and width 64 spilled 60 bytes holding them).
-    def per_query(x):
-        return coords.queries(x, s) if coords.keys_first else x
+    def read(x) -> jax.Array:
+        return x() if isinstance(x, functools.partial) else x
 
-    inverse_total = per_query(algebra.inverse(total))
+    def per_query(x):
+        return coords.queries(read(x), s) if coords.keys_first else read(x)
+
+    inverse_total = per_query(algebra.inverse(read(total)))
     exponentials, weights = algebra.normalized(logits, per_query(peak), inverse_total, how)
     # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
     # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
     # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
     # launch's instructions, ET-CONFLICTS-h100).
-    at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos) if walk.accurate else None
+    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
                                      inverse_total, multiplier=multiplier)
     return exponentials, weights, cotangents, slopes, seen
 
-def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq) -> None:
+def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
     """A fused dK/dV consumer's tile `dq` added into dQ at its queries from `q_first` (`place` its row and
-    head), through its output stage, free until its dK and dV are stored; interpreted, into a copy of the
-    consumer's own (`Family.added`)."""
+    head), its `columns` where it is a share of them (`pl.ds`), through its output stage, free until its dK
+    and dV are stored; interpreted, into a copy of the consumer's own (`Family.added`)."""
     row, head = place
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
+    view = view if columns is None else view.at[:, columns]
     walk.program.family.added(dq, view, walk.interpret, smem=out_smem.at[index, pl.ds(0, rows)])
 
 

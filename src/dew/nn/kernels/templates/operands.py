@@ -1,15 +1,17 @@
-"""The recurrence mainloop's products on its family (`templates.recurrence.mainloop`): a tile in shared memory
-as the parts its products take (`Parts`), and the algebra's products (`recurrence_algebra.Issue`) issued on
-the family, a register operand staged first (`Issuer`)."""
+"""Prepared operands (design §6, one protocol for every template): a tile in shared memory as the parts its
+products take (`Parts`), and products issued on a family from such tiles or from register values, a register
+operand staged first into its product's buffers, an fp32 one as its parts (`product.formed`), or taken in
+registers where the family's products read them there (`Issuer`). The recurrence's products issue so; a
+template's own parts move onto it."""
 
 import functools
-from collections.abc import Iterable
+import itertools
+from collections.abc import Callable, Iterable
 from typing import Protocol
 
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product
 
 
@@ -57,13 +59,15 @@ class Issuer:
     name, a tile a part), an fp32 one as its parts, as many as its buffers (one, a cast to theirs). A product
     whose buffers are a list of such sets keeps each value it stages there for the products after it that
     take the same value, staging a new one into the set its last product read longest ago. A product whose
-    buffers are a count takes a register left operand in that many parts as they are, staged nowhere, on a
-    family whose products read their operands from registers (`Family.operands_in_registers`,
-    `register_operand`). Operands of three parts issue the products whose parts' orders sum under three,
-    smallest first; of two, under two."""
+    buffers are a count takes a register left operand in that many parts as they are, staged nowhere, where
+    the family's product takes its left operand in registers (`Family.register_products`: mma.sync's
+    fragments, wgmma's register form). Operands of three parts issue the products whose parts' orders sum
+    under three, smallest first; of two, under two. A scaled operand (`product.Scaled`) takes its product
+    into an accumulator of its own, restored by the algebra's `restored(value, exponent)` (attention's
+    exact power of two)."""
 
-    def __init__(self, call: Issuing, buffers: dict | None = None):
-        self.call, self.buffers = call, buffers or {}
+    def __init__(self, call: Issuing, buffers: dict | None = None, restored: Callable | None = None):
+        self.call, self.buffers, self.restored = call, buffers or {}, restored
         # By product name: each set's value (held, so its identity stays its own) and its last use.
         self.held: dict = {}
 
@@ -108,46 +112,100 @@ class Issuer:
             read.append(buffer)
         return self.call.family.staged(value, buffer)
 
-    def summed(self, products: Iterable, shape: tuple[int, int] | None = None) -> jax.Array:
+    def summed(self, products: Iterable, shape: tuple[int, int] | None = None, *, retired: bool = False,
+               into=None):
         """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
         accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
         attention's output, `algebra.key_decayed_output`). Each product's operands are staged as it is
-        issued, so `products` may form them one at a time (`algebra.key_decayed_pairs`), a staging into a
-        tile an issued product may still read waiting for the products in flight first
-        (`Family.settled`). An operand may be a callable forming it then, where `shape`, the sum's, is
-        given. A `Blocks` entry (`algebra.Blocks`, a product a block of tiles in memory) is issued as a loop
-        over its blocks where the family's products read their operands from registers
-        (`Family.operands_in_registers`, whose accumulator is a value the loop carries): unrolled, ptxas held
-        every block's fragments at once, an A100's scores backward at keys and values 256 wide spilling 280
-        bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
-        products = list(products)
+        issued, so `products` may form them one at a time (`algebra.key_decayed_pairs`, attention's parts), a
+        staging into a tile an issued product may still read waiting for the products in flight first
+        (`Family.settled`); `retired`, each product done before the next is formed, so a register operand's
+        registers are free again (attention's parts, formed a part at a time). A product of a scaled operand
+        (`product.Scaled`) takes an accumulator of its own and is restored (`restored`), the unscaled
+        products before and after it each summed in one. An operand may be a callable forming it then, where
+        `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
+        a count) is issued so (`Family.register_products`). `into`, an accumulator the walk carries (its home,
+        a warpgroup accumulator ref or a register array), takes every product in place and is returned, no
+        value read (a scaled operand takes none). A `product.Blocks` entry, a product a block of tiles in
+        memory, is issued as a loop over its blocks where the family's products read their operands from
+        registers (`Family.operands_in_registers`, whose accumulator is a value the loop carries): unrolled,
+        ptxas held every block's fragments at once, an A100's scores backward at keys and values 256 wide
+        spilling 280 bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
+        products = self._entries(products)
+        first = next(products)
         family, interpret = self.call.family, self.call.interpret
+        if shape is None:
+            lhs, rhs = (first.left(0), first.right(0)) if isinstance(first, product.Blocks) else first[1:]
+            shape = (lhs.shape[0], rhs.shape[1])
+        held: list = [first]  # the next product not yet issued, where a group stopped before it
 
-        def issued(acc):
+        def group(acc, alone: bool):
+            # Products into `acc` until a scaled one (left held for its own group), or the one scaled
+            # product alone.
             read: list = []
-            for entry in products:
-                if isinstance(entry, algebra.Blocks) and self._rolls(entry):
+            while held:
+                if isinstance(held[-1], product.Blocks):
                     # The accumulator laid out as products leave it, the loop's carry one layout.
-                    block = functools.partial(self._block, entry)
-                    acc = jax.lax.fori_loop(0, entry.count, block, family.as_tile(acc))
+                    blocks = held.pop()
+                    acc = jax.lax.fori_loop(0, blocks.count, functools.partial(self._block, blocks),
+                                            family.as_tile(acc))
+                    held.extend(itertools.islice(products, 1))
                     continue
-                for name, lhs, rhs in algebra.expanded([entry]):
+                name, lhs, rhs = held[-1]
+                if isinstance(lhs, product.Scaled):
+                    if not alone:
+                        return acc
+                    lhs = lhs.value
+                held.pop()
+                registered = self._registered(name, lhs)
+                if registered is not None:
+                    (right,) = self._operand(rhs, name, lhs, read)
+                    acc = family.register_products(acc, registered, right, interpret)
+                else:
                     left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
                     acc = family.issued(acc, left, right, interpret)
+                if retired:
+                    family.settled(0)
+                held.extend(itertools.islice(products, 1))
+                if alone:
+                    return acc
             return acc
 
-        if shape is None:
-            (_, lhs, rhs), *_ = algebra.expanded(products[:1])
-            shape = (lhs.shape[0], rhs.shape[1])
-        return family.summed(shape, issued, interpret)
+        def summed_group() -> jax.Array:
+            # The group at the held product: a scaled product's own accumulator, restored, or the unscaled
+            # products from it to the next scaled one in one.
+            scaled = held[-1][1] if isinstance(held[-1][1], product.Scaled) else None
+            part = family.summed(shape, lambda acc: group(acc, alone=scaled is not None), interpret)
+            if scaled is None:
+                return part
+            if self.restored is None:
+                raise ValueError("a scaled operand's product needs the algebra's restore (`restored`)")
+            return self.restored(part, scaled.exponent)
 
-    def _rolls(self, blocks: "algebra.Blocks") -> bool:
-        """Whether `summed` issues `blocks` as a loop: more than one, on a family whose products read
-        registers, each operand a tile in memory (a `Parts`, which a block index slices)."""
-        return (blocks.count > 1 and self.call.family.operands_in_registers
-                and isinstance(blocks.left(0), Parts) and isinstance(blocks.right(0), Parts))
+        if into is not None:
+            into = group(into, alone=False)
+            if held:
+                raise ValueError("a carried accumulator takes no scaled operand's product (`into`)")
+            return into
+        total = summed_group()
+        while held:
+            total = total + summed_group()
+        return total
 
-    def _block(self, blocks: "algebra.Blocks", j, acc):
+    def _entries(self, products: Iterable):
+        """`products` as `summed` issues them: a `product.Blocks` it loops over as it is, more than one block
+        of tiles in memory (`Parts`) on a family whose products read registers; any other as its blocks'
+        products, one a block."""
+        for entry in products:
+            as_is = (not isinstance(entry, product.Blocks)
+                     or (entry.count > 1 and self.call.family.operands_in_registers
+                         and isinstance(entry.left(0), Parts) and isinstance(entry.right(0), Parts)))
+            if as_is:
+                yield entry
+            else:
+                yield from ((entry.name, entry.left(j), entry.right(j)) for j in range(entry.count))
+
+    def _block(self, blocks: product.Blocks, j, acc):
         """`acc` with block `j`'s product of `blocks` issued onto it (`summed`'s loop)."""
         left, right = blocks.left(j), blocks.right(j)
         return self.call.family.issued(acc, left.refs, right.refs, self.call.interpret)
@@ -156,9 +214,12 @@ class Issuer:
         """`lhs`'s parts in registers where its product takes it there (its buffers a count, `Issuer`'s),
         else None."""
         count = self.buffers.get(name)
-        if not isinstance(count, int) or isinstance(lhs, (Parts, product.Exact, product.Transposed)):
+        if not isinstance(count, int):
             return None
         value = lhs() if callable(lhs) else lhs
+        if not isinstance(value, jax.Array):
+            # A shared tile (`Parts`), or an operand staged its own way (`product.Exact`, `Transposed`).
+            return None
         return product.formed(value, count) if count > 1 else (value,)
 
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
@@ -184,3 +245,4 @@ class Issuer:
         if max(len(left), len(right)) == 2:
             return family.summed(shape, lambda acc: family.issued(acc, left, right, interpret), interpret)
         return family.apart(shape, left, right, interpret)
+

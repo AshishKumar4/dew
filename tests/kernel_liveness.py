@@ -11,6 +11,7 @@ allocation and scheduling constraints are checked separately."""
 import collections
 import dataclasses
 import math
+import operator
 import re
 
 from jax._src.interpreters import mlir as jax_mlir
@@ -382,6 +383,159 @@ def _streams_into(value, parent, seen=None) -> bool:
     return True
 
 
+INTEGER_OPERATIONS = {
+    "arith.addi": operator.add, "llvm.add": operator.add,
+    "arith.subi": operator.sub, "llvm.sub": operator.sub,
+    "arith.muli": operator.mul, "llvm.mul": operator.mul,
+    "arith.andi": operator.and_, "llvm.and": operator.and_,
+    "arith.ori": operator.or_, "llvm.or": operator.or_,
+    "arith.xori": operator.xor, "llvm.xor": operator.xor,
+    "arith.divui": operator.floordiv, "llvm.udiv": operator.floordiv,
+    "arith.remui": operator.mod, "llvm.urem": operator.mod,
+    "arith.shli": operator.lshift, "llvm.shl": operator.lshift,
+    "arith.shrui": operator.rshift, "llvm.lshr": operator.rshift,
+}
+"""The integer operations `Threads` evaluates, each on unsigned numbers of its result's width."""
+
+INTEGER_CASTS = {"arith.index_cast": True, "arith.extsi": True, "llvm.sext": True,
+                 "arith.index_castui": False, "arith.extui": False, "arith.trunci": False,
+                 "llvm.zext": False, "llvm.trunc": False}
+"""The integer casts `Threads` evaluates, each whether it widens by the sign (a narrowing cast keeps the low
+bits either way)."""
+
+
+def _bits(type_) -> int | None:
+    """The width of an integer type, of a vector's integers, or of an index (64); None for any other."""
+    if isinstance(type_, ir.VectorType):
+        type_ = ir.VectorType(type_).element_type
+    if isinstance(type_, ir.IndexType):
+        return 64
+    return ir.IntegerType(type_).width if isinstance(type_, ir.IntegerType) else None
+
+
+def _integers(attribute, type_) -> tuple[int, ...]:
+    """The elements of an integer constant `attribute` of `type_`, a vector's too (a splat's repeated)."""
+    if isinstance(type_, ir.VectorType):
+        elements = ir.DenseIntElementsAttr(attribute)
+        return tuple(elements[index] for index in range(len(elements)))
+    return (ir.IntegerAttr(attribute).value,)
+
+
+def _integer(function, left: int, right: int, bits: int) -> int | None:
+    """`function` of two unsigned numbers of `bits` bits, in that width; None where the operation is undefined
+    (a shift by the width or more) or LLVM folds it against no bit it knows of a thread id: a division or
+    remainder by anything but a power of two, a multiply-high sequence (a column's index in a tile 224
+    wide)."""
+    if function in (operator.floordiv, operator.mod) and (right == 0 or right & (right - 1)):
+        return None
+    if function in (operator.lshift, operator.rshift) and right >= bits:
+        return None
+    return function(left, right) & ((1 << bits) - 1)
+
+
+def _cast(element: int, source: int, bits: int, signed: bool) -> int:
+    """`element`, an unsigned number of `source` bits, as one of `bits`: its low bits where narrower, else
+    extended by its sign (`signed`) or by zeros."""
+    if signed and element >> (source - 1):
+        element -= 1 << source
+    return element & ((1 << bits) - 1)
+
+
+def _axis(op) -> int | None:
+    """The axis (0, 1, 2: x, y, z) a `gpu.thread_id` or `gpu.block_dim` names."""
+    builder = ir.AttrBuilder.get("gpu.GPU_DimensionAttr")
+    return next((axis for axis in gpu.Dimension
+                 if op.attributes["dimension"] == builder(axis, context=op.context)), None)
+
+
+def _block_threads(op) -> tuple[int, ...] | None:
+    """The thread dimensions of the `gpu.launch` around `op`; None outside one, or a size not constant."""
+    launch = op.parent
+    while launch is not None and launch.name.removeprefix(PREFIX) != "gpu.launch":
+        launch = launch.parent
+    if launch is None:
+        return None
+    view = launch.opview
+    sizes = [_constant(size) for size in (view.blockSizeX, view.blockSizeY, view.blockSizeZ)]
+    return tuple(size for size in sizes if size is not None) if None not in sizes else None
+
+
+class Threads:
+    """What each thread of a launch computes of the values made of its thread ids and constants alone, by the
+    integer operations LLVM folds against the bits it knows of a thread id (`INTEGER_OPERATIONS`, a division
+    or remainder by a power of two alone) and casts (`INTEGER_CASTS`), and vectors assembled from them:
+    Mosaic's index chains over a layout (a lane's, a warp's and a register's place in a tile, `Family.iota`).
+    Each is evaluated for every thread of the launch's block, as a tuple of its elements."""
+
+    def __init__(self):
+        self.found: dict = {}
+
+    def columns(self, value) -> list[tuple[int, ...]] | None:
+        """`value`'s elements, each as the numbers the threads of its launch hold of it (by flat thread id);
+        None where `value` is not made of thread ids and constants alone, or its elements are not 32 bits. An
+        element every thread holds alike is a constant: LLVM folds it from the bits it knows of the thread id
+        (a column's index with its lane's bits masked off leaves its register's place, the offsets a causal
+        mask compares against its row's bound, `Family.column_offsets`) and ptxas takes it as an immediate
+        (`ISETP.GT.AND P4, PT, R12, 0x8`). Elements equal in every thread are one value: LLVM merges them (a
+        column's index with its register's bits masked off leaves its lane's, the same in each of a thread's
+        registers' columns: one `and.b32 %r10, %r92, 6`)."""
+        owner = value.owner
+        sizes = None if isinstance(owner, ir.Block) else _block_threads(owner.operation)
+        if sizes is None or _bits(value.type) != 32:
+            return None
+        rows = self._rows(value, sizes)
+        return None if rows is None else [tuple(row[index] for row in rows) for index in range(len(rows[0]))]
+
+    def _rows(self, value, sizes) -> list[tuple[int, ...]] | None:
+        """`value`'s elements in each thread of a block of `sizes` (by its flat id, x fastest); None where it
+        is not made of thread ids and constants alone: a block's id, a loop's carry, any other operation."""
+        if value not in self.found:
+            self.found[value] = self._computed(value, sizes)
+        return self.found[value]
+
+    def _computed(self, value, sizes) -> list[tuple[int, ...]] | None:
+        owner = value.owner
+        if isinstance(owner, ir.Block):
+            return None
+        op, bits = owner.operation, _bits(value.type)
+        name, threads = op.name.removeprefix(PREFIX), math.prod(sizes)
+        if bits is None or len(op.results) != 1:
+            return None
+        if name in ("arith.constant", "llvm.mlir.constant"):
+            if bits % 8:
+                return None
+            elements = _integers(op.attributes["value"], value.type)
+            return [tuple(e & ((1 << bits) - 1) for e in elements)] * threads
+        if name in ("gpu.thread_id", "gpu.block_dim"):
+            axis = _axis(op)
+            if axis is None:
+                return None
+            if name == "gpu.block_dim":
+                return [(sizes[axis],)] * threads
+            return [(thread // math.prod(sizes[:axis]) % sizes[axis],) for thread in range(threads)]
+        if name not in (*INTEGER_OPERATIONS, *INTEGER_CASTS, "vector.from_elements", "vector.broadcast",
+                        "vector.splat"):
+            return None
+        found = [self._rows(operand, sizes) for operand in op.operands]
+        operands = [rows for rows in found if rows is not None]
+        if len(operands) != len(found):
+            return None
+        if name in INTEGER_OPERATIONS and len(operands) == 2:
+            computed = [[_integer(INTEGER_OPERATIONS[name], a, b, bits) for a, b in zip(*pair, strict=True)]
+                        for pair in zip(*operands, strict=True)]
+            rows = [tuple(e for e in row if e is not None) for row in computed]
+            return None if any(len(row) != len(given) for row, given in zip(rows, computed, strict=True)) \
+                else rows
+        if name in INTEGER_CASTS and len(operands) == 1 and (source := _bits(op.operands[0].type)):
+            return [tuple(_cast(e, source, bits, INTEGER_CASTS[name]) for e in row) for row in operands[0]]
+        if name == "vector.from_elements":
+            return [tuple(e for row in rows for e in row) for rows in zip(*operands, strict=True)]
+        if name in ("vector.broadcast", "vector.splat") and isinstance(value.type, ir.VectorType):
+            count = math.prod(ir.VectorType(value.type).shape)
+            return [row * count for row in operands[0]] if all(len(row) == 1 for row in operands[0]) else None
+        return None
+
+
 def _recomputed(op, seen: set) -> int:
     """The instructions recomputing `op`'s results from special registers and constants: its own (none for a
     regrouping, `COSTLESS`; five for a remainder or quotient by a constant not a power of two, a
@@ -422,6 +576,9 @@ class _Pass:
         self.free = set()
         self.divergent = divergent
         self.compiler = compiler
+        self.threads = Threads()
+        # The register each distinct number a hoisted chain's elements hold in the threads takes (`_kept`).
+        self.registers: dict = {}
         self.launches: list[Peak] = []
         self.mma_words = 0
         # Each run of a block's warpgroup products' accumulator atoms, by the run's key: ptxas issues every
@@ -488,6 +645,27 @@ class _Pass:
             return False
         return all(operand in self.free for operand in op.operands)
 
+    def _kept(self, value) -> list:
+        """The registers of `value`, a chain hoisted out of the loop that reads it and held across the loop
+        (`RECOMPUTED`): one for each distinct number its elements hold in the threads (`Threads.columns`),
+        none for an element every thread holds alike; a register for each part where the numbers are
+        unknown."""
+        columns = self.threads.columns(value)
+        if columns is None:
+            return self.atoms.fresh(value.type)
+        element = value.type
+        if isinstance(element, ir.VectorType):
+            element = ir.VectorType(element).element_type
+        kept = []
+        for column in columns:
+            if len(set(column)) == 1:
+                kept.append(None)
+                continue
+            if column not in self.registers:
+                (self.registers[column],) = self.atoms.fresh(element)
+            kept.append(self.registers[column])
+        return kept
+
     def define(self, op):
         """The atoms of `op`'s results: its operands' where it only regroups them, else new ones."""
         name = op.name.removeprefix(PREFIX)
@@ -503,7 +681,11 @@ class _Pass:
                 and _recomputed(op, set()) > RECOMPUTED):
             # Hoisted out of a loop that reads it, and longer than ptxas recomputes: kept in registers.
             for value in produced:
-                self.atoms.of[value] = self.atoms.fresh(value.type)
+                self.atoms.of[value] = self._kept(value)
+                if self.atoms.of[value] and all(atom is None for atom in self.atoms.of[value]):
+                    # Every thread holds the same: an immediate.
+                    self.atoms.of[value] = []
+                    self.free.add(value)
             return
         if name in FREE or self._rematerialized(op, name):
             for value in produced:
@@ -840,7 +1022,10 @@ RECOMPUTED = 3
 """The longest chain of instructions from special registers and constants ptxas recomputes at a use rather
 than keeps; a longer one hoisted out of a loop it is read in is held across the loop (192 hoisted values at
 a 128-register cap: chains of 3 from the thread id recompute, of 4 spill, on CUDA 12.9 and 13.4; an sm80
-attention mask's column ids, 45 to 127 of them, held so in its SASS)."""
+attention mask's column ids, 45 to 127 of them, held so in its SASS), as a register for each distinct number
+the threads hold of it (`_kept`): LLVM folds what every thread holds alike to an immediate (the sm90 fused
+dK/dV backward's 32 mask offsets, `ISETP.GT.AND P4, PT, R12, 0x8`) and merges what is equal in every thread
+(the fused forward's 32 mask bases, one `and.b32 %r10, %r92, 6`)."""
 COSTLESS = re.compile(r"(arith\.(index_cast|index_castui|extui|extsi|trunci|bitcast)"
                       r"|vector\.(broadcast|splat|extract|extractelement|from_elements|insert|insertelement|bitcast)"
                       r"|llvm\.(bitcast|extractvalue|insertvalue|extractelement|insertelement|zext|sext|trunc)"

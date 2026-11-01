@@ -58,7 +58,7 @@ from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import bundles, mosaic, product, resources
 from dew.nn.kernels.templates.gemm import cost
-from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
+from dew.nn.kernels.templates.operands import Issuer, Parts
 
 
 def bundle_dtype(dtype) -> jnp.dtype:

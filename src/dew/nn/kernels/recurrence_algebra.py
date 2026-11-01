@@ -43,7 +43,7 @@ import numpy as np
 
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.templates.attention_algebra import power2
-from dew.nn.kernels.templates.product import Exact, Transposed
+from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul, two_product
 
 from . import recurrence
@@ -617,24 +617,6 @@ backward's loads a `Tile`."""
 TileLoad = Callable[..., Tile]
 """A load of a `Tile` (the backward's operands)."""
 
-
-class Blocks(NamedTuple):
-    """`count` products named `name` to sum, `left(j) @ right(j)` a block `j` (tiles in memory): one a
-    block, which a mainloop may issue as a loop over `j`, its operands' fragments loaded a block at a time
-    (`templates.recurrence.issuing.Issuer.summed`), where unrolled ptxas held every block's at once."""
-
-    name: str
-    left: Callable[..., "Operand"]
-    right: Callable[..., "Operand"]
-    count: int
-
-
-def expanded(products) -> list:
-    """`products`, `(name, left, right)` and `Blocks`, as a list of `(name, left, right)`, a product a
-    block."""
-    return [product for entry in products
-            for product in ([(entry.name, entry.left(j), entry.right(j)) for j in range(entry.count)]
-                            if isinstance(entry, Blocks) else [entry])]
 
 Operand = jax.Array | Tile | Transposed | Exact
 """A product's operand (`Issue`'s): registers, a tile in memory, or registers taken transposed."""

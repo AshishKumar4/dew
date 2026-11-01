@@ -68,14 +68,19 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
-accurate."""
+RAISED_FORMS = ("fused-shared-dq", "fused-producer-dq")
+"""The backward's forms whose consumers hold more registers than a warpgroup's even share, legal only where
+the GPU's compile honors their raise (`resources.RAISES_HONORED`)."""
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
+                  *(RAISED_FORMS if resources.RAISES_HONORED else ()), "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
+where raises hold (`RAISED_FORMS`), and the accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128,
+               "fused-producer-dq": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
 the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
 128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
@@ -88,12 +93,18 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     `accurate-halves` (a width split's, `BackwardTiles.columns`); or the fast form's one launch (`fused`),
     queries first on the dQ launch's layout, or keys first on `FED`'s (`fused-keys-first`), each consumer
     64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
-    (`fused-shared-keys`)."""
+    (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
+    their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
+    producer adding it (`fused-producer-dq`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
     if form == "fused-shared-keys":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
                                                      shared_keys=True)
+    if form in ("fused-shared-dq", "fused-producer-dq"):
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
+                                                     dkv_consumers=2, shared_dq=True, staged_logits=True,
+                                                     producer_dq=form == "fused-producer-dq")
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
     if form == "accurate":
@@ -1490,14 +1501,17 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in ("sm90",)
+GATED = ("sm90",)
+"""The GPUs whose families the mainloop qualifies (`attention_mosaic_program.QUALIFIED`): an H100's
+wgmma."""
+
+BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
-BACKWARD_GATE += [("sm90", width, False, hooks) for width in (64, 128) for hooks in BACKWARD_HOOKS
-                  if hooks != "none"]
-"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (an H100's; mma.sync's
-is not, `test_an_a100_derives_no_mosaic_backward`), a causal call's head widths, each form, hookless; and
-each score hook at the widths a hooked call's derivation takes whole (row 2281: its live set beside the
-step's)."""
+BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
+                  for hooks in BACKWARD_HOOKS if hooks != "none"]
+"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
+call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
+whole (row 2281: its live set beside the step's)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
@@ -1536,14 +1550,16 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
     assert _gated_backward("sm80", 128, accurate)[2] is None
 
 
-FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
-                for training in (template.Kept.NONE, template.Kept.SPLIT)]
-FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
+FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
+                for width in (64, 128, 256) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
-                 for hooks in BACKWARD_HOOKS if hooks != "none"] + [(256, template.Kept.NONE, "softcap")]
-"""The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
-forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
-set beside the walk's)."""
+                 for hooks in BACKWARD_HOOKS if hooks != "none"]
+FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
+"""The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
+head widths, the inference and the training forward, hookless, each score hook at the widths a hooked
+call's derivation takes (row 2281: its live set beside the walk's), and a softcap's inference forward 256
+wide (Gemma's)."""
 
 
 def _forward_kernels(op, ba, config) -> dict:
@@ -1561,10 +1577,10 @@ def _forward_kernels(op, ba, config) -> dict:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("width", "training", "hooks"), FORWARD_GATE)
-def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, hooks):
+@pytest.mark.parametrize(("generation_name", "width", "training", "hooks"), FORWARD_GATE)
+def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
-    wide under the score hook `hooks` names, lowered and compiled by ptxas for an H100 on this CPU
+    wide under the score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
     model's decision ptxas's (`mosaic_failures`)."""
     from fla_gdn_support import KernelCase
@@ -1579,7 +1595,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, h
     def forward(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, hooked, residuals=training)
 
-    with generation.assumed("sm90"):
+    with generation.assumed(generation_name):
         zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
         op, args = attention_mosaic._forward_call(*zeros, spans, hooked, scale=None,
                                                   natural=attention_mosaic.NATURAL)
@@ -1588,7 +1604,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, h
         assert config is not None, f"the Mosaic forward derives no config {width} wide"
         found = compile_mosaic_kernels(
             [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
-            "sm90")
+            generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
