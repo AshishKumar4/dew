@@ -415,14 +415,16 @@ def _reverse_keyed(call: _Call, h) -> tuple[_Operand, object]:
 def _reverse_launched(call: _Call, batch: int, bv: int, walked_width: int, *, gates: bool,
                       skips: bool = False) -> tuple:
     """`_reverse`'s outputs' types, its walked streams and its final memories' streams, a program walking
-    `walked_width` value columns; where the walk `gates` the values, their stream and beta's sums, and where
-    it `skips`, the skip's sums."""
+    `walked_width` value columns; where the walk `gates` the values, their stream and beta's sums, where it
+    `skips`, the skip's sums, and under a decay a key dimension the memory decay's."""
     width, value_width, given = call.width, call.value_width, call.given
     final = _Operand(batch * call.heads * width, 1, jnp.dtype(jnp.float32))
     out_type = (call.memories.shape(value_width), _value_grads(call).shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32),
                 *((jax.ShapeDtypeStruct((value_width // bv, call.heads, call.rows), jnp.float32),)
-                  * (gates + skips)))
+                  * (gates + skips)),
+                *((jax.ShapeDtypeStruct((value_width // bv, call.chunks * call.heads * width), jnp.float32),)
+                  * call.per_key))
     keyed = _reverse_keyed(call, 0)[0]
     blocks = _streamed(queries=((CHUNK, width), keyed), keys=((CHUNK, width), keyed),
                        **({"w": ((CHUNK, width), dataclasses.replace(call.held, rows=call.rows))}
@@ -452,14 +454,12 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
     `[HV]` fp32 there, `dv` takes `D do` too and a fifth output the skip's, `sum(v do)`, as that kernel forms
     `dD`. Under a decay a key dimension `memory` is the memories each chunk enters (`call.memories`), and a
     fourth output `[Dv / BV, chunks * HV * Dk]` fp32 each value block's part of the memory decay's gradient
-    `sum(h dh)` (`algebra.key_memory_decay`), from the memory's gradient as the walk holds it, its key rows
-    in a tile's rows (in `key_backward._key_memory_back` they met the keys' columns, kda-lower5-sm90 at
-    6e03eb57e)."""
-    width, value_width, family = call.width, call.value_width, call.family
+    `sum(h dh)` (`algebra.key_memory_decay`) from the memory's gradient the walk holds, its key rows a
+    tile's (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held)."""
+    width, value_width, family, grads = call.width, call.value_width, call.family, _value_grads(call)
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
-    grads = _value_grads(call)
     batch = dht.shape[0] // (call.heads * width)
     final = _Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     chunks = call.chunks
@@ -504,36 +504,19 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
 
         def _reverse_step(lands, issue, column, columns, f, slots, grad, accumulators):
             n = chunks - 1 - f
-            span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
+            span = pl.ds(n * CHUNK, CHUNK)
             for i, part in enumerate(grad):
                 before_store()
                 memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
                                smem=lands[f"memory{i}"], wait=False)
                 if call.per_key:
                     rows = pl.ds(memory(n, i), call.block)
-                    entered = family.tile_of(entered_ref.at[rows, pl.ds(column, bv)])
-                    gated_ref[0].at[column // bv, rows][...] = algebra.key_memory_decay(entered, part)
-
-            def block(name, operand, i):
-                return _tile(slots, name, operand, columns=pl.ds(i * call.block, call.block))
+                    gated_ref[0].at[column // bv, rows][...] = algebra.key_memory_decay(
+                        family.tile_of(entered_ref.at[rows, pl.ds(column, bv)]), part)
 
             out = _tile(slots, "out", given, columns=columns)
-            local = _tile(slots, "local", grads, columns=columns).value().astype(jnp.float32)
-            keyed = _reverse_keyed(call, h)[0]
-            keys, queries = (functools.partial(block, name, keyed) for name in ("keys", "queries"))
-            weights = functools.partial(block, "w", held) if call.delta else None
-            if call.per_key:
-                # Each key slice's rows' decays across the chunk, `exp2(g_last)` a column's.
-                kept = [algebra.raised(*(family.rows_of(ref.at[last, pl.ds(h * width + i * call.block,
-                                                                            call.block)])
-                                         for ref in (hi_ref, lo_ref)))[:, None] for i in range(slices)]
-                grad, dv = algebra.key_reverse_carried(grad, keys, weights, queries, out, local, kept,
-                                                       held.dtype, issue)
-            else:
-                gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
-                ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
-                grad, dv = algebra.reverse_carried(grad, keys, weights, queries, out.value(), local, gate,
-                                                   low, ending, ending_low, scale, held.dtype, issue)
+            grad, dv = _reverse_carried(call, slots, grad, out, columns, issue, (hi_ref, lo_ref), h, n,
+                                        scale=scale)
             if gates:
                 skip = None if skip_ref is None else skip_ref[h]
                 dv, *terms = _values_gated_back(call, slots, columns, out, dv,
@@ -552,9 +535,6 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                        landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
     out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates, skips=skips)
-    if call.per_key:
-        out_type = (*out_type, jax.ShapeDtypeStruct((value_width // bv, call.chunks * call.heads * width),
-                                                    jnp.float32))
     # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
     steps = chunks / sequences.shape[0]
     work = Work(2 * (2 + call.delta) * CHUNK * width * walked_width * steps, steps)
@@ -577,6 +557,33 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                                 k if v is None else v, hi if beta is None else beta,
                                 *(() if skip is None else (skip.astype(jnp.float32),)),
                                 *(() if memory is None else (memory,)))
+
+
+def _reverse_carried(call: _Call, slots, grad: list, out: Parts, columns, issue: Issuer, prefix: tuple, h,
+                     n, *, scale: float) -> tuple:
+    """`_reverse`'s step's algebra on chunk `n` of head `h`: the memory's gradient carried through the chunk
+    and the corrected values' (`algebra.reverse_carried`; under a decay a key dimension
+    `algebra.key_reverse_carried`, each key slice's rows decayed across the chunk by `exp2(g_last)` a
+    column's), from the walk's tiles (`slots`, the value block's `columns`) and the prefix's halves'
+    refs."""
+    family, held, width = call.family, dataclasses.replace(call.held, rows=call.rows), call.width
+    span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
+
+    def block(name, operand, i):
+        return _tile(slots, name, operand, columns=pl.ds(i * call.block, call.block))
+
+    local = _tile(slots, "local", _value_grads(call), columns=columns).value().astype(jnp.float32)
+    keyed = _reverse_keyed(call, h)[0]
+    keys, queries = (functools.partial(block, name, keyed) for name in ("keys", "queries"))
+    weights = functools.partial(block, "w", held) if call.delta else None
+    if call.per_key:
+        kept = [algebra.raised(*(family.rows_of(ref.at[last, pl.ds(h * width + i * call.block, call.block)])
+                                 for ref in prefix))[:, None] for i in range(width // call.block)]
+        return algebra.key_reverse_carried(grad, keys, weights, queries, out, local, kept, held.dtype, issue)
+    gate, low = (family.rows_of(ref.at[h, span]) for ref in prefix)
+    ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in prefix)
+    return algebra.reverse_carried(grad, keys, weights, queries, out.value(), local, gate, low, ending,
+                                   ending_low, scale, held.dtype, issue)
 
 
 def _values_gated_back(call: _Call, slots, columns, out: Parts, dv, betas, skip) -> tuple:
