@@ -22,10 +22,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sparx.shapes import Circle
 
-__version__ = "1.0"
-
 _EXPORTS = {"Circle": "sparx.shapes", "Model10": "sparx.shapes", "Model2": "sparx.shapes",
-            "area": "sparx.measures", "PI": "sparx.measures"}
+            "area": "sparx.measures", "PI": "sparx.measures", "__version__": "sparx._version"}
 
 
 def __getattr__(name: str) -> type | Callable:
@@ -61,6 +59,7 @@ def tree(root: Path) -> Path:
         "class Circle:\n    pass\n\n\nclass Model2:\n    pass\n\n\nclass Model10:\n    pass\n")
     (root / "sparx" / "measures.py").write_text(
         "PI = 3.0\n\n\ndef area(radius):\n    return PI * radius**2\n")
+    (root / "sparx" / "_version.py").write_text('__version__ = "1.0"\n')
     return root
 
 
@@ -86,7 +85,7 @@ def test_a_package_whose_lists_disagree_is_rewritten_for_every_consumer(tmp_path
     assert generate(root, "--check") == 0
     star, shapes = ["Circle", "Model10", "Model2", "PI", "__version__", "area"], ["Model2", "Model10"]
     assert consumed(root, "runtime") == {"bound": {}, "star": star, "area": 3.0, "shapes": shapes}
-    bound = dict.fromkeys(["Circle", "Model10", "Model2", "PI", "area"], True)
+    bound = dict.fromkeys(["Circle", "Model10", "Model2", "PI", "__version__", "area"], True)
     assert consumed(root, "static") == {"bound": bound, "star": star, "area": 3.0, "shapes": shapes}
     ruff = subprocess.run([sys.executable, "-m", "ruff", "check", "--config", str(REPO / "pyproject.toml"),
                            "--select=I001,RUF022,F401,F811", str(root / "sparx" / "__init__.py")],
@@ -106,3 +105,23 @@ def test_an_export_moved_to_another_module_is_read_from_there(tmp_path):
     assert generate(root) == 0
     assert consumed(root, "runtime")["area"] == 3.0
     assert consumed(root, "static")["bound"]["area"]
+
+
+def test_a_package_exporting_its_own_module_binds_it_from_a_relative_path(tmp_path):
+    """A package that exports its own module of a name (`"measures": "sparx.measures"`), rewritten from a path
+    relative to where the tool runs, imports the module itself where a type checker reads it, and lists it
+    for a star import."""
+    root = tree(tmp_path)
+    package = root / "sparx" / "__init__.py"
+    package.write_text(package.read_text().replace('"area": "sparx.measures"',
+                                                   '"area": "sparx.measures", "measures": "sparx.measures"'))
+    done = subprocess.run([sys.executable, str(TOOL), "sparx"], cwd=root, capture_output=True, text=True,
+                          timeout=120)
+    assert done.returncode == 0, done.stderr
+    script = ("import importlib, sys, typing\ntyping.TYPE_CHECKING = True\nimport sparx\n"
+              "print(sparx.measures is importlib.import_module('sparx.measures'),\n"
+              "      'measures' in sparx.__all__)\n")
+    read = subprocess.run([sys.executable, "-c", script], cwd=root, env={"PYTHONPATH": str(root)},
+                          capture_output=True, text=True, check=True)
+    assert read.stdout.split() == ["True", "True"]
+

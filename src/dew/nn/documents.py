@@ -50,8 +50,7 @@ def document_mask(segment_ids) -> jax.Array:
     the mask every kernel but splash and the pallas flash kernel reads for
     `segment_ids`; those two compare the ids per block.
     """
-    queries, keys = document_ids(segment_ids)
-    return (queries[:, :, None] == keys[:, None, :]) & (queries[:, :, None] != 0)
+    return _spanned(segment_ids)
 
 
 def with_documents(mask, segment_ids):
@@ -100,6 +99,15 @@ def held_keys(segment_ids: CrossDocuments) -> jax.Array:
     return _searched(ordered, wanted, "right") - _searched(ordered, wanted, "left")
 
 
+def holds_keys(segment_ids: CrossDocuments) -> jax.Array:
+    """Whether each query's document holds any key in its row, `[B, Q]`, whatever order the keys stand
+    in: the keys sorted first (`held_keys` reads them in ascending order), a padding query (0) holding
+    none."""
+    queries, keys = document_ids(segment_ids)
+    ordered, wanted = jnp.sort(_padding_last(keys), axis=-1), _padding_last(queries)
+    return (queries != 0) & (_searched(ordered, wanted, "right") > _searched(ordered, wanted, "left"))
+
+
 def aligned_places(segment_ids: CrossDocuments) -> jax.Array:
     """Each query's place among its document's keys under causality or a window, `[B, Q]`: a document's
     query of rank r among its Q queries sits at rank K - Q + r among its K keys (`CrossDocuments`)."""
@@ -121,9 +129,21 @@ def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
     query's place, a window of w the w - 1 before it, or without causality those within w - 1 of it
     (`dew.nn.visibility.window_sides`). A key's rank in its document is its distance from the
     document's first key, the keys running in ascending id order."""
+    # Elementwise over the keys' ranks, not the spans' sorted search, which takes no batch-sharded ids
+    # under explicit sharding (test_parallelism_matrix's data4_explicit).
     _, keys = document_ids(segment_ids)
     ordered = _padding_last(keys)
     key_rank = jnp.arange(keys.shape[-1])[None, :] - _searched(ordered, ordered, "left")
     keep = document_mask(segment_ids) & visible(aligned_places(segment_ids)[:, :, None], key_rank[:, None, :],
                                                  causal=causal, window=sliding_window)
     return keep[:, None]
+
+
+def _spanned(segment_ids) -> jax.Array:
+    """The keys each query of a call of documents `segment_ids` sees by its documents alone, `[B, Q, K]`:
+    every key in reach, the ids keeping each query to its own, padding none, as spans (`template.dense`)."""
+    from dew.nn.kernels.templates import attention as template
+
+    queries, keys = document_ids(segment_ids)
+    end = jnp.where(queries == 0, 0, keys.shape[1]).astype(jnp.int32)
+    return template.dense(template.KeySpans(jnp.zeros_like(end), end, queries, keys, keys.shape[1], "spans"))

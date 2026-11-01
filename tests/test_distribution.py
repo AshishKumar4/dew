@@ -10,6 +10,7 @@ whose data axis crosses the two is hybrid sharding; the losses it trains to
 have to be the reference's.
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -313,9 +314,7 @@ def test_a_declared_pool_without_a_coordinator_is_refused():
     assert alone.returncode == 0, alone.stdout + alone.stderr
 
 
-@pytest.mark.gpu(reason="a cluster pins device ids on GPU; the CPU backend takes none")
-@pytest.mark.mesh(devices=2)
-def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
+def a_launched_process_keeps_every_device_inside_a_slurm_step():
     """`dew launch --processes-per-host 1` gives its one process every local
     device, and names none of them. Inside a Slurm step, JAX's detection would
     still place it:
@@ -437,7 +436,7 @@ def test_a_stopped_pool_ends_its_ranks_without_aborts():
     SIGKILLed after the grace. Rank 0's process holds the pool's coordination
     service: killed first, it left the others to abort in XLA's error
     polling, with "Check failure" stack traces that read as crashes of their
-    own (DistSequence's land7 run, stopped by its timeout). Stopped last, it
+    own (a sequence-parallel distribution run, stopped by its timeout). Stopped last, it
     leaves no rank to abort."""
     program = ("import os, time\n"
                "from dew.training.runtime import prepare_process\n"
@@ -479,16 +478,19 @@ def stopped_by_sigterm(process: subprocess.Popen, after: str, timeout: float = 3
 
 
 def resumed_where_it_stopped(tmp_path: Path, run) -> None:
-    """Train the worker's varying stream for eight steps uninterrupted; again,
+    """Train the worker's varying stream for eight steps uninterrupted and, beside it, again,
     SIGTERMed after its second step; and once more from its checkpoints.
     `run(arguments, stop)` runs the worker with `arguments` and returns its
     exit code and output, SIGTERMed after the second step when `stop`."""
     steps, checkpoints = 8, tmp_path / "checkpoints"
     worker = ["--steps", str(steps), "--vary"]
-    code, output = run([*worker, "--out", str(tmp_path / "whole.json")], stop=False)
-    assert code == 0, output
-    code, output = run([*worker, "--out", str(tmp_path / "stopped.json"), "--checkpoints", str(checkpoints),
-                        "--step-seconds", "1"], stop=True)
+    # The uninterrupted run shares nothing with the stopped one, which it runs beside (ledger 2190).
+    with concurrent.futures.ThreadPoolExecutor(1) as beside:
+        uninterrupted = beside.submit(run, [*worker, "--out", str(tmp_path / "whole.json")], stop=False)
+        code, output = run([*worker, "--out", str(tmp_path / "stopped.json"), "--checkpoints",
+                            str(checkpoints), "--step-seconds", "1"], stop=True)
+        whole_code, whole_output = uninterrupted.result()
+    assert whole_code == 0, whole_output
     assert code == 128 + signal.SIGTERM, output
     stopped = re.search(r"Preempted at step (\d+)", output)
     assert stopped is not None, output
@@ -577,9 +579,7 @@ def test_a_pool_whose_program_ends_while_its_failure_watches_read_exits_cleanly(
     assert code == 0, output
 
 
-@pytest.mark.gpu(reason="the execution bound is XLA's GPU watchdog; CPU pools have none")
-@pytest.mark.mesh(devices=2)
-def test_a_rank_that_stalls_between_collectives_ends_the_pool():
+def a_rank_that_stalls_between_collectives_ends_the_pool():
     """Rank 1 stops before its fourth step without failing, as a rank blocked
     on a read, or on a compile that waits for its peers, does. Rank 0 waits
     inside that step's reduction. Every process stays alive and none fails,
@@ -714,9 +714,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
     assert done.returncode != 0, done.stdout + done.stderr
 
 
-@pytest.mark.gpu(reason="a CPU array reaches its host without a device-to-host transfer")
-@pytest.mark.mesh(devices=2)
-def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
+def a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
     """With held_by="first" only process 0 holds the gathered tree. Process 1
     takes part in every computation and agreement, and copies none of the
     tree's values to its host: its preflight waits on each shard, which raises
@@ -830,6 +828,13 @@ def scheduled(tmp_path: Path, mesh: dict, processes: int, *flags: str) -> tuple[
         return json.loads(out.read_text()), {name: params[name] for name in params.files}
 
 
+def every_row(record: dict) -> dict[str, np.ndarray]:
+    """Every row every process handed the step, sorted: groups complete in any order."""
+    stacked = {name: np.concatenate(value) for name, value in record["rows"].items()}
+    order = np.lexsort(stacked["input_ids"].T[::-1])
+    return {name: value[order] for name, value in stacked.items()}
+
+
 def handed(record: dict, process: int) -> dict[str, np.ndarray]:
     """The rows `process` handed the step."""
     return {name: np.asarray(rows[process]) for name, rows in record["rows"].items()}
@@ -845,19 +850,26 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
     pool, pooled = scheduled(tmp_path, {"fsdp": 2}, 2)
     alone, single = scheduled(tmp_path, {"fsdp": 2}, 1)
     assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
-
-    def rows(record: dict) -> dict[str, np.ndarray]:
-        """Every row every process handed the step, sorted: groups complete in any order."""
-        stacked = {name: np.concatenate(value) for name, value in record["rows"].items()}
-        order = np.lexsort(stacked["input_ids"].T[::-1])
-        return {name: value[order] for name, value in stacked.items()}
-
-    together, reference = rows(pool), rows(alone)
+    together, reference = every_row(pool), every_row(alone)
     for name in ("input_ids", "response_mask", "behavior_log_probs"):
         np.testing.assert_array_equal(together[name], reference[name])
     np.testing.assert_allclose(together["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
     for name, value in single.items():
         np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+
+
+@pytest.mark.mesh(devices=2)
+def test_the_global_estimator_whitens_every_share_by_the_whole_batch(tmp_path):
+    """fsdp across two processes under REINFORCE++'s global estimator, the shares' returns spread apart
+    (`--estimator global`): each process packs its own rows, whitened by the moments of every share
+    pooled, so together they hold the advantages one process gives the whole batch, not each share's
+    own whitening."""
+    pool, _ = scheduled(tmp_path, {"fsdp": 2}, 2, "--estimator", "global")
+    alone, _ = scheduled(tmp_path, {"fsdp": 2}, 1, "--estimator", "global")
+    together, reference = every_row(pool), every_row(alone)
+    assert np.unique(np.abs(reference["advantages"])).size > 2
+    for name in ("input_ids", "response_mask", "advantages"):
+        np.testing.assert_array_equal(together[name], reference[name])
 
 
 @pytest.mark.mesh(devices=2)
@@ -911,7 +923,7 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     starts none whose fingerprints differ, openxla/xla#49677;
     docs/guides/multi-node.md), every process does; on the CPU, where a
     process's topology is its own devices, the others compile the step again,
-    as upstream JAX does (Main, 2026-10-26: no fork code for the CPU alone)."""
+    as upstream JAX does (the maintainer, 2026-10-26: no fork code for the CPU alone)."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"

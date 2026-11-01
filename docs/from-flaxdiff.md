@@ -24,8 +24,8 @@ Each row names what FlaxDiff provided, Dew's version of it, and the test that ho
 |---|---|---|
 | Linear, cosine, square-root, Karras VE and EDM schedules | `dew.diffusion.schedules`, and the `EDM`, `Karras`, `Cosine` and `Flow` presets in place of `get_diffusion_preset` | `tests/test_schedulers.py` (published beta tables, sigma grids, inversions) |
 | Flow matching, logit-normal draws, resolution shift | `FlowMatchingScheduler`, `Flow`, `ResolutionShift` | `tests/test_flow_matching.py` (SD3 and Flux losses and gradients) |
-| The exponential schedule | `published_betas(schedule="exp")` | The formula only; no test compares it with FlaxDiff's yet |
-| The continuous VP cosine and the tangent-grid cosine schedules | Not in Dew yet | |
+| The exponential schedule | `ExpNoiseScheduler` and `exp_beta_schedule`, its table clipped at its own `beta_end`; Diffusers' exponential table stays `published_betas(schedule="exp")` | `tests/test_schedulers.py`: the betas bit for bit, the rates and P2 weights on par with FlaxDiff's (`tools/flaxdiff_schedules_reference.py`) |
+| The continuous VP cosine and the tangent-grid cosine schedules | `CosineContinuousNoiseScheduler`; `CosineGeneralNoiseScheduler`, with FlaxDiff's weight, 1 + sigma^2 / sigma_max^2, its conditioning on whole thousandths of t and its sigma_data of 1. With a kappa other than 1 the grid ends at sigma_max / kappa^2, as FlaxDiff's does: `sigma_range` names those ends, which solvers keep to, and `sigma_min` and `sigma_max` hold the arguments | `tests/test_schedulers.py`: rates, sigmas and weights on par with FlaxDiff's, its conditioning exactly its own |
 | Epsilon, x0, v, velocity and EDM-preconditioned targets | `dew.diffusion.transforms` | `tests/test_predictors.py` |
 | DDPM, DDIM, Euler, Euler ancestral, Heun, RK4 and multistep DPM samplers | `dew.sampling.solvers` | `tests/test_samplers.py`; RK4 and multistep DPM against FlaxDiff's own latents and gradients |
 | Classifier-free guidance, also over an interval | `dew.sampling.guidance.CFG` | `tests/test_guidance.py` |
@@ -69,7 +69,7 @@ images = pipe(["a lighthouse on a rocky coast"], key=0, steps=25, solver=Heun())
 
 `images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way the older trainer previewed its runs, with Euler ancestral over 200 steps of that trainer's own time grid and classifier-free guidance 3. Passing another `steps` samples the same grid at that count. `tests/test_flaxdiff.py` compares a call with the older package's own preview sampling of the same run, run from its source at the pinned commit. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds the matching Dew architecture with `adaln_silu=False` and `text_pooling="all"`, the two places where the blocks of the `flaxdiff` 0.2 package differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against that package's own code.
 
-Anything else, including the older UNets and the 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
+Anything else, including the older UNets and the 2024 checkpoints, has no loader: a run of another architecture, schedule, autoencoder or condition count is refused from its config, and a 2024 aggregate checkpoint (`default/checkpoint`) by its layout. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
 
 ## FlaxDiff's named datasets
 

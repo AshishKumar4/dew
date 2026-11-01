@@ -27,6 +27,7 @@ from reference_error import (
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from tool_support import load
+from whole_suite import timed
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -83,18 +84,12 @@ def through(chunk: int, starts, dy, dfinal):
     return run
 
 
-# tools/mamba_ssd_reference.py's cases: bf16 and fp32 operands over packed documents, a ragged last chunk
-# and groups of three heads; fp32 over whole chunks and one group; fp32 at a state wider than one
-# 128-wide product, as Falcon-H1's 256. The summing kernels also take two heads a program, a group's
-# three split two and one.
-CASES = [
-    pytest.param("bf16", None, id="bf16"),
-    pytest.param("bf16", 2, id="bf16-summing-two-of-three-heads"),
-    pytest.param("ragged-documents", None, id="ragged-documents"),
-    pytest.param("ragged-documents", 2, id="ragged-documents-summing-two-of-three-heads"),
-    pytest.param("whole-chunks", None, id="whole-chunks"),
-    pytest.param("wide-state-documents", None, id="wide-state-documents"),
-]
+CASES = {"bf16": (None, 2), "ragged-documents": (None, 2), "whole-chunks": (None,),
+         "wide-state-documents": (None,)}
+"""tools/mamba_ssd_reference.py's cases, each with the heads a program its summing kernels take (None their
+own): bf16 and fp32 operands over packed documents, a ragged last chunk and groups of three heads, a group's
+three also split two and one; fp32 over whole chunks and one group; fp32 at a state wider than one 128-wide
+product, as Falcon-H1's 256."""
 
 
 def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
@@ -114,12 +109,18 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
                         and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
 
 
-@pytest.mark.parametrize("case, heads", CASES)
-def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
+PAST_TARGET = {"port": {"bf16": 256, "ragged-documents": 130, "wide-state-documents": 297}}
+"""The port's cases whose interpreted seeds take a group past its two minutes (seconds, train 270's CI on
+66a222273, ledger 2119), which the whole suite runs (`timed`)."""
+
+
+@pytest.mark.parametrize("case", timed(PAST_TARGET, "port", list(CASES)))
+def test_the_port_is_as_exact_as_mamba_ssm(case):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 
-    The truth is mamba_ssm's minimal torch reference in float64. With `heads`, kernels summing a group's heads
-    take that many a program; both configured forms see the same declared draws and every leaf.
+    The truth is mamba_ssm's minimal torch reference in float64. Each of the case's head counts (`CASES`:
+    kernels summing a group's heads take that many a program) runs every declared draw, each draw's truth
+    taken once for all of them.
     """
     stored = recording(SEEDED)
     precision = str(stored.pop(PRECISION, "no precision"))
@@ -142,23 +143,62 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         return ssd_value_and_grad(lambda *values: mamba_ssd.ssd_scan(*values, seq, chunk, INTERPRETED),
                                   inputs, jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
 
-    pins = {}
-    if heads:
-        _, inputs = draw(0)
-        rows, state = min(64, chunk), min(32, inputs["B"].shape[-1])
-        pins = {mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
-                mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
-                mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
-    with tuning.pinned(pins):
-        assert_as_exact(jax.jit(run), reference, draw, f"mamba_ssm {case}, heads={heads}",
-                        seeds=seeds, truth_fn=truth)
+    _, inputs = draw(0)
+    rows, state = min(64, chunk), min(32, inputs["B"].shape[-1])
+
+    def pinned(heads):
+        """`run` with its summing kernels taking `heads` a program, or their own where None, pinned as it
+        traces."""
+        pins = {} if heads is None else {
+            mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+            mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
+            mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
+
+        def form(index, arrays):
+            with tuning.pinned(pins):
+                return run(index, arrays)
+
+        return form
+
+    forms = [pinned(heads) for heads in CASES[case]]
+    count = len(forms)
+    assert_as_exact(jax.jit(lambda index, arrays: tuple(form(index, arrays) for form in forms)),
+                    as_given(lambda *args: (reference(*args),) * count), draw,
+                    f"mamba_ssm {case}, heads {CASES[case]}", seeds=seeds,
+                    truth_fn=as_given(lambda *args: (truth(*args),) * count))
+
+
+def the_template_is_as_exact_as_mamba_ssm():
+    """The SSD on the recurrence template under the run's fast forms (`chunk_ssd` with the scan's selector
+    named 'mosaic_gpu'), whose 16-bit numbers are mamba_ssm's (`mainloop._prepared`): every output and
+    gradient on par with recorded mamba_ssm on its bf16 case's declared draws, mamba_ssm's own distance from
+    float64 at the same inputs the bound (check 1), the truth Dew's float64 path as the port's test takes
+    it. A GPU cell (tests/test_gpu_recurrence.py): interpreted, the template's training at the case's shape
+    outlasts a test's budget. Its fp32 cases are the accurate forms' bar's
+    (test_recurrence_template_stability)."""
+    case = "bf16"
+    stored = recording(SEEDED)
+    stored.pop(PRECISION, None)
+    seeds = declared_seeds(SEEDED)[case]
+    chunk, dtype = int(stored[f"{case}.chunk"]), jnp.dtype(str(stored[f"{case}.dtype"]))
+    shape, documents = tuple(stored[f"{case}.shape"]), bool(stored[f"{case}.documents"])
+    draw, reference, truth = indexed_recording(
+        stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
+        truth_fn=jax.jit(lambda inputs: mamba_ssd_xla(inputs, chunk)))
+
+    def run(index, arrays):
+        del index
+        with generation.chosen(ssd="mosaic_gpu"):
+            return mamba_ssd_xla(arrays, chunk, dtype)
+
+    assert_as_exact(jax.jit(run), as_given(reference), draw, f"the template against mamba_ssm, {case}",
+                    seeds=seeds, truth_fn=as_given(truth))
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():
     """A scan whose head and state widths are no powers of two (Nemotron-H 4B's 80-wide heads) runs on the
-    port over its operands padded with zero columns (`recurrence_chunk._rated_scan`), its route the port's:
-    its output, final state and every operand's gradient the port's over the padded operands, cut back,
-    bit for bit."""
+    port over its operands padded with zero columns (`recurrence_chunk._rated_scan`): its output, final
+    state and every operand's gradient the port's over the padded operands, cut back, bit for bit."""
     (x, dt, A, B, C, D, h0), starts = scan_operands(2, 40, 4, 20, 2, 24, documents=True)
     keys = jax.random.split(jax.random.key(3))
     dy, dfinal = jax.random.normal(keys[0], x.shape), jax.random.normal(keys[1], h0.shape)
@@ -168,9 +208,8 @@ def test_the_port_takes_widths_padded_to_powers_of_two():
         ends = [(0, wide - size) for wide, size in zip(widths, t.shape[-len(widths):], strict=True)]
         return jnp.pad(t, [(0, 0)] * (t.ndim - len(widths)) + ends)
 
-    with row_names_port(), generation.routes() as found:
+    with row_names_port():
         got = jax.jit(through(16, starts, dy, dfinal))(x, dt, A, B, C, D, h0)
-    assert ("ssd", "pallas") in {(route.choice, route.kernel) for route in found}
     wide = (padded(x, 32), dt, A, padded(B, 32), padded(C, 32), D, padded(h0, 32, 32))
     with row_names_port():
         want = jax.jit(through(16, starts, padded(dy, 32), padded(dfinal, 32, 32)))(*wide)

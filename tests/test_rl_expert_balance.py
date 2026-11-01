@@ -64,7 +64,7 @@ class Critic(nn.Module):
     """A per-token value over an embedding, which PPO reads as `[B, T]` values."""
 
     @nn.compact
-    def __call__(self, tokens, *, segment_ids=None, positions=None):
+    def __call__(self, tokens, *, coordinates=None):
         return nn.Embed(VOCAB, 1)(tokens)[..., 0]
 
 

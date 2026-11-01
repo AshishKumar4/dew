@@ -16,12 +16,12 @@ import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from dew.batch import Variables
 from dew.interop import decoder_parts, hf_decoders as decoders
 from dew.interop.streaming import SourceLeaf, WeightLayout
+from dew.interop.unread import Stored, Unread
 
 type Place = Callable[[tuple[str, ...]], tuple[str, ...]]
 """Where a leaf of the decoder's own tree sits in the bundle that holds it."""
@@ -31,36 +31,25 @@ def _held(path: tuple[str, ...]) -> tuple[str, ...]:
     return path
 
 
-def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """Return the leaf `hf_decoders._stack_experts` stacked a per-expert
-    `experts/K/projection/kernel` path into, and K."""
-    if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
-            and path[-1] == "kernel"):
-        return (*path[:-3], path[-2], path[-1]), int(path[-3])
-    return path, None
+def _leaf_rank(variables: Mapping[str, object], path: tuple[str, ...], expert_index: int | None) -> int:
+    """Return the rank of the leaf a stored tensor is bound to, past an expert's axis.
 
-
-def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
-                  expert_index: int | None) -> int:
-    """Return how many axes a bound leaf carries ahead of its stored matrix.
-
-    A kernel stores `[in, out]` where its source stores `[out, in]`, and a
-    grouped projection's leaf keeps one such matrix per group: DeepSeek
+    A grouped projection's leaf keeps one stored matrix per group: DeepSeek
     V4's `[groups, in, rank]` is stored `[groups * rank, in]`, the group
-    axis folded into the rows (modeling_deepseek_v4.py:294-323). The
-    transpose is the same swap of the trailing pair under those axes, so
-    the leaf says how many there are. A per-expert source tensor is one
-    slice of its stacked leaf, which is taken before the transpose.
+    axis folded into the rows (modeling_deepseek_v4.py:294-323), so the
+    leaf says how many axes its orientation (`decoder_parts.stored_order`)
+    swaps under. A per-expert source tensor is one slice of its stacked
+    leaf, which is taken before the transpose. A path that holds no array
+    is a matrix's.
     """
     node: object = variables
     for part in path:
         if not isinstance(node, Mapping) or part not in node:
             raise ValueError(f"the loaded tree holds no {path}, which {part!r} names")
         node = node[part]
-    if not isinstance(node, np.ndarray | jax.Array | SourceLeaf):
-        return 0
-    rank = node.ndim - (0 if expert_index is None else 1)
-    return max(rank - 2, 0)
+    if not isinstance(node, np.ndarray | Unread | jax.Array | SourceLeaf):
+        return 2
+    return node.ndim - (0 if expert_index is None else 1)
 
 
 def reading_layout(name: str, reading: decoder_parts.Reading, config,
@@ -71,39 +60,27 @@ def reading_layout(name: str, reading: decoder_parts.Reading, config,
     the storage operations that rebuild it from them, a `packed` tensor's from the layouts of its
     parts; None where no leaf takes it. `variables` is the decoder's own tree."""
     family = decoders.family_entry(model_type)
+
+    def leaf_rank(path: tuple[str, ...], expert: int | None) -> int:
+        return _leaf_rank(variables, path, expert)
+
+    def layout(name: str, part: decoder_parts.Part, stored: Stored) -> WeightLayout | None:
+        plan = decoder_parts.part_plan(part, stored, family, leaf_rank)
+        return None if plan is None else plan.layout(name, stored.shape, place)
+
     if reading.packing is None:
-        # The tensor as stored, which `prepare` may have reshaped for the tree.
-        stored = reading.parts[0]._replace(tensor=reading.stored)
-        return _leaf_layout(name, stored, family, variables, place)
-    parts = [_leaf_layout(part.name, part, family, variables, place) for part in reading.parts]
+        # The tensor as stored, which `prepare` may have reshaped for the tree; one it made has none.
+        return None if reading.stored is None else layout(name, reading.parts[0], reading.stored)
+    parts = [layout(part.name, part, part.tensor) for part in reading.parts]
     if any(part is None for part in parts):
         raise ValueError(f"packed tensor {name!r} has no parameter path")
     return reading.packing.layout(name, [part for part in parts if part is not None], config)
 
 
-def _leaf_layout(name: str, part: decoder_parts.Part, family: decoder_parts.DecoderFamily,
-                 variables: Mapping[str, object], place: Place) -> WeightLayout | None:
-    transpose = None
-    tensor = part.tensor
-    if part.path is None:
-        return None
-    path, expert_index = _stacked_expert(part.path)
-    paths = (place(path),)
-    if path[-1] == "kernel" and tensor.ndim == 2:
-        lead = _leading_axes(variables, path, expert_index)
-        transpose = (*range(lead), lead + 1, lead)
-    # A floating weight is written in its leaf's dtype, bfloat16 and FP8
-    # included (`weights.checkpoint_dtype`'s test); an index table carries
-    # the width the checkpoint stored it in back.
-    stored = None if jnp.issubdtype(tensor.dtype, jnp.floating) else tensor.dtype
-    padded = tensor.shape[0] if part.name.endswith(family.zero_padded) else None
-    return WeightLayout(name, paths, tensor.shape, transpose, None, expert_index, stored, padded)
-
-
 def decoder_layouts(readings: Sequence[decoder_parts.Reading], record: decoder_parts.DecoderFields,
                     family: str | decoder_parts.DecoderFamily, variables: Variables, *, place: Place = _held,
                     export_name: Callable[[str], str] = str
-                    ) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
+                    ) -> tuple[tuple[WeightLayout, ...], dict[str, Stored]]:
     """Each source tensor's binding into the bundle, from the readings `read_decoder` placed in the
     decoder's tree `variables`, under `export_name` of its name, and the tensors none binds, under
     the same names. `place` puts a leaf of the decoder's tree where the bundle holds it."""

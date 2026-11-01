@@ -44,14 +44,17 @@ def main() -> None:
 
     sampler = threading.Thread(target=sample)
     sampler.start()
-    start = time.perf_counter()
-    if shard_size == "main":
-        loaded.save(out)
-    else:
-        loaded.save(out, max_shard_size=int(shard_size) if shard_size.isdigit() else shard_size)
-    seconds = time.perf_counter() - start
-    done.set()
-    sampler.join()
+    try:
+        start = time.perf_counter()
+        if shard_size == "main":
+            loaded.save(out)
+        else:
+            loaded.save(out, max_shard_size=int(shard_size) if shard_size.isdigit() else shard_size)
+        seconds = time.perf_counter() - start
+    finally:
+        # The sampler ends however the save does: a failed one raises its own error, not a hang at exit.
+        done.set()
+        sampler.join()
     files = sorted(out.rglob("*.safetensors"))
     print(json.dumps({"repo": repo, "max_shard_size": shard_size, "rss_before_gb": round(before[0], 2),
                       "rss_peak_during_save_gb": round(highest[0], 2),

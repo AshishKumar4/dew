@@ -115,23 +115,29 @@ def _keeping_gradients(optimizer):
     return optax.chain(kept, optimizer)
 
 
-def _decoder(*, scanned=False, remat=None, mixture=False, rows=8):
+def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False):
     """`_trained`'s tied bf16 decoder over fp32 parameters, as its LM objective, and the batch of
-    `rows` rows it trains on."""
+    `rows` rows it trains on; with `dex`, its first layer's two heads a differential pair whose lambda
+    anneals over its first ten updates, the whole decoder training beside it."""
+    from dew.batch import TEXT_KEY
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.lm import LMObjective
     from dew.objectives.routing import ExpertBalance
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
                               tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned, remat=remat,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
+    if dex:
+        from dew.nn.dex import DifferentialExtension
+
+        model = model.with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10, trains="all"))
     objective = LMObjective(model, seq_len=8, pad_id=0,
                             balance=ExpertBalance(aux_loss_alpha=.01) if mixture else None)
     return objective, {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
 
 
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None):
+             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -143,11 +149,12 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     `scanned` decoder of four layers runs them as one scan over their
     stacked weights, each layer's stored apart, and each block recomputes
     as `remat` names. With `longer`, every other step reads a batch of that
-    many rows, whose shape the trainer plans apart. Returns the state, each
-    step's loss and the trainer, its plan the last shape's."""
-    from dew.objectives.lm import TEXT_KEY
+    many rows, whose shape the trainer plans apart. A `dex` decoder's first
+    layer is a differential pair (`_decoder`). Returns the state, each step's
+    loss and the trainer, its plan the last shape's."""
+    from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
-    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows)
+    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows, dex=dex)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
@@ -253,6 +260,18 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, **run)
     plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, **run)
     assert int(narrow.updates) == int(plain.updates) == 2
+    assert _assert_plain_update(narrow, losses, plain, plain_losses)
+
+
+def test_a_dex_decoder_through_its_copies_trains_as_it_does_without_them():
+    """A decoder whose differential lambda anneals over the run's updates reads, in training, a float32
+    lambda the anneal computes on before its cast to bfloat16, which outside training (no updates) it
+    casts at once: the copies, chosen off the loss the step runs, its committed updates among its
+    inputs, leave lambda out, so through them every parameter, the last gradient and every loss over
+    three updates are bitwise a plain run's."""
+    narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, steps=3, dex=True)
+    plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, steps=3, dex=True)
+    assert int(narrow.updates) == 3
     assert _assert_plain_update(narrow, losses, plain, plain_losses)
 
 
@@ -373,11 +392,12 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
 
 
-def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(monkeypatch):
+def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
     """A window of one step that recomputes nothing holds about as much without its copies as with them:
     its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
-    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
-    reaches it compiles the step with them once more and keeps them, as they fit there too."""
+    own rung neither way, the plan climbs past the rung that dropped them, and keeps them dropped at the
+    rung and split it reaches: once a plan fits, a run compiles no other (whether the copies would be
+    faster there is the offline plan's to weigh, `compile_ahead`)."""
     free = 2 ** 39
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
@@ -392,11 +412,10 @@ def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(m
     assert [(probe["narrow"], probe["fits"]) for probe in probes[:2]] == [(True, False), (False, False)]
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
     planned = {key: plan[key] for key in rung}
-    fitted, last = probes[-2], probes[-1]
+    last = probes[-1]
     assert planned != {key: base[key] for key in rung}
-    assert [{key: probe[key] for key in rung} for probe in (fitted, last)] == [planned, planned]
-    assert [(probe["narrow"], probe["fits"]) for probe in (fitted, last)] == [(False, True), (True, True)]
-    assert plan["narrow"] and state.compute is not None
+    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (False, True)
+    assert not plan["narrow"] and state.compute is None
 
 
 def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):

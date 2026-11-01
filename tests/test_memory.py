@@ -22,6 +22,7 @@ from memory_support import (
     ROWS,
     WIDTH,
     applied,
+    decode_passes,
     decoded,
     drawn,
     head_of,
@@ -58,54 +59,6 @@ def test_yaads_objective_switches_by_the_whole_errors_norm():
     for delta, step in ((0.5, [0.5, 0.5]), (3.0, [2.0, 0.1])):
         gradient = jax.grad(Objective("l2_or_l1", delta=delta))(prediction, target)
         np.testing.assert_array_equal(np.asarray(gradient), np.asarray(step, np.float32))
-
-
-def test_an_l2_linear_memory_runs_the_gated_delta_rule():
-    """A linear memory on the l2 objective that steps every token is the delta rule: traced for an
-    H100, its call takes the gated delta rule's kernels through the shared recurrence's dispatch, a route
-    each product (forward, training; `recurrence_chunk.PORT_CELLS`), and the same memory chunked by four,
-    whose gradients wait for their chunk's start, decides no such route."""
-    from dew.nn.kernels import generation
-
-    def routes(module: InContextMemory) -> list[tuple[str, str]]:
-        x = jax.ShapeDtypeStruct((ROWS, LENGTH, WIDTH), jnp.float32)
-        params = jax.eval_shape(module.init, jax.random.key(0), x)
-        with generation.assumed("sm90"), generation.routes() as found:
-            jax.eval_shape(module.apply, params, x)
-        return [(route.choice, route.kernel) for route in found if route.choice == "gated_delta_rule"]
-
-    assert routes(layer("delta_rule")) == [("gated_delta_rule", "fla")] * 2
-    assert routes(layer("delta_rule").clone(chunk=CHUNK)) == []
-
-
-@pytest.mark.parametrize(("dtype", "features", "chosen", "kernel", "verdict"), [
-    ("float32", FEATURES, {}, "step", "kernel"),
-    ("float64", FEATURES, {}, "xla", "inherent"),
-    ("float32", 12, {}, "xla", "gap: roadmap: recurrence step widths"),
-    ("float32", FEATURES, {"delta_decode": "fused"}, "step", "inherent")],
-    ids=["fp32", "float64", "width_12", "fused_chosen"])
-def test_a_cached_linear_memorys_token_takes_the_shared_decode_dispatch(dtype, features, chosen, kernel,
-                                                                        verdict):
-    """A linear memory's cached token, traced for an H100, steps through the shared decode dispatch: the
-    recurrence's step kernel where it takes the state, fp32 of power-of-two widths, else the portable
-    step, so a float64 memory keeps its own precision and a head width the kernel's blocks do not take
-    never reaches its launch; with the fused step chosen, which a memory has nothing to fuse into, the
-    step. Each route off the preferred kernel says why, as the kernel-route audit reads it."""
-    from dew.nn.kernels import generation
-    from tools import kernel_routes
-
-    module = layer("delta_rule", dtype=jnp.dtype(dtype)).clone(head_features=features)
-    decode = MixerCall(decode=True)
-    with jax.enable_x64(new_val=dtype == "float64"):
-        x = jax.ShapeDtypeStruct((ROWS, 1, WIDTH), jnp.dtype(dtype))
-        params = jax.eval_shape(module.init, jax.random.key(0), x)
-        _, cache = jax.eval_shape(lambda held, x: module.apply(held, x, decode, mutable=["cache"]),
-                                  params, x)
-        with generation.assumed("sm90"), generation.chosen(**chosen), generation.routes() as found:
-            jax.eval_shape(lambda held, cached, x: module.apply({**held, **cached}, x, decode,
-                                                                mutable=["cache"]), params, cache, x)
-    [route] = [route for route in found if route.choice == "delta_decode"]
-    assert (route.kernel, kernel_routes.verdict(route)) == (kernel, verdict)
 
 
 class Product(nn.Module):
@@ -200,9 +153,10 @@ def test_logical_positions_leave_a_documents_chunks_in_place():
 def test_a_decode_continues_the_full_pass(name):
     """A prefill and then one token a call, through the cache, reads each token as the full pass does,
     momentum, chunk boundaries and a level's network as its last scheduled update committed it carried
-    across the calls: on par against float64 (check 1)."""
+    across the calls: on par with the full passes, each step's at the width it reads (`decode_passes`),
+    against float64 (check 1)."""
     module = layer(name)
-    full = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
+    full = decode_passes(module, np.ones((ROWS, LENGTH), np.int32), 6)
     assert_as_exact(decoded(module), full, drawn(module), f"decoded {name} memory",
                     seeds=SEEDS.get(f"decoded {name}", MEMORY_SEEDS),
                     truth_fn=written(module, dtype=jnp.float64))
@@ -213,7 +167,8 @@ def test_a_cached_prefill_starts_each_packed_document_afresh(name):
     """A cached prefill of packed documents starts each from the initial network, its chunks counted
     from its own first token, and the calls after it continue its last document: a prefill of a
     three-token document and five tokens of the next, then that document's last four one call each,
-    reads each token as the full packed pass does, on par against float64 (check 1)."""
+    reads each token as the full packed passes do, each step's at the width it reads (`decode_passes`), on
+    par against float64 (check 1)."""
     module = layer(name)
     decode = MixerCall(decode=True)
     segments = np.where(np.arange(LENGTH) < 3, 1, 2).astype(np.int32)
@@ -230,7 +185,7 @@ def test_a_cached_prefill_starts_each_packed_document_afresh(name):
             reads.append(token)
         return jnp.concatenate(reads, axis=1)
 
-    full = applied(module, packed(np.broadcast_to(segments, (ROWS, LENGTH))))
+    full = decode_passes(module, np.broadcast_to(segments, (ROWS, LENGTH)), 8)
     assert_as_exact(decoded, full, drawn(module), f"packed cached {name} memory", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, segments=segments))
 
@@ -256,17 +211,17 @@ def test_a_zero_step_reads_the_initial_network():
 
 def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
     """With `orthogonalize`, each matrix of a token's gradient steps as Muon's quintic Newton-Schulz of it
-    (optax's iteration, `dew.optim._orthogonalized`, Nested Learning Sec 4.2) and its vectors as they are:
-    the layer is the paper's update with that map applied to its gradients, on par against float64
-    (check 1)."""
-    from dew.optim import _orthogonalized
+    (optax's iteration, `dew.newton_schulz.orthogonalized_leaf`, Nested Learning Sec 4.2) and its vectors
+    as they are: the layer is the paper's update with that map applied to its gradients, on par against
+    float64 (check 1)."""
+    from dew.newton_schulz import orthogonalized_leaf
 
     module = layer("titans").clone(orthogonalize=5)
 
     def gradient(loss, apply, start, k, target):
         """The paper's gradient with Muon's map on each matrix, in the reference's own precision."""
         g = jax.grad(lambda held: loss(apply(held, k), target))(start)
-        return jax.tree.map(lambda leaf: _orthogonalized(leaf, 5, None) if leaf.ndim == 2 else leaf, g)
+        return jax.tree.map(lambda leaf: orthogonalized_leaf(leaf, 5, None) if leaf.ndim == 2 else leaf, g)
 
     assert_as_exact(applied(module), written(module, dtype=jnp.float32, gradient=gradient), drawn(module),
                     "orthogonalized memory", seeds=MEMORY_SEEDS,

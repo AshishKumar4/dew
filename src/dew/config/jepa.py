@@ -14,12 +14,14 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
+from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
+from dew.config.media import media_field
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
+from dew.nn.protocols import ReadsClips
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.optim import OptimConfig
-from dew.registry import JsonDict, ModelConfig, models
+from dew.registry import JsonDict, ModelConfig
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
                      "ssm_state_dim", "dropout_rate", "precision")
@@ -35,8 +37,9 @@ class JepaRunConfig(RunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("jepa"))
     """The JEPA objective and its arguments (`--objective.momentum 0.996 1.0`).
     Its EMA ramps over the whole run unless it names `momentum_steps`."""
+    # bf16 compute over float32 parameters, as the LM recipe's (`dew.config.lm`).
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("jepa_encoder", {"precision": "default", "dtype": "bfloat16"}))
+        default_factory=lambda: ModelConfig("jepa_encoder", {"precision": "default"}))
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=1e-3))
     predictor: JsonDict = dataclasses.field(default_factory=dict)
     """Predictor kwargs, over the encoder's shared ones."""
@@ -54,33 +57,40 @@ class JepaRunConfig(RunConfig):
         varies."""
         return media_field(self.chain(), "JEPA")
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
         # Compiled once, before the objective, whose EMA ramps over the run's length: JEPA reads its
         # batches as the chain makes them, with no stages of its own.
+        self.built_fresh()
         dataset, held = self.compiled(ObjectiveData(), self.chain(), self.validation)
         sample = self.sample()
         video = sample.key == "video"
-        if video != (models[self.model.name] is models["jepa_video_encoder"]):
-            raise ValueError("a video dataset and --model jepa_video_encoder go together")
-        encoder = self.model.build()
+        encoder = self.model.build(**self.numerics_fields())
+        if video != (isinstance(encoder, ReadsClips) and encoder.reads_clips):
+            raise ValueError("a video dataset and an encoder that reads clips (--model jepa_video_encoder) "
+                             "go together")
         # A frame is [height, width, channels], an image's or each of a clip's.
         grid = (sample.shape[-3] // encoder.patch_size, sample.shape[-2] // encoder.patch_size)
-        fields = self.model.fields
+        # The encoder's settings as it was built, read off the built module: its class's defaults and what
+        # the run derived for it (its compute dtype from the run's numerics), which no record of its
+        # arguments states. The predictor takes the shared ones unless `predictor` sets them, and always
+        # computes as the encoder does, its dtype and attention kernel.
+        shared = {key: getattr(encoder, key) for key in SHARED_MODEL_KEYS
+                  if hasattr(encoder, key) and key not in self.predictor}
         predictor = ModelConfig("jepa_predictor", {
-            **{key: value for key, value in fields.items() if key in SHARED_MODEL_KEYS}, **self.predictor,
-            "grid": grid, "factorized": video, "scan_order": encoder.scan_order,
-            **{key: fields[key] for key in ("dtype", "attention_impl") if key in fields}}).build()
+            **self.predictor, "grid": grid, "factorized": video, "scan_order": encoder.scan_order}).build(
+                **shared, dtype=encoder.dtype, attention_impl=encoder.attention_impl)
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
         ramp = {}
         if "momentum_steps" not in self.objective.fields:
             updates = self.trainer.total_updates(dataset)
-            if updates is None:
+            if updates is None and self.trainer.examples is None:
                 raise ValueError("a run bounded by tokens alone counts no updates ahead for the target "
                                  "encoder's momentum to ramp over; set --objective.momentum_steps")
+            # A run bounded in examples that counts no updates ahead ramps it over its progress.
             ramp = {"momentum_steps": updates}
         adapted = {}
         if self.lora is not None:
@@ -93,8 +103,7 @@ class JepaRunConfig(RunConfig):
         objective = self.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample,
                                          **ramp, **adapted)
         probes = self.validation_metrics(validates=bool(held))
-        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
-                                                      validation=held))
+        return Prepared(self, objective, dataset, metrics=probes, validation=held)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """A linear and a k-nearest-neighbour probe of the frozen encoder, where `probe_classes` names

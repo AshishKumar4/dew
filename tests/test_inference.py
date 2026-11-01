@@ -34,6 +34,7 @@ from dew.data.sources import source
 from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import Images, RunProcessor, TextGeneration, TextToImage
+from dew.inference.projections import inference_projections
 from dew.inputs import Field, TextCondition, unit_range
 from dew.registry import ModelConfig
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
@@ -145,7 +146,7 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     against 2.7e-8 rms)."""
     import torch
     from diffusers.image_processor import VaeImageProcessor
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     processor = VaeImageProcessor()
     levels = np.arange(256, dtype=np.float64)
@@ -397,6 +398,10 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=N
 
 @pytest.mark.parametrize("family", ["qwen3_5", "mimo"])
 def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, family):
+    """A Qwen3.5 or MiMo run saved when its projector recorded `vision_width`, `merge_size` and
+    `out_width` reloads (`earlier_shapes`, ledger 1622): the restored task computes, bit for bit, what
+    the trained model does over its weights packed as a task packs them (`inference_projections`),
+    whose packed products XLA:CUDA rounds otherwise than their members' (ledger 2543)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.multimodal import MultimodalTransformer
     from dew.nn.vision import MiMoProjector, Qwen35Projector, SiglipVision
@@ -424,10 +429,111 @@ def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, fam
     tokens = jnp.asarray([[1, 30, 4, 5]], jnp.int32)
     conditioning = {"pixel_values": pixels, "image_lengths": jnp.asarray([[1]], jnp.int32)}
     images = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)
-    expected = model.apply(state.variables, tokens, conditioning=conditioning, image_indices=images)
+    expected = model.apply(inference_projections(model, state.variables), tokens, conditioning=conditioning,
+                           image_indices=images)
     actual = restored.model.apply(restored.variables, tokens, conditioning=conditioning,
                                   image_indices=images)
     np.testing.assert_array_equal(actual, expected)
+
+
+def reloaded(directory, state, record) -> TextGeneration:
+    """The task a run saved at step 0 under `record` reloads (`TextGeneration.from_run`)."""
+    with Checkpoints(str(directory), keep=1) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+    return TextGeneration.from_run(str(directory), step=0)
+
+
+def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
+    """A run saved when a decoder and its layer kinds stated YaRN in a field of its own beside
+    `rope_scaling` reloads (`earlier_shapes`), its YaRN read as today's one rope scaling (ledger
+    1898): the restored task computes, bit for bit, what the trained model does over its weights
+    packed as a task packs them (`inference_projections`)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.nn.rope import YarnScaling
+    from dew.objectives.lm import LMObjective
+
+    yarn = YarnScaling(factor=4.0, original_max_position_embeddings=8)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                              max_seq_len=16, attention_impl="reference", rope_scaling=yarn,
+                              layer_types=("sliding_attention", "full_attention"),
+                              kinds={"sliding_attention": LayerKind(window=4, rope_scaling=yarn)})
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+
+    def earlier(fields):
+        # Today's union field writes its class beside its fields; the YaRN field wrote the fields alone.
+        scaling = fields.pop("rope_scaling")
+        return {**fields, "rope_scaling": None, "yarn": scaling["fields"]}
+
+    fields = record["model"]["fields"]
+    fields["kinds"]["sliding_attention"] = earlier(fields["kinds"]["sliding_attention"])
+    record["model"]["fields"] = earlier(fields)
+    restored = reloaded(tmp_path, state, record)
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]], jnp.int32)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
+                                  model.apply(inference_projections(model, state.variables), tokens))
+
+
+def test_an_earlier_mova_record_reloads_its_saved_decoder(tmp_path):
+    """A MoVA run saved when its value experts recorded the layer dispatch they ran under, at its
+    defaults, reloads (ledger 2751): the experts read their layer's routed MLP today, and the restored
+    task computes, bit for bit, what the trained model does over its weights packed as a task packs
+    them (`inference_projections`)."""
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+
+    mova = Path(__file__).parent / "fixtures" / "hf" / "k2-horizon-mova-tiny"
+    model = Pretrained.load(mova, weights=False, dtype="float32", attention_impl="reference").model
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    values = record["model"]["fields"]["value_experts"]
+    held = values["fields"] if "class" in values else values
+    held.update(implementation="auto", dispatch="global", capacity_factor=None)
+    restored = reloaded(tmp_path, state, record)
+    tokens = jnp.asarray(np.load(mova / "input_ids.npy"))
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
+                                  model.apply(inference_projections(model, state.variables), tokens))
+
+
+@pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "yarn"])
+def test_an_earlier_multimodal_record_reloads_its_saved_decoder(tmp_path, scaled):
+    """A multimodal run saved when its nested decoder, which the wrapper records as its fields alone
+    (`MultimodalTransformer.language_model`), wrote a `yarn` field of its own, unset or YaRN's, reloads
+    (`earlier_shapes`, ledger 2274): the restored task computes, bit for bit, what the trained model
+    does over its weights packed as a task packs them (`inference_projections`)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.rope import YarnScaling
+    from dew.nn.vision import Qwen35Projector, SiglipVision
+    from dew.objectives.lm import LMObjective
+
+    yarn = YarnScaling(factor=4.0, original_max_position_embeddings=8) if scaled else None
+    model = MultimodalTransformer(
+        CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                          max_seq_len=16, attention_impl="reference", rope_scaling=yarn),
+        SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1, image_size=4,
+                     patch_size=2),
+        Qwen35Projector(hidden_size=4, spatial_merge_size=2, width=16, out_width=8, bias=True), "qwen3_5", 30)
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    decoder = record["model"]["fields"]["language_model"]
+    # The earlier decoder wrote its YaRN, the fields alone, in a field of its own.
+    scaling = decoder.pop("rope_scaling")
+    decoder.update(rope_scaling=None, yarn=None if scaling is None else scaling["fields"])
+    restored = reloaded(tmp_path, state, record)
+    tokens = jnp.asarray([[1, 30, 4, 5, 6, 7, 8, 9, 10, 11]], jnp.int32)
+    conditioning = {"pixel_values": jnp.arange(48, dtype=jnp.float32).reshape(1, 1, 3, 4, 4) / 48,
+                    "image_lengths": jnp.asarray([[1]], jnp.int32)}
+    images = jnp.asarray([[-1, 0] + [-1] * 8], jnp.int32)
+    np.testing.assert_array_equal(
+        restored.model.apply(restored.variables, tokens, conditioning=conditioning, image_indices=images),
+        model.apply(inference_projections(model, state.variables), tokens, conditioning=conditioning,
+                    image_indices=images))
 
 
 def test_every_route_generates_through_the_same_packed_projections(tmp_path):
@@ -439,7 +545,7 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     export of it writes, the run's own tree, bit for bit."""
     from flax.core import unfreeze
 
-    from dew.inference.projections import inference_projections, projection_groups
+    from dew.inference.projections import projection_groups
     from dew.interop import Pretrained
     from dew.objectives.lm import LMObjective
     from dew.quantization import Quantization
@@ -490,7 +596,7 @@ def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
     tree's shapes, which binding a deep decoder to read took tens of milliseconds of every call.
     A decoder that counts its declarations is asked once over every call on one tree, draws what
     a task over its tree packed beforehand draws, and is asked again for a tree of another shape."""
-    from dew.inference.projections import inference_projections, projection_groups
+    from dew.inference.projections import projection_groups
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.sampling import Sampling
 
@@ -653,7 +759,8 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path,
 
 def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tmp_path):
     """An LM run records its decoder's task settings (`TextSettings`) and nothing else beside
-    its objective and model, and they read back as the objective's own; a record holding
+    its objective, its model and the numerics it trained under (rows 2255 and 2500), and they read back as
+    the objective's own; a record holding
     another field, as a sampling temperature no LM run writes, is refused rather than loaded
     with the field ignored."""
     from dew.inference.tasks import TextSettings, saved_settings, settings_fields
@@ -662,7 +769,7 @@ def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tm
     checkpoints = Checkpoints(str(tmp_path), keep=2)
     record = checkpoints.artifact()
     assert isinstance(record, dict)
-    assert set(record) == {"objective", "model", *settings_fields(TextSettings)}
+    assert set(record) == {"objective", "model", "precision", *settings_fields(TextSettings)}
     assert saved_settings(record, TextSettings) == objective.task_settings()
     dew.pipeline(str(tmp_path))
     checkpoints.save(int(state.step) + 1, state, artifact={**record, "temperature": 0.5})
@@ -821,16 +928,18 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte",
+def make_block_run(directory, fixture="diffusion-gemma-workflow", scale=0.0, tokenizer="byte",
                    pad_token_id=0):
     """A block-diffusion run directory: a committed DiffusionGemma fixture's
     weights under a checkpoint that records the objective, its `pad_token_id`
-    and the tokenizer `tokenizer` names, each parameter moved by `moved` times
-    a seeded normal draw (a stand-in for training); returns the objective and
+    and the tokenizer `tokenizer` names, each parameter moved by `scale` times
+    a seeded normal draw (a stand-in for training, `model_support.moved`); returns the objective and
     the saved state. The default fixture reads images and is the published
     layout's own; `diffusion-gemma-sft` is Google's dense text-only model,
     which transformers' class cannot build, so its export is refused."""
     from pathlib import Path
+
+    from model_support import moved
 
     from dew.data.text import tokenizer_for
     from dew.interop import Pretrained
@@ -842,11 +951,8 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
                                         pad_token_id=pad_token_id,
                                         processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
-    if moved:
-        leaves, tree = jax.tree.flatten(state.variables["params"])
-        keys = jax.random.split(jax.random.key(5), len(leaves))
-        params = jax.tree.unflatten(tree, [leaf + moved * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                           for leaf, key in zip(leaves, keys, strict=True)])
+    if scale:
+        params = moved(state.variables["params"], jax.random.key(5), scale)
         state = state.replace(variables={**state.variables, "params": params})
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(0, state, None, artifact=objective.inference_record())
@@ -1016,14 +1122,13 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
-def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
-    """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
-    step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
-    bf16 CLIP as the published hybrid DiT has, and the task samples as the objective's own does."""
+def saved_clip_run(directory):
+    """A text-to-image run with a bf16 CLIP, as the published hybrid DiT has, after one training step,
+    saved in `directory` with its inference record: its config, objective and state."""
     from pathlib import Path
 
     config = stating(dataclasses.replace(
-        run_config(tmp_path, preset=Flow()),
+        run_config(directory, preset=Flow()),
         text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
                            dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
     objective = config.build()
@@ -1032,9 +1137,17 @@ def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
     batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
              **objective.inputs.tokenize(["a bird"] * jax.device_count())}
     state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints = Checkpoints(str(directory))
     checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
+    return config, objective, state
+
+
+def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
+    """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
+    step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
+    bf16 CLIP as the published hybrid DiT has, and the task samples as the objective's own does."""
+    _, objective, state = saved_clip_run(tmp_path)
     original = objective.pipeline(state, ema=False)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
 
@@ -1050,21 +1163,7 @@ def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
 def test_binding_new_encoder_weights_encodes_both_branches_with_them(tmp_path):
     """A restored task binds a new encoder tree: its conditional and unconditional features and
     samples match a fresh task over those weights, not the old ones."""
-    from pathlib import Path
-
-    config = stating(dataclasses.replace(
-        run_config(tmp_path, preset=Flow()),
-        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
-                           dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
-    objective = config.build()
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
-    state = trainer.initial_state()
-    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
-             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(1, state, None, artifact=objective.inference_record())
-    checkpoints.wait()
+    config, _, _ = saved_clip_run(tmp_path)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
     prompts = ["a bird", "a cat"]
     old_blank = restored.prepare(prompts, key=0, steps=8).unconditional

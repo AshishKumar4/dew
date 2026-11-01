@@ -4,8 +4,9 @@ The arithmetic is checked against MaxText 0.2.4's `calculate_indexer_loss`
 and exact top-k mask, fetched and run as published by
 tools/indexer_reference.py: the loss and its gradient on par with the
 published loss's from its float64 run over recorded seeds (check 1,
-tests/reference_error.py), the selection MaxText's mask exactly, as on the
-transcription's tiny tensors (tests/fixtures/indexer). The phases are
+tests/reference_error.py), each query's KL on par with the published loss of
+that query alone, and the selection MaxText's mask exactly, on those tensors
+and on tiny ones (tests/fixtures/indexer). The phases are
 checked through the LM objective on a toy DeepSeek stack: the warm-up moves
 the indexer and nothing else, the sparse phase keeps the indexer's gradient
 and the main model's apart, and a packed batch scores its documents as it
@@ -40,7 +41,6 @@ from dew.nn.sparse_selection import top_k_keys
 from dew.objectives.base import Step
 from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.training import Layout, MeshSpec, Trainer
-from tools import indexer_reference as transcription
 from tools.indexer_reference import published_inputs, published_keep
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "indexer"
@@ -53,7 +53,7 @@ SEQ = 16
 VOCAB = 64
 TINY_SHARD = 256
 SEEDS = {'covering': 256, 'covered positions': 512, 'dropped': 256, 'dropped positions': 256, 'packed': 64,
-         'packed alone': 128, 'total': 512, 'documents alone': 512, 'split tree': 8, 'per query': 64}
+         'packed alone': 128, 'total': 512, 'documents alone': 512, 'split tree': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
@@ -98,13 +98,14 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
 
     @jax.jit
     def kl(inputs, cotangent):
-        """The loss and its gradient in the scores under `cotangent` (`with_gradients`), the selection
-        read off the scores as given."""
+        """The loss and its gradient in the scores under `cotangent` (`with_gradients`), and each query's KL,
+        the selection read off the scores as given."""
         region = top_k_keys(inputs["scores"], keep, 6) if phase == "sparse" else keep
         value, gradient = with_gradients(
             lambda scores: jnp.mean(indexer_kl(scores, inputs["query"], inputs["key"], region, scale)))(
             inputs["scores"], cotangent)
-        return {"loss": value, "gradient": gradient}
+        per_query = indexer_kl(inputs["scores"], inputs["query"], inputs["key"], region, scale)
+        return {"loss": value, "gradient": gradient, "per query": per_query}
 
     path = FIXTURES / f"recorded_{name}.npz"
     seeds = declared_seeds(path)[name]
@@ -132,37 +133,6 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
         assert bool(jnp.all(jnp.isfinite(jax.grad(
             lambda scores: jnp.sum(indexer_kl(scores, legacy["query"], legacy["key"],
                                               legacy_keep, float(legacy["scale"]))))(legacy["scores"]))))
-
-    # Each query's KL, which the published mean does not show, on par with the transcription's
-    # (tools/indexer_reference.py, the same steps in NumPy) from its float64 run.
-    scale_ = np.float32(transcription.HEAD_DIM ** -0.5)
-    additive = (transcription.causal_mask() if mask == "causal"
-                else transcription.packed_mask(np.asarray(legacy["segments"])))
-
-    def draw(seed):
-        rng = np.random.default_rng([23, seed])
-        shape = (transcription.BATCH, transcription.LENGTH, transcription.HEADS, transcription.HEAD_DIM)
-        query, key = (rng.normal(size=shape).astype(np.float32) for _ in range(2))
-        length = transcription.LENGTH
-        scores = np.maximum(rng.normal(scale=1.5, size=(transcription.BATCH, length, length)), 0)
-        return scores.astype(np.float32), query, key
-
-    @as_given
-    def transcribed(scores, query, key):
-        dtype = np.asarray(scores).dtype
-        indexer_mask, masked_scores = transcription.indexer_call(np.asarray(scores), additive,
-                                                                 transcription.TOP_K)
-        scaled = np.asarray(query) * np.asarray(scale_, dtype)
-        per_query, _ = transcription.calculate_indexer_loss(
-            masked_scores, scaled, np.asarray(key), additive, indexer_mask, sparse_loss=phase == "sparse",
-            dtype=dtype)
-        return {"per query": per_query}
-
-    def ours(scores, query, key):
-        region = top_k_keys(scores, legacy_keep, transcription.TOP_K) if phase == "sparse" else legacy_keep
-        return {"per query": indexer_kl(scores, query, key, region, float(scale_))}
-
-    assert_as_exact(jax.jit(ours), transcribed, draw, f"{name} per query", seeds=SEEDS['per query'])
 
 
 # --------------------------------------------------------------------------

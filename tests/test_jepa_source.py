@@ -19,8 +19,10 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from float64_terms import float64_terms
 from interop_support import fixture_with_meta
-from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import widened
 from torch_layout import QKV, case_arrays, dew_leaf, join_qkv, leaf, split_qkv, torch_leaf
 
 from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor

@@ -2,11 +2,13 @@
 
 import base64
 import binascii
+import contextlib
 import functools
 import io
 import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, overload
@@ -23,6 +25,8 @@ from dew._records import JSON, json_value, record
 from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
+from dew.data.mixing import CorpusCounts
+from dew.data.pipeline import Pack, Refused, Rejected, cut_counts, cut_unit
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import (
     BUCKET_MINIMUM,
@@ -38,13 +42,15 @@ from dew.decision.head import Head
 from dew.decision.images import Images
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
+    OPTION_TILE,
     QUESTION_FIELDS,
+    Bounds,
     DecisionInputs,
     Encoded,
-    JointLayout,
     Laid,
     Layout,
     MarkerLayout,
+    QuestionLayout,
     Specials,
     render,
     with_context,
@@ -64,11 +70,19 @@ from dew.decision.questions import (
 )
 from dew.files import write_atomically
 from dew.inference import scoring
-from dew.inference.tasks import SavedRun, SavedRunTask, shape_bucket
+from dew.inference.tasks import (
+    InItsForm,
+    SavedRun,
+    SavedRunTask,
+    length_ladder,
+    shape_bucket,
+    traced_in_its_form,
+)
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
 from dew.mesh import batch_axes
+from dew.nn.attention import AttentionImpl
 from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import program
@@ -77,6 +91,7 @@ from dew.objectives.base import Metric, Objective, joined
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.data.tokens import FirstFit
     from dew.decision.objective import DecisionObjective
     from dew.decision.sources import PretrainedDecision
     from dew.distributed.placement import Layout as Placement, MeshSpec
@@ -87,15 +102,21 @@ TASK_FILE = "decide.json"
 
 @dataclass(frozen=True)
 class Budget:
-    """How much one forward pass may hold: at most `tokens` padded tokens and `rows` question rows.
+    """How much one forward pass may hold: at most `tokens` tokens in at most `rows` windows.
 
-    Laya's `predict_items` uses 16384 and 256. A pass's row count is padded to a
-    power of two and its row length to one of at least 64, so passes share
-    compiled programs.
+    Laya's `predict_items` uses 16384 and 256. A pass packs its rows into a
+    few windows of one of a few lengths, declared once (`Decide.pass_shapes`),
+    each window's question slots its bounds' (`Layout.bounds`), and its
+    options to `options` where it is declared, so every pass shares one of a
+    few programs, compiled up front (`Decide.compile_scoring`).
     """
 
     tokens: int = 16384
     rows: int = 256
+    options: int | None = None
+    """The options every question of a pass pads to, the run's widest (training's own static width);
+    None rounds each pass's widest up to a power of two, a program for each, compiled as it comes. A
+    request of more widens its pass, compiling it."""
 
 
 @dataclass(frozen=True)
@@ -114,27 +135,44 @@ class Weights:
 
 
 @dataclass(frozen=True)
-class Usage:
-    """What a request cost: the tokens every question row read, and how much of the state the rows kept.
+class PassShape:
+    """The shape of one scoring pass (`Decide.pass_shapes`): `rows` windows of `length` tokens, each
+    holding whole rows packed first-fit as a run's windows hold them (`Decide.packing`), its questions in
+    `questions` slots (a run's window's, `DecisionObjective.bounds`) of `options` options
+    each (the budget's, None where it declares none: each pass's own, rounded up to a power of two)."""
 
-    The kept share is the smallest any question kept. `trimmed` says whether a
-    row shortened a question's instructions or options to fit.
-    """
+    length: int
+    rows: int
+    questions: int | None
+    options: int | None
+
+
+@dataclass(frozen=True)
+class Usage:
+    """What a request cost: the tokens every question row read, how much of the state the rows kept,
+    the smallest share any question kept, and each cut by what it cut, the rows it shortened and the
+    tokens it removed, as training counts a row's cuts (`cut_counts`)."""
 
     input_tokens: int
     state_tokens: int
     state_kept: int
-    trimmed: bool = False
+    cut: Mapping[str, tuple[int, int]] = field(default_factory=dict)
 
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
 
+    @property
+    def trimmed(self) -> bool:
+        """Whether a row's declared budgets cut a question's instructions or options."""
+        return "instructions" in self.cut or "options" in self.cut
+
 
 def usage_of(rows: Sequence[Encoded]) -> Usage:
-    """What a request's `rows` cost: their tokens, the state's, and the least of it any row kept."""
+    """What a request's `rows` cost: their tokens, the state's, the least of it any row kept, and each
+    cut's rows and tokens."""
     return Usage(sum(len(row.tokens) for row in rows), max((row.state_tokens for row in rows), default=0),
-                 min((row.state_kept for row in rows), default=0), any(row.trimmed for row in rows))
+                 min((row.state_kept for row in rows), default=0), cut_counts(row.cuts for row in rows))
 
 
 @dataclass(frozen=True)
@@ -147,22 +185,44 @@ class DecideSettings:
     head: Mapping[str, object]
     """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
     its one field the record leaves to the backbone: a record, not a value the settings build."""
-    layout: Layout
+    layout: Layout = field(metadata={"derived": "budgets"})
+    """The rows' layout, which the run builds of its budgets (`DecisionRunConfig.max_len`, ...), its
+    head's labels and its source's attention."""
     specials: Specials
     tokenizer: str | None
-    processor: SourceReference | None
+    processor: SourceReference | None = field(metadata={"derived": "source"})
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
+    questions: int | None = field(default=None, metadata={"derived": "data"})
+    """The most questions a row of the run's data holds (`Layout.row_questions`), as the run recorded
+    it; a pass's question slots are its windows' (`Decide.pass_shapes`), so no task reads it. None where
+    the run recorded none, as before it did."""
+    options: int | None = field(default=None, metadata={"derived": "data"})
+    """The most options a question of the run's data lays out, a "none of the above" it adds included,
+    which a pass of its task pads each question to (`Budget.options`); None as `questions`."""
+
+
+def _calibrated(directory: str) -> tuple[Mapping[str, object], Weights] | None:
+    """The calibration `Decide.save` wrote into the run in `directory` (`TASK_FILE`) and the weights it
+    was fitted on; None where it wrote none."""
+    from dew.registry import from_record
+
+    saved = epath.Path(directory) / TASK_FILE
+    if not saved.exists():
+        return None
+    settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
+    return settings, from_record(Weights, _records.json_value(settings["weights"], "weights"))
 
 
 @dataclass(frozen=True)
-class Decide(SavedRunTask):
+class Decide(SavedRunTask, InItsForm):
     """Answers typed questions about a state, with one forward pass per batch.
 
     `decide(state, questions)` returns one answer per question, with its
-    probabilities over exactly the question's options. `batch` answers many
-    requests together within the `budget`, `tournament` splits a choice too large
+    probabilities over exactly the question's options, and `decide(requests)`
+    each of many requests' answers, scored together within the `budget` in a
+    scoring server's passes (`RowScoring`), `tournament` splits a choice too large
     for one pass into rounds, `calibrated` fits the calibration to held-out
     examples, and `systemone` takes and returns TypeSafe Jev's wire format. The
     logits are divided by `calibration`'s temperatures, and each answer reports
@@ -187,7 +247,7 @@ class Decide(SavedRunTask):
     @classmethod
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
-                        attention_impl: str = "auto") -> Self:
+                        attention_impl: AttentionImpl = "auto") -> Self:
         """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from
@@ -203,16 +263,30 @@ class Decide(SavedRunTask):
         if not isinstance(bundle, PretrainedDecision):
             raise TypeError(f"{name} declares no decision task")
         # The name a caller asked for, a Hub folder included, not the cache path it resolved to.
-        return cls.of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}")
+        return cls._of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}", owned=True)
 
     @classmethod
     def of(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
         """Build the declared decision task from a loaded composite bundle, without loading again.
         It answers under `name`, by default the Hub id the bundle resolved or else its directory."""
-        return cls(DecisionModel(bundle.model, bundle.head),
-                   joined({"backbone": bundle.variables, "head": bundle.head_variables}),
-                   bundle.layout, bundle.decision_tokenizer, bundle.specials, bundle.calibration,
-                   name=name or str(bundle.origin or bundle.source), processor=bundle.processor)
+        return cls._of(bundle, name=name, owned=False)
+
+    @classmethod
+    def _of(cls, bundle: "PretrainedDecision", *, name: str | None, owned: bool) -> Self:
+        """`of`, the bundle's weights packed as a task serves them (`_served`): in place where the
+        caller gives them up (`owned`), else into a tree of the task's own."""
+        task = cls.released(bundle, name=name)
+        return replace(task, variables=_served(task.model, task.variables, owned=owned))
+
+    @classmethod
+    def released(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
+        """The declared decision task over the bundle's own tree, its projections as the model holds
+        them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
+        model = DecisionModel(bundle.model, bundle.head)
+        variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
+        return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
+                   bundle.calibration, name=name or str(bundle.origin or bundle.source),
+                   processor=bundle.processor, precision=bundle.numerics)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
@@ -233,8 +307,22 @@ class Decide(SavedRunTask):
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
+        # Its passes pad to the options the run trained at, so a server compiles their programs up front.
+        budget = Budget(options=settings.options)
         return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
-                   name=str(epath.Path(directory).name), weights=weights, processor=processor)
+                   name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget)
+
+    @classmethod
+    def default_step(cls, directory: str) -> int | None:
+        """The step the run's calibration (`TASK_FILE`) was fitted on where that is the step the run
+        ranked best: a run that ended on its best step (`restore_best`) calibrates that step and loads
+        it. Else its latest, which refuses a calibration fitted on another (`calibration`)."""
+        saved = _calibrated(directory)
+        if saved is None:
+            return None
+        with Checkpoints(directory) as checkpoints:
+            best = checkpoints.best
+        return saved[1].step if saved[1].step == best else None
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
@@ -259,54 +347,76 @@ class Decide(SavedRunTask):
                 averaged = checkpoints.stored(step).get("ema") is not None
         else:
             averaged = ema
-        task = cls._recorded(directory, record, saved_model(record, dtype).build(), variables,
-                             Weights(step, averaged), dtype)
-        saved = epath.Path(directory) / TASK_FILE
-        if not saved.exists():
+        backbone = saved_model(record, dtype).build()
+        task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)
+        task = replace(task, variables=_served(task.model, task.variables))
+        saved = _calibrated(directory)
+        if saved is None:
             return task
-        settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
-        fitted = from_record(Weights, _records.json_value(settings["weights"], "weights"))
+        settings, fitted = saved
         # An average's own directory names the runs it averages beside the step it holds (`save`).
         if (fitted.step, fitted.ema) != (step, averaged):
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
+        saved = dict(_records.record(settings["budget"], "budget"))
+        # A budget saved before a pass's question slots were its windows' (ledger 2385) names the questions
+        # it padded to, which no pass reads now.
+        saved.pop("questions", None)
+        budget = from_record(Budget, _records.json_value(saved, "budget"))
+        # An options width the saved budget leaves None is the run's recorded one (`DecideSettings.options`).
+        if budget.options is None:
+            budget = replace(budget, options=task.budget.options)
         return replace(task, weights=fitted,
                        calibration=from_record(Calibration, _records.json_value(settings["calibration"],
                                                                                "calibration")),
-                       budget=from_record(Budget, _records.json_value(settings["budget"], "budget")),
-                       name=_records.text(settings["name"], "name"))
+                       budget=budget, name=_records.text(settings["name"], "name"))
 
     @classmethod
     def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
                  calibrate_on: "Iterable[Example | Mapping[str, object]] | Reader | None" = None) -> Self:
         """The task over `runs`' weights as any runs average (`dew.checkpoints.averaged`: their fp32
-        mean, each run's at `step`, its latest where None, and `ema` as `from_run` reads them, a LoRA
+        mean, each run's at `step`, its latest where None, `SavedRun.at`, and `ema` as `from_run`
+        reads them, a LoRA
         backbone's factors merged first), its calibration the identity, or refit on `calibrate_on`'s
         held-out answers (`calibrated`): temperatures are fitted to one set of weights.
 
         The runs are one task's: their recorded settings (`DecideSettings`: head, layout, tokenizer,
         special tokens, processor and context encoder) the same; a run whose settings differ is
-        refused (ValueError), naming them. The task's `weights` record each run's directory, step and
-        whether its average was read, so it is no one run's: `save` writes it to a directory of its own
-        as a run, which `from_run` and `dew.pipeline` then load, whatever its layout."""
+        refused (ValueError), naming them. The widths a pass pads to are no part of the weights: the
+        average's are the widest any run recorded, None where none recorded one. The task's `weights`
+        record each run's directory, step and whether its average was read, so it is no one run's:
+        `save` writes it to a directory of its own as a run, which `from_run` and `dew.pipeline` then
+        load, whatever its layout."""
         from dew.checkpoints import averaged_pinned
         from dew.inference.tasks import saved_settings
 
-        pinned = [SavedRun.pinned(directory, step) for directory in runs]
+        pinned = [SavedRun.at(directory, step) for directory in runs]
         recorded = [run.record for run in pinned]
-        first = saved_settings(recorded[0], DecideSettings) if recorded else None
-        for directory, saved in zip(runs, recorded, strict=True):
-            settings = saved_settings(saved, DecideSettings)
-            differing = [entry.name for entry in fields(DecideSettings)
-                         if getattr(settings, entry.name) != getattr(first, entry.name)]
+        settings = [saved_settings(saved, DecideSettings) for saved in recorded]
+        padded = ("questions", "options")
+        for directory, own in zip(runs, settings, strict=True):
+            differing = [entry.name for entry in fields(DecideSettings) if entry.name not in padded
+                         and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
+        # One task's numerics, which every run trained under (`SavedRun.precision`), carried onto the
+        # average (`SavedRun.formed`).
+        for run in pinned[1:]:
+            if run.precision != pinned[0].precision:
+                raise ValueError(f"the run in {run.directory} trained under other numerics than {runs[0]} "
+                                 f"({run.precision} against {pinned[0].precision}), so their weights are "
+                                 f"not one task's to average")
         average = averaged_pinned(pinned, ema=ema)
         task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
+        task = pinned[0].formed(replace(task, variables=_served(task.model, task.variables)))
+        # A pass's question slots are its windows' (`pass_shapes`); the runs' widest options pad its
+        # questions.
+        widest = max((own.options for own in settings if own.options is not None), default=None)
+        task = replace(task, budget=replace(task.budget, options=widest))
         return task if calibrate_on is None else task.calibrated(calibrate_on)
 
     def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
@@ -400,41 +510,47 @@ class Decide(SavedRunTask):
                                opt_state=optax.EmptyState(), ema=None,
                                key=jax.device_put(jax.random.key(0), replicated), scale=None,
                                window_size=jax.device_put(jnp.asarray(1, jnp.int32), replicated))
-            checkpoints.save(self.weights.step, state, artifact=DecisionObjective(self).inference_record())
+            # The record names the numerics the average answers under (`traced`).
+            with self.traced():
+                record = DecisionObjective(self).inference_record()
+            checkpoints.save(self.weights.step, state, artifact=record)
             checkpoints.wait()
 
+    @overload
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
-                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
-        """Return one answer per question in `questions`, about `state` and any `images`.
+                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]: ...
 
-        Images need a layout with a place for them (`Layout.images`) and the
-        backbone's processor, as a joint-head release brings. `context` is a
-        sequence the decision reads beside the state through the backbone's
-        cross-attention (`Example.context`).
+    @overload
+    def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
+                 contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
+
+    @traced_in_its_form
+    def __call__(self, state, questions=None, *, images=(), context=None, contexts=None):
+        """Return one answer per question in `questions`, about `state` and any `images`; or, given a
+        sequence of `(state, questions)` requests and no `questions`, each request's answers in order.
+
+        A call's rows are scored together within the budget, shortest first, in the passes a scoring
+        server runs and over its programs (`logits`), one path for a call and a server alike. Images
+        need a layout with a place for them (`Layout.images`) and the backbone's processor, as a
+        joint-head release brings. `context` is a sequence the decision reads beside the state through
+        the backbone's cross-attention (`Example.context`), and `contexts` each request's, in order.
         """
+        if questions is None:
+            return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
+                                                             [asked for _, asked in state])]
         if images:
             return self._seen(state, questions, images, context)[0]
-        return self.batch([(state, questions)], contexts=[context])[0][0]
+        return self._answered(self.rows([(state, questions)], contexts=[context]), [questions])[0][0]
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
-        """Each request's rows as `batch` scores them: its state and questions laid out, with its
+        """Each request's rows as a call scores them: its state and questions laid out, with its
         context (`contexts`, in order, or None for none) beside them."""
         contexts = [None] * len(requests) if contexts is None else list(contexts)
         if len(contexts) != len(requests):
             raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
         return [self._encoded(state, questions, context=context)
                 for (state, questions), context in zip(requests, contexts, strict=True)]
-
-    def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
-              contexts: Sequence[JSON | None] | None = None) -> list[tuple[dict[str, Answer], Usage]]:
-        """Return each request's answers and usage.
-
-        The rows of every request are scored together within the budget. `contexts`
-        holds each request's context, in order (`__call__`), or None for none.
-        """
-        return self._answered(self.rows(requests, contexts=contexts),
-                              [questions for _, questions in requests])
 
     def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
                 ) -> list[tuple[dict[str, Answer], Usage]]:
@@ -451,12 +567,116 @@ class Decide(SavedRunTask):
                    for row, own in zip(rows, scores, strict=True) for slot, laid in enumerate(row.questions)}
         return {name: answers[name] for name in questions}, usage_of(rows)
 
-    def fits(self, rows: Sequence[Encoded]) -> bool:
-        """Whether `rows` are one of `logits`' passes: within the budget's rows, and its tokens at the
-        pass's bucketed shape (`shape_bucket`)."""
+    def planned(self) -> "PassPlan":
+        """An empty pass, which takes rows one at a time while they fit (`PassPlan`): what a server
+        grows a pass by, each row placed once."""
+        return PassPlan(self)
+
+    @functools.cached_property
+    def pass_shapes(self) -> tuple[PassShape, ...]:
+        """The shapes a text pass packs its rows into, declared once: windows of the layout's length
+        and its halvings (`dew.inference.tasks.length_ladder`), each at a few window counts, one (a lone
+        request's pass), the powers of 8 below the most the budget's tokens and rows allow, and that
+        most; each window's question slots a run's window's of that length (`DecisionObjective.bounds`),
+        its options the budget's (`Budget`). Where the budget declares its options, each shape is one
+        program, which `compile_scoring` compiles."""
+        shapes = []
+        for length, bounds in self._bounds.items():
+            most = max(1, min(self.budget.rows, self.budget.tokens // length))
+            counts = sorted({*(8 ** power for power in range(math.floor(math.log(most, 8)) + 1)), most})
+            shapes.extend(PassShape(length, count, bounds.questions, self.budget.options) for count in counts)
+        return tuple(shapes)
+
+    def _shape(self, rows: Sequence[Encoded]) -> PassShape:
+        """The shape of the pass over `rows` (`pass_shapes`): of the shortest length whose windows hold
+        them all, the fewest such windows declared; else the most windows of the longest length, which
+        a plan refuses (`planned`). First-fit opens a window only where those before it have no room, so the
+        windows it uses at a length are the same however many it may: one placement over the most a
+        length declares gives the fewest that hold them."""
+        plan = self.planned()
+        if all(plan.add(row) for row in rows):
+            return plan.shape()
         longest = max(len(row.tokens) for row in rows)
-        return (len(rows) <= self.budget.rows
-                and shape_bucket(longest, 64) * shape_bucket(len(rows), 1) <= self.budget.tokens)
+        # The layout refuses a row past its window (`_encoded`), which the last length is.
+        return [shape for shape in self.pass_shapes if shape.length >= longest][-1]
+
+    def packing(self, shape: PassShape, questions: int | None = None) -> Pack:
+        """How a pass of `shape` packs its rows: first-fit into its windows, each holding whole rows within
+        a run's bounds (`DecisionObjective.bounds`), as a run packs its rows (`dew.decision.rows.packing`),
+        their gold left out; with `questions` past the shape's slots, a window's questions widened to
+        that many, for a row the bounds' probes undercount (a program of its own)."""
+        if questions is None or questions <= (shape.questions or 0):
+            return self._packs[shape.length, shape.rows]
+        from dew.decision.rows import packing
+
+        held = self.context_length
+        widened = replace(self._bounds[shape.length], questions=questions)
+        return replace(packing(replace(self.layout, max_len=shape.length), widened,
+                               None if held is None else max(shape.length, held), trained=False),
+                       bins=shape.rows)
+
+    @functools.cached_property
+    def _row_scoring(self) -> "RowScoring":
+        """The task's rows as a scoring task over no weights, held once so its passes' plans and
+        compiled programs are built once (`logits`)."""
+        return RowScoring(replace(self, variables={}))
+
+    @functools.cached_property
+    def _bounds(self) -> dict[int, Bounds]:
+        """Each pass length's window bounds, as a run's windows of that length hold them
+        (`DecisionObjective.bounds`): the layout's window and its halvings, none shorter than the
+        shortest row it lays out (`_probe`). A length shorter than the row its bounds count by, or a
+        context shorter than that row's schema (`Layout.shortest_row`, a question of a one-character
+        option), holds one row a window, of one question unless the row asks more (`packing`)."""
+        shortest, schema = self.layout.shortest_row(self.tokenizer, self.specials)
+        held, segments = self.context_length, self._scoring.segments
+        counted = held is None or schema <= held
+        return {length: replace(self.layout, max_len=length).bounds(
+            self.tokenizer, self.specials, held, segments, None if held is None else max(length, held))
+            if length >= shortest and counted else Bounds(1, 1, None)
+            for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens))}
+
+    @functools.cached_property
+    def _packs(self) -> dict[tuple[int, int], Pack]:
+        """Each pass shape's packing (`packing`), by its length and windows."""
+        from dew.decision.rows import packing
+
+        held = self.context_length
+        return {(shape.length, shape.rows): replace(
+            packing(replace(self.layout, max_len=shape.length), self._bounds[shape.length],
+                    None if held is None else max(shape.length, held), trained=False), bins=shape.rows)
+            for shape in self.pass_shapes}
+
+    def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
+        """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
+        default), in parallel, by one pass of the layout's shortest row at each shape that holds it, so
+        a scorer compiles none while it serves; returns the shapes compiled. Where the budget declares no
+        options (`Budget`), a pass's own decide its program, which it compiles as it comes, and none is
+        compiled here."""
+        if self.budget.options is None:
+            return ()
+        mesh = mesh_of(self.variables if variables is None else variables)
+
+        def compiled(shape: PassShape) -> None:
+            # Each worker traces under the mesh a pass serves under: a thread's mesh is its own.
+            with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
+                self._pass(self._probe, variables, shape)
+
+        # A layout that keeps a schema whole lays the probe out past a window, or its schema past the
+        # context, too small for it, and those shapes compile on their first pass.
+        fits_context = self.context_length is None or all(
+            len(row.context or ()) <= self.context_length for row in self._probe)
+        held = tuple(shape for shape in self.pass_shapes
+                     if fits_context and shape.length >= max(len(row.tokens) for row in self._probe))
+        with ThreadPoolExecutor(max_workers=max(1, len(held))) as pool:
+            list(pool.map(compiled, held))
+        return held
+
+    @functools.cached_property
+    def _probe(self) -> list[Encoded]:
+        """The layout's shortest row, one one-option question about an empty state, laid out in its
+        window, which the shortest length (`pass_shapes`) is."""
+        return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
               context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
@@ -485,7 +705,8 @@ class Decide(SavedRunTask):
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
-        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
+        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length,
+                                        attention=self.layout.attention)
         held = self.variables if variables is None else variables
         scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
@@ -497,12 +718,17 @@ class Decide(SavedRunTask):
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
-        rows = with_context(self.layout.rows(self.tokenizer, self.specials, state, questions, media=media),
-                            self.tokenizer, context, self.context_length)
-        for row in rows:
+        laid = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
+        for row in laid:
+            # A row whose declared budgets cut its options alike is answered as its release answers it,
+            # the cut in its usage; training leaves such a row out (`Layout.refusal`).
             if not self.layout.fits(row):
-                raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
-                                 f"the maximum context length, max_len={self.layout.max_len}")
+                raise Refused("unfit", f"the question needs {len(row.tokens)} tokens besides the state, more "
+                                       f"than the maximum context length, max_len={self.layout.max_len}")
+            if self.layout.refusal(row, self.context_length) == "unfit":
+                raise Refused("unfit", f"the question needs {len(row.context or ())} context tokens, more "
+                                       f"than the {self.context_length} the backbone's cross-attention reads")
+        rows = with_context(laid, self.tokenizer, context, self.context_length)
         self.model.head.validate_rows(rows)
         for laid in (laid for row in rows for laid in row.questions):
             count = len(questions[laid.name].options)
@@ -521,47 +747,64 @@ class Decide(SavedRunTask):
     def logits(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
         """Return each row's raw `[Q, K]` logits, one row per question laid out in it, in slot order.
 
-        The rows are scored shortest first, in passes that fit the budget.
+        The rows are scored shortest first, in the passes a server of this task runs and over its
+        programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
+        server alike.
         """
+        server = scoring.ScoringServer(self._row_scoring, self.variables)
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
-        found: dict[int, np.ndarray] = {}
-        start = 0
-        while start < len(order):
-            stop = start + 1
-            while stop < len(order) and self.fits([rows[index] for index in order[start:stop + 1]]):
-                stop += 1
-            chosen = order[start:stop]
-            found.update(zip(chosen, self.scored([rows[index] for index in chosen]), strict=True))
-            start = stop
-        return [found[index] for index in range(len(rows))]
+        futures = {index: server.submit(rows[index]) for index in order}
+        server.run()
+        return [futures[index].result() for index in range(len(rows))]
 
     def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
-        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows, over
-        `variables` (the task's own by default)."""
-        scores = self._pass(rows, self.variables if variables is None else variables)
-        return [scores[index, :len(row.questions)] for index, row in enumerate(rows)]
+        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which a plan takes
+        (`planned`), over `variables` (the task's own by default)."""
+        return self._pass(rows, self.variables if variables is None else variables)
 
-    def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None) -> np.ndarray:
-        """One forward pass at bucketed shapes, its rows placed on the
-        weights' mesh (`RowPlan`)."""
-        questions = max(len(row.questions) for row in rows)
-        options = max(len(laid.options) for row in rows for laid in row.questions)
-        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=shape_bucket(questions, 1),
-                                        options=shape_bucket(options, 1),
-                                        context_length=self.context_length)
-        length = shape_bucket(inputs.tokens.shape[1], 64)
-        inputs = replace(
-            inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
-            segments=_widened(inputs.segments, length),
-            positions=None if inputs.positions is None else _widened(inputs.positions, length),
-            slots=None if inputs.slots is None else _widened(inputs.slots, length),
-            blocks=None if inputs.blocks is None else _widened(inputs.blocks, length, -1))
-        count = shape_bucket(len(rows), 1)
-        padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
+    def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None,
+              shape: PassShape | None = None) -> list[np.ndarray]:
+        """Each of `rows`' raw `[Q, K]` logits from one forward pass at its declared shape (`pass_shapes`,
+        the shortest that holds `rows` unless `shape` is given): the rows packed first-fit into its
+        windows as a run packs its rows (`packing`), each window read as a run reads one
+        (`dew.decision.rows.PackedRows`, `laid_out`), so each row attends its own tokens alone and is
+        scored as it is alone, the windows placed on the weights' mesh (`RowPlan`)."""
+        from dew.data.packing import first_fit_windows
+        from dew.decision.rows import PackedRows, model_row
+
+        shape = self._shape(rows) if shape is None else shape
+        offered = max(len(laid.options) for row in rows for laid in row.questions)
+        # A declared width holds a pass unless a row asks more, which widens it (a program of its own).
+        options = shape_bucket(offered, 1) if shape.options is None else max(shape.options, offered)
+        pack = self.packing(shape, max(len(row.questions) for row in rows))
+        windows = first_fit_windows([model_row(row, options, self.context_length) for row in rows], pack)
+        if len(windows) > shape.rows:
+            raise ValueError(f"{len(rows)} rows pack into {len(windows)} windows of {shape.length} "
+                             f"tokens, more than the {shape.rows} the pass holds; a plan says which rows "
+                             "a pass holds (`planned`)")
+        bounds = self._bounds[shape.length]
+        in_context = self.layout.spans_in_context
+        # A joint layout's windows hold their real options in as many slots as its bounds allow, as a
+        # run's (`DecisionObjective.data`).
+        compact = (-(-bounds.options // OPTION_TILE) * OPTION_TILE
+                   if self.layout.joint and bounds.options is not None else None)
+        read = PackedRows(shape.length, compact, in_context)
+        laid = [read.map(window) for window, _ in windows]
+        batch = {name: np.stack([window[name] for window in laid]) for name in laid[0]}
+        inputs = laid_out(batch, bounds.segments, spans_in_context=in_context,
+                          whole_blocks=whole_blocks_of(self.layout), attention=self.layout.attention)
+        padded = RowPlan(None, len(windows), shape.rows, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
-        plan = RowPlan.over(mesh_of(held), count)
-        return plan.host(self._forward(held, plan.place(plan.pad(padded))))[:len(rows)]
+        plan = RowPlan.over(mesh_of(held), shape.rows)
+        logits = plan.host(self._forward(held, plan.place(plan.pad(padded))))
+        found: list[np.ndarray] = [np.empty(0)] * len(rows)
+        for window, (_, standing) in enumerate(windows):
+            owners = np.asarray(batch["question_rows"][window])
+            for order, index in enumerate(standing, start=1):
+                found[index] = logits[window, np.flatnonzero(owners == order)]
+        return found
 
+    @traced_in_its_form
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
         """`model.logits`, compiled with the XLA options its backbone and head take where they run
@@ -577,22 +820,24 @@ class Decide(SavedRunTask):
         The options are cut into near-equal groups of at most `group`, and each
         group's winner goes on, until one group is left to answer the question
         (Laya's `predict_tournament`). A finalist's probabilities cover only the last
-        round's options.
+        round's options. Each question plays its own rounds: one whose finalists fit a
+        group is not split again while the others play on, and waits for the final with
+        its finalists unchanged.
         """
         if group < 2:
             raise ValueError("a tournament groups at least two options")
         remaining = {name: list(question.options) for name, question in questions.items()
                      if isinstance(question, Choice) and len(question.options) > group}
-        while any(len(options) > group for options in remaining.values()):
+        while playing := {name: options for name, options in remaining.items() if len(options) > group}:
             rounds = {}
-            for name, options in remaining.items():
+            for name, options in playing.items():
                 parts = -(-len(options) // group)
                 for part in range(parts):
                     chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
                     rounds[f"{name}/{part}"] = _restricted(questions[name], chosen)
             answers = self(state, rounds)
-            remaining = {name: [_choice(answers[key]) for key in rounds if key.rsplit("/", 1)[0] == name]
-                         for name in remaining}
+            remaining |= {name: [_choice(answers[key]) for key in rounds if key.rsplit("/", 1)[0] == name]
+                          for name in playing}
         final = {name: _restricted(question, remaining[name]) if name in remaining else question
                  for name, question in questions.items()}
         return self(state, final)
@@ -634,8 +879,10 @@ class Decide(SavedRunTask):
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()
-        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
-                                    key=0, metrics=chosen, mesh=self._mesh)
+        # Scored under the numerics the task answers under (`traced`), as its calls are.
+        with self.traced():
+            evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
+                                        key=0, metrics=chosen, mesh=self._mesh)
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
     @property
@@ -677,8 +924,9 @@ class Decide(SavedRunTask):
         scored = []
         segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments, spans_in_context=isinstance(self.layout, JointLayout)
-                              and self.layout.schema_in_context)
+            inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context,
+                              whole_blocks=whole_blocks_of(self.layout),
+                              attention=self.layout.attention)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -748,7 +996,8 @@ class Decide(SavedRunTask):
         """`systemone` over a list of bodies, served as a server serves them (`scoring`,
         `dew.inference.scoring.ScoringServer`): each body admitted on its own, so a refusal is its
         body's alone, and the admitted ones' rows scored together, a pass at a time."""
-        server = scoring.ScoringServer.from_task(*self.scoring(details=details, strict=strict, whole=whole))
+        # A call's server compiles the passes it runs as it runs them, not every shape up front.
+        server = scoring.ScoringServer(*self.scoring(details=details, strict=strict, whole=whole))
         answered: dict[int, dict[str, JSON] | ValueError] = {}
         futures = {}
         for index, request in enumerate(requests):
@@ -796,7 +1045,9 @@ class Decide(SavedRunTask):
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
         if details:
             reported.update(state_tokens=usage.state_tokens, state_kept=usage.state_kept,
-                            truncated=usage.truncated)
+                            truncated=usage.truncated,
+                            cut={kind: {"rows": rows, "removed": removed, "unit": cut_unit(kind)}
+                                 for kind, (rows, removed) in usage.cut.items()})
         return {"model": self.name,
                 "answers": {name: _wire(questions[name], answer, details=details, gated=gated)
                             for name, answer in answers.items()},
@@ -805,6 +1056,93 @@ class Decide(SavedRunTask):
 
 EXTENSIONS = ("images", "context")
 """The request fields `Decide.systemone` reads beyond Jev's, which `strict` drops."""
+
+
+@dataclass
+class _Placing:
+    """A length's first-fit placement of a pass's rows (`PassPlan`): the placement over its most windows,
+    each field's room, the fields a row is counted along, and each row's window so far."""
+
+    placement: "FirstFit"
+    rooms: dict[str, int]
+    paired: tuple[str, ...]
+    windows: list[int] = field(default_factory=list)
+
+    def place(self, row: Encoded) -> int | None:
+        """The window `row` goes to, which takes it, or None where none has room."""
+        # A row's tokens, its questions along each field of theirs, and its context's tokens.
+        sizes = [len(row.tokens) if name == "tokens" else len(row.context or ()) if name == "context"
+                 else len(row.questions) for name in self.paired]
+        if any(size > self.rooms[name] for size, name in zip(sizes, self.paired, strict=True)):
+            return None
+        window = self.placement.place(sizes)
+        if window is not None:
+            self.windows.append(window)
+        return window
+
+
+class PassPlan:
+    """A pass growing a row at a time (`Decide.planned`): each length a pass may take (`pass_shapes`)
+    keeps its first-fit placement of the rows so far over its most windows, so a row is placed once at
+    each length rather than every row replayed for each one more (ledger 2424). A length drops out when
+    a row is longer than its windows or finds no room in them; first-fit opens a window only where those
+    before it have no room, so no later row brings it back. The pass holds its rows while a length
+    does. A row that asks more questions than a length's windows hold widens them (`Decide.packing`),
+    its rows placed again; a row refused ends the plan, which takes none after it."""
+
+    def __init__(self, decide: Decide):
+        self.decide = decide
+        self.rows: list[Encoded] = []
+        self.questions = 0
+        self.alive = sorted({shape.length for shape in decide.pass_shapes})
+        self.placing: dict[int, _Placing] = {}
+
+    def _placed(self, length: int) -> _Placing | None:
+        """A fresh placement of the pass's rows at `length`, over its most windows and the pass's
+        questions, or None where they do not all fit."""
+        from dew.data.packing import window_fields
+        from dew.data.tokens import FirstFit
+
+        most = [shape for shape in self.decide.pass_shapes if shape.length == length][-1]
+        pack = self.decide.packing(most, self.questions)
+        rooms, paired = window_fields(pack)
+        placement = FirstFit([rooms[name] for name in paired], pack.bins, pack.segments)
+        placing = _Placing(placement, rooms, paired)
+        return placing if all(placing.place(row) is not None for row in self.rows) else None
+
+    def add(self, row: Encoded) -> bool:
+        """Take `row` into the pass where a length still holds every row so far and it; False where none
+        does, which ends the plan."""
+        if len(row.questions) > self.questions:
+            self.questions = len(row.questions)
+            self.placing = {}
+        held = []
+        for length in self.alive:
+            if length < len(row.tokens):
+                continue
+            if length not in self.placing:
+                placed = self._placed(length)
+                if placed is None:
+                    continue
+                self.placing[length] = placed
+            if self.placing[length].place(row) is not None:
+                held.append(length)
+        self.alive = held
+        if held:
+            self.rows.append(row)
+        return bool(held)
+
+    def shape(self) -> PassShape:
+        """The pass's shape: of the shortest length that holds its rows, the fewest windows declared that
+        hold them."""
+        length = self.alive[0]
+        used = max(self.placing[length].windows) + 1
+        return next(shape for shape in self.decide.pass_shapes
+                    if shape.length == length and shape.rows >= used)
+
+    def windows(self) -> list[int]:
+        """Each row's window at the pass's shape (`shape`)."""
+        return list(self.placing[self.alive[0]].windows)
 
 
 @dataclass(frozen=True)
@@ -823,57 +1161,153 @@ class _Row:
     media: Images | None = None
 
 
-@dataclass(frozen=True)
-class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndarray, dict[str, JSON]]):
-    """A `Decide` task as a scoring task of Jev request bodies (`dew.inference.scoring.Scoring`),
-    answering each as `Decide.systemone` does under `details`, `strict` and `whole`.
+class _WirePlan:
+    """A wire pass growing a row at a time (`WireScoring.planned`): rows of text packed as `Decide`'s
+    passes pack them (`PassPlan`); rows of images, which run a row a batch row (`Decide._seen_pass`),
+    all of one length and their images alike, as many as one row a window of their length's most
+    windows (`pass_shapes`)."""
 
-    `admit` parses and lays out a body, refusing what Jev would refuse, a body the layout could
-    answer only by cutting it under `whole` included. A pass is `Decide.logits`' one pass within the
-    task's budget (`Decide.fits`) over text rows, or one over rows of images as long as each other and
-    of alike images (`Images.joined`); `forward` runs it over the weights it is handed, and `answer`
-    reads a body's answers off its rows' logits. `decide` holds no weights (`Decide.scoring`)."""
+    def __init__(self, decide: Decide):
+        self.decide = decide
+        self.text = decide.planned()
+        self.seen: list[_Row] = []
+        self.taken = 0
+
+    def add(self, row: _Row) -> bool:
+        if row.media is None:
+            if self.seen:
+                return False
+            self.taken += 1
+            return self.text.add(row.encoded)
+        if self.taken:
+            return False
+        first = self.seen[0] if self.seen else row
+        assert first.media is not None
+        length = len(first.encoded.tokens)
+        most = max((shape.rows for shape in self.decide.pass_shapes if shape.length >= length), default=1)
+        if (len(row.encoded.tokens) != length or not first.media.alike(row.media)
+                or len(self.seen) >= most):
+            return False
+        self.seen.append(row)
+        return True
+
+
+@dataclass(frozen=True)
+class _DecideScoring[RequestT, PayloadT, AnswerT](
+        scoring.Scoring[RequestT, _Row, PayloadT, np.ndarray, AnswerT]):
+    """A `Decide` task's passes as a scoring task's (`dew.inference.scoring.Scoring`): a pass is one
+    within the task's budget (`Decide.planned`) over text rows, or one over rows of images as long as each
+    other and of alike images (`Images.joined`), which `forward` runs over the weights it is handed;
+    `decide` holds no weights. Every scoring of the task, a call's (`RowScoring`) and a server's of Jev
+    bodies (`WireScoring`), runs these passes over the same compiled programs."""
 
     decide: Decide
-    details: bool = False
-    strict: bool = False
-    whole: bool = False
 
-    def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Row, _Admitted]:
-        decide = self.decide
-        state, questions, images, context = decide._read_wire(request, strict=self.strict)
-        if images:
-            row, media = decide._shown(state, questions, images, context)
-            rows = (_Row(row, media),)
-        else:
-            rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
-        usage = usage_of([row.encoded for row in rows])
-        if self.whole and (usage.truncated or usage.trimmed):
-            cut = "state" if usage.truncated else "instructions or options"
-            raise ValueError(f"the request does not fit the maximum context length, max_len="
-                             f"{decide.layout.max_len} tokens, without cutting its {cut}")
-        return scoring.Scored(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
-
-    def fits(self, rows: Sequence[_Row]) -> bool:
-        seen = [row.media for row in rows if row.media is not None]
-        if not seen:
-            return self.decide.fits([row.encoded for row in rows])
-        encoded = [row.encoded for row in rows]
-        return (len(seen) == len(rows) and len({len(row.tokens) for row in encoded}) == 1
-                and all(seen[0].alike(media) for media in seen) and self.decide.fits(encoded))
+    def planned(self) -> "_WirePlan":
+        return _WirePlan(self.decide)
 
     def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
-        # The server chose these rows as one pass (`fits`), so they run as one, over the weights it
+        # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
         # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
             return self.decide.scored([row.encoded for row in rows], variables)
         return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
                                       variables)
 
+    def compile(self, variables: Variables) -> tuple[PassShape, ...]:
+        # The text passes' programs (`Decide.pass_shapes`); a pass of images compiles on its first.
+        return self.decide.compile_scoring(variables)
+
+
+@dataclass(frozen=True)
+class RowScoring(_DecideScoring[Encoded, None, np.ndarray]):
+    """A `Decide` task's laid-out text rows as a scoring task (`dew.inference.scoring.Scoring`): each
+    request one row (`Decide._encoded`), answered by its raw `[Q, K]` logits, the passes a server of
+    Jev bodies runs (`Decide.logits`)."""
+
+    def admit(self, request: Encoded) -> scoring.ScoringRequest[_Row, None]:
+        return scoring.ScoringRequest((_Row(request),), None)
+
+    def answer(self, payload: None, outputs: Sequence[np.ndarray]) -> np.ndarray:
+        return outputs[0]
+
+
+@dataclass(frozen=True)
+class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON]]):
+    """A `Decide` task as a scoring task of Jev request bodies (`dew.inference.scoring.Scoring`),
+    answering each as `Decide.systemone` does under `details`, `strict` and `whole`.
+
+    `admit` parses and lays out a body, refusing what Jev would refuse, a body the layout could
+    answer only by cutting it under `whole` included; `answer` reads a body's answers off its rows'
+    logits."""
+
+    details: bool = False
+    strict: bool = False
+    whole: bool = False
+    counts: CorpusCounts = field(default_factory=lambda: CorpusCounts("served", "served"), compare=False)
+    """What the task admitted and refused, as a run's data counters count its rows (`CorpusCounts`):
+    each request it answers, cut short where any row's state was, and each cut's rows and tokens;
+    each it refuses under its reason (`Refused`), `unfit`, `options_alike`, or `cut` under `whole`. A
+    server reads them as a run reads its own (`CorpusCounts.metrics`)."""
+
+    def admit(self, request: Mapping[str, object]) -> scoring.ScoringRequest[_Row, _Admitted]:
+        decide = self.decide
+        state, questions, images, context = decide._read_wire(request, strict=self.strict)
+        try:
+            if images:
+                row, media = decide._shown(state, questions, images, context)
+                rows = (_Row(row, media),)
+            else:
+                rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
+        except Refused as refused:
+            self.counts.dropped(Rejected(refused.reason))
+            raise
+        usage = usage_of([row.encoded for row in rows])
+        if self.whole and (usage.truncated or usage.trimmed):
+            # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
+            removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
+            self.counts.dropped(Rejected("cut", cut=removed))
+            cut = "state" if usage.truncated else "instructions or options"
+            raise Refused("cut", f"the request does not fit the maximum context length, max_len="
+                                 f"{decide.layout.max_len} tokens, without cutting its {cut}")
+        self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
+        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
+
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,
                                           *self.decide._replied(payload.questions, payload.rows, outputs),
                                           details=self.details)
+
+
+def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
+    """A task's weights with its backbone's projections packed as a served decoder's are, each
+    group's input quantization moved with it (`dew.inference.projections`): the one layout a task holds
+    whatever its source stored, a run's packed or an export's apart, so its loads compute one program
+    (ledger 2299). Weights it owns (`owned`, a load's) pack in place, their members freed
+    (`packed_owned`); a bundle's borrowed ones (`Decide.of`) into a new tree that leaves the bundle's
+    whole (`inference_projections`). A run that held some of them frozen packs as its export does,
+    its whole tree's groups, each frozen where all its members were (ledger 2439). An adapter binds
+    and an export writes the model's own tree (`unpacked`)."""
+    from dew.batch import part
+    from dew.inference.projections import inference_projections, packed_owned
+
+    pack = packed_owned if owned else inference_projections
+    return joined({"backbone": pack(model.backbone, part(variables, "backbone")),
+                   "head": part(variables, "head")})
+
+
+def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
+    """A task's weights as a run trains them, the model's own tree: the backbone's projections, packed
+    to serve (`_served`), split back (`unpacked`, ledger 2299), so a run trains, and its resume builds,
+    one tree wherever it runs: a trunk held frozen splits back frozen (ledger 2439). A task that holds
+    no weights (a scoring task's, `Decide.scoring`) has none to split."""
+    from dew.batch import FROZEN, part
+    from dew.inference.projections import unpacked
+
+    backbone = part(variables, "backbone")
+    if "params" not in backbone and FROZEN not in backbone:
+        return variables
+    return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head")})
 
 
 def decoded_images(images: object) -> list[Image.Image]:
@@ -920,11 +1354,14 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False
-             ) -> DecisionInputs:
+def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False,
+             whole_blocks: bool = False,
+             attention: tuple[tuple[tuple[int, ...], ...], int] | None = None) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
     holding at most `max_segments` rows, the questions' spans in each row's context where
-    `spans_in_context` (`JointLayout.schema_in_context`)."""
+    `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
+    `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
+    says (`Layout.attention`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -937,14 +1374,16 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          blocks=given("blocks"), max_segments=max_segments,
-                          spans_in_context=spans_in_context)
+                          context_segments=given("context_segments"), question_rows=given("question_rows"),
+                          blocks=given("blocks"), streams=given("streams"),
+                          reads=None if attention is None else attention[0],
+                          fragments=1 if attention is None else attention[1], max_segments=max_segments,
+                          spans_in_context=spans_in_context, whole_blocks=whole_blocks and "blocks" in batch)
 
 
-def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:
-    """A `[B, L]` leaf padded on the right to `length` with `fill`: the
-    padding token, or an invalid slot at position and option slot zero."""
-    return jnp.pad(leaf, ((0, 0), (0, length - leaf.shape[1])), constant_values=fill)
+def whole_blocks_of(layout: Layout) -> bool:
+    """Whether `layout`'s rows are each one block of the whole row (`QuestionLayout.split` 'whole')."""
+    return isinstance(layout, QuestionLayout) and layout.blocks and layout.split == "whole"
 
 
 def _restricted(question: Question, options: Sequence[str]) -> Choice:

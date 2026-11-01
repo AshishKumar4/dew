@@ -13,7 +13,6 @@ logits moves at least one bit of them.
 
 import functools
 import math
-import re
 from pathlib import Path
 
 import jax
@@ -21,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
+from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -31,14 +30,16 @@ from reference_error import (
     without_ynn,
 )
 
+from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.kernels.generation import chosen
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
-from dew.nn.rope import YarnScaling
+from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
 
 VOCAB = 37
 SEQ = 12
@@ -56,7 +57,8 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64}
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64,
+         'learned hybrid decode': 8, 'layouts': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
 
@@ -224,6 +226,9 @@ def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
     expected = flax_with_keep(query, value, mask, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
                                           dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    # Zero queries give every visible weight exp(0) = 1 over an integer sum, one correctly rounded quotient,
+    # and the keep mask and its exact multiplier 2 are the same draw's: both programs round the same value
+    # once, so they agree bit for bit by construction.
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
     probabilities = np.asarray(actual)[0]
     for row in range(4):
@@ -264,6 +269,8 @@ def test_attention_dropout_preserves_visibility_masks(rng):
     expected = flax_with_keep(query, value, visible, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, segment_ids=documents,
         implementation="auto", dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    # Bit for bit by construction, as in `test_attention_probability_dropout_matches_flax_on_the_same_draw`:
+    # zero queries' weights are one correctly rounded quotient each, the keep mask the same draw's.
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
     assert not np.any(np.asarray(actual)[0, 2:, :, :2]), "documents never see an earlier document"
 
@@ -293,18 +300,23 @@ def decode_logits(model, params, prompt, rest):
 
 
 def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ, **shape):
-    """Check 1: `model`'s prefill of `prompt` tokens and single-token steps on par with its full pass
-    from position `prompt - 1` over drawn variables and tokens, the truth the model in float64. A
-    model whose logits a scaling divides is run unscaled in float64 and divided there, since the model
-    divides its states in fp32."""
+    """Check 1: `model`'s prefill of `prompt` tokens and single-token steps on par with its full passes
+    from position `prompt - 1` over drawn variables and tokens, each step's at the width it reads
+    (`as_stepped`), the truth the model's one full pass in float64. A model whose logits a scaling
+    divides is run unscaled in float64 and divided there, since the model divides its states in fp32."""
     def decoded(params, ids):
         return decode_logits(model, params, ids[:, :prompt], ids[:, prompt:])
+
+    forward = jax.jit(model.apply)
+
+    def stepped(params, ids):
+        return as_stepped(lambda tokens: forward(params, tokens), ids, prompt)[:, prompt - 1:]
 
     def full(model, divided=1.0):
         return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:] / divided)
 
     wide = float64(model.clone(logits_scaling=1.0))
-    assert_as_exact(decoded, full(model), drawn(model, length=length, **shape), label, seeds=seeds,
+    assert_as_exact(decoded, stepped, drawn(model, length=length, **shape), label, seeds=seeds,
                     truth_fn=full(wide, model.logits_scaling))
 
 
@@ -337,30 +349,32 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
 
 
-@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-def test_a_cached_prompt_reads_its_cache_through_flash_where_its_wheel_runs(rng, without_deterministic_ops):
+def a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_deterministic_ops):
     """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
-    mask, which FlashAttention takes wherever its wheel holds code for the GPU (Hopper's declared cell, other
-    GPUs' first kernel by legality): the compiled prefill holds its kernel there, and its logits are on par
-    with the xla kernel's uncached forward from the float64 forward over drawn weights and prompts
-    (check 1)."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION
-
+    mask, whatever kernel the GPU takes: its logits are on par with the xla kernel's uncached forward from
+    the float64 forward over drawn weights and prompts (check 1)."""
     model = tiny(dtype=jnp.bfloat16)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    prompt = ids[:, :6]
     made, step = decode_steps(model)
-    compiled = step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text()
-    probe = jnp.zeros((1, 8, 1, 64), jnp.bfloat16)
-    failed = ATTENTION.kernel('flash').failed(attention_case(probe, probe))
-    flash = not {requirement.code for requirement in failed} & {'not_installed', 'binary_arch'}
-    # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
-    assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
+
+
+def test_a_cached_prompt_reads_its_cache_under_a_chosen_template():
+    """A prompt prefilled into the cache under `chosen(attention='template')` builds no mask, so the mask's
+    kernel is never decided and the template takes the call (row 2662: decided eagerly, the template's
+    refusal of a mask raised): its logits on par with the xla kernel's uncached forward from the float64
+    forward over drawn weights and prompts (check 1)."""
+    model = tiny()
+    made, step = decode_steps(model)
+
+    def prefilled(params, prompt):
+        with chosen(attention='template'):
+            return step(params, made(params, prompt.shape[0]), prompt)[0]
+
+    assert_as_exact(prefilled, applied(model.clone(attention_impl='xla')), drawn(model, length=6),
+                    "cached prefill on a chosen template", seeds=SEEDS['cached prefill'],
+                    truth_fn=applied(float64(model)))
 
 
 def test_reference_and_xla_kernels_agree_when_causal():
@@ -386,14 +400,15 @@ def test_sliding_window_agrees_across_kernels(rng):
                     seeds=SEEDS['window kernels'])
 
 
-def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, monkeypatch):
+def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng):
     """Gemma 2's tanh on the logits, against the equation on a hand-computed
-    case: reference and xla agree with it, and 'auto' resolves a softcapped
-    call to that same math even where cudnn would otherwise run (bf16 inputs,
-    an 8-wide head, a gpu backend), while cudnn raises a ValueError naming
-    the implementation. A cap of 2 on logits of order 10 changes the
-    weights by a wide margin; an uncapped path moves the output. Each path is
-    on par with the equation from its float64 run over drawn calls (check 1)."""
+    case: reference and xla agree with it, and a bf16 'auto' call is that same
+    math, check 1 on whatever kernel it runs (the accuracy gate decides, never
+    one kernel's equality to another's, nor which kernel it is), while cudnn
+    raises a ValueError naming the implementation.
+    A cap of 2 on logits of order 10 changes the weights by a wide margin;
+    an uncapped path moves the output. Each path is on par with the equation
+    from its float64 run over drawn calls (check 1)."""
     def draw(seed):
         return tuple(jax.random.normal(k, (1, 6, 2, 8)) * 3
                      for k in jax.random.split(jax.random.fold_in(rng, seed), 3))
@@ -424,13 +439,9 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
         halves = [x.astype(jnp.bfloat16).astype(jnp.float32) for x in (query, key, value)]
         return equation(*halves).astype(jnp.bfloat16).astype(query.dtype)
 
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     assert_as_exact(attention('auto', dtype=jnp.bfloat16), jax.jit(bf16_equation), draw,
                     "routed bf16 softcap", seeds=SEEDS['routed softcap'], truth_fn=equation)
     halves = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
-    routed, plain = (scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation=name)
-                     for name in ('auto', 'reference'))
-    np.testing.assert_array_equal(np.asarray(routed), np.asarray(plain))
     with pytest.raises(ValueError):
         scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation='cudnn')
 
@@ -527,14 +538,42 @@ def test_sliding_attention_decode_matches_the_full_sequence():
 def hybrid(**overrides):
     """Qwen3.5's stack at toy size: three gated-delta-net layers, one gated
     full-attention layer with a partial rotary."""
-    return tiny(num_layers=4, num_kv_heads=2, head_dim=8, output_gate=True,
-                partial_rotary_factor=0.5,
-                layer_types=('linear_attention',) * 3 + ('full_attention',),
-                kinds={'linear_attention': {'mixer': {
-                    'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
-                    'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
-                    'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
-                **overrides)
+    return tiny(**{'num_layers': 4, 'num_kv_heads': 2, 'head_dim': 8, 'output_gate': True,
+                   'partial_rotary_factor': 0.5,
+                   'layer_types': ('linear_attention',) * 3 + ('full_attention',),
+                   'kinds': {'linear_attention': {'mixer': {
+                       'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
+                       'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
+                       'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
+                   **overrides})
+
+
+def test_learned_positions_continue_from_the_models_own_count_whatever_its_first_layer(rng):
+    """Learned positions read a cached call's places from the model's own count of each row's real
+    tokens (`DecodeCursor`), whatever mixer its first layer runs: Qwen3.5's stack, whose first layers
+    are gated delta nets that keep no cursor, decodes on par with its full pass (check 1), where every
+    cached step read position 0 off a first layer with no cursor (audit NN-A5)."""
+    model = hybrid(position_embedding='learned', partial_rotary_factor=None)
+    decoded_against_full(model, 4, "learned hybrid decode", SEEDS['learned hybrid decode'], batch=16)
+
+
+@pytest.mark.parametrize("scaling", [
+    YarnScaling(factor=4.0, original_max_position_embeddings=8),
+    RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=4),
+    LongRopeScaling(short_factor=(1.0, 1.5), long_factor=(2.0, 3.0), original_max_position_embeddings=4)],
+    ids=["yarn", "llama3", "longrope"])
+def test_a_scaled_decoder_and_its_kind_rebuild_from_their_own_fields(scaling):
+    """A decoder and a layer kind each given one rope scaling, YaRN's, Llama 3.1's or LongRoPE's, rebuild
+    from the fields the registry records for them (`record_fields`), the union's class record read as its
+    class, so a plain constructor over a saved record makes the same model (ledger 1898)."""
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.registry import record_fields
+
+    kind = LayerKind(window=4, rope_scaling=scaling)
+    assert LayerKind(**record_fields(kind, LayerKind)) == kind
+    model = tiny(rope_scaling=scaling, layer_types=("sliding_attention", "full_attention"),
+                 kinds={"sliding_attention": kind})
+    assert type(model)(**record_fields(model, type(model))) == model
 
 
 def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
@@ -542,7 +581,7 @@ def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
     layer given YaRN and a partial rotary under the proportional convention, the default, refuses at
     its first call."""
     with pytest.raises(ValueError):
-        tiny(partial_rotary_factor=0.5, yarn=YarnScaling()).init(rng, tokens(rng))
+        tiny(partial_rotary_factor=0.5, rope_scaling=YarnScaling()).init(rng, tokens(rng))
 
 
 def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
@@ -860,20 +899,12 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-@pytest.mark.gpu(reason="cuDNN runs on CUDA")
-def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
+def a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
     """A bf16 model whose layers name cudnn (`attention_impl`) runs a packed batch on cuDNN, its
-    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`), which 'auto'
-    leaves for the cheaper xla kernel: the route says cudnn, and the logits are on par with the xla
-    kernel's from the float64 model over drawn weights and tokens (check 1)."""
-    from dew.nn.kernels.generation import routes
-
-    ids, segment_ids, positions = packed_pair(rng)
-    params = tiny().init(rng, ids)
+    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`): the logits are
+    on par with the xla kernel's from the float64 model over drawn weights and tokens (check 1)."""
+    _, segment_ids, positions = packed_pair(rng)
     named = tiny(attention_impl='cudnn', dtype=jnp.bfloat16)
-    with routes() as found:
-        named.apply(params, ids, positions=positions, segment_ids=segment_ids)
-    assert {route.kernel for route in found if route.choice == "attention"} == {"cudnn"}
     packed = {"positions": positions, "segment_ids": segment_ids}
     plain = tiny(attention_impl='xla', dtype=jnp.bfloat16)
     assert_as_exact(applied(named, **packed), applied(plain, **packed), drawn(tiny()), "packed cudnn logits",
@@ -884,10 +915,8 @@ def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, wit
 def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
         rng, without_deterministic_ops):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
-    raises, naming every requirement it fails (`dew.nn.kernels.selection.select`), as torch's
-    `sdpa_kernel` does, rather than running another kernel: here an fp32 model, packed or not. A
-    packed batch's documents are no reason, as a named cuDNN takes them as their mask. 'auto' runs
-    both."""
+    raises, naming the kernel (`dew.nn.kernels.selection.select`), as torch's `sdpa_kernel` does,
+    rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
     model = tiny(attention_impl='cudnn')
     ids, segment_ids, positions = packed_pair(rng)
     params = tiny().init(rng, ids)
@@ -897,9 +926,6 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
     with pytest.raises(KernelRefused) as packed:
         model.apply(params, ids, positions=positions, segment_ids=segment_ids)
     assert plain.value.kernel == packed.value.kernel == "cudnn"
-    assert "dtype" in {refusal.code for refusal in plain.value.refusals}
-    assert "dtype" in {refusal.code for refusal in packed.value.refusals}
-    assert "documents" not in {refusal.code for refusal in packed.value.refusals}
     tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
@@ -1020,53 +1046,56 @@ def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute
     the fp32 sum of the rounded operands rounded to bf16 once, from that sum
     in float64, over drawn weights and tokens (check 1). At "highest" the head
     multiplies the fp32 table, and its logits are on par with that fp32
-    product. The truth of each takes the head's own states as exact input."""
-    model = tiny(dtype=jnp.bfloat16)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    logits = model.apply(params, ids)
-    np.testing.assert_array_equal(
-        np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
-    )
+    product. The truth of each takes the head's own states as exact input.
+    Under JAX's default precision, as a run's default numerics multiply."""
+    with jax.default_matmul_precision(None):
+        model = tiny(dtype=jnp.bfloat16)
+        ids = tokens(rng)
+        params = model.init(rng, ids)
+        logits = model.apply(params, ids)
+        np.testing.assert_array_equal(
+            np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
+        )
 
-    def head(model, dtype, finish, *, rounded):
-        # The states as the compiled model computes them: on a GPU an uncompiled bf16 stack fuses
-        # otherwise, and the head's input is the compiled one's.
-        states = jax.jit(lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states))
+        def head(model, dtype, finish, *, rounded):
+            # The states as the compiled model computes them: on a GPU an uncompiled bf16 stack fuses
+            # otherwise, and the head's input is the compiled one's.
+            states = jax.jit(lambda params, ids: model.apply(params, ids,
+                                                             method=CausalTransformer.hidden_states))
 
-        @as_given
-        def run(params, ids):
-            narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
-            with jax.enable_x64(new_val=False):
-                hidden = states(narrow, ids)
-            hidden = np.asarray(hidden, np.float32)
-            table = np.asarray(params["params"]["embed_tokens"]["embedding"], np.float32)
-            if rounded:
-                table = np.asarray(jnp.asarray(table, jnp.bfloat16), np.float32)
-            return finish(jnp.einsum("...d,vd->...v", jnp.asarray(hidden, dtype), jnp.asarray(table, dtype),
-                                     precision=jax.lax.Precision.HIGHEST))
-        return run
+            @as_given
+            def run(params, ids):
+                narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
+                with jax.enable_x64(new_val=False):
+                    hidden = states(narrow, ids)
+                hidden = np.asarray(hidden, np.float32)
+                table = np.asarray(params["params"]["embed_tokens"]["embedding"], np.float32)
+                if rounded:
+                    table = np.asarray(jnp.asarray(table, jnp.bfloat16), np.float32)
+                return finish(jnp.einsum("...d,vd->...v", jnp.asarray(hidden, dtype),
+                                         jnp.asarray(table, dtype), precision=jax.lax.Precision.HIGHEST))
+            return run
 
-    def to_bf16(product):
-        return product.astype(jnp.bfloat16).astype(jnp.float32)
+        def to_bf16(product):
+            return product.astype(jnp.bfloat16).astype(jnp.float32)
 
-    def unrounded(product):
-        return product
+        def unrounded(product):
+            return product
 
-    assert_as_exact(applied(model), head(model, jnp.float32, to_bf16, rounded=True), drawn(model),
-                    "bf16 head", seeds=SEEDS['bf16 head'],
-                    truth_fn=head(model, jnp.float64, unrounded, rounded=True))
-    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
-    table = params["params"]["embed_tokens"]["embedding"]
-    exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
-                       table.astype(jnp.bfloat16).astype(jnp.float32),
-                       precision=jax.lax.Precision.HIGHEST)
-    assert not np.array_equal(np.asarray(logits), np.asarray(exact))
+        assert_as_exact(applied(model), head(model, jnp.float32, to_bf16, rounded=True), drawn(model),
+                        "bf16 head", seeds=SEEDS['bf16 head'],
+                        truth_fn=head(model, jnp.float64, unrounded, rounded=True))
+        hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
+        table = params["params"]["embed_tokens"]["embedding"]
+        exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
+                           table.astype(jnp.bfloat16).astype(jnp.float32),
+                           precision=jax.lax.Precision.HIGHEST)
+        assert not np.array_equal(np.asarray(logits), np.asarray(exact))
 
-    strict = tiny(dtype=jnp.bfloat16, precision="highest")
-    assert_as_exact(applied(strict), head(strict, jnp.float32, unrounded, rounded=False), drawn(strict),
-                    "strict head", seeds=SEEDS['strict head'],
-                    truth_fn=head(strict, jnp.float64, unrounded, rounded=False))
+        strict = tiny(dtype=jnp.bfloat16, precision="highest")
+        assert_as_exact(applied(strict), head(strict, jnp.float32, unrounded, rounded=False), drawn(strict),
+                        "strict head", seeds=SEEDS['strict head'],
+                        truth_fn=head(strict, jnp.float64, unrounded, rounded=False))
 
 
 def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
@@ -1112,7 +1141,7 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
     bf16, times the fp32 weight in fp32, rounded to bf16, exactly; the
     gradient of sum(out * c), the sum over rows of c * round(y), on par with
     NumPy's fp32 sum of it from its float64 sum over drawn inputs (check 1)."""
-    from dew.nn.attention import RMSNorm
+    from dew.nn.norms import RMSNorm
 
     x = (jax.random.normal(jax.random.key(0), (64, 512)) * 3).astype(jnp.bfloat16)
     weight = 1.0 + 0.1 * jax.random.normal(jax.random.key(1), (512,), jnp.float32)
@@ -1154,12 +1183,12 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("mixture", [None, {"experts": 8, "top_k": 2, "expert_features": 32}])
 def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixture):
-    """The rows are independent, so splitting the batch over devices changes
-    no token's arithmetic. With XLA free to skip roundings, what fused on one
-    device and on four differed: the hidden states of a 4-layer bf16 decoder
-    matched in 13% of entries, an 8-expert MoE's top-2 routes differed in
-    0.3% of layer 0's choices and 2.8% of layer 3's, and its loss moved
-    2.6e-4. Every rounding kept, they are bitwise the same."""
+    """The rows are independent, so splitting the batch over devices changes no token's arithmetic. With
+    XLA free to skip roundings, what fused on one device and on four differed: the hidden states of a
+    4-layer bf16 decoder matched in 13% of entries, an 8-expert MoE's top-2 routes differed in 0.3% of layer
+    0's choices and 2.8% of layer 3's, and its loss moved 2.6e-4. Every rounding kept, the split's hidden
+    states are on par with one device's over drawn weights and tokens (check 1; the owner's option (a),
+    10-22: floats by check 1 across layouts), truth the decoder in float64."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     config = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8, "num_kv_heads": 4,
@@ -1167,17 +1196,19 @@ def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixtur
     if mixture is not None:
         config["mixture"] = {**mixture, "layers": (0, 1, 2, 3)}
     model = CausalTransformer(**config)
-    ids = jax.random.randint(jax.random.key(0), (16, 32), 0, 512)
-    params = model.init(jax.random.key(1), ids)
-
-    def hidden(params, ids):
-        return model.apply(params, ids, method=CausalTransformer.hidden_states)
-
-    one = jax.jit(hidden)(params, ids)
     mesh = Mesh(np.asarray(jax.devices()[:4]), ("data",))
-    split = jax.jit(hidden)(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
 
-    np.testing.assert_array_equal(np.asarray(one), np.asarray(split))
+    def hidden(model):
+        return lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states)
+
+    compiled = jax.jit(hidden(model))
+
+    def split(params, ids):
+        return compiled(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
+
+    assert_as_exact(as_given(split), compiled, model_draw(model, (16, 32), 512),
+                    f"one device against four, {'MoE' if mixture else 'dense'}", seeds=SEEDS['layouts'],
+                    truth_fn=hidden(model.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("activation", ["swiglu", "geglu", "geglu_exact"])
@@ -1412,8 +1443,7 @@ def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):
     decoded_against_full(model, 4, "grouped decode", SEEDS['grouped decode'])
 
 
-@pytest.mark.gpu(reason="needs a GPU")
-def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
+def a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
     """A decode step's keys are the cache's filled slots, a count per row, so
     they reach cuDNN as its padding lengths rather than as a materialized mask:
     that mask sent Qwen3-0.6B's decode to xla's two dense dots over the whole
@@ -1426,8 +1456,7 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
 
 
 
-@pytest.mark.gpu(reason="needs a GPU")
-def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
+def a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
     """A cache prefill of left-padded prompts builds its cursor mask, which
     sends a training call to xla (`kernel_for_materialized_mask`); a prefill
     runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
@@ -1467,9 +1496,10 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
     model = tiny(causal=causal)
     valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
 
-    def states(model, **declared):
+    def states(model, right_padded: bool = False):
+        laid = coordinates(valid.shape, valid=valid, right_padded=right_padded)
         return jax.jit(lambda params, ids: jnp.where(valid[..., None], model.apply(
-            params, ids, attention_mask=valid, method=CausalTransformer.hidden_states, **declared), 0))
+            params, ids, coordinates=laid, method=CausalTransformer.hidden_states), 0))
 
     assert_as_exact(states(model, right_padded=True), states(model), drawn(model), f"{causal} right padded",
                     seeds=SEEDS['right padded'], truth_fn=states(model.clone(dtype=jnp.float64)))

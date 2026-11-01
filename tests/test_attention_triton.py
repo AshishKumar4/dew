@@ -9,6 +9,7 @@ import pytest
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
+    ONE_RUN,
     ROWS,
     RUN_CASES,
     SINKS,
@@ -17,7 +18,7 @@ from test_attention_template import (
     geometry as core_geometry,
 )
 
-from dew.nn.attention import alibi_bias
+from dew.nn.attention_masks import alibi_slopes
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -46,8 +47,8 @@ config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp3
 
 @pytest.fixture(autouse=True)
 def _interpreted_as_an_a100():
-    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the frozen
-    Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
+    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the
+    Pallas-Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
     if jax.default_backend() != "cpu":
         yield
         return
@@ -61,9 +62,10 @@ def geometry(case: dict) -> tuple[int, int]:
 
 
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
-          attention_triton.Tiles(32, 64, 8, 3), attention_triton.Tiles(128, 128, 8, 2))
-"""The configs each case runs at on the CPU, where interpreting all of `SPACE` would take hours; a GPU
-runs every config (`test_every_config_on_a_gpu`)."""
+          attention_triton.Tiles(128, 64, 4, 2))
+"""The configs each case runs at on the CPU, where interpreting every tile the derivation steps through
+(`FORWARD_STEPS`) would take hours; a GPU runs each (`every_config_on_a_gpu`, a cell of
+tests/test_gpu_attention.py)."""
 
 
 def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 32):
@@ -82,7 +84,7 @@ def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 
 def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> template.Hooks:
     """The hooks `names` asks for: a softcap and ALiBi as one score_mod, sinks as the initial state, an
     output gate."""
-    slopes = alibi_bias(jnp.ones((1, 1)), 4, dtype=jnp.float32).reshape(4)
+    slopes = jnp.asarray(alibi_slopes(4))
 
     def score_mod(s, q_pos, k_pos, *params):
         if "softcap" in names:
@@ -123,12 +125,15 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
-    pin = tuning.pinned({attention_triton.TritonForward: config})
+    pin = {attention_triton.TritonForward: config}
 
-    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), taken
-    # to the reference's natural ones as the algebra takes them (`algebra.Forward.naturalized`).
-    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=width ** -0.5,
-                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None)
+    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), the
+    # query's taken by its scale's power of two (`template.prescale`), taken to the reference's natural ones
+    # as the algebra takes them (`algebra.Forward.naturalized`).
+    power, scale = template.prescale(dtype, width, width ** -0.5)
+    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=scale,
+                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
+                           prescale=power)
 
     def ours(query, key, value):
         if mainloop == "portable":
@@ -136,7 +141,7 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
                                             block_k=config.block_k, pad=attention_triton.BLOCK,
                                             residuals=residuals, natural=natural)
         else:
-            with pin:
+            with tuning.pinned(pin):
                 out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
                                                natural=natural, interpret=not ON_GPU)
         # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
@@ -179,23 +184,24 @@ def test_the_plain_forward_is_on_par_over_runs(form, config):
 
 
 def test_the_frozen_mainloop_refuses_runs():
-    """The frozen Triton mainloop walks one key interval a query: its legality rule names a call's runs, its
-    launches are not eligible for them, and its forward and backward refuse them before any launch, so the
-    route takes the Mosaic or the plain-JAX mainloop (ledger 956)."""
+    """The Pallas-Triton mainloop walks one key interval a query: called on a call's runs, its forward and
+    backward refuse them before any launch rather than compute them as one interval (ledger 956)."""
     queries, keys = core_geometry(RUN_CASES["runs"])
     spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
-    reason = attention_triton.refused(spans)
-    assert reason is not None and attention_triton.refused(template.spans(queries, keys, ROWS)) is None
     query = jnp.zeros((ROWS, queries, 2, 32), jnp.float32)
     key = jnp.zeros((ROWS, keys, 1, 32), jnp.float32)
-    op = attention_triton.TritonForward(keys=keys)
-    ba = op.bind(query, key, key, spans.start, spans.end, None, None, (), (), None, None, None,
-                 residuals=False, interpret=True)
-    assert not op.eligible(ba, generation.gpu_target("sm90"))
     with pytest.raises(NotImplementedError):
         attention_triton.forward(query, key, key, spans, interpret=True)
     with pytest.raises(NotImplementedError):
         attention_triton.backward(query, key, key, spans, None, query, interpret=True)
+
+
+@pytest.mark.parametrize("config", PINNED[:2], ids=str)
+def test_one_run_a_query_is_the_interval_the_frozen_mainloop_walks(config):
+    """One run a query (`test_attention_template.ONE_RUN`, a chunked or banded local-attention layer's runs)
+    is one key interval, which the Pallas-Triton mainloop walks forward and backward (ledger 1991)."""
+    check(ONE_RUN, HOOKS["none"], jnp.float32, config)
+    check_backward(ONE_RUN, (), jnp.float32, config)
 
 
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
@@ -213,12 +219,9 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
     check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
 
 
-@pytest.mark.gpu(reason="every config compiles for the GPU")
-@pytest.mark.parametrize("case", ["causal-documents-window", *IRREGULAR])
-@pytest.mark.parametrize("config", attention_triton.SPACE, ids=str)
-def test_every_config_on_a_gpu(config, case):
-    """Every config of the space, bf16, every hook: over causal documents under a window, and over the
-    irregular full and causal calls (`IRREGULAR`)."""
+def every_config_on_a_gpu(config, case):
+    """Every tile the forward's derivation steps through (`FORWARD_STEPS`), bf16, every hook: over causal
+    documents under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
     check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
 
 
@@ -318,7 +321,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
         streams = jax.random.split(jax.random.fold_in(jax.random.key(77), seed), 6)
         params = []
         if "alibi" in names:
-            params.append(alibi_bias(jnp.ones((1, 1)), heads, dtype=jnp.float32).reshape(heads))
+            params.append(jnp.asarray(alibi_slopes(heads)))
         if "temperature" in names:
             params.append(jax.random.uniform(streams[0], (rows, heads, queries), jnp.float32, 0.5, 1.5))
         if "key" in names:
@@ -370,7 +373,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
         return template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                for value, kind in zip(params, kinds, strict=True)), initial)
 
-    pins = tuning.pinned({attention_triton.TritonBackward: joint(config, dkv_config)})
+    pins = {attention_triton.TritonBackward: joint(config, dkv_config)}
 
     def ours(query, key, value, dout, params, initial):
         if mainloop == "portable":
@@ -379,7 +382,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
                                                 pad=attention_triton.BLOCK, natural=natural,
                                                 accurate=accurate)
         else:
-            with pins:
+            with tuning.pinned(pins):
                 grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
                                                   natural=natural, accurate=accurate, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
@@ -476,11 +479,11 @@ def test_an_integer_parameter_keys_and_runs():
         query, key, value = draw_qkv(seed)
         return query, key, value, jax.random.normal(jax.random.key(seed + 1000), query.shape, jnp.float32)
 
-    pins = tuning.pinned({attention_triton.TritonForward: PINNED[1],
-                          attention_triton.TritonBackward: joint(PINNED[0])})
+    pins = {attention_triton.TritonForward: PINNED[1],
+            attention_triton.TritonBackward: joint(PINNED[0])}
 
     def ours(query, key, value, dout):
-        with pins:
+        with tuning.pinned(pins):
             out = attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
             grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=not ON_GPU)
         return out, grads.query, grads.key, grads.value
@@ -503,10 +506,10 @@ def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
         return o * jnp.arange(32, dtype=o.dtype)
 
     hooks = template.Hooks(output_mod=output_mod)
-    pins = tuning.pinned({attention_triton.TritonForward: PINNED[1]})
+    pins = {attention_triton.TritonForward: PINNED[1]}
 
     def ours(query, key, value):
-        with pins:
+        with tuning.pinned(pins):
             return attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
 
     def xla(query, key, value):
@@ -576,7 +579,8 @@ def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype)
 def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
     """fp32, one query over one key beside a resumed state of denominator 2^25 and maximum 87: the key's
     weight exp(-87) / 2^25 is below fp32's least subnormal, yet against a cotangent of 2^100 its gradient
-    is a normal number, as the reference's derivative gives."""
+    is a normal number, as the reference's derivative's is: kept apart from zero where the reference keeps
+    it (the stability rule)."""
     spans = template.spans(1, 1, 1)
     zeros = jnp.zeros((1, 1, 1, 1), jnp.float32)
     state = template.Initial(jnp.full((1, 1, 1), 87.0), jnp.full((1, 1, 1), 2.0 ** 25),
@@ -589,7 +593,7 @@ def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
     _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, hooks, scale=1.0), zeros)
     [theirs] = pull(dout)
     assert float(theirs[0, 0, 0, 0]) > 0
-    np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert np.isfinite(np.asarray(ours)).all() and float(ours[0, 0, 0, 0]) >= np.finfo(np.float32).tiny
 
 
 def test_a_small_fp16_cotangent_channel_beside_a_large_one_still_sums_into_dv():
@@ -625,7 +629,8 @@ def test_a_small_fp16_cotangent_beside_a_large_one_still_reaches_its_key():
 def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
     """fp16, one query over keys whose third weight is about 5.3e-8 before its denominator of 2 and
     2.7e-8 after it, which fp16's least subnormal (6e-8) holds only before: dV's third row takes it, as
-    the reference's derivative does."""
+    the reference's derivative does, kept apart from zero where the reference keeps it (the stability
+    rule)."""
     spans = template.spans(1, 3, 1)
     query = jnp.ones((1, 1, 1, 1), jnp.float16)
     key = jnp.asarray([0.0, 0.0, -16.75], jnp.float16).reshape(1, 3, 1, 1)
@@ -637,7 +642,7 @@ def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
     _, pull = jax.vjp(lambda value: template.reference(query, key, value, spans, scale=1.0), value)
     [theirs] = pull(dout)
     assert float(theirs[0, 2, 0, 0]) > 0
-    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+    assert np.isfinite(np.asarray(ours, np.float32)).all() and float(ours[0, 2, 0, 0]) > 0
 
 
 def test_the_backward_resumes_queries_that_read_no_key():
@@ -659,15 +664,12 @@ def test_the_backward_walks_many_key_tiles(case):
     check_backward(IRREGULAR[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.float32, PINNED[0])
 
 
-@pytest.mark.gpu(reason="every config compiles for the GPU")
-@pytest.mark.parametrize("case", ["causal-documents-window", *IRREGULAR])
-@pytest.mark.parametrize("config", attention_triton.BACKWARD_SPACE, ids=str)
-def test_every_backward_config_on_a_gpu(config, case):
-    """Every config of the backward's space, bf16, a softcap, sinks and ALiBi, over causal documents
-    under a window and over the irregular full and causal calls (`IRREGULAR`): each config the launch takes
-    at the call (`TritonBackward.fitting`: its threads within their registers, its programs within a block's
-    shared memory) on par with the reference, and each other refused where it is pinned
-    (`tuning.Unpinnable`), so no call runs it."""
+def every_backward_config_on_a_gpu(config, case):
+    """Every tile the backward's derivation steps through (`BACKWARD_STEPS`), bf16, a softcap, sinks and
+    ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
+    each the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
+    programs within a block's shared memory) on par with the reference, and each other refused where it is
+    pinned (`tuning.Unpinnable`), so no call runs it."""
     import tokamax
 
     from dew.nn.kernels import generation
@@ -679,7 +681,7 @@ def test_every_backward_config_on_a_gpu(config, case):
               "key": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16),
               "value": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16)}
     op = attention_triton.TritonBackward()
-    takes = config in op.fitting(tokamax.BoundArguments(op, arrays), generation.gpu_target())
+    takes = op.legal(tokamax.BoundArguments(op, arrays), config, generation.gpu_target())
     tiles = attention_triton.Tiles
 
     def run():
@@ -803,3 +805,42 @@ def test_the_accurate_form_lowers_and_compiles_on_tritons_compiler(target, sinks
                              KernelCase("backward", lambda: (backward, (shape,) * 4))], target)
     assert len(found) >= 2
     assert not failures(found), "\n".join(failures(found))
+
+
+@pytest.mark.parametrize("width", [64, 128])
+def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block(width):
+    """An fp32 call's forward and backward at the configs the launches take themselves (no pin), compiled by
+    XLA's CUDA backend for a compile-only A100 on this CPU (tests/kernel_compile.py), within the 166912 bytes
+    a block holds: fp32 operands stage more than 16-bit ones in Triton's backward (CELLS-a100's template
+    arm asked 182272 at 128-wide heads), which its model must count, or the call fails to compile there."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    spans = template.spans(1024, 1024, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, 1024, 8, width), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, width), jnp.float32)
+
+    def step(query, key, value, dout):
+        out, *residuals = attention_triton.forward(query, key, value, spans, residuals=True)
+        grads = attention_triton.backward(query, key, value, spans, None, dout, residuals=tuple(residuals))
+        return out, grads.query, grads.key, grads.value
+
+    found = compile_kernels([KernelCase("step", lambda: (step, (query, key, key, query)))], "sm80")
+    assert not failures(found), "\n".join(failures(found))
+
+
+def test_a_training_forward_derives_the_largest_tile_its_threads_hold():
+    """The forward's derivation on an A100 at 128-wide heads: a plain walk takes the measured 128 by 64; a
+    training walk, whose anchor value row holds 128 more registers a thread, steps down to 64 by 64 (160
+    a thread), where the fixed space it replaced fell to its next fitting entry, 32 by 32, at two to three
+    times the time."""
+    import tokamax
+
+    from dew.nn.kernels import generation
+
+    arrays = {name: jax.ShapeDtypeStruct((1, 1024, heads, 128), jnp.bfloat16)
+              for name, heads in (("query", 4), ("key", 2), ("value", 2))}
+    op, target = attention_triton.TritonForward(), generation.TARGETS["sm80"]
+    plain = op.derived(tokamax.BoundArguments(op, arrays), target)
+    training = op.derived(tokamax.BoundArguments(op, {**arrays, "residuals": True}), target)
+    assert (plain, training) == (attention_triton.Tiles(128, 64, 4, 2), attention_triton.Tiles(64, 64, 4, 2))

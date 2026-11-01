@@ -1,4 +1,4 @@
-"""What `reference_error.float64_terms` takes for a leaf's terms: the root sum
+"""What `float64_terms.float64_terms` takes for a leaf's terms: the root sum
 of squares of the terms its final sums add, carried into it, and nothing behind them;
 and the attention oracle's float64 truth held to an exact evaluation."""
 
@@ -8,9 +8,9 @@ import mpmath
 import numpy as np
 import pytest
 from attention_oracle import anchored_softmax
+from float64_terms import float64_terms
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
-from reference_error import float64_terms
 
 from dew.accuracy import reduction_bound, within
 
@@ -87,7 +87,7 @@ def test_a_named_sum_carries_its_terms_through_a_residual_add():
     (`checkpoint_name`) before the residual add. The name moves the sum, so
     the stream's terms are the projection's whatever the stream holds: an
     entry where the add cancels keeps the projection's terms, not its own
-    near-zero size (FrontDamselfly, MiMo's vision tower)."""
+    near-zero size (the Models lane, MiMo's vision tower)."""
     rng = np.random.default_rng(2)
     x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
 

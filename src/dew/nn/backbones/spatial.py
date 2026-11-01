@@ -22,8 +22,8 @@ class SpatialForward:
     def residual(self, module, x, time, *, train=False):
         return module(x, time, train=train)
 
-    def attention(self, module, x, context, *, train=False):
-        return module(x, context, train=train)
+    def attention(self, module, x, context):
+        return module(x, context)
 
     def stage_attention(self, module, x, context):
         return module(x, context)
@@ -67,7 +67,7 @@ class SpatialCount:
         self.flops += module.model_flops(self.positions(output), x.shape[-1], time.shape[-1])
         return output
 
-    def attention(self, module, x: SpatialShape, context, *, train=False) -> SpatialShape:
+    def attention(self, module, x: SpatialShape, context) -> SpatialShape:
         self.flops += module.cross_flops(self.positions(x), self.context_lengths, self.text_features)
         return x
 

@@ -7,6 +7,7 @@ cell prints meanwhile, from any thread and in any pieces, stays in its outputs.
 """
 
 import os
+import re
 from pathlib import Path
 
 import nbformat
@@ -82,8 +83,10 @@ def test_a_notebook_keeps_the_panels_last_frame_the_summary_and_every_line_print
     # The frame the run opened with, compiling at step 0, updated in place to its last.
     frame, summary = panels
     assert "dew" in text(frame) and "Affine" in text(frame) and "40/40" in text(frame)
-    assert "finished" in text(frame) and "loss" in text(frame)
-    assert "Affine" in text(summary) and "40 steps" in text(summary)
+    # Ended: the frame's bottom border carries the finished mark, not a spinner.
+    assert "loss" in text(frame) and "✓" in text(frame)
+    # The summary's step count among its words, its styling's escape codes aside.
+    assert "Affine" in text(summary) and "40" in re.sub(r"\x1b\[[0-9;]*m", " ", text(summary)).split()
     # Styled, so the site renders each as the panel it is, not as one more line of a log.
     assert all("<span" in "".join(output.data["text/html"]) for output in panels)
     printed = "".join(output.text for output in outputs if output.output_type == "stream")

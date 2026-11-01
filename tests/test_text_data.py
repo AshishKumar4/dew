@@ -787,10 +787,22 @@ def stores(tmp_path):
             "packed_records": exported("packed_records", [2, 9], "ids")}
 
 
-def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(stores):
+def test_the_same_corpus_gives_the_same_windows_in_every_store_and_packs_each_stores_records(stores):
+    """A token store's windows are its stream, however its producer cut it into records; packed, its
+    documents are the records its producer wrote (row 3028), each store's packing that of its own
+    records read from memory: the corpus's EOS spans where they are its records, else its pieces."""
+    from dew.data import Memory
+
+    def rows(batches):
+        return [jax.tree.map(lambda value: value.tolist(), row) for row in _read(batches)]
+
     def validation(stored, **layout):
-        rows = _read(_validated(stored, **layout))
-        return [jax.tree.map(lambda value: value.tolist(), row) for row in rows]
+        return rows(_validated(stored, **layout))
+
+    def records(sizes):
+        pieces = [{"text": piece.astype(np.int32)} for piece in _pieces(CORPUS, sizes)]
+        chain = _laid(Memory(pieces), 5, 1, pack="first-fit", bins=2).read("memory").loading(LOADING)
+        return rows(held(chain)(DataPartition()))
 
     windows = {name: validation(stored, seq_len=4, batch=1) for name, stored in stores.items()}
     packed = {name: validation(stored, seq_len=5, batch=1, pack="first-fit", bins=2)
@@ -799,10 +811,13 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
         CORPUS[start:start + 5].tolist() for start in range(0, len(CORPUS) - 4, 4)]
     lengths = [count for row in packed["documents"]
                for segment, count in Counter(row["text_coordinates"].segments).items() if segment]
-    assert sorted(lengths) == [2, 3, 3, 4, 6], "the documents are the eos spans"
+    assert sorted(lengths) == [2, 3, 3, 4, 6], "the documents store's records are the eos spans"
     for name in stores:
         assert windows[name] == windows["documents"], name
-        assert packed[name] == packed["documents"], name
+    # The stores' pieces (`stores`): the EOS spans, then [4, 3] and [2, 9], each with the rest.
+    for name, sizes in (("documents", [4, 3, 6, 2]), ("records", [4, 3]), ("packed_records", [2, 9])):
+        assert packed[name] == records(sizes), name
+    assert packed["records"] != packed["documents"]
 
 
 def test_a_hub_tokenizer_runs_the_revision_its_identity_names(monkeypatch, tmp_path):
@@ -831,6 +846,28 @@ def test_a_hub_tokenizer_runs_the_revision_its_identity_names(monkeypatch, tmp_p
     encoded = [int(token) for token in sent.map({"text": "hello there"})["text"]]
     assert encoded == load_tokenizer(str(files), local_files_only=True).encode("hello there")
     assert resolved == [("acme/tokenizer", None)]
+
+
+def test_a_reader_that_names_a_tokenizer_class_loads_it_through_the_one_loader(tmp_path):
+    """A CLIP tower's tokenizer loads through the one loader as the slow `CLIPTokenizer` its pipeline's
+    own reads (`load_tokenizer(cls=)`, ledger 3013): a load of its own, apart from the loader's default
+    fast class over the same files and shared by every reader that names the class, encoding a caption
+    as transformers' `CLIPTokenizer` itself does."""
+    import tarfile
+
+    from transformers import CLIPTokenizer
+
+    from dew.data.text import pin_tokenizer
+
+    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
+        archive.extractall(tmp_path, members=[member for member in archive.getmembers()
+                                              if member.name.startswith("sd/tokenizer")], filter="data")
+    pinned = pin_tokenizer(str(tmp_path / "sd" / "tokenizer"))
+    slow = pinned.transformers(cls="CLIPTokenizer")
+    assert type(slow) is CLIPTokenizer and pinned.transformers(cls="CLIPTokenizer") is slow
+    assert pinned.transformers() is not slow
+    caption = "a photograph of an astronaut riding a horse"
+    assert slow(caption)["input_ids"] == CLIPTokenizer.from_pretrained(pinned.directory)(caption)["input_ids"]
 
 
 def test_a_release_whose_remote_tokenizer_renames_qwen2s_loads_as_qwen2s_without_its_code(tmp_path):

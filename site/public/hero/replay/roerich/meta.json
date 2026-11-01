@@ -14,7 +14,7 @@
  "model": {
   "model": "dewml/hybrid-dit-176m",
   "parameters": 175640848,
-  "dew_commit": "aaffb62c07ffad78c72b29758673d1c4f5c37f4a",
+  "dew_commit": "5a5a378b540a090a81c211b1c760b9f875640ec8",
   "device": "NVIDIA GeForce RTX 4080"
  },
  "frames": 30,

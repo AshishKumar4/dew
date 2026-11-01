@@ -28,6 +28,16 @@ def documented(gen_api):
     return (package, *gen_api.documented(package, gen_api.P.pages))
 
 
+def test_the_condition_encoder_contract_has_its_own_reference_page(documented):
+    """Both public contract types have their defining module as their reference home, including
+    ConditionWork, which the encoder implementations import but do not themselves define."""
+    _, pages, homes = documented
+    assert homes.get("dew.inputs.condition.ConditionWork") == "dew.inputs.condition"
+    assert homes.get("dew.inputs.condition.ConditionEncoder") == "dew.inputs.condition"
+    entries = {entry.canonical for entry in pages["dew.inputs.condition"].entries}
+    assert {"dew.inputs.condition.ConditionWork", "dew.inputs.condition.ConditionEncoder"} <= entries
+
+
 def test_a_name_bound_in_one_cell_is_resolved_in_the_next(gen_api, documented, tmp_path):
     notebook = tmp_path / "two.ipynb"
     notebook.write_text(json.dumps({"cells": [
@@ -199,7 +209,8 @@ def test_check_rejects_an_unresolvable_or_nondeclaration_reference(
 def test_a_notebook_pinned_to_a_commit_is_held_to_that_commits_api(gen_api, reference_package, monkeypatch):
     """A notebook whose install pins the package to a commit shows the API that commit documented: a name it
     documented resolves there though the package has since renamed it, one it never held does not, and an
-    unpinned notebook is held to the API as it is."""
+    unpinned notebook is held to the API as it is; a pin to a commit the checkout's history does not hold is
+    refused (ledger 2783)."""
     source, overview = reference_package
     root = overview.parent
     source.write_text("def old_name(): ...\n")
@@ -217,8 +228,13 @@ def test_a_notebook_pinned_to_a_commit_is_held_to_that_commits_api(gen_api, refe
     monkeypatch.setattr("sys.argv", ["gen_api.py", "--check"])
     notebook(root / "pinned.ipynb", install, "from example import old_name\nold_name()\n")
     gen_api.main()
+    # A commit with the same tree that the history does not hold, as one from before a rewrite is to an
+    # environment built before it: refused, though its object is there to archive.
+    outside = git(root, "commit-tree", f"{commit}^{{tree}}", "-m", "outside the history").strip()
+    stray = install.replace(commit, outside)
     for name, cells in (("pinned_absent.ipynb", (install, "import example\nexample.never_held()\n")),
-                        ("current.ipynb", ("from example import old_name\n",))):
+                        ("current.ipynb", ("from example import old_name\n",)),
+                        ("pinned_outside.ipynb", (stray, "from example import old_name\nold_name()\n"))):
         notebook(root / name, *cells)
         with pytest.raises(SystemExit) as stopped:
             gen_api.main()

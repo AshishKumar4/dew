@@ -31,18 +31,13 @@ import torch
 import transformers
 from interop_support import token_draw
 from jax.sharding import PartitionSpec as P
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    equations,
-    torch_with_gradients,
-    with_gradients,
-)
+from reference_error import as_given, assert_as_exact, equations, torch_with_gradients, with_gradients
 
 from dew.batch import coordinates
 from dew.data.dataset import Loader
+from dew.distributed.placement import Layout
 from dew.interop import Pretrained
+from dew.interop.pretrained import PretrainedFallback
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
@@ -132,6 +127,64 @@ def loss_and_gradients(loaded, model, params):
 
     return dew_fn
 
+def test_a_load_reads_each_tensor_by_name_from_its_checkpoint(source, loaded, tmp_path):
+    """A tier-3 load reads its checkpoint's tensors by name, memory-mapped, into a model built on the
+    meta device (ledger 1493): every parameter is the source's own, bit for bit, and a parameter the
+    checkpoint lacks is refused, named, where a draw would stand in for the source's."""
+    from safetensors.numpy import load_file, save_file
+
+    directory, model = source
+    params = loaded.variables["params"]
+    held = {name: value for name, value in model.state_dict().items() if name in params}
+    assert set(held) == set(params)
+    for name, value in held.items():
+        np.testing.assert_array_equal(np.asarray(params[name]), value.numpy(), err_msg=name, strict=True)
+    lacking = tmp_path / "lacking"
+    shutil.copytree(directory, lacking)
+    tensors = load_file(lacking / "model.safetensors")
+    del tensors["gpt_neox.layers.0.mlp.dense_h_to_4h.weight"]
+    save_file(tensors, lacking / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(lacking, fallback="torchax", dtype="float32")
+
+
+def test_a_checkpoint_transformers_converts_is_refused_where_it_lacks_a_parameter(tmp_path):
+    """A tier-3 checkpoint in a layout transformers' load converts (OLMoE's experts a tensor each, which it
+    fuses) loads through that load, and is refused where it lacks a parameter its model's class names,
+    which that load would draw, as a checkpoint read by name is (ledger 1493)."""
+    from safetensors.numpy import load_file, save_file
+
+    config = transformers.OlmoeConfig(vocab_size=256, hidden_size=32, intermediate_size=32,
+                                      num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
+                                      num_experts=2, num_experts_per_tok=1, max_position_embeddings=64)
+    transformers.OlmoeForCausalLM(config).eval().save_pretrained(tmp_path)
+    tensors = load_file(tmp_path / "model.safetensors")
+    assert any(".mlp.experts.0." in name for name in tensors)
+    with pytest.warns(TransformersTierWarning):
+        Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+    del tensors["model.layers.0.self_attn.q_proj.weight"]
+    save_file(tensors, tmp_path / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+
+
+def test_two_tier_3_models_place_their_names_side_by_side(loaded, tmp_path):
+    """A run of two tier-3 models (a distillation's student and teacher) places each one's torch names by
+    its own plan, the second refining the layout the first refined (`TorchCausalLM.placement`), and one
+    name two models would place differently is refused, which one layout cannot place both by."""
+    ctrl = transformers.CTRLConfig(n_positions=32, n_embd=64, n_layer=2, n_head=4, dff=128, vocab_size=256)
+    transformers.CTRLLMHeadModel(ctrl).eval().save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        other = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    both = other.model.placement(loaded.model.placement(Layout()))
+    assert isinstance(both, TorchLayout)
+    assert both.axes("gpt_neox.layers.0.attention.query_key_value.weight", 2) == ("mlp", "embed")
+    assert both.axes("transformer.w.weight", 2) == ("vocab", "embed")
+    assert loaded.model.placement(both) == both
+    with pytest.raises(ValueError):
+        loaded.model.placement(TorchLayout(names=(("gpt_neox.embed_in.weight", ("embed", "vocab")),)))
+
+
 def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, tokens):
     """`apply` is the torch forward, and LMObjective's chunked loss over the
     captured head input and the head weight is transformers' own loss."""
@@ -165,7 +218,8 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,
     every parameter moves, the rotary buffers come back bitwise, and the
-    torch names take the specs the name table gives them."""
+    torch names take the specs the model's tensor-parallel plan gives them: a trainer built from Python
+    takes the layout as the objective's model refines it (`Objective.placement`, ledger 2777)."""
     params, buffers = loaded.variables["params"], loaded.variables["buffers"]
     assert set(buffers) == {"gpt_neox.rotary_emb.inv_freq", "gpt_neox.rotary_emb.original_inv_freq"}
     assert not set(params) & set(buffers)
@@ -174,7 +228,8 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     batch = tokens[np.arange(rows) % ROWS]
     data = Loader(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, tensor=2), layout=TorchLayout(min_shard=1))
+                      mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+    assert trainer.layout == objective.placement(Layout(min_shard=1)) != Layout(min_shard=1)
 
     state = trainer.fit(data, steps=4, log_every=1)
 
@@ -187,16 +242,33 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     layer = "gpt_neox.layers.0"
     assert moved[f"{layer}.attention.query_key_value.weight"].sharding.spec == P("tensor", "fsdp")
     # The row-parallel projection, [embed, mlp] in torch: the residual width
-    # takes fsdp and the 4h width the tensor axis (8a6ff3e8's Megatron 2-D).
+    # takes fsdp and the 4h width the tensor axis (40e6435b's Megatron 2-D).
     assert moved[f"{layer}.mlp.dense_4h_to_h.weight"].sharding.spec == P("fsdp", "tensor")
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
 @pytest.mark.mesh(devices=4)
+def test_a_load_onto_a_mesh_places_the_torch_names_by_the_models_plan(source):
+    """A tier-3 source loaded onto a mesh (a run's frozen source, `RunConfig.source_placement`) lies as its
+    model's tensor-parallel plan places its torch names (`TorchCausalLM.placement`): a column-split
+    projection's output width on the tensor axis and its input on fsdp, a row-split one's the other way,
+    its token table's rows over both; a tensor the plan names nothing for, a norm's, by the shape."""
+    with pytest.warns(UserWarning):
+        placed = Pretrained.load(source[0], fallback="torchax", dtype="float32",
+                                 mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+    assert isinstance(placed.model.placement(Layout()), TorchLayout)
+    params, layer = placed.variables["params"], "gpt_neox.layers.0"
+    assert params[f"{layer}.attention.query_key_value.weight"].sharding.spec == P("tensor", "fsdp")
+    assert params[f"{layer}.attention.dense.weight"].sharding.spec == P("fsdp", "tensor")
+    assert params[f"{layer}.mlp.dense_h_to_4h.weight"].sharding.spec == P("tensor", "fsdp")
+    assert params["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
+
+
+@pytest.mark.mesh(devices=4)
 def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
-    """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
-    tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
-    tensor axis as the table splits them, while the trained ones, their moments and one step's
+    """`Layout.frozen_whole` reaches a torch-named tree: the model's tensor-parallel plan picks each
+    tensor's axes (`TorchLayout`), and the one placement keeps the frozen tensors whole over fsdp, split
+    over the tensor axis as the plan splits them, while the trained ones, their moments and one step's
     update lie as the split layout lays them."""
     from dew.batch import FROZEN, freeze
     from dew.distributed.batches import shard_batch
@@ -210,7 +282,8 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
     def stepped(frozen_whole: bool):
         objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None, variables=variables)
         trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0), mesh=mesh, checkpoints=None,
-                          tracker=None, layout=TorchLayout(min_shard=1, frozen_whole=frozen_whole))
+                          tracker=None,
+                          layout=Layout(min_shard=1, frozen_whole=frozen_whole))
         trainer.device_mesh = mesh.build(jax.devices()[:4])
         state, shardings, _ = trainer.place()
         placed = shard_batch(trainer.device_mesh, batch)
@@ -507,9 +580,9 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
 
     @jax.jit
     def trained(ids, segments, valid):
-        logits = loaded.model.apply(loaded.variables, ids, train=True, segment_ids=segments,
-                                    attention_mask=valid, method="logits",
-                                    rngs={"dropout": jax.random.key(5)})
+        logits = loaded.model.apply(loaded.variables, ids, train=True,
+                                    coordinates=coordinates(ids.shape, segments=segments, valid=valid),
+                                    method="logits", rngs={"dropout": jax.random.key(5)})
         return {"logits": jnp.where(valid[..., None], logits, 0)}
 
     def ours(ids, segments, valid, _):
@@ -541,14 +614,15 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
 
 def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
     """OpenAI GPT's layers compute their attention in their own code, asking transformers' attention
-    interface nothing: tier 3 runs that attention as transformers does, so it names no Dew kernel
-    (`attention_impl`) and reads no packed rows (`Lacks`)."""
+    interface nothing: the torchax route, which a load asks for though the type has a family of its own,
+    runs that attention as transformers does, so it names no Dew kernel (`attention_impl`) and reads no
+    packed rows (`Lacks`)."""
     torch.manual_seed(0)
     config = transformers.OpenAIGPTConfig(n_embd=64, n_layer=2, n_head=4, vocab_size=TINY["vocab_size"],
                                           n_positions=64)
     transformers.OpenAIGPTLMHeadModel(config).save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32")
+        loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     assert loaded.model.graph.attention_impl is None
     ids, segments, _, _ = packed_rows(0)
     with pytest.raises(Lacks):
@@ -556,7 +630,7 @@ def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_pack
                            method="logits")
     # Refused before the load warns of its tier.
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+        Pretrained.load(tmp_path, dtype="float32", fallback="torchax", attention_impl="reference")
 @pytest.mark.parametrize("route", ["tier 3", "fallback"])
 def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_path):
     """Without its weights a tier-3 source is built from its config alone, its weight files never read
@@ -678,6 +752,35 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
                     seeds=BF16_SEEDS, truth_fn=truth_fn)
 
 
+def test_a_bf16_tier_3_model_takes_forward_mode_through_its_forward_and_its_gradient(tokens, tmp_path):
+    """A bf16 tier-3 model's forward takes forward mode, and so does the gradient of a loss over its
+    logits (ledger 2653, 3039): its broadcasts, which sum their gradient in fp32 as torch does, are JAX's
+    own between exact casts, which a jvp and a jvp of the gradient run through, where a custom VJP took
+    no tangent: each tangent is finite and nonzero. Their accuracy is the broadcast's contract's
+    (tests/test_contracts_gemm.py)."""
+    torch.manual_seed(0)
+    transformers.GPTNeoXForCausalLM(transformers.GPTNeoXConfig(**TINY)).to(torch.bfloat16).save_pretrained(
+        tmp_path)
+    with pytest.warns(UserWarning):
+        model = Pretrained.load(tmp_path, fallback="torchax", dtype="bfloat16", param_dtype="bfloat16")
+    ids = jnp.asarray(tokens[:, :SEQ])
+    cotangent = jnp.asarray(np.random.default_rng(0).standard_normal((ids.shape[0], SEQ, TINY["vocab_size"])),
+                            jnp.float32)
+
+    def loss(params):
+        logits = model.model.apply({**model.variables, "params": params}, ids)
+        return jnp.sum(jnp.asarray(logits, jnp.float32) * cotangent)
+
+    params = model.variables["params"]
+    direction = jax.tree.map(lambda leaf: jnp.ones_like(leaf) * jnp.asarray(1e-2, leaf.dtype), params)
+    value, tangent = jax.jvp(loss, (params,), (direction,))
+    _, curvature = jax.jvp(jax.grad(loss), (params,), (direction,))
+    assert np.isfinite(float(value)) and np.isfinite(float(tangent)) and float(tangent) != 0
+    leaves = jax.tree.leaves(curvature)
+    assert all(np.all(np.isfinite(np.asarray(leaf, np.float32))) for leaf in leaves)
+    assert any(np.any(np.asarray(leaf, np.float32) != 0) for leaf in leaves)
+
+
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
     """The saved directory is a transformers checkpoint of the given weights."""
     variables = {**loaded.variables, "params": {name: np.asarray(leaf) * 0.5
@@ -702,16 +805,18 @@ def test_the_output_table_scores_as_the_bf16_forward_whatever_dtype_the_states_a
     rounds the logits to bf16. The output table carries that compute dtype,
     so states handed to it in fp32, as a loss may hold them, score as the
     forward's own logits do: bf16 values, each within one bf16 step of the
-    forward's, which sums the same products in another order."""
-    loaded = Pretrained.load(source[0], fallback="torchax", dtype="bfloat16")
-    table = loaded.model.apply(loaded.variables, method="output_table")
-    hidden = loaded.model.apply(loaded.variables, jnp.asarray(tokens), method="hidden_states")
-    logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(tokens)))
-    scored = np.asarray(table.logits(hidden.astype(jnp.float32)), np.float32)
-    np.testing.assert_array_equal(scored, np.asarray(jnp.asarray(scored, jnp.bfloat16), np.float32))
-    # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
-    apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
-    assert np.abs(apart).max() <= 1
+    forward's, which sums the same products in another order.
+    Under JAX's default precision, as a run's default numerics multiply."""
+    with jax.default_matmul_precision(None):
+        loaded = Pretrained.load(source[0], fallback="torchax", dtype="bfloat16")
+        table = loaded.model.apply(loaded.variables, method="output_table")
+        hidden = loaded.model.apply(loaded.variables, jnp.asarray(tokens), method="hidden_states")
+        logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(tokens)))
+        scored = np.asarray(table.logits(hidden.astype(jnp.float32)), np.float32)
+        np.testing.assert_array_equal(scored, np.asarray(jnp.asarray(scored, jnp.bfloat16), np.float32))
+        # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
+        apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
+        assert np.abs(apart).max() <= 1
 
 
 def tied_float32(tmp_path):
@@ -723,22 +828,25 @@ def tied_float32(tmp_path):
     return loaded
 
 
-def test_a_float32_forward_and_its_output_table_multiply_float32_products(tokens, tmp_path):
-    """A float32 torchax model multiplies every product of its forward, torch's operators that
-    state no precision among them, at HIGHEST, as its output table does, under JAX's own default
-    precision: the two reads of the same logits take the same arithmetic, where the forward ran
-    TF32 on a GPU and the table float32 products."""
+def test_a_float32_forward_and_its_output_table_multiply_in_ieee_float32(tokens, tmp_path):
+    """A float32 torchax model that states no precision multiplies every product of its forward in IEEE
+    float32, as the torch code it runs does (torch's float32 matmul, TF32 off), and its output table's
+    head alike (`dew.nn.precision.exact_float32`, ledger 2500), under JAX's own default precision: the
+    two reads of the same logits take the same arithmetic."""
     loaded = tied_float32(tmp_path)
     ids = jnp.asarray(tokens[:, :SEQ])
     highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    vocab = loaded.model.apply(loaded.variables, method="output_table").matrix.shape[0]
     for read in (lambda variables: loaded.model.apply(variables, ids),
                  lambda variables: loaded.model.apply(variables, method="output_table").logits(
                      loaded.model.apply(variables, ids, method="hidden_states"))):
         with jax.default_matmul_precision(None):
             graph = jax.make_jaxpr(read)(loaded.variables)
-        products = [equation.params["precision"] for equation in equations(graph)
-                    if equation.primitive.name == "dot_general"]
-        assert products and all(precision == highest for precision in products), products
+        products = [(equation.params["precision"],
+                     any(vocab in variable.aval.shape for variable in equation.invars))
+                    for equation in equations(graph) if equation.primitive.name == "dot_general"]
+        assert any(head for _, head in products), products
+        assert all(precision == highest for precision, _ in products), products
 
 
 def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_path):
@@ -757,37 +865,59 @@ def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_
     assert direct.dtype == table.dtype == jnp.float64
 
 
-@pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
-def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tokens, tmp_path):
+TORCHAX_SEEDS = 8
+"""The float32 torchax model's declared draws of token ids against torch's forward (check 1), sized by
+`seeds_for` paired with the model on an A100."""
+
+
+def a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_path):
     """On a GPU, a float32 torchax model's own logits and its output table's over the same
-    states are each as exact as torch's float32 forward, from torch's in float64, under JAX's own
-    default precision (the test lane sets 'highest' for every product that states none)."""
+    states are each on par with torch's float32 forward from torch's in float64 over drawn token
+    ids (check 1), under JAX's own default precision (the test lane sets 'highest' for every
+    product that states none)."""
     loaded = tied_float32(tmp_path)
-    ids = tokens[:, :SEQ]
     model = head_model("tied")
-    with jax.default_matmul_precision(None):
-        direct = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)), np.float64)
-        hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
-        table = np.asarray(loaded.model.apply(loaded.variables, method="output_table").logits(hidden),
-                           np.float64)
-    reference = torch_logits(model, ids).astype(np.float64)
-    with float64(), torch.no_grad():
+    with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
-        wide.load_state_dict(model.state_dict())
-        truth = wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
-    assert_as_exact_as_the_reference(direct, reference, truth, "the forward's logits")
-    assert_as_exact_as_the_reference(table, reference, truth, "the output table's logits")
+    wide.load_state_dict(model.state_dict())
+
+    def draw(seed):
+        return (np.random.RandomState(seed).randint(0, TINY["vocab_size"], (ROWS, SEQ)).astype(np.int32),)
+
+    @as_given
+    def ours(ids):
+        # Run as the model runs, eagerly, at JAX's default precision.
+        with jax.default_matmul_precision(None):
+            direct = loaded.model.apply(loaded.variables, jnp.asarray(ids))
+            hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
+            table = loaded.model.apply(loaded.variables, method="output_table").logits(hidden)
+        return {"forward": np.asarray(direct), "output table": np.asarray(table)}
+
+    def torch_twice(run):
+        """Torch's logits for both of Dew's leaves."""
+        def both(ids):
+            logits = run(np.asarray(ids))
+            return {"forward": logits, "output table": logits}
+        return as_given(both)
+
+    def truth(ids):
+        with float64(), torch.no_grad():
+            return wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
+
+    assert_as_exact(ours, torch_twice(lambda ids: torch_logits(model, ids).astype(np.float64)), draw,
+                    "a float32 torchax model's logits", seeds=TORCHAX_SEEDS, truth_fn=torch_twice(truth))
 
 
-STATES_SEEDS = {"cohere": 8, "cohere2": 8, "cohere2 keyed": 8}
+STATES_SEEDS = {"cohere": 8, "cohere runs": 8, "cohere2": 8, "cohere2 keyed": 8}
 """The final states' declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
 def slotted_rows(seed):
     """A drawn option-slot row as a decision readout lays it: a prompt every token sees, then options
     each seeing the prompt and itself causally and no other option, positions restarting after the
-    prompt for each option; its tokens, `[B, S, S]` visibility and `[B, S]` positions."""
+    prompt for each option; its tokens, `[B, S, S]` visibility, `[B, S]` positions and `[B, S]` option slots
+    (0 the prompt's, `DecisionInputs.slots`)."""
     rng = np.random.default_rng([0x1657, seed])
     prompt = int(rng.integers(3, 7))
     lengths = rng.integers(1, 4, 3)
@@ -800,7 +930,8 @@ def slotted_rows(seed):
     visible = (order[:, None] >= order[None, :]) & shared
     tokens = rng.integers(0, COHERE_VOCAB, (2, length)).astype(np.int32)
     rows = (2, length, length)
-    return tokens, np.broadcast_to(visible, rows).copy(), np.tile(positions, (2, 1)).astype(np.int32)
+    return (tokens, np.broadcast_to(visible, rows).copy(), np.tile(positions, (2, 1)).astype(np.int32),
+            np.tile(group, (2, 1)).astype(np.int32))
 
 
 COHERE_VOCAB = transformers.CohereConfig(**COHERE).vocab_size
@@ -808,18 +939,19 @@ COHERE_VOCAB = transformers.CohereConfig(**COHERE).vocab_size
 
 @pytest.mark.parametrize("case", sorted(STATES_SEEDS))
 def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
-    """A tier-3 model whose head is no plain product (Cohere's logits are scaled) gives the states its
-    head reads (`hidden_states`), transformers' final normed states, under a stated visibility (an
-    option-slot row's) at its tokens' positions, and its head over given states (`logits_from_hidden`),
-    transformers' logits; Cohere 2's window keeps each query to the keys within it of the stated keys'
-    positions where the call states them (`keyed`), and leaves the stated visibility whole where not,
-    as Dew's own attention reads them. Each as exact as transformers' own float32 from its float64 twin
-    (check 1), transformers given the same masks, a window's layers theirs, and position ids. A decision
-    head sizes itself to the states (`DecisionModel.head_size`), which the model's initialization
-    traces."""
-    from dew.decision.model import DecisionModel
+    """A tier-3 model whose head is no plain product (Cohere's logits are scaled) gives the states its head
+    reads (`hidden_states`), transformers' final normed states, under a stated visibility (an option-slot
+    row's) at its tokens' positions, and its head over given states (`logits_from_hidden`), transformers'
+    logits; Cohere 2's window keeps each query to the keys within it of the stated keys' positions where
+    the call states them (`keyed`), and leaves the stated visibility whole where not, as Dew's own
+    attention reads them; the visibility stated as the decision model states it, key runs (`runs`,
+    `decision.model.key_runs`), reads as its mask. Each as exact as transformers' own float32 from its
+    float64 twin (check 1), transformers given the same masks, a window's layers theirs, and position ids.
+    A decision head sizes itself to the states (`DecisionModel.head_size`), which the model's
+    initialization traces."""
+    from dew.decision.model import DecisionModel, key_runs
 
-    family, keyed = case.split(" ")[0], case.endswith("keyed")
+    family, keyed, runs = case.split(" ")[0], case.endswith("keyed"), case.endswith("runs")
     torch.manual_seed(0)
     model = PACKED_MODELS[family]().eval()
     model.save_pretrained(tmp_path)
@@ -834,15 +966,18 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
     window = getattr(model.config, "sliding_window", None)
 
     @jax.jit
-    def ours_jitted(variables, tokens, visible, positions):
+    def ours_jitted(variables, tokens, visible, positions, slots):
         keys = {"attention_key_positions": positions} if keyed else {}
-        hidden = loaded.model.apply(variables, tokens, positions=positions, attention_pairwise_mask=visible,
-                                    method="hidden_states", **keys)
+        stated = ({"attention_key_runs": key_runs(slots, jnp.ones_like(slots), 3, causal=True)} if runs
+                  else {"attention_pairwise_mask": visible})
+        laid = coordinates(tokens.shape, positions=positions)
+        hidden = loaded.model.apply(variables, tokens, coordinates=laid, method="hidden_states", **stated,
+                                    **keys)
         return hidden, loaded.model.apply(variables, hidden, method="logits_from_hidden")
 
     @as_given
-    def ours(tokens, visible, positions):
-        hidden, logits = ours_jitted(loaded.variables, tokens, visible, positions)
+    def ours(tokens, visible, positions, slots):
+        hidden, logits = ours_jitted(loaded.variables, tokens, visible, positions, slots)
         return {"states": np.asarray(hidden, np.float64), "logits": np.asarray(logits, np.float64)}
 
     def masks(visible, positions, dtype):
@@ -858,7 +993,8 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
         return {kind: additive(near if kind == "sliding_attention" else visible) for kind in types}
 
     def theirs(source, dtype):
-        def run(tokens, visible, positions):
+        def run(tokens, visible, positions, slots):
+            del slots
             mask = masks(visible, positions, dtype)
             with torch.no_grad():
                 out = source(input_ids=torch.from_numpy(tokens).long(),
@@ -919,6 +1055,7 @@ def slot_request(seed):
                                                    "criteria": dict.fromkeys(options)}}}
 
 
+@pytest.mark.whole_suite
 def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers_states(tmp_path):
     """A slot release whose backbone no registered family computes loads it as tier 3 and decides
     over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /
@@ -1016,7 +1153,8 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
 def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, stated, tmp_path):
     """A tier-3 model on Dew's attention decodes through Dew's cache: a padded prompt fills its row's
     slots and each next token one more, and every decoded step's logits hold check 1 against
-    transformers' full forward of that row's prefix (its float64 twin's the truth), Cohere 2's window
+    transformers' full forward of that row's prefix, each step's its own at the width it reads (ledger
+    1543; its float64 twin's one forward the truth), Cohere 2's window
     included, the padding stated by a validity mask or as the document 0 of the row's segments; its
     greedy generation's tokens are the full forward's argmax at each step."""
     from dew.inference import TextGeneration
@@ -1064,20 +1202,25 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
-    def theirs(source, precision=contextlib.nullcontext):
+    def theirs(source, precision=contextlib.nullcontext, *, stepped: bool = True):
+        def forward(ids):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
+
         def run(prompt, valid, continued):
             rows = []
             for row in range(2):
                 ids = np.concatenate([prompt[row][valid[row]], continued[row]])
-                with precision(), torch.no_grad():
-                    logits = source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
                 real = int(valid[row].sum())
-                rows.append(logits[real - 1:real + steps])
+                if stepped:
+                    rows.append(np.stack([forward(ids[:real + step])[-1] for step in range(steps + 1)]))
+                else:
+                    rows.append(forward(ids)[real - 1:real + steps])
             return np.stack(rows)
         return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",
-                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64))
+                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64, stepped=False))
 
     # The rows' coordinates state the same validity and positions as their separate fields.
     prompt, valid, _ = draw(0)
@@ -1302,8 +1445,9 @@ def _longcat(tmp_path, config: dict, **load):
     torch.manual_seed(0)
     model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(**config)).eval()
     model.save_pretrained(tmp_path)
-    with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32", **load)
+    # The tier by the load's result: its warning went unseen in listed-file runs (row 1728).
+    loaded = Pretrained.load(tmp_path, dtype="float32", **load)
+    assert isinstance(loaded, PretrainedFallback)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()

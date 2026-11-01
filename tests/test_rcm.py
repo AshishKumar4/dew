@@ -166,7 +166,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     the fake score, each leaving the other's gradient zero, and the saved
     student's task samples as the objective's own. A LoRA student distills
     the same teacher, whose model and the fake score's are the run's
-    without the adapter."""
+    without the adapter. A saved student, which holds its teacher, loads without its teacher's run."""
     import dataclasses
 
     from diffusion_stubs import batch_for
@@ -203,7 +203,8 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     for directory in ("teacher", "student"):
         (tmp_path / directory).mkdir()
     checkpoints = Checkpoints(str(tmp_path / "teacher"))
-    checkpoints.save(1, state, None)
+    # As the teacher's run saves it, its task's record beside its weights.
+    checkpoints.save(1, state, None, {}, artifact=teacher.inference_record())
     checkpoints.wait()
     teacher_run.save(str(tmp_path / "teacher"))
 
@@ -229,16 +230,17 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     np.testing.assert_array_equal(np.asarray(table), np.asarray(
         state.variables["constants"]["conditioning"]["time_embed"]["layers_0"]["frequencies"]))
 
+    @jax.jit
     def gradients(step):
         def loss(tree):
             return task.loss({**params, "params": tree}, batch,
-                             Step(jnp.asarray(step), jax.random.PRNGKey(4), None))[0].total
+                             Step(step, jax.random.PRNGKey(4), None))[0].total
         return jax.grad(loss)(params["params"])
 
     def size(tree):
         return float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(tree)))
 
-    student, critic = gradients(3), gradients(2)
+    student, critic = gradients(jnp.asarray(3)), gradients(jnp.asarray(2))
     assert size({k: v for k, v in student.items() if k != FAKE_SCORE}) > 0 and size(student[FAKE_SCORE]) == 0
     assert size({k: v for k, v in critic.items() if k != FAKE_SCORE}) == 0 and size(critic[FAKE_SCORE]) > 0
 
@@ -248,9 +250,11 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     start = adapted.init(jax.random.PRNGKey(0))
     assert {path[-1].key for path, _ in jax.tree_util.tree_flatten_with_path(start["params"])[0]
             if path[0].key != FAKE_SCORE} == {"lora_A", "lora_B"}
-    for step in (Step(jnp.asarray(at), jax.random.PRNGKey(4), None) for at in (3, 2)):
-        np.testing.assert_allclose(*(objective.loss(tree, batch, step)[0].total
-                                     for objective, tree in ((adapted, start), (task, params))), rtol=1e-5)
+    losses = [jax.jit(lambda tree, step, objective=objective: objective.loss(tree, batch, Step(
+        step, jax.random.PRNGKey(4), None))[0].total) for objective in (adapted, task)]
+    for at in (3, 2):
+        np.testing.assert_allclose(*(loss(tree, jnp.asarray(at)) for loss, tree in zip(
+            losses, (start, params), strict=True)), rtol=1e-5)
     trainer = Trainer(adapted, optax.adam(1e-3), key=jax.random.PRNGKey(5))
     tuned = trainer.initial_state()
     tuned, *_ = trainer.compile(tuned, batch)(tuned, batch)
@@ -266,6 +270,11 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     expected = task.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], key=9)
                                   .host().images, expected)
+    # The student holds its teacher: it rebuilds over its own tree, its teacher's run moved away.
+    (tmp_path / "teacher").rename(tmp_path / "moved")
+    rebuilt = DiffusionRunConfig.load(str(tmp_path / "student")).build(variables=distilled.variables)
+    np.testing.assert_array_equal(rebuilt.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images,
+                                  expected)
 
 
 def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tmp_path):
@@ -304,7 +313,8 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
     state, *_ = trainer.compile(state, batch)(state, batch)
     (tmp_path / "teacher").mkdir()
     checkpoints = Checkpoints(str(tmp_path / "teacher"))
-    checkpoints.save(1, state, None)
+    # As the teacher's run saves it, its task's record beside its weights.
+    checkpoints.save(1, state, None, {}, artifact=teacher.inference_record())
     checkpoints.wait()
     teacher_run.save(str(tmp_path / "teacher"))
     task = dataclasses.replace(teacher_run, teacher_run=str(tmp_path / "teacher"), objective=ObjectiveConfig(
@@ -369,7 +379,7 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     assert (to_record(objective.task_settings(), ImageSettings)
             == to_record(direct.task_settings(), ImageSettings))
     assert objective.steps == direct.steps == 3 and objective.guidance is None
-    assert objective.grid is not None and objective.solver != source.schedule.solver
+    assert objective.grid is not None and objective.solver != source.solver
     expected = model_part(source.variables)
     held = objective.init(jax.random.PRNGKey(0))
     for tree in (objective.teacher_variables, held[TEACHER]):

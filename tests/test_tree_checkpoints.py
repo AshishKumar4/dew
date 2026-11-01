@@ -1,4 +1,11 @@
 """A mapping saved in place of a train state checkpoints, resumes and is retained as a train state is."""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import textwrap
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -153,14 +160,75 @@ def test_a_reader_beside_the_run_lists_each_step_as_it_commits(tmp_path):
     np.testing.assert_array_equal(reader.restore(step=2)[0]["x"], np.full((3,), 2))
 
 
-def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path, monkeypatch):
-    """A reader that restored a step and closed lists the committed steps without reopening the store:
-    the listing reads the step names alone."""
-    writer = Checkpoints(str(tmp_path))
+LISTING = textwrap.dedent("""
+    import json, os, sys
+    import jax.numpy as jnp
+    from dew.checkpoints import Checkpoints
+
+    root = os.path.realpath(sys.argv[1])
+    writer = Checkpoints(root)
     writer.save(1, {"x": jnp.full((3,), 1)})
     writer.wait()
-    reader = Checkpoints(str(tmp_path))
+    reader = Checkpoints(root)
+    seen, watching = [], []
+
+    def readable(argument):
+        if isinstance(argument, (str, bytes, os.PathLike)):
+            return os.fsdecode(argument)
+        return argument if isinstance(argument, int) else None
+
+    def audited(event, arguments):
+        if watching:
+            seen.append((watching[-1], event, [readable(argument) for argument in arguments[:2]]))
+
+    sys.addaudithook(audited)
+    watching.append("restore")
     reader.restore(step=1)
+    watching.pop()
     reader.close()
-    monkeypatch.setattr(Checkpoints, "_open", lambda self: pytest.fail("committed() opened the store"))
-    assert reader.committed() == [1]
+    watching.append("listing")
+    listed = reader.committed()
+    watching.pop()
+    print(json.dumps({"listed": listed, "root": root, "seen": seen}))
+""")
+"""A process that saves a step, restores it, closes and lists, every filesystem event of the restore
+and of the listing recorded at the interpreter's boundary (its audit events: an `open` by path or by
+descriptor, a listing, a move's both paths, a truncation, a removal), its hook its own."""
+
+LISTS = frozenset({"os.listdir", "os.scandir"})
+"""The filesystem audit events a listing is: it reads directories' entries and nothing else."""
+
+
+def touches(event: str) -> bool:
+    """Whether an audit event reaches a file or changes a filesystem beyond listing a directory: an
+    `open`, or any `os.` or `shutil.` event but LISTS (a timestamp's change, a move, an attribute's
+    write and a removal among them)."""
+    return event == "open" or (event.startswith(("os.", "shutil.")) and event not in LISTS)
+
+
+def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path):
+    """A reader that restored a step and closed lists the committed steps without reopening the store:
+    observed at the interpreter's filesystem boundary in a process of its own (`LISTING`), the listing
+    lists directories and opens no file anywhere, by path or by descriptor, and writes, moves or removes
+    nothing anywhere, as the restore before it did open the step's files. A file's metadata read (a
+    stat) is no audit event and no part of the claim."""
+    import dew
+
+    # The child imports the Dew this process imports, from this checkout's sources.
+    source = str(pathlib.Path(dew.__file__).resolve().parents[1])
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        [source, *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep))])}
+    finished = subprocess.run([sys.executable, "-c", LISTING, str(tmp_path)], capture_output=True,
+                              text=True, timeout=600, check=False, env=environment)
+    assert finished.returncode == 0, finished.stderr
+    report = json.loads(finished.stdout.splitlines()[-1])
+    assert report["listed"] == [1]
+    restored = [(event, paths) for phase, event, paths in report["seen"] if phase == "restore"]
+    assert any(event == "open" and isinstance(paths[0], str) and paths[0].startswith(report["root"])
+               for event, paths in restored)
+    listing = [(event, paths) for phase, event, paths in report["seen"] if phase == "listing"]
+    changed = [entry for entry in listing if touches(entry[0])]
+    assert listing and not changed, listing
+    # The classification refuses what a listing must not do, without an open.
+    assert all(touches(event) for event in ("os.utime", "os.chown", "os.setxattr", "os.rename",
+                                            "os.truncate", "shutil.move"))

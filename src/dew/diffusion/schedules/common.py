@@ -130,6 +130,13 @@ class GeneralizedNoiseScheduler(ContinuousNoiseScheduler):
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
 
+    @property
+    def sigma_range(self) -> tuple[float, float]:
+        """The least and greatest sigma the schedule's grid reaches, which a solver keeps its sigmas
+        inside (Heun's churn, the Brownian tree): `sigma_min` and `sigma_max` where the grid runs
+        between its arguments, as every member's but FlaxDiff's tangent grid does."""
+        return self.sigma_min, self.sigma_max
+
     @abstractmethod
     def sigmas(self, t) -> jax.Array:
         """Return the noise level at `t`."""

@@ -97,24 +97,21 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 
 	/**
 	 * Prepare and smoke `commit`, a pushed branch's container code, on a preparer of its own,
-	 * without promoting it: an operator iterates on the smoke without a deploy from main.
+	 * without promoting it: an operator iterates on the smoke without a deploy from main. Recorded once
+	 * the preparer takes it; one it refuses or cannot be asked (a trial it runs already) is the caller's
+	 * answer alone, null where it took it, so the trial it runs stays the one `trialled` reports.
 	 */
-	async trial(commit: string): Promise<void> {
+	async trial(commit: string): Promise<string | null> {
 		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('a trial names a full commit');
 		const trial: Trial = { commit, at: Date.now(), token: crypto.randomUUID() };
-		await this.ctx.storage.put('trialled', trial);
 		try {
 			await this.env.PREPARER.get(this.env.PREPARER.idFromName('trial')).trial(commit,
 				{ registry: this.ctx.id.toString(), token: trial.token });
 		} catch (error) {
-			// Unless a later trial, or this one's own report, came in while the preparer was asked.
-			await this.ctx.storage.transaction(async (storage) => {
-				const last = await storage.get<Trial>('trialled');
-				if (last?.token === trial.token && !last.generation && !last.failure) {
-					await storage.put('trialled', { ...last, failure: String(error).slice(-6000) });
-				}
-			});
+			return String(error).slice(-6000);
 		}
+		await this.ctx.storage.put('trialled', trial);
+		return null;
 	}
 
 	async trialled(now = Date.now()): Promise<{ pending: string | null; last: Trial | null }> {

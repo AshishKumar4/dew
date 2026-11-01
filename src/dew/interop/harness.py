@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from dew.cleanup import end_group, exit_code, signal_group
+from dew.inference.rollouts import INFRASTRUCTURE
 from dew.objectives.rl.sessions import Call, Session, Status, Task
 
 from .gateway import SESSION, Gateway, Recorded, calls, engine_failure, refused_prompt
@@ -406,6 +407,11 @@ class HarnessSource:
                 except httpx.HTTPError as error:
                     _logger.warning("could not delete gateway session %s: %s", session, error)
             future.set_result(verdict)
+        except INFRASTRUCTURE as error:
+            # The trial's own boundary failed (a missing executable or working directory, a pipe the
+            # host could not make): the session is an infrastructure failure the scheduler retries.
+            if not future.done():
+                future.set_result(ended(Status.INFRA_ERROR, detail=f"trial: {type(error).__name__}: {error}"))
         except BaseException as error:
             if not future.done():
                 future.set_exception(error)

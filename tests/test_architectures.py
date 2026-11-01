@@ -16,7 +16,7 @@ on disk afterwards.
 
 import functools
 import json
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -24,8 +24,11 @@ import numpy as np
 import optax
 import pytest
 import selection_margins
+from architecture_cases import CASES, IDS, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKENS, TEXT_VOCAB, VOCAB, Case
 from diffusion_stubs import StubText
 from diffusion_support import images_of
+from jepa_cases import MASK
+from map_judge import drawing
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -39,10 +42,10 @@ from dew.data.images import CAPTIONS
 from dew.diffusion import presets
 from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
-from dew.nn.attention import Stage
-from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
+from dew.nn.attention_blocks import Stage
+from dew.nn.text_checkpoints import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.jepa import JepaObjective, MultiBlockMask
+from dew.objectives.jepa import JepaObjective
 from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
@@ -53,10 +56,6 @@ from dew.training.model_flops import prepare_counts
 pytestmark = pytest.mark.mesh
 
 
-RES = 16
-FRAMES = 2
-PATCH = 4
-GRID = (RES // PATCH, RES // PATCH)
 # One batch element per simulated device, so the 8x1 and 2x4 meshes see the
 # same global batch.
 BATCH = 8
@@ -67,206 +66,6 @@ TINY_SHARD = 256
 # Enough to run the sampler loop end to end: sample quality is not what a
 # two-step run can be about.
 SAMPLER_STEPS = 2
-# 2x2 target blocks on the 4x4 grid, which leaves 8 context tokens.
-MASK = MultiBlockMask.for_grid(GRID, num_targets=2, scale=(0.2, 0.3))
-
-TEXT_TOKENS = 8
-TEXT_FEATURES = 32
-TEXT_VOCAB = 16
-
-
-@dataclass(frozen=True)
-class Case:
-    """One architecture at the smallest size that still exercises it."""
-
-    architecture: str
-    config: dict
-    frames: int = 0
-    """Video architectures take (frames, H, W, C) samples; 0 means images."""
-    predictor: dict | None = None
-    """Set for JEPA: `architecture` is the encoder and this builds its predictor."""
-    seq_len: int = 0
-    """Set for language models: batches are token windows, not images."""
-    label: str = ""
-    """A second case of one architecture, named apart from the first."""
-
-    @property
-    def is_jepa(self) -> bool:
-        return self.predictor is not None
-
-    @property
-    def is_lm(self) -> bool:
-        return self.seq_len > 0
-
-    @property
-    def sample_shape(self) -> tuple:
-        square = (RES, RES, 3)
-        return square if self.frames == 0 else (self.frames, *square)
-
-    @property
-    def sample_key(self) -> str:
-        return "video" if self.frames else "image"
-
-    @property
-    def name(self) -> str:
-        return self.architecture + (f"+{self.label}" if self.label else "")
-
-
-DIT = {"patch_size": PATCH, "emb_features": 64, "num_layers": 2, "num_heads": 2,
-       "mlp_ratio": 2}
-UNET = {"emb_features": 64, "feature_depths": [16, 32],
-        "attention_configs": [None, {"heads": 2, "use_projection": False,
-                                     "use_self_and_cross": False}],
-        "num_res_blocks": 1, "num_middle_res_blocks": 1}
-ENCODER = {"patch_size": PATCH, "emb_features": 32, "num_layers": 2, "num_heads": 2,
-           "mlp_ratio": 2}
-PREDICTOR = {"grid": GRID, "emb_features": 32, "predictor_features": 16,
-             "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}
-
-VOCAB = 64
-SEQ_LEN = 16
-LONG_SEQ_LEN = 128
-"""The rows of a cell whose float32 error is heavy-tailed over draws, a few draws holding most of it
-(Gemma 3n's and Qwen 3.5's): longer rows put more such events in each draw,
-so check 1's pooled ratio resolves over a sized count of draws, where SEQ_LEN's rows left the
-reference compared with itself unresolved within 512. Qwen 3.5's rows are twice as long: at 128 its
-embedding's momentum still did not resolve within 512. Gemma 3n's draws also clear the sparsity
-cutoff by a margin (`selection_margin`)."""
-LM = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
-      "num_kv_heads": 1, "mlp_features": 64, "max_seq_len": SEQ_LEN}
-
-CASES = [
-    Case("unet", UNET),
-    # Both U-shaped stacks split their layers into a down and an up half
-    Case("uvit", {"patch_size": PATCH, "emb_features": 64, "num_layers": 4,
-                  "num_heads": 2}),
-    Case("simple_udit", {**DIT, "num_layers": 2}),
-    Case("simple_dit", DIT),
-    Case("simple_mmdit", DIT),
-    Case("hierarchical_mmdit", {"base_patch_size": 2, "emb_features": (32, 64, 96),
-                                "num_layers": (1, 1, 1), "num_heads": (2, 2, 2),
-                                "mlp_ratio": 2}),
-    Case("hybrid_dit", {**DIT, "num_layers": 4, "ssm_state_dim": 8,
-                        "ssm_attention_ratio": "3:1"}),
-    Case("video_dit", {**DIT, "num_layers": 1}, frames=FRAMES),
-    Case("unet_3d", {**UNET, "attention_configs": [None, None], "temporal_heads": 2},
-         frames=FRAMES),
-    Case("jepa_encoder", ENCODER, predictor=PREDICTOR),
-    Case("jepa_video_encoder", {**ENCODER, "num_layers": 1},
-         predictor={**PREDICTOR, "factorized": True}, frames=FRAMES),
-    Case("causal_transformer", LM, seq_len=SEQ_LEN),
-    # Eight experts so the expert dimension divides every mesh this file
-    # builds, on the second layer only, so one dense and one sparse
-    # feed-forward go through the same run.
-    Case("causal_transformer", {**LM, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
-         seq_len=SEQ_LEN, label="moe"),
-    # GPT OSS at toy width: sink attention on both kinds, the fused biased
-    # experts on every layer, and YaRN over grouped-query heads.
-    Case("causal_transformer", {
-        **LM, "mlp": "swigluoai", "attention_sinks": True, "qk_norm": False,
-        "layer_types": ("sliding_attention", "full_attention"),
-        "kinds": {"sliding_attention": {"window": 4}},
-        "yarn": {"factor": 4.0, "original_max_position_embeddings": 8, "truncate": False},
-        "mixture": {"experts": 8, "top_k": 2},
-    }, seq_len=SEQ_LEN, label="gpt_oss"),
-    # DeepSeek V3.2's stack at toy width: the mla mixer with its sparse
-    # indexer on every layer, and the routed layer with the balancing bias,
-    # the group limit and a shared expert. The low ranks are 32 wide, so the
-    # latent norms' scales, whose rounding over a draw varies most, hold
-    # enough values a draw for the layout cell to resolve.
-    Case("causal_transformer", {
-        **LM, "head_dim": 16,
-        "mixer": {"class": "mla", "fields": {"q_lora_rank": 32, "kv_lora_rank": 32,
-                  "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
-                  "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16}},
-        "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
-                    "groups": 4, "groups_per_token": 2, "bias": True,
-                    "expert_features": 16, "shared_features": 16},
-    }, seq_len=SEQ_LEN, label="mla"),
-    # DeepSeek V2 Lite's stack at toy width: the mla mixer without the query
-    # LoRA, and a routed layer under softmax group-limited routing scored by
-    # the best expert, unnormalised, with a shared expert and no bias.
-    Case("causal_transformer", {
-        **LM, "head_dim": 16,
-        "mixer": {"class": "mla", "fields": {"kv_lora_rank": 8, "qk_nope_head_dim": 8,
-                  "qk_rope_head_dim": 8, "v_head_dim": 8}},
-        "mixture": {"experts": 8, "top_k": 4, "layers": (1,), "score_function": "softmax",
-                    "norm_topk_prob": False, "groups": 4, "groups_per_token": 2,
-                    "group_score": "max", "expert_features": 16, "shared_features": 32},
-    }, seq_len=SEQ_LEN, label="deepseek_v2"),
-    # GLM 4.5's stack at toy width: biased q/k/v over a bias-free o_proj, a
-    # half rotary, DeepSeek V3 routing with a shared expert on the last
-    # layer, and one MTP depth that routes like it.
-    Case("causal_transformer", {
-        **LM, "attention_bias": True, "o_proj_bias": False, "qk_norm": False,
-        "head_dim": 8, "partial_rotary_factor": 0.5, "partial_rotary_type": "default",
-        "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
-                    "bias": True, "expert_features": 16, "shared_features": 16},
-        "num_nextn_predict_layers": 1,
-    }, seq_len=SEQ_LEN, label="glm4_moe"),
-    # Llama 4's stack at toy width: chunked rotated layers, adjacent pairs under the weightless L2
-    # norm, around a global layer without positions tuning its temperature; the routed layers scale
-    # their inputs.
-    Case("causal_transformer", {
-        **LM, "head_dim": 8, "qk_norm": False,
-        "layer_types": ("chunked_attention", "full_attention"),
-        "kinds": {"chunked_attention": {"chunk": 4, "qk_norm": True, "mixer": {
-                      "class": "attention", "fields": {"rotary_pairs": "adjacent", "qk_norm_weight": False}}},
-                  "full_attention": {"mixer": {"class": "attention", "fields": {
-                      "nope": True, "temperature_tuning": (4.0, 0.1)}}}},
-        "mixture": {"experts": 8, "top_k": 1, "layers": (1,), "score_function": "sigmoid",
-                    "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
-                    "shared_features": 16},
-    }, seq_len=SEQ_LEN, label="llama4"),
-    # Gemma 4's 26B-A4B at toy width: the routed branch beside every layer's
-    # dense MLP, the global layer reading its values off the keys with its
-    # own head dim and key/value count, and the per-layer output scalar.
-    Case("causal_transformer", {
-        **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
-        "sandwich_norms": True, "qk_norm": True, "v_norm": True,
-        "embedding_scale": True, "attention_scale": 1.0, "partial_rotary_factor": 0.25,
-        "layer_types": ("sliding_attention", "full_attention"),
-        "kinds": {"sliding_attention": {"window": 4},
-                  "full_attention": {"head_dim": 16, "num_kv_heads": 1}},
-        "attention_k_eq_v": True, "layer_scalar": "frozen",
-        "mixture": {"experts": 8, "top_k": 2, "expert_features": 16, "parallel": True},
-    }, seq_len=SEQ_LEN, label="gemma4_moe"),
-    # Gemma 3n at toy width: three copies of the residual stream under
-    # AltUp, the LAuReL block, gaussian top-k on the first layer, widths
-    # that differ per layer, per-layer inputs and the last layer sharing the
-    # first's keys and values. The first layer's 192 units keep about ten a
-    # token at 0.95 sparsity, where the released models keep hundreds: at 48,
-    # about two, a token whose kept units all sit just above the cutoff gives
-    # the feed-forward's post-norm a near-zero input, whose direction float32
-    # resolves poorly, and four draws in 320 held 60% of a layer-0 leaf's
-    # pooled error (at 192, at most 22%; at 384, 6%).
-    Case("causal_transformer", {
-        **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
-        "mlp_features": (192, 64), "activation_sparsity_pattern": (0.95, 0.0),
-        "sandwich_norms": True, "qk_norm": True, "v_norm": True,
-        "embedding_scale": True, "attention_scale": 1.0, "final_logit_softcap": 30.0,
-        "layer_types": ("sliding_attention", "sliding_attention"),
-        "kinds": {"sliding_attention": {"window": 4, "rope_theta": 1e4}},
-        "altup": {"num_inputs": 3}, "laurel_rank": 8,
-        "per_layer_input_dim": 8, "kv_shared_layers": (1,), "max_seq_len": LONG_SEQ_LEN,
-    }, seq_len=LONG_SEQ_LEN, label="gemma3n"),
-    # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
-    # one gated full-attention layer with the sliced partial rotary. The
-    # delta net's projections are wide enough to cross the shard threshold,
-    # so its declarations and its heuristic conv taps are what the layout
-    # places here.
-    Case("causal_transformer", {
-        **LM, "num_layers": 4, "head_dim": 8, "output_gate": True,
-        "partial_rotary_factor": 0.5, "partial_rotary_type": "default",
-        "layer_types": ("linear_attention",) * 3 + ("full_attention",),
-        "kinds": {"linear_attention": {"mixer": {
-            "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
-            "linear_num_value_heads": 4, "linear_key_head_dim": 8,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}},
-        "max_seq_len": 2 * LONG_SEQ_LEN}, seq_len=2 * LONG_SEQ_LEN, label="qwen35"),
-]
-
-IDS = [case.name for case in CASES]
 
 
 def batches(case: Case, encoder: ConditionEncoder | None, seed: int = 0):
@@ -384,8 +183,8 @@ def run_case(case: Case, tmp_path, mesh: MeshSpec, devices=None, state=None, ste
                         metrics=(Spread(seen, artifact),), preview=True, state=state)
 
     assert dict(trainer.device_mesh.shape) == {
-        "data": (devices or jax.device_count()) // (mesh.fsdp * mesh.stage), "expert": 1, "fsdp": mesh.fsdp,
-        "tensor": 1, "sequence": 1, "stage": mesh.stage}
+        "diloco": 1, "data": (devices or jax.device_count()) // (mesh.fsdp * mesh.stage), "expert": 1,
+        "fsdp": mesh.fsdp, "tensor": 1, "sequence": 1, "stage": mesh.stage}
     assert int(state.step) == steps
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == steps and all(np.isfinite(loss) for loss in losses), losses
@@ -431,6 +230,7 @@ resolves at all: Gemma 3n's and Qwen 3.5's errors are heavy-tailed across draws 
 one device's pooled error, seed 247, an indexer selection the draw filter lets through: ledger 1527),
 where the reference compared with itself resolves no momentum within 4096 draws. Every cell is named:
 one added is sized."""
+
 
 def selects(case: Case) -> bool:
     """Whether the cell's model selects discontinuously (`selection_margins.selects`)."""
@@ -517,8 +317,8 @@ def orbit(width: int):
 def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
-    compiled once for every draw at the plan fit takes, a frontier's first, untimed in Dew's tests
-    (`dew.training.planning.UNTIMED_FRONTIER`): a function of the raw batch and the order returning
+    compiled once for every draw at the plan fit admits, without timing alternatives:
+    a function of the raw batch and the order returning
     the stepped state's variables, optimizer state and EMA taken back to the identity order
     (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
     samples widened (`wide`), built at its first call, so under the caller's float64."""
@@ -595,9 +395,32 @@ LAYOUT_CELLS = [*((case, steps, layout) for index, case in enumerate(CASES)
                 *((case, PIPELINED[case.name], "2x2x2 stage") for case in CASES if case.name in PIPELINED)]
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), LAYOUT_CELLS,
-                         ids=[f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
-                              for case, steps, layout in LAYOUT_CELLS])
+
+
+def cell_ids(cells) -> list[str]:
+    """Each layout cell's test id: its case, its steps and its layout's kind."""
+    return [f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
+            for case, steps, layout in cells]
+
+
+def cells_of(*names: str) -> list:
+    """The layout cells of the cases `names`."""
+    return [cell for cell in LAYOUT_CELLS if cell[0].name in names]
+
+
+THREE_D_UNET_CELLS = cells_of("unet_3d")
+UNET_CELLS = cells_of("unet")
+HIERARCHICAL_MMDIT_CELLS = cells_of("hierarchical_mmdit")
+QWEN35_CELLS = cells_of("causal_transformer+qwen35")
+"""The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
+with the seeds a task draws within 120 s on one core: a map task records its draws alone (70 to 93 s
+fixed, `map_judge.drawing`), its judge runs the cell whole but for them (row 2788)."""
+
+SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *QWEN35_CELLS]
+UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
     replicated, the batch split across every device), 2x4 fsdp (the
@@ -613,6 +436,42 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     orders of magnitude. The steps check 1 draws are `fit`'s own on the
     run's batch, bit for bit, each compiled once for every draw. Adam's two
     moments and its count follow the parameters' placement too."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), THREE_D_UNET_CELLS, ids=cell_ids(THREE_D_UNET_CELLS))
+@pytest.mark.check1_shards(seeds=32, per_task=8)
+def test_a_3d_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the 3D U-Net."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), UNET_CELLS, ids=cell_ids(UNET_CELLS))
+@pytest.mark.check1_shards(seeds=64, per_task=40)
+def test_a_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the U-Net."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), HIERARCHICAL_MMDIT_CELLS,
+                         ids=cell_ids(HIERARCHICAL_MMDIT_CELLS))
+@pytest.mark.check1_shards(seeds=8, per_task=3)
+def test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hierarchical
+    MMDiT."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), QWEN35_CELLS, ids=cell_ids(QWEN35_CELLS))
+@pytest.mark.check1_shards(seeds=64, per_task=16)
+def test_a_qwen35_decoder_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the Qwen3.5 decoder."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """A cell of `test_architecture_trains_on_every_layout_as_on_one_device`: `case` trained `steps` steps
+    on `layout` as on one device (check 1)."""
     trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
     initial = trainer.initial_state()
 
@@ -644,14 +503,18 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
 
     seeds = LAYOUT_SEEDS[case.name]
     mesh = LAYOUTS[layout]
-    single, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)
-    laid, state, _ = run_case(case, tmp_path, mesh, state=copied(), steps=steps)
     drawn = {"one device": drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps),
              layout: drawn_steps(case, tmp_path, mesh, None, initial, steps)}
+    # A map task of a sharded cell (`map_judge.drawing`) records its draws alone: the fits (each its run
+    # and the state it fitted), their bits and their placement are its judge's, which runs the cell whole
+    # but for the draws it pools.
+    fits = () if drawing() else (
+        run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)[:2],
+        run_case(case, tmp_path, mesh, state=copied(), steps=steps)[:2])
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
-    for run, fitted, stepped in zip((single, laid), (alone, state), drawn.values(), strict=True):
+    for (run, fitted), stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
         ours = stepped(*own)
         for name, tree in ours.items():
             held = jax.device_get(getattr(run.staging.saved(fitted), name))
@@ -665,6 +528,9 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
     assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
                     seeds=seeds, truth_fn=truth, orders=orders)
+    if drawing():
+        return
+    state = fits[1][1]
     if mesh.fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return

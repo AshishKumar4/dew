@@ -8,7 +8,7 @@
 		"jax": "0.11.2.post16",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "3b58b801e7153def8d9461b1457b8854d0eece4e",
+		"dew": "8b4627a66ce8c94f102107a2e661e8ccc69c3cfb",
 		"date": "2026-10-24"
 	},
 	"hero": {

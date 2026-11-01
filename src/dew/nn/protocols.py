@@ -47,16 +47,18 @@ from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
+from dew.batch import Coordinates
 from dew.nn.inputs import ModelKwarg
 from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from dew._records import JSON
     from dew.diffusion.process import DenoisingCondition
-    from dew.inputs.encoders import ConditionWork
+    from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.backbones.decoder_stack import DecoderBank
-    from dew.nn.cross_attention import CrossAttention
+    from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
@@ -109,6 +111,8 @@ __all__ = [
     "ProjectionGroup",
     "ProjectsParameters",
     "QuantizesInputs",
+    "ReadsClips",
+    "ReadsTrain",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
@@ -118,6 +122,8 @@ __all__ = [
     "TimeScaled",
     "TokenModel",
     "TritonGemm",
+    "VocabularyRows",
+    "label_logits",
 ]
 
 
@@ -146,6 +152,30 @@ class Lacks(TypeError, ValueError):
 
 
 @struct.dataclass
+class Projection:
+    """A bias-free linear map the final states take before a vocabulary matrix meets them
+    (`OutputTable.projection`): an embedding of its own width's `project_out` (OPT-350m's), its
+    `kernel` `[features, width]` as the layer multiplies by it (an adapter's update included), after a
+    checkpoint's quantizer of the layer's input, its operands promoted to `compute` as the layer
+    promotes them and multiplied at `precision` by the layer's own plain product (`dense.plain_product`:
+    the GEMM template's route, the fp32 sum taken in float64 on a CPU under Dew's tests)."""
+
+    kernel: jax.Array
+    precision: PrecisionLike = struct.field(pytree_node=False, default=None)
+    compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
+    input_quantizer: InputQuantizer | None = None
+
+    def __call__(self, hidden: jax.Array) -> jax.Array:
+        """`hidden` `[..., features]` projected to `[..., width]`."""
+        from dew.nn.dense import plain_product
+
+        hidden = hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
+        dtype = jnp.result_type(hidden, self.kernel) if self.compute is None else self.compute
+        return plain_product()(hidden.astype(dtype), self.kernel.astype(dtype),
+                               (((jnp.ndim(hidden) - 1,), (0,)), ((), ())), precision=self.precision)
+
+
+@struct.dataclass
 class OutputTable:
     """A vocabulary head as a matrix a loss contracts: `matrix` as the tree
     stores it, `[vocab, features]` when `vocab_major` and `[features, vocab]`
@@ -155,7 +185,9 @@ class OutputTable:
     model's compute dtype, decides the product's operands
     (`dew.nn.precision.head_product`; the states' dtype where None), and an
     `input_quantizer` rounds the states first as a checkpoint's head input
-    quantization does.
+    quantization does. Where the matrix is an embedding's own width, the states
+    reach it through a `projection` first (`Projection`), so every reader of
+    the states the product takes (`states`) reads them at the matrix's width.
 
     Contracting the model's final states with it (`logits`) reproduces the
     model's own logits, scale, bias, softcap and any adapter on the head
@@ -171,9 +203,13 @@ class OutputTable:
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
     scale: jax.Array | None = None
+    projection: Projection | None = None
 
     def states(self, hidden: jax.Array) -> jax.Array:
-        """`hidden` as the product reads it: through the input quantizer's QDQ."""
+        """`hidden` as the product reads it: through the `projection` where the head has one, then the
+        input quantizer's QDQ."""
+        if self.projection is not None:
+            hidden = self.projection(hidden)
         return hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
 
     def logits(self, hidden: jax.Array, *, temperature: float = 1.0) -> jax.Array:
@@ -219,11 +255,31 @@ class OutputTable:
 
     def rows(self) -> jax.Array:
         """Each vocabulary token's `[vocab, features]` row: the matrix's, times
-        the token's scale, whose dot product with a state is the token's logit
-        before its bias and softcap, in the wider of the two dtypes. A reader
+        the token's scale, whose dot product with a state as the product reads
+        it (`states`) is the token's logit before its bias and softcap, in the
+        wider of the two dtypes. A reader
         of tokens' vectors (a decision head's lexical prior) takes these."""
         rows = self.matrix if self.vocab_major else self.matrix.T
         return rows if self.scale is None else rows * self.scale[:, None]
+
+
+@runtime_checkable
+class ReadsTrain(Protocol):
+    """A module whose call takes `train`, for a stochastic layer of its own (a token mixer's or a
+    feed-forward's dropout, a vision tower's drop path): its owner passes `train` where `reads_train`
+    says the call reads it, whatever the module's family."""
+
+    @property
+    def reads_train(self) -> bool: ...
+
+
+@runtime_checkable
+class ReadsClips(Protocol):
+    """An encoder that says whether it reads a clip's frames, (B, T, H, W, C), or an image: a run over
+    clips takes one that does, and a run over images one that doesn't."""
+
+    @property
+    def reads_clips(self) -> bool: ...
 
 
 @runtime_checkable
@@ -233,10 +289,14 @@ class SteppedInContext(Protocol):
     variables, None without a level; the tree with others in their place; and the two halves of the
     head the steps run between, the level on final states (`continuum_states`) and the head past it
     (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
-    `in_context` says whether the model holds a level."""
+    `in_context` says whether the model holds a level, and `affine_head`, read from the bound model,
+    whether `head_logits` is affine in its states, which a damped step's curvature bound needs
+    (`ChunkAdaptation.damped`)."""
 
     @property
     def in_context(self) -> bool: ...
+
+    def affine_head(self) -> bool: ...
 
     def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
 
@@ -491,6 +551,27 @@ def head_table(model: nn.Module, variables) -> OutputTable | None:
     return table
 
 
+def label_logits(model: nn.Module, variables, answers: jax.Array, ids: Sequence[Sequence[int]]) -> jax.Array:
+    """`model`'s own logits `[B, N, K, V]` at each of the `[K, V]` label `ids` of each answer state of
+    `answers` `[B, N, features]`, a class read as its label's tokens' logits (a verbalizer): its output
+    table at the labels' columns alone, computed in fp32 (`OutputTable.columns`), where one matrix is
+    its head (`head_table`); else its exact head over the answer states, a few rows
+    (`LogitsFromHidden`), the labels' columns taken. No product is rebuilt from the vocabulary's rows,
+    which carry no bias and no softcap."""
+    held = np.asarray(ids, np.int64)
+    table = head_table(model, variables)
+    if table is not None:
+        return table.columns(answers, held.reshape(-1).tolist(), exact=True).reshape(
+            *answers.shape[:2], *held.shape)
+    if not isinstance(model, LogitsFromHidden):
+        raise TypeError(f"a readout of labels reads its backbone's exact head, which a "
+                        f"{type(model).__name__} does not give (AffineHead, LogitsFromHidden)")
+    full = jnp.asarray(model.apply(variables, answers, method="logits_from_hidden"))
+    picked = jnp.take(full, jnp.asarray(held.reshape(-1)), axis=-1)
+    return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
+        *answers.shape[:2], *held.shape)
+
+
 @runtime_checkable
 class VocabularyRows(Protocol):
     """A model whose head scores its final states against one row per vocabulary token: each
@@ -568,7 +649,7 @@ class CrossAttending(Protocol):
     """A decoder whose layers can read a conditioning sequence through gated
     cross-attention (`dew.nn.cross_attention`): CausalTransformer answers this."""
 
-    cross_attention: CrossAttention | None
+    cross_attention: CrossBlocks | None
 
     @property
     def context_width(self) -> int:
@@ -585,12 +666,46 @@ class CrossAttending(Protocol):
         of `context_lengths` tokens."""
         ...
 
-    def token_embeddings(self, tokens: jax.Array) -> jax.Array:
-        """Each token's row of the model's own table, unscaled and without positions: a context's
-        tokens as a cross-attention reads them by the table (`dew.nn.cross_attention.encode_context`)."""
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        """The part of `cross_flops` done by the decoder's own matrices, which train as its trunk does."""
         ...
 
-    def with_cross_attention(self, cross: CrossAttention | None) -> Self: ...
+    def stream_embeddings(self, tokens: jax.Array) -> jax.Array:
+        """Each token's row of the model's own table at its stream's width, unscaled and without
+        positions: a context's tokens as a cross-attention reads them by the table
+        (`dew.nn.cross_attention.encode_context`)."""
+        ...
+
+    def with_cross_attention(self, cross: CrossBlocks | None) -> Self: ...
+
+
+@runtime_checkable
+class Scanning(Protocol):
+    """A decoder whose like layers, and those repeating one period, can run under flax's scan
+    (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
+
+    def with_scanned_layers(self) -> Self: ...
+
+
+@runtime_checkable
+class Differential(Protocol):
+    """A decoder whose softmax layers can take DEX's differential on chosen heads (`dew.nn.dex`):
+    CausalTransformer, and a wrapper over one."""
+
+    @property
+    def dex(self) -> DifferentialExtension | None: ...
+
+    def with_dex(self, extension: DifferentialExtension | None) -> Self: ...
+
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        """Where the decoder's parameters sit under `params` (`()` for its own, a wrapper's deeper), and
+        its softmax attention layers, by index: what DEX extends and its recipe trains."""
+        ...
+
+    def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+        """`variables` as an export writes them, its DEX folded into its layers' output projections
+        (`dew.nn.dex.folded`); `ValueError` where a layer's does not fold."""
+        ...
 
 
 @runtime_checkable
@@ -621,7 +736,7 @@ class Recomputing(Protocol):
     own: a resumed run never compiles a lighter rung than it trained on.
     `recompute_half` is the model one rung up where that rung recomputes only
     the few values it names, a half rung the planner tries at each split
-    (`dew.training.planning.plan_step`), else None."""
+    (`dew.training.planning.FitSearch`), else None."""
 
     def recompute_record(self) -> JSON: ...
 
@@ -783,7 +898,7 @@ def refuse_block_reading(model: nn.Module, reading: str) -> None:
     chunks = block_chunks_of(model)
     if not chunks:
         raise ValueError(f"{reading} needs a trunk layer that reads blocks "
-                         f"(AttentionMixer.bidirectional_blocks), and {type(model).__name__} has none")
+                         f"(MixerBase.reads_blocks), and {type(model).__name__} has none")
     if not whole_block(chunks):
         raise ValueError(f"{reading} is read whole only by a layer with no attention chunk, and every layer "
                          f"of {type(model).__name__} that reads blocks has one ({list(chunks)}), which cuts "
@@ -811,6 +926,17 @@ class ShiftsLogits(Protocol):
 
     @property
     def shifted_logits(self) -> bool: ...
+
+
+@runtime_checkable
+class PositionCapacity(Protocol):
+    """A model that declares the most places a row may hold that its positions cover, which a row longer
+    than that would read past (a learned table's rows), None where its positions cover any (rotary,
+    ALiBi): what a training row's length is checked against, apart from its decode cache's capacity
+    (`Bounded.max_seq_len`). A model that declares none is checked for none."""
+
+    @property
+    def position_capacity(self) -> int | None: ...
 
 
 @runtime_checkable
@@ -853,8 +979,7 @@ class Exposing(Protocol):
     """A decoder that hands back its hidden states beside its logits, which a
     drafting strategy seeds from; without them a model decodes but cannot draft."""
 
-    def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
-                          ) -> tuple[jax.Array, jax.Array]: ...
+    def states_and_logits(self, tokens: jax.Array, **kwargs: ModelKwarg) -> tuple[jax.Array, jax.Array]: ...
 
 
 @runtime_checkable
@@ -862,7 +987,7 @@ class Selective(Protocol):
     """A decoder that scores one position per row instead of them all, so its
     prefill runs the head only on the slot the first draw reads."""
 
-    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
+    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: ModelKwarg
                              ) -> tuple[jax.Array, jax.Array]: ...
 
 
@@ -943,10 +1068,11 @@ class BlockDenoiser(Protocol):
     canvas_length, vocab_size]` logits, self-conditioned on the previous step's
     (`self_conditioning_logits`, a zero signal in rows whose
     `self_conditioning_mask` is false); `max_seq_len` bounds the prompt and
-    its canvases. A canvas is refined and committed at the logical `positions`
-    that continue its prompt's, None where the prompt gives none and the
-    cache's cursor places it. A causal language model scores tokens too, but
-    runs none of these, so it is not one."""
+    its canvases. A canvas is refined at the logical `positions` that continue
+    its prompt's, None where the prompt gives none and the cache's cursor
+    places it, and committed at them laid out as its `coordinates`, the one
+    layout a method past `__call__` reads (ledger 1122). A causal language
+    model scores tokens too, but runs none of these, so it is not one."""
 
     @property
     def canvas_length(self) -> int: ...
@@ -959,7 +1085,7 @@ class BlockDenoiser(Protocol):
 
     def init_cache(self, batch_size: int) -> None: ...
 
-    def encode(self, tokens: jax.Array, *, positions: jax.Array | None = None) -> jax.Array: ...
+    def encode(self, tokens: jax.Array, *, coordinates: Coordinates | None = None) -> jax.Array: ...
 
     def __call__(self, tokens: jax.Array, *, self_conditioning_logits: jax.Array | None = None,
                  self_conditioning_mask: jax.Array | None = None,

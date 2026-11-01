@@ -8,16 +8,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
 from reference_error import (
     FACTOR,
+    MOST_SEEDS,
     PARITY,
     REDRAW,
     GateFailure,
     Inconclusive,
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
     assert_moves,
     assert_same_artifact,
     declared_seeds,
@@ -29,6 +29,8 @@ from reference_error import (
     seeds_for,
     widened,
 )
+
+from dew.nn.precision import accumulated
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
@@ -50,6 +52,76 @@ def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_of
     with np.load(out) as theirs:
         for name, value in ynn_programs.outputs(without_ynn).items():
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
+
+
+def one_key_draw(seed):
+    """bf16 queries [2, 5, 4, 32] over a single key and value of two heads."""
+    rng = np.random.default_rng([1698, 1, seed])
+    return tuple(jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+                 for shape in ((2, 5, 4, 32), (2, 1, 2, 32), (2, 1, 2, 32)))
+
+
+def pulled_by_itself(attention):
+    """`attention`'s output and the gradients of its inputs under that output as the cotangent."""
+    def run(query, key, value):
+        out, pull = jax.vjp(attention, query, key, value)
+        return out, *pull(out)
+    return run
+
+
+def xla_attention(query, key, value):
+    """jax.nn's attention, its XLA implementation."""
+    return jax.nn.dot_product_attention(query, key, value, implementation="xla")
+
+
+def written_attention(query, key, value):
+    """The same attention written out: grouped heads, fp32 logits, a softmax in fp32 rounded to bf16."""
+    group = query.shape[2] // key.shape[2]
+    keys, values = jnp.repeat(key, group, axis=2), jnp.repeat(value, group, axis=2)
+    logits = jnp.einsum("btnh,bsnh->bnts", query, keys, preferred_element_type=jnp.float32)
+    weights = jax.nn.softmax(logits / np.sqrt(query.shape[-1]), axis=-1).astype(query.dtype)
+    return jnp.einsum("bnts,bsnh->btnh", weights, values)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
+        tmp_path, monkeypatch):
+    """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
+    every matmul precision; check 1 decides, once before its draws, that both arms of that site take the
+    fusions (`_ynn_decided`), the two still of one kind, names that decision in its stage's line
+    (STAGES_LOG) and in the report CI reads (`SWITCHED`), and judges them."""
+    import json
+
+    from reference_error import STAGES_LOG, SWITCHED, without_ynn
+
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
+    log = tmp_path / "stages.jsonl"
+    monkeypatch.setenv(STAGES_LOG, str(log))
+    assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
+                    "attention over one key", seeds=16)
+    lines = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [entry["label"] for entry in lines] == ["attention over one key"]
+    assert lines[0]["ynn"] is not None
+    assert [entry["label"] for entry in SWITCHED] == ["attention over one key"]
+    SWITCHED.clear()
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
+    """Where XLA:CPU refuses WITHOUT_YNN's options themselves, a site of two Dew paths raises before
+    deciding (`_ynn_option_held`), so it moves onto the fusions and passes nowhere."""
+    import reference_error
+
+    reference_error._ynn_option_held.cache_clear()
+    monkeypatch.setattr(reference_error, "WITHOUT_YNN", {"xla_cpu_no_such_option": "none"})
+    try:
+        with pytest.raises(RuntimeError):
+            assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention),
+                            one_key_draw, "attention over one key, its options refused", seeds=16)
+        assert not reference_error.SWITCHED
+    finally:
+        reference_error._ynn_option_held.cache_clear()
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
@@ -227,6 +299,427 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     assert min(seen[1:]) >= SIZING_FROM
 
 
+def noised_draw(seed):
+    """A draw of standard normal values beside three noises of 1e-7 of them, which arms add at chosen scales
+    (the further references' and the library arm's sites)."""
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+
+
+def cancelling(split: bool, *, leak: bool = False, residue: float = 0.0):
+    """A leaf of rows that cancel, rows of no terms and plain rows: rows 0-7 a dot less itself (the
+    reference's the same dot twice, exactly zero; split, Dew's second dot summed in two halves, an ulp
+    or so off zero; leaked, one term dropped from it), rows 8-11 the dot of zero rows (`residue` added),
+    and the rest the plain dot, every arm alike."""
+    def halves(x, w):
+        return x[:, :32] @ w[:32] + (x[:, 33:] @ w[33:] if leak else x[:, 32:] @ w[32:])
+
+    def arm(x, w):
+        whole = x @ w
+        other = halves(x, w) if split else x @ w
+        return {"rows": jnp.concatenate([whole[:8] - other[:8], whole[8:12] + residue, whole[12:]])}
+    return arm
+
+
+def cancelling_draw(seed):
+    """A [64, 64] by [64, 4] dot's operands, rows 8-11 of the first zero."""
+    rng = np.random.default_rng([2440, seed])
+    x = rng.standard_normal((64, 64))
+    x[8:12] = 0
+    return jnp.asarray(x, jnp.float32), jnp.asarray(rng.standard_normal((64, 4)), jnp.float32)
+
+
+def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
+    """Term sizing (`assert_as_exact`'s `terms`, owner 10-29): a row whose truth cancels exactly, Dew's an
+    ulp or so off its zero where the reference's sum cancels to it, is judged at its terms' size by the
+    row rule and admitted, by default too, its truth holding a row of float64 zero (`_cancelling_terms`,
+    ledger 2851), where without terms (False) it fails as a row of float64 zero against the reference's
+    exact zero; and nothing else is: a dropped term in that row is refused, a residue on rows whose terms
+    are zero too (no size) is refused as a row of float64 zero, and a truth with no terms (run as given)
+    is refused at the site."""
+    reference = cancelling(split=False)
+    assert_as_exact(cancelling(split=True), reference, cancelling_draw, "a cancelling dot", seeds=16,
+                    terms=True)
+    assert_as_exact(cancelling(split=True), reference, cancelling_draw, "by default", seeds=16)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untermed", seeds=16,
+                        terms=False)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True, leak=True), reference, cancelling_draw, "a leaked term",
+                        seeds=16, terms=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(cancelling(split=True, residue=1e-20), reference, cancelling_draw,
+                        "a residue on rows of no terms", seeds=16, terms=True)
+    with pytest.raises(ValueError):
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untraceable", seeds=16,
+                        terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
+
+
+def sharded_site(monkeypatch, root, shards, site):
+    """`site()` run as armada runs a sharded site: a map task for each range of `shards` (DRAWS), its
+    records under `root` (RECORDS), then their judge (POOL over `root`); what each map task's run
+    returned and what the judge's did."""
+    from map_judge import DRAWS, POOL, RECORDS
+
+    drawn = []
+    for index, (start, stop) in enumerate(shards):
+        monkeypatch.setenv(DRAWS, f"{start}:{stop}")
+        monkeypatch.setenv(RECORDS, str(root / str(index)))
+        drawn.append(site())
+    monkeypatch.delenv(DRAWS)
+    monkeypatch.delenv(RECORDS)
+    monkeypatch.setenv(POOL, str(root))
+    try:
+        return drawn, site()
+    finally:
+        monkeypatch.delenv(POOL)
+
+
+def test_a_sharded_sites_map_tasks_size_its_cancelling_rows_and_its_judge_runs_no_truth(
+        tmp_path, monkeypatch):
+    """A site whose truth holds a row of float64 zero (`cancelling`) sized by its terms by default
+    (`_cancelling_terms`) is so in each map task (DRAWS), which runs the truth on its first draw to find
+    them, and its records carry each row's size; its judge (POOL) reads them, running no truth at all, and
+    judges as the site does whole: on par admitted, a leaked term refused alike."""
+    truths = []
+
+    def counted(x, w):
+        # Each run of the truth, compiled or not, on the host (a trace alone counts nothing).
+        jax.debug.callback(lambda: truths.append(1))
+        return cancelling(split=False)(x, w)
+
+    def site(dew, label):
+        def run():
+            truths.clear()
+            assert_as_exact(dew, cancelling(split=False), cancelling_draw, label, seeds=16,
+                            truth_fn=counted)
+            return len(truths)
+        return run
+
+    drawn, judged = sharded_site(monkeypatch, tmp_path / "on par", [(0, 40), (40, 80)],
+                                 site(cancelling(split=True), "on par"))
+    assert all(count >= 1 for count in drawn), "each map task sizes its rows from the truth"
+    assert judged == 0, "a judge runs no truth"
+    assert_as_exact(cancelling(split=True), cancelling(split=False), cancelling_draw, "whole", seeds=16,
+                    truth_fn=counted)
+    with pytest.raises(GateFailure) as whole:
+        assert_as_exact(cancelling(split=True, leak=True), cancelling(split=False), cancelling_draw,
+                        "leaked", seeds=16, truth_fn=counted)
+    with pytest.raises(GateFailure) as pooled:
+        sharded_site(monkeypatch, tmp_path / "leaked", [(0, 40), (40, 80)],
+                     site(cancelling(split=True, leak=True), "leaked"))
+    # The judge, the last to run, ran no truth before it refused.
+    assert truths == [], "a judge runs no truth"
+    assert str(pooled.value) == str(whole.value)
+
+
+MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
+"""A fixed [4, 4] product past `cancelling`'s rows (`mixed`)."""
+
+
+def mixed(arm):
+    """`arm`'s rows through MIX: a row that cancels before that product sums zero terms into it, in
+    float64, however far each arm is off its zero."""
+    def run(x, w):
+        return {"rows": arm(x, w)["rows"] @ jnp.asarray(MIX)}
+    return run
+
+
+def mixed_terms(x, w):
+    """`mixed`'s terms carried through its cancellation (`float64_terms`' sizes): each dot's entry the
+    root sum of squares of its products, the cancelling rows' two sums both, then MIX's products of
+    those sizes."""
+    sizes = np.sqrt(np.square(np.asarray(x)) @ np.square(np.asarray(w)))
+    sizes[:8] *= np.sqrt(2.0)
+    return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
+
+
+def product_draws(key: int, inner: int):
+    """Draws of a [16, `inner`] by [`inner`, 8] fp32 product's operands, a stream of their own by `key`."""
+    def draw(seed):
+        rng = np.random.default_rng([key, seed])
+        return (jnp.asarray(rng.standard_normal((16, inner)), jnp.float32),
+                jnp.asarray(rng.standard_normal((inner, 8)), jnp.float32))
+    return draw
+
+
+a_product_draw = product_draws(2641, 64)
+"""A [16, 64] by [64, 8] fp32 product's operands."""
+
+
+def test_the_tail_tests_floor_is_derived_from_its_faults_at_the_leafs_noise():
+    """The tail test's null share (`_tail_floor`, Main 2026-10-31) is ½ at the counts EXAMPLE_POWER asks,
+    where no fault of FAULTS clears it with power to spare; at a large count over a heavy symmetric noise it
+    rises above ½, so equally exact arms whose tails are a little uneven pass, and twice off on a tenth, the
+    smallest fault, is still refused there; a fault in the leaf's own noise lowers its floor."""
+    from check1_statistics import LOWER_TAIL, _tail_floor, _tail_sign
+
+    rng = np.random.default_rng([2469, 3])
+    small = 0.4 * rng.standard_t(3, 1024) / np.sqrt(3)
+    assert _tail_floor(small, LOWER_TAIL) == 0.5
+    heavy = 0.5 * rng.standard_t(3, 82000) / np.sqrt(3)
+    uneven = np.where(rng.random(82000) < 0.02, np.abs(heavy), heavy)  # a little more of the tail above
+    assert _tail_floor(uneven, LOWER_TAIL) > 0.55 and _tail_sign(uneven) >= LOWER_TAIL
+    twice = heavy + np.where(rng.random(82000) < 0.1, np.log(2.0), 0.0)
+    assert _tail_sign(twice) < LOWER_TAIL
+    tenfold = heavy + np.where(rng.random(82000) < 0.1, np.log(10.0), 0.0)
+    assert _tail_floor(tenfold, LOWER_TAIL) < _tail_floor(heavy, LOWER_TAIL)
+    assert _tail_sign(tenfold) < LOWER_TAIL
+
+
+def test_a_row_both_arms_hold_exactly_is_not_carried_and_the_site_judges_as_before():
+    """A row of float64 zero both arms hold exactly is no evidence (`_paired`): it is not carried in a
+    seed's zero rows, which a window's gradient fills with every row it never touches (ledger 2469), and
+    a site of such rows passes as it did."""
+    from reference_error import _drawn
+
+    def zeroed_draw(seed):
+        x, w = a_product_draw(seed)
+        return x.at[:4].set(0.0), w
+
+    draws = _drawn(jnp.matmul, jnp.matmul, zeroed_draw, range(2))
+    for rows, mine, theirs in (seed[0] for seed in draws.zero_rows):
+        assert not np.any((mine == 0) & (theirs == 0)) and not np.isin(np.arange(4), rows).any()
+    assert_as_exact(jnp.matmul, jnp.matmul, zeroed_draw, "rows held exactly", seeds=8)
+
+
+def test_check_1_refuses_a_draw_its_seed_does_not_fix_and_an_arm_of_more_than_its_inputs():
+    """Planted controls (ledger 2641): a draw from a generator its seed does not fix, and an arm drawing a
+    noise of its own, each compare draws no seed pairs, and check 1 refuses both before judging them
+    (`UnpairedDraw`); a planted non-finite entry in Dew's arm fails it."""
+    from reference_error import UnpairedDraw
+
+    unseeded = np.random.default_rng()
+
+    def unfixed_draw(seed):
+        x, w = a_product_draw(seed)
+        return x + jnp.asarray(unseeded.standard_normal(x.shape) * 1e-3, jnp.float32), w
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(jnp.matmul, jnp.matmul, unfixed_draw, "a draw its seed does not fix", seeds=16)
+    noise = iter(range(10**6))
+
+    def noisy(x, w):
+        return x @ w + 1e-6 * jax.random.normal(jax.random.key(next(noise)), (16, 8))
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(as_given(noisy), jnp.matmul, a_product_draw, "an arm of its own noise", seeds=16)
+
+    def planted(x, w):
+        return (x @ w).at[3, 5].set(jnp.nan)
+
+    with pytest.raises(GateFailure):
+        assert_as_exact(planted, jnp.matmul, a_product_draw, "a planted non-finite entry", seeds=16)
+
+
+def test_the_paired_worst_row_refuses_a_row_far_off_on_some_examples_and_passes_equally_exact_arms():
+    """At a site that stacks examples, each example's worst row is held to the reference's on the same
+    example (`_paired_rows`, ledger 2469): equally exact arms, their worst rows' log ratios symmetric however
+    wide (a spread of 1.0 and 2.0), pass; Dew ten times the reference's on a fifth of 512 examples of such
+    spread is refused at LOWER_TAIL; and two examples past the factor, both Dew's, are no finding."""
+    from reference_error import LOWER_TAIL, ROW_FACTOR, _paired_rows
+
+    rng = np.random.default_rng([2469, 512])
+    for spread in (1.0, 2.0):
+        null = rng.normal(0.0, spread, 512)
+        assert _paired_rows(null, ROW_FACTOR) >= LOWER_TAIL
+        off = null.copy()
+        off[::5] += math.log(10.0)
+        assert _paired_rows(off, ROW_FACTOR) < LOWER_TAIL
+    assert _paired_rows(np.asarray([3.0, 3.0, 0.0]), ROW_FACTOR) >= LOWER_TAIL
+
+
+def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whole(tmp_path, monkeypatch):
+    """armada's map and judge (`DRAWS`, `POOL`): a site whose seeds are sharded across map tasks, each writing
+    its draws and judging nothing, is judged over their pooled draws as it is when it draws them itself: a
+    product on par passes, and a bfloat16 one fails with the same findings; a pool that stops short of a
+    stage's seeds, or holds a gap, is refused, never judged."""
+    import map_judge
+    from map_judge import DRAWS, POOL, RECORDS, PoolRefused
+
+    def judged(dew, label, shards):
+        sharded_site(monkeypatch, tmp_path / label, shards,
+                     lambda: assert_as_exact(dew, jnp.matmul, a_product_draw, label, seeds=16))
+
+    def halved(x, w):
+        return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
+
+    judged(jnp.matmul, "on par", [(0, 30), (30, 80)])
+    with pytest.raises(GateFailure) as whole:
+        assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16)
+    with pytest.raises(GateFailure) as pooled:
+        judged(halved, "halved", [(0, 40), (40, 80), (40, 80)])
+    assert str(pooled.value) == str(whole.value)
+    with pytest.raises(PoolRefused) as short:
+        judged(halved, "halved, short", [(0, 16)])
+    with pytest.raises(PoolRefused) as gapped:
+        judged(halved, "halved, with a gap", [(0, 8), (16, 80)])
+    assert (short.value.held, gapped.value.held) == (16, 8)
+    # Two tests' sites of one label, their records under one pool: each judge pools its own test's alone.
+    def as_test(test, dew, *, records=None, pool=None):
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", f"tests/test_{test}.py::test_{test} (call)")
+        for name, value in ((DRAWS, records and "0:80"), (RECORDS, records), (POOL, pool)):
+            if value:
+                monkeypatch.setenv(name, value)
+            else:
+                monkeypatch.delenv(name, raising=False)
+        assert_as_exact(dew, jnp.matmul, a_product_draw, "one label", seeds=16)
+
+    as_test("halved", halved, records=str(tmp_path / "shared" / "halved"))
+    as_test("on_par", jnp.matmul, records=str(tmp_path / "shared" / "on par"))
+    as_test("on_par", jnp.matmul, pool=str(tmp_path / "shared"))
+    with pytest.raises(GateFailure):
+        as_test("halved", halved, pool=str(tmp_path / "shared"))
+    # One site, its id, label and ranges alike, run on two Pythons into one pool: each Python's judge pools
+    # its own Python's draws alone.
+    for python, dew in (("3.12", jnp.matmul), ("3.14", halved)):
+        monkeypatch.setattr(map_judge, "python", lambda python=python: python)
+        as_test("one_site", dew, records=str(tmp_path / "pythons" / python))
+    monkeypatch.setattr(map_judge, "python", lambda: "3.12")
+    as_test("one_site", jnp.matmul, pool=str(tmp_path / "pythons"))
+    monkeypatch.setattr(map_judge, "python", lambda: "3.14")
+    with pytest.raises(GateFailure):
+        as_test("one_site", halved, pool=str(tmp_path / "pythons"))
+
+
+def test_check_1_refuses_a_draw_and_an_arm_that_turn_stateful_after_their_first_block():
+    """Planted controls of a later block (ledger 2641): a draw fixed by its seed in a site's first block that
+    reads a state its calls leave from then on, and an arm of no noise on its first block that adds one
+    after, are refused at the next block's first draw (`UnpairedDraw`), as every block checks its first
+    draw and its arms on it; the first block alone passes."""
+    from reference_error import UnpairedDraw
+
+    asked = []
+
+    def later_stateful(seed):
+        x, w = a_product_draw(seed)
+        asked.append(seed)
+        return (x if seed == asked[0] else x + 1e-3 * len(asked)), w
+
+    with pytest.raises(UnpairedDraw):
+        null_runs(jnp.matmul, later_stateful, "a draw stateful after its first block", seeds=8, runs=2)
+    calls = []
+
+    def noisy_later(x, w):
+        calls.append(len(calls))
+        return x @ w + (0 if len(calls) <= 2 else 1e-6 * len(calls))
+
+    # Its truth a pure product of its own, so the arm's first two calls are its first block's evaluation and
+    # that check's replay: the first block passes, and the second's replay refuses it.
+    [(verdict, _, _)] = null_runs(as_given(noisy_later), a_product_draw, "an arm pure on its first block",
+                                  seeds=8, runs=1, truth_fn=jnp.matmul)
+    assert verdict == "pass" and len(calls) > 2
+    calls.clear()
+    with pytest.raises(UnpairedDraw):
+        null_runs(as_given(noisy_later), a_product_draw, "an arm of noise after its first block", seeds=8,
+                  runs=2, truth_fn=jnp.matmul)
+
+
+def test_check_1_sizes_rows_by_their_terms_beside_an_output_held_as_none():
+    """Term sizing reads a truth's terms by the truth's own structure (`_term_leaves`): an output held as
+    None (a gradient of an input given as None, as `with_gradients` returns one) takes no leaf of the
+    terms, so the leaves after it are sized by their own, not their neighbour's."""
+    def holding_none(arm):
+        def run(x, w):
+            return {"before": arm(x, w)["rows"], "none": None, "after": arm(x, w)["rows"][:, :2]}
+        return run
+
+    assert_as_exact(holding_none(cancelling(split=True)), holding_none(cancelling(split=False)),
+                    cancelling_draw, "terms beside a None", seeds=16, terms=True)
+
+
+def test_check_1_sizes_a_row_that_cancels_behind_its_final_sum_by_the_sites_own_terms():
+    """A site's own terms program (`assert_as_exact`'s `terms`): the traced terms are a leaf's final
+    sums' alone, so rows that cancel before a further product (`mixed`, as an attention query that keeps
+    one key cancels its logit gradient before dQ sums it) have none and fail as rows of float64 zero; the
+    site's own terms, carried through the cancellation, size them, and nothing else is admitted: a
+    dropped term there is refused, a residue on rows whose terms are zero too is refused, and terms of
+    another tree are refused at the site."""
+    reference = mixed(cancelling(split=False))
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "traced terms", seeds=16,
+                        terms=True)
+    assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "the site's terms", seeds=16,
+                    terms=mixed_terms)
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True, leak=True)), reference, cancelling_draw, "a leaked term",
+                        seeds=16, terms=mixed_terms)
+    with pytest.raises(GateFailure):
+        assert_as_exact(mixed(cancelling(split=True, residue=1e-20)), reference, cancelling_draw,
+                        "a residue on rows of no terms", seeds=16, terms=mixed_terms)
+    with pytest.raises(ValueError):
+        assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "another tree", seeds=16,
+                        terms=lambda x, w: mixed_terms(x, w)["rows"])
+
+
+long_dot_draw = product_draws(1698, 4096)
+"""A [16, 4096] by [4096, 8] fp32 dot's operands: sums long enough that fp32's own rounding of them is
+several times the half ulp of a float64 sum rounded once."""
+
+
+def dews_product(x, w):
+    """Dew's product (`accumulated`): in the suite's wide CPU arithmetic, float64 sums rounded once."""
+    return accumulated(jnp.matmul, x, w)
+
+
+def summed_wide(x, w):
+    """Dew's product stating a precision of its own inside its arm, so it keeps the float64 sums."""
+    with jax.default_matmul_precision("highest"):
+        return dews_product(x, w)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the suite's wide arithmetic is a CPU's")
+def test_check_1_runs_each_arm_as_its_users_sum_their_products():
+    """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`summed_as_run`), the
+    truth outside that: Dew's product, which sums in float64 only under the suite's wide arithmetic, is
+    judged as its users run it, so XLA's plain fp32 dot is on par with it; and against the same
+    product kept to its float64 sums, the plain dot fails, so the truth is still float64's."""
+    assert_as_exact(jnp.matmul, dews_product, long_dot_draw, "as its users sum", seeds=16)
+    with pytest.raises(GateFailure):
+        assert_as_exact(jnp.matmul, summed_wide, long_dot_draw, "summed wide", seeds=16)
+
+
+def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
+    """`also`: one Dew arm against several references on the same draws, each judged by its own check 1
+    under its own label, Dew and the truth evaluated once a draw for them all. A Dew arm on par with one
+    reference and three times another's error fails against that one alone; a site with every
+    reference on par passes; beside a plain Dew arm, a further reference of another kind than the
+    reference's is refused."""
+    calls = {"dew": 0, "truth": 0}
+
+    draw = noised_draw
+
+    def arm(scale, noise, counted=None):
+        @as_given
+        def run(x, mine, theirs, other):
+            if counted:
+                calls[counted] += 1
+            return {"value": x + scale * {"mine": mine, "theirs": theirs, "other": other}[noise]}
+        return run
+
+    @as_given
+    def truth(x, *_):
+        calls["truth"] += 1
+        return {"value": x}
+
+    dew = arm(1.0, "mine", "dew")
+    assert_as_exact(dew, arm(1.0, "theirs"), draw, "two references", seeds=16, truth_fn=truth,
+                    also={"another": arm(1.0, "other")})
+    # Dew's arm once a draw, and once more on the first, the check that it depends on its inputs alone
+    # (`_of_its_inputs`).
+    assert calls == {"dew": 17, "truth": 16}, calls
+    with pytest.raises(GateFailure) as failed:
+        assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
+                        also={"another": arm(1.0, "other")})
+    assert {finding.leaf for finding in failed.value.findings} == {"one far, against another['value']"}
+    def plain(x, *_):
+        return {"value": x}
+
+    with pytest.raises(ValueError):
+        assert_as_exact(plain, plain, draw, "two kinds", seeds=16, truth_fn=truth,
+                        also={"given": arm(1.0, "other")})
+
+
 def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references():
     """With the owner's library arm (`library_fn`), Dew is held within PARITY of the larger of the
     reference's error and the library arm's, seed by seed, on the leaves the exception covers: a Dew
@@ -236,9 +729,7 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     compile. Null runs judge as the site does."""
     from reference_error import null_runs
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+    draw = noised_draw
 
     def arm(scale, noise):
         @as_given
@@ -299,11 +790,38 @@ def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
                     "a reference with options", seeds=8)
 
 
+def test_an_arm_compiled_outside_the_gates_policy_is_refused():
+    """An arm compiled without YNNPACK's fusions (`without_ynn`) beside an arm run as given, where the
+    gate compiles Dew's arm with the fusions as its users run it, is refused rather than run unseen
+    without them (row 2287); beside another Dew arm, where the gate compiles without them too, it runs
+    as the gate would compile it. A plain jit is nested under the gate's own compile, whose options
+    apply; a jit with options of its own refuses that nesting itself (row 1800). Every other arm kind
+    runs: plain, as given, a window loop's."""
+    from reference_error import _arms, over_windows, without_ynn
+
+    def doubled(x):
+        return {"y": jnp.asarray(x) + jnp.asarray(x)}
+
+    given = as_given(lambda x: {"y": np.asarray(x) * 2})
+    with pytest.raises(TypeError):
+        _arms(without_ynn(doubled), given)
+    with pytest.raises(TypeError):
+        _arms(over_windows(without_ynn(doubled)), given)
+    x = np.ones(4, np.float32)
+    for dew, reference in ((without_ynn(doubled), doubled), (doubled, given), (jax.jit(doubled), given),
+                           (jax.jit(doubled), doubled), (doubled, doubled)):
+        mine, theirs = _arms(dew, reference)
+        np.testing.assert_array_equal(np.asarray(mine(x)["y"]), np.asarray(theirs(x)["y"]))
+    with pytest.raises(ValueError):
+        _arms(jax.jit(doubled, compiler_options={"xla_cpu_enable_fast_math": False}), doubled)[0](x)
+
+
 def test_a_float64_truth_runs_as_one_compiled_program():
-    """The gate compiles a JAX truth (`_truth_program`): its first call runs as given and every later
-    one is the compiled program's, whose values are the eager truth's own. A NumPy truth (its first
-    call returns host values) runs as given, and so do a truth `as_given`, one compiled already and a
-    window loop's by its own; a check over a compiled truth judges as over the eager one."""
+    """The gate compiles a JAX truth (`_truth_program`) from its first call on, never running it eagerly, so
+    a seed's truth is the same whichever seed a process draws first, and its values are the eager truth's
+    own. A NumPy truth (it cannot be traced, and returns host values) runs as given, and so do a truth
+    `as_given`, one compiled already and a window loop's by its own; a check over a compiled truth judges
+    as over the eager one."""
     from reference_error import _Truth, _truth_program, _Windowed, as_given, over_windows
 
     calls = []
@@ -315,10 +833,10 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     with jax.enable_x64(new_val=True):
         program = _truth_program(truth)
         x, w = (np.asarray(value, np.float64) for value in _draw(0))
-        eager = program(x, w)
-        compiled = program(x, w)
-        assert calls[0] is False and True in calls
-        np.testing.assert_allclose(compiled["y"], eager["y"], rtol=1e-14)
+        first, later = program(x, w), program(x, w)
+        assert calls == [True]
+        np.testing.assert_array_equal(first["y"], later["y"])
+        np.testing.assert_allclose(first["y"], truth(x, w)["y"], rtol=1e-14)
         numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
         numpy(x, w)
         assert numpy.run is numpy.fn
@@ -700,7 +1218,10 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
     odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
     straddles it and is wider than it over 8 seeds and over the second stage's 40 alike: inconclusive,
-    never a pass. Fewer seeds than FEWEST_SEEDS are inconclusive whatever they read."""
+    never a pass. Its draws' paired ratios do not pass it either: their log ratios spread past
+    QUALIFYING_SPREAD (`_typical_status`, ledger 2469). Fewer seeds than FEWEST_SEEDS are inconclusive
+    whatever they read."""
+    from reference_error import _interval, _status, _typical_status
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -717,6 +1238,9 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     def truth(x, mine, theirs):
         return {"y": x}
 
+    mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
+    assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
+    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
     with pytest.raises(Inconclusive):
         assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
@@ -923,6 +1447,155 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
                                                                             range(cut - 1))])
 
 
+def test_a_recording_kept_as_row_distances_judges_as_the_live_reference_does():
+    """A reference recorded as each row's RMS distance from its float64 truth alone (`record_distances`,
+    for a recorder whose outputs over the seeds are too large to keep): check 1 over that recording
+    passes Dew's same sum in another order and fails Dew's sum with a term lost, as it does against the
+    live reference."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def as_inputs(fn):
+        return lambda inputs: fn(inputs["x"], inputs["w"])
+
+    with jax.enable_x64(new_val=True):
+        def truth_of(seed):
+            return jax.tree.map(np.asarray, _product(*(np.asarray(part, np.float64) for part in _draw(seed))))
+
+        def distances(seed):
+            found = np.asarray(_product(*_draw(seed))["y"], np.float64)
+            return np.sqrt(np.mean(np.square(found - truth_of(seed)["y"]), axis=1))
+
+        kept = {"y": np.stack([distances(seed) for seed in range(160)])}
+        recorded = recorder.record_distances("site", draw, kept, truth_of, {"y": "float32"})
+    seeds = int(recorded["site.seeds"])
+    assert_as_exact(_reordered, _product, _draw, "live", seeds=seeds)
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                                truth_fn=as_inputs(_product))
+    assert_as_exact(lambda index, inputs: as_inputs(_reordered)(inputs), reference, drawn, "reordered",
+                    seeds=seeds, truth_fn=truth)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(lambda index, inputs: as_inputs(_lost_term)(inputs), reference, drawn, "lost term",
+                        seeds=seeds, truth_fn=truth)
+    assert raised.type is GateFailure
+
+
+def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do():
+    """A summarized recording made in shards with a run of pilots from SIZING_FROM (`merge_shards`) keeps
+    them apart from its verdict's seeds, and its reference carries them: a paired sizing of it takes those
+    pilots alone and declares what the live reference's paired sizing declares on the same draws, its
+    lookups never past them. Pilots that leave a seed out of their run, or whose leaves are not the
+    verdict's shapes, are refused, and so are a seed past them and a pilot drawn again otherwise."""
+    from reference_error import SIZING_FROM
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    draw, evaluate = _tiny_row_recording(_product)
+
+    def product(inputs):
+        return _product(inputs["x"], inputs["w"])
+
+    # The product summed in the other order: Dew's own rounding, apart from the reference's on each draw.
+    reordered = jax.jit(lambda x, w: {"y": jnp.dot(x[:, ::-1], w[::-1], precision="highest")})
+    live = seeds_for(_product, _draw, "live", dew_fn=reordered)
+    pilots = range(SIZING_FROM, SIZING_FROM + 2 * live)
+
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, product, summary=True)
+        kept = len(whole["site.input_digest"])
+        cut = SIZING_FROM + live // 2
+        shards = [recorder.record_shard("site", draw, evaluate, seeds)
+                  for seeds in (range(cut, pilots.stop), range(kept), range(SIZING_FROM, cut))]
+        merged = recorder.merge_shards("site", shards)
+        for key, value in whole.items():
+            np.testing.assert_array_equal(merged[key], value, err_msg=key)
+        assert len(merged["site.pilot.input_digest"]) == len(pilots)
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", shards[:2])
+        # One pilot shard's leaf apart from the others', and every pilot's apart from the verdict's.
+        for at in ((0,), (0, 2)):
+            narrow = [dict(shard, **{"site.shape.y": np.asarray([1, 1], np.int64)}) if index in at else shard
+                      for index, shard in enumerate(shards)]
+            with pytest.raises(ValueError):
+                recorder.merge_shards("site", narrow)
+        # Pilots of another leaf than the verdict's.
+        renamed = [{key.removesuffix(".y") + ".z" if key.endswith(".y") else key: value
+                    for key, value in shard.items()} for shard in shards[::2]]
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [shards[1], *renamed])
+        straddling = recorder.record_shard("site", draw, evaluate, range(SIZING_FROM - 1, SIZING_FROM + 1))
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [*shards, straddling])
+        # Pilots joined onto a recording made whole before them are the pilots merged with its shards.
+        joined = recorder.with_pilots("site", whole, shards[::2])
+        assert joined.keys() == merged.keys()
+        for key, value in merged.items():
+            np.testing.assert_array_equal(joined[key], value, err_msg=key)
+        with pytest.raises(ValueError):
+            recorder.with_pilots("site", joined, shards[::2])
+
+        seeds = int(merged["site.seeds"])
+        drawn, reference, truth = indexed_recording(merged, "site", seeds, inputs_of=draw, truth_fn=product)
+    assert reference.pilots == pilots
+    asked = []
+
+    def recorded(index, inputs):
+        asked.append(int(index))
+        return reference(index, inputs)
+    recorded.recorded, recorded.pilots = True, reference.pilots
+
+    def dew(index, inputs):
+        return reordered(inputs["x"], inputs["w"])
+
+    assert seeds_for(recorded, drawn, "recorded", dew_fn=dew, truth_fn=truth) == live
+    assert min(asked) >= SIZING_FROM and max(asked) < pilots.stop
+    with pytest.raises(AssertionError):
+        drawn(pilots.stop)
+    with pytest.raises(AssertionError):
+        indexed_recording({**merged, "site.pilot.input_digest": merged["site.pilot.input_digest"][::-1]},
+                          "site", seeds, inputs_of=draw, truth_fn=product)[0](SIZING_FROM)
+
+
+def test_a_recording_read_for_some_of_its_leaves_judges_them_alone():
+    """A summarized recording read for some of its leaves (`indexed_recording(..., leaves=)`) holds those
+    leaves' evidence and sketches, its pilots' too, and every entry the recording shares: its reference
+    gives those leaves alone, at a verdict seed and a pilot's, and check 1 judges them over it; a leaf the
+    recording lacks is refused."""
+    from reference_error import SIZING_FROM
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    @jax.jit
+    def both(x, w):
+        y = jnp.dot(x, w, precision="highest")
+        return {"y": y, "z": 2 * y}
+
+    def one(inputs):
+        return {"y": both(inputs["x"], inputs["w"])["y"]}
+
+    draw, evaluate = _tiny_row_recording(both)
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, lambda inputs: both(inputs["x"], inputs["w"]),
+                                     summary=True)
+        recorded = recorder.with_pilots("site", whole, [recorder.record_shard(
+            "site", draw, evaluate, range(SIZING_FROM, SIZING_FROM + 16))])
+        seeds = int(recorded["site.seeds"])
+        drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=one,
+                                                    leaves=("y",))
+        for seed in (0, SIZING_FROM):
+            assert set(reference(*drawn(seed))) == {"y"}
+        with pytest.raises(ValueError):
+            indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=one, leaves=("y", "w"))
+    assert_as_exact(lambda index, inputs: one(inputs), reference, drawn, "leaves", seeds=seeds,
+                    truth_fn=truth)
+
+
 def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
     """A summarized recording of windows read back through `indexed_recording` with a truth over windows
     (`over_windows`): its rounding count traces one window, as one draw's program, so the truth is read
@@ -1059,6 +1732,19 @@ def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_pa
                 indexed_recording({**stored, "site.truth.y": truth.astype(narrow)}, "site", seeds)
 
 
+def _squared_case(first: int):
+    """A recording test's draw, 64 normal fp32 values a seed from `first` on, and its evaluation: the
+    reference's `x x - 1` in fp32 beside its float64 truth."""
+    def draw(seed):
+        return {"x": np.random.default_rng(first + seed).normal(size=(64,)).astype(np.float32)}
+
+    def evaluate(inputs):
+        x = inputs["x"]
+        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+
+    return draw, evaluate
+
+
 @pytest.mark.parametrize("proxy", [True, False])
 def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path, proxy):
     """tools/recorded_references.py records a reference over the seeds its own recording resolves, and
@@ -1067,12 +1753,7 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
 
     recorder = load("recorded_references")
 
-    def draw(seed):
-        return {"x": np.random.default_rng(100 + seed).normal(size=(64,)).astype(np.float32)}
-
-    def evaluate(inputs):
-        x = inputs["x"]
-        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+    draw, evaluate = _squared_case(100)
 
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
@@ -1125,12 +1806,7 @@ def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
 
     recorder = load("recorded_references")
 
-    def draw(seed):
-        return {"x": np.random.default_rng(200 + seed).normal(size=(64,)).astype(np.float32)}
-
-    def evaluate(inputs):
-        x = inputs["x"]
-        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+    draw, evaluate = _squared_case(200)
 
     def one_element(inputs):
         return {"y": jnp.sum(inputs["x"] * inputs["x"])[None]}
@@ -1158,12 +1834,7 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
 
     recorder = load("recorded_references")
 
-    def draw(seed):
-        return {"x": np.random.default_rng(300 + seed).normal(size=(64,)).astype(np.float32)}
-
-    def evaluate(inputs):
-        x = inputs["x"]
-        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+    draw, evaluate = _squared_case(300)
 
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
@@ -1215,7 +1886,10 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
         assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
     [(verdict, _, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
     assert verdict == "over"
-    assert len(taken) == len(set(taken))
+    # Each run draws its first seed again, the check that its seed fixes it (`_of_its_seed`); its draws are
+    # otherwise its own.
+    drawn = [seed for at, seed in enumerate(taken) if not at or taken[at - 1] != seed]
+    assert len(drawn) == len(set(drawn)) and len(taken) - len(drawn) == 3
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
     assert null_rate_bound(3, 3) == 1.0
@@ -1390,3 +2064,296 @@ def test_a_row_of_float64_zero_is_judged_over_the_runs_seeds():
     # A row zero on some seeds alone pools over those.
     assert pooled_zero_rows([seed([1.0, 1.0], [1.0, 1.0]), (np.asarray([3]), np.asarray([5.0]),
                                                              np.asarray([1.0]))]) == []
+
+
+def test_a_truth_sketch_is_its_signed_sums_bit_for_bit():
+    """`truth_sketch` is its definition, bit for bit: each entry times its seed's SKETCH signs (bit k of
+    its word, +1 where set), summed in float64 in blocks of SKETCH_BLOCK in order and the blocks summed
+    exactly, at sizes off and on a block's edge and past one chunk of 2^16 entries."""
+    import math
+
+    from reference_error import SKETCH, SKETCH_BLOCK, _sign_bits, truth_sketch
+
+    for size in (1, SKETCH_BLOCK - 1, 5 * SKETCH_BLOCK, (1 << 16) + 77):
+        values = np.random.default_rng(size).standard_normal(size) * 10.0 ** np.random.default_rng(
+            size + 1).uniform(-30, 30, size)
+        bits = _sign_bits(size, seed=3)
+        signs = np.where((bits[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & np.uint64(1), 1.0, -1.0)
+        products = values[:, None] * signs
+        blocks = []
+        for start in range(0, size, 1 << 16):
+            chunk = products[start:start + (1 << 16)]
+            padded = np.concatenate([chunk, np.zeros((-len(chunk) % SKETCH_BLOCK, SKETCH))])
+            blocks.append(padded.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
+        expected = [math.fsum(column) for column in np.concatenate(blocks).T.tolist()]
+        assert truth_sketch(values, seed=3).tolist() == expected
+
+
+
+def _bits(value):
+    """`value` held to its bits: an array's or a float's dtype, shape and bytes (a NaN's and a zero's sign
+    included), a summary's field by field, a tuple's item by item."""
+    import dataclasses
+
+    if dataclasses.is_dataclass(value):
+        return [(field.name, _bits(getattr(value, field.name))) for field in dataclasses.fields(value)]
+    if isinstance(value, (tuple, list)):
+        return [_bits(item) for item in value]
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    array = np.asarray(value)
+    return array.dtype.str, array.shape, array.tobytes()
+
+
+def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
+    """Check 1 reads a leaf laid out otherwise, F-ordered or strided, Dew's, the reference's and the
+    truth's, as its C-ordered copy, bit for bit (`_evidence`, `leaf_summary`): every leaf lies in C order
+    beside the others of its width (`_LaidTruths`), so its sums run alike whatever its layout. The leaves
+    hold rows of float64 zero and leaves of every rank."""
+    from reference_error import _evidence, _prepared, leaf_summary
+
+    rng = np.random.default_rng(2201)
+    shapes = [(70, 129), (9, 33), (5, 4, 9), (40,), (3, 2, 1), (12, 9), ()]
+    truth = {f"leaf{at}": rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3)
+             for at, shape in enumerate(shapes)}
+    truth["leaf1"][2] = 0.0
+
+    def arm():
+        return {name: (value * (1 + 2.0 ** -20 * rng.standard_normal(value.shape))).astype(np.float32)
+                for name, value in truth.items()}
+
+    def strided(array):
+        wide = np.zeros((*array.shape[:-1], 2 * array.shape[-1]), array.dtype)
+        wide[..., ::2] = array
+        return wide[..., ::2]
+
+    def otherwise(tree):
+        return {name: (np.asfortranarray, strided)[at % 2](value) if np.ndim(value) else value
+                for at, (name, value) in enumerate(tree.items())}
+
+    dew, reference, laid = otherwise(arm()), otherwise(arm()), otherwise(truth)
+    assert not any(np.asarray(value).flags.c_contiguous for tree in (dew, reference, laid)
+                   for value in tree.values() if np.ndim(value) >= 2)
+    ordered = [{name: np.ascontiguousarray(value) for name, value in tree.items()}
+               for tree in (dew, reference, laid)]
+
+    def evidence(dew, reference, truth):
+        return _evidence(_prepared(dew, truth), reference, truth, shared=True)
+
+    assert _bits(evidence(dew, reference, laid)) == _bits(evidence(*ordered))
+    for name in truth:
+        assert _bits(leaf_summary(dew[name], laid[name])) == _bits(
+            leaf_summary(ordered[0][name], ordered[2][name])), name
+
+
+def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
+    """A summarized recording's evidence (`record_case`'s summary), read back as check 1 reads it
+    (`indexed_recording`'s reference), is the evidence of the same reference outputs read live
+    (`leaf_summary`), bit for bit in every field the recording keeps, its rows of float64 zero included."""
+    from reference_error import leaf_summary
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    _, live = _tiny_row(4)
+    draw, evaluate = _tiny_row_recording(live)
+
+    def truth_fn(inputs):
+        return live(inputs["x"], inputs["w"])
+
+    with jax.enable_x64(new_val=True):
+        recorded = recorder.record_case("site", draw, evaluate, truth_fn, summary=True)
+        _, reference, _ = indexed_recording(recorded, "site", int(recorded["site.seeds"]), inputs_of=draw,
+                                            truth_fn=truth_fn)
+        zero_rows = 0
+        for seed in range(len(recorded["site.input_digest"])):
+            outputs, truth = evaluate(draw(seed))
+            for name, kept in reference(np.int32(seed), draw(seed)).items():
+                read = leaf_summary(outputs[name], truth[name])
+                fields = ("mse", "worst", "zero_rows", "zero_errors", "finite", "dtype")
+                assert _bits([getattr(kept, field) for field in fields]) == _bits(
+                    [getattr(read, field) for field in fields]), (seed, name)
+                zero_rows += len(kept.zero_rows)
+    assert zero_rows
+
+
+def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
+    """A leaf recorded as each row's RMS distance from its float64 truth (`rows_summary`) reads as the leaf
+    whole does (`leaf_summary`): its worst row, the rows its truth sizes zero, their errors and own sizes,
+    its finiteness and dtype; and a leaf of no rows is exact, as `leaf_summary` reads one."""
+    from reference_error import _rows_rms, leaf_summary, rows_summary
+
+    rng = np.random.default_rng(1848)
+    truth = rng.standard_normal((6, 8))
+    truth[2] = 0.0  # a row the truth sizes zero
+    reference = (truth + rng.standard_normal((6, 8)) * 1e-6).astype(np.float32)
+    whole = leaf_summary(reference, truth)
+    read = rows_summary(_rows_rms(reference.astype(np.float64) - truth, 8), truth, finite=True,
+                        dtype="float32", mse=whole.mse)
+    for field in ("mse", "worst", "zero_rows", "zero_errors", "finite", "dtype", "zero_sizes", "worst_log"):
+        np.testing.assert_array_equal(getattr(read, field), getattr(whole, field), err_msg=field)
+    empty, exact = (rows_summary(np.zeros(0), np.zeros((0, 4)), finite=True, dtype="float32"),
+                    leaf_summary(np.zeros((0, 4), np.float32), np.zeros((0, 4))))
+    for field in ("mse", "worst", "zero_rows", "finite"):
+        np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)
+
+
+def rounding_apart(seed):
+    """A draw whose two arms round apart, as two programs under fp32 sums do (ledger 2469): a value, its
+    scale (lognormal, sigma 3, as a draw's conditioning sets it) and each arm's own rounding's size on it
+    (lognormal, sigma 0.2, each arm's own, so the draws' log RMS ratios spread about 0.28)."""
+    rng = np.random.default_rng([2469, seed])
+    return (rng.standard_normal(64).astype(np.float32), np.float32(np.exp(rng.normal(0, 3.0))),
+            np.exp(rng.normal(0, 0.2, 2)).astype(np.float32))
+
+
+def rounded_apart(arm: int, factor: float = 1.0, *, every: int = 1):
+    """`rounding_apart`'s arm `arm`: its value plus its own rounding, the draw's scale times its size times a
+    fixed pattern of its own; Dew's `factor` times further on every `every`th draw's value (by its first
+    element's bits)."""
+    @as_given
+    def run(x, scale, sizes):
+        pattern = np.random.default_rng([arm, int(np.asarray(x).view(np.uint32)[0])]).standard_normal(x.shape)
+        hit = int(np.asarray(x).view(np.uint32)[0]) % every == 0
+        return np.asarray(x, np.float64) + scale * sizes[arm] * 1e-7 * pattern * (factor if hit else 1.0)
+    return run
+
+
+def exact_value(x, scale, sizes):
+    return np.asarray(x, np.float64)
+
+
+def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or_on_a_minority_is_refused():
+    """Where two arms round apart (each draw's error the draw's scale, heavy-tailed, times each arm's own
+    rounding), the pooled ratio does not resolve within MOST_SEEDS, and a final verdict it leaves
+    inconclusive asks the draws' paired ratios (`_typical_status`, ledger 2469): an equally exact pair,
+    its log ratios spread within QUALIFYING_SPREAD, passes at the count it sizes; a Dew twice off on every
+    draw is refused by its typical draw; one ten times off on a tenth of its draws, which the typical
+    draw's ratio leaves under PARITY, is refused by the spread its fault adds."""
+    from check1_statistics import _interval, _resolves, _typical_status
+
+    reference = rounded_apart(1)
+    seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
+                      dew_fn=rounded_apart(0))
+    # The pooled ratio does not resolve even at MOST_SEEDS: its sums are ruled by their largest draws.
+    def squared(arm, seed):
+        x, scale, sizes = rounding_apart(seed)
+        return float(np.mean((arm(x, scale, sizes) - exact_value(x, scale, sizes)) ** 2))
+
+    most = [[squared(arm, seed) for seed in range(MOST_SEEDS)] for arm in (rounded_apart(0), reference)]
+    low, high = _interval(*(np.asarray(errors) for errors in most))
+    assert high > PARITY * low and seeds <= MOST_SEEDS
+    assert_as_exact(rounded_apart(0), reference, rounding_apart, "rounding apart", seeds=seeds,
+                    truth_fn=exact_value)
+    with pytest.raises(GateFailure):
+        assert_as_exact(rounded_apart(0, 2.0), reference, rounding_apart, "twice off", seeds=seeds,
+                        truth_fn=exact_value)
+    with pytest.raises(GateFailure):
+        assert_as_exact(rounded_apart(0, 10.0, every=10), reference, rounding_apart, "a tenth ten times off",
+                        seeds=seeds, truth_fn=exact_value)
+    # Dew a hundred times the reference's squared error on 13 of 256 draws, equal on the rest: the pooled
+    # ratio 2.46, unresolved, the typical draw's ratio under PARITY; the spread of its log ratios refuses it.
+    mine, theirs = np.where(np.arange(256) < 13, 100.0, 1.0), np.ones(256)
+    assert not _resolves(*_interval(mine, theirs))
+    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
+
+
+def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_typical_draw():
+    """The second stage is drawn by the pooled ratio alone, and its typical draw asked only of a final
+    verdict the pooled ratio leaves inconclusive: a leaf whose first 32 seeds straddle PARITY (Dew's squared
+    error 4 and 0.01 by turns, the reference's 1), whose typical draw would pass them, and whose further
+    seeds read 4, is over at the second stage."""
+    from reference_error import NO_ZERO_ROWS, _Draws, _staged
+
+    def drawn(start, stop):
+        count = stop - start
+        dew = np.asarray([4.0 if seed >= 32 or seed % 2 == 0 else 0.01 for seed in range(start, stop)])
+        return _Draws(["leaf"], dew[:, None], np.ones((count, 1)), np.zeros((count, 1, 2)),
+                      [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (0,))
+
+    over, unresolved, stage = _staged(drawn, 32, "over later")
+    assert stage == 2 and [finding.leaf for finding in over] == ["over laterleaf"] and not unresolved
+
+
+def stacked_examples(seed):
+    """A draw of 16 examples whose two arms round apart, each example its own heavy-tailed scale (lognormal,
+    sigma 3, shared by the arms) and each arm's own rounding's size on it (lognormal, sigma 0.4 on its log
+    RMS error): the draw's RMS error is ruled by its worst example (ledger 2469)."""
+    rng = np.random.default_rng([2469, 16, seed])
+    return (rng.standard_normal((16, 32)).astype(np.float32),
+            np.exp(rng.normal(0, 3.0, 16)).astype(np.float32),
+            np.exp(rng.normal(0, 0.4, (2, 16))).astype(np.float32))
+
+
+def stacked_arm(arm: int, factor: float = 1.0, every: int = 0):
+    """`stacked_examples`' arm `arm`: each example's value plus its own rounding, the example's scale times
+    its size times a fixed pattern of its own; Dew's `factor` times further on every `every`th example."""
+    @as_given
+    def run(x, scale, sizes):
+        rng = np.random.default_rng([arm, int(np.asarray(x).view(np.uint32)[0, 0])])
+        noise = rng.standard_normal(x.shape) * (scale * sizes[arm] * 1e-7)[:, None]
+        if every:
+            noise[::every] *= factor
+        return {"rows": np.asarray(x, np.float64) + noise}
+    return run
+
+
+def exact_rows(x, scale, sizes):
+    return {"rows": np.asarray(x, np.float64)}
+
+
+def test_a_site_that_stacks_examples_is_judged_by_its_examples_paired_ratios_and_refuses_a_fault_on_some():
+    """At a site whose leaves stack independent examples (`assert_as_exact`'s `examples`), a leaf the pooled
+    ratio cannot size, its draws ruled by their worst example, is judged by its examples' paired ratios
+    (ledger 2469): an equally exact pair passes at the count it sizes; Dew three times off on a fifth of
+    each draw's examples, which their draws' medians barely see, is refused by their tail about those
+    medians."""
+    from reference_error import _interval
+
+    reference = stacked_arm(1)
+    seeds = seeds_for(reference, stacked_examples, "stacked", truth_fn=exact_rows, dew_fn=stacked_arm(0),
+                      examples=True)
+    # The pooled ratio does not resolve at that count: its draws are ruled by their worst examples.
+    def squared(arm, seed):
+        x, scale, sizes = stacked_examples(seed)
+        return float(np.mean((arm(x, scale, sizes)["rows"] - np.asarray(x, np.float64)) ** 2))
+
+    pooled = [[squared(arm, seed) for seed in range(seeds)] for arm in (stacked_arm(0), reference)]
+    low, high = _interval(*(np.asarray(errors) for errors in pooled))
+    assert high > PARITY * low and seeds <= MOST_SEEDS
+    assert_as_exact(stacked_arm(0), reference, stacked_examples, "stacked", seeds=seeds, truth_fn=exact_rows,
+                    examples=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(stacked_arm(0, 3.0, every=5), reference, stacked_examples, "a fifth three times off",
+                        seeds=seeds, truth_fn=exact_rows, examples=True)
+
+
+def bits_apart():
+    """A product whose last bits alternate from call to call, as a GPU reduction that adds with atomics in
+    arrival order does: odd calls exact, even calls an ulp up (its calls counted in a list it closes over)."""
+    calls = []
+
+    def product(x, w):
+        calls.append(len(calls))
+        out = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+        return out if len(calls) % 2 else np.nextafter(out, np.float32(np.inf))
+    return as_given(product)
+
+
+@pytest.mark.parametrize(("backend", "deterministic", "refused"), [
+    ("gpu", False, False), ("gpu", True, True), ("cpu", False, True)])
+def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
+        monkeypatch, request, backend, deterministic, refused):
+    """Check 1 replays a site's arms on their first draw and requires their outputs again bit for bit only
+    where the run promises a repeat (`_repeat_promised`, ledger 2842): on a GPU by default, whose reductions
+    add with atomics in arrival order, an arm whose last bits move is not refused; on a GPU in deterministic
+    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`)."""
+    from reference_error import UnpairedDraw
+
+    monkeypatch.setattr(jax, "default_backend", lambda: backend)
+    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
+    label = f"bits apart on a {backend}" + (", deterministic" if deterministic else "")
+    if refused:
+        with pytest.raises(UnpairedDraw):
+            null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
+    else:
+        null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)

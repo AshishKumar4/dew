@@ -10,8 +10,8 @@ real vLLM engine: asked for the model's own argmax, the server reproduces
 Dew's greedy draw token for token, and the vLLM-only controls the client
 places in `extra_body` change what the server's sampler does. The launch:
 
-    vllm serve <export> --host 127.0.0.1 --port <port> --dtype float32 \
-        --enforce-eager --gpu-memory-utilization 0.2 --max-num-seqs 8 \
+    NVIDIA_TF32_OVERRIDE=0 vllm serve <export> --host 127.0.0.1 --port <port> \
+        --dtype float32 --enforce-eager --gpu-memory-utilization 0.2 --max-num-seqs 8 \
         --trust-request-chat-template
     OPENAI_BASE_URL=http://127.0.0.1:<port>/v1 pytest tests/test_vllm_interop.py
 
@@ -20,11 +20,16 @@ does not ship; a host whose gcc is newer than the CUDA toolkit allows also
 needs VLLM_USE_FLASHINFER_SAMPLER=0, or the engine fails to build
 FlashInfer's sampling kernels at startup.
 
-`--dtype float32` is what the logprob tolerance below is calibrated to.
+`--dtype float32` is what the logprob check below holds the server to: its
+logprobs as exact as Dew's own fp32 ones, the truth Dew's float64 forward.
+On an Ampere or Hopper GPU the server's float32 matmuls run in TF32 unless
+cuBLAS is told otherwise (`NVIDIA_TF32_OVERRIDE=0`): in TF32 its logprobs
+sat 1.2e-3 from float64 against Dew's 3.7e-6, and the greedy draw parted at
+its first token (ledger 2101).
 The export records no `torch_dtype`, so vLLM's own default serves it in
 bfloat16 through FlashAttention instead of fp32 through Triton: the argmax
 survives that on these prompts, but the reported logprobs move from within
-0.0013 of Dew's own to within 0.017, and the tolerance refuses the second.
+0.0013 of Dew's own to within 0.017, which the check refuses.
 This checkpoint's margin between first and second choice reaches down to
 0.07 in logits, so neither dtype flips a token here; a wider model or a
 longer draw is where that stops being true.
@@ -35,6 +40,7 @@ the same weights. Without `OPENAI_BASE_URL` the SDK would address
 api.openai.com, so an unset variable skips.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -42,6 +48,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from float64_terms import float64_forward
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.inference import OpenAICompletion
 from dew.interop import Pretrained
@@ -196,13 +204,13 @@ def test_the_server_reports_dews_own_logprobs(client, reference):
     """Tighter than the token identity, and it drifts first.
 
     A logprob is a number rather than a decision, so it moves before an
-    argmax flips. Both engines score in fp32 here and the kernels still
-    differ, which is worth about 0.0013; the tolerance sits between that
-    and the 0.07 logit margin this model keeps between its first and second
-    choice, where drift would start flipping tokens.
+    argmax flips. Both engines score in fp32 here and the kernels differ:
+    the server's logprobs are as exact as Dew's own fp32 ones
+    (`assert_as_exact_as_the_reference`), the truth Dew's float64 forward of
+    the same weights over the same tokens.
     """
     tokenizer, loaded = reference
-    worst = 0.0
+    served, ours, truth = [], [], []
 
     for prompt in PROMPTS:
         head = tokenizer.encode(prompt, add_special_tokens=False)
@@ -212,14 +220,17 @@ def test_the_server_reports_dews_own_logprobs(client, reference):
         reported = choice.logprobs.token_logprobs
         assert len(reported) == DRAWN, prompt
 
-        logits = np.asarray(loaded.model.apply(
-            loaded.variables, jnp.asarray([head + choice.token_ids], jnp.int32)))[0]
+        ids = jnp.asarray([head + choice.token_ids], jnp.int32)
+        logits = np.asarray(loaded.model.apply(loaded.variables, ids))[0]
+        wide = np.asarray(float64_forward(loaded.model, loaded.variables, ids)[0])[0]
         for offset, token in enumerate(choice.token_ids):
-            row = logits[len(head) + offset - 1].astype(np.float64)
-            ours = float(row[token] - np.logaddexp.reduce(row))
-            worst = max(worst, abs(ours - float(reported[offset])))
+            place = len(head) + offset - 1
+            served.append(float(reported[offset]))
+            ours.append(float(jax.nn.log_softmax(logits[place])[token]))
+            truth.append(float(wide[place, token] - np.logaddexp.reduce(wide[place])))
 
-    assert worst < 0.01, f"max |dew - vllm| logprob {worst:.5f}"
+    assert_as_exact_as_the_reference(np.asarray(served), np.asarray(ours), np.asarray(truth),
+                                     "vLLM's reported logprobs")
 
 
 def test_streaming_replays_the_completion_it_would_have_returned(client, continuation):
@@ -263,16 +274,24 @@ def test_the_server_refuses_impossible_controls_but_ignores_unknown_ones(client)
 
     `Sampling` admits top-p zero and Dew's own sampler keeps the argmax
     under it; vLLM's sampler rejects the value outright, so a policy that
-    runs natively is a 400 here. The context the export declares and the
-    server's logprob cap are refused the same way. An unrecognised control
+    runs natively is a 400 here, as is the server's logprob cap. A request
+    past the context the export declares draws nothing past it: refused, or
+    (as vLLM's later servers do) cut at the context. An unrecognised control
     is not: vLLM's request models allow extra fields, so a misspelled
     vLLM-only key in `extra_body` is dropped silently, which is why the
     client builds the controls it supports itself.
     """
     with pytest.raises(openai.BadRequestError):
         client(PROMPTS[0], DRAWN, sampling=Sampling(temperature=1.0, top_p=0.0))
-    with pytest.raises(openai.BadRequestError):
-        client(PROMPTS[0], 200, sampling=GREEDY)
+    # More new tokens than the served export's whole context: refused, or drawn no further than it.
+    context = json.loads((Path(client.model) / "config.json").read_text())["max_position_embeddings"]
+    try:
+        past = client(PROMPTS[0], context + 1, sampling=GREEDY, extra_body={"return_token_ids": True})
+    except openai.BadRequestError as refused:
+        assert refused.status_code == 400
+    else:
+        choice = past.responses[0].choices[0]
+        assert len(choice.prompt_token_ids) + len(choice.token_ids) <= context, past.finish_reasons
     with pytest.raises(openai.BadRequestError):
         client(PROMPTS[0], DRAWN, sampling=GREEDY, logprobs=1000)
 

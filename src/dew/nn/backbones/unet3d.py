@@ -17,10 +17,11 @@ from flax.typing import Dtype, PrecisionLike
 from dew.batch import merge
 from dew.nn.dense import Dense
 
-from ..attention import NormalAttention, RMSNorm
+from ..attention_blocks import NormalAttention
 from ..blocks import TimeProjection
 from ..dit import ROPE_THETA
 from ..flops import MissingFlopsCount, patch_lengths, projection_flops
+from ..norms import RMSNorm
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from .spatial import SpatialCount, SpatialShape

@@ -136,6 +136,20 @@ test('a preparation tears down and reports an offline smoke failure in the phase
 	// The snapshot of a preparation that failed its smoke is recorded, so an operator deletes it.
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['snapshot', 'failed']]);
 });
+test('a preparation whose container the account refused reports the refusal, not an unstarted container', async () => {
+	globalThis.scheduler ??= (await import('node:timers/promises')).scheduler;
+	const prepared = preparer();
+	// The preview's trials, 2026-10-30: the account's containers at its limits.
+	prepared.container.monitor = () => Promise.reject(new Error('Account resource limit exceeded'));
+	prepared.container.setInactivityTimeout = async () => { throw new Error('The container has not been started'); };
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response('# trusted pinned installer');
+	try {
+		await prepared.runner.prepare(COMMIT, { registry: 'registry', token: 'lease' });
+		await prepared.runner.alarm();
+	} finally { globalThis.fetch = originalFetch; }
+	assert.match(prepared.reports[0][1].failure, /container did not start: Error: Account resource limit exceeded/);
+});
 test('a smoke the runtime cuts off while it restores restores again, once', async () => {
 	const built = { snapshot: { id: 'snapshot' }, prepareSeconds: 1, snapshotSeconds: 1 };
 	// The smoke's alarm was reset a minute into its restore: its start is recorded, its container left running.

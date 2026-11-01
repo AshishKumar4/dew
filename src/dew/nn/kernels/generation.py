@@ -10,32 +10,45 @@ docs/performance.md, "Kernel choices per generation".
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import dataclasses
 import functools
 import inspect
 import logging
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
+    from dew.nn.precision import Numerics
+
+    from .selection import Refusal
+
 _log = logging.getLogger(__name__)
 
-ASSUMED: contextvars.ContextVar[str | None] = contextvars.ContextVar("assumed_generation", default=None)
-"""The generation `assumed` stands in for the default device's, None outside it."""
+@dataclasses.dataclass(frozen=True)
+class Assumption:
+    """The device `assumed` stands in for the default device's: its generation, and its facts (`target`)
+    where it was given them. Equal wherever the generation and every fact are (`_facts`), as JAX's trace
+    key reads it, not by a target's identity or its partial hash."""
+    generation: str
+    target: GpuTarget | None = dataclasses.field(default=None, compare=False, hash=False)
+    facts: Hashable = None
 
-ASSUMED_TARGET: contextvars.ContextVar[GpuTarget | None] = contextvars.ContextVar("assumed_target",
-                                                                                    default=None)
-"""The device facts `assumed` stands in for the default device's where it was given them, None otherwise."""
+
+def assumption() -> Assumption | None:
+    """The device `assumed` stands in for in this thread, None outside it: one value, which JAX's trace
+    and compile caches key on (`dew.cache.KERNEL_ASSUMED`) and every choice reads."""
+    from dew import cache
+
+    return cache.KERNEL_ASSUMED.value
 
 
 @contextlib.contextmanager
 def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
     process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
-    `KERNELS` choice and kernel refusal acts as on that GPU while a step traces and lowers for one on
+    kernel choice and refusal acts as on that GPU while a step traces and lowers for one on
     a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
     and costed by them alone. None assumes nothing. JAX keys its trace and compile caches on the device
@@ -43,20 +56,14 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     from dew import cache
 
     if isinstance(generation, GpuTarget):
-        target, name = generation, generation.generation
+        value = Assumption(generation.generation, generation, _facts(generation))
     else:
-        target, name = None, generation
-    token = ASSUMED.set(name)
-    facts = ASSUMED_TARGET.set(target)
-    try:
-        with cache.KERNEL_ASSUMED((name, None if target is None else _facts(target))):
-            yield
-    finally:
-        ASSUMED_TARGET.reset(facts)
-        ASSUMED.reset(token)
+        value = None if generation is None else Assumption(generation)
+    with cache.KERNEL_ASSUMED(value):
+        yield
 
 
-def _facts(value):
+def _facts(value: Hashable | Mapping | list) -> Hashable:
     """`value`'s facts as a hashable tree, equal wherever the facts are: a dataclass's fields by name, a
     mapping's entries sorted by key, a sequence's items in order."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -69,12 +76,11 @@ def _facts(value):
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_form', 'attention_mainloop', 'decode', 'delta_decode',
+CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
                       'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
                       'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
-                      'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
-"""The choices `measured_kernel` answers, and so the ones `chosen` may name and a dispatch reports
-(`route`). A choice no generation's row names runs its site's own best kernel."""
+                      'selective_scan', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
+"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
 
 
 def _named(choices: Iterable[str]) -> None:
@@ -86,8 +92,8 @@ def _named(choices: Iterable[str]) -> None:
 
 @contextlib.contextmanager
 def chosen(**kernels: str) -> Iterator[None]:
-    """Within the block, a choice named in `kernels` runs that kernel whatever the generation's row
-    measured, for an A/B of two kernels or a test of a kernel this device's row does not name.
+    """Within the block, a choice named in `kernels` runs that kernel whatever its selector would
+    take, for an A/B of two kernels or a test of a kernel the selector does not take on this device.
     Nested blocks keep the outer block's other choices and restore its choices on exit. JAX keys its
     trace and compile caches on the choices (`dew.cache.KERNEL_CHOICES`), so a function jitted
     outside the block traces again within it."""
@@ -98,8 +104,35 @@ def chosen(**kernels: str) -> Iterator[None]:
         yield
 
 
+def numerics() -> Numerics:
+    """The run's numerics in effect (`run_precision`), the defaults outside any: JAX keys its trace and
+    compile caches on them (`dew.cache.NUMERICS`), so a function jitted under one run's traces again
+    under another's."""
+    from dew import cache
+    from dew.nn.precision import Numerics
+
+    held = cache.NUMERICS.value
+    return Numerics() if held is None else held
+
+
+@contextlib.contextmanager
+def run_precision(policy: Numerics) -> Iterator[None]:
+    """Within the block, programs trace under a run's numerics' products and forms
+    (`dew.nn.precision.Numerics`): every product that states no precision at `policy.matmul`
+    (`jax.default_matmul_precision` through `configured_precision`; "default" leaves JAX's configuration
+    as it stands), and each op's accurate form where its forms are "accurate", the attention template's
+    among them, which reads them here (`numerics`, the one seam of a run's forms). The dtypes are the
+    model's and the optimizer's own fields, which the run sets from the numerics: a bf16 operand has
+    lost its bits before any product reads it, whatever its precision."""
+    from dew import cache
+    from dew.nn.precision import configured_precision
+
+    with configured_precision(policy.matmul), cache.NUMERICS(policy):
+        yield
+
+
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})
-"""The `KERNELS` values that run Dew's Pallas or Triton kernels, which lower through JAX's Pallas
+"""The kernel names that run Dew's Pallas or Triton kernels, which lower through JAX's Pallas
 Triton backend for a GPU only: what the CPU dry run lowers (`dew.training._lowering`) and the kernel
 lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
@@ -120,6 +153,7 @@ class Architecture:
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    resident_threads: int = 1536
     wgmma: bool = False
     tma: bool = False
     tmem_columns: int | None = None
@@ -142,16 +176,20 @@ class Architecture:
 # IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
 # (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
 # A family no device of which was measured takes its nearest measured family's values, said so below.
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3,
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048,
+                       load_latency=466.3,
                        l2_bytes_per_clock=35.7)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
                                 l2_bytes_per_clock=38.8)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
-_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, tma=True,
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024, load_latency=541.5,
+                       l2_bytes_per_clock=38.8)
+_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, resident_threads=2048,
+                       wgmma=True, tma=True,
                        load_latency=478.8, l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
-_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512, tma=True,
+_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, resident_threads=2048,
+                          tmem_columns=512, tma=True,
                           load_latency=478.8, l2_bytes_per_clock=54.6)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates
 # and measured values.
@@ -209,8 +247,6 @@ class GpuTarget:
     for. Empty resources remain unknown. The standard-library-only table can
     also be read by a Torch reference's environment without importing JAX.
 
-    `head_tile` is the chunked LM head's `(tokens, columns)` tile where one was
-    measured to beat the default (`dew.objectives.lm.chunked.chunked_tile`).
     `multiprocessors` is the canonical device's streaming multiprocessors, a real
     device's own where it reports them (`gpu_target`), which a launch sizes its
     programs by (`dew.nn.kernels.decode_attention`). `clock_hz` and
@@ -230,10 +266,10 @@ class GpuTarget:
     generation: str
     device_kind: str
     shared_limit: int | None = None
-    kernels: Mapping[str, str] = dataclasses.field(default_factory=dict)
-    dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict)
+    # Out of the hash (still compared), so a target keys a cache: a template's launches lowered once each
+    # (`mainloop._lowered_once`).
+    dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict, hash=False)
     aliases: tuple[str, ...] = ()
-    head_tile: tuple[int, int] | None = None
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
@@ -241,6 +277,10 @@ class GpuTarget:
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
     `dew.nn.kernels.options.compiler_options`)."""
+    triton_gemm_fusions: bool = True
+    """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
+    where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
+    (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
 
     @property
     def architecture(self) -> Architecture:
@@ -368,7 +408,7 @@ class GpuTarget:
 # (locks/cuda12.txt, cuda13.txt), so it was not measured here; its Mosaic one's backward takes no mixed
 # dtypes. Requalifying that Triton backend as a comparator is ledger 153. No tokamax implementation is
 # a row's kernel; Dew calls its own through tokamax's Op. Decode (bf16, one query,
-# A100-SXM4-40GB, 2026-10-21, ced5d3ad9, synchronized ms by dew.telemetry.benchmark.samples): Qwen3-0.6B's
+# A100-SXM4-40GB, 2026-10-21, 79d8a3abf, synchronized ms by dew.telemetry.benchmark.samples): Qwen3-0.6B's
 # 16/8 heads of 128 at 1 to 128 rows over 2048 to 131072 keys, the decode kernel 1.57x faster than
 # cuDNN in geometric mean over the 28 shapes, faster in 21, at most 1.19x the fastest arm (cuDNN
 # 2.78 ms and the decode kernel 0.42 at one row of 131072 keys; cuDNN's 7 wins at 4, 16 and 128 rows
@@ -379,27 +419,23 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
-              {'xla_triton_gemm': 'off', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined',
-               'delta_gates': 'joined'},
-              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
-              multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9),
-    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {},
+              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
+              memory_bandwidth=2039e9, triton_gemm_fusions=False),
+    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
-              {'xla_triton_gemm': 'off'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
-               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
-              multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9),
-    GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
-              {'xla_triton_gemm': 'off', 'rms_norm': 'pallas', 'swiglu': 'pallas', 'delta_gates': 'joined'}, {
+               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), multiprocessors=58,
+              clock_hz=2040e6, memory_bandwidth=300e9, triton_gemm_fusions=False),
+    GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9),
+              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -447,13 +483,13 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     generation takes the generation's canonical device. SKU queries retain
     that SKU's peaks. Unknown kinds have empty resources.
     """
-    if identifier is None and (facts := ASSUMED_TARGET.get()) is not None:
-        return facts
+    if identifier is None and (found := assumption()) is not None and found.target is not None:
+        return found.target
     if identifier is None:
         import jax
         device = jax.local_devices()[0]
         generation, kind = device_generation(), device.device_kind
-        real = device.platform == 'gpu' and ASSUMED.get() is None
+        real = device.platform == 'gpu' and assumption() is None
         if real and gpu_placed():
             _one_kind(jax.devices())
         target = gpu_target(kind)
@@ -477,7 +513,7 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
-    the kernel lab's oracle; tests/kernel_compile.py). Its devices state their compute capability, which
+    the kernel benchmark's oracle; tests/kernel_compile.py). Its devices state their compute capability, which
     Mosaic GPU lowers for (its `utils._infer_arch`; a device that states none it takes for sm90's, and an
     sm80 kernel's cp.async waits do not lower), but an sm90's, which Mosaic's default already is: stated,
     its `9.0` sends a warpgroup-MMA kernel's ptxas a lower default SM than the sm_90a its PTX targets
@@ -498,7 +534,7 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
 # rejects the BF16_BF16_F32 dot algorithm at run time ("UNIMPLEMENTED:
 # Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"),
 # cuDNN's fused attention refuses bf16 ("SDPA FP16/BF16 requires SM80"), and
-# Triton does not compile; measured on a T4 (sm75), KernelMatrix 2026-09-22.
+# Triton does not compile; measured on a T4 (sm75), 2026-09-22.
 BF16_GPU = 80
 
 
@@ -592,12 +628,11 @@ def device_generation() -> str:
     TPU v6e, and the platform's name otherwise; within `assumed`, the one it
     names. A call placed off the process's default backend (`placed_platform`),
     as a host-layout run's on a GPU host's CPU, takes its platform's name, so
-    every choice a target row measures (`measured_kernel`) follows it there.
+    every choice keyed on the target follows it there.
     """
     import jax
-    generation = ASSUMED.get()
-    if generation is not None:
-        return generation
+    if (found := assumption()) is not None:
+        return found.generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
     device = jax.local_devices()[0]
@@ -610,32 +645,14 @@ def device_generation() -> str:
     return device.platform
 
 
-def measured_kernel(choice: str, default: str, *, fastest: str | None = None) -> str:
-    """The kernel `chosen` names for `choice`, else `fastest`, the site's own measurement of a call
-    no row measured (an fp32 SiLU product), else `KERNELS` on this generation, else `default`."""
+def chosen_kernel(choice: str, default: str) -> str:
+    """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
+    without a selector (the attention template's form, a step's narrow copies)."""
     from dew import cache
 
     _named((choice,))
-    if (kernel := dict(cache.KERNEL_CHOICES.value).get(choice)) is not None:
-        return kernel
-    return fastest or gpu_target(device_generation()).kernels.get(choice, default)
+    return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
-
-@dataclasses.dataclass(frozen=True)
-class Refusal:
-    """Why the kernel a target prefers does not take a call, from the call's own facts on that
-    target (its shapes, dtypes, mask): a stable `code`, which a kernel's `SUPPORTS` keys its declared
-    limits on, and the `detail` a log names. What the host cannot run is no refusal (`Route.ran`)."""
-
-    code: str
-    detail: str
-    row: str | None = None
-    """The roadmap or ledger row that tracks lifting the limit (`dew.nn.kernels.selection.Requirement`),
-    `INHERENT` where no implementation of the kernel lifts it, None for a refusal no requirement gives
-    (an analysis's own, which its op's requirements read)."""
-
-    def __str__(self) -> str:
-        return self.detail
 
 
 INHERENT = 'inherent'
@@ -646,10 +663,11 @@ INHERENT = 'inherent'
 class Route:
     """One dispatch's decision, made from the target's facts (`device_generation`, the call's shapes
     and dtypes, the binary's architectures), never the host's placement: `kernel` is what the target
-    runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (the
-    generation's row, `chosen`, or the site's own best), `refusal` why `preferred` did not take the
+    runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (`chosen`,
+    or its selector's preference), `refusal` why `preferred` did not take the
     call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
-    `assumed` on a CPU). A route is generic exactly where `kernel != preferred`."""
+    `assumed` on a CPU), and `forced` the kernel the call named or `chosen` named, which forced the choice
+    (None where the selector chose). A route is generic exactly where `kernel != preferred`."""
 
     choice: str
     kernel: str
@@ -658,6 +676,7 @@ class Route:
     ran: str
     target: str
     site: str
+    forced: str | None = None
 
 
 class _Routes:
@@ -694,32 +713,30 @@ _logged: set[tuple[str, str, str]] = set()
 
 
 def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
-          ran: str | None = None) -> Route:
+          ran: str | None = None, forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
-    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` or the
-    generation's row names, else `kernel`; `ran` is what this host executes, `kernel` by default.
-    Every `routes` block open records it. A call off the measured kernel is the dispatch's own choice,
-    logged once a process for each kernel and refusal at INFO, naming both; one that runs the
-    preferred kernel, or a choice no row names, logs nothing."""
+    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
+    `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
+    A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
+    both and the refusal's reason; one that runs the preferred kernel logs nothing."""
     from dew import cache
 
     _named((choice,))
     generation = device_generation()
-    picked = None if preferred else dict(cache.KERNEL_CHOICES.value).get(choice)
-    measured = preferred or picked or gpu_target(generation).kernels.get(choice)
-    found = Route(choice, kernel, measured or kernel, refusal, ran or kernel, generation, _site())
+    preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
+    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
     for collected in cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
-    if measured not in (None, kernel) and (choice, kernel, detail) not in _logged:
+    if preferred != kernel and (choice, kernel, detail) not in _logged:
         _logged.add((choice, kernel, detail))
-        named = "the kernel `chosen` names" if picked else f"the kernel measured fastest on {generation}"
-        _log.info("%s runs %r, not %r, %s: %s", choice, kernel, measured, named, detail)
+        _log.info("%s runs %r, not %r, on %s: %s", choice, kernel, preferred, generation, detail)
     return found
 
 
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
-                   live_cotangents: bool = False) -> Callable:
+                   live_cotangents: bool = False, primal: Callable | None = None,
+                   nested: bool = True) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
@@ -738,11 +755,12 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
-    cotangent is never formed."""
+    cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
+    that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
+    it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
+    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
     import jax
-    import jax.numpy as jnp
-    import numpy as np
-    from jax.custom_derivatives import SymbolicZero
+    from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
     @jax.custom_jvp
     def produced(*operands):
@@ -752,7 +770,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def _(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(jnp.zeros_like, saved))
+        return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
     @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
     def pulled(saved, operands, cotangent, live):
@@ -773,23 +791,20 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     @jax.custom_jvp
     def bounded(*operands):
-        return forward(*operands)[0]
+        return forward(*operands)[0] if primal is None else primal(*operands)
 
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals)
+        output, saved = (produced if nested else forward)(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)
                 if not isinstance(direction, SymbolicZero)]
         if not live:
-            return output, jax.tree.map(jnp.zeros_like, output)
+            return output, zero_from_primal(output)
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            # An operand with no tangent space (an index, a length) takes float0's zero.
-            whole = [jnp.zeros_like(operand) if jnp.issubdtype(operand.dtype, jnp.inexact)
-                     else np.zeros(operand.shape, jax.dtypes.float0)
-                     for operand in jax.tree.leaves(operands)]
+            whole = [zero_from_primal(operand) for operand in jax.tree.leaves(operands)]
             for index, value in zip(live, moving, strict=True):
                 whole[index] = value
             return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
@@ -802,26 +817,32 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             return [pulled_back[index] for index in live]
 
         moving = [directions[index] for index in live]
-        return output, linear_map(tangent, transposed, (primals, saved), moving)
+        # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
+        # tangent, every reverse pass traced the portable math's forward mode for its type alone (a gated
+        # delta net layer's training step's trace on an H100's lowering, row 3142).
+        typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
+        return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
 
     bounded.defjvp(bounded_jvp, symbolic_zeros=True)
     return bounded
 
 
-def linear_map(apply: Callable, pullback: Callable, residuals, moving):
+def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
     or `jax.linear_transpose` transposes, and under `jax.vmap` too, where the map is one of `apply` and
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
-    derivative in `residuals` (a higher order's)."""
+    derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
+    avals like it), which `apply` is then traced for only where forward mode runs it."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
     # (`jax.eval_shape`'s) drop an explicit axis's, and reverse mode would hand the pullback its cotangent
     # unsharded (row 1759).
-    traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
-    out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
+    if out_aval is None:
+        traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
+        out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
     return _linear_primitive()(apply, pullback, in_avals, out_aval)(residuals, moving)
 
@@ -942,16 +963,16 @@ def gpu_placed() -> bool:
     assumed GPU. A step traced for an assumed GPU (`lower_for`) lowers without devices, even on a
     GPU host, so it makes none."""
     import jax
-    return ASSUMED.get() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+    return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
 def backend() -> str:
     """The platform a call's code is chosen for: `placed_platform()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
     platform acts as on that device while a step traces for it on another."""
-    generation = ASSUMED.get()
-    if generation is None:
+    if (found := assumption()) is None:
         return placed_platform()
+    generation = found.generation
     if generation.startswith('sm'):
         return 'gpu'
     if generation in TARGETS and tpu(TARGETS[generation]):

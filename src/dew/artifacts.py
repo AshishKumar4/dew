@@ -9,7 +9,8 @@ on the host as static metadata.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import dataclasses
+from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 import numpy as np
@@ -75,12 +76,31 @@ class Decisions:
     where the answer is certain and soft where annotators split, which
     questions `[N, Q]` ask a score, whose options are ordered levels, and which
     `[N, Q]` have a known answer to score."""
+
     probabilities: jax.Array
     options: jax.Array
     labels: jax.Array
     targets: jax.Array
     ordinal: jax.Array
     scored: jax.Array
+    classes: jax.Array | None = None
+    """Each option slot's class `[N, Q, K, 2]`, its question and option as a 64-bit key in two int32
+    lanes (`dew.decision.rows.class_id`), which a per-class metric reads; None where the rows carry
+    none (a served request's)."""
+
+    def unscored(self, padding: np.ndarray) -> Decisions:
+        """These decisions at their batch's shape with the questions of the `padding` rows unscored
+        (`FixedRows`): every metric of them reads its rows through `scored`."""
+        return dataclasses.replace(self, scored=np.asarray(self.scored, bool) & ~padding[:, None])
+
+
+@runtime_checkable
+class FixedRows(Protocol):
+    """An artifact whose metrics read the rows they score through a mask of its own: a validation pass
+    keeps it at its batch's shape and clears the mask on its padding rows (`unscored`), so every batch
+    of a split, a short tail among them, reads in one shape."""
+
+    def unscored(self, padding: np.ndarray) -> Self: ...
 
 
 type Artifact = DataclassInstance
@@ -89,8 +109,10 @@ per-row fields lead with the batch's rows, which a validation pass cuts to
 the real ones. Dew's own are the classes above. A package's objective may
 score into a dataclass of its own, which its metrics read by type
 (`Metric.reads`); a metric picks exactly one scoring artifact, and previews
-never satisfy metrics. A tracker shows a preview of Dew's types, so a
-package shows its own as one of them, a spike raster as an `ImageGrid`."""
+never satisfy metrics. An artifact whose metrics read the rows they score
+through a mask of its own keeps its batch's shape through a validation pass
+(`FixedRows`). A tracker shows a preview of Dew's types, so a package shows its own as one
+of them, a spike raster as an `ImageGrid`."""
 
 type Artifacts = Artifact | tuple[Artifact, ...]
 """One artifact, or several."""

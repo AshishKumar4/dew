@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from lane_environment import outside_suite
 
 import dew
 from dew.interop import load_params, save_params
@@ -376,52 +377,40 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
 # ---------------------------------------------------------------------------------
 
 
-def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None):
-    """transformers' own class for the export's model_type loads its files
-    with a clean report (`decoder_export_reference.reference_model`) and,
-    over the same ids, holds the run's own logits to tests/reference_error.py's
-    rule: in fp32 the reference, in float64 the truth. An `ordered_export`
-    holds the trained run over 52 residual orders when one draw can flake,
-    each order of the run's canonical tree exported and, packed as the run's
-    task holds it, run by Dew; every reference order in float64 must compute
-    the identity's truth.
-    """
-    from reference_error import (
-        ORDERS,
-        assert_as_exact_as_the_reference,
-        assert_as_exact_over_orders,
-        assert_computes_the_oracle,
-        distance,
-    )
-    from residual_orders import orders, permuted, residual_width
+RUN_EXPORT_SEEDS = 8
+"""A run's export's declared draws of ids against transformers' fp32 read of it (check 1), sized by
+`seeds_for` paired with the run's logits on the CPU."""
 
-    from dew.inference.projections import inference_projections
-    from dew.interop import Pretrained
-    from tools.decoder_export_reference import Case, reference_logits
+
+def assert_transformers_reads_the_run(export, task, ids, *, seeds: int = RUN_EXPORT_SEEDS):
+    """transformers' own class for the export's model_type loads its files
+    with a clean report (`decoder_export_reference.reference_model`) and holds
+    the run's own logits, its projections packed as the run's task holds
+    them, on par with its fp32 forward from its float64 one over drawn ids
+    of the shape of `ids` (check 1), at the run's declared `seeds`.
+    """
+    from interop_support import reference_read
+    from reference_error import assert_as_exact
+
+    from tools.decoder_export_reference import Case
 
     case = Case("run export", str(export))
-    truth = reference_logits(case, export, ids, wide=True)
-    if ordered_export is None:
-        ours = np.asarray(task.model.apply(task.variables, jnp.asarray(ids, jnp.int32)))
-        assert_as_exact_as_the_reference(ours, reference_logits(case, export, ids), truth,
-                                         "run export logits")
-        return
-    source = Pretrained.load(export, dtype="float32", attention_impl="reference")
-    forward = jax.jit(lambda variables: task.model.apply(variables, jnp.asarray(ids, jnp.int32)))
-    mine, theirs = [], []
-    # Two attention projections, a key reduction, two MLP projections and
-    # the norms/residuals per layer, then the output head, bound the chain.
-    model = source.model
-    roundings = model.num_layers * (4 * model.emb_features + model.mlp_features + ids.shape[1] + 16)
-    roundings += 2 * model.emb_features
-    for order in orders(residual_width(source.variables), ORDERS, seed=0):
-        variables = permuted(source.variables, order)
-        source.save(ordered_export, variables=variables)
-        assert_computes_the_oracle(reference_logits(case, ordered_export, ids, wide=True), truth,
-                                   "run export logits in order", roundings=roundings)
-        mine.append(distance(forward(inference_projections(task.model, variables)), truth))
-        theirs.append(distance(reference_logits(case, ordered_export, ids), truth))
-    assert_as_exact_over_orders(mine, theirs, "run export logits")
+    vocabulary = json.loads((Path(export) / "config.json").read_text())["vocab_size"]
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, vocabulary, np.shape(ids)).astype(np.int32),)
+
+    def read(wide):
+        return reference_read(case, export, wide=wide)
+
+    assert_as_exact(lambda drawn: task.model.apply(task.variables, drawn), read(wide=False), draw,
+                    "run export logits", seeds=seeds, truth_fn=read(wide=True))
+
+
+TRAINED_EXPORT_SEEDS = 8
+"""The trained run's export's declared draws of ids against transformers' read of it (check 1), sized by
+`seeds_for` paired with the run's packed logits on the CPU: one draw's ratio could flake, which the
+pooled seeds resolve."""
 
 
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
@@ -454,7 +443,7 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
         np.asarray(reloaded.model.apply(inference_projections(reloaded.model, reloaded.variables), ids)),
         np.asarray(task.model.apply(task.variables, ids)))
     assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]),
-                                      ordered_export=tmp_path / "orders")
+                                      seeds=TRAINED_EXPORT_SEEDS)
 
 
 FRESH_TRAINING = """
@@ -495,8 +484,7 @@ def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
 
 
     root = Path(__file__).resolve().parents[1]
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    env = {**outside_suite(os.environ), "PYTHONPATH": str(root / "src")}
     program = FRESH_TRAINING.format(module="lm", objective="LMObjective")
     trained = subprocess.run([sys.executable, "-c", program, str(tmp_path / "run")],
                              capture_output=True, text=True, env=env, timeout=600)

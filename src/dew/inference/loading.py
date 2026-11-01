@@ -13,22 +13,19 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
 
-import jax
-import jax.numpy as jnp
-import numpy as np
 from etils import epath
 from jax.typing import DTypeLike
 
 from dew.batch import Variables
 from dew.cache import persist_compilations
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
-from dew.data.text import Tokenizer
+from dew.config import SourceOptions
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
-from dew.nn.inputs import Media, ModelInputs, pad_token_rows
+from dew.nn.precision import Numerics
 from dew.objectives.base import SavedTask
 from dew.registry import dtype_name
 
@@ -49,6 +46,8 @@ def pipeline(
     step: int | str | None = None,
     revision: str | None = None,
     trust: Sequence[str] = (),
+    options: SourceOptions | None = None,
+    precision: Numerics | str | None = None,
 ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
     """Load the inference task for `source`, with its weights placed once.
 
@@ -69,7 +68,14 @@ def pipeline(
     selects a run's checkpoint and `revision` pins a Hub source; passing
     `revision` for a run directory or `step` for a source raises
     `ValueError`. `trust` names the packages outside Dew a run's record may
-    import, as `trust_remote_code` does in transformers.
+    import, as `trust_remote_code` does in transformers. `options` selects
+    what a source builds, as a run's `--source` options do (`SourceOptions`:
+    a wrapper's language model alone, the prediction depths kept, each layer
+    kind's attention); a run's record selects its own, so passing them for a
+    run directory raises `ValueError`. `precision` gives a source's task its
+    numerics (`Pretrained.load(precision=...)`: its dtypes, and the precision and
+    forms its calls trace under); a run's record names its own, so passing it for
+    a run directory raises `ValueError`.
 
     Loading a task also points XLA at the on-disk executable cache, unless a
     cache directory is already set, so a restarted process reuses what it
@@ -98,20 +104,30 @@ def pipeline(
     if root.is_dir() and (root / RUN_FILE).is_file():
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
+        if options is not None and options != SourceOptions():
+            raise ValueError("source options select what a source builds; a run's record selects its own "
+                             "model")
+        if precision is not None:
+            raise ValueError("precision gives a source's task its numerics; a run's record names its own")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
                          param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
                          trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
+    if precision is not None and (dtype is not None or param_dtype is not None):
+        raise ValueError("precision sets a source's dtype and param_dtype; pass the numerics or the dtypes, "
+                         "not both")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
-                        revision=revision)
+                        revision=revision, options=SourceOptions() if options is None else options,
+                        precision=precision)
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
               step: int | str | None, trust: Sequence[str]) -> SavedTask:
     """The task the run's recorded objective declares (`Objective.saved_task`), built from the checkpoint
-    pinned here (`SavedTask.from_saved`), which nothing pins again."""
+    pinned here (`SavedRun.pinned`, its task's default step where none is asked), which nothing pins
+    again."""
     from dew.inference.tasks import SavedRun
 
     run = SavedRun.pinned(str(root), step, trust)
@@ -119,22 +135,30 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
     if task is None:
         raise TypeError(f"a run of {run.objective.__name__} loads as no task: its class declares no "
                         "`saved_task`")
-    return task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
+    loaded = task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
+    # A Dew task traces in the attention form its run trained in (`SavedRun.formed`).
+    return run.formed(loaded)
 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> SavedTask:
+                 revision: str | None, options: SourceOptions, precision: Numerics | str | None) -> SavedTask:
     from dew.distributed.placement import MeshSpec as DefaultMesh
     from dew.inference.projections import packed_owned
     from dew.interop import Pretrained, PretrainedPipeline
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+    # What the source builds, as a run's source loads it (`SourceOptions.keywords`), in the numerics
+    # asked for, which set its dtypes.
+    loaded = (Pretrained.load(source, revision=revision, mesh=placement, layout=layout, precision=precision,
+                              **options.keywords())
+              if precision is not None else
+              Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
+                              **options.keywords())
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
-                              layout=layout))
+                              layout=layout, **options.keywords()))
     if not isinstance(loaded, PretrainedPipeline):
         # The task owns the weights it loaded: their projections pack once, where they were placed.
         # (Public bundle.pipeline borrows weights; packing here may relinquish the unpacked device
@@ -160,41 +184,3 @@ def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | N
     shardings = chosen_layout.shardings(placed_on, variables)
     chosen_layout.check(variables, shardings, placed_on)
     return stream(variables, shardings)
-
-
-@dataclass(frozen=True)
-class RunProcessor:
-    """Adapts a run's tokenizer to the `Processor` interface a task uses.
-
-    Calling it encodes each text prompt and left-pads the rows into
-    `ModelInputs`; a text run takes no images or audio. `decode` returns one
-    string per token row.
-    """
-
-    tokenizer: Tokenizer
-
-    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
-                 audio: Media | None = None) -> ModelInputs:
-        if images is not None or audio is not None:
-            raise ValueError("a text run takes no images or audio")
-        rows = [text] if isinstance(text, str) else list(text)
-        ids = [self.tokenizer.encode(row) for row in rows]
-        tokens, fields = pad_token_rows(ids)
-        return ModelInputs(jnp.asarray(tokens), jax.tree.map(jnp.asarray, fields))
-
-    def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
-        return [self.tokenizer.decode(row) for row in np.asarray(tokens)]
-
-    def encode(self, text: str, *, specials: bool) -> list[int]:
-        """`text`'s ids from the run's tokenizer, with the special tokens it adds around a sequence
-        where `specials`, and none otherwise."""
-        return self.tokenizer.encode(text, add_special_tokens=specials)
-
-    def spelling(self, ids: Sequence[int]) -> str:
-        """The text the run's tokenizer decodes `ids` to, its special tokens spelled out."""
-        return self.tokenizer.decode(list(ids))
-
-    @property
-    def bos_id(self) -> int | None:
-        """The id the run's tokenizer starts a sequence with, or None."""
-        return self.tokenizer.bos_id

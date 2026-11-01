@@ -186,6 +186,19 @@ def indexed_loader(records: int, batch: int = BATCH):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class Indexed:
+    """`records` records that say which they are, in the field the objective reads."""
+
+    records: int
+
+    def __len__(self):
+        return self.records
+
+    def __getitem__(self, index):
+        return {"image": np.full((RES, RES, 3), index, np.uint8)}
+
+
 def elastic_loader(records: int, workers: int):
     """The same records compiled to a global order, whose position is a global count.
 
@@ -198,16 +211,7 @@ def elastic_loader(records: int, workers: int):
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
-    class Indexed:
-        """Records that say which they are, in the field the objective reads."""
-
-        def __len__(self):
-            return records
-
-        def __getitem__(self, index):
-            return {"image": np.full((RES, RES, 3), index, np.uint8)}
-
-    return compile(Pipeline(Memory(Indexed())).shuffle(0).repeat().batch(BATCH), seed=0,
+    return compile(Pipeline(Memory(Indexed(records))).shuffle(0).repeat().batch(BATCH), seed=0,
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
 
 
@@ -249,6 +253,29 @@ def online_loader(records: int, workers: int, address: str, *, shared: bool):
 
     return compile(online_pipeline(records, address, shared=shared).batch(BATCH), seed=0,
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
+
+
+@dataclasses.dataclass(frozen=True)
+class Unthirded:
+    """Whether a record's image is not every third one's, so a stream filtered by it drops records."""
+
+    identity = "unthirded@1"
+
+    def __call__(self, row) -> bool:
+        return int(row["image"][0, 0, 0]) % 3 != 0
+
+
+def replicated_loader(records: int, workers: int):
+    """`elastic_loader`'s records filtered, so which rows there are only the whole order states, read
+    elastically (`Pipeline.elastic`): every process reads that order and keeps its share of each
+    batch. A fetch would read it differently on each, which an elastic read over several refuses."""
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    chain = Pipeline(Memory(Indexed(records))).shuffle(0).repeat().filter(Unthirded()).batch(BATCH).elastic()
+    return compile(chain, seed=0, loading=Loading(workers=workers, threads=2, read_buffer=8,
+                                                  worker_buffer=2)).train
 
 
 def batch_records(batch) -> list[int]:
@@ -687,7 +714,9 @@ def mode_fit(args) -> dict:
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
-    if args.online:
+    if args.replicated:
+        open_train = replicated_loader(args.records, args.workers)
+    elif args.online:
         open_train = online_loader(args.records, args.workers, args.online, shared=args.shared)
     elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
@@ -1301,6 +1330,42 @@ def mode_evaluation_replicas(args) -> dict:
     return {"measured": measured, "no_consumer": unconsumed}
 
 
+def mode_evaluation_kept(args) -> dict:
+    """A pass of no metrics whose decisions only process 0 is asked to keep (`scored_to`): every rank
+    scores the batches root writes, so the pool meets at each collective and the pass ends."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    from dew.artifacts import Representations
+    from dew.data.dataset import Loader
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Trainer
+
+    class Kept(Objective):
+        """A loss of the rows' distance from a centre, scoring each batch's rows as artifacts."""
+
+        def fresh_variables(self, key, held):
+            return {"params": {"centre": jnp.zeros(())}}
+
+        def loss(self, variables, batch, step):
+            return self.row_mean(jnp.abs(batch["x"] - variables["params"]["centre"]), batch), Aux({})
+
+        def evaluate(self, params, batch, step):
+            return Representations(features=batch["x"], labels=batch["x"][:, 0])
+
+    trainer = Trainer(Kept(), optax.sgd(.01), key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    batch = {"x": np.arange(4, dtype=np.float32)[:, None]}
+    data = Loader(train=lambda partition: iter([batch]), val=lambda partition: iter([batch, batch]),
+                  records=8, batch=4)
+    kept = Path(args.run_dir) / "kept"
+    result = Evaluation.run(trainer.objective, state.variables, data.val, key=state.key, loss=True,
+                            scored_to=kept if jax.process_index() == 0 else None, mesh=trainer.device_mesh)
+    written = sorted(path.name for path in kept.iterdir()) if kept.is_dir() else []
+    return {"scores": result.scalars, "written": written}
+
+
 def mode_evaluation_clocks(args) -> dict:
     """Each rank evaluates the text-to-image diffusion objective's validation
     loss from its own clocks, rank 1's ahead of rank 0's: the loss draws its
@@ -1881,6 +1946,7 @@ def mode_mixed_validity(args) -> dict:
     """
     import jax
 
+    from dew.batch import token_validity
     from dew.nn.inputs import agreed_validity
     from dew.sampling import Sampling, generate
 
@@ -1902,7 +1968,7 @@ def mode_mixed_validity(args) -> dict:
         "local_fields": sorted(local.token_fields),
         "agreed_fields": sorted(agreed.token_fields),
         "agreed_all_true": (None if not agreed.token_fields else
-                            bool(np.all(np.asarray(agreed.token_fields["attention_mask"])))),
+                            bool(np.all(np.asarray(token_validity(agreed.token_fields))))),
         "placed_fields": trained["placed_fields"],
         "tokens": np.asarray(drawn.tokens).tolist(),
         "raw_log_probs": np.asarray(drawn.raw_log_probs, np.float64).tolist(),
@@ -2234,17 +2300,16 @@ def mode_step_fits(args) -> dict:
 
 
 def mode_whole_validation(args) -> dict:
-    """The validation passes of the evaluated objectives in `--part` i/n (the
-    ith, i + nth, ... of them), and in part 0 `Perplexity`'s, on this pool, as
-    `tests/test_whole_validation.py` runs them on one process."""
+    """The validation passes of the evaluated objectives in `--part` i (`POOLED`'s ith), and in part 0
+    `Perplexity`'s, on this pool, as `tests/test_whole_validation.py` runs them on one process."""
     import jax
-    from objective_cases import corpus_windows
-    from test_whole_validation import EVALUATED, evaluated, perplexity
+    from objective_data import corpus_windows
+    from test_whole_validation import POOLED, evaluated, perplexity
 
-    index, parts = (int(value) for value in args.part.split("/"))
+    index = int(args.part)
     root = Path(args.run_dir) / f"process{jax.process_index()}"
     windows = corpus_windows(root / "corpus")
-    passes = {name: evaluated(name, windows, root / name) for name in EVALUATED[index::parts]}
+    passes = {name: evaluated(name, windows, root / name) for name in POOLED[index]}
     if index:
         return {"passes": passes}
     return {"passes": passes, "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
@@ -2364,6 +2429,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
+         "evaluation_kept": mode_evaluation_kept,
          "evaluation_clocks": mode_evaluation_clocks,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
          "fp8_sites": mode_fp8_sites}
@@ -2394,7 +2460,7 @@ def parse_args(argv=None):
     parser.add_argument("--tokens", help="the committed token store the run trains on")
     parser.add_argument("--held-tokens", help="the committed token store it validates on")
     parser.add_argument("--seq-len", type=int, default=8)
-    parser.add_argument("--part", default="0/1", help="i/n: whole_validation's share of the objectives")
+    parser.add_argument("--part", default="0", help="i: whole_validation's part of the objectives (`POOLED`)")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
@@ -2404,6 +2470,8 @@ def parse_args(argv=None):
                                          "(`online_loader`)")
     parser.add_argument("--refusal", action="store_true",
                         help="fit reports the ValueError it is refused with instead of raising it")
+    parser.add_argument("--replicated", action="store_true",
+                        help="the records filtered and read elastically (`replicated_loader`)")
     parser.add_argument("--shared", action="store_true",
                         help="each process fetches its own share of the shuffled catalog (`online_pipeline`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")

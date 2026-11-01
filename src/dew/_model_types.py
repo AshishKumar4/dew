@@ -4,7 +4,10 @@ Vision translation reads these without importing the interop package, whose
 public entry point imports the vision classes itself.
 """
 
-QWEN35_TYPES = ('qwen3_5', 'qwen3_5_moe')
+QWEN35_TYPES = ('qwen3_5', 'qwen3_5_moe', 'qwen4_exp')
+"""The wrappers of Qwen 3.5's kind: its tower, merger, packed media, M-RoPE and root prediction layer.
+Qwen4-Exp's are Qwen 3.5's, class for class (modeling_qwen4_exp.py:1660-1964), its processor
+Qwen3VLProcessor."""
 GEMMA4_TYPES = ('gemma4', 'gemma4_unified')
 QWEN35_TEXT_TYPES = tuple(f'{name}_text' for name in QWEN35_TYPES)
 _QWEN35_VISION_TYPES = (*QWEN35_TYPES, *(f'{name}_vision' for name in QWEN35_TYPES))
@@ -24,3 +27,7 @@ attention_output_norm), its pre_feedforward_layernorm is the MLP's pre-norm
 (the block's post_attention_layernorm), and its post_feedforward_layernorm
 normalizes the MLP output (mlp_output_norm). Gemma's decoders and Gemma 4's
 vision tower share the layout."""
+
+LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
+"""The collection a decoder block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`):
+Google's release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""

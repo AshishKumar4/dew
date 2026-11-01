@@ -18,16 +18,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER
+from lm_support import token_batch_of
+from model_support import TINY_DECODER, prediction_logits
 from reference_error import assert_as_exact
 from test_lm_objective import assert_as_exact_over_instances, written_cross_entropy
-from token_support import token_batch_of
 
-from dew.batch import coordinates
+from dew.batch import TEXT_KEY, coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 
 VOCAB = 37
@@ -69,22 +69,26 @@ def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
             method=CausalTransformer.mtp_step, decode=True, mutable=['cache'])
         return logits, carried
 
-    def first_depth(model):
+    def first_depth(model, width=None):
         def logits(variables, ids):
             hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-            return model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0][:, :1]
+            # The depth over the trunk's whole states, or the first `width` of them and their tokens.
+            depths = model.apply(variables, hidden[:, :width], ids[:, :width],
+                                 method=CausalTransformer.mtp_logits)
+            return depths[0][:, :1]
         return logits
 
     assert jnp.asarray(decoded(variables, ids)[1]).shape == (ids.shape[0], 1, model.emb_features)
-    # The decode step's first-depth logits on par with the full depth's at its first position, the
-    # whole sequence's forward at its own shape (check 1 over drawn models and tokens).
+    # The decode step's first-depth logits on par with the depth's over the step's own operands, the
+    # trunk's first state and its next token (ledger 1543: the reference at the shapes the step computes),
+    # from the full depth's in float64 (check 1 over drawn models and tokens).
     init = jax.jit(model.init)
 
     def draw(seed):
         ids = token_batch(batch=2, seed=seed)[TEXT_KEY]
         return init(jax.random.key(seed), ids), ids
 
-    assert_as_exact(lambda variables, ids: decoded(variables, ids)[0], first_depth(model), draw,
+    assert_as_exact(lambda variables, ids: decoded(variables, ids)[0], first_depth(model, 2), draw,
                     "the decode step's depth logits", seeds=DECODE_SEEDS,
                     truth_fn=first_depth(model.clone(dtype=jnp.float64)))
 
@@ -100,8 +104,7 @@ def test_a_depth_reads_the_token_after_its_position():
     changed = ids.at[0, -1].set((ids[0, -1] + 1) % VOCAB)
 
     def depth_logits(tokens):
-        hidden = model.apply(params, tokens, method=CausalTransformer.hidden_states)
-        return model.apply(params, hidden, tokens, method=CausalTransformer.mtp_logits)[0]
+        return prediction_logits(model, params, tokens)
 
     before, after = depth_logits(ids), depth_logits(changed)
     assert jnp.array_equal(before[:, :-1], after[:, :-1])
@@ -248,6 +251,26 @@ def packed_row():
     return jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(positions)
 
 
+def test_the_depths_read_a_packed_rows_layout_as_its_coordinates_alone():
+    """The prediction depths (`mtp_logits`) read the rows' layout as `Coordinates` alone (ledger 1122):
+    a request's flat fields laid out once by its `ModelInputs` (`kwargs`) give the same logits bit for
+    bit as the coordinates built from them, and flat fields handed to the depths are refused."""
+    model = tiny(num_nextn_predict_layers=2)
+    ids, segments, positions = packed_row()
+    variables = model.init(jax.random.key(0), ids)
+    hidden = jax.random.normal(jax.random.key(1), (*ids.shape, model.emb_features))
+    laid = coordinates(segments=segments, positions=positions)
+    flat = ModelInputs(jnp.asarray(ids), {"segment_ids": jnp.asarray(segments),
+                                          "positions": jnp.asarray(positions)})
+    by_fields = model.apply(variables, hidden, ids, **flat.kwargs(), method=CausalTransformer.mtp_logits)
+    by_coordinates = model.apply(variables, hidden, ids, coordinates=laid,
+                                 method=CausalTransformer.mtp_logits)
+    for ours, reference in zip(by_coordinates, by_fields, strict=True):
+        np.testing.assert_array_equal(ours, reference)
+    with pytest.raises(TypeError):
+        model.apply(variables, hidden, ids, segment_ids=segments, method=CausalTransformer.mtp_logits)
+
+
 @pytest.mark.parametrize("depths", [1, 2])
 def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     """Coordinates may ride the `ModelInputs` instead of beside the batch's
@@ -267,7 +290,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
     options = {"train": True, "depths": True, "rngs": {"dropout": step_at().key}}
     supplied = objective.token_scores(params, carried[TEXT_KEY], **options)
-    explicit = objective.token_scores(params, ids, segment_ids=segments, positions=positions, **options)
+    laid = coordinates(segments=segments, positions=positions)
+    explicit = objective.token_scores(params, ids, coordinates=laid, **options)
     for ours, reference in zip((supplied.losses, supplied.weights, *supplied.depths),
                               (explicit.losses, explicit.weights, *explicit.depths), strict=True):
         for left, right in zip(jax.tree.leaves(ours), jax.tree.leaves(reference), strict=True):

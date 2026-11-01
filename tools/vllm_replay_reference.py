@@ -96,7 +96,7 @@ def references(record: dict) -> None:
 def engine_as_exact(record: dict) -> None:
     """The record's vLLM bf16 behavior log-probabilities as close to the float64 truth as transformers'
     bf16 run on the record's routing, by tests/reference_error.py's rule."""
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     def joined(read):
         return np.concatenate([read(call) for call in record["calls"]])

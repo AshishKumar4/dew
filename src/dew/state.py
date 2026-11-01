@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import optax
 from flax import struct
 from flax.training.dynamic_scale import DynamicScale
+from jax.typing import DTypeLike
 
 from dew.batch import FROZEN, Batch, Variables, merge
+from dew.optim import parameter_name
+
+if TYPE_CHECKING:
+    from dew.objectives.base import Objective
 
 __all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState"]
 
@@ -67,6 +74,26 @@ def kept_window(held: Accumulation | None, pending: Accumulation, filled: int | 
 
 
 @struct.dataclass
+class Replicas:
+    """DiLoCo's inner copies (`dew.training.diloco`), each replica group's own state stacked on a first
+    axis that the mesh's diloco axis splits: its clocks of accepted microbatches and committed updates,
+    its variables, optimizer state, EMA, loss scale, pooling window and held tokens, each as a
+    `TrainState` field of one run holds them (`REPLICA_FIELDS`)."""
+    microstep: jax.Array
+    updates: jax.Array
+    variables: Variables
+    opt_state: optax.OptState
+    ema: Variables | None
+    scale: DynamicScale | None
+    accumulation: Accumulation | None
+    deferred: jax.Array | None
+
+
+REPLICA_FIELDS = tuple(field.name for field in dataclasses.fields(Replicas))
+"""The `TrainState` fields each DiLoCo replica holds its own of (`Replicas`)."""
+
+
+@struct.dataclass
 class TrainState:
     """Holds everything a run must checkpoint to resume where it stopped.
 
@@ -93,6 +120,21 @@ class TrainState:
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
+    consumed: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True})
+    """The source examples the run's dispatched batches consumed, int32, in a run bounded in examples
+    (`dew.batch.EXAMPLES_CONSUMED`): each step adds what its microbatch's real rows were the last rows of,
+    whether or not the update it joins commits, so the run's schedules and cadences read its progress
+    exactly, the same on every process; None in a run counted otherwise, which a checkpoint that holds
+    none restores (`OPTIONAL`)."""
+    deferred: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True})
+    """The real tokens of the calls whose updates the optimizer holds back
+    (`dew.held_updates.update_applied`), two uint32 words (`dew.training.model_flops._TokenCount`),
+    committed with the update that applies them; None for an optimizer that applies every update, which
+    a checkpoint that holds none restores."""
+    inner: Replicas | None = dataclasses.field(default=None, metadata={"optional": True})
+    """DiLoCo's replicas' inner state (`dew.training.diloco`), where the variables, the EMA and the
+    optimizer state above are the outer model's and its outer optimizer's; None in a run of one copy,
+    which a checkpoint that holds none restores."""
     compute: Variables | None = struct.field(default=None,
                                              metadata={'checkpointed': False, 'variables': True})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies
@@ -114,11 +156,37 @@ class TrainState:
                 "read state.variables")
         return merge(self.variables, self.ema)
 
+    @property
+    def window(self) -> Accumulation | None:
+        """The pooling window a step reads: the run's own, or under DiLoCo its groups', stacked
+        (`Replicas.accumulation`)."""
+        return self.accumulation if self.inner is None else self.inner.accumulation
+
+    @property
+    def pending_tokens(self) -> jax.Array | None:
+        """The real tokens an update's open window holds (`Accumulation.tokens`, two words), which a run's
+        clocks count pending (`TokenClock`): its own window's, or under DiLoCo the first group's, each group
+        counting the whole batch's tokens as the run commits them; None for no window or no count."""
+        window = self.window
+        if window is None or window.tokens is None:
+            return None
+        return window.tokens if self.inner is None else window.tokens[0]
+
+    def with_window(self, window: Accumulation | None) -> TrainState:
+        """This state with `window` as the window its step reads (`window`)."""
+        if self.inner is None:
+            return dataclasses.replace(self, accumulation=window)
+        return dataclasses.replace(self, inner=dataclasses.replace(self.inner, accumulation=window))
+
 
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
 """The train-state fields a checkpoint holds, by their names; a field its
 declaration marks `checkpointed=False` is rebuilt on resume."""
+
+OPTIONAL = tuple(field.name for field in dataclasses.fields(TrainState) if field.metadata.get('optional'))
+"""The checkpointed train-state fields a run may hold none of, as a run on another clock holds no
+examples consumed: a checkpoint that holds none restores None (`dew.checkpoints`), whichever Dew wrote it."""
 
 MODEL_STATE = ("step", "microstep", "updates", "variables", "ema")
 """The train-state fields that say which model a step holds, its counters, variables and EMA:
@@ -129,6 +197,25 @@ VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields that each hold a variables tree, keyed by collection (`params`,
 `FROZEN`, ...), as their declarations mark them; the optimizer's state mirrors the trained
 parameters' paths instead."""
+
+
+def drawn_in[LossT, EffectsT](variables: Variables, dtype: DTypeLike | None,
+                               objective: Objective[LossT, EffectsT]) -> Variables:
+    """`variables` with each floating parameter the run draws fresh stored in `dtype`, as Flax's
+    `param_dtype` would draw it: every leaf of `params` its objective holds no loaded tree for, and
+    each module drawn beside a loaded base (`Objective.fresh_modules`). What the base loaded stays as its
+    source stored it (`dew.config.RunConfig.source_keywords`), and an adapter's factors as they are
+    stored (`dew.lora.FACTOR_DTYPE`). None leaves every leaf as drawn."""
+    if dtype is None:
+        return variables
+    held = objective.held_variables() or {}
+    kept = {path for path, _ in jax.tree_util.tree_leaves_with_path(held.get("params", {}))}
+    fresh = tuple(f"{module}/" for module in objective.fresh_modules())
+
+    def stored(path, leaf):
+        drawn = path not in kept or f"{parameter_name(path)}/".startswith(fresh)
+        return leaf.astype(dtype) if drawn and jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+    return {**variables, "params": jax.tree_util.tree_map_with_path(stored, variables["params"])}
 
 
 def apart[State: TrainState](state: State) -> tuple[State, Variables | None]:

@@ -14,14 +14,16 @@ from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
+from dew.checkpoints import RUN_FILE
 from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
-from dew.training import Checkpoints, Layout, MeshSpec, Wandb
+from dew.training import Checkpoints, Layout, LocalTracker, MeshSpec, Wandb
 
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
@@ -327,6 +329,24 @@ def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
     assert Checkpoints(str(tmp_path / "no-final")).latest is None
 
 
+def test_a_run_that_must_start_afresh_refuses_a_directory_that_holds_one_before_writing_its_record(tmp_path):
+    """`trainer.resume="never"` trains a fresh run directory and refuses one that holds a checkpoint, on
+    every rank, before the run's record is written over that run's; `resume="require"` refuses a
+    directory that holds none to continue, so a job that must continue never trains from scratch."""
+    def run(resume, steps: int = 1) -> RunConfig:
+        return RunConfig(trainer=TrainerConfig(steps=steps, resume=resume, checkpoint_dir=str(tmp_path),
+                                               eval_every=None, checkpoint_every=None))
+
+    data = Loader(lambda partition: batches(), None, None, 8)
+    with pytest.raises(ValueError):
+        run("require").train(Regression(), data, name="kept")
+    assert int(run("never").train(Regression(), data, name="kept").step) == 1
+    record = (tmp_path / "kept" / RUN_FILE).read_bytes()
+    with pytest.raises(ValueError):
+        run("never", steps=2).train(Regression(), data, name="kept")
+    assert (tmp_path / "kept" / RUN_FILE).read_bytes() == record
+
+
 def test_publishing_requires_a_final_checkpoint_policy():
     with pytest.raises(ValueError):
         TrainerConfig(publish=True, wandb=Wandb(project="test"), checkpoint_final=False)
@@ -343,10 +363,9 @@ def test_train_scores_every_named_validation_split(tmp_path):
               "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
     run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="splits",
               validation=splits)
-    rows = [json.loads(line) for line in
-            (tmp_path / "runs" / "splits" / "tracking" / "scalars.jsonl").read_text().splitlines()]
-    val, test = ({row["step"]: row["scalars"][f"{split}/loss"]
-                  for row in rows if f"{split}/loss" in row["scalars"]} for split in ("val", "test"))
+    reports = LocalTracker(tmp_path / "runs" / "splits" / "tracking").scalars()
+    val, test = ({step: values[f"{split}/loss"] for step, values in reports if f"{split}/loss" in values}
+                 for split in ("val", "test"))
     assert sorted(val) == sorted(test) == [1, 2]
     assert all(test[step] > val[step] for step in val), "the shifted test targets score a higher loss"
 
@@ -363,7 +382,8 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     trace = tmp_path / "trace"
     config = TrainerConfig(
         name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, accumulation=2,
-        dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
+        precision=Numerics(Dtypes(compute="float16")), mesh=MeshSpec(fsdp=2),
+        layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
     state = RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
@@ -373,6 +393,27 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     assert state.scale is not None
     assert state.accumulation is not None
     assert any(path.is_file() for path in trace.rglob("*"))
+
+
+def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
+    """A run saved while its profile window held its capture's options as its own fields
+    (`host_tracer_level`, `python_tracer_level`, `activity_cap`) loads with them its capture's
+    (`ProfileWindow.capture`, row 2932), so it captures as it did."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training import ProfileWindow
+
+    capture = CaptureOptions(host_tracer_level=1, python_tracer_level=1, activity_cap=7)
+    window = ProfileWindow(str(tmp_path / "trace"), 3, capture=capture)
+    path = tmp_path / "run" / "run.json"
+    assert RunConfig(trainer=TrainerConfig(profile=window)).save(str(tmp_path / "run")) == str(path)
+    record = json.loads(path.read_text())
+    # A field that declares its class exactly is the record of its fields; a union's is a class record.
+    trainer = record["fields"]["trainer"]
+    written = trainer.get("fields", trainer)["profile"]
+    saved = written.get("fields", written)
+    saved.update(saved.pop("capture"))
+    path.write_text(json.dumps(record))
+    assert RunConfig.load(str(path)).trainer.profile == window
 
 
 class _Bucket:
@@ -570,7 +611,7 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
     from dew.config.jepa import JepaRunConfig
     from dew.config.lm import LMRunConfig
     from dew.decision.config import DecisionRunConfig
-    from dew.decision.metrics import AURC, ECE, Accuracy
+    from dew.decision.metrics import AURC, ECE, Accuracy, MacroF1, ScoredQuestions
     from dew.decision.scoring import Brier, LogLoss
     from dew.objectives.jepa.probes import KnnProbe, LinearProbe
     from dew.objectives.lm.objective import Perplexity
@@ -580,7 +621,8 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
 
     assert kinds(LMRunConfig().validation_metrics(validates=True)) == [Perplexity]
     assert LMRunConfig().validation_metrics(validates=False) == ()
-    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [Accuracy, ECE, AURC, LogLoss]
+    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [
+        Accuracy, MacroF1, ECE, AURC, LogLoss, Brier, ScoredQuestions]
     assert kinds(JepaRunConfig(probe_classes=7).validation_metrics(validates=True)) == [LinearProbe, KnnProbe]
     linear, knn = JepaRunConfig(probe_classes=7, knn_k=5).validation_metrics(validates=False)
     assert (linear.num_classes, knn.num_classes, knn.k) == (7, 7, 5)
@@ -604,9 +646,9 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
 
 @pytest.mark.parametrize("kind", ["lm", "decision", "diffusion"])
 def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
-    """`--source.text-only`, `--source.prediction-depths` and `--source.attention` are every run kind's,
-    and its source's load reads them beside where it reads the source (`RunConfig.source_keywords`):
-    the attention as the load's `modeling_overrides`."""
+    """`--source.text-only`, `--source.prediction-depths`, `--source.attention` and
+    `--source.scan-layers` are every run kind's, and its source's load reads them beside where it reads
+    the source (`RunConfig.source_keywords`): the attention as the load's `modeling_overrides`."""
     from dew.config import SourceOptions
     from dew.config.diffusion import DiffusionRunConfig
     from dew.config.lm import LMRunConfig
@@ -615,11 +657,14 @@ def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
     kinds = {"lm": LMRunConfig, "decision": DecisionRunConfig, "diffusion": DiffusionRunConfig}
     run = kinds[kind].cli(["--source.text-only", "--source.prediction-depths", "0",
                            "--source.attention", "full_attention", "block_bidirectional",
-                           "--trainer.multi-host", "False"])
+                           "--source.scan-layers", "--trainer.multi-host", "False"])
     assert run.source == SourceOptions(text_only=True, prediction_depths=0,
-                                       attention={"full_attention": "block_bidirectional"})
+                                       attention={"full_attention": "block_bidirectional"}, scan_layers=True)
     keywords = run.source_keywords(frozen=False)
     assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    assert keywords["scan_layers"] is True
+    # A source the run trains is stored in its master weights' dtype, one it keeps frozen as stored.
+    assert keywords["param_dtype"] == "float32" and run.source_keywords(frozen=True)["param_dtype"] == "auto"
     assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}
     assert type(run).from_dict(run.to_dict()).source == run.source
 
@@ -684,3 +729,17 @@ def test_a_run_branches_into_the_cooldowns_its_command_line_names():
     assert run.trainer.cooldowns == Cooldowns(at=("20%", "40%"), length="10%", shape="linear")
     assert LMRunConfig.from_dict(run.to_dict()).trainer.cooldowns == run.trainer.cooldowns
     assert LMRunConfig.cli(["--trainer.multi-host", "False"]).trainer.cooldowns is None
+
+
+def test_a_run_whose_model_names_a_component_by_its_alias_reads_back_and_takes_an_override():
+    """A run whose model names a component by an alias of another kind (a mixer's `attention`) reads
+    back from its record as it was written, and takes an override, through the translation a record of
+    an earlier main's fields reads through (`dew.inference.tasks.earlier_model`, ledger 2423)."""
+    from dew.config.lm import LMRunConfig
+    from dew.registry import ModelConfig
+
+    fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+              "mixer": {"class": "attention", "fields": {}}}
+    run = LMRunConfig(model=ModelConfig("causal_transformer", fields), trainer=TrainerConfig(steps=1))
+    assert LMRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))).model == run.model
+    assert run.override({"trainer.steps": 3}).model == run.model

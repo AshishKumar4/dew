@@ -9,13 +9,14 @@ from dataclasses import dataclass
 import grain.python as grain
 import numpy as np
 import pytest
+from data_support import Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
-from dew.data.pipeline import Configured, ObjectiveData, Rejected
+from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
 from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
@@ -282,6 +283,21 @@ class FetchLike:
                 {**row, "payload": np.full(4, row["i"], dtype=np.uint8)})
 
 
+class CutThirds:
+    """Refuses every third row under the cut that refused it, three tokens of its text, as a budget
+    refuses a row it cut until it no longer fits; the rows it was called on (`calls`)."""
+
+    rejects = True
+    identity = "cut-thirds@1"
+
+    def __init__(self):
+        self.calls: list[int] = []
+
+    def __call__(self, row):
+        self.calls.append(row["i"])
+        return Rejected("third", cut={"text": 3}) if row["i"] % 3 == 0 else row
+
+
 @dataclass(frozen=True)
 class ConfigureFetch:
     identity = "fetch-like-factory@1"
@@ -498,9 +514,9 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
     """A stateful iterator resumes through state= and load_state=, and one without them by
     replaying the records it already gave; both continue exactly where they stopped."""
     # The state is a NumPy array, as a library's own state often holds, through the JSON checkpoint.
-    for source in (from_iter(Countdown, name="countdown", state=lambda it: np.array([it.next]),
+    for source in (from_iter(Countdown, identity="countdown", state=lambda it: np.array([it.next]),
                              load_state=lambda it, saved: setattr(it, "next", int(saved[0]))),
-                   from_iter(Countdown, name="replayed", replay=True)):
+                   from_iter(Countdown, identity="replayed", replay=True)):
         reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
         try:
             first = [next(reader)["i"].tolist() for _ in range(3)]
@@ -575,7 +591,7 @@ def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
     """A stateless iterator that declares no replay reads and reports how far
     it read, but refuses to resume, where one that declares either resumes
     (`test_an_iterator_resumes_through_its_own_state_or_by_replaying`)."""
-    source = from_iter(Countdown, name="undeclared")
+    source = from_iter(Countdown, identity="undeclared")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
     try:
         next(reader)
@@ -592,10 +608,11 @@ def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
 
 
 def test_an_iterator_resuming_through_its_state_cannot_also_declare_a_replay():
-    from_iter(Countdown, name="stateful", state=lambda it: 0, load_state=lambda it, saved: None)
-    from_iter(Countdown, name="replayed", replay=True)
+    from_iter(Countdown, identity="stateful", state=lambda it: 0, load_state=lambda it, saved: None)
+    from_iter(Countdown, identity="replayed", replay=True)
     with pytest.raises(ValueError):
-        from_iter(Countdown, name="both", state=lambda it: 0, load_state=lambda it, saved: None, replay=True)
+        from_iter(Countdown, identity="both", state=lambda it: 0, load_state=lambda it, saved: None,
+                  replay=True)
 
 
 def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
@@ -606,7 +623,7 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
     import datasets
 
     stream = datasets.IterableDataset.from_generator(lambda: ({"i": i} for i in range(40)))
-    source = from_hf(stream, name="counting@1")
+    source = from_hf(stream, identity="counting@1")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
     try:
         first = [next(reader)["i"].tolist() for _ in range(3)]
@@ -623,7 +640,7 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
         resumed.close()
     assert [row["i"] for row in source] == list(range(40))
     with pytest.raises(ValueError):
-        from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), name="shuffled@1")
+        from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), identity="shuffled@1")
     with pytest.raises(ValueError):
         from_hf(stream)
 
@@ -649,7 +666,7 @@ def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count,
     import datasets
 
     stream = datasets.IterableDataset.from_generator(hf_rows, gen_kwargs={"shards": list(range(shard_count))})
-    source = from_hf(stream, name=f"sharded-{shard_count}@1")
+    source = from_hf(stream, identity=f"sharded-{shard_count}@1")
     chain = (source.map(lambda row: {**row, "twice": 2 * row["i"]}, identity="twice@1")
              .interleave(2).repeat(1).batch(2))
     data = compile(chain, read="streamed", loading=dataclasses.replace(READ, workers=workers))
@@ -698,7 +715,7 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
     path = tmp_path / "records.jsonl"
     path.write_text("".join(json.dumps({"i": index}) + "\n" for index in range(12)))
     stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
-    source = from_hf(stream, name="cached-counting@1")
+    source = from_hf(stream, identity="cached-counting@1")
     cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
     manifest = source.manifest()
     cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key))
@@ -749,6 +766,89 @@ def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
     assert {name for name in counts if name.startswith("data/rows/")} == {
         "data/rows/train-1", "data/rows/train-2", "data/rows/train-3"}
     assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
+
+
+class ThirdQuestionRefused:
+    """An objective's step after `Questioned` that refuses each record's third question's row."""
+
+    identity = "third-question-refused@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("third question") if int(row["question"]) == 2 else row
+
+
+def _asked(read: str, *, shuffled: bool = True) -> Dataset:
+    """12 records, ids 1 to 12, each with `id % 3 + 1` pairs of tokens, as `read` reads them: in one
+    order or each share its own, shuffled where `shuffled`."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    tokens = [np.arange(2 * (int(record) % 3 + 1), dtype=np.int32) for record in ids]
+    chain = Memory([{"id": record, "tokens": held} for record, held in zip(ids, tokens, strict=True)],
+                   shard_rows=4).named("asked")
+    if not shuffled:
+        return chain
+    return chain.shuffle(seed=3, window=12) if read == "streamed" else chain.shuffle(seed=3)
+
+
+@pytest.mark.parametrize("expansion", ["questions", "chunks"])
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read, workers, expansion):
+    """A training read bounded to its 12 records, in one order or each share its own, read alone or by
+    loading workers, through an objective's step that makes 24 rows of them, a question's each
+    (`Questioned`) or a chunk of two tokens each (`text.Chunks`), and one that refuses 4 of those
+    (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are its 12 source examples,
+    counted before the step makes rows of them, and not the rows it delivers again after; its
+    rejections are the rows refused after it (row 1944)."""
+    steps = ((Questioned(), ThirdQuestionRefused()) if expansion == "questions"
+             else (text.Chunks(2, fields=("tokens",)),))
+    data = compile(_asked(read).batch(2), objective=ObjectiveData(train=steps), read=read,
+                   loading=dataclasses.replace(READ, workers=workers), examples=12)
+    stream = data.train(DataPartition())
+    try:
+        rows = sum(len(batch["id"]) for batch in stream)
+        counts = data.statistics()
+    finally:
+        stream.close()
+    assert counts["data/rows/asked"] == 12
+    if expansion == "questions":
+        assert rows == 24 - 4 == 20
+        assert counts["data/rejected/asked/third question"] == 4
+    else:
+        assert rows == 24
+
+
+def wide_draw(metadata):
+    return WideDraw()
+
+
+def questioned(metadata):
+    return Questioned()
+
+
+@pytest.mark.parametrize("then", ["draw", "configured draw", "configured expansion"])
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples(workers, then):
+    """A memory read of the 12 records, in their order and unbounded, read alone or by loading workers,
+    whose objective makes 24 rows of them (`Questioned`), then draws (`WideDraw`, written, or configured
+    for the run, which a memory read binds between two passes that each hold the corpus) or makes rows of
+    those rows in turn (a `Questioned` configured for the run), and refuses rows of the third question
+    (`ThirdQuestionRefused`): it makes the rows as it holds the corpus, before the reader opens, which
+    reads them on, and the corpus's rows (data/rows) are its 12 source examples, as many as it held,
+    however many rows the reader has read (row 1944)."""
+    step = {"draw": WideDraw(), "configured draw": Configured(wide_draw, needs=(), scope="run", random=True),
+            "configured expansion": Configured(questioned, needs=(), scope="run", expands=True)}[then]
+    data = compile(_asked("memory", shuffled=False).batch(2), read="memory",
+                   loading=dataclasses.replace(READ, workers=workers),
+                   objective=ObjectiveData(train=(Questioned(), step, ThirdQuestionRefused())))
+    stream = data.train(DataPartition())
+    try:
+        for read in (3, 12):
+            for _ in range(read):
+                next(stream)
+            assert data.statistics()["data/rows/asked"] == 12
+    finally:
+        stream.close()
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
@@ -863,7 +963,8 @@ def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_w
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
     row it delivers was cut short after the repeat, so its truncated share is one, whatever the
-    rows the memory read held before."""
+    rows the memory read held before, and the cut's record counts the row and the three tokens it
+    removed of the field it cut."""
     from dew.data.steps.text import LengthPolicy
 
     rows = Memory([{"text": np.arange(5, dtype=np.int32)} for _ in range(4)])
@@ -878,6 +979,71 @@ def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     counts = data.statistics()
     assert counts["data/rows/memory"] == 1
     assert counts["data/truncated/memory"] == 1.0
+    assert counts["data/cut/memory/text"] == counts["data/cut_examples/memory/text"] == 1
+    assert counts["data/cut_removed/memory/text"] == 3
+
+
+@pytest.mark.parametrize(("read", "cached"), [("memory", False), ("memory", True), ("indexed", False),
+                                            ("streamed", False)])
+def test_a_refused_records_cut_counts_beside_its_refusal_in_every_read(tmp_path, read, cached):
+    """A record a step refuses keeps the cut that refused it (`Rejected.cut`), which every read counts
+    beside the refusal (`data/cut_refused`): a memory read, which counts its rows anew as it holds them,
+    its step run or, through a cache, filled and then read back without running it; and an indexed or
+    streamed read, whose filter counts its refusals within the reader's counts. The delivered rows' cuts
+    count none of it."""
+    steps = [CutThirds() for _ in range(2 if cached else 1)]
+    for step in steps:
+        chain = Memory(rows("sample", 6)).named("sample").filter_map(step)
+        data = compile((chain.cache(str(tmp_path / "cache")) if cached else chain).batch(1), read=read,
+                       loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            for _ in range(4):
+                next(stream)
+        finally:
+            stream.close()
+        counts = data.statistics()
+        assert counts["data/rejected/sample/third"] >= 2
+        assert counts["data/cut_refused/sample/text"] == 3 * counts["data/rejected/sample/third"]
+        delivered = ("data/cut/", "data/cut_examples/", "data/cut_removed/")
+        assert not any(name.startswith(delivered) for name in counts)
+    if cached:
+        # The second read took the refusals and their cuts from the cache its first filled.
+        assert steps[-1].calls == []
+
+
+def test_successive_cuts_of_a_record_compose_in_its_record():
+    """Two cuts of one field, a text of 9 tokens cut to 6 and then to 2, record the 7 tokens they removed
+    of one row, not the last cut's 4; a cut of another field stands beside them, its own row counted, and
+    the loader's counters read the composed record."""
+    from dew.data.steps.text import LengthPolicy
+
+    rows = Memory([{"text": np.arange(9, dtype=np.int32), "label": np.arange(5, dtype=np.int32)}])
+    chain = (rows.map(LengthPolicy(6)).map(LengthPolicy(2)).map(LengthPolicy(3, field="label"))
+             .batch(1))
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        next(stream)
+    finally:
+        stream.close()
+    counts = data.statistics()
+    assert counts["data/cut/memory/text"] == 1 and counts["data/cut_removed/memory/text"] == 7
+    assert counts["data/cut/memory/label"] == 1 and counts["data/cut_removed/memory/label"] == 2
+
+
+def test_a_rendered_prompt_kept_to_its_length_counts_the_start_it_removed():
+    """A prompt longer than its length, kept by its end (`long="truncate"`), records the cut: its row
+    cut short, one row and the tokens of its start removed, as every length policy does."""
+    from dew.data.prompts import LENGTH_KEY
+    from dew.data.steps.chat import RenderPrompt
+
+    prompt = {"prompt": "a prompt of many bytes"}
+    rendered = RenderPrompt("byte", max_prompt_len=8, long="truncate").map(prompt)
+    whole = RenderPrompt("byte", max_prompt_len=64).map(prompt)
+    removed = int(whole[LENGTH_KEY]) - 8
+    assert removed > 0 and rendered["_dew_truncated"] and rendered["_dew_cut"] == {"prompt": (1, removed)}
+    assert "_dew_cut" not in whole
 
 
 def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
@@ -1153,7 +1319,7 @@ def test_column_verbs_preserve_simultaneous_renames_and_selection(read):
 
 
 def _stamped(facts):
-    """A run-scoped step that writes the run's row count into each record."""
+    """A step that writes the row count its facts state into each record."""
     count = facts["rows"]
     return lambda row: {**row, "rows": np.int32(count)}
 
@@ -1193,6 +1359,41 @@ class _Noised(grain.RandomMapTransform):
 
     def random_map(self, element, rng):
         return {**element, "noise": int(rng.integers(0, 1000))}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_an_objectives_configured_step_over_a_mixture_binds_to_each_corpus_own_facts(read):
+    """An objective's configured step that neither draws nor expands runs on each corpus before the
+    mixture, bound to the facts that corpus states: corpora of 2 and 3 records, which share no row
+    count, each stamp their own."""
+    members = [Memory([{"size": np.int32(size)}] * size, identity=f"corpus {size}") for size in (2, 3)]
+    objective = ObjectiveData(train=(Configured(_stamped, needs=("rows",)),))
+    loader = compile(mix(members).batch(1), objective=objective, read=read, loading=READ)
+    stream = loader.train(DataPartition())
+    try:
+        batches = list(itertools.islice(stream, 10))
+    finally:
+        stream.close()
+    assert len(batches) == 10 and {int(batch["size"][0]) for batch in batches} == {2, 3}
+    for batch in batches:
+        np.testing.assert_array_equal(batch["rows"], batch["size"])
+
+
+def test_a_configured_step_states_whether_it_expands_and_binding_to_another_is_refused():
+    """As a configured step states that it draws, it states that it expands a record into several
+    (`Configured.expands`): one stated so reads each record as its expansion makes it, and one that
+    binds to an expansion unstated, or states one and binds to a map, is refused before it reads."""
+    rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(4)]))
+    doubled = compile(rows.map(Configured(lambda facts: _Doubled(), needs=(), expands=True)).batch(8),
+                      read="memory", loading=READ).train(DataPartition())
+    try:
+        assert sorted(next(doubled)["id"].tolist()) == [0, 0, 1, 1, 2, 2, 3, 3]
+    finally:
+        doubled.close()
+    for configured in (Configured(lambda facts: _Doubled(), needs=()),
+                       Configured(lambda facts: (lambda row: row), needs=(), expands=True)):
+        with pytest.raises(ValueError):
+            compile(rows.map(configured).batch(2), read="memory", loading=READ)
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])

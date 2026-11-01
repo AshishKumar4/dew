@@ -16,8 +16,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from float64_terms import float64_forward
 from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance, float64_forward
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import FACTOR, distance
 
 import dew
 from dew.inference.projections import inference_projections, pending, projection_groups

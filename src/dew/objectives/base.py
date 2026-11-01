@@ -13,9 +13,11 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import functools
 import math
+import weakref
 import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -45,10 +47,13 @@ from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
+from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn import categorical
+from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
-from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
-from dew.nn.protocols import HiddenStates, ProjectsParameters, StagedStacks
+from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
+from dew.nn.progress import END, Progress, ReadsProgress
+from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters, StagedStacks
 from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
@@ -98,6 +103,27 @@ class Ratio:
         dtype = jnp.result_type(self.total.dtype, mass.dtype, jnp.float32)
         value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
         return jnp.where(active, value, 0), active
+
+
+@struct.dataclass
+class Weighted:
+    """A loss of several terms, each a `Ratio` normalized by its own mass, summed with `weights`:
+    `sum_i weight_i * term_i.mean()`, which has mass where any term of nonzero weight has.
+
+    Each term sums across microbatches and devices as a `Ratio` does, so every term is its mean over the
+    whole update before the weights combine them (`Objective.reduce_loss`).
+    """
+
+    terms: tuple[Ratio, ...]
+    weights: tuple[float, ...] = struct.field(pytree_node=False)
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        """Return the weighted sum of the terms' means, and whether any term of nonzero weight has mass."""
+        means = [(weight, *term.mean()) for weight, term in zip(self.weights, self.terms, strict=True)]
+        value = functools.reduce(jnp.add, [weight * mean for weight, mean, _ in means])
+        active = functools.reduce(jnp.logical_or, [active for weight, _, active in means if weight != 0],
+                                  jnp.asarray(a=False))
+        return value, active
 
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
@@ -276,6 +302,18 @@ class Step:
     """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
     QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
     what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
+    watched: Watched | None = struct.field(pytree_node=False, default=None)
+    """The activations a sampled step watches (`dew.nn.inspection.watching`): the objective opens the
+    `inspected` collection in the model call it trains through and returns what it sowed
+    (`Aux.inspected`). None on every other step; static, as `qk_stats` is."""
+
+    def sown(self, *collections: str) -> list[str]:
+        """The collections a model call the objective trains through opens: `collections`, the ones its
+        objective reads, and those the step asks for, `qk` where the optimizer clips by it and
+        `inspected` where the step watches activations. A call opening none returns an empty mapping
+        beside its output."""
+        return [*collections, *(["qk"] if self.qk_stats else []),
+                *([INSPECTED] if self.watched is not None else [])]
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -408,6 +446,9 @@ class Aux(Generic[Effects]):
     clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
+    inspected: Variables | None = None
+    """What the watched modules of the model call the objective trains through sowed
+    (`dew.nn.inspection.INSPECTED`), where the step watches (`Step.watched`); None otherwise."""
     record: Evaluated | Recorded | None = None
     """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
     which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
@@ -471,13 +512,14 @@ class TrainingScalars[Statistics, Additions]:
 class Prediction:
     """What a token objective scored a batch with, for comparison with a teacher.
 
-    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass.
+    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass, None where the caller
+      asked for none (`predict`'s `logits`): its loss scored them a tile at a time and held none.
     - `losses`: the `[B, S]` per-position loss the objective sums.
     - `weights`: the `[B, S]` weight the objective gives each position.
     - `hidden`: the `[B, S, D]` states of the layers the caller asked for,
       in the order asked.
     """
-    logits: jax.Array
+    logits: jax.Array | None
     losses: jax.Array
     weights: jax.Array
     hidden: tuple[jax.Array, ...]
@@ -535,11 +577,14 @@ class EMASpec:
 
     `decay` is a schedule over steps because some objectives ramp the
     momentum; I-JEPA anneals it from 0.996 to 1.0. The step it reads is the
-    count of completed optimizer updates. `select` picks the tracked leaves
-    and defaults to all of them.
+    count of completed optimizer updates, or where `progressed` the run's
+    progress, the share of its examples bound consumed before the update, in
+    a run bounded in examples that no plan counts ahead (`TrainState.consumed`).
+    `select` picks the tracked leaves and defaults to all of them.
     """
     decay: optax.Schedule
     select: PathFilter = everything
+    progressed: bool = False
 
     @classmethod
     def constant(cls, decay: float | None) -> EMASpec | None:
@@ -659,6 +704,12 @@ class Objective(ABC, Generic[Loss, Effects]):
     def inputs(self, inputs: InputSpec | None) -> None:
         self._inputs = inputs
 
+    named_inputs: str | None = None
+    """The batch field an objective names as its sample alone, as `Supervised(inputs="x")` does, which a
+    run declares as `inputs` at the per-example shape its model reads of the run's first batch
+    (`Trainer.fit`); None where `inputs` declares the shapes in full, an explicit spec that overrides
+    any the data would give, or declares none."""
+
     ema: EMASpec | None = None
     saved_task: ClassVar[type[SavedTask] | None] = None
     settings: ClassVar[type[DataclassInstance] | None] = None
@@ -671,6 +722,11 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
+    passes_progress: bool = False
+    """Whether its training loss passes the run's progress (`progress`) to a model that reads it
+    (`dew.nn.progress.ReadsProgress`); an objective that passes none refuses such a model, which would
+    otherwise train at the run's end. An objective over another's model, a distillation's over its
+    student, passes as that one does."""
     ema_is_reference: ClassVar[bool] = False
     """Whether the objective's average is the frozen reference its loss compares against (an RL
     policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
@@ -701,8 +757,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         networks of its own, such as a few-step student and the fake score
         that critiques it, can give each network its own copy of `tx`, with
         its own state and update count, by `optax.multi_transform` over the
-        networks. It can then alternate them with `optax.conditionally_mask`,
-        whose count is the trainer's number of committed updates, the clock
+        networks. It can then alternate them with `optax.conditionally_mask`
+        under `dew.held_updates.phased`, which says each update trains one of
+        them, whose count is the trainer's number of committed updates, the clock
         its loss reads as `Step.updates`: every microbatch an update
         accumulates is of that update's phase, however many it takes.
         """
@@ -779,6 +836,23 @@ class Objective(ABC, Generic[Loss, Effects]):
             lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
             else leaf, batch))) for index in range(rows)], np.int64)
 
+    def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None:
+        """The statistics `loss` returns for `batch`, without its `Aux`, by the loss's own path (its
+        configured terms, its mode and its model's draws under `step`), with each unit's share of their
+        first leaf (a `Ratio`'s total, a routed decoder's prediction total): `[B]` for an example's,
+        `[B, T]` for a token's, the shares summing to that leaf. A method that credits each unit by its
+        own loss reads them (`dew.objectives.perturbation`). None, the default, where the objective states
+        no units, whose whole statistics credit every unit; the model's other collections are left as they
+        are."""
+        return None
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The tokens each of `batch`'s rows holds, read from its shapes alone, so a placed batch
+        answers without a wait: the most a row's `scored_tokens` counts, and what a device steps of
+        it (`dew.training.memory.device_tokens`). None where rows hold no token geometry, an image's,
+        whose run reads its committed tokens off the devices at each step a count is due."""
+        return None
+
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
 
@@ -826,6 +900,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         model = vars(self).get("model")
         return () if model is None else (ProgramModule(model, None, trained=True),)
+
+    def placement(self, layout: Layout) -> Layout:
+        """The run's `layout` as the modules this objective's programs run refine it for their own trees
+        (`dew.distributed.placement.RefinesLayout`, a tier-3 model's torch names), each in its turn; the
+        layout as it is where none does."""
+        for entry in self.program_key():
+            if isinstance(entry.module, RefinesLayout):
+                layout = entry.module.placement(layout)
+        return layout
 
     def towers(self) -> tuple[Held, ...]:
         """Every network this objective's programs run, whose quantization the options they compile
@@ -924,6 +1007,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise NotImplementedError(f"{type(self).__name__} draws no fresh tree: give it variables, "
                                   "or implement fresh_variables")
 
+    def fresh_modules(self) -> tuple[str, ...]:
+        """The modules this objective trains that are drawn fresh beside a loaded base, by their paths
+        under `params` (`backbone/layers_1/cross_attention`, `head`), which a run trains in a fresh group
+        (`dew.optim.OptimConfig.fresh_groups`): none by default, an objective declaring what it draws beside
+        the base it holds and what its source drew (`Pretrained.fresh`). One drawn with no parameter, a
+        tied readout, the group leaves out (`dew.config.trained_modules`)."""
+        return ()
+
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules
         add: a loss head, a projector, a phase's split. The default adds nothing."""
@@ -967,12 +1058,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
                 now is not was for now, was in zip(kept, held[0], strict=True)):
-            # A fresh callable gives JAX a fresh trace even for the same bound method.
-            @functools.wraps(function)
-            def run(*args, **kwargs):
-                return function(*args, **kwargs)
+            from dew.nn.kernels.options import OuterProgram
 
-            held = (kept, jax.jit(run, static_argnames=static_argnames, compiler_options=options))
+            # A program jits a fresh callable, so JAX traces it afresh even for the same bound method.
+            held = (kept, OuterProgram(function, static_argnames=static_argnames, compiler_options=options))
             cached[1][key] = held
         return held[1]
 
@@ -1114,7 +1203,16 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
+        if not (self.passes_progress or validation):
+            self._refuse_unpassed_progress()
+        if validation:
+            # A validation's step is no training step, so its model reads the run's end (`progress`).
+            loss = self.validation_loss(variables, batch, step)
+        else:
+            watched = step.watched
+            with (watching(watched.modules, histogram=watched.histogram, cotangents=watched.cotangents)
+                  if watched else contextlib.nullcontext()):
+                loss = self.loss(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:
@@ -1128,11 +1226,12 @@ class Objective(ABC, Generic[Loss, Effects]):
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
 
-        A `Ratio` reduces by `Ratio.mean`, and a scalar is its own value with
-        mass one. Composite statistics need an override, since the default
-        raises `TypeError` for them.
+        A `Ratio` reduces by `Ratio.mean`, terms `Weighted` together by
+        `Weighted.mean`, and a scalar is its own value with mass one. Other
+        composite statistics need an override, since the default raises
+        `TypeError` for them.
         """
-        if isinstance(stats, Ratio):
+        if isinstance(stats, (Ratio, Weighted)):
             return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
@@ -1206,8 +1305,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         The tile is `tile`, or the objective's own when that is None. The
         return value describes the new tile, or is None when there was nothing
         to move, as for an objective with no such head. This is the first rung
-        of the fit ladder (`dew.training.memory.recompute_more`), which logs
-        the description, and a resumed run moves to the same rung again.
+        of the fit ladder (`dew.training.memory.recompute_more`), whose climb
+        logs the description (`dew.training.planning.FitSearch.compiled_again`),
+        and a resumed run moves to the same rung again.
         """
         return None
 
@@ -1255,11 +1355,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Effects], Prediction]:
+                layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]:
         """Return the loss over `batch` as `loss` computes it, together with the prediction behind it.
 
         The result holds the statistics, the `Aux` reports and a `Prediction`
-        with the token logits, the weight of every position and the hidden
+        with the token logits (none unless `logits`), the weight of every position and the hidden
         states of `layers`. The statistics are one `Ratio` over the positions
         the weights count, so a distillation can mix in terms over the same
         mass. `train` turns dropout on, as `loss` has it; a frozen teacher
@@ -1302,11 +1402,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         `variables` are the weights `evaluate` takes; the loss reads their
         `evaluation_variables`. Where both are asked for and the objective
         scores them together (`_validation_scores`), the batch is scored once.
+        `step` is the evaluation's, no training step (`Step.training`).
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
             report = self.program('report', self._validation_scores)
-            return report(weights, batch, replace(step, training=False))
+            return report(weights, batch, step)
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None
 
@@ -1346,6 +1447,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self.model_tree(variables)
 
+    def bind_widths(self, widths: Mapping[str, object]) -> None:
+        """Take the run's static widths, the facts its data's run-scoped steps bound (`Loader.widths`,
+        such as a decision's `slots`), before the run records its task (`task_settings`). An objective
+        whose task pads to none keeps none."""
+        del widths
+
     def task_settings(self) -> DataclassInstance | None:
         """Return the task settings a saved step records beside its model, an
         instance of `settings`, or None when the objective declares no
@@ -1357,6 +1464,36 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
+        """The projection groups, their paths from the `params` root, that a checkpoint of this
+        objective's run may hold packed as a served task holds them, which a resume splits back
+        (`dew.checkpoints`): none, but where a run trained a task's packed tree (`DecisionObjective`).
+        Carried to 1.0, when it is deleted (ledger 1552)."""
+        del variables
+        return ()
+
+    def progress(self, step: Step) -> Progress:
+        """The run's progress this step's loss passes a model that reads it (`dew.nn.progress`): the
+        updates the run committed before a training step (`Step.committed`), and the run's end in any
+        other, a validation's and its report's alike (`Step.training`), whose update clock stays as it
+        is for what else reads it."""
+        return Progress(step.committed) if step.training else END
+
+    def progress_readers(self) -> tuple[nn.Module, ...]:
+        """The trained modules its programs run (`program_key`), whatever the objective holds, whose
+        computation changes over a run (`ReadsProgress`): those a training step passes the run's
+        progress, or trains at the run's end."""
+        return tuple(entry.module for entry in self.program_key() if entry.trained
+                     and isinstance(entry.module, ReadsProgress) and entry.module.reads_progress())
+
+    def _refuse_unpassed_progress(self) -> None:
+        """Refuse a module that reads the run's progress (`progress_readers`) under an objective whose
+        loss passes it none (`passes_progress`): it would train at the run's end."""
+        for module in self.progress_readers()[:1]:
+            raise ValueError(f"{type(self).__name__} passes its model no run's progress, which a "
+                             f"{type(module).__name__} reads (dew.nn.progress): it would train at the "
+                             f"run's end")
+
     def recorded_model(self) -> nn.Module:
         """The model a saved step's record names (`inference_record`): the objective's own."""
         return self.model
@@ -1365,10 +1502,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the model and task settings that let a saved step be rebuilt.
 
         It records the objective's import path, its `recorded_model`'s record,
-        and `task_settings`, field by field. An objective that declares no task
+        `task_settings`, field by field, and the numerics the step trained under
+        (`generation.run_precision`), which a loaded task's calls trace under
+        (`dew.inference.tasks.InItsForm.traced`). An objective that declares no task
         settings returns None; a custom research method can still restore its
         raw state.
         """
+        from dew.nn.kernels import generation
         from dew.registry import ModelConfig, import_path, record_fields, to_record
 
         settings = self.task_settings()
@@ -1376,7 +1516,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             return None
         return {'objective': import_path(type(self)),
                 'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
-                **record_fields(settings, type(settings))}
+                **record_fields(settings, type(settings)),
+                'precision': to_record(generation.numerics(), Numerics)}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
@@ -1529,6 +1670,37 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     """
     return -categorical.cross_entropy(logits, tokens)
 
+
+_TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (
+    weakref.WeakKeyDictionary())
+
+
+def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tuple[float, float]:
+    """The work of an update of `objective` on `batch` as its traced programs run it, for an objective whose
+    work no closed form counts (`dew.nn.flops.traced_flops`): its loss's forward, and its loss's gradient's
+    program, the forward and the backward as JAX differentiates it, none through a stopped gradient (a world
+    model's imagined rollouts, whose actor learns by REINFORCE). Kept by the batch's shapes, so a run whose
+    batches keep theirs traces once."""
+    from dew.nn.flops import traced_flops
+
+    shapes = jax.eval_shape(lambda batch: batch, batch)
+    signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
+    kept = _TRACED.setdefault(objective, {})
+    if signature not in kept:
+        variables = jax.eval_shape(objective.init, jax.random.key(0))
+        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+        rest = {name: value for name, value in variables.items() if name != "params"}
+
+        def forward(variables: Variables, batch: Batch) -> jax.Array:
+            return objective.scalar_loss(variables, batch, step)[0]
+
+        def gradient(params: Variables, rest: Variables, batch: Batch) -> Variables:
+            return jax.grad(lambda params: forward({**rest, "params": params}, batch))(params)
+
+        kept[signature] = (traced_flops(forward, variables, shapes),
+                           traced_flops(gradient, variables["params"], rest, shapes))
+    return kept[signature]
+
 __all__ = [
     "OMITTED",
     "Aux",
@@ -1547,5 +1719,6 @@ __all__ = [
     "TrainingScalars",
     "joined",
     "model_rngs",
+    "traced_update_flops",
     "training_rngs",
 ]

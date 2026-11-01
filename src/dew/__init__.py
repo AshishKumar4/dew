@@ -6,14 +6,19 @@ training layer, with no modality, encoder or tracker backend. Importing
 `dew` opens no JAX backend and loads no optional dependency; encoders,
 decoders and datasets load what they need when they are built.
 
-`import dew` does set two XLA flags before the backend opens.
+`import dew` does set XLA flags, before anything it imports loads jaxlib, so
+they hold for every XLA runtime the process loads (`dew.devices.flags_hold`):
+one everywhere and, when JAX's CUDA plugin is installed, two more.
 `--xla_allow_excess_precision=false` makes XLA round values declared in a
-narrow dtype such as bf16 where the program rounds them. When JAX's CUDA
-plugin is installed, `--xla_gpu_enable_allocator_spatial_partitioning=false`
-keeps a preallocated GPU pool in one piece for a step's temporaries. If you
-set either flag yourself in XLA_FLAGS, your value is kept. If the JAX
-backend has already opened, the flags cannot take effect, and Dew logs a
-warning.
+narrow dtype such as bf16 where the program rounds them. On CUDA,
+`--xla_gpu_enable_allocator_spatial_partitioning=false` keeps a preallocated
+GPU pool in one piece for a step's temporaries, and
+`--xla_backend_extra_options=-nvptx-prec-divf32=2` divides fp32 to the nearest
+float, as a CPU and the references Dew is held to do (`dew.devices`). If you
+set any of them yourself in XLA_FLAGS, your value is kept. Where jax was
+imported before Dew, XLA may have parsed its flags already and Dew's are
+unproven; where the JAX backend has already opened, they cannot take effect,
+and Dew logs a warning.
 
 `import dew` also makes the JAX user contexts the kernel autotuner and kernel
 choices key traces on (`dew.cache.KERNEL_TUNES`, `KERNEL_PINS`,
@@ -32,13 +37,14 @@ a program that never ran `absl.app` would stop them there. A program that
 parses its flags itself, through `absl.app` or `FLAGS(argv)`, still does.
 """
 
+from importlib import import_module as _import_module
 from typing import TYPE_CHECKING
 
 from absl import flags as _flags
 
-from dew import cache as cache
 from dew._exports import lookup as _lookup
 from dew.devices import (
+    connect_at_creation as _connect_at_creation,
     divide_exactly as _divide_exactly,
     keep_roundings as _keep_roundings,
     unpartition_gpu_pool as _unpartition_gpu_pool,
@@ -47,6 +53,7 @@ from dew.devices import (
 _keep_roundings()
 _divide_exactly()
 _unpartition_gpu_pool()
+_connect_at_creation()
 
 
 def _parse_absl_flags() -> None:
@@ -59,6 +66,7 @@ def _parse_absl_flags() -> None:
 _parse_absl_flags()
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew._version import __version__
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
     from dew.diffusion import Process
@@ -91,8 +99,6 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         WandbTracker,
     )
 
-__version__ = "0.1.0"
-
 _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",
     "Observe": "dew.training", "Pause": "dew.training",
@@ -114,6 +120,7 @@ _EXPORTS = {
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
+    "__version__": "dew._version",
 }
 
 
@@ -169,3 +176,11 @@ __all__ = [
     "pipeline",
     "sample",
 ]
+
+if TYPE_CHECKING:
+    from dew import cache as cache
+else:
+    # `dew.cache` makes JAX's user contexts at `import dew`, before any thread starts, and its `import jax`
+    # loads jaxlib: after Dew's flags are in XLA_FLAGS, where every runtime XLA loads parses them
+    # (`dew.devices`).
+    _import_module("dew.cache")

@@ -2,6 +2,7 @@
 
 Run with transformers 5.16.1, Torch and tokenizers installed:
     PYTHONPATH=src python tools/multimodal_reference.py
+    PYTHONPATH=src:. python tools/multimodal_reference.py float64 [family ...]  # the float64 truths
 
 No network access or pretrained downloads are used. Each family's existing
 tiny fixture supplies the weights, and every reference lands in
@@ -216,41 +217,6 @@ def write_gemma3n_native() -> None:
 
 
 
-def gemma3n_post_sgd_spread() -> None:
-    """How far fp32 reduction order alone moves Gemma 3n's post-SGD logits:
-    the reference's own step on CUDA (TF32 off) against the same step on the
-    CPU, which is what wrote updated_logits.npy. Run in a venv whose torch
-    has CUDA; writes post_sgd_spread.json beside the references.
-    """
-    from transformers import Gemma3nForConditionalGeneration
-
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    source, destination = ROOT / "gemma-3n-audio-tiny", ROOT / "gemma3n-native-tiny"
-    processor = AutoProcessor.from_pretrained(source, local_files_only=True)
-    audio = [np.load(source / "waveform_0.npy"), np.load(source / "waveform_1.npy")]
-    images = np.random.default_rng(2604).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
-    prompts = ["listen <audio> <image> ok", "say <image> <audio> again <image> ok"]
-    encoded = _encode(processor, images, prompts, audio)
-    valid = encoded["attention_mask"].bool()
-    updated = {}
-    for device in ("cpu", "cuda"):
-        model = Gemma3nForConditionalGeneration.from_pretrained(
-            source, attn_implementation="eager").float().eval().to(device)
-        singles = [{name: value.to(device) for name, value in single.items()}
-                   for single in _row_slices(encoded, model)]
-        _sgd_step(model, singles, valid)
-        with torch.no_grad():
-            updated[device] = torch.cat([model(**single, use_cache=False).logits[0].cpu()
-                                         for single in singles])
-    recorded = torch.from_numpy(np.load(destination / "updated_logits.npy"))[valid]
-    report = {"torch": torch.__version__, "device": torch.cuda.get_device_name(),
-              "cuda_vs_cpu": float((updated["cuda"] - updated["cpu"]).abs().max()),
-              "cpu_vs_recorded": float((updated["cpu"] - recorded).abs().max())}
-    (destination / "post_sgd_spread.json").write_text(json.dumps(report) + "\n")
-    print(report)
-
-
 def _copied(source: str, destination: str, config_class, model_class, **changes):
     """The fixture `source`'s model, its config's top-level fields set to `changes`, built eager
     in float32 with its weights loaded strictly, and saved with its config under `destination`.
@@ -443,6 +409,46 @@ def write_gemma4_unified_native() -> None:
     print(f"{destination.name}: forward shape {tuple(result.logits.shape)}", flush=True)
 
 
+def write_float64_truths(references: str, checkpoint: str) -> None:
+    """The float64 truth of what `_write_forward_backward` recorded in `references` from the fixture
+    `checkpoint`'s model: its float64 twin (tools/torch_precision.py) over the same stored batch
+    encoding, one row at a time: its logits, then its summed next-token loss, pixel gradient and logits
+    after one SGD step of LEARNING_RATE, in logits_f64.npy, training_f64.json, pixel_gradient_f64.npy
+    and updated_logits_f64.npy. The Dew side's checks hold Dew and the fp32 reference to it
+    (tests/test_multimodal_model.py)."""
+    from transformers import AutoModelForImageTextToText
+
+    from tools.torch_precision import float64, float64_twin
+
+    destination, source = ROOT / references, ROOT / checkpoint
+    model = AutoModelForImageTextToText.from_pretrained(source, dtype=torch.float32,
+                                                        attn_implementation="eager").eval()
+    recorded = ("logits", "updated_logits", "pixel_gradient", "continuation", "raw_images")
+    encoded = {path.stem: torch.from_numpy(np.load(path)) for path in destination.glob("*.npy")
+               if path.stem not in recorded and not path.stem.endswith("_f64")}
+    twin = float64_twin(model)
+    with float64():
+        widened = {name: value.double() if value.is_floating_point() else value
+                   for name, value in encoded.items()}
+        valid = widened["attention_mask"].bool()
+        singles = _row_slices(widened, twin)
+        shape = (*widened["input_ids"].shape, twin.config.get_text_config().vocab_size)
+        logits, updated = torch.zeros(shape, dtype=torch.float64), torch.zeros(shape, dtype=torch.float64)
+        with torch.no_grad():
+            for row, single in enumerate(singles):
+                logits[row, valid[row]] = twin(**single, use_cache=False).logits[0]
+        loss, pixel_inputs = _sgd_step(twin, singles, valid)
+        with torch.no_grad():
+            for row, single in enumerate(singles):
+                updated[row, valid[row]] = twin(**single, use_cache=False).logits[0]
+    np.save(destination / "pixel_gradient_f64.npy",
+            torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
+    np.save(destination / "logits_f64.npy", logits.numpy())
+    np.save(destination / "updated_logits_f64.npy", updated.numpy())
+    (destination / "training_f64.json").write_text(json.dumps({"loss": float(loss.detach())}) + "\n")
+    print(destination, "float64 loss", float(loss.detach()), flush=True)
+
+
 def write_llama4_native() -> None:
     """The actual Llama4Processor tiling: local tiles, a global tile and separators."""
     from transformers import Llama4Config, Llama4ForConditionalGeneration, Llama4Processor
@@ -484,8 +490,14 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["gemma4-unified"]:
         write_gemma4_unified_native()
         sys.exit()
-    if sys.argv[1:] == ["gemma3n-spread"]:
-        gemma3n_post_sgd_spread()
+    if sys.argv[1:2] == ["float64"]:
+        # Which references each family's test reads, and the checkpoint they were written from: the
+        # tests' declaration, data alone.
+        sys.path.insert(0, str(ROOT.parents[1]))
+        from multimodal_families import FAMILIES
+
+        for family in sys.argv[2:] or FAMILIES:
+            write_float64_truths(*FAMILIES[family])
         sys.exit()
     write_gemma3_native()
     write_gemma3n_native()

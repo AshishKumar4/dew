@@ -9,13 +9,15 @@ import numpy as np
 import pytest
 from test_model_flops import forward_products
 
+from dew.batch import TEXT_KEY
 from dew.diffusion import presets
 from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, Field, InputSpec
+from dew.inputs.condition import ConditionWork
 from dew.inputs.diffusion import DiffusionConditioner, T5Segment
-from dew.inputs.encoders import CharTable, ConditionWork, T5Text
-from dew.nn.attention import Stage
+from dew.inputs.encoders import CharTable, T5Text
+from dew.nn.attention_blocks import Stage
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, MTPBlock
@@ -42,7 +44,7 @@ from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 from dew.training.model_flops import TRAINING_FLOPS, prepare_counts, step_counts
 

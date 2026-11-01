@@ -5,12 +5,12 @@
     "loaded_with": "dew.pipeline('dewml/hybrid-dit-176m', revision=...)",
     "checkpoint_step": 1350000,
     "parameters": 175640848,
-    "dew_commit": "aaffb62c07ffad78c72b29758673d1c4f5c37f4a",
+    "dew_commit": "5a5a378b540a090a81c211b1c760b9f875640ec8",
     "device": "NVIDIA GeForce RTX 4080",
     "jax": "0.11.2.post3",
     "compute": "published run dtypes, unquantized",
     "run_json_sha256": "ba2160cd785227b4460c8ce1d76b28d74386039601b7cd1b5acbc7f32f1f477a",
-    "tools_commit": "70831a757 (branch landing/visuals: tools/landing_visuals.py on top of integration/all aaffb62c0; library unchanged)"
+    "tools_commit": "70831a757 (branch landing/visuals: tools/landing_visuals.py on top of integration/all 5a5a378b5; library unchanged)"
   },
   "note": "One image per prompt. square_256 only for band-free renders; wide_3x2 is the largest centred 3:2 box inside any flat edge bands (crop_3x2 = left, top, right, bottom).",
   "images": [

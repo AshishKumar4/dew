@@ -43,6 +43,7 @@ from process_support import (
     terminate,
     worker_env as worker_env,
 )
+from test_whole_validation import POOLED
 from token_support import Corpus, write_token_corpus
 
 from dew.checkpoints import FROZEN_STORE
@@ -65,6 +66,17 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 AVERAGING = Path(__file__).with_name("averaging_worker.py")
 """The worker of the pools that average runs."""
+PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
+"""The worker of the pools whose profile window one rank cannot stop."""
+EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
+READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
+"""The worker of the pools that run on the examples clock."""
+CLOCKED = 17
+"""The examples a pool's run bounded in examples is bounded to: of ten records, seven read twice, and in
+one global order a last global batch of one row, which one share holds and the other does not."""
+
+LOG_WRITER = Path(__file__).with_name("log_writer_worker.py")
+"""The worker of the pool whose tracker fails off the step loop."""
 
 
 def dumped_params(out: Path, suffix: str = ".npz") -> dict:
@@ -130,13 +142,100 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
         assert report["unused_shape"] == [MESH_DEVICES]
         assert report["sum"] == 3 * MESH_DEVICES
 
+
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
-    reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus.train, seq_len=4,
-                       timeout=60)
+    reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus.train, seq_len=4)
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
+
+
+def clocked_pool(directory: Path, processes: int, devices: int = 1, **flags) -> list[dict]:
+    """`processes` processes of `devices` each training a run bounded to CLOCKED examples as `flags` set it
+    (`examples_clock_worker.examples_clock`), each's report."""
+    return run_pool("examples_clock", directory, processes, script=EXAMPLES_CLOCK, devices=devices,
+                    examples=CLOCKED, **flags)
+
+
+def assert_trained_once(reports: list[dict], *, clocked: bool = True) -> None:
+    """A pooled run bounded to CLOCKED examples: it ended on every process at one step, and its steps
+    trained exactly the examples its shares' streams deal them, id by id, each example's rows whole: seven
+    of its ten records twice and the others once. On the examples clock (`clocked`), it ended with its
+    bound consumed on every process, its clock the pool's (the examples its logs read rising to the
+    bound); planned ahead, as a read in one global order is, it keeps no clock."""
+    assert len({report["step"] for report in reports}) == 1
+    if clocked:
+        assert [report["consumed"] for report in reports] == [CLOCKED] * len(reports)
+        logged = reports[0]["logged"]
+        assert logged == sorted(logged) and logged[-1] == CLOCKED
+    else:
+        assert [report["consumed"] for report in reports] == [None] * len(reports)
+    assert all(not report["logged"] for report in reports[1:])
+    trained = {record: round(count, 4) for record, count in reports[0]["counts"].items()}
+    assert trained == {record: round(count, 4) for record, count in reports[0]["dealt"].items()}
+    assert sorted(trained.values()) == [1] * 3 + [2] * 7
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("deal", ["order", "records", "shards"])
+def test_a_pool_bounded_in_examples_trains_its_bound_once_however_its_read_deals_it(tmp_path, deal):
+    """Two processes bounded to CLOCKED examples of ten records, read in one global order, as records each
+    share reads its own of (an objective making one to three rows of each), or as physical shards of 3,
+    3, 3 and 1 rows each share reads its own, where a pool once refused a bound in examples (row 2538).
+    Dealt, the shares run out at steps apart, each reading on with a batch of the pool's emptied until
+    both have, on the examples clock; in one order, the pool plans its steps as one process of two devices
+    does and trains its batches, to its parameters. Either way it trains its bound once
+    (`assert_trained_once`)."""
+    reports = clocked_pool(tmp_path / "pool", 2, deal=deal)
+    assert_trained_once(reports, clocked=deal != "order")
+    if deal == "order":
+        alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal=deal)
+        assert reports[0]["counts"] == alone[0]["counts"]
+        for index in range(2):
+            assert_same_parameters(dumped_params(tmp_path / "pool" / f"process{index}.json"),
+                                   dumped_params(tmp_path / "alone" / "process0.json"))
+
+
+@pytest.mark.distributed
+def test_a_pool_whose_shares_two_processes_each_read_counts_each_share_once(tmp_path):
+    """Four processes, two to each share of the data (a tensor axis across them, `DataPartition.readers`):
+    each share's examples count once, by its first reader, so the run trains its bound once
+    (`assert_trained_once`) and every process's clock is the pool's."""
+    assert_trained_once(clocked_pool(tmp_path / "pool", 4, deal="records", tensor=2))
+
+
+@pytest.mark.distributed
+def test_a_pool_paused_inside_its_uneven_tail_resumes_to_the_run_that_never_paused(tmp_path):
+    """A pool on the examples clock, its shares dealt records of their own, paused at 90% of its examples,
+    where one share's stream ends steps before the other's, and resumed: a share that ran out reads none
+    from its first read on, and steps with a batch of the pool's emptied, so the resumed run trains its
+    bound once (`assert_trained_once`), to the parameters of the run that never paused, bit for bit."""
+    paused = clocked_pool(tmp_path / "paused", 2, deal="records", pause=0.9)
+    whole = clocked_pool(tmp_path / "whole", 2, deal="records")
+    assert_trained_once(paused)
+    assert [report["step"] for report in paused] == [report["step"] for report in whole]
+    assert paused[0]["counts"] == whole[0]["counts"]
+    for index in range(2):
+        assert_identical_parameters(dumped_params(tmp_path / "paused" / f"process{index}.json"),
+                                    dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_pools_cooldown_across_its_uneven_tail_reads_its_shares_as_its_run_does(tmp_path):
+    """A pool on the examples clock whose cooldown branches from the step before its first share's stream
+    ends to the step its last one's does, across the steps its shares end apart at: the branch's reads are
+    the pool's (a share that ran out stepping emptied), so it runs to its end on every process and scores
+    once, and the run reads on after it and trains its bound once (`assert_trained_once`). A pool planned
+    in one order cools as one process of two devices does, to the bit."""
+    reports = clocked_pool(tmp_path / "pool", 2, deal="records", cooldown=True)
+    assert max(reports[0]["batches"]) > min(reports[0]["batches"]), "the shares' streams end at one step"
+    assert_trained_once(reports)
+    assert len(reports[0]["cooled"]) == 1 and np.isfinite(reports[0]["cooled"]).all()
+    planned = clocked_pool(tmp_path / "planned", 2, deal="order", cooldown=True)
+    alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal="order", cooldown=True)
+    # The same programs over the same rows, a sum of two devices' parts in either order.
+    assert len(planned[0]["cooled"]) == 1 and planned[0]["cooled"] == alone[0]["cooled"]
 
 
 @pytest.mark.distributed
@@ -232,7 +331,7 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
         assert report["process_count"] == 2
         assert report["device_count"] == MESH_DEVICES
         assert report["local_device_count"] == MESH_DEVICES // 2
-        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["mesh_shape"] == {"diloco": 1, "data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_devices"] == MESH_DEVICES
         assert report["mesh_process_indices"] == [0, 1]
@@ -255,7 +354,7 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
     for index, report in enumerate(reports):
         assert report["process_index"] == index
         assert report["local_device_count"] == MESH_DEVICES // 4
-        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["mesh_shape"] == {"diloco": 1, "data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
 
@@ -346,27 +445,23 @@ def test_processes_read_disjoint_windows_of_one_packing(tmp_path):
         assert report["windows"] % (worker.BATCH // 2) == 0, "a partial batch came out"
 
 
-WHOLE_VALIDATION_PARTS = 3
-"""The pools the objectives' passes are spread over: one pool ran all of them
-in 371 s, the longest test CI had, which no other test could run beside."""
-
-
 @pytest.mark.distributed
-@pytest.mark.parametrize("part", range(WHOLE_VALIDATION_PARTS))
+@pytest.mark.parametrize("part", range(len(POOLED)))
 def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tmp_path, part):
     """`tests/test_whole_validation.py`'s passes on a pool of two: each
     process reads its share of a split of a batch and one record, the share
     that runs out first scoring its last batch's copy with every row a
     repeat, and every objective's loss and `Perplexity` count each record once.
     A split of one record leaves process 1's share empty, and it is scored once.
-    Each part is a pool of its own over every third objective, and the first
-    also scores `Perplexity`."""
+    Each part is a pool of its own over its objectives (`POOLED`, which holds
+    every evaluated objective once), and the first also scores `Perplexity`."""
     from test_whole_validation import EVALUATED, assert_every_record_once, assert_the_metric_over_every_record
 
+    assert sorted(name for names in POOLED for name in names) == EVALUATED
     reports = run_pool("whole_validation", tmp_path / "out", 2, run_dir=tmp_path / "run", timeout=1800,
-                       part=f"{part}/{WHOLE_VALIDATION_PARTS}")
+                       part=str(part))
     assert reports[0]["passes"] == reports[1]["passes"]
-    assert sorted(reports[0]["passes"]) == EVALUATED[part::WHOLE_VALIDATION_PARTS]
+    assert sorted(reports[0]["passes"]) == sorted(POOLED[part])
     for name, report in reports[0]["passes"].items():
         assert_every_record_once(name, report)
     if part == 0:
@@ -503,6 +598,7 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
         assert report["mesh_shape"] == {
+            "diloco": 1,
             "data": 2,
             "expert": 1,
             "fsdp": 4,
@@ -755,6 +851,48 @@ def test_a_pool_fetching_its_shares_online_resumes_where_it_stopped(tmp_path, on
         assert report["dataset_state"] == whole[index]["dataset_state"]
         assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+def replicated_flags(run_dir: Path, steps: int) -> dict:
+    """A fit over a filtered stream read elastically (`Pipeline.elastic`): every process reads the
+    order one reads, and keeps its rows."""
+    return {"name": "replicated", "replicated": True, "run_dir": run_dir, "fsdp_size": 1, "steps": steps,
+            "records": RECORDS}
+
+
+@pytest.fixture(scope="module")
+def replicated_checkpoint(tmp_path_factory):
+    """Two processes' elastic fit over a filtered stream, saved after `POOL_STEPS` steps."""
+    from dew.position import REPLICATED
+
+    directory = tmp_path_factory.mktemp("replicated-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, **replicated_flags(directory / "run", POOL_STEPS))
+    positions = {report["dataset_state"] for report in reports}
+    assert len(positions) == 1, "the processes saved different elastic positions"
+    assert REPLICATED in json.loads(positions.pop())
+    return directory / "run"
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("processes", [1, 4])
+def test_an_elastic_filtered_stream_resumes_on_another_process_count(tmp_path, replicated_checkpoint,
+                                                                      processes):
+    """A filtered stream read per share resumes only on the shares that saved it. Read elastically,
+    the position two processes saved is every process's, and one process or four resume from it:
+    they land where a pool of their own size that nobody stopped lands, its data position and its
+    parameters, since both read the batches one process reads."""
+    directory = tmp_path / "resumed-run"
+    shutil.copytree(replicated_checkpoint, directory)
+    resumed = run_pool("fit", tmp_path / "resumed", processes,
+                       **replicated_flags(directory, 2 * POOL_STEPS))
+    whole = run_pool("fit", tmp_path / "whole", processes,
+                     **replicated_flags(tmp_path / "whole-run", 2 * POOL_STEPS))
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
 PACKED_SEQ_LEN = 15
@@ -1112,6 +1250,31 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
     assert {name: after[name] for name in before} == before
 
 
+@pytest.mark.distributed
+def test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica(tmp_path, killed_local_pool):
+    """Process 1's local directory is gone, as a replaced host's is. Its shards each have a copy on
+    process 0 (the data axis runs across the two processes, fsdp within each), so the pool still
+    resumes from local step eight, not persistent step six: process 0 from its own disk, process 1
+    from process 0's copy over the mesh. Both land on the data position and the parameters of the
+    run nobody killed, byte for byte."""
+    directory = tmp_path / "lost"
+    shutil.copytree(killed_local_pool, directory)
+    shutil.rmtree(directory / "local" / "process1")
+    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
+
+    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+
+    assert [report["restored_step"] for report in resumed] == [LOCAL_KILL_AFTER] * 2
+    assert resumed[0]["restored_from"] == str(directory / "local" / "process0")
+    assert resumed[1]["restored_from"] == f"{directory / 'local' / 'process0'} (a replica)"
+    for index, report in enumerate(resumed):
+        assert shard_of(report["restored_dataset_state"]) == index
+        assert report["step"] == STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                                    dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool
 # --------------------------------------------------------------------------
@@ -1265,10 +1428,11 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     single = run_worker("mixed_validity", tmp_path / "single.json", fsdp_size=2,
                         explicit=True)
 
-    # The producers really did disagree, and the seams really did agree.
+    # The producers really did disagree, and the seams really did agree, on one layout: each rank's
+    # validity laid out as its rows' coordinates (ledger 1122).
     assert reports[0]["local_fields"] == [] and reports[1]["local_fields"] == ["attention_mask"]
-    assert [report["agreed_fields"] for report in reports] == [["attention_mask"]] * 2
-    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    assert [report["agreed_fields"] for report in reports] == [["coordinates"]] * 2
+    assert [report["placed_fields"] for report in reports] == [["coordinates"]] * 2
     assert reports[0]["agreed_all_true"] is True and reports[1]["agreed_all_true"] is False
     assert reports[0]["batch_sharding"]["fully_addressable"] == [False]
 
@@ -1312,7 +1476,8 @@ def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
     reports = run_pool("sequence_hybrid", tmp_path / "pool", 2, script=worker_script, devices=1, fsdp_size=1,
                        timeout=180)
     assert [report["sequence_processes"] for report in reports] == [[[0, 1]]] * 2
-    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    # Each rank's validity laid out as its rows' coordinates, one layout (ledger 1122).
+    assert [report["placed_fields"] for report in reports] == [["coordinates"]] * 2
     assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
     assert np.isfinite(reports[0]["loss"]) and np.isfinite(reports[0]["update_scale"])
     assert reports[0]["update_scale"] > 0
@@ -1352,7 +1517,8 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
 
     for report in reports:
         assert report["process_count"] == 2
-        assert report["image_spec"] == report["token_spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        requests = "P(('diloco', 'data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["image_spec"] == report["token_spec"] == requests
         assert report["image_rows"] == report["rows"] == 3
         assert set(report["rejected"]) == {"prompts", "guidance", "steps", "row_count",
                                            "prepared", "prepared_rows", "request_kind", "budget"}
@@ -1379,7 +1545,7 @@ def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_
 
     for report in reports:
         assert report["process_count"] == 2
-        assert report["spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["spec"] == "P(('diloco', 'data', 'expert', 'fsdp', 'tensor'),)"
         # Four placed prompt rows per process, three of them real, times three
         # continuations: the padded prompt's group stays out of the result.
         assert report["global_rows"] == 24 and report["rows"] == 9
@@ -1435,11 +1601,11 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert len(preview) == 1 and preview[0] not in scoring
         assert report["results"]["preview_only"]["events"][0][0] == "preview"
         assert len(report["results"]["preview_only"]["events"]) == 1
-        assert report["results"]["preview_only"]["scores"]["evaluation/coordinated_batches"] == 1
-        assert report["results"]["preview_only"]["scores"]["evaluation/records"] == 8
+        assert report["results"]["preview_only"]["scores"]["evaluation/counts/val/coordinated_batches"] == 1
+        assert report["results"]["preview_only"]["scores"]["evaluation/counts/val/records"] == 8
         # Process 0 holds one batch and process 1 two: process 0 covers the
         # second with its first's rows marked repeats, so the pass reads all 12.
-        assert report["results"]["uneven"]["scores"]["evaluation/coordinated_batches"] == 2
+        assert report["results"]["uneven"]["scores"]["evaluation/counts/val/coordinated_batches"] == 2
         for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
             assert "error" in report["results"][phase], (phase, report)
             if phase != "construct":
@@ -1448,8 +1614,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert report["results"]["empty"] == {"scores": {}, "events": []}
         assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
         assert "no_consumer" not in report["closed"]
-        assert report["results"]["normal"]["scores"]["evaluation/records"] == 16
-        assert report["results"]["uneven"]["scores"]["evaluation/records"] == 12
+        assert report["results"]["normal"]["scores"]["evaluation/counts/val/records"] == 16
+        assert report["results"]["uneven"]["scores"]["evaluation/counts/val/records"] == 12
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []
@@ -1460,14 +1626,36 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
 
 
 @pytest.mark.distributed
+def test_a_tracker_failing_off_the_step_loop_stops_both_processes_at_one_tick(tmp_path):
+    """Rank 0's tracker fails writing its second log, which its writer does off the step loop (row 2313):
+    both processes end with rank 0's error, the peer through the agreement, having run the same steps,
+    as the loop agrees on each write's outcome at a tick every process reaches alike, never on the
+    writer's threads. Which tick that is depends on when the writer runs, so the steps run are the
+    processes' agreement, not a count."""
+    reports = run_pool("training_log_failure", tmp_path, 2, script=LOG_WRITER)
+    # Rank 0 raises its tracker's own error; its peer, the agreement's report of it.
+    assert [report["error"] for report in reports] == ["ValueError", "PeerFailure"], reports
+    assert reports[0]["steps"] == reports[1]["steps"], reports
+
+
+@pytest.mark.distributed
 @pytest.mark.parametrize("axis", ["stage", "sequence"])
 def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, axis):
     reports = run_pool("evaluation_replicas", tmp_path, 2, devices=1, name=axis)
     assert reports[0]["measured"] == reports[1]["measured"]
     for report in reports:
         assert report["measured"]["val/count"] == 3
-        assert report["measured"]["evaluation/records"] == 3
+        assert report["measured"]["evaluation/counts/val/records"] == 3
         assert report["no_consumer"] == {}
+
+
+@pytest.mark.distributed
+def test_a_pass_only_root_is_asked_to_keep_runs_alike_on_every_rank(tmp_path):
+    """Process 0 alone is asked to keep a pass's decisions, which scores no metric: both ranks score
+    every batch and end, with root's loss, and root writes each batch's file."""
+    first, second = run_pool("evaluation_kept", tmp_path / "out", 2, run_dir=tmp_path / "run")
+    assert first["scores"] == second["scores"] and "val/loss" in first["scores"]
+    assert first["written"] == second["written"] == ["val-00000.npz", "val-00001.npz"]
 
 
 @pytest.mark.distributed
@@ -1585,6 +1773,33 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
     assert "NotADirectoryError" in reports[0]["failed"]
     assert "profiling window start" in reports[1]["failed"]
     assert all(report["recovered"] == 2 for report in reports)
+
+@pytest.mark.distributed
+def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_exports(tmp_path):
+    """Rank 0 cannot write its trace as the window stops, while rank 1's stop starts its export: the pool
+    fails the stop together, and each rank's cleanup waits for the exports it started, so rank 1's export
+    has written its manifest and none runs on as the fit returns (row 2767's review)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    reports = run_pool("profile_stop_failure", tmp_path / "pool", 2, script=PROFILE_STOP, devices=2,
+                       timeout=300, steps=4, profile_dir=str(tmp_path / "pool" / "trace"))
+    assert all("profile stop" in (report["failed"] or "") for report in reports), reports
+    assert reports[1]["manifests"] == 1
+    assert all(report["recovered"] == 2 for report in reports)
+
+
+@pytest.mark.distributed
+def test_a_pools_reads_after_its_first_agree_nothing_where_no_share_can_run_out_alone(tmp_path):
+    """A pool agrees a read of its training stream after the first only where its shares may run out
+    apart: over a finite global order, which every share runs out of at the same read, over arrays
+    handed whole, over a Grain map dataset handed to read without end, and in a cooldown branch of an
+    endless order, a run of twice the steps takes no round more than the shorter one (a read agreed
+    at each step, as every one of these was, takes one a step: 1.4 ms on two loopback processes, 38 ms
+    on eight containers, docs/performance.md)."""
+    reports = run_pool("read_rounds", tmp_path / "rounds", 2, script=READ_ROUNDS, timeout=300, steps=4)
+    for report in reports:
+        assert {kind: longer - shorter for kind, (shorter, longer) in report.items()} == {
+            "global": 0, "whole": 0, "map": 0, "cooldown": 0}, report
+
 
 @pytest.mark.distributed
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):

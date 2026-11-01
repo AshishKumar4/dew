@@ -569,9 +569,12 @@ def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str,
                                             strict=True):
                 dot = figure.circle(x, y, 3.5, fill=color)
                 if moved:
-                    figure.animate(dot, {seconds * 0.15: {"transform": "translate(0px,0px)"},
-                                         seconds * 0.55: {"transform": f"translate({to_x - x:.1f}px,"
-                                                                       f"{to_y - y:.1f}px)"}})
+                    # From the places as written, to the hundredth, so a dot's place plus its slide is
+                    # exactly where its twin is written.
+                    slide = (_number(round(to_x, 2) - round(x, 2)), _number(round(to_y, 2) - round(y, 2)))
+                    moves = {seconds * 0.15: {"transform": "translate(0px,0px)"},
+                             seconds * 0.55: {"transform": f"translate({slide[0]}px,{slide[1]}px)"}}
+                    figure.animate(dot, moves)
             continue
         with figure.group() as group:
             figure.polyline(placed, color=color, width=1.25, dash="5 4" if index >= len(SERIES) else None)

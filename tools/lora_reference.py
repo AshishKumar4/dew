@@ -4,7 +4,7 @@
 Everything here runs under torch with PEFT, which dew does not depend on, so
 this is the only place the reference adapters are executed. Two isolated
 environments, both sharing the baseline site-packages through a `.pth` file
-(see /home/mrwhite0racle/.cache/dew/vision-check/lib/python3.12/site-packages/dew-baseline.pth):
+(see ~/.cache/dew/vision-check/lib/python3.12/site-packages/dew-baseline.pth):
 
     uv venv --python <py312> ~/.cache/dew/peft-reference
     uv pip install --python ~/.cache/dew/peft-reference/bin/python --no-deps peft==0.20.0 accelerate psutil

@@ -1,6 +1,7 @@
 """Attention over nearby keys in memory linear in the sequence: sliding windows
-and chunked local attention, run as one flagged kernel call where a kernel
-takes the window, else as banded blocks of the span."""
+and chunked local attention, run as one whole call where the attention template
+takes it (its spans, a chunk each query's run of keys) or a kernel takes the
+window as a flag, else as banded blocks of the span."""
 
 import functools
 
@@ -8,25 +9,22 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.batch import valid_order
+from dew.batch import prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, logical_spec
 
 from .attention import (
-    SPLASH_LANES,
+    AttentionImpl,
     attention_kernel,
-    chunk_mask,
-    combined_attention_mask,
-    cudnn_takes_mask,
-    kernel_for_materialized_mask,
-    query_split,
+    mask_kernel,
     resolve_implementation,
     scaled_dot_product_attention,
-    split_with_queries,
-    tensor_shards,
 )
+from .attention_kernels import SPLASH_LANES
+from .attention_masks import chunk_mask, combined_attention_mask
+from .attention_parallel import query_split, split_with_queries, tensor_shards
 from .documents import with_documents
 from .inputs import sequence_blocks
-from .kernels.selection import forced
+from .kernels.templates import attention as template
 from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
 from .visibility import same_chunk, visible
 
@@ -46,7 +44,7 @@ def _banded(x, before=None):
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
                     places=None, segment_ids=None, max_segments=None, valid=None,
                     right_padded: bool = False, dtype=None, precision=None, force_fp32_for_softmax=True,
-                    implementation='auto', sinks=None, softcap=None):
+                    implementation: AttentionImpl = 'auto', sinks=None, softcap=None):
     """Causal self-attention in which each query reads only nearby keys, in
     memory linear in the sequence.
 
@@ -62,11 +60,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     without them; `right_padded` says each row's valid slots come first
     (`AttentionMetadata.right_padded`).
 
-    No `[S, S]` array is built above two spans. A window flash, cudnn (no
+    No `[S, S]` array is built above two spans. A call the attention template
+    takes runs whole as its spans, which it walks tile by tile: the window, or
+    each query's run of its chunk's keys (`chunk_runs`), with the documents,
+    the valid keys, the sinks and the softcap. A window flash, cudnn (no
     sinks) or splash takes as a flag, without packing, runs there, skipping
-    blocks outside it.
-    Chunks that start at row multiples fold into the batch. Everything else
-    runs banded: query blocks of the span against their own block and the one
+    blocks outside it. Elsewhere chunks that start at row multiples fold into
+    the batch, and everything else runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
     pads to whole spans, so at most two spans take the dense call. A row with
     padding among its tokens runs on its real tokens alone (`compacted`), so
@@ -87,8 +87,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         _local_attention, window=window, chunk=chunk, max_segments=max_segments, dtype=dtype,
         precision=precision, force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
         sinks=sinks, softcap=softcap)
-    # A window counts tokens by their distance alone, so only a chunk reads the places.
-    places = None if chunk is None else places
+    # A window counts tokens by their distance alone, so only a chunk reads the places, at 32 bits at
+    # least: a chunk past a narrower dtype's largest is no number of it.
+    if chunk is None or places is None:
+        places = None
+    else:
+        places = jnp.asarray(places)
+        places = places.astype(jnp.promote_types(places.dtype, jnp.int32))
     if valid is not None and not right_padded:
         return compacted(attend, query, key, value, places, segment_ids, valid)
     return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid)
@@ -107,21 +112,15 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments)
-    # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
-    # its additive bias where cudnn runs (docs/performance.md: 16384 packed
-    # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
-    # asked for 10.0 GiB at 8192). Flash takes no mask, and the whole call's
-    # packed documents keep cuDNN off it (they reach it only as this mask), so
-    # where 'auto' chose either for the window, a masked call still goes to
-    # cudnn, unless the caller chose xla (`generation.chosen`).
-    banded = resolved == 'flash' or (resolved == 'xla' and forced('attention') is None)
-    on_cudnn = resolved == 'cudnn' or (implementation == 'auto' and banded
-                                       and cudnn_takes_mask(implementation, query, softcap=softcap,
-                                                            sinks=sinks is not None))
-    masked = 'cudnn' if on_cudnn else kernel_for_materialized_mask(
-        implementation, query, key, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax)
+        causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments).ran
+    if resolved == 'template':
+        # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
+        # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
+        # the documents, the valid keys, the sinks and the softcap as they are, no band and no mask.
+        runs = (None if chunk is None
+                else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk))
+        return whole(implementation=implementation, causal=True, sliding_window=window,
+                     segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
     if window is not None and valid is None:
         # An explicit 'tpu' at a length splash cannot tile would reach the
         # flash kernel, whose default 128-row blocks must divide the length
@@ -133,6 +132,13 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         if on_splash or (packs and (windowed or length <= 2 * span)):
             return whole(implementation=implementation, causal=True, sliding_window=window,
                          segment_ids=segment_ids, max_segments=max_segments)
+    # Past the whole call, a mask built here is at most `[S, 2W]` per head, which cuDNN takes as its
+    # additive bias (`mask_kernel`'s `as_bias`): flash takes no mask, and the whole call's packed documents
+    # keep cuDNN off it, so the band goes to cuDNN where it takes the call, a kernel a run's context forces
+    # as forced.
+    masked = mask_kernel(implementation, query, key, as_bias=True, dtype=dtype, precision=precision,
+                         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
+                         sinks=sinks is not None)
     shards = sequence_shards()
     # Under a sequence axis each shard's first block reads the previous
     # shard's last `span` rows, which only one neighbour holds when a shard's
@@ -178,6 +184,24 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     return checkpoint_name(out, 'attention_output')
 
 
+def chunk_runs(places, segment_ids, valid, rows: int, length: int, chunk: int) -> jax.Array:
+    """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` (`template.spans`' `runs`): its own chunk's keys
+    of `chunk` places at or before it within its document, chunked attention's, as the template's spans
+    take a chunk (`template.spans`' `chunk`, the one algorithm), one interval a query, which every
+    mainloop walks. `places` `[S]` or `[B, S]`, None for the row index. The keys `valid` `[B, S]` does not
+    mark are no document's (id 0, padding): a compacted row's padding sits after its tokens at places
+    that restart (`compacted`), which the search along a document's places would read as its own."""
+    positions = None
+    if places is not None:
+        place = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(places)), (rows, length))
+        positions = place, place
+    if valid is not None:
+        segment_ids = jnp.where(valid, 1 if segment_ids is None else segment_ids, 0)
+    spans = template.spans(length, length, rows, causal=True, chunk=chunk, positions=positions,
+                           segment_ids=segment_ids)
+    return jnp.stack([spans.start, spans.end], axis=-1)[:, :, None, :]
+
+
 def compacted(attend, query, key, value, places, segment_ids, valid):
     """`attend` over each row's real tokens moved to its front in order, their
     places and documents with them, and its outputs moved back to their slots:
@@ -202,8 +226,8 @@ def compacted(attend, query, key, value, places, segment_ids, valid):
     real = _whole_sequence(jnp.asarray(valid, bool))
     order, count = valid_order(real)
     # Each slot's column in that order: a real token's rank among the real, a padding slot's after them.
-    column = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1,
-                       count[:, None] + jnp.cumsum(~real, axis=1, dtype=jnp.int32) - 1)
+    column = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1,
+                       count[:, None] + prefix_sum(~real, dtype=jnp.int32) - 1)
 
     def moved(x, to):
         x = jnp.asarray(x)

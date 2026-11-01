@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
-"""Write the fixtures of PEFT and Diffusers reading the LoRA adapters Dew writes.
+"""The LoRA adapters Dew writes, and the fixtures of Diffusers reading them.
 
 Each case adapts a committed tiny source through Dew, moves every factor by
 a seeded draw (a stand-in for training) and writes the adapter with
 `LoRA.save`: PEFT's directory for a decoder, the Diffusers file for a
-pipeline. Its consumer then reads exactly those files and runs the adapted
-and the merged model on fixed inputs, in float32 and in float64. Two halves,
-in two environments:
+pipeline. tests/test_lora.py writes a decoder's case itself and runs PEFT
+over it in the test; a pipeline's consumer reads exactly the committed files
+and runs the adapted and the merged model on fixed inputs, in float32 and in
+float64. Two halves, in two environments, for the pipelines:
 
-- `export` (the Dew environment, on the CPU) writes every case's adapter into
-  tests/fixtures/lora_exports/<case>, which is committed. tests/test_lora.py
+- `export` (the Dew environment, on the CPU) writes every pipeline case's adapter
+  into tests/fixtures/lora_exports/<case>, which is committed. tests/test_lora.py
   reruns `export_case` on its own device and requires those files' layout,
   and reads its outputs from the committed files.
-- `consume` (a PEFT 0.20.0 environment over the Dew one, whose
-  transformers 5.16.1, Diffusers 0.34.0 and torch it uses) loads each
+- `consume` (a PEFT environment over the Dew one, whose transformers,
+  Diffusers and torch it uses; the committed files were recorded under PEFT
+  0.20.0, transformers 5.16.1 and Diffusers 0.34.0) loads each
   committed adapter, requires every tensor in the file to land in the model
   and no other adapter state, and writes tests/fixtures/lora_exports/<case>.npz:
   the inputs, the adapted and the merged (PEFT's `merge_and_unload`,
   Diffusers' `fuse_lora`) outputs in float32 and float64
   (`torch_precision.float64`) and the output without the adapter.
 
-The decoders are tests/fixtures/hf/llama-tiny under PEFT's `PeftModel`;
-the pipelines are the tiny SD (its PyTorch UNet), FLUX and SD3 sources
+The decoders are tests/fixtures/hf/llama-tiny under PEFT's `PeftModel`, in
+the test; the pipelines are the tiny SD (its PyTorch UNet), FLUX and SD3 sources
 under their Diffusers pipelines' `load_lora_weights`.
 
     uv venv --python .venv/bin/python ~/.cache/dew/reference-venvs/peft
     echo $PWD/.venv/lib/python3.12/site-packages \\
         > ~/.cache/dew/reference-venvs/peft/lib/python3.12/site-packages/dew-env.pth
-    uv pip install --python ~/.cache/dew/reference-venvs/peft/bin/python --no-deps peft==0.20.0
+    uv pip install --python ~/.cache/dew/reference-venvs/peft/bin/python --no-deps peft==0.21.2
     JAX_PLATFORMS=cpu PYTHONPATH=src python tools/lora_export_reference.py export
     ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_export_reference.py consume
 """
@@ -77,6 +79,8 @@ CASES = {
     "flux": Case("flux", 4, alpha=8.0, rslora=True),
     "sd3": Case("sd3", 5, rank=2, alpha=3.0),
 }
+PIPELINES = {name: case for name, case in CASES.items() if case.source != "llama"}
+"""The cases whose consumer is recorded: a decoder's, PEFT, runs in the test."""
 
 
 @contextlib.contextmanager
@@ -186,29 +190,6 @@ def assert_landed(model, tensors: Mapping[str, np.ndarray], prefix: str = "") ->
             raise AssertionError(f"{name} holds other values than the file's")
 
 
-def decoder_outputs(adapter: Path, wide: bool) -> dict[str, np.ndarray]:
-    """llama-tiny under PEFT with the adapter, and merged into the weights."""
-    import torch
-    from peft import PeftModel
-    from safetensors.numpy import load_file
-    from transformers import AutoModelForCausalLM
-
-    from tools.diffusers_consumer import precision
-
-    ids = torch.from_numpy(np.load(LLAMA / "input_ids.npy")).long()
-    with precision(wide):
-        base = AutoModelForCausalLM.from_pretrained(LLAMA, dtype=torch.float64 if wide else torch.float32,
-                                                    attn_implementation="eager")
-        model = PeftModel.from_pretrained(base, adapter).eval()
-        assert_landed(model, load_file(str(adapter / "adapter_model.safetensors")))
-        with torch.no_grad():
-            adapted = model(ids).logits.numpy()
-            with model.disable_adapter():
-                plain = model(ids).logits.numpy()
-            merged = model.merge_and_unload()(ids).logits.numpy()
-    return {"adapted": adapted, "merged": merged, "base": plain}
-
-
 def _prediction(family: str, model, arrays: Mapping[str, np.ndarray], wide: bool) -> np.ndarray:
     """The denoiser's call on the inputs, read back into Dew's layout: the
     SD UNet and SD3 take channels first, FLUX packs 2x2 latent patches into
@@ -297,16 +278,12 @@ def consume() -> None:
     restore_transformers_names()
 
     FIXTURES.mkdir(parents=True, exist_ok=True)
-    for name, case in CASES.items():
+    for name, case in PIPELINES.items():
         adapter = FIXTURES / name
-        if case.source == "llama":
-            arrays = {"input_ids": np.load(LLAMA / "input_ids.npy")}
-        else:
-            with source_directory(case.source) as source:
-                arrays = pipeline_inputs(source, case.source)
+        with source_directory(case.source) as source:
+            arrays = pipeline_inputs(source, case.source)
         for precision, wide in (("fp32", False), ("fp64", True)):
-            outputs = (decoder_outputs(adapter, wide) if case.source == "llama"
-                       else pipeline_outputs(case.source, adapter, arrays, wide))
+            outputs = pipeline_outputs(case.source, adapter, arrays, wide)
             arrays.update({f"{precision}.{kind}": value for kind, value in outputs.items()
                            if kind != "base" or not wide})
         meta = {"peft": peft.__version__,
@@ -321,7 +298,7 @@ def consume() -> None:
 def export() -> None:
     from dew.interop.pretrained import Pretrained
 
-    for name, case in CASES.items():
+    for name, case in PIPELINES.items():
         with source_directory(case.source) as source:
             loaded = Pretrained.load(source, dtype="float32", attention_impl="xla")
             export_case(case, loaded, FIXTURES / name)

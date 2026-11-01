@@ -9,9 +9,10 @@ them imports another for these."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +55,12 @@ leaves that `freeze` keeps in `params` are the ones that train. The frozen
 leaves stay in this collection as part of the state, and `thaw` merges the
 two before the model reads them."""
 
+PACKED_FROZEN = "packed_frozen"
+"""The collection that flags, beside a projection group packed from a tree split for training whose
+members are some trained and some frozen (`dew.inference.projections`), which members were frozen: at
+each of its packed leaves' paths, one flag a member, in the group's order. With `FROZEN` it is the
+training split, which a split of the group restores and `thaw` drops: the model reads neither."""
+
 
 VALID_ROWS = "valid_rows"
 """The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
@@ -74,6 +81,32 @@ trainer's transaction reads it for the examples' draws (`Step.example_index`) an
 batch the objective sees."""
 
 
+EXAMPLES_CONSUMED = "examples_consumed"
+"""A training batch's column of the source examples each row is the last of, int32, in a run bounded in
+examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
+consumes, which the trainer's step adds to the run's clock (`TrainState.consumed`) and takes out of the
+batch the objective sees. A repeat filling out a short batch holds none."""
+
+
+CLOSES_WINDOW = "closes_window"
+"""A training batch's step-wide flag, in a run bounded in examples that counts no steps ahead: whether it
+is the last its stream holds, so the update window it ends commits over the microbatches it holds however
+few (`dew.training.transaction.Transaction.prepare_attempt`), where a window of a whole update's would be
+left open, and the examples it consumed with it, as the stream ends."""
+
+CONSUMED_COUNT = "consumed_count"
+"""A training batch's host field of the examples it consumes (`ConsumedCount`), which the trainer counts
+as it prepares the batch, so its loop reads the run's progress without waiting on its devices."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ConsumedCount:
+    """A training batch's consumed examples as its host counted them before placing it, the sum of its
+    `EXAMPLES_CONSUMED` column: an object no device holds (`dew.distributed.batches.split_fields`)."""
+
+    examples: int
+
+
 def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
     """The rows `count` places hold of `rows` real ones, cycling through them, and which places hold
     a repeat: the rule a batch filled out with its own rows (`dew.data.dataset.FilledBatch`) and a
@@ -88,10 +121,20 @@ def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
 VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
 
+SEGMENTS_FIELD = "segment_ids"
+"""The token field that numbers each slot's document. Absent means one document a row."""
+
+POSITIONS_FIELD = "positions"
+"""The token field that holds each slot's place. Absent means each slot's own, counted from its row's
+start."""
+
 
 COORDINATES_FIELD = "coordinates"
 """The token field that holds the tokens' `Coordinates`, which a decoder reads in place of the
 validity field, `segment_ids` and `positions`."""
+
+TEXT_KEY = "text"
+"""Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
 
 BLOCKS_FIELD = "block_groups"
 """The token field that numbers the tokens' blocks, which the attention layers that read blocks see whole
@@ -137,17 +180,43 @@ class Coordinates:
     tokens; `starts` marks each document's first real token but a row's
     first, which continues whatever state the row holds. Each is None where
     it holds nothing (one document a row, every token real, no start), which
-    a layer's fast path reads as a static fact. `max_segments` bounds the
-    documents a row holds (the packer's static plan, else the row length) and
-    `right_padded` says every row's real tokens come first.
+    a layer's fast path reads as a static fact. `firsts` `[B, D]` are each
+    row's documents' first slots in order, the row's first slot among them,
+    `S` past its last (`document_firsts`): the packed documents' coordinates
+    every varlen kernel reads (`dew.nn.inputs.cu_seqlens`), built with the
+    coordinates, never by a layer: by one builder wherever coordinates are
+    made, a host's batch and a traced step's alike, or their slots sliced or
+    rotated (`along_tokens`; row 1923); each layer's own scan over the
+    batch's flattened tokens, which a mesh splits, ran one token a loop
+    iteration on a 2xH100 run (row 1897). `max_segments` bounds the documents a row holds
+    (the packer's static plan, else the row length) and `right_padded` says
+    every row's real tokens come first.
     """
 
     positions: jax.Array | None = None
     segments: jax.Array | None = None
     valid: jax.Array | None = None
     starts: jax.Array | None = None
+    firsts: jax.Array | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
+
+    TOKEN_ALIGNED: ClassVar[tuple[str, ...]] = ("positions", "segments", "valid", "starts")
+    """The fields one entry a token, `[B, S]`; `firsts` is one a document, `[B, D]`, its entries slots."""
+
+    def tokens(self) -> dict[str, jax.Array]:
+        """The token-aligned fields it holds (`TOKEN_ALIGNED`), by name: what a check of a batch's token
+        layout reads."""
+        return {name: getattr(self, name) for name in self.TOKEN_ALIGNED if getattr(self, name) is not None}
+
+    def along_tokens(self, transform: Callable[[jax.Array], jax.Array]) -> Coordinates:
+        """`transform` applied along the tokens to each token-aligned field (`TOKEN_ALIGNED`): a slice or a
+        rotation of the slots. The documents' firsts, which index the slots, are built again from the
+        moved starts (`document_firsts`), as every `Coordinates` builds them."""
+        moved = replace(self, **{name: transform(value) for name, value in self.tokens().items()})
+        if moved.starts is None:
+            return moved
+        return replace(moved, firsts=document_firsts(moved.starts, moved.max_segments + 1))
 
     def places(self) -> jax.Array | None:
         """Each token's logical place in an uncached call: the given `positions`, else its rank among
@@ -159,13 +228,90 @@ class Coordinates:
         return real_places(self.valid)
 
 
+SCAN_BLOCKS = 64
+"""How many blocks a running sum or maximum along a token axis cuts the axis into (`prefix_sum`): its scans
+run inside each block, so a mesh that splits the axis into up to this many shards keeps every scan on one
+shard, and the blocks' carries are one reduction over the blocks before each."""
+
+
+def prefix_sum(x, axis: int = 1, *, dtype=None, xp=jnp):
+    """`x`'s running sum along `axis`, `cumsum`'s, in `dtype` (as `cumsum` takes it where None: a bool's
+    or a narrow integer's in the default integer), as a program a mesh that splits the axis keeps
+    parallel: XLA's SPMD partitioner turns one scan along a split axis into a scan with a live carry,
+    which the GPU's associative-scan rewrite refuses, and runs it as a loop of one iteration a token (a
+    2xH100 training step ran ten times slower, ledger 1905). Here each of `SCAN_BLOCKS` blocks scans its
+    own slots along an axis no mesh splits, and each block adds the sum of the blocks before it, in the
+    result's dtype throughout, so an integer sum wraps as `cumsum`'s does. Exact for integers; a float's
+    sum is reassociated by blocks. `xp` numpy computes it on the host."""
+    if xp is np:
+        return np.cumsum(x, axis=axis, dtype=dtype)
+    x = jnp.asarray(x)
+    # The dtype `cumsum` sums `x` in, given `dtype` or not.
+    one = jax.ShapeDtypeStruct((1,), x.dtype)
+    summed = jax.eval_shape(lambda first: jnp.cumsum(first, dtype=dtype), one).dtype
+    return _blocked_scan(x.astype(summed), axis, lambda part, at: jnp.cumsum(part, axis=at, dtype=summed),
+                         lambda part, axis: jnp.sum(part, axis=axis, dtype=summed), jnp.add, 0)
+
+
+def prefix_max(x, axis: int = 1, *, xp=jnp):
+    """`x`'s running maximum along `axis`, `cummax`'s, as a program a mesh that splits the axis keeps
+    parallel (`prefix_sum`)."""
+    if xp is np:
+        return np.maximum.accumulate(x, axis=axis)
+    x = jnp.asarray(x)
+    return _blocked_scan(x, axis, lambda part, at: jax.lax.cummax(part, axis=at), jnp.max, jnp.maximum,
+                         _extreme(x.dtype, low=True))
+
+
+def prefix_min(x, axis: int = 1, *, reverse: bool = False, xp=jnp):
+    """`x`'s running minimum along `axis`, from its end where `reverse`, as a program a mesh that splits
+    the axis keeps parallel (`prefix_sum`)."""
+    flipped = xp.flip(xp.asarray(x), axis) if reverse else xp.asarray(x)
+    if xp is np:
+        running = np.minimum.accumulate(flipped, axis=axis)
+    else:
+        running = _blocked_scan(flipped, axis, lambda part, at: jax.lax.cummin(part, axis=at), jnp.min,
+                                jnp.minimum, _extreme(flipped.dtype, low=False))
+    return xp.flip(running, axis) if reverse else running
+
+
+def _extreme(dtype, *, low: bool):
+    """The identity of a running maximum (`low`) or minimum over `dtype`: a float's infinity, an integer's
+    bound, a bool's False or True."""
+    if jnp.issubdtype(dtype, jnp.floating):
+        return -jnp.inf if low else jnp.inf
+    if dtype == jnp.bool_:
+        return not low
+    bounds = jnp.iinfo(dtype)
+    return bounds.min if low else bounds.max
+
+
+def _blocked_scan(x, axis: int, scan, reduce, combine, identity):
+    """`scan` along `axis` of `x` cut into `SCAN_BLOCKS` blocks, each block's scan combined with the
+    `reduce` of the blocks' totals before it, the axis padded with `identity` to whole blocks. An empty
+    axis scans to itself."""
+    moved = jnp.moveaxis(x, axis, -1)
+    *lead, length = moved.shape
+    if length == 0:
+        return x
+    size = -(-length // SCAN_BLOCKS)
+    widths = [(0, 0)] * len(lead) + [(0, size * SCAN_BLOCKS - length)]
+    padded = jnp.pad(moved, widths, constant_values=jnp.asarray(identity, x.dtype))
+    inner = scan(padded.reshape(*lead, SCAN_BLOCKS, size), len(lead) + 1)
+    earlier = jnp.tril(jnp.ones((SCAN_BLOCKS, SCAN_BLOCKS), bool), -1)
+    carried = reduce(jnp.where(earlier, inner[..., None, :, -1], jnp.asarray(identity, x.dtype)), axis=-1)
+    joined = combine(inner, carried[..., None]).astype(x.dtype)
+    joined = joined.reshape(*lead, size * SCAN_BLOCKS)[..., :length]
+    return jnp.moveaxis(joined, -1, axis)
+
+
 def real_places(valid: jax.Array) -> jax.Array:
     """Each slot's rank among its row's real tokens under `valid` `[B, S]`: a real token's place, a
     padding slot's the rank before it, 0 before any (`Coordinates.places` where no positions are given)."""
-    return jnp.maximum(jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1, 0)
+    return jnp.maximum(prefix_sum(valid, dtype=jnp.int32) - 1, 0)
 
 
-def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
+def coordinates(shape: tuple[int, ...] | None = None, *, segments=None, valid=None, positions=None,
                 max_segments: int | None = None, right_padded: bool = False, xp=jnp) -> Coordinates:
     """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
     (one document a row where None), a `valid` mask (every token real where None), explicit
@@ -193,19 +339,69 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
         real = real & (segments != 0)
         positions = xp.where(real, document_ranks(real, starts, xp=xp), 0)
     positions = None if positions is None else xp.asarray(positions, np.int32)
-    return Coordinates(positions, segments, valid, starts,
-                       max_segments=(1 if segments is None else length) if max_segments is None
-                       else max_segments,
+    max_segments = (1 if segments is None else length) if max_segments is None else max_segments
+    # The documents' firsts, by the one builder a host's batch and a traced step's alike take.
+    firsts = None if starts is None else document_firsts(starts, max_segments + 1, xp=xp)
+    return Coordinates(positions, segments, valid, starts, firsts, max_segments=max_segments,
                        right_padded=right_padded)
+
+
+TOKEN_LAYOUT_FIELDS = (SEGMENTS_FIELD, VALIDITY_FIELD, POSITIONS_FIELD)
+"""The flat token fields a call's layout is given in where it gives no `Coordinates`
+(`token_coordinates`): its documents, its validity and its places."""
+
+
+def token_coordinates(shape: tuple[int, ...], given: Coordinates | None = None, *, segments=None,
+                      valid=None, positions=None, right_padded: bool = False) -> Coordinates | None:
+    """A call's token layout as one `Coordinates`, the one conversion of its fields: `given` as it is,
+    else built (`coordinates`) from the flat fields `segment_ids` (`segments`), `attention_mask`
+    (`valid`) and `positions`, None where the call gives none. A call giving both is refused: its
+    `Coordinates` would silently drop its flat fields (ledger 1122)."""
+    fields = zip(TOKEN_LAYOUT_FIELDS, (segments, valid, positions), strict=True)
+    flat = [name for name, value in fields if value is not None] + (["right_padded"] if right_padded else [])
+    if given is not None:
+        if flat:
+            raise ValueError(f"a call's tokens are laid out by their coordinates or by their fields, not "
+                             f"both: coordinates with {', '.join(flat)}")
+        return given
+    if not flat:
+        return None
+    return coordinates(shape, segments=segments, valid=valid, positions=positions, right_padded=right_padded)
+
+
+def field_coordinates(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
+                      shape: tuple[int, ...]) -> Coordinates | None:
+    """A row's token fields' layout as one `Coordinates`, the one conversion of a field dict's flat
+    layout (`token_coordinates`): their `Coordinates` as they are, else built from their flat
+    `segment_ids`, `attention_mask` and `positions`, None where they carry neither; both refused."""
+    return token_coordinates(shape, laid_coordinates(fields), segments=flat_field(fields, SEGMENTS_FIELD),
+                             valid=flat_field(fields, VALIDITY_FIELD),
+                             positions=flat_field(fields, POSITIONS_FIELD))
+
+
+def document_firsts(starts, documents: int, *, xp=jnp):
+    """Each row's first `documents` documents' first slots in order `[B, min(documents, S)]`, the row's
+    first slot and each of `starts` `[B, S]`, `S` past its last: a sort of each row's slots, which a mesh
+    splitting the rows sorts on each device (`Coordinates.firsts`)."""
+    rows, length = starts.shape
+    if xp is np:
+        begun = np.asarray(starts, bool).copy()
+        begun[:, 0] = True
+        slots = np.broadcast_to(np.arange(length, dtype=np.int32), (rows, length))
+    else:
+        # Placed as the starts are (an Explicit mesh's rows split), each row sorted on its own device.
+        begun = jnp.asarray(starts, bool).at[:, 0].set(True)
+        placed = jax.typeof(begun).sharding
+        slots = jax.lax.broadcasted_iota(jnp.int32, (rows, length), 1, out_sharding=placed)
+    return xp.sort(xp.where(begun, slots, length), axis=1)[:, :min(documents, length)].astype(np.int32)
 
 
 def document_ranks(real, starts, *, xp=jnp):
     """Each slot's count of the real tokens before it in its document `[B, S]`, `starts` marking each
     document's first real token but a row's first, a padding slot taking the count before it (0
     before any)."""
-    rank = xp.cumsum(real, axis=1, dtype=np.int32) - 1
-    begun = xp.where(starts, rank, 0)
-    first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
+    rank = prefix_sum(real, dtype=np.int32, xp=xp) - 1
+    first = prefix_max(xp.where(starts, rank, 0), xp=xp)
     return xp.maximum(rank - first, 0)
 
 
@@ -223,50 +419,89 @@ def document_starts(segments, valid, *, xp=jnp):
     """`[B, S]`: each real token whose segment differs from the previous real token's in its row, a
     row's first real token continuing what precedes the row and a padding slot starting nothing."""
     order, _ = valid_order(valid, xp=xp)
-    rank = xp.cumsum(valid, axis=1, dtype=np.int32) - 1
+    rank = prefix_sum(valid, dtype=np.int32, xp=xp) - 1
     compact = xp.take_along_axis(segments, order, axis=1)
     changed = xp.concatenate([xp.zeros_like(compact[:, :1], bool), compact[:, 1:] != compact[:, :-1]],
                              axis=1)
     return valid & xp.take_along_axis(changed, xp.maximum(rank, 0), axis=1)
 
 
+def flat_field(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], name: str
+               ) -> jax.Array | np.ndarray | None:
+    """The token field `name`, an array, or None where the fields hold none; a `Coordinates` under a
+    flat field's name is refused."""
+    value = fields.get(name)
+    if isinstance(value, Coordinates):
+        raise TypeError(f"token field {name!r} holds an array, not Coordinates")
+    return value
+
+
+def laid_coordinates(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]) -> Coordinates | None:
+    """The `Coordinates` a row's token fields carry, or None where they carry flat layout fields or
+    none; fields carrying both are refused, as a call giving both is (`token_coordinates`), since one
+    would silently win over the other, and so is anything but `Coordinates` under their key (ledger
+    1122)."""
+    laid = fields.get(COORDINATES_FIELD)
+    if laid is None:
+        return None
+    if not isinstance(laid, Coordinates):
+        raise TypeError(f"token field {COORDINATES_FIELD!r} holds Coordinates, not {type(laid).__name__}")
+    flat = [name for name in TOKEN_LAYOUT_FIELDS if fields.get(name) is not None]
+    if flat:
+        raise ValueError(f"token fields are laid out by their coordinates or by their fields, not both: "
+                         f"coordinates with {', '.join(flat)}")
+    return laid
+
+
 def token_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]):
     """The validity `[B, S]` a row's token fields hold, as given: their `Coordinates`' where the fields
-    carry them, else the validity field; None where neither holds one."""
-    laid = fields.get(COORDINATES_FIELD)
-    return laid.valid if isinstance(laid, Coordinates) else fields.get(VALIDITY_FIELD)
+    carry them (`laid_coordinates`), else the validity field; None where neither holds one."""
+    laid = laid_coordinates(fields)
+    return laid.valid if laid is not None else flat_field(fields, VALIDITY_FIELD)
 
 
 def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
     """The validity `[B, S]` and documents `[B, S]` of a row's token fields as the decoder reads them:
-    their `Coordinates`' where the fields carry them, else the validity field (`token_validity`) and
+    their `Coordinates`' where the fields carry them (`laid_coordinates`), else the validity field and
     `segment_ids`. Each is None where nothing gives it (every slot real, one document a row). `xp` is
     the array module."""
-    laid = fields.get(COORDINATES_FIELD)
-    valid = token_validity(fields)
-    segments = laid.segments if isinstance(laid, Coordinates) else fields.get("segment_ids")
+    laid = laid_coordinates(fields)
+    valid = laid.valid if laid is not None else flat_field(fields, VALIDITY_FIELD)
+    segments = laid.segments if laid is not None else flat_field(fields, SEGMENTS_FIELD)
     return (None if valid is None else xp.asarray(valid, bool),
             None if segments is None else xp.asarray(segments))
 
 
 def with_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
                   valid: jax.Array | np.ndarray | None) -> dict:
-    """`fields` holding `valid` as their validity where `token_validity` reads it, None removing it:
-    in their `Coordinates` where the fields carry them, which the decoder reads in place of the
-    validity field, else in the validity field."""
-    laid = fields.get(COORDINATES_FIELD)
-    if isinstance(laid, Coordinates):
-        return {**fields, COORDINATES_FIELD: replace(laid, valid=valid)}
-    rest = {name: value for name, value in fields.items() if name != VALIDITY_FIELD}
-    return rest if valid is None else {**rest, VALIDITY_FIELD: valid}
+    """`fields` holding `valid` as their validity where `token_validity` reads it, None removing it, their
+    layout one `Coordinates` built again from it (`coordinates`, its documents' starts and firsts
+    following it), whether the fields carried coordinates or flat layout fields (ledger 1122); none where
+    nothing is left to lay out (one document a row, every token real, at its slot), as fields that
+    carry no layout. A field dict's layout so takes one shape for one set of given fields, which a
+    pool's processes agree on (`dew.nn.inputs.agreed_validity`). Arrays stay on the host where `valid`
+    and the fields are numpy."""
+    laid = laid_coordinates(fields)
+    segments = laid.segments if laid is not None else flat_field(fields, SEGMENTS_FIELD)
+    positions = laid.positions if laid is not None else flat_field(fields, POSITIONS_FIELD)
+    rest = {name: value for name, value in fields.items()
+            if name not in (*TOKEN_LAYOUT_FIELDS, COORDINATES_FIELD)}
+    given = [field for field in (valid, segments, positions) if field is not None]
+    if not given:
+        return rest
+    host = all(isinstance(field, np.ndarray) for field in given)
+    rebuilt = coordinates(tuple(np.shape(given[0])[:2]), segments=segments, valid=valid, positions=positions,
+                          max_segments=None if laid is None else laid.max_segments,
+                          right_padded=laid is not None and laid.right_padded, xp=np if host else jnp)
+    return {**rest, COORDINATES_FIELD: rebuilt}
 
 
 def token_positions(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
     """The logical positions `[B, S]` of a row's token fields as the decoder reads them: their
-    `Coordinates`' where the fields carry them, else the `positions` field; None where neither gives
-    any. `xp` is the array module."""
-    laid = fields.get(COORDINATES_FIELD)
-    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+    `Coordinates`' where the fields carry them (`laid_coordinates`), else the `positions` field; None
+    where neither gives any. `xp` is the array module."""
+    laid = laid_coordinates(fields)
+    positions = laid.positions if laid is not None else flat_field(fields, POSITIONS_FIELD)
     return None if positions is None else xp.asarray(positions)
 
 
@@ -417,12 +652,14 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
 def thaw(variables: Variables) -> Variables:
     """Undo `freeze`, merging the frozen leaves back into one `params` collection.
 
-    Variables without a `FROZEN` collection are returned unchanged.
+    The flags of a packed group's frozen members (`PACKED_FROZEN`) go with the split they describe.
+    Variables without either collection are returned unchanged, and a part that trains nothing (`part`
+    of a frozen module) holds its frozen leaves alone.
     """
-    if FROZEN not in variables:
+    if FROZEN not in variables and PACKED_FROZEN not in variables:
         return variables
-    rest = {name: value for name, value in variables.items() if name != FROZEN}
-    return {**rest, "params": merge(variables[FROZEN], variables["params"])}
+    rest = {name: value for name, value in variables.items() if name not in (FROZEN, PACKED_FROZEN)}
+    return {**rest, "params": merge(variables.get(FROZEN, {}), variables.get("params", {}))}
 
 
 def dicts[Tree](tree: Tree) -> Tree:
@@ -451,12 +688,33 @@ def owned_dicts[Tree](tree: Tree) -> Tree:
     return jax.tree.map(lambda leaf: leaf, dicts(tree))
 
 
+PROBES = "cotangent_probes"
+"""The collection a step's cotangent probes ride in, laid out by the model calls that read them
+(`dew.nn.inspection.tapped`)."""
+
+
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
     module's own tree out of an objective's that nests several under each
     collection, `params/policy` and `frozen/policy`, so an adapted module's
-    base comes with its factors."""
-    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
+    base comes with its factors. A step's cotangent probes, laid out as the
+    objective nests what its model calls sow, give `name`'s where it nests
+    them under `name`, else pass whole (`PROBES`)."""
+    cut = {collection: subtree[name] for collection, subtree in variables.items()
+           if collection != PROBES and name in subtree}
+    return cut if PROBES not in variables else {**cut, PROBES: probed(variables, name)[PROBES]}
+
+
+def probed(variables: Variables, name: str | None) -> Variables:
+    """`variables` with a step's cotangent probes cut to those its objective nests under `name`, what one
+    of its model calls sows (`dew.nn.inspection.probes_of`), all of them where it nests none there; none
+    with `name` None, for a call whose cotangent the step does not summarize (a pass under no gradient)."""
+    if PROBES not in variables:
+        return variables
+    rest = {collection: tree for collection, tree in variables.items() if collection != PROBES}
+    if name is None:
+        return rest
+    return {**rest, PROBES: variables[PROBES].get(name, variables[PROBES])}
 
 
 def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
@@ -495,6 +753,8 @@ __all__ = [
     "EXAMPLE_ROWS",
     "FROZEN",
     "PARAMETER_ROOTS",
+    "SCAN_BLOCKS",
+    "TEXT_KEY",
     "VALIDITY_FIELD",
     "VALID_ROWS",
     "Batch",
@@ -507,12 +767,18 @@ __all__ = [
     "document_ranks",
     "document_starts",
     "everything",
+    "field_coordinates",
+    "flat_field",
     "freeze",
+    "laid_coordinates",
     "leaves_by_path",
     "merge",
     "owned_dicts",
     "padded_rows",
     "part",
+    "prefix_max",
+    "prefix_min",
+    "prefix_sum",
     "real_places",
     "real_slots",
     "scored_targets",

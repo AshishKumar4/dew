@@ -16,9 +16,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
-from model_support import model_draw
+from model_support import called_outputs, model_draw
 from reference_error import assert_as_exact
 
+from dew.batch import coordinates, token_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.mixers import AttentionMixer
@@ -135,6 +136,30 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
                         modeling_overrides={"attention": {"linear_attention": "block_bidirectional"}})
 
 
+def test_a_nemotron_hybrids_attention_layers_read_blocks_where_an_override_names_them(tmp_path):
+    """Nemotron-H's attention kind reads its blocks under a block-bidirectional override, as a
+    Nemotron 3.5 Lightning run asks of it, its Mamba kind the release's, and without groups the plain
+    release's logits bitwise; the saved model states the override and reloads reading blocks
+    (ledger 1883)."""
+    from dew.interop import Pretrained
+
+    plain = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla")
+    blocked = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla",
+                              modeling_overrides=BLOCKED)
+    assert blocked.model.kind_of("full_attention").mixer.bidirectional_blocks
+    assert blocked.model.kind_of("linear_attention") == plain.model.kind_of("linear_attention")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, blocked.model.vocab_size)
+    np.testing.assert_array_equal(np.asarray(blocked.model.apply(blocked.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
+    read = blocked.model.apply(blocked.variables, ids, block_groups=jnp.asarray(BLOCKS))
+    blocked.save(tmp_path / "saved")
+    assert json.loads((tmp_path / "saved" / "config.json").read_text())["modeling_overrides"] == BLOCKED
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids,
+                                                                  block_groups=jnp.asarray(BLOCKS))),
+                                  np.asarray(read))
+
+
 def test_a_layer_that_reads_no_groups_stays_causal():
     """Block and image groups reach every layer, and a layer whose kind reads neither computes what it
     computes without them, bitwise."""
@@ -162,7 +187,8 @@ CACHED_SEEDS = 16
 def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
     """Gemma 4's layout, images on its sliding layers and blocks on its full ones: a prefill, a cached call of
     several tokens and single steps, each call's groups at its tokens' slots, on par with the full pass over
-    the same groups from the cached rollout's first prediction on (check 1, from float64). With shared keys
+    the same groups from the cached rollout's first prediction on, each call's at the width it reads
+    (`called_outputs`; check 1, from the one full pass in float64). With shared keys
     the last two layers read the first two's (Gemma 4's trailing run), so a layer reading groups over keys
     another layer caches holds no cache of its own."""
     kinds = {"sliding_attention": {"window": 3, "mixer": AttentionMixer(bidirectional_images=True)},
@@ -176,7 +202,14 @@ def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
 
     rolled = rollout(decoder, CALLS, block_groups=blocks, image_groups=images)
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
-    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(decoder),
+    forward = jax.jit(lambda params, ids, held_blocks, held_images: decoder.apply(
+        params, ids, block_groups=held_blocks, image_groups=held_images))
+
+    def calls(params, ids):
+        return called_outputs(lambda hi: forward(params, ids[:, :hi], blocks[:, :hi], images[:, :hi]),
+                              CALLS)[:, 3:]
+
+    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], calls,
                     model_draw(decoder, (2, 12), VOCAB), "cached blocks", seeds=CACHED_SEEDS,
                     truth_fn=full(wide))
 
@@ -228,26 +261,15 @@ def test_a_blocks_last_call_reads_its_earlier_keys_past_the_window_from_the_cach
                     truth_fn=full(wide))
 
 
-def test_a_non_causal_kind_reading_blocks_keeps_its_kernel(without_deterministic_ops):
+def test_a_non_causal_kind_reading_blocks_computes_what_it_computes_without_them():
     """A non-causal kind sees its whole row already, so the groups it would read add nothing: a call with
-    and without them reports the same attention routes on an A100 (`generation.routes`), cuDNN named, with
-    no mask of their own. Only routes are traced, no program compiled, so on the cuda lane, whose
-    --xla_gpu_deterministic_ops keeps cuDNN away from a run (`without_deterministic_ops`), the flag is
-    taken out for the routes the claim is about."""
+    them gives the call without them, bit for bit, every key it reads the same."""
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)}).clone(
-        causal=False, attention_impl="cudnn", dtype=jnp.bfloat16)
+        causal=False, dtype=jnp.bfloat16)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
-    # The same parameters as this host's kernel makes them, where a named cuDNN does not run.
-    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
-
-    def routes(**groups):
-        with generation.assumed("sm80"), generation.routes() as found:
-            jax.eval_shape(lambda params, ids: decoder.apply(params, ids, **groups), params, ids)
-        return [(route.choice, route.kernel) for route in found]
-
-    plain = routes()
-    assert ("attention", "cudnn") in plain
-    assert routes(block_groups=jnp.asarray(BLOCKS)) == plain
+    params = decoder.init(jax.random.key(1), ids)
+    plain = decoder.apply(params, ids)
+    np.testing.assert_array_equal(decoder.apply(params, ids, block_groups=jnp.asarray(BLOCKS)), plain)
 
 
 WINDOWED_BLOCKS = {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bidirectional_blocks=True)}}
@@ -256,16 +278,15 @@ WINDOWED_BLOCKS = {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bi
 @pytest.mark.parametrize("kinds", [{"full_attention": {}}, WINDOWED_BLOCKS], ids=["full", "window-blocks"])
 def test_padding_inside_a_row_reaches_the_fused_kernel_as_its_keys_validity(kinds):
     """A call with padding inside its rows hands the kernel its real keys and, under a window, the places
-    the window counts, rather than a mask it builds: a layer naming the template runs it, where the template
-    refuses a mask by its inherent limit (so a mask built here would raise)."""
+    the window counts, rather than a mask it builds: a layer naming the template traces on an A100, where
+    the template refuses a mask by its inherent limit (so a mask built here would raise)."""
     decoder = model(**kinds).clone(dtype=jnp.bfloat16, attention_impl="template")
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
     blocks = jnp.asarray(WINDOWED) if kinds is WINDOWED_BLOCKS else None
-    with generation.assumed("sm80"), generation.routes() as found:
+    with generation.assumed("sm80"):
         jax.eval_shape(lambda params, ids: decoder.apply(params, ids, attention_mask=jnp.asarray(GAPS),
                                                          block_groups=blocks), params, ids)
-    assert {route.kernel for route in found if route.choice == "attention"} == {"template"}
 
 
 def test_a_server_keeps_a_block_layers_prefill_apart():
@@ -300,7 +321,8 @@ def test_a_prediction_depth_reads_the_groups_of_the_tokens_it_reads():
 def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_does():
     """A multimodal wrapper hands its language model the call's groups (`MultimodalTransformer`): text alone
     through its cache, a prefill, a cached call and single steps, with blocks inside each call, on par with
-    its full pass over the same groups from float64 (check 1)."""
+    its full passes over the same groups, each call's at the width it reads (`called_outputs`), from the one
+    full pass in float64 (check 1)."""
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
     wrapper = wrapped(decoder)
     groups = jnp.asarray(CACHED_BLOCKS)
@@ -310,7 +332,12 @@ def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_
 
     rolled = rollout(wrapper, CALLS, block_groups=groups)
     wide = wrapped(decoder.clone(dtype=jnp.float64, attention_impl="reference"))
-    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(wrapper),
+    forward = jax.jit(lambda params, ids, held: wrapper.apply(params, ids, block_groups=held))
+
+    def calls(params, ids):
+        return called_outputs(lambda hi: forward(params, ids[:, :hi], groups[:, :hi]), CALLS)[:, 3:]
+
+    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], calls,
                     model_draw(wrapper, (2, 12), VOCAB), "multimodal cached blocks", seeds=CACHED_SEEDS,
                     truth_fn=full(wide))
 
@@ -323,3 +350,81 @@ def test_a_blocks_bounds_are_its_runs_first_token_and_one_past_its_last():
                                   [[0, 1, 1, 3, 3, 5, 5, 5], [0, 0, 0, 0, 4, 4, 4, 4]])
     np.testing.assert_array_equal(np.asarray(block_ends(groups)),
                                   [[1, 3, 3, 5, 5, 8, 8, 8], [4, 4, 4, 4, 8, 8, 8, 8]])
+
+
+WHOLE = np.asarray([[0, 0, 0, 1, 1, 1, 1, -1], [2, 2, 2, 2, 3, 3, 3, 3]], np.int32)
+"""`SEGMENTS`' documents each one whole block, its padding in none."""
+PADDED = np.asarray([[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 0]], bool)
+"""Right-padded rows, each one document."""
+WHOLE_CASES = {
+    "documents": ({"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}},
+                  {"segment_ids": SEGMENTS, "block_groups": WHOLE}, True),
+    "documents-past-a-window": ({"sliding_attention": {"window": 2,
+                                                       "mixer": AttentionMixer(bidirectional_blocks=True)}},
+                                {"segment_ids": SEGMENTS, "block_groups": WHOLE}, True),
+    "right-padded-rows": ({"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}},
+                          {"attention_mask": PADDED, "right_padded": True,
+                           "block_groups": np.where(PADDED, 0, -1).astype(np.int32)}, True),
+    "a-non-causal-window": ({"sliding_attention": {"window": 2, "bidirectional_window": True,
+                                                   "mixer": AttentionMixer(bidirectional_blocks=True)}},
+                            {"segment_ids": SEGMENTS, "block_groups": WHOLE}, False),
+}
+"""Calls whose blocks are each a document's whole real tokens, each its kinds, fields and whether the decoder
+is causal: packed documents, read under a window of two the blocks pass, rows of one document each,
+right-padded, named by no segment ids, and a non-causal decoder's layer keeping its window both ways, which
+reads no blocks, whole or not."""
+
+
+@pytest.mark.parametrize("case", WHOLE_CASES.values(), ids=list(WHOLE_CASES))
+def test_whole_blocks_read_as_their_block_causal_reading(case):
+    """Where its producer states each block is its document's whole (`AttentionMetadata.whole_blocks`, a
+    decision row read whole), a block layer takes the non-causal call over the documents its blocks are:
+    its states and its QK-Clip maxima are bitwise those of its block-causal reading of the same blocks,
+    under a window the blocks pass and over padding the rows name by validity alike."""
+    kinds, fields, causal = case
+    decoder = model(**kinds).clone(attention_impl="xla", causal=causal)
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), ids)
+    given = {name: jnp.asarray(value) if isinstance(value, np.ndarray) else value
+             for name, value in fields.items()}
+    # The case's flat layout laid out once (`Coordinates`), the layout `hidden_states` reads.
+    given["coordinates"] = token_coordinates(ids.shape, segments=given.pop("segment_ids", None),
+                                             valid=given.pop("attention_mask", None),
+                                             right_padded=given.pop("right_padded", False))
+
+    def states(**whole):
+        return decoder.apply(params, ids, method=CausalTransformer.hidden_states, mutable=["qk"], **given,
+                             **whole)
+
+    whole, blocked = (jax.tree.map(np.asarray, states(**read)) for read in ({"whole_blocks": True}, {}))
+    np.testing.assert_equal(whole, blocked)
+
+
+def test_whole_blocks_route_as_the_non_causal_call_by_documents():
+    """A block layer reading whole blocks (`AttentionMetadata.whole_blocks`) computes bitwise what a
+    non-causal decoder computes over the documents, and its call routes as that decoder's does on an
+    H100 (the kernels that run a non-causal call by documents, which block groups' spans refuse)."""
+    kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
+    decoder = model(**kinds).clone(attention_impl="xla")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), ids)
+    segments, blocks = jnp.asarray(SEGMENTS), jnp.asarray(WHOLE)
+
+    def states(decoder, **fields):
+        return np.asarray(decoder.apply(params, ids, coordinates=coordinates(ids.shape, segments=segments),
+                                        method=CausalTransformer.hidden_states, **fields))
+
+    np.testing.assert_array_equal(states(decoder, block_groups=blocks, whole_blocks=True),
+                                  states(decoder.clone(causal=False)))
+
+    def routes(decoder, **fields):
+        bf16 = decoder.clone(attention_impl="auto", dtype="bfloat16", head_dim=64)
+        shapes = jax.eval_shape(lambda: bf16.init(jax.random.key(1), ids))
+        with generation.assumed("sm90"), generation.routes() as found:
+            laid = coordinates(ids.shape, segments=segments)
+            jax.jit(lambda params: bf16.apply(params, ids, coordinates=laid,
+                                              method=CausalTransformer.hidden_states, **fields)).trace(shapes)
+        return [(route.choice, route.kernel) for route in found]
+
+    assert routes(decoder, block_groups=blocks, whole_blocks=True) == routes(decoder.clone(causal=False))
+    assert routes(decoder, block_groups=blocks) != routes(decoder.clone(causal=False))

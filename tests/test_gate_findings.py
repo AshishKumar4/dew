@@ -12,13 +12,8 @@ from xml.etree import ElementTree
 
 import numpy as np
 import pytest
-from reference_error import (
-    GateFailure,
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    row_errors,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import GateFailure, as_given, assert_as_exact, row_errors
 
 
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
@@ -185,12 +180,34 @@ def test_a_test_the_gate_fails_reports_its_findings_as_a_junit_property(tmp_path
     assert found["test_call"][0]["measure"] == raised.value.findings[0].measure
 
 
+def test_a_skip_or_a_failure_outside_the_gate_loads_no_gate(tmp_path):
+    """The report hook reads a test's GateFailure only where the gate is loaded: a skipped or failed test
+    that never imported it loads none, so the files whose tests skip are not keyed on the gate's every
+    change in the test cache (30 of main's 2,204 rows were, 10-29)."""
+    site = tmp_path / "test_site.py"
+    site.write_text("import sys\nimport pytest\n\n\n"
+                    "def test_skipped():\n    pytest.skip('not here')\n\n\n"
+                    "def test_failed():\n    assert False\n\n\n"
+                    "def test_after():\n    assert 'reference_error' not in sys.modules\n")
+    report = tmp_path / "report.xml"
+    tests = Path(__file__).resolve().parent
+    path = os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")])
+    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider",
+                           f"--junitxml={report}", str(site)], cwd=tmp_path,
+                          env={**os.environ, "PYTHONPATH": path})
+    ended = {case.get("name"): [child.tag for child in case]
+             for case in ElementTree.parse(report).iter("testcase")}
+    assert done.returncode == 1 and ended == {"test_skipped": ["skipped"], "test_failed": ["failure"],
+                                              "test_after": []}, ended
+
+
 def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_largest_quotient():
     """Row 1628: a sized row's error over its size and the zero rows' pooled squares overflowed from
     finite evidence (an error of 1e154 over a row of 1e-160), and the promotion matcher refuses a
     non-finite measure. Each now comes from logs or a scaled sum: the measure is finite, and the row still
     fails."""
-    from reference_error import pooled_zero_rows, rows_over
+    from one_draw import rows_over
+    from reference_error import pooled_zero_rows
 
     truth = np.asarray([[1e-160, 1e-160], [1.0, 1.0]])
     reference = np.asarray([[0.0, 0.0], [1.0, 1.0]])
@@ -203,10 +220,10 @@ def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_lar
 
 
 def test_a_worse_row_past_float64s_largest_quotient_measures_larger():
-    """A row's error over its size is judged and measured by its log (`_log_over`), so two quotients
+    """A row's error over its size is judged and measured by its log (`log_over`), so two quotients
     past float64's largest, 1e310 and 1e311, keep their order: a candidate ten times worse is not
     matched to its parent's failure."""
-    from reference_error import rows_over
+    from one_draw import rows_over
 
     truth = np.asarray([[1e-160, 1e-160], [1e-148, 1e-148]])
     reference = truth + np.asarray([[1e140, 1e140], [1e152, 1e152]])

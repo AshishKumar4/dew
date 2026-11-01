@@ -24,13 +24,8 @@ import numpy as np
 import pytest
 import tool_support
 from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    torch_with_gradients,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path
@@ -89,7 +84,7 @@ def flux2_arms(source, arrays, record, name):
     from diffusers import Flux2Transformer2DModel
 
     from tools.diffusers_reference_helpers import flux2_ids
-    from tools.torch_precision import float64
+    from tools.torch_precision import float64, float64_twin
 
     model, params, layouts = load(source, name)
     rows, columns = record["cases"][name]["grid"]
@@ -133,9 +128,9 @@ def flux2_arms(source, arrays, record, name):
     checkpoint = source / name / "transformer"
     narrow = Flux2Transformer2DModel.from_pretrained(checkpoint, torch_dtype=torch.float32,
                                                      local_files_only=True).eval()
-    with float64():
-        wide = Flux2Transformer2DModel.from_pretrained(checkpoint, torch_dtype=torch.float64,
-                                                       local_files_only=True).eval()
+    # The float64 truth's model, built as every twin is (`float64_twin`): its config's class at float64,
+    # the published weights loaded into it strictly.
+    wide = float64_twin(narrow)
     weights = {id(module): {key: value.detach().numpy() for key, value in module.named_parameters()}
                for module in (narrow, wide)}
     # The pipeline's four-axis ids, as the fixture's walk laid them out for its text and latent.

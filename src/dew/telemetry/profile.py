@@ -8,11 +8,14 @@ no instrumentation hooks.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import json
 import logging
 import os
 import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
@@ -52,27 +55,89 @@ def require_profile_support() -> _Converter:
     return converter
 
 
-def capture_options() -> jax.profiler.ProfileOptions:
-    """The options a Dew capture starts with, for any JAX trace that should read like one.
+ACTIVITY_CAP = 2 * 1024 * 1024
+"""The CUDA activity events (kernels, copies) a Dew capture keeps on GPU, CUPTI's
+`gpu_max_activity_api_events`: past it CUPTI drops whole buffers of events and says so only in a C++
+log, so Dew states the cap it set and reads a capture holding that many as cut short (`Profiler`'s
+manifest)."""
 
-    Host events at level 2 and the compiled HLO, and no Python tracer: it
-    records every Python and C call, which slows Python-heavy host work
-    several times over (a server's 512-row settle loop took 0.85 ms a step
-    traced against 0.18 ms untraced), so the trace would show host time,
+
+def held_back(capture: Path, metadata: dict) -> list[str]:
+    """Why a capture that stopped cleanly holds less than its run did, from what it holds (`capture_status`
+    "partial"), empty where nothing is missing: on an accelerator, a local device with no kernel track in
+    the trace; on GPU, as many activity events as CUPTI's cap (`ACTIVITY_CAP`, the options' own), past which
+    CUPTI drops whole buffers and says so only in a C++ log. A CPU run's trace holds no device track.
+
+    A trace with no device plane at all lost the device profiler's whole contribution, its kernels and the
+    HLO alike: XProf drops an XSpace past protobuf's 2 GB limit whole, saying so only in a C++ log (row
+    1893: a 2xH100 capture of three 21-40 s steps of a 4.2B model, 2,176,305,421 bytes, kept its host
+    planes alone)."""
+    if metadata.get("backend") not in ("gpu", "tpu"):
+        return []
+    from dew.telemetry.trace import device_events
+
+    try:
+        planes, _ = device_events(capture)
+    except FileNotFoundError:
+        return ["the capture wrote no trace"]
+    advanced = (metadata.get("options") or {}).get("advanced_configuration") or {}
+    return missing_tracks({name: len(events) for name, events in planes.items()},
+                          len(metadata["device_kinds"]), advanced.get("gpu_max_activity_api_events"))
+
+
+def missing_tracks(events: dict[str, int], devices: int, cap: int | None) -> list[str]:
+    """`held_back`'s reasons from the number of kernel events each device plane holds (`events`), the
+    local `devices` and CUPTI's activity `cap` (None off GPU; a negative cap is XLA's no limit, which
+    drops nothing). Within 1% of the cap is the cap reached: CUPTI drops whole buffers (a 2000-event cap
+    kept 1987 kernel events of an H100 step's 19160)."""
+    reasons = []
+    tracked = sum(1 for count in events.values() if count)
+    if devices and not events:
+        reasons.append(f"none of {devices} local devices has a plane in the trace: the device profiler's "
+                       "data, kernels and HLO alike, was dropped whole, as XProf drops an XSpace past "
+                       "protobuf's 2 GB limit (trace fewer steps, or lower `activity_cap`)")
+    elif tracked < devices:
+        reasons.append(f"{devices - tracked} of {devices} local devices have no kernel track in the trace")
+    total = sum(events.values())
+    if cap is not None and cap >= 0 and total >= cap * 0.99:
+        reasons.append(f"CUPTI's activity cap of {cap} events reached ({total} kept): the events past it "
+                       "were dropped, so the trace is cut short (a capture's `activity_cap` raises it)")
+    return reasons
+
+
+@dataclasses.dataclass(frozen=True)
+class CaptureOptions:
+    """What a Dew capture records, for any JAX trace that should read like one (`profile_options`): host
+    events at `host_tracer_level`, Python calls at `python_tracer_level`, and on GPU at most
+    `activity_cap` CUDA activity events.
+
+    By default host events at level 2 and the compiled HLO, and no Python
+    tracer: it records every Python and C call, which slows Python-heavy host
+    work several times over (a server's 512-row settle loop took 0.85 ms a
+    step traced against 0.18 ms untraced), so the trace would show host time,
     and the device idle behind it, that the run never spends. On TPU the
     trace also carries compute and sync events.
     """
-    options = jax.profiler.ProfileOptions()
-    options.host_tracer_level = 2
-    options.python_tracer_level = 0
-    # Exporting every live executable's HLO cost 0.95 s and 3.4 MB for a
-    # 4-layer decoder's fit that had evaluated and sampled first (RTX 4080).
-    # 400 unrelated compiled programs made a CPU capture of small work take
-    # 15 s and 75 MB.
-    options.enable_hlo_proto = True
-    if jax.default_backend() == "tpu":
-        options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
-    return options
+
+    host_tracer_level: int = 2
+    python_tracer_level: int = 0
+    activity_cap: int = ACTIVITY_CAP
+
+    def profile_options(self) -> jax.profiler.ProfileOptions:
+        """JAX's options for a capture of these (`jax.profiler.start_trace`'s `profiler_options`)."""
+        options = jax.profiler.ProfileOptions()
+        options.host_tracer_level = self.host_tracer_level
+        options.python_tracer_level = self.python_tracer_level
+        # Exporting every live executable's HLO cost 0.95 s and 3.4 MB for a
+        # 4-layer decoder's fit that had evaluated and sampled first (RTX 4080).
+        # 400 unrelated compiled programs made a CPU capture of small work take
+        # 15 s and 75 MB.
+        options.enable_hlo_proto = True
+        if jax.default_backend() == "tpu":
+            options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
+        elif jax.default_backend() == "gpu":
+            options.advanced_configuration = {"gpu_max_activity_api_events": self.activity_cap}
+        return options
 
 
 def active_profile() -> Profiler | None:
@@ -96,6 +161,12 @@ COMMAND_BUFFERS = (
     "no device time is attributed to HLO ops (reports/hlo_stats.json): the kernels XLA ran as CUDA "
     "command buffers stay under their module. Profile with "
     "XLA_FLAGS=--xla_gpu_enable_command_buffer= for op-level reports, and time runs without it")
+
+
+def process_directory(directory: Path) -> Path:
+    """Where this process's captures under `directory` go: `directory` itself, or in a pool of processes
+    `process-<rank>` within it, since each process captures its own devices."""
+    return directory if jax.process_count() == 1 else directory / f"process-{jax.process_index()}"
 
 
 def report_table(path: Path, index: int = 0) -> tuple[list[str], list[dict[str, JSON]]]:
@@ -211,6 +282,11 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
     elif attributed == 0:
         metadata["op_attribution"] = COMMAND_BUFFERS
         _logger.warning("Profile %s: %s", directory, COMMAND_BUFFERS)
+    _manifest(directory, metadata, failures)
+
+
+def _manifest(directory: Path, metadata: dict[str, JSON], failures: list[Exception]) -> None:
+    """Write `directory`'s manifest, naming every file it holds, and raise the export's `failures`."""
     written: list[JSON] = [str(path.relative_to(directory))
                            for path in sorted(directory.rglob("*")) if path.is_file()]
     metadata["artifacts"] = written
@@ -253,12 +329,19 @@ class Profiler:
     `XLA_FLAGS=--xla_gpu_enable_command_buffer=`; time runs without that
     flag, since launching kernels one by one costs time. Where hlo_stats has
     no column naming the ops, `op_attribution` records that it could not tell.
+
+    A capture whose reader reads its trace alone (`dew.telemetry.trace`), as a
+    benchmark's device timeline or XLA's profile-guided latency estimates do,
+    takes `reports=False`: it needs no XProf, and its stop writes its manifest
+    alone, not the reports, whose conversion takes minutes for a training
+    window's capture (row 2017).
     """
 
     def __init__(self, directory: str | os.PathLike[str] | None = None, *,
-                 options: jax.profiler.ProfileOptions | None = None) -> None:
+                 options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None:
         self._directory = None if directory is None else Path(directory)
         self._options = options
+        self._reports = reports
         self._capture: Path | None = None
         self._converter: _Converter | None = None
         self._metadata: dict[str, JSON] = {}
@@ -302,21 +385,20 @@ class Profiler:
             self._phase = "starting"
         owned_start = False
         try:
-            converter = require_profile_support()
+            converter = require_profile_support() if self._reports else None
             backend = jax.default_backend()
-            options = capture_options() if self._options is None else self._options
+            options = CaptureOptions().profile_options() if self._options is None else self._options
             _drain()
             if self._directory is None:
                 self._directory = Path(tempfile.mkdtemp(prefix="dew-profile-"))
             self._directory = self._directory.expanduser().resolve()
-            root = self._directory
+            root = process_directory(self._directory)
             count, rank = jax.process_count(), jax.process_index()
-            if count > 1:
-                root = root / f"process-{rank}"
             root.mkdir(parents=True, exist_ok=True)
             capture = Path(tempfile.mkdtemp(prefix="capture-", dir=root))
             metadata: dict[str, JSON] = {
-                "versions": {name: version(name) for name in ("jax", "jaxlib", "xprof")},
+                "versions": {name: version(name)
+                             for name in ("jax", "jaxlib", *(("xprof",) if self._reports else ()))},
                 "backend": backend, "devices": [str(device) for device in jax.local_devices()],
                 "device_kinds": [device.device_kind for device in jax.local_devices()],
                 "process_index": rank, "process_count": count,
@@ -352,10 +434,15 @@ class Profiler:
             raise
         return self
 
-    def stop(self) -> None:
-        self._stop("completed")
+    def stop(self, *, wait: bool = True) -> None:
+        """Stop the capture and export its reports and manifest: at once, or where not `wait`, in a process
+        of its own beside the caller's work (`dew.telemetry.export`), the capture already stopped, which
+        `exported` waits for. A training run's window stops so, since converting a capture takes far longer
+        than the steps it traced (row 2017: minutes for a 3-step window). A stop that failed exports at
+        once, so its manifest records why, as it raises."""
+        self._stop("completed", wait=wait)
 
-    def _stop(self, body: str) -> None:
+    def _stop(self, body: str, *, wait: bool = True) -> None:
         global _active
         failures: list[BaseException] = []
         with _lifecycle:
@@ -379,19 +466,24 @@ class Profiler:
                 self._capture = None
                 self._converter = None
                 self._metadata = {}
-        assert capture is not None and converter is not None
+        assert capture is not None
         self._captures.append(capture)
         metadata["body_status"] = body
-        metadata["capture_status"] = "failed" if failures else "completed"
-        metadata["capture_errors"] = [str(error) for error in failures]
-        try:
-            _reports(capture, converter, metadata)
-        except BaseException as error:
-            failures.append(error)
         if self._temporary:
             _logger.info("Profile saved under %s", self._directory)
-        if failures:
-            raise BaseExceptionGroup("Profile cleanup or export failed", failures)
+        # A capture without reports writes its manifest alone, at once.
+        if wait or failures or converter is None:
+            _export(capture, converter, metadata, failures)
+            return
+        # A fresh interpreter of the exporter alone, never the caller's program again: the conversion reads
+        # and writes on its own, and holds no lock the caller's steps take (the converter's native calls
+        # may hold the GIL throughout). It reads files alone, so its JAX opens no accelerator, whose
+        # memory the run holds; and it imports the Dew this process runs, first on its path.
+        source = str(Path(__file__).resolve().parents[2])
+        path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
+        _exporting[capture] = subprocess.Popen(
+            [sys.executable, "-m", "dew.telemetry.export", str(capture), json.dumps(metadata)],
+            env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
 
     def __enter__(self) -> Self:
         return self.start()
@@ -405,6 +497,52 @@ class Profiler:
                 if exc is None:
                     raise
                 exc.add_note(f"Profile cleanup/report failure: {error}")
+
+
+_exporting: dict[Path, subprocess.Popen[bytes]] = {}
+"""The captures a stop left exporting in a process of their own (`Profiler.stop`), until `exported`."""
+
+
+def exported(directory: str | os.PathLike[str] | None = None) -> None:
+    """Wait for the exports `Profiler.stop` left running in processes of their own, of every capture or of
+    those under `directory`, refusing any that failed: what reads a capture's reports and manifest reads
+    them after this (`dew.training.profiling.ProfileReport`)."""
+    root = None if directory is None else Path(directory).expanduser().resolve()
+    waited = [capture for capture in _exporting if root is None or capture.is_relative_to(root)]
+    failed = []
+    for capture in waited:
+        code = _exporting.pop(capture).wait()
+        if code:
+            failed.append(f"{capture} (exit {code}; its manifest records why)")
+    if failed:
+        raise RuntimeError("Profile export failed for " + ", ".join(failed))
+
+
+def _export(capture: Path, converter: _Converter | None, metadata: dict[str, JSON],
+            failures: list[BaseException]) -> None:
+    """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports where
+    it has a `converter` and its manifest (`_reports`, `_manifest`), raising every failure of the stop
+    (`failures`) and of the export together."""
+    reasons = [] if failures else held_back(capture, metadata)
+    metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
+    metadata["capture_errors"] = [str(error) for error in failures]
+    metadata["capture_reasons"] = [*reasons]
+    try:
+        if converter is None:
+            metadata["reports"] = []
+            _manifest(capture, metadata, [])
+        else:
+            _reports(capture, converter, metadata)
+    except BaseException as error:
+        failures.append(error)
+    if failures:
+        raise BaseExceptionGroup("Profile cleanup or export failed", failures)
+
+
+def exporting(capture: str, metadata: dict[str, JSON]) -> None:
+    """`_export` in an export's own process (`Profiler.stop`, `dew.telemetry.export`), whose exit code says
+    whether it failed."""
+    _export(Path(capture), require_profile_support(), metadata, [])
 
 
 def region(name: str) -> AbstractContextManager[None]:

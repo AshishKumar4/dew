@@ -6,7 +6,7 @@ Research note, 2026-09-02.
 
 Every library below was cloned fresh and read as source. Claims are cited as `path:line` against the clone, or as a URL. Where a fact could not be found I say so rather than guess. Two things were checked by running them rather than by reading: tokamax on this workstation's RTX 4080 (appendix A), and the existence of the model releases named here, using `huggingface_hub.HfApi().list_models`.
 
-Clones live in `/tmp/research/GoogleStack/<name>/`. The tokamax test script is `/tmp/research/GoogleStack/tokamax_gpu_test.py`.
+Clones live in `/tmp/research/google-jax-stack/<name>/`. The tokamax test script is `/tmp/research/google-jax-stack/tokamax_gpu_test.py`.
 
 Verdict tags, one or more per section:
 
@@ -729,13 +729,13 @@ Run on this workstation, 2026-09-02. NVIDIA GeForce RTX 4080, compute capability
 Reproduce:
 
 ```sh
-mkdir -p /tmp/research/GoogleStack && cd /tmp/research/GoogleStack
+mkdir -p /tmp/research/google-jax-stack && cd /tmp/research/google-jax-stack
 uv venv --python 3.12 tokamax-venv
 uv pip install --python ./tokamax-venv/bin/python "jax[cuda12]" tokamax triton
 ./tokamax-venv/bin/python tokamax_gpu_test.py
 ```
 
-The script is at `/tmp/research/GoogleStack/tokamax_gpu_test.py`. Note that `triton` is not a dependency of the `tokamax` wheel; it is listed only in tokamax's `cuda` extra, along with `jax[cuda13]` (`tokamax/pyproject.toml:65-71`). Without it, the Triton path fails with a bare `ImportError` at import time rather than a useful message.
+The script is at `/tmp/research/google-jax-stack/tokamax_gpu_test.py`. Note that `triton` is not a dependency of the `tokamax` wheel; it is listed only in tokamax's `cuda` extra, along with `jax[cuda13]` (`tokamax/pyproject.toml:65-71`). Without it, the Triton path fails with a bare `ImportError` at import time rather than a useful message.
 
 Output, with autotuning-cache warnings removed:
 

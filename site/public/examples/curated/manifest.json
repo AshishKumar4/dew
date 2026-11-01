@@ -5,7 +5,7 @@
   "loaded_with": "dew.pipeline('dewml/hybrid-dit-176m', revision=...)",
   "checkpoint_step": 1350000,
   "parameters": 175640848,
-  "dew_commit": "9235af7f3e8e80169dac359b2c60a295a8c92845",
+  "dew_commit": "3bdb2c23ff2850c3f27516f9e303348718eef3bd",
   "device": "NVIDIA A100-SXM4-40GB",
   "jax": "0.11.2.post3",
   "compute": "published run dtypes, unquantized",

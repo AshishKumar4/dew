@@ -3,6 +3,9 @@ that rebuilds from what it logged."""
 
 import dataclasses
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
@@ -20,7 +23,7 @@ from dew.diffusion.presets import Flow
 from dew.optim import ScheduleSpec
 from dew.registry import import_path, record_argument
 from dew.sampling import Heun
-from dew.training import MeshSpec
+from dew.training import LocalTracker, MeshSpec
 
 pytestmark = pytest.mark.mesh
 
@@ -82,6 +85,30 @@ def test_a_chains_settings_are_set_together():
     assert moved.data.facts()["fields"]["image"] == [128, 128, 3]
 
 
+def test_an_image_size_override_derives_the_flow_shift_and_the_edm_space_afresh():
+    """A Flow run's resolution shift counts the tokens of the images it trains on, derived where it builds
+    its process (`DiffusionRunConfig.derived_preset`), so moving the images' size on the command line
+    (`data.images.size`) moves the shift with it, where a count derived once at construction kept the old
+    size's (row 3026): 256-pixel images are 256 tokens and 512-pixel ones 1024, mu 0.5 and about 0.63. A
+    token count the preset states holds at any size, and the run records the preset as given. An EDM run's
+    sigma space follows its autoencoder alike."""
+    from dew.data import presets
+    from dew.data.sources import source
+    from dew.diffusion.presets import EDM, ResolutionShift
+
+    flowers = source("tfds://oxford_flowers102").pipe(presets.images, 256, batch=8)
+    run = DiffusionRunConfig(data=flowers, preset=Flow(resolution_shift=ResolutionShift()))
+    moved = run.assigned(["data.images.size=512"])
+    assert run.derived_preset().resolution_shift.tokens == 256
+    assert moved.derived_preset().resolution_shift.tokens == 1024
+    assert moved.derived_preset().resolution_shift.shift() == ResolutionShift(tokens=1024).shift()
+    assert moved.preset.resolution_shift.tokens is None
+    stated = DiffusionRunConfig(data=flowers, preset=Flow(resolution_shift=ResolutionShift(tokens=64)))
+    assert stated.assigned(["data.images.size=512"]).derived_preset().resolution_shift.tokens == 64
+    edm = DiffusionRunConfig(data=flowers, preset=EDM())
+    assert edm.derived_preset().regime == "pixel" and edm.preset.regime is None
+
+
 def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
     """A run's own fields and its chain's settings are one point, built once: audio conditioning and
     clips that carry audio are valid only together, and a point that sets both reads as both."""
@@ -115,6 +142,104 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
     assert set(record["fields"]["data"]) == {"unrecorded"}
     with pytest.raises(ValueError):
         RunConfig.load(str(tmp_path / "runs" / "unrecorded_run"))
+
+
+def profiled(report_file: Path) -> dict:
+    """A profile's report, held to the capture it names: the steps the capture's training annotations
+    hold are exactly the two after its warmup of two, the steps its log covers."""
+    from dew.training.profiling import traced_steps
+
+    report = json.loads(report_file.read_text())
+    assert traced_steps(Path(report["capture"])) == (2, 3) and tuple(report["traced"]) == (2, 3)
+    assert (report["steps"], report["warmup"]) == (2, 2)
+    assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
+    # Device figures where the capture holds every device's track, else unknown, None, never 0, and why.
+    measured = [report[name] for name in ("device_window_ms", "compute_ms", "device_idle_ms")]
+    assert (report["device"] is None) == all(value is not None and value >= 0 for value in measured)
+    assert (Path(report["capture"]) / "reports").is_dir()
+    return report
+
+
+def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_time(tmp_path):
+    """`dew profile run.py --warmup 2 --steps 2 --out DIR` trains the run afresh in a directory of its
+    own, writing no checkpoint, traces the two steps after its warmup, its capture's training
+    annotations those steps alone, and writes the report of the window, the one log interval those steps
+    make: its step and input-wait times, the step's compile, and the device time XProf attributes to its
+    ops or why it attributes none, beside the capture's own reports. A second profile into the same
+    directory is refused."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.checkpoints import Checkpoints
+    from dew.cli.main import main
+
+    out = tmp_path / "profile"
+    command = ["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out", str(out)]
+    assert main(command) == 0
+    assert profiled(out / "report.json")["directory"] == str(out)
+    assert Checkpoints(str(out / "autoencoder_experiment")).latest is None
+    with pytest.raises(ValueError):
+        main(command)
+
+
+def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
+    """`dew profile --host-tracer-level 1 --python-tracer-level 1` captures with those options: the capture's
+    options own them (`CaptureOptions`, the window's `capture`), the command only maps its flags onto them,
+    and the capture's manifest records what it ran with (rows 1894, 2932)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.cli.main import main
+
+    out = tmp_path / "profile"
+    assert main(["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out",
+                 str(out), "--host-tracer-level", "1", "--python-tracer-level", "1"]) == 0
+    manifest = json.loads((Path(profiled(out / "report.json")["capture"]) / "manifest.json").read_text())
+    assert (manifest["options"]["host_tracer_level"], manifest["options"]["python_tracer_level"]) == (1, 1)
+
+
+def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_directory(tmp_path):
+    """`dew profile run.py` with no `--out` profiles into profiles/<the run's name>/<the time it starts>,
+    the time agreed across the pool once the process is prepared: the run's XLA flags reach XLA, which
+    reads them as JAX opens its backend, so an XLA dump the run asks for is written."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    dump = tmp_path / "dump"
+    flags = f"--xla_dump_to={dump}"
+    (tmp_path / "dumped.py").write_text(
+        "import dataclasses\n"
+        "from autoencoder_experiment import run as experiment\n"
+        "def run():\n"
+        "    built = experiment()\n"
+        f"    trainer = dataclasses.replace(built.trainer, xla_flags={flags!r})\n"
+        "    return dataclasses.replace(built, trainer=trainer)\n")
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
+    done = subprocess.run([sys.executable, "-m", "dew.cli.main", "profile", str(tmp_path / "dumped.py"),
+                           "--warmup", "2", "--steps", "2"],
+                          cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
+    assert done.returncode == 0, done.stderr[-4000:]
+    (report_file,) = (tmp_path / "profiles" / "dumped").glob("*/report.json")
+    profiled(report_file)
+    assert any(dump.iterdir())
+
+
+def test_a_configured_run_is_profiled_without_its_ranking_cooldowns_or_validation(tmp_path):
+    """A configured run that ranks its checkpoints by its training loss, branches into cooldowns and
+    validates a split of its own is profiled without them: its profile writes no checkpoint, best or
+    otherwise, and runs no cooldown, which would want the validation the profile drops."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import Cooldowns
+
+    run = autoencoder_experiment.run()
+    run = dataclasses.replace(run, trainer=dataclasses.replace(
+        run.trainer, name="ranked", best="train/loss", cooldowns=Cooldowns(at=(2,), length=2)))
+    report = run.profile(str(tmp_path / "profile"), warmup=2, steps=2)
+    assert report is not None and report.traced == (2, 3)
+    with Checkpoints(str(tmp_path / "profile" / "ranked")) as checkpoints:
+        assert checkpoints.latest is None and checkpoints.best is None
 
 
 @pytest.mark.parametrize("built", ["in Python", "as a run states them"])
@@ -244,10 +369,39 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
                               eval_every=1, checkpoint_every=None))
     trained = run.prepare().train("jepa-loss")
     assert int(trained.updates) == 1
-    reports = [json.loads(line)["scalars"] for line in
-               (tmp_path / "jepa-loss" / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    reports = [values for _, values in LocalTracker(tmp_path / "jepa-loss" / "tracking").scalars()]
     assert any("val/loss" in report and np.isfinite(report["val/loss"]) for report in reports)
     assert not any("probe" in name for report in reports for name in report)
+
+
+@pytest.mark.parametrize("precision", ["bf16-mixed", "16-mixed"])
+def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the_dtype(precision):
+    """A JEPA run whose encoder record states no dtype computes in the dtype its numerics derive
+    (`numerics_fields`: bfloat16 for bf16-mixed, float16 for 16-mixed), and its predictor computes in that
+    dtype and with that attention kernel too, as its configuration promises: read off the built encoder,
+    where its record states none (row 3027, a predictor left at float32 beside a bfloat16 encoder). Its
+    own width and depth stay the predictor's."""
+    import jax.numpy as jnp
+
+    from dew.config import TrainerConfig
+    from dew.data import TFDS, presets
+    from dew.nn.precision import numerics_of
+    from dew.registry import ModelConfig
+
+    root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    run = JepaRunConfig(
+        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                           "num_heads": 2, "mlp_ratio": 2, "attention_impl": "xla"}),
+        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        data=TFDS("dew_images", path=str(root), split="all").pipe(presets.images, 16, batch=8),
+        trainer=TrainerConfig(precision=numerics_of(precision), steps=1))
+    objective = run.build_run().objective
+    expected = {"bf16-mixed": jnp.bfloat16, "16-mixed": jnp.float16}[precision]
+    assert jnp.dtype(objective.encoder.dtype) == jnp.dtype(expected)
+    assert jnp.dtype(objective.predictor.dtype) == jnp.dtype(expected)
+    assert objective.predictor.attention_impl == objective.encoder.attention_impl == "xla"
+    assert (objective.predictor.num_layers, objective.predictor.predictor_features) == (1, 8)
+    assert objective.predictor.emb_features == objective.encoder.emb_features == 16
 
 
 def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_updates(tmp_path):

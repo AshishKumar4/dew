@@ -10,9 +10,10 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.interop import hf_decoders
 from dew.interop.hf_decoders import alias_groups, checked_groups, read_decoder, translate_wrapper_config
-from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, layer_scalar_mode
+from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.vision import tower_variables
 from dew.nn.vision.gemma4 import (
     gemma4_projector_layouts,

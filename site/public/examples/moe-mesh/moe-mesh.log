@@ -22,4 +22,4 @@ step 300: loss 0.588, predicted exchange rounds per layer (max over expert group
 'x = y * ' -> '2;'
 'total = ' -> 'count * 2;'
 'count = ' -> 'count * 2;'
-Wrote /mnt/scratch/dew/tmp/moe-final/moe-mesh.svg and /mnt/scratch/dew/tmp/moe-final/moe-mesh.json
+Wrote moe-mesh.svg and moe-mesh.json

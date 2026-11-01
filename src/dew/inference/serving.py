@@ -25,7 +25,10 @@ program per prompt bucket plus the decode-only one.
 stays the one way to load weights and a processor, and every request runs
 the task's bound policy. A request draws with its submitted key folded as a
 one-row `TextGeneration` call folds it, so it draws the same tokens served
-or alone. `submit` returns a future for its `Generation`, `step` runs one
+or alone, except where the model's products round at boundaries that its
+programs' own roundings cross (a quantized decoder's moving weights, ledger
+2032): there each draw is on par with the model's full forward, by check 1,
+not equal to the lone task's. `submit` returns a future for its `Generation`, `step` runs one
 iteration, `run` steps until queue and rows are empty, and calling the
 server with a batch does both.
 
@@ -69,7 +72,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -82,7 +85,15 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew._hashing import array_fingerprint
-from dew.batch import Variables
+from dew.batch import (
+    COORDINATES_FIELD,
+    POSITIONS_FIELD,
+    VALIDITY_FIELD,
+    Variables,
+    laid_coordinates,
+    token_positions,
+    token_validity,
+)
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages, States, prefix_hashes
 from dew.inference.projections import pack_projections, packed_layout
@@ -93,6 +104,7 @@ from dew.inference.serving_kernel import (
     Paged,
     Placement,
     decode_programs,
+    dispatched,
     joined,
     mixed_refusal,
     opened,
@@ -114,7 +126,7 @@ from dew.inference.tasks import (
     shape_bucket,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
-from dew.nn.cross_attention import CrossAttention
+from dew.nn.cross_attention import CrossBlocks
 from dew.nn.inputs import (
     CONTEXT,
     CONTEXT_LENGTHS,
@@ -124,8 +136,11 @@ from dew.nn.inputs import (
     mesh_of,
     request_key,
 )
-from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import GROUPS, KVCache, is_paged, leaf_name
+from dew.nn.kernels import generation
+from dew.nn.kernels.options import OuterProgram, compiler_options
+from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
+from dew.nn.precision import Numerics
+from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
@@ -204,7 +219,7 @@ _KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
 """The shape and dtype of a default key's data, read without a device."""
 
 
-def _seed(key: int | jax.Array | None) -> int | jax.Array:
+def _seed(key: int | jax.Array) -> int | jax.Array:
     """A request's key as a row holds it: an integer seed as given, for
     `_row_keys` to make into a key, or a key's data. `_row_keys` makes and
     reads every row's key with the default PRNG implementation, so a key of
@@ -219,7 +234,7 @@ def _seed(key: int | jax.Array | None) -> int | jax.Array:
     return jax.random.key_data(typed)
 
 
-@jax.jit
+@OuterProgram
 def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded: jax.Array,
               folds: jax.Array) -> jax.Array:
     """One fixed-width admission's key data, without a device-to-host read:
@@ -469,6 +484,28 @@ def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bo
                          'serving; use whole-prompt dense admission')
 
 
+def _served_mesh(task: TextGeneration) -> Mesh | None:
+    """The mesh `task`'s weights lie on, which a server serves on, refused where a server cannot: a
+    stage or sequence axis, or one over several processes."""
+    mesh = mesh_of(task.variables)
+    if mesh is None:
+        return None
+    if mesh.shape.get(STAGE_AXIS, 1) > 1:
+        raise ValueError(
+            "a server decodes through the whole layer stack every step; the stage axis "
+            "runs the stack as the training pipeline, which the decoder refuses to decode "
+            "through (one token a step leaves no microbatches to pipeline). Serve on a "
+            "mesh with stage=1"
+        )
+    if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
+        raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
+                         "and a decoder refuses to decode under a sequence axis, which splits a "
+                         "sequence's positions. Serve on a mesh with sequence=1")
+    if not NamedSharding(mesh, P()).is_fully_addressable:
+        raise ValueError("a server schedules its rows from one process; a mesh over several "
+                         "processes would need them to agree on every step's admission")
+    return mesh
+
 class Server:
     """Serves text requests with continuous batching over one resident KV cache.
 
@@ -479,7 +516,8 @@ class Server:
     row. A row leaves where the task's criteria end it (EOS, a stop string) or
     at its budget, and the next request takes its slot. Every request runs
     the task's policy and draws the same tokens it would draw through the
-    task alone with the same key.
+    task alone with the same key, except where the model's products round at
+    boundaries that the two programs' roundings cross (the module docstring).
 
     Build one with `from_task`. `admission` bounds the prompts one step
     prefills. A request whose prompt and budget do not fit the capacity is
@@ -495,7 +533,8 @@ class Server:
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
-                 prefix: int | Literal["prompt"] | None = None) -> None:
+                 prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None,
+                 progress: Progress = END) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -513,7 +552,7 @@ class Server:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
         self.model = model
-        self.cross: tuple[CrossAttention, int, np.dtype] | None = None
+        self.cross: tuple[CrossBlocks, int, np.dtype] | None = None
         """The model's cross-attention layers and its context's width and dtype, where a request may
         carry a context beside its prompt."""
         if isinstance(model, CrossAttending) and model.cross_attention is not None:
@@ -534,6 +573,12 @@ class Server:
         self.default_budget = default_budget
         self.max_length = max_length
         self.prefix: int | Literal["prompt"] | None = prefix
+        # The numerics its task's run trained in (`InItsForm`), which every step traces under; None,
+        # those in effect around it.
+        self.precision = precision
+        # The run's progress a model that reads one draws at (`dew.nn.progress`), an input of every step
+        # like the weights, which `reload` moves to each version it serves without a compile.
+        self.progress = progress
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
@@ -567,6 +612,9 @@ class Server:
             self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
             """The group fields some layer reads whole (`dew.nn.kv_cache.GROUPS`), whose groups its cache
             keeps beside the keys: the ones a served prompt's slot beside its tokens."""
+            self.keyed = ROUNDING_KEYS in held
+            """Whether a layer's decode cache holds its rows' rounding keys (`dew.nn.kv_cache.ROUNDING_KEYS`),
+            so a prompt's state follows its request's key, which then names its prefix too (`_prepared`)."""
             # None selects the one mixed forward of `_mixed_step`.
             self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
@@ -583,8 +631,9 @@ class Server:
                 _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
             formats, chosen = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
-                state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step, self._admitting = decode_programs(formats, self._admitted, compiler_options(model))
+                state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar, progress)
+            self._step, self._admitting = map(dispatched, decode_programs(formats, self._admitted,
+                                                                          compiler_options(model)))
             if chosen is not None:
                 # The compile that chose the layout is the decoding step: compiling it again at the
                 # formats would repeat the server's largest compile (`resident_formats`).
@@ -614,9 +663,14 @@ class Server:
             self._states = states
             self._restored, self._captured = state_programs(formats, states)
 
-    def _context(self) -> contextlib.AbstractContextManager[None]:
-        """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
-        return contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh)
+    @contextlib.contextmanager
+    def _context(self) -> Iterator[None]:
+        """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
+        under the numerics its task's run trained in."""
+        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
+              contextlib.nullcontext() if self.precision is None
+              else generation.run_precision(self.precision)):
+            yield
 
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
@@ -665,23 +719,11 @@ class Server:
         slots only two iterations gained, by under 1%. A call seats requests
         only before its first iteration, so the slots take more iterations
         to fill (docs/performance.md).
+
+        A server draws at the progress its task draws at (`TextGeneration.progress`), the run's end or a
+        run's, and `reload` moves it to the version it serves.
         """
-        mesh = mesh_of(task.variables)
-        if mesh is not None:
-            if mesh.shape.get(STAGE_AXIS, 1) > 1:
-                raise ValueError(
-                    "a server decodes through the whole layer stack every step; the stage axis "
-                    "runs the stack as the training pipeline, which the decoder refuses to decode "
-                    "through (one token a step leaves no microbatches to pipeline). Serve on a "
-                    "mesh with stage=1"
-                )
-            if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
-                raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
-                                 "and a decoder refuses to decode under a sequence axis, which splits a "
-                                 "sequence's positions. Serve on a mesh with sequence=1")
-            if not NamedSharding(mesh, P()).is_fully_addressable:
-                raise ValueError("a server schedules its rows from one process; a mesh over several "
-                                 "processes would need them to agree on every step's admission")
+        mesh = _served_mesh(task)
         if task.n != 1:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
@@ -736,7 +778,7 @@ class Server:
             ),
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
-            decode_steps=decode_steps, prefix=task.prefix,
+            decode_steps=decode_steps, prefix=task.prefix, precision=task.precision, progress=task.progress,
         )
 
     @property
@@ -758,8 +800,11 @@ class Server:
         """Whether a request waits or runs, or a call's draws wait to be read."""
         return bool(self._queue or self._rows or self._pending is not None)
 
-    def reload(self, variables: Variables) -> None:
-        """Serve `variables` from the next step on, in place of the current weights.
+    def reload(self, variables: Variables, progress: Progress | None = None) -> None:
+        """Serve `variables` from the next step on, in place of the current weights, at the run's
+        `progress` where one is given (a run's version, `NativeRolloutServer.load`), else at the one it
+        served. A progress takes the place of one of its kind: a server built at the run's end serves
+        that end, and one built at a run's progress serves a run's progress, its steps compiled for it.
 
         The tree must match the served one leaf for leaf in shape, and a leaf
         that is not floating point must match its dtype too. A floating leaf
@@ -770,12 +815,17 @@ class Server:
         prefix pages the old weights wrote are no longer shared. `reload` is
         not thread-safe against `step`, so the caller must serialize the two.
         """
+        if progress is not None and (progress.updates is None) != (self.progress.updates is None):
+            raise ValueError("a server serves the run's end or a run's progress, as it was built; build it "
+                             "from a task at a run's progress (LMObjective.policy) to serve a run's versions")
         packed = pack_projections(normalized(variables, self._source_shapes), self._weight_groups)
         self.variables = reloaded(packed, self.variables)
+        if progress is not None:
+            self.progress = progress
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array | None = None) -> Ticket:
+               key: int | jax.Array) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -816,14 +866,22 @@ class Server:
             if self.cross is not None and CONTEXT in conditioning:
                 context = self._request_context(conditioning.pop(CONTEXT),
                                                   conditioning.pop(CONTEXT_LENGTHS, None))
-            if set(inputs.token_fields) - {"attention_mask", "positions", *GROUPS} or conditioning:
+            # The prompt's layout, its coordinates or its flat fields (`laid_coordinates`): one document.
+            laid = laid_coordinates(inputs.token_fields)
+            if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD, COORDINATES_FIELD, *GROUPS}
+                    or conditioning or (laid is not None and laid.segments is not None)):
                 raise ValueError(
                     "a served prompt carries tokens, validity, positions, image and block groups and a "
-                    "cross-attention decoder's context only; media and custom token fields do not slot"
+                    "cross-attention decoder's context only; media, packed documents and custom token "
+                    "fields do not slot"
                 )
             ids = np.asarray(inputs.tokens)
-            fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
-            positions = fields.pop("positions", None)
+            fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()
+                      if name in GROUPS}
+            valid, positions = token_validity(inputs.token_fields), token_positions(inputs.token_fields)
+            if valid is not None:
+                fields[VALIDITY_FIELD] = np.asarray(valid)
+            positions = None if positions is None else np.asarray(positions)
         else:
             ids = host_token_rows(np.atleast_2d(np.asarray(prompt)))
             fields = {}
@@ -845,8 +903,13 @@ class Server:
         groups = {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
                   for name in GROUPS if name in fields and name in self.group_fields}
         salt = b""
-        if context is not None or groups:
+        if context is not None or groups or self.keyed:
             hasher = hashlib.blake2b(digest_size=16)
+            if self.keyed:
+                # A cached memory rounds by the request's own key (`dew.nn.kv_cache.ROUNDING_KEYS`), so the
+                # state after a prefix is that key's: the prefix is shared only under one key.
+                hasher.update(b"seed" if isinstance(seed, int) else b"key")
+                hasher.update(np.asarray(seed).tobytes() + np.int64(fold).tobytes())
             if context is not None:
                 # The context's dtype too, so equal bytes of another dtype salt apart.
                 array_fingerprint(hasher, np.asarray(context))
@@ -896,14 +959,15 @@ class Server:
         """A request's context as its real tokens on the host, `[length, features]`, in the dtype
         the model reads a context in (`CrossAttending.context_dtype`), refused where it is not one
         row of the model's width, counts tokens it does not hold, or holds more than the
-        cross-attention layers cache (`CrossAttention.context_length`)."""
+        cross-attention layers cache (`CrossBlocks.context_length`)."""
         assert self.cross is not None
         cross, features, dtype = self.cross
-        given = CrossContext.from_conditioning({CONTEXT: jnp.asarray(embeddings), **(
-            {} if lengths is None else {CONTEXT_LENGTHS: jnp.asarray(lengths)})})
-        tokens = np.asarray(given.embeddings, dtype)
+        # Checked where it is, on the host: admission places the batch (`_admit`), never the request.
+        given, counts, _ = CrossContext.checked({CONTEXT: embeddings, **(
+            {} if lengths is None else {CONTEXT_LENGTHS: lengths})}, np)
+        tokens = np.asarray(given, dtype)
         # The count as given, before the cache's int32 holds it, where a wider one would wrap.
-        counted = np.asarray(given.lengths if lengths is None else lengths)
+        counted = np.asarray(counts)
         if tokens.shape[0] != 1 or tokens.shape[-1] != features:
             raise ValueError(f"a request's context is one row of {features}-wide tokens, got {tokens.shape}")
         length = int(counted.reshape(-1)[0])
@@ -935,7 +999,8 @@ class Server:
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
-                self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar)
+                self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar,
+                self.progress)
             if self._captures:
                 self._states = self._captured(self._states, self._resident, self._carried,
                                               *_padded(self._captures, self.admission, 1))
@@ -955,7 +1020,7 @@ class Server:
         prompts: str | Sequence[str] | Sequence[Sequence[int]] | ModelInputs,
         max_new_tokens: int | None = None,
         *,
-        key: int | jax.Array | None = None,
+        key: int | jax.Array,
     ) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 
@@ -1083,7 +1148,7 @@ class Server:
             self._admitted,
         )
         conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
-        fields = {"attention_mask": placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
+        fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
         return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:10])
 

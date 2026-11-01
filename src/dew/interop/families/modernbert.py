@@ -15,8 +15,6 @@ does not run, so they build the dense [S, S] logits a global layer does: at
 from collections.abc import Mapping
 from functools import partial
 
-import numpy as np
-
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
@@ -38,6 +36,7 @@ from dew.interop.decoder_parts import (
     specified_layer_types,
     ungated_mlp,
 )
+from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 _ENCODER = 'ModernBertModel'
@@ -160,8 +159,8 @@ def _nested(name: str) -> str:
     return 'model.' + name if name.startswith(('embeddings.', 'layers.', 'final_norm.')) else name
 
 
-def _modernbert_prepare(tensors: Mapping[str, np.ndarray],
-                        _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _modernbert_prepare(tensors: Mapping[str, Stored],
+                        _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     return {_nested(name): tensor for name, tensor in tensors.items()}
 
 

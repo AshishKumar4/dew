@@ -85,17 +85,21 @@ def test_a_norm_that_drops_a_square_fails_at_its_sum():
                               norm_graph(xla), inputs, width_orbit(inputs), "lost square")
 
 
+def faulted_tail(fault):
+    """The norm graph with its pointwise tail's output passed through `fault`."""
+    dew = norm_graph(xla)
+    tail = Node("output", ("x", "squares", "scale"), Pointwise(),
+                jax.jit(lambda x, squares, scale: fault(dew.node("output").fn(x, squares, scale))))
+    return composed(dew.inputs, (dew.node("squares"), tail), ("output",), ("squares",))
+
+
 def test_a_pointwise_tail_an_ulp_off_where_the_reference_is_exact_fails():
     """Dew's tail one ulp past the reference's at every element: a pointwise node is held element by
     element on common parents, so even an ulp fails where the reference rounds correctly."""
     inputs = norm_inputs()
-    dew = norm_graph(xla)
-    off = Node("output", ("x", "squares", "scale"), Pointwise(),
-               jax.jit(lambda x, squares, scale:
-                       jnp.nextafter(dew.node("output").fn(x, squares, scale), jnp.inf)))
     with pytest.raises(AssertionError):
-        assert_graph_as_exact(composed(dew.inputs, (dew.node("squares"), off), ("output",), ("squares",)),
-                              norm_graph(xla), norm_graph(xla), inputs, width_orbit(inputs), "an ulp")
+        assert_graph_as_exact(faulted_tail(lambda output: jnp.nextafter(output, jnp.inf)), norm_graph(xla),
+                              norm_graph(xla), inputs, width_orbit(inputs), "an ulp")
 
 
 def test_a_witness_that_rounds_otherwise_than_its_graph_fails():
@@ -110,19 +114,20 @@ def test_a_witness_that_rounds_otherwise_than_its_graph_fails():
 
 def test_a_nan_at_one_element_fails():
     inputs = norm_inputs()
-    dew = norm_graph(xla)
-    broken = Node("output", ("x", "squares", "scale"), Pointwise(),
-                  jax.jit(lambda x, squares, scale:
-                          dew.node("output").fn(x, squares, scale).at[3, 5].set(jnp.nan)))
     with pytest.raises(AssertionError):
-        assert_graph_as_exact(composed(dew.inputs, (dew.node("squares"), broken), ("output",), ("squares",)),
-                              norm_graph(xla), norm_graph(xla), inputs, width_orbit(inputs), "nan")
+        assert_graph_as_exact(faulted_tail(lambda output: output.at[3, 5].set(jnp.nan)), norm_graph(xla),
+                              norm_graph(xla), inputs, width_orbit(inputs), "nan")
 
 
 def norm_backward(summed):
     """The norm's backward from the common forward's saved `squares` and a fixed cotangent `g`: the sum
     over the width of g·x·scale (a Sum), then dx and dscale's per-row terms (Pointwise), and dscale's sum
-    over the rows (a Sum)."""
+    over the rows (a Sum). Its nodes are plain jits, which the gate compiles without YNNPACK's fusions by
+    check 1's own policy (`_compiled_alike`): with them XLA:CPU sums the reference's products in a YNNPACK
+    fusion, each rounded to float32, and the half-sum's in a loop that contracts each product into its add,
+    so the two arms' terms round apart at every order and a sum whose reference terms happen to cancel more
+    of the shared rounding sits past FACTOR at an element on some hosts (ledger 3048: 6 of 40 seeds on one
+    host, 13 of 40 on another, none without the fusions)."""
     def inverse(x, squares):
         return jax.lax.rsqrt(squares[..., None] / x.shape[-1] + EPSILON)
 
@@ -134,6 +139,32 @@ def norm_backward(summed):
     dscale = Node("dscale", ("g", "x", "squares"), Sum({"g": 0, "x": 0, "squares": 0}),
                   jax.jit(lambda g, x, squares: summed(jnp.moveaxis(g * x * inverse(x, squares), 0, -1))))
     return composed(("g", "x", "scale", "squares"), (projected, dx, dscale), ("dx", "dscale"))
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="YNNPACK's fusions are XLA:CPU's")
+def test_a_node_xla_cpu_compiles_only_with_ynnpacks_fusions_moves_both_sides_onto_them():
+    """The gate compiles each node's sides by check 1's policy (`_compiled_alike`), its mode decided once
+    on the node's parents: attention's XLA backward over a single key in bf16, which XLA:CPU compiles
+    only with YNNPACK's fusions, moves both sides onto them, recorded in SWITCHED, and passes (3113)."""
+    from reference_error import SWITCHED, without_ynn
+
+    def backward(query, key, value):
+        out, pull = jax.vjp(lambda q, k, v: jax.nn.dot_product_attention(q, k, v, implementation="xla"),
+                            query, key, value)
+        return pull(out)[0]
+
+    rng = np.random.default_rng(3113)
+    inputs = {name: jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+              for name, shape in (("query", (2, 5, 4, 32)), ("key", (2, 1, 2, 32)), ("value", (2, 1, 2, 32)))}
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        without_ynn(backward)(**inputs)
+    node = Node("dquery", tuple(inputs), Pointwise(), jax.jit(backward))
+    graph = composed(tuple(inputs), (node,), ("dquery",))
+    SWITCHED.clear()
+    assert_graph_as_exact(graph, graph, graph, inputs, lambda order: (inputs, lambda outputs: outputs),
+                          "one key")
+    assert SWITCHED and all(entry["label"].startswith("one key dquery") for entry in SWITCHED)
+    SWITCHED.clear()
 
 
 def backward_inputs():

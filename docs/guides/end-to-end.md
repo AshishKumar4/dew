@@ -54,6 +54,8 @@ python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemm
     --tasks hellaswag --limit 64
 ```
 
+A run too large for one device loads sharded, its weights stored narrower: the mesh's sizes and `param_dtype` are keys of `--model_args`, `run=runs/gemma4-sft/checkpoints/gemma4-sft,fsdp=4,param_dtype=bfloat16`, as `TextGeneration.from_run` takes its `mesh` and `param_dtype` (`DewLM.from_run` also takes a `layout`).
+
 ```bash
 JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 ```

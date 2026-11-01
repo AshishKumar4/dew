@@ -17,6 +17,8 @@ from dew.objectives.base import token_log_probs
 
 MASKED_SEEDS = 8
 """Check 1's declared seeds for a masked row against the row of its held classes alone."""
+SMOOTHED_SEEDS = 8
+"""Check 1's declared seeds for a smoothed target's cross entropy against Optax's."""
 COLLAPSE_SEEDS = {20: 8, 40: 8, 80: 8}
 """Check 1's declared seeds for a confident label's derivative at each margin, sized by `seeds_for`."""
 CANCELLATION_SEEDS = 256
@@ -39,7 +41,9 @@ def test_each_form_computes_in_at_least_float32_and_keeps_float64(given, compute
                  categorical.kl_divergence(rows, logits(given, seed=1)), token_log_probs(rows, labels),
                  categorical.rescaled(rows, jnp.exp(rows), rows + 1),
                  categorical.target_loss(rows, rows, rows),
-                 *categorical.segment_log_partition(rows[0], jnp.asarray([0, 0, 1, 2, 1, 3, 3]), 3)[:1]]
+                 *categorical.segment_log_partition(rows[0], jnp.asarray([0, 0, 1, 2, 1, 3, 3]), 3)[:1],
+                 *(charge(rows, jax.nn.one_hot(labels, 7, dtype=given))
+                   for charge in (categorical.brier, categorical.spherical, categorical.ranked_probability))]
         assert {form.dtype for form in forms} == {jnp.dtype(computed)}
 
 
@@ -82,10 +86,55 @@ def test_the_forms_agree_and_a_masked_class_takes_no_probability():
     assert np.all(np.isinf(np.asarray(categorical.soft_cross_entropy(rows, stray, held))))
 
 
+def held_target(width: int) -> jax.Array:
+    """A soft target over a row's four leading classes, none on the classes past them."""
+    return jnp.zeros((3, width)).at[:, :4].set(jnp.asarray([0.1, 0.2, 0.3, 0.4]))
+
+
+def test_each_scoring_charge_is_proper_and_charges_an_honest_forecast_least():
+    """Brier's, the spherical and the ranked probability charges of a forecast against a target
+    distribution over a row's held classes are least where the forecast is the target: in float64 every
+    other forecast of those classes is charged more than the honest one."""
+    with jax.enable_x64(new_val=True):
+        rng = np.random.default_rng(0)
+        held = jnp.arange(7) < 5
+        targets = jnp.zeros((64, 7)).at[:, :5].set(rng.dirichlet(np.ones(5), 64))
+        honest = jnp.log(jnp.where(held, targets, 1.0))
+        others = jnp.asarray(rng.standard_normal((16, 64, 7)) * 2)
+        for charge in (categorical.brier, categorical.spherical, categorical.ranked_probability):
+            least = np.asarray(charge(honest, targets, held))
+            charged = np.asarray(jax.vmap(lambda other, charge=charge: charge(other, targets, held))(others))
+            assert np.all(least < charged), charge.__name__
+
+
+@pytest.mark.parametrize("share", [0.1, 0.5])
+def test_a_smoothed_target_is_optaxs_over_the_rows_held_classes(share):
+    """Label smoothing spreads `share` of a target's mass evenly over the row's held classes and
+    nothing past them: its cross entropy over a row of 7 classes, 5 held, is on par with Optax's
+    smoothed labels' (`optax.smooth_labels`, as torch smooths a probability target) over the 5 held
+    classes alone (check 1)."""
+    held = jnp.arange(7) < 5
+    labels = jax.nn.one_hot(np.arange(32) % 5, 7)
+    assert np.all(np.asarray(categorical.smoothed(labels, held, share))[:, 5:] == 0)
+
+    def smoothed(rows, labels):
+        return categorical.soft_cross_entropy(rows, categorical.smoothed(labels, held, share), held)
+
+    def optaxs(rows, labels):
+        return optax.softmax_cross_entropy(rows[:, :5], optax.smooth_labels(labels[:, :5], share))
+
+    assert_as_exact(smoothed, optaxs, lambda seed: (logits(jnp.float32, shape=(32, 7), seed=seed), labels),
+                    f"smoothed at {share}", seeds=SMOOTHED_SEEDS)
+
+
 FORMS = {
     "cross entropy": lambda rows, where: categorical.cross_entropy(rows, jnp.asarray([0, 3, 2]), where),
     "divergence": lambda rows, where: categorical.kl_divergence(rows, rows[::-1] * 0.5, where),
     "entropy": lambda rows, where: categorical.entropy(rows, where),
+    "brier": lambda rows, where: categorical.brier(rows, held_target(rows.shape[-1]), where),
+    "spherical": lambda rows, where: categorical.spherical(rows, held_target(rows.shape[-1]), where),
+    "ranked probability": lambda rows, where: categorical.ranked_probability(
+        rows, held_target(rows.shape[-1]), where),
 }
 
 

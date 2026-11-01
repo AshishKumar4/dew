@@ -77,6 +77,13 @@ test('a lease that hears nothing fails at its end, and a report after it changes
 	assert.equal(result.late.generation, null);
 	assert.deepEqual(result.late.failure, result.status.failure);
 });
+test('a trial the preparer refuses, as it runs another, leaves the one it runs reported', async () => {
+	// The preview, 2026-10-30: a refused trial had cleared the running one's record, and every later trial read idle.
+	const result = await scenario('refused');
+	assert.match(result.refused, /already running/);
+	assert.equal(result.trialled.pending, 'a'.repeat(40));
+	assert.equal(result.trialled.last.failure, undefined);
+});
 test('a trial whose preparer fails late does not overwrite a trial begun meanwhile', async () => {
 	const result = await scenario('overlap');
 	assert.equal(result.trialled.pending, 'b'.repeat(40));

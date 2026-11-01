@@ -7,6 +7,7 @@ incorrectly charged to a decision model.
 """
 
 import dataclasses
+import itertools
 import json
 import threading
 from pathlib import Path
@@ -43,6 +44,7 @@ from dew.nn.flops import (
     delta_flops,
     dense_training_flops,
     projection_flops,
+    traced_flops,
 )
 from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
@@ -75,6 +77,92 @@ LENGTHS = np.asarray([2, 5], np.int64)
 def decoder(**kwargs):
     return CausalTransformer(vocab_size=64, emb_features=8, num_heads=2, num_kv_heads=1,
                              head_dim=4, num_layers=3, mlp_features=16, **kwargs)
+
+
+def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
+    """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
+    matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
+    scan's body times its length, a branch's costliest arm, a platform choice's the branch an accelerator
+    runs, a gradient's backward products beside its forward's; a while loop and a linear solve, whose run
+    programs a trace does not tell, are refused."""
+    def shaped(*shape):
+        return jax.ShapeDtypeStruct(shape, jnp.float32)
+
+    assert traced_flops(lambda x, w: x @ w, shaped(2, 3, 5), shaped(5, 7)) == 2 * 2 * 3 * 5 * 7
+
+    def convolved(image, kernel):
+        return jax.lax.conv_general_dilated(image, kernel, (2, 2), "SAME",
+                                            dimension_numbers=("NHWC", "HWIO", "NHWC"))
+
+    outputs, taps = 2 * 5 * 5 * 8, 3 * 3 * 4
+    assert traced_flops(convolved, shaped(2, 10, 10, 4), shaped(3, 3, 4, 8)) == 2 * outputs * taps
+
+    def scanned(x, w):
+        return jax.lax.scan(lambda carry, _: (jnp.tanh(carry @ w), None), x, None, length=6)[0]
+
+    assert traced_flops(scanned, shaped(4, 5), shaped(5, 5)) == 6 * 2 * 4 * 5 * 5
+
+    def branched(x, w, v):
+        return jax.lax.cond(x.sum() > 0, lambda: x @ w @ v, lambda: x @ w[:, :3])
+
+    assert traced_flops(branched, shaped(4, 5), shaped(5, 6), shaped(6, 3)) == 2 * 4 * 5 * 6 + 2 * 4 * 6 * 3
+
+    def chosen(named):
+        def run(x, w):
+            return jax.lax.platform_dependent(x, w, cpu=lambda x, w: x @ w @ w,
+                                              default=lambda x, w: x @ w @ w @ w,
+                                              **({"cuda": lambda x, w: x @ w} if named else {}))
+        return run
+
+    # A platform choice is the branch an accelerator runs: the one that names it, else the default.
+    assert traced_flops(chosen(named=True), shaped(4, 5), shaped(5, 5)) == 2 * 4 * 5 * 5
+    assert traced_flops(chosen(named=False), shaped(4, 5), shaped(5, 5)) == 3 * 2 * 4 * 5 * 5
+
+    gradient = jax.grad(lambda w, x: jnp.sum(jax.nn.relu(x @ w)))
+    assert traced_flops(gradient, shaped(5, 7), shaped(3, 5)) == 2 * (2 * 3 * 5 * 7)
+    with pytest.raises(MissingFlopsCount):
+        traced_flops(lambda x: jax.lax.while_loop(lambda c: c.sum() < 9, lambda c: c @ c, x), shaped(2, 2))
+
+    def solved(b):
+        return jax.lax.custom_linear_solve(lambda x: jnp.eye(2) @ x, b, solve=lambda mv, b: b, symmetric=True)
+
+    with pytest.raises(MissingFlopsCount):
+        traced_flops(solved, shaped(2))
+
+
+def test_a_world_model_run_reports_its_updates_gradient_programs_work():
+    """A Dreamer run's train/flops is its update's work as the program differentiating its loss runs it, the
+    independent count of that program's products: the world model's forward and backward on the replayed
+    windows, the imagination's rollout without a backward through the stopped world model."""
+    import optax
+    from test_dreamer import tiny
+
+    from dew.objectives.base import Step
+    from dew.objectives.rl.dreamer import DreamerV3Objective
+    from dew.training import Trainer
+
+    rng = np.random.default_rng(0)
+    batch = {"observation": rng.normal(size=(8, 6, 1)).astype(np.float32),
+             "action": rng.uniform(-1, 1, (8, 6, 1)).astype(np.float32),
+             "reward": rng.normal(size=(8, 6)).astype(np.float32), "first": np.zeros((8, 6), bool),
+             "last": np.zeros((8, 6), bool), "terminal": np.zeros((8, 6), bool)}
+    objective = DreamerV3Objective(tiny())
+    variables = objective.init(jax.random.key(0))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+    rest = {name: value for name, value in variables.items() if name != "params"}
+
+    def gradient(params, rest, batch):
+        def loss(params):
+            return objective.scalar_loss({**rest, "params": params}, batch, step)[0]
+
+        return jax.grad(loss)(params)
+
+    tracker = RecordingTracker()
+    data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(1), tracker=tracker)
+    trainer.fit(data, steps=2, log_every=2)
+    reported = next(scalars["train/flops"] for _, scalars in tracker.scalars if "train/flops" in scalars)
+    assert reported == forward_products(gradient, variables["params"], rest, batch)
 
 
 def test_integer_token_counts_carry_across_words_on_a_partitioned_batch():
@@ -190,6 +278,24 @@ def test_backbone_composes_layers_loop_passes_and_a_separate_lm_head():
     assert model.clone(loop=Loop(3, layers=(1, 3))).model_flops(LENGTHS) == 7 * layer
     assert model.clone(scan_layers=True, remat=RematPolicy()).model_flops(LENGTHS) == 3 * layer
     assert model.clone(tie_embeddings=False).logits_flops(LENGTHS) == model.logits_flops(LENGTHS)
+
+
+def test_an_embedding_of_its_own_width_counts_both_projections_and_its_narrower_head():
+    """An embedding four wide under an eight-wide stream (`embedding_features`) adds `project_in`'s
+    product to the trunk once, and the head counts `project_out`'s product and the tied table at the
+    embedding's width."""
+    model, projected = decoder(), decoder(embedding_features=4)
+    assert projected.model_flops(LENGTHS) == model.model_flops(LENGTHS) + 2 * 4 * 8 * 7
+    assert projected.logits_flops(LENGTHS) == 2 * 8 * 4 * 7 + 2 * 4 * 64 * 7
+
+
+def test_a_projected_heads_projection_runs_on_every_prediction_depth():
+    """The shared head a prediction depth scores with runs `project_out` before its table, so an adapter
+    on it works on each depth's shorter states, as on the head's: one fewer token a depth."""
+    projected = decoder(embedding_features=4, num_nextn_predict_layers=2)
+    usage = projected.prediction_matrix_usage(("params", "project_out"), LENGTHS)
+    np.testing.assert_array_equal(usage, np.concatenate([np.maximum(np.asarray(LENGTHS) - depth, 0)
+                                                         for depth in (1, 2)]))
 
 
 def test_hybrid_backbone_reuses_its_mixer_factory_geometry():
@@ -563,8 +669,8 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
 
 @pytest.mark.parametrize("kind", ["gdn", "kda", "ssd", "mamba"])
 def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
-    """Three delta MACs and the one-pass update's readout (`readout_products`), two SSD/Mamba MACs,
-    executed once per real token."""
+    """Three delta MACs (the prediction, the write and the readout of the updated state, `recurrence.update`)
+    and two SSD/Mamba MACs, executed once per real token."""
     batch, length, heads, key, value = 2, 7, 2, 3, 5
     q = jnp.ones((batch, length, heads, key))
     v = jnp.ones((batch, length, heads, value))
@@ -573,7 +679,7 @@ def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
         g = jnp.zeros((batch, length, heads, key) if kind == "kda" else (batch, length, heads))
         rule = recurrent_delta_rule if kind == "kda" else recurrent_gated_delta_rule
         counted = forward_products(rule, q, q, v, g, beta, state_mac=True)
-        assert counted == 6 * batch * length * heads * key * value + 2 * batch * length * heads * key
+        assert counted == 6 * batch * length * heads * key * value
     elif kind == "ssd":
         b = jnp.ones((batch, length, heads, key))
         counted = forward_products(recurrent_ssd, v, beta, jnp.ones((heads,)), b, b,
@@ -599,23 +705,11 @@ def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
     """One-token recurrence has no chunk-prep products, and the convs
     compute no outputs over their zero history: the model's count is the
     full traced product count, with no tolerance to hide a missing learned
-    projection."""
+    projection. A delta rule's token reads its updated state (`recurrence.update`, rows 1859 and 1962),
+    the analytic rule's three state products (`delta_flops`) and no more."""
     x = jnp.ones((2, 1, 8))
     variables = model.init(jax.random.key(202), x)
-    assert (model.model_flops(np.array([1, 1])) + readout_products(model, 2)
-            == forward_products(model.apply, variables, x, state_mac=True))
-
-
-def readout_products(model, tokens: int) -> int:
-    """The `q . k` product a delta rule's token takes beside its analytic rule's three state products
-    (`delta_flops`): the token scan is the decode step's one-pass update (`recurrence.update`), whose
-    output reads the old state and adds the token's own write by `q . k`, two a key dimension and a value
-    head."""
-    if isinstance(model, GatedDeltaNet):
-        return 2 * tokens * model.num_v_heads * model.head_k_dim
-    if isinstance(model, KimiDeltaAttention):
-        return 2 * tokens * model.num_heads * model.head_dim
-    return 0
+    assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
 
 
 @pytest.mark.parametrize("kind", ["sparse", "latent", "gpt_oss", "gemma4"])

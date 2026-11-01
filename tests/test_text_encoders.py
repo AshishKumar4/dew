@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 import pytest
+from interop_support import respelled
 from reference_error import as_given, assert_as_exact
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec, T5Text
@@ -326,11 +327,8 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference(fringe, tmp_path):
     pixel values have to be the reference's exactly since it is the
     reference's own processor."""
     expected = reference(TINY)
-    source = tmp_path / "clip"
-    shutil.copytree(TINY, source)
-    config = fixture_config(source)
-    config["vision_config"]["image_size"] += fringe
-    (source / "config.json").write_text(json.dumps(config))
+    source = respelled(TINY, tmp_path / "clip", lambda config: {**config, "vision_config": {
+        **config["vision_config"], "image_size": config["vision_config"]["image_size"] + fringe}})
     model = CLIPModel.from_pretrained(str(source))
 
     pixel_values = image_processor(TINY)(
@@ -370,11 +368,8 @@ def test_a_vision_tower_runs_the_activation_its_config_names(hidden_act, tmp_pat
     """The vision tower's MLP runs the `hidden_act` its config names, as the text tower's does
     (`tower_activation`): the tiny checkpoint's image embeddings under each activation are on par
     with transformers' own float32 ones from its float64 ones over drawn images (check 1)."""
-    copy = tmp_path / "tiny"
-    shutil.copytree(TINY, copy)
-    config = fixture_config(copy)
-    config["vision_config"]["hidden_act"] = hidden_act
-    (copy / "config.json").write_text(json.dumps(config))
+    copy = respelled(TINY, tmp_path / "tiny", lambda config: {
+        **config, "vision_config": {**config["vision_config"], "hidden_act": hidden_act}})
     model = CLIPModel.from_pretrained(str(copy))
     shape = tuple(json.loads((TINY / "prompts.json").read_text())["images"]["shape"])
 

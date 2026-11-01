@@ -1,9 +1,297 @@
 # Changelog
 
 Dew's releases, newest first. The version is `dew.__version__`, and a
-release's tag is that version with a `v` in front (`v0.1.0`).
+release's tag is that version with a `v` in front (`v0.1.0`). A release's
+notes are frozen once it is cut: its section's sha256 is recorded in
+tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
+
+- Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md).
+  egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
+  (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
+  traitlets) and ipywidgets, jupyterlab-widgets, widgetsnbextension and comm.
+- On a host of two or more GPUs, XLA's pool leaves NCCL's communicators their measured full-speed room:
+  the share the run names (`dew.devices.pool_bound`) is the pool's upper bound, a child process measures
+  the communicators, all-to-all and permute connections once per configuration into Dew's cache, and a
+  program whose communicators need more than the room left is refused at Dew's one compile point, naming
+  the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
+  through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
+- Dew requires its JAX build 0.12.0.1.post42, and its `cuda12` and `cuda13` extras install Dew's builds of
+  the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
+  (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
+  strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
+  (docs/installation.md lists each fix).
+- DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
+  mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
+  outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.
+- A step that fails on its first run raises `FirstRunFailed`, naming each GPU's bytes free outside XLA's
+  pool, where its collectives' NCCL communicators take their buffers, as the fit check read them and
+  after the failure; a first run that succeeds logs each GPU's free bytes there at the check and after.
+- Dew no longer wraps JAX's `xla_bridge.backends`. XLA parses `XLA_FLAGS` once per runtime it loads,
+  possibly before a backend opens, so a flag holds for certain where `XLA_FLAGS` carried it before the
+  process loaded jaxlib (`dew.devices.flags_hold`). `import dew` sets its own flags before anything it
+  imports loads jaxlib; `dew train`, `dew profile` and `dew inspect` run again from their start with a
+  run's `trainer.xla_flags` set where they do not hold yet; `prepare_process` warns that flags it sets
+  after jaxlib loaded are unproven, and still refuses flags asked for after the backend opened.
+- A float64 `SafetensorsBanks` stream under `jax.enable_x64` no longer depends on the thread XLA runs a
+  layer's fetch on. The setting is thread-local, and JAX narrows a callback's results by it on the thread
+  that runs the callback, so a fetch on one of XLA's workers (a forward with a wide graph runs it there)
+  was refused with "Incorrect output dtype for return value". A 64-bit leaf now crosses the callback as
+  its 32-bit words and is bitcast back on the device.
+- A token export's documents are the records its producer wrote, by its length index, not its tokens'
+  EOS: an EOS a document's own text spells splits nothing, an export without an EOS packs, an empty
+  record is no document, and no `train.documents.npy` is written or read. A plan saved before resumes
+  where it read the same documents; where it read others, the store's fingerprint says how its documents
+  are read now, and the plan is refused.
+- A diffusion run derives its preset's resolution shift and EDM space where it builds its process, so a
+  `data.images.size` or autoencoder override derives them afresh. A JEPA run's predictor computes in its
+  built encoder's dtype and attention kernel.
+- One capture path: `dew.telemetry.profile.CaptureOptions` replaces `capture_options()`, and a
+  `ProfileWindow` holds it as `capture` in place of its `host_tracer_level`, `python_tracer_level` and
+  `activity_cap` (a saved run's are read as its capture's). `Profiler(reports=False)` captures a trace a
+  reader reads alone, with no XProf reports; the benchmarks and PGLE's guided profile capture through
+  it. The fit's trace record is `ProfileTraced`.
+- The step and data benchmarks rate MFU over the whole mesh's peak, as the trainer does, and report
+  their compiled work as a lower bound beside the launches it left out.
+- `from_grain`, `from_iter` and `from_hf` take a source's content version as `identity=`, as
+  `from_torch` does; a saved chain's iterator `name` reads as its identity.
+- A record's remote media path is read from Dew's mirror, refused (`Unmirrored`) where the mirror has no
+  room for it.
+- Muon's and MuonClip's AdamW group, the norms, biases and embeddings, keeps both moments in float32 by
+  default (`state_dtype`), as AdamW does: under bfloat16 or float16 weights its second moment no longer
+  underflows.
+- A distillation's `teacher_run` is read as its run's task loads it (`dew.inference.SavedRun`): the
+  model the run publishes, so a Flow-GRPO run's trained policy and not its KL reference; guidance
+  distillation's teacher objective is the run's own sampling task.
+
+- Environments and reinforcement learning for control, in `dew.rl` and `dew.objectives`:
+  - Environments as two pure functions: an `Env`'s `reset` and `step`, batched, cut at a time limit, rolled
+    out by one `lax.scan` (`dew.rl.env`). MuJoCo Playground's environments are Envs (`dew.rl.playground`,
+    the `playground` extra).
+  - Simulators outside JAX, stepped from the host with their arrays crossing by DLPack
+    (`dew.rl.simulator`).
+  - A device replay (`dew.rl.replay`).
+  - Brax's PPO for continuous control (`dew.objectives.rl.control`).
+  - DreamerV3 as its code computes it (`dew.objectives.rl.dreamer`): vector or image observations, bfloat16
+    compute, privileged auxiliary heads, and pretraining from demonstrations with behaviour cloning.
+  - DreamerV3's optimizer, LaProp after adaptive gradient clipping (`dew.laprop`), as the `laprop`
+    optimizer of `dew.optim`, which `OptimConfig.optimizer` names.
+  - TransDreamer's transformer dynamics (`dew.objectives.rl.tssm`).
+  - Dreamer 4's shortcut-forcing world model (`dew.objectives.world_model`).
+  - DiffusionNFT (`dew.objectives.rl.nft`).
+  - `tools/rl_acceptance.py` runs these against their papers. `tutorials/12-world-models.ipynb` acts and
+    imagines in one loop.
+- A first-person drone gate race in JAX (`dew.rl.flight`), flown by a racing quadrotor's physics in JAX
+  (`dew.rl.quadrotor`: a 5-inch racer at 12 times its weight, first-order motors, a Betaflight-form rate
+  loop, rotor, body and vertical drag, ground effect, a LiPo pack's sag, disturbances and noise, each drawn
+  per episode):
+  - Progress-to-gate rewards, gates passed only through their openings, and frames, pillars and the ground
+    solid along each physics step.
+  - Courses of four families (published layouts, loops, Song's chained primitives with split-S and dives,
+    figure-eights) under a difficulty curriculum, the next gate lit for the camera.
+  - Each drone's physics, latency, camera and image randomized.
+  - HyperLux draws its cameras (`dew.rl.hyperlux`, the `hyperlux` extra) over textured grounds, skies,
+    pillars and props (`tools/fpv_assets.py`, CC0 textures).
+  - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
+    DreamerV3 agent on the camera alone.
+- A run's watched activations (`Inspection.modules`) name a module by its class or its path, and a language
+  model's are summarized over its real tokens alone, its scorer's as it prepared them, through a pipelined
+  stack's microbatches too; a preference pair lays out each half's real tokens (`real_mask`).
+- `Inspection(cotangents=True)` logs the loss's cotangent at each watched output (`inspect/cotangents/...`),
+  from a probe's gradient, every objective's model calls carrying the probes.
+- A JEPA run's watched activations are named by the part that runs them, `context_encoder/...` (was
+  `encoder/...`) and `predictor/...`.
+- A step compiled ahead lists, past the plan it takes, each rung that recomputes more and fits at fewer
+  microbatches than every plan before it (`compile_ahead(..., frontier=True)`,
+  `--trainer.compile-ahead.frontier`), the plans `tools/benchmark_step.py` times on the GPUs; a run names
+  the fastest by its remat, `--trainer.split` and `LMObjective.head_tile`.
+## 0.2.0
+
+The first release on Dew's own package index, `pip install dewml --extra-index-url
+https://pypi.dewml.dev/simple`, beside Dew's JAX build, which PyPI does not hold. PyPI's `dewml` is a
+pointer from now on: its 0.1.1 installs nothing and names the index.
+
+- The fit search's derived first candidate counts what its gradient program holds at its peak, as JAX
+  lowers it and the GPU's fusion keeps its values (a one-device `shard_map` inline, a Pallas kernel its
+  outputs alone, a `platform_dependent` the platform's branch), and the GEMM workspace XLA gives each
+  matmul (32 MiB from Hopper on, 4 MiB before; a compile-only GPU's 4 MiB, but a matmul fused with its
+  loop's slice). A program with a ragged product states its peak as a bound from below. Every compile's plan record carries `derived_headroom` beside its measured `headroom`, and a
+  compile the derivation judged otherwise logs a model miss.
+- An inspection's `every` counts windows of the run's accumulation steps; MeanFlow's and LADD's sampled
+  steps summarize the forward their loss trains, with no second forward. `dew inspect` views a run
+  whose objective names its input alone. `RunConfig.prepare()` returns a `Prepared` holding the run's
+  objective, data and what `train` takes beside them, with `train(name)` and `inspected(name)`.
+- A run on the examples clock resumed with a larger examples bound trains on to it.
+- A file an export's manifest or a source's `file_info` declares is never read as other bytes under
+  that declaration, which a run's identity holds: an export records the version its store published
+  each shard at (an S3 ETag, a GCS generation), and each read of a range of it is held to that version,
+  refused (`dew.data.declared.Replaced`) where the store no longer holds it; Parquet and Arrow files on
+  S3 or GCS keep Arrow's own clients, each read of a fragment between two reads of the file's version;
+  an export on a Hub repository read by its branch is read at the commit the branch names as its
+  manifest is read, every file it lists at that commit; a local or in-memory file is checked against its
+  digest as a read opens it, and an indexed reader reads the file it checked while it holds it; any
+  other remote file, and an ArrayRecord shard, which its reader opens by path, is read whole into Dew's
+  mirror and checked there. A published cache generation's shards and lengths, and a token export's
+  lengths, are read as declared too.
+- A streamed Hub split reads the files of the configuration it names, or of the default its card
+  states, as `datasets` resolves its card's `configs` (`data_files` under `data_dir`), and its Parquet
+  conversion reads that configuration's directory: naming none, where a card states several and marks
+  no default, is refused, as is naming one it does not state, where every configuration's split of
+  that name was read before.
+- MaxText's GPT-3 builds as a decoder: `scale_offset` on a `'layer'` norm stores its weight as its
+  offset from one (`dew.nn.norms.OffsetLayerNorm`), beside learned positions, biased attention and MLP
+  and tied logits; MaxText's Engram layer, from its bucket ids, is the PLE layer a decoder builds with
+  biased projections (`Engram.ple_bias`). Each is held to MaxText 0.2.5's run
+  (`tests/test_maxtext_gpt3.py`, `tests/test_maxtext_engram.py`). MaxText's hashing of tokens to buckets
+  is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
+- A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
+  places a MoVA model's stacked value experts on the expert axis.
+- A compilation cache directory a run names after its process first compiled (`prepare_process`,
+  `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
+  JAX kept the first directory.
+- A decision run's summary states each question budget with where it came from beside the window's
+  (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
+  states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
+  counts beside the delivered rows' (`Rejected.cut`).
+- A schedule's saved position holds the committed tokens each finished stage ended at, and a resume
+  whose finished stage ends at other tokens is refused, where it read the next stage at once.
+- An audio tower (`HFAudio`, `AudioCondition`) takes a `revision`, reads its configuration and feature
+  extractor from one commit's files, and holds their hashes in its identity, so an extractor that moved
+  under the checkpoint's name re-keys the encoded audio.
+- A run whose optimizer holds its whole update back on some calls (`optax.MultiSteps`, or
+  `optax.apply_every` last in a chain) counts its update count, EMA, committed tokens and
+  `power_profiles`' averages by the updates the optimizer applies, as its state says, where it counted
+  every call; the tokens of a held call wait in the state (`TrainState.deferred`) for the update that
+  applies them, an input `MultiSteps`' skip predicate discards commits none, and each held call draws
+  its examples afresh. A held update whose state does not say which call applied one is refused before
+  any step, naming the composition and the supported one: `optax.apply_if_finite` (drop non-finite
+  steps with `Trainer(dynamic_scale=...)`), `optax.conditionally_mask` anywhere but under
+  `dew.held_updates.phased`, which says each update trains one of the networks it alternates (the
+  consistency objective's phases), and a held update within another, under a mask, partition or
+  condition, or before a later transform.
+- Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
+  (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
+  IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
+  products exactly with `--optim.optimizer-opts '{"ns_precision": "F32_F32_F32"}'` (a
+  `jax.lax.DotAlgorithmPreset` by name), refused in JAX's own words where its platform has not the
+  algorithm; a run saved with `ns_precision` as a precision level loads with its algorithm. Opt-in beside
+  it: `per_head` (head widths by parameter pattern) orthogonalizes each head's block alone, as Kimi K3;
+  `ns_coeffs: "polar_express"` takes Polar Express's coefficients; `neuron_beta2` normalizes each output
+  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`, its coefficients
+  (`NEWTON_SCHULZ`) exported there alone.
+- An evaluation of a run on the examples clock records the examples it had consumed
+  (`evaluation/examples_consumed`) beside its step; a cooldown branch's, scored at the step it branched
+  at, records the branch's own count under `cooldown/examples_consumed`.
+- An evaluation's counts are its split's: `evaluation/counts/<split>/coordinated_batches` and
+  `evaluation/counts/<split>/records`, so splits scored at one step each keep their own. A cooldown
+  branch's scores are named `cooldown/<split>/<metric>`, which no split's own name can take.
+- A Gauss-Newton step (`Residuals(damping=...)`) takes every derivative order: its microbatch pullback and
+  damped step are custom JVPs, so `jax.jvp`, `jax.linearize` and a Hessian-vector product run through it,
+  and a parameter's step cotangent comes in the parameter's own dtype. The LM heads (whole, tiled and
+  fused) take a gradient of their gradient and its forward derivative, a Hessian-vector product through
+  the loss, on JAX 0.12.0.1.post40, whose variadic reduce differentiates beside a constant operand.
+
+- A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
+  preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
+  `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
+  and serve under their precision and forms. The attention template's form is the run's numerics' alone
+  (`run_precision`); `generation.chosen(attention_form=...)` is gone.
+- A token layout is one `dew.batch.Coordinates` past a model's `__call__`: `hidden_states`, `logits`,
+  `states_and_logits`, the prediction depths' methods, `draft` and `DiffusionGemma.encode` take
+  `coordinates=` (`dew.batch.coordinates(shape, segments=..., valid=..., positions=...)`) where they
+  took `segment_ids`, `attention_mask` and `positions`; `__call__` still takes the flat fields and
+  converts them once. `ModelInputs.from_value` and `ModelInputs.kwargs` lay a request's flat fields out
+  as its `coordinates`, `LMObjective.token_scores` takes `coordinates=`, and a field dict carrying both
+  a `Coordinates` and a flat layout field is refused where it is read.
+- A run's progress (`dew.nn.progress.Progress`, the updates committed before a step) is a declared
+  input: a model whose computation changes over a run (`ReadsProgress`, a DEX decoder) takes it as its
+  call's `progress=` keyword and carries it to its layers in `AttentionMetadata.progress`, so a compiled
+  forward keys on it. A run's training loss passes it (`Objective.progress`); a call that passes none
+  reads the run's end. `dew.nn.progress.progress()` and `stepping` are gone, and an objective that
+  passes no progress (`Objective.passes_progress`) refuses a model that reads it, as the trainer does
+  under a custom step (`Trainer(step=)`) unless its factory says it passes it
+  (`dew.training.PassesProgress`).
+- One entry point and one path for scoring decisions: `decide(state, questions)` answers a request and
+  `decide([(state, questions), ...], contexts=...)` many, their rows packed into the passes a scoring
+  server runs and over its compiled programs. `Decide.batch` and `Decide.fits` are gone; call the task
+  with the sequence. A scoring server's pass now looks at every waiting request while its plan takes
+  their rows (`ScoringServer(rows=None)`, the default), where it looked at 64 at most and left larger
+  shapes' windows part empty.
+- A float32 product with no stated precision follows JAX's configured precision
+  (`jax_default_matmul_precision`), TF32 on recent GPUs as JAX documents, where Dew pinned it at
+  `Precision.HIGHEST`; a model's `precision` field still sets its own. A float32 run on an A100 trained
+  2.8 times slower for the pin. A router's logits, a vocabulary head's (the loss's) and a recurrence's
+  state products keep IEEE float32 where nothing states a precision, each for its stated reason.
+- One typed record of a run's numerics, `trainer.precision` (`dew.nn.precision.Numerics`), set once
+  and recorded with the run: its dtypes (`Dtypes`: parameters, compute and outputs, Flax's
+  `param_dtype` and `dtype`, the usual ones by Lightning's names in `DTYPE_PRESETS`: "bf16-mixed" by
+  default, "32-true", "bf16-true", "16-mixed"), its matmul
+  precision by JAX's own levels ("default", "high", "highest", or a `jax.lax.DotAlgorithmPreset`), and
+  its ops' forms ("fast" or "accurate"). `ACCURATE` names the scientific one: "32-true", "highest" and
+  the accurate forms. It replaces `trainer.attention_form`; a run saved with that field loads and
+  resumes with it as its forms.
+- DEX (arXiv 2505.16333): a learned differential on chosen heads' attention outputs, `O'_h = O_h -
+  lambda(t) O_h W_D,h`, with lambda annealed from zero over the run's first updates
+  (`dew.nn.dex.DifferentialExtension`). Attach it with `Pretrained.load(..., dex=...)` or
+  `with_dex`, or from a run with `--source.dex '{"layers": [[layer, [heads...]], ...]}'`. By default
+  it follows the paper's recipe: the attention's key, value and output projections train beside the
+  extension, and the rest is frozen. Layers that choose as many heads scan as one run and split over
+  pipeline stages, each holding its heads and `lambda_init` as constants of its own; `save` and
+  `export` write each layer's differential at its learned lambda folded into its output projection.
+- A decoder's cross-attention is any configuration that builds a block per layer (`CrossBlocks`), which
+  `with_cross_attention` takes. `SharedCrossAttention` is a new one: each named layer reads the
+  conditioning sequence through its own attention's projections and norms, and the read joins the
+  residual through one tanh gate per layer, zero at the start, the only weight it adds.
+  `CrossAttention`, IDEFICS's gated block, is the other.
+- A request names its key: `TextGeneration`, `BlockGeneration` and `MaskedGeneration` calls and
+  `Server.submit` and `Server.__call__` take `key=` as a required keyword, as every native sampler does,
+  where a call without one raised `ValueError` at run time; it now raises `TypeError` at the call.
+- RL rollout metrics report each data source's status shares and mean trained reward
+  (`source/<source>/status/<name>`, `source/<source>/reward/mean`) where a step's prompts come from two or
+  more (`Session.source`, the prompt's `PromptRecord.data_source`).
+- A decoder whose family runs remote code (`LFM3`) saves with its release's code beside its config: the
+  modules its `auto_map` names and every module they import, at the release's pinned revision, so the
+  export opens through transformers' `trust_remote_code` as the release does.
+- Muse Glimmer's processor reads videos (`pixel_values_videos`, `video_grid_thw`) as Qwen 3.5's does,
+  each frame pair a temporal patch the tower attends within.
+- LLaDA2.0 generates as its release does: `text_generation()`, `dew.pipeline` and an objective over the
+  source walk its response 32 places at a time with `Confident`'s reveal (LLaDA2.1 alike, without its
+  release's editing), and `MaskedSettings`, `MaskedGeneration` and `MaskedDiffusionObjective` take
+  `Confident` and `block` for any masked model.
+- Masked diffusion walks a block at a time, as LLaDA2's releases generate: `DiscreteProcess.generate(...,
+  block=)` unmasks each block of counted places over its own steps, each position reading its document
+  through its own block, and `dew.diffusion.discrete.Confident` reveals as LLaDA2 does (the draws past a
+  confidence threshold, else a quota's most confident).
+- Liquid's LFM3 (`lfm3`, LiquidAI/LFM3-1.7B and the text backbone of LFM3-VL and d1) loads, trains, decodes
+  and saves: its gated short convolution layers are a mixer of their own (`short_conv`, its last inputs
+  through the decode cache), and attention gates each head by its own sigmoid (`gate_projection='head'`).
+- `NodePerturbation`, mixed into an objective, trains its model without backpropagation, by node
+  perturbation of every Dense, DenseGeneral and Embed output as Dust does, the rest by weight-space
+  evolution strategies, pooled over a split or accumulated update as its gradient is;
+  `Objective.scored_units` states the units it credits.
+- `Residuals` objectives train on the mean square of their residuals, by the gradient or by damped
+  Gauss-Newton; `dew.nn.fourier.FourierPyramid` is a multi-resolution Fourier feature pyramid;
+  `examples/pinn_burgers.py` solves the self-similar Burgers profile in float64.
+- `Trainer.fit(resume=)` makes resuming explicit: `"auto"` continues the latest checkpoint where there
+  is one, as before; `"require"` refuses a directory with none, for a job that must not start afresh;
+  `"never"` refuses one that already holds a run (`Checkpoints.resumed`). A run configuration takes it
+  as `trainer.resume` and refuses before writing its record over the directory's.
+- `dew profile run.py --warmup 20 --steps 10` (`RunConfig.profile`) trains a run afresh in a directory of
+  its own, traces a window of steps and prints where they spent their time (`ProfileReport`): step,
+  input wait, compile, device time in collectives and the rest, analytic work and MFU.
+  `Supervised(work=)` declares a batch's training FLOPs for a model Dew holds no count for.
+- `Supervised(model, loss, inputs="x")` names the input field alone; the run reads its shape off its
+  first batch as the model reads it, after the loader's device steps (`Objective.named_inputs`). An
+  explicit `InputSpec` still states it.
+- Under JAX's AutoPGLE (`JAX_ENABLE_PGLE=1`) the trainer guides its ahead-compiled step by a profile of
+  its first runs, which JAX's jit never did for it, and records the profile in the step's plan.
+- A token budget, a cadence of tokens and a schedule's stages read the committed-token count off the
+  devices only where the steps since the last read could have reached what they read next
+  (`Objective.row_tokens`), so the steps between dispatch without waiting on the one before.
+- A schedule's stages each train at the row length their chain lays out, up to the model's
+  `max_seq_len`, so a context-extension schedule (8k-token rows, then 64k) trains its later stage
+  where the objective's one row length refused it.
 
 - A tiled LM head's backward carries the state gradient over its vocabulary tiles as a compensated
   pair on every backend (`dew.nn.precision.paired_sum`), so its error is the tile products' own: on an

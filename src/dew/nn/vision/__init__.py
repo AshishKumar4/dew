@@ -41,62 +41,104 @@ with its path map and its config and weight translators, and each family's
 classes say where their tensors sit (`TowerLayout`, `ProjectorLayout`), so the
 kinds `dew.registry` names are the one list of them. The package exports the
 classes a caller constructs or subclasses, and reads a kind's tensors through
-its class's layout (`tower_variables`, `projector_variables`).
+its class's layout (`tower_variables`, `projector_variables`). Each name is imported from its own module
+when first read, so a caller of one family's tower reads no other family's.
 """
 
-from __future__ import annotations
-
-from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-import numpy as np
+from dew._exports import lookup as _lookup
 
-from dew.batch import Variables
+if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew.nn.vision.common import (
+        ProjectorBase,
+        ProjectorLayout,
+        TowerBase,
+        TowerGeometry,
+        TowerLayout,
+        projector_layout,
+        projector_variables,
+        tower_layout,
+        tower_variables,
+    )
+    from dew.nn.vision.deepseek_v41 import DeepseekV41Projector, DeepseekV41Vision
+    from dew.nn.vision.gemma3n import Gemma3nProjector, Gemma3nVision
+    from dew.nn.vision.gemma4 import Gemma4Projector, Gemma4Vision, Gemma4VisionTransformer
+    from dew.nn.vision.llama4 import Llama4Projector, Llama4Vision, Llama4VisionTransformer
+    from dew.nn.vision.mimo import MiMoProjector, MiMoVision
+    from dew.nn.vision.muse_glimmer import MuseGlimmerProjector, MuseGlimmerVision
+    from dew.nn.vision.qwen35 import Qwen35Projector, Qwen35Vision
+    from dew.nn.vision.siglip import GemmaProjector, SiglipVision
+    from dew.nn.vision.vit import MergeProjector, VisionTransformer, ViTLayout
 
-from .common import (
-    ProjectorBase as ProjectorBase,
-    ProjectorLayout as ProjectorLayout,
-    TowerBase as TowerBase,
-    TowerGeometry as TowerGeometry,
-    TowerLayout as TowerLayout,
-    projector_layout as projector_layout,
-    tower_layout as tower_layout,
-)
-from .deepseek_v41 import DeepseekV41Projector as DeepseekV41Projector, DeepseekV41Vision as DeepseekV41Vision
-from .gemma3n import Gemma3nProjector as Gemma3nProjector, Gemma3nVision as Gemma3nVision
-from .gemma4 import (
-    Gemma4Projector as Gemma4Projector,
-    Gemma4Vision as Gemma4Vision,
-    Gemma4VisionTransformer as Gemma4VisionTransformer,
-)
-from .llama4 import (
-    Llama4Projector as Llama4Projector,
-    Llama4Vision as Llama4Vision,
-    Llama4VisionTransformer as Llama4VisionTransformer,
-)
-from .mimo import MiMoProjector as MiMoProjector, MiMoVision as MiMoVision
-from .muse_glimmer import MuseGlimmerProjector as MuseGlimmerProjector, MuseGlimmerVision as MuseGlimmerVision
-from .qwen35 import Qwen35Projector as Qwen35Projector, Qwen35Vision as Qwen35Vision
-from .siglip import GemmaProjector as GemmaProjector, SiglipVision as SiglipVision
-from .vit import (
-    MergeProjector as MergeProjector,
-    VisionTransformer as VisionTransformer,
-    ViTLayout as ViTLayout,
-)
+_EXPORTS = {
+    "ProjectorBase": "dew.nn.vision.common",
+    "ProjectorLayout": "dew.nn.vision.common",
+    "TowerBase": "dew.nn.vision.common",
+    "TowerGeometry": "dew.nn.vision.common",
+    "TowerLayout": "dew.nn.vision.common",
+    "projector_layout": "dew.nn.vision.common",
+    "projector_variables": "dew.nn.vision.common",
+    "tower_layout": "dew.nn.vision.common",
+    "tower_variables": "dew.nn.vision.common",
+    "DeepseekV41Projector": "dew.nn.vision.deepseek_v41",
+    "DeepseekV41Vision": "dew.nn.vision.deepseek_v41",
+    "Gemma3nProjector": "dew.nn.vision.gemma3n",
+    "Gemma3nVision": "dew.nn.vision.gemma3n",
+    "Gemma4Projector": "dew.nn.vision.gemma4",
+    "Gemma4Vision": "dew.nn.vision.gemma4",
+    "Gemma4VisionTransformer": "dew.nn.vision.gemma4",
+    "Llama4Projector": "dew.nn.vision.llama4",
+    "Llama4Vision": "dew.nn.vision.llama4",
+    "Llama4VisionTransformer": "dew.nn.vision.llama4",
+    "MiMoProjector": "dew.nn.vision.mimo",
+    "MiMoVision": "dew.nn.vision.mimo",
+    "MuseGlimmerProjector": "dew.nn.vision.muse_glimmer",
+    "MuseGlimmerVision": "dew.nn.vision.muse_glimmer",
+    "Qwen35Projector": "dew.nn.vision.qwen35",
+    "Qwen35Vision": "dew.nn.vision.qwen35",
+    "GemmaProjector": "dew.nn.vision.siglip",
+    "SiglipVision": "dew.nn.vision.siglip",
+    "MergeProjector": "dew.nn.vision.vit",
+    "VisionTransformer": "dew.nn.vision.vit",
+    "ViTLayout": "dew.nn.vision.vit",
+}
 
-if TYPE_CHECKING:
-    from dew.interop.streaming import WeightLayout
-
-
-def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
-                    ) -> tuple[Variables, tuple[WeightLayout, ...]]:
-    """One vision tower's variables, in the requested storage (`tower_layout`), and the layouts
-    that write its tensors back from them."""
-    return tower_layout(kind).variables(hf_tensors, param_dtype)
+__getattr__ = _lookup(__name__, _EXPORTS)
 
 
-def projector_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
-                        ) -> tuple[Variables, tuple[WeightLayout, ...]]:
-    """One projector kind's parameters, in the requested storage (`projector_layout`), and the
-    layouts that write its tensors back from them."""
-    return projector_layout(kind).variables(hf_tensors, param_dtype)
+def __dir__() -> list[str]:
+    return list(__all__)
+
+__all__ = [
+    "DeepseekV41Projector",
+    "DeepseekV41Vision",
+    "Gemma3nProjector",
+    "Gemma3nVision",
+    "Gemma4Projector",
+    "Gemma4Vision",
+    "Gemma4VisionTransformer",
+    "GemmaProjector",
+    "Llama4Projector",
+    "Llama4Vision",
+    "Llama4VisionTransformer",
+    "MergeProjector",
+    "MiMoProjector",
+    "MiMoVision",
+    "MuseGlimmerProjector",
+    "MuseGlimmerVision",
+    "ProjectorBase",
+    "ProjectorLayout",
+    "Qwen35Projector",
+    "Qwen35Vision",
+    "SiglipVision",
+    "TowerBase",
+    "TowerGeometry",
+    "TowerLayout",
+    "ViTLayout",
+    "VisionTransformer",
+    "projector_layout",
+    "projector_variables",
+    "tower_layout",
+    "tower_variables",
+]

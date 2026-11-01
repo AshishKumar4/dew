@@ -293,7 +293,7 @@ def main(config: Config) -> None:
     }
     (config.out / "moe-mesh.json").write_text(json.dumps(record))
     (config.out / "moe-mesh.svg").write_text(drawing(record, where, config))
-    print(f"Wrote {config.out / 'moe-mesh.svg'} and {config.out / 'moe-mesh.json'}")
+    print("Wrote moe-mesh.svg and moe-mesh.json")
 
 
 # ---------------------------------------------------------------------------

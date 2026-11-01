@@ -4,21 +4,27 @@ runs out before its length."""
 import collections
 import dataclasses
 
+import grain.python as grain
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from examples_clock_worker import Questioned
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
+from test_barren_reads import Untouched
 
-from dew.batch import VALID_ROWS
+from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
 from dew.data import Memory
-from dew.data.compile import compile
-from dew.data.dataset import Closeable, DataPartition, Loader
-from dew.data.pipeline import Pipeline
+from dew.data.compile import compile, fitted
+from dew.data.dataset import Closeable, DataPartition, Loader, Loading
+from dew.data.pipeline import ObjectiveData, Pipeline
+from dew.distributed.batches import batch_signature
 from dew.objectives import Aux, Objective
-from dew.optim import Linear, OptimConfig
+from dew.optim import Cosine, Linear, OneCycle, OptimConfig
+from dew.telemetry.records import FitStarted
 from dew.training import Best, Checkpoints, Pause, Trainer
+from dew.training.interval import CONSUMED_COMMITTED, CONSUMED_EXAMPLES
 
 FEATURES = 4
 RECORDS = 10
@@ -102,18 +108,16 @@ def trained(x, directory=None, stops: tuple[Pause | None, ...] = (None,)):
     return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
 
 
-def ids_read(loader: Loader, steps: int, field: str) -> collections.Counter:
-    """The real values of `field` in the first `steps` training batches of `loader`, which ends there."""
-    stream = loader.train(DataPartition())
+def ids_read(loader: Loader, field: str, partition: DataPartition | None = None) -> collections.Counter:
+    """The real values of `field` in every training batch `partition`'s share of `loader` reads (a single
+    reader's where None), whose read ends at its bound."""
+    stream = loader.train(DataPartition() if partition is None else partition)
     read: collections.Counter = collections.Counter()
     try:
-        for _ in range(steps):
-            batch = next(stream)
+        for batch in stream:
             real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch[field]), bool)), bool)
             values = np.asarray(batch[field])[real]
             read.update(values[values > 0].tolist())
-        with pytest.raises(StopIteration):
-            next(stream)
     finally:
         if isinstance(stream, Closeable):
             stream.close()
@@ -128,11 +132,130 @@ def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examp
     RECORDS of them."""
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
     loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).batch(BATCH), examples=examples)
-    read = ids_read(loader, loader.example_steps(examples), "id")
+    read = ids_read(loader, "id")
     passes, rest = divmod(examples, RECORDS)
     assert sum(read.values()) == examples
     assert collections.Counter(read.values()) == collections.Counter(
         {passes + 1: rest, passes: RECORDS - rest} if passes else {1: rest})
+
+
+POOLED = 3
+"""The shares of the pools a bound in examples is dealt between, which the ten records' passes do not
+split evenly."""
+
+POOLED_SHARDS = 3
+"""The rows of each physical shard of the pools' streamed reads: 3, 3, 3 and a last of 1."""
+
+
+def examples_read(loader: Loader, partition: DataPartition, *, expanded: bool) -> collections.Counter:
+    """The examples by id `partition`'s share of `loader` reads, each example's rows whole (an objective's
+    `id % 3 + 1` rows of each where `expanded`)."""
+    rows = collections.Counter(ids_read(loader, "id", partition))
+    made = {record: record % 3 + 1 if expanded else 1 for record in rows}
+    assert all(count % made[record] == 0 for record, count in rows.items()), rows
+    return collections.Counter({record: count // made[record] for record, count in rows.items()})
+
+
+def dealt_records(ids: np.ndarray, examples: int, index: int) -> collections.Counter:
+    """The oracle of a pool's bound over records each share reads its own of, dealt `index :: POOLED`: the
+    examples at each of the pool's first `examples` places, pass after pass, that fall to share `index`."""
+    places = [place % len(ids) for place in range(examples)]
+    return collections.Counter(int(ids[place]) for place in places if place % POOLED == index)
+
+
+def dealt_shards(ids: np.ndarray, examples: int, index: int, *, rewound: bool) -> collections.Counter:
+    """The oracle of a pool's bound over the stream's physical shards of POOLED_SHARDS rows, dealt place by
+    place (`index :: POOLED`) in the order the compile's seed (0) shuffles them: each pass its own order
+    where the stream repeats them itself; a pass replayed, each share its own places again, where a later
+    repeat replays the stream (`rewound`). The rows of each place the first `examples` rows reach that
+    falls to share `index`."""
+    shards = [ids[start:start + POOLED_SHARDS] for start in range(0, len(ids), POOLED_SHARDS)]
+    order = grain.MapDataset.range(len(shards)).shuffle(seed=0)
+    read: collections.Counter = collections.Counter()
+    if rewound:
+        passes, examples = divmod(examples, len(ids))
+        for place in range(len(shards)):
+            if place % POOLED == index:
+                read.update({int(record): passes for record in shards[order[place]]})
+        order = order.repeat(1)
+    else:
+        order = order.repeat()
+    place = 0
+    while examples > 0:
+        shard = shards[order[place]]
+        if place % POOLED == index:
+            read.update(int(record) for record in shard[:examples])
+        examples -= len(shard)
+        place += 1
+    return read
+
+
+POOL_DEALS = {
+    # A global order, cut into shares after the bound.
+    "one order": lambda rows: rows.shuffle(3),
+    # Records each share reads its own of (`index :: count`), an objective making rows of each.
+    "dealt records": lambda rows: rows,
+    "dealt records in workers": lambda rows: rows.loading(Loading(workers=1, threads=1, read_buffer=1)),
+    # Physical shards each share reads its own of, the stream repeating them, one at a time or two.
+    "dealt shards": lambda rows: rows,
+    "dealt shards interleaved": lambda rows: rows.interleave(2),
+    # The stream repeated after a step, each share replaying its own shards, one at a time or two.
+    "dealt shards rewound": lambda rows: rows.random_map(Untouched(), identity="untouched@1").repeat(),
+    "dealt shards rewound interleaved": lambda rows: rows.interleave(2).random_map(
+        Untouched(), identity="untouched@1").repeat(),
+}
+
+
+@pytest.mark.parametrize("examples", [1, 7, 23])
+@pytest.mark.parametrize("deal", list(POOL_DEALS))
+def test_a_pools_shares_read_its_bound_once_however_its_read_deals_them(deal, examples):
+    """A pool of three shares bounded to `examples` reads exactly its bound's examples between its shares,
+    each where its read deals it, however that is (`POOL_DEALS`): in one order, the examples one process
+    reads; dealt by record or by physical shard, each share the examples at its places among the pool's
+    first `examples` (`dealt_records`, `dealt_shards`), so no share repeats a record while another's go
+    unread, and a share dealt none reads none. A share's interleave reads its own places' rows alone, and
+    loading workers keep the count each share's records hold."""
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    streamed = deal.startswith("dealt shards")
+    rows = POOL_DEALS[deal](Pipeline(Memory({"id": ids}, shard_rows=POOLED_SHARDS)))
+    expanded = deal != "one order"
+    loader = compile(rows.batch(2 * POOLED), read="streamed" if streamed else "memory",
+                     objective=ObjectiveData(train=(Questioned(),)) if expanded else None, examples=examples)
+    shares = [examples_read(loader, DataPartition(index=index, count=POOLED), expanded=expanded)
+              for index in range(POOLED)]
+    if deal == "one order":
+        assert sum(shares, collections.Counter()) == examples_read(loader, DataPartition(), expanded=expanded)
+    elif deal.endswith("rewound interleaved"):
+        # A pass a later repeat replays is read whole before the next, so a share's interleave crosses no
+        # pass: the share reads its own shards' part of each pass the bound reaches, in its own order.
+        dealt = [dealt_shards(ids, examples, index, rewound=True) for index in range(POOLED)]
+        whole = [dealt_shards(ids, (examples // RECORDS + 1) * RECORDS, index, rewound=True)
+                 for index in range(POOLED)]
+        assert [sum(share.values()) for share in shares] == [sum(share.values()) for share in dealt]
+        assert all(set(share) <= set(own) for share, own in zip(shares, whole, strict=True))
+        passes = examples // RECORDS
+        assert all(count in (passes, passes + 1) for share in shares for count in share.values())
+    elif streamed:
+        assert shares == [dealt_shards(ids, examples, index, rewound=deal.endswith("rewound"))
+                          for index in range(POOLED)]
+    else:
+        assert shares == [dealt_records(ids, examples, index) for index in range(POOLED)]
+    assert sum(sum(share.values()) for share in shares) == examples
+
+
+@pytest.mark.parametrize("examples", [7, 23])
+def test_a_pools_shares_whose_records_a_step_drops_before_the_bound_read_it_dealt_by_example(examples):
+    """A pool of three shares whose read drops records before the bound (a filter that keeps the even
+    ids), so no share knows ahead how many of its records reach it: the bound's examples are dealt to the
+    shares every count-th, each share reading its part of them, kept records alone, the pool the bound."""
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).filter_map(Evens()).batch(2 * POOLED),
+                     read="indexed", objective=ObjectiveData(train=(Questioned(),)), examples=examples)
+    shares = [examples_read(loader, DataPartition(index=index, count=POOLED), expanded=True)
+              for index in range(POOLED)]
+    assert [sum(share.values()) for share in shares] == [len(range(index, examples, POOLED))
+                                                          for index in range(POOLED)]
+    assert all(record % 2 == 0 for share in shares for record in share)
 
 
 def test_an_examples_budget_counts_documents_before_they_are_packed():
@@ -141,9 +264,189 @@ def test_an_examples_budget_counts_documents_before_they_are_packed():
     it, in the windows of the steps one pass over it counts, and ends."""
     documents = [{"text": np.full(length, length, np.int32)} for length in range(1, 6)]
     loader = compile(Pipeline(Memory(documents)).pack(8).batch(2), examples=13)
-    read = ids_read(loader, loader.example_steps(13), "text")
+    read = ids_read(loader, "text")
     reached = collections.Counter(1 + index % 5 for index in range(13))
     assert read == {token: count * token for token, count in reached.items()}
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["step", "configured"])
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+@pytest.mark.parametrize("examples", [7, 23])
+def test_an_examples_budget_counts_examples_before_the_objective_expands_them(examples, read, configured):
+    """An objective that makes each record several rows (a question a row) is bounded by its examples,
+    not its rows: the read bounded to `examples` records holds every row of each example the bound
+    reaches, as many times as it reaches it, and ends, whatever number of rows each example makes, in a
+    memory read and a streamed one alike, the expansion given as a step or as a configured one that
+    binds to it from the source's facts (`Configured`)."""
+    from dew.data.pipeline import Configured, ObjectiveData
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+    expansion = Configured(lambda facts: Questioned(), needs=(), expands=True) if configured else Questioned()
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
+                     objective=ObjectiveData(train=(expansion,)), examples=examples)
+    read = ids_read(loader, "id")
+    passes, rest = divmod(examples, RECORDS)
+    assert sum(count / (record % 3 + 1) for record, count in read.items()) == examples
+    assert all(count % (record % 3 + 1) == 0 for record, count in read.items())
+    assert sorted(count // (record % 3 + 1) for record, count in read.items()) == sorted(
+        [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
+
+
+class Fanned:
+    """An objective's expansion of each record `id` into `id % 4` rows, none for some, each row's two
+    tokens naming it (`id * 10 + question`)."""
+
+    def flat_map(self, element):
+        record = int(element["id"])
+        return tuple({"text": np.full(2, record * 10 + question, np.int32)} for question in range(record % 4))
+
+
+class LastDropped(grain.MapTransform):
+    """An objective's filter of the rows after an expansion: the last row of every fifth record."""
+
+    rejects = True
+
+    def map(self, element):
+        from dew.data.pipeline import Rejected
+
+        record, question = divmod(int(element["text"][0]), 10)
+        return Rejected("dropped") if record % 5 == 0 and question == record % 4 - 1 else element
+
+
+def consumed_by_row(examples: int) -> dict[int, int]:
+    """The oracle of where each of the first `examples` records read in order is consumed: by the row
+    (`id * 10 + question`) its expansion makes last, or where it makes none, or its last row is dropped,
+    by the next row kept after it."""
+    owed, pending = collections.Counter(), 0
+    for record in range(1, examples + 1):
+        rows = record % 4
+        if not rows:
+            pending += 1
+        for question in range(rows):
+            last = question == rows - 1
+            if record % 5 == 0 and last:
+                pending += 1
+                continue
+            owed[record * 10 + question] += pending + int(last)
+            pending = 0
+    assert not pending, "the oracle's last record is consumed by a row of its own"
+    return owed
+
+
+@pytest.mark.parametrize("packed, workers", [(False, 0), (True, 0), (False, 1)],
+                         ids=["rows", "packed", "workers"])
+def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed, workers):
+    """A run bounded to 23 examples, read in order as a stream, whose objective makes 0 to 3 rows of each
+    and drops the last row of every fifth: each batch's consumed examples (`EXAMPLES_CONSUMED`) are those
+    whose last row it holds, an example of no rows, or of a dropped last row, consumed by the next row
+    kept, rows packed into windows, batched as they are, or read by loading workers in groups that hold
+    their dropped rows apart; the batches together consume all 23, and the column a projection of the
+    batch would leave out is kept."""
+    from dew.batch import EXAMPLES_CONSUMED
+    from dew.data.pipeline import ObjectiveData, Pack
+
+    owed = consumed_by_row(23)
+    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
+    # The objective packs the rows it makes into windows of up to four rows, as a decision objective does.
+    pack = Pack(9, fields=("text",)) if packed else None
+    objective = ObjectiveData(train=(Fanned(), LastDropped()), pack=pack)
+    # Loading workers run the objective's steps, so their groups hold its dropped rows' markers.
+    loader = compile(chain.batch(BATCH).select_columns("text"), read="streamed", objective=objective,
+                     examples=23, loading=Loading(workers=workers))
+    assert loader.example_steps(23) is None
+    stream = loader.train(DataPartition())
+    total = 0
+    try:
+        for batch in stream:
+            # Each row of the batch once: a short last batch is filled out with repeats of its rows.
+            held = np.asarray(batch["text"])
+            expected = sum(owed[row] for row in set(held[held > 0].tolist()))
+            assert int(np.sum(batch[EXAMPLES_CONSUMED])) == expected
+            total += expected
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert total == 23
+
+
+class Evens(grain.MapTransform):
+    """An objective's filter of the odd records, which it states it drops (`rejects`)."""
+
+    rejects = True
+
+    def map(self, element):
+        from dew.data.pipeline import Rejected
+
+        return element if int(element["id"]) % 2 == 0 else Rejected("odd")
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_an_examples_budget_counts_the_examples_an_objectives_filter_keeps_given_or_configured(read):
+    """A run bounded to `examples` reads that many examples an objective's filter keeps, the filter
+    given as a step or as a configured one that binds to it alike: its kept examples, each even, the
+    bound reaching past the five a pass keeps."""
+    from dew.data.pipeline import Configured, ObjectiveData
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+
+    def kept(step) -> collections.Counter:
+        loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
+                         objective=ObjectiveData(train=(step,)), examples=7)
+        return ids_read(loader, "id")
+
+    given = kept(Evens())
+    assert sum(given.values()) == 7 and all(record % 2 == 0 for record in given)
+    assert kept(Configured(lambda facts: Evens(), needs=())) == given
+
+
+def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_its_rows():
+    """Two corpora mixed, whose examples the objective makes one row and three rows each: the bound
+    counts examples before the objective makes rows of them, so the rows it reads are exactly as many
+    examples' rows as it is bounded to, each example's rows whole."""
+    from dew.data import mix
+    from dew.data.pipeline import ObjectiveData
+
+    one = Pipeline(Memory({"id": np.full(RECORDS, 3, np.int32)})).repeat()
+    three = Pipeline(Memory({"id": np.full(RECORDS, 2, np.int32)})).repeat()
+    loader = compile(mix([one, three], weights=[0.5, 0.5]).batch(BATCH),
+                     objective=ObjectiveData(train=(Questioned(),)), examples=EXAMPLES)
+    read = ids_read(loader, "id")
+    assert read[2] % 3 == 0
+    assert read[3] + read[2] // 3 == EXAMPLES
+
+
+@pytest.mark.parametrize("shuffled", [True, False], ids=["shuffled", "in-order"])
+def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes(shuffled):
+    """A decision objective lays an example out as a row a question: an examples budget over examples
+    of two questions each reads exactly that many source examples, two rows each, its windows holding
+    twice as many rows as the budget's examples, in the memory read decision rows take, whose objective
+    steps start eagerly over the store: shuffled, and in order, where the bound stands before every
+    objective step a memory read would run over the store first."""
+    from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
+
+    from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
+
+    layout = StateFirstLayout(max_len=128)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout)
+    asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
+    answers = {"first": "true", "second": "false"}
+    records = [{"example": Example(f"state {index}", asked, answers)} for index in range(RECORDS)]
+    chain = Pipeline(Memory(records)).pipe(decisions)
+    # In order, no stage stands between the chain's records and the objective's eager steps.
+    chain = chain.shuffle(3) if shuffled else chain
+    loader = compile(chain.batch(BATCH), read="memory", objective=objective.data(), examples=EXAMPLES)
+    rows = consumed = 0
+    for batch in loader.train(DataPartition()):
+        # A short last batch is filled with windows it marks as no rows of its own (`VALID_ROWS`).
+        real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["segments"]), bool)), bool)
+        rows += sum(len(set(window[window > 0].tolist())) for window in np.asarray(batch["segments"])[real])
+        consumed += int(np.sum(batch.get(EXAMPLES_CONSUMED, 0)))
+    assert rows == 2 * EXAMPLES
+    # A read no plan counts ahead keeps its progress in the examples its batches consume, each once.
+    assert loader.example_steps(EXAMPLES) is not None or consumed == EXAMPLES
 
 
 def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_sizes():
@@ -151,6 +454,420 @@ def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_siz
     trains on each record as many times as the bound reaches it: its losses and weight match SGD on
     the same records at a rate falling to 0 over those updates (check 1)."""
     assert_as_exact(trained, descended, records, "examples run", seeds=EXAMPLES_SEEDS)
+
+
+@dataclasses.dataclass(frozen=True)
+class Repeated:
+    """An objective's expansion of each record into `id % 3 + 1` copies of its row, read after the bound;
+    a frozen record, so a resumed run knows it for the step it saved."""
+
+    def flat_map(self, element):
+        return tuple({"x": element["x"]} for _ in range(int(element["id"]) % 3 + 1))
+
+
+class Echoed(Pulled):
+    """`Pulled` over the rows its data step makes of each record (`Repeated`)."""
+
+    def data(self):
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData(train=(Repeated(),))
+
+
+CLOCKED_RECORDS = 18
+"""A clocked run's records: their 36 rows fill five batches, two updates of two and a last window of one."""
+CLOCKED_END = PEAK / 4
+"""Where a clocked run's rate ends, so its last update moves the weight too."""
+
+
+def clocked_descent(accumulation: int):
+    """The reference arm of a clocked run updating every `accumulation` batches (`clocked_run`): the losses
+    of each step and the final weight of Adam on `Echoed` over `x`'s CLOCKED_RECORDS records read in
+    order, each `id % 3 + 1` rows, in batches of BATCH rows (the last short), at a rate falling linearly from
+    PEAK to CLOCKED_END over the run's progress, the share of its records whose last row an earlier batch held
+    (`TrainState.consumed`); a window the stream ends inside commits over its own rows at the stream's
+    last batch. In float64, the truth."""
+    @as_given
+    def descended(x):
+        ids = np.arange(1, CLOCKED_RECORDS + 1)
+        owner = np.repeat(np.arange(CLOCKED_RECORDS), ids % 3 + 1)
+        rows, last = x[owner], np.r_[owner[1:] != owner[:-1], True]
+        batches = [(rows[start:start + BATCH], int(np.sum(last[start:start + BATCH])))
+                   for start in range(0, len(rows), BATCH)]
+        w = first = second = jnp.zeros(FEATURES, x.dtype)
+        losses, consumed = [], 0
+        for update, at in enumerate(range(0, len(batches), accumulation)):
+            window = batches[at:at + accumulation]
+            losses += [jnp.mean(jnp.square(w - held)) for held, _ in window[:-1]]
+            # The window commits at its last step, a whole update's or the stream's last batch, the progress
+            # it reads the examples its batches before that step consumed.
+            consumed += sum(count for _, count in window[:-1])
+            held = jnp.concatenate([rows for rows, _ in window])
+            losses.append(jnp.mean(jnp.square(w - held)))
+            gradient = 2 * jnp.sum(w - held, axis=0) / (len(held) * FEATURES)
+            first, second = 0.9 * first + 0.1 * gradient, 0.999 * second + 0.001 * jnp.square(gradient)
+            corrected = (first / (1 - 0.9 ** (update + 1)), second / (1 - 0.999 ** (update + 1)))
+            moved = corrected[0] / (jnp.sqrt(corrected[1]) + 1e-8)
+            w = w - (PEAK + (CLOCKED_END - PEAK) * consumed / CLOCKED_RECORDS) * moved
+            consumed += window[-1][1]
+        return {"w": w, "loss": jnp.stack(losses)}
+    return descended
+
+
+def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1,
+                learning_rate=None, examples: int = CLOCKED_RECORDS):
+    """A run bounded to `examples` examples of `x`, read in order as a stream, whose objective makes
+    `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
+    batches of BATCH rows, checkpointed to `directory` where given: its final state and its tracker."""
+    tracker = RecordingTracker()
+    ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
+    chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
+    optim = OptimConfig(optimizer="adam", learning_rate=learning_rate or Linear(peak_value=PEAK,
+                                                                                end_value=CLOCKED_END))
+    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation,
+                      checkpoints=None if directory is None else Checkpoints(str(directory)))
+    return trainer.fit(chain.batch(BATCH), examples=examples, log_every=log_every, stop=stop), tracker
+
+
+def clocked_run(accumulation: int, directory=None, stops: tuple[Pause | None, ...] = (None,)):
+    """A clocked run (`clocked_fit`) fitted once under each of `stops` in turn, each fit resuming the one
+    before from `directory`: no pass counts its steps ahead, so its schedule reads the examples its
+    batches consumed. Its losses of every step and its final weight."""
+    @as_given
+    def trained(x):
+        stepped, state = [], None
+        for stop in stops:
+            state, tracker = clocked_fit(x, accumulation, directory=directory, stop=stop)
+            stepped += losses(tracker)
+        assert state is not None and int(state.consumed) == CLOCKED_RECORDS
+        return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
+    return trained
+
+
+class Thinned:
+    """An objective's expansion of each record into `id % 3` copies of its row, none of every third, read
+    after the bound."""
+
+    def flat_map(self, element):
+        return tuple({"x": element["x"]} for _ in range(int(element["id"]) % 3))
+
+
+class Thin(Pulled):
+    """`Pulled` over the rows its data step makes of each record (`Thinned`)."""
+
+    def data(self):
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData(train=(Thinned(),))
+
+
+def clocked_chain(x) -> Pipeline:
+    """CLOCKED_RECORDS records of `x` beside their ids, read in order as a stream, in batches of BATCH
+    rows."""
+    ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
+    return Pipeline(Memory({"x": x, "id": ids})).read("streamed").batch(BATCH)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_clocked_run_whose_last_examples_make_no_rows_ends_at_its_bound(accumulation):
+    """The examples a bound reads after the last row it keeps are consumed at the stream's end, by the run's
+    last batch: every third record makes no rows, the bound's last among them, and the run ends having
+    consumed its whole bound, as its schedule's end reads it, whether its last batch ends a whole update or
+    a window of its own."""
+    (x,) = clocked_records(0)
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    state = Trainer(Thin(), optim, key=0, accumulation=accumulation).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
+    assert CLOCKED_RECORDS % 3 == 0 and int(state.consumed) == CLOCKED_RECORDS
+
+
+def thin_fit(x, accumulation: int = 1, **fit):
+    """A run of `Thin` over CLOCKED_RECORDS records of `x` (`clocked_chain`) under `Linear`, fitted as
+    `fit` says: its final state."""
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    chain = fit.pop("chain", clocked_chain(x))
+    return Trainer(Thin(), optim, key=0, accumulation=accumulation,
+                   checkpoints=fit.pop("checkpoints", None)).fit(chain, log_every=1, **fit)
+
+
+def test_a_clocked_run_names_its_length_once():
+    """A clocked run's progress reaches its end where its read ends at its bound, so a take after the bound,
+    which would end it first, is refused before any step, as two lengths of one run are; a bound past what
+    the devices' clock counts is refused too."""
+    from dew.training._fit import CLOCK_LIMIT, clocked
+
+    (x,) = clocked_records(0)
+    with pytest.raises(ValueError):
+        thin_fit(x, chain=clocked_chain(x).take(2), examples=CLOCKED_RECORDS)
+    with pytest.raises(ValueError):
+        clocked(CLOCK_LIMIT + 1, None, custom=False, rollout=False)
+    assert clocked(CLOCK_LIMIT, None, custom=False, rollout=False) == CLOCK_LIMIT
+
+
+def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_clock_keeps_none(tmp_path):
+    """A state supplied to a fit opens its data afresh: a clocked fit from a finished clocked run's state
+    consumes its whole bound again from none, ending at it; a run of steps from that state keeps no clock,
+    in its state or its checkpoints, its schedules counted in updates; and a clocked fit from that run's
+    state reads its progress again (`reclocked`)."""
+    (x,) = clocked_records(0)
+    # A fit donates the state it is given, so each one's counts are read before the next fit takes it.
+    first = thin_fit(x, examples=CLOCKED_RECORDS)
+    steps = int(first.step)
+    assert int(first.consumed) == CLOCKED_RECORDS
+    again = thin_fit(x, examples=CLOCKED_RECORDS, state=first)
+    assert int(again.consumed) == CLOCKED_RECORDS and int(again.step) == 2 * steps
+    checkpoints = Checkpoints(str(tmp_path))
+    stepped = thin_fit(x, steps=2 * steps + 2, state=again, checkpoints=checkpoints, checkpoint_every=1)
+    checkpoints.wait()
+    assert stepped.consumed is None
+    assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(int(stepped.step)).keys()
+    # Back on the examples clock, its schedule reads the run's progress from none consumed again.
+    assert int(thin_fit(x, examples=CLOCKED_RECORDS, state=stepped).consumed) == CLOCKED_RECORDS
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_run_of_steps_resumes_a_checkpoint_that_kept_no_count_and_a_clocked_run_refuses_it(tmp_path,
+                                                                                           accumulation):
+    """A run of steps keeps no examples consumed in its checkpoints (`TrainState.consumed`), as a run from
+    before the examples clock kept none: a run of steps resumes such a checkpoint, its pending window read
+    through the template every resume reads (`Checkpoints.accumulation_template`, row 2433), while a run on
+    the examples clock, whose schedule would read its progress off the count, refuses it before any step.
+    Every fit reads one loader under one constant rate, so the count is all the checkpoints differ by; a
+    clocked run's checkpoint, which kept its count, resumes on the examples clock (the control)."""
+    (x,) = clocked_records(0)
+    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    loader, _ = fitted(clocked_chain(x), None, objective=Echoed().data(), examples=CLOCKED_RECORDS)
+
+    def fit(directory, **bound):
+        checkpoints = Checkpoints(str(directory))
+        state = Trainer(Echoed(), optim, key=0, accumulation=accumulation, checkpoints=checkpoints).fit(
+            loader, log_every=1, checkpoint_every=1, **bound)
+        checkpoints.wait()
+        return state
+
+    assert fit(tmp_path / "steps", steps=1).consumed is None
+    resumed = fit(tmp_path / "steps", steps=2)
+    assert int(resumed.step) == 2 and resumed.consumed is None
+    with pytest.raises(ValueError):
+        fit(tmp_path / "steps", examples=CLOCKED_RECORDS)
+    assert Checkpoints(str(tmp_path / "steps")).latest == 2
+    fit(tmp_path / "examples", examples=CLOCKED_RECORDS, stop=Pause(0.5))
+    assert int(fit(tmp_path / "examples", examples=CLOCKED_RECORDS).consumed) == CLOCKED_RECORDS
+
+
+class Placed(Pulled):
+    """`Pulled`, keeping the fields of every batch the trainer places for its step, as it reads each placed
+    batch's row geometry (`Objective.row_tokens`)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fields: list[frozenset[str]] = []
+
+    def row_tokens(self, batch):
+        self.fields.append(frozenset(batch))
+        return super().row_tokens(batch)
+
+
+def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path):
+    """A run bounded in examples whose plan counts its steps ahead (a global order read in memory) runs on
+    steps: the count its data marks rides no batch into its step, its state keeps no clock and its
+    checkpoints none, while a run whose plan counts none reads the count in its step."""
+    (x,) = clocked_records(0)
+    ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    planned = Pipeline(Memory({"x": x, "id": ids})).read("memory").batch(BATCH)
+    loader, _ = fitted(planned, None, objective=Placed().data(), examples=CLOCKED_RECORDS)
+    stream = loader.train(DataPartition())
+    try:
+        assert EXAMPLES_CONSUMED in next(stream)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    seen, checkpoints = Placed(), Checkpoints(str(tmp_path))
+    state = Trainer(seen, optim, key=0, checkpoints=checkpoints).fit(
+        planned, examples=CLOCKED_RECORDS, log_every=1, checkpoint_every=1)
+    checkpoints.wait()
+    assert state.consumed is None and seen.fields
+    assert not any(EXAMPLES_CONSUMED in held for held in seen.fields)
+    assert not {CONSUMED_EXAMPLES, CONSUMED_COMMITTED} & checkpoints.control(int(state.step)).keys()
+    clocked = Placed()
+    chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed").batch(BATCH)
+    Trainer(clocked, optim, key=0).fit(chain, examples=CLOCKED_RECORDS, log_every=1)
+    assert clocked.fields and all(EXAMPLES_CONSUMED in held for held in clocked.fields)
+
+
+def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
+    """Every batch of a clocked run marks its real rows and whether it closes its window, so a run whose
+    first compile plans its split keeps one step program: nothing compiles after its first step, its
+    short last batch, filled and marked, among them (18 records, two whole batches and a short one;
+    row 2532)."""
+    (x,) = clocked_records(0)
+    tracker = RecordingTracker()
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
+                                                         log_every=1)
+    # `train/compiles` counts the step's compiles over the whole fit (`Interval.compiles`): the first
+    # step's planning and its program, and none after.
+    logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+    assert len(logged) > 1 and logged[0]["train/compiles"] == logged[-1]["train/compiles"] > 0
+
+
+class Signed(Pulled):
+    """`Pulled`, keeping the signature of each batch the trainer hands a step (`batch_signature`), as it
+    reads each one's row geometry (`Objective.row_tokens`)."""
+
+    def __init__(self):
+        super().__init__()
+        self.signed: list = []
+
+    def row_tokens(self, batch):
+        self.signed.append(batch_signature(batch))
+        return super().row_tokens(batch)
+
+
+def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as_its_fit_does():
+    """Every step a clocked run compiles takes its batches marked whether they close their window
+    (`closes_window`): its cooldown branch steps on batches of the signature its fit's are, and compiles
+    no program of its own (the run's compile count unchanged through the branch), and a step compiled
+    ahead for the run (`step_batch`) is handed a batch of that one signature, so the run takes the saved
+    program as its own (rows 2527, 2434)."""
+    from dew.training import Cooldowns
+    from dew.training._fit import first_batch
+    from dew.training.ahead import step_batch
+
+    (x,) = clocked_records(0)
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    signed, tracker = Signed(), RecordingTracker()
+    # A cooldown branch is scored by the run's validation, which reads the corpus's first batch.
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    Trainer(signed, optim, key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held,
+        cooldowns=Cooldowns(at=("50%",), length=1))
+    assert len(signed.signed) > 1 and all(signature == signed.signed[0] for signature in signed.signed)
+    logged = [scalars["train/compiles"] for _, scalars in tracker.scalars if "train/compiles" in scalars]
+    assert logged and logged[0] == logged[-1]
+    trainer = Trainer(Pulled(), optim, key=0)
+    loader, _ = fitted(clocked_chain(x), None, objective=Pulled().data(), examples=CLOCKED_RECORDS)
+    trainer.reading(loader, examples=CLOCKED_RECORDS)
+    assert batch_signature(step_batch(trainer, first_batch(loader, trainer.device_mesh))) == signed.signed[0]
+
+
+def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
+    """A batched step after a pack that makes no rows of a group of windows leaves the examples whose last
+    tokens those windows held to the next window kept: the batches of a read bounded in examples consume
+    every one once, where the step's empty group was refused."""
+    docs = [np.full(index % 4 + 2, index + 1, np.int32) for index in range(12)]
+
+    def drop_first(columns):
+        # The group of windows holding the first document's tokens makes no rows; the rest keep theirs.
+        if any(1 in np.asarray(window) for window in columns["text"]):
+            return {name: [] for name in columns}
+        return columns
+
+    chain = (Pipeline(Memory({"text": docs})).read("streamed").pack(6, fields=("text",))
+             .flat_map(drop_first, batched=True, batch_size=2).batch(2))
+    stream = compile(chain, read="streamed", examples=len(docs)).train(DataPartition())
+    try:
+        batches = list(stream)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert not any(1 in np.asarray(batch["text"]) for batch in batches)
+    assert sum(int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in batches) == len(docs)
+
+
+def clocked_records(seed: int) -> tuple[np.ndarray]:
+    """A clocked run's corpus of one draw: CLOCKED_RECORDS rows of FEATURES coordinates, unit normals."""
+    return (np.random.default_rng(seed).normal(size=(CLOCKED_RECORDS, FEATURES)).astype(np.float32),)
+
+
+def test_a_clocked_runs_share_of_its_examples_falls_where_its_batches_pass_it():
+    """A run bounded in examples that counts no steps ahead logs at a share of its examples (`25%`, every 5
+    of 18) at each step whose batch brings its consumed examples past a multiple of that share
+    (`Counted(every, "examples")`), and at its last."""
+    ids = np.arange(1, CLOCKED_RECORDS + 1)
+    owner = np.repeat(np.arange(CLOCKED_RECORDS), ids % 3 + 1)
+    last = np.r_[owner[1:] != owner[:-1], True]
+    consumed = np.cumsum([int(np.sum(last[start:start + BATCH])) for start in range(0, len(owner), BATCH)])
+    passing = [step for step, (now, before) in enumerate(zip(consumed, np.r_[0, consumed[:-1]], strict=True),
+                                                         start=1) if now // 5 > before // 5]
+    _, tracker = clocked_fit(*clocked_records(0), 1, log_every="25%")
+    logged = [step for step, scalars in tracker.scalars if "train/loss" in scalars]
+    assert logged == sorted({*passing, len(consumed)})
+
+
+def test_a_clocked_run_paused_at_half_its_examples_and_resumed_trains_on_as_one_that_never_paused(tmp_path):
+    """A run bounded in examples that counts no steps ahead, paused once half its examples are consumed and
+    resumed without the pause, lands where the whole run does, step for step and in its weight
+    (check 1): its checkpoint held the examples it consumed with its data position."""
+    directories = iter(range(1 << 20))
+
+    def paused(x):
+        return clocked_run(2, tmp_path / str(next(directories)), (Pause(0.5), None))(x)
+
+    assert_as_exact(as_given(paused), clocked_run(2), clocked_records, "paused clocked run",
+                    seeds=PAUSE_SEEDS)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_run_no_pass_counts_ahead_reads_its_schedule_off_the_examples_it_consumed(accumulation):
+    """A run bounded in examples whose objective makes rows of each after the bound counts no steps ahead:
+    its rate falls over the share of its examples its batches consumed, each example consumed by the batch
+    that holds its last row, and its losses and weight are Adam's at that rate (check 1); updating every
+    two batches, the window its stream ends inside commits over its own rows."""
+    assert_as_exact(clocked_run(accumulation), clocked_descent(accumulation), clocked_records,
+                    f"clocked run of {accumulation}", seeds=EXAMPLES_SEEDS)
+
+
+def test_a_clocked_run_resumed_with_a_larger_bound_trains_on_to_it(tmp_path):
+    """A run bounded in examples, trained to its bound and resumed with a larger one, trains on from the
+    examples it consumed to the new bound, as a run on the steps clock resumed with more steps does: the
+    larger bound's first examples are the smaller one's, its order read further (row 2649). Resumed with a
+    bound below what it consumed, it is refused: that order reads less than the run read."""
+    (x,) = clocked_records(0)
+    first, _ = clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
+    assert int(first.consumed) == CLOCKED_RECORDS // 2
+    resumed, _ = clocked_fit(x, 1, directory=tmp_path)
+    assert int(resumed.consumed) == CLOCKED_RECORDS and int(resumed.step) > int(first.step)
+    with pytest.raises(ValueError):
+        clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
+
+
+def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
+    """A limit a repeat reads after (`take(5).repeat()`), grown on resume, reads other records past the
+    saved position (its second pass the larger limit's next records, not the first five again), so the
+    resume is refused: only a bound with nothing but a batch after it reads on (row 2649)."""
+    (x,) = clocked_records(0)
+
+    def fit(count: int, steps: int):
+        chain = Pipeline(Memory({"x": x})).read("streamed").take(count).repeat().batch(BATCH)
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)))
+        return trainer.fit(chain, steps=steps, log_every=1)
+
+    fit(5, 2)
+    with pytest.raises(ValueError):
+        fit(10, 4)
+
+
+def test_a_resume_refuses_a_mixed_corpus_limit_grown_beneath_the_mixtures_repeat(tmp_path):
+    """A mixed corpus's limit, grown on resume, holds records its mixture's own shuffle and repeat read
+    after it (`mix([member.take(5)]).shuffle(window=2).take(100).repeat()`), so the resume is refused: only
+    the run's own chain's bound grows (row 2649)."""
+    from dew.data.pipeline import mix
+
+    (x,) = clocked_records(0)
+
+    def fit(count: int, steps: int):
+        member = Pipeline(Memory({"x": x})).take(count)
+        chain = mix([member]).read("streamed").shuffle(window=2).take(100).repeat().batch(BATCH)
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)))
+        return trainer.fit(chain, steps=steps, log_every=1)
+
+    fit(5, 2)
+    with pytest.raises(ValueError):
+        fit(10, 4)
 
 
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
@@ -219,6 +936,23 @@ def test_a_stream_that_runs_out_after_a_ranked_step_ends_on_a_whole_checkpoint(t
             checkpoints=Checkpoints(str(tmp_path))).fit(
         finite, steps=10, eval_every=1, best=Best(objective.loss, weights_only=True))
     assert Checkpoints(str(tmp_path)).latest == 1
+
+
+def test_a_cooldown_branch_on_a_step_that_ranks_a_weights_only_best_runs_on_past_it(tmp_path):
+    """A cooldown branch taken at a step whose evaluation ranks a best kept as weights alone, on a
+    stream that may run out: the branch reopens the stream, the save asks it whether the step is the
+    run's last before writing the weights, and the run trains on to its end (the save asked while it held
+    the reopened stream's placements, which its first batch waited on forever: row 2088's review)."""
+    from dew.training import Cooldowns
+
+    x = np.random.default_rng(0).normal(size=(6 * BATCH, FEATURES)).astype(np.float32)
+    objective = Pulled()
+    state = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+                    checkpoints=Checkpoints(str(tmp_path))).fit(
+        compile(Pipeline(Memory({"x": x})).repeat(1).batch(BATCH), read="memory",
+                validation=Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)), steps=4, eval_every=2,
+        best=Best(objective.loss, weights_only=True), cooldowns=Cooldowns(at=(2,), length=1))
+    assert int(state.step) == 4
 
 
 def test_a_run_resumed_where_its_finite_stream_ran_out_ends_there_with_nothing_to_read(tmp_path):
@@ -290,3 +1024,157 @@ def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
     resumed = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, stop=None)).train(
         Pulled(), chain(x), name="budget")
     assert (int(paused.step), int(resumed.step)) == (2 * ACCUMULATION, 3 * ACCUMULATION)
+
+
+def test_asking_a_streamed_runs_steps_reads_none_of_its_data():
+    """A run bounded in examples whose read no plan counts ahead keeps its progress in the examples it
+    consumes, so asking its steps (`Loader.example_steps`) reads none of its data: its objective's
+    expansion makes no row of any example."""
+    from dew.data.pipeline import ObjectiveData
+
+    seen: list[int] = []
+
+    class Watched(Fanned):
+        def flat_map(self, element):
+            seen.append(int(element["id"]))
+            return super().flat_map(element)
+
+    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
+    loader = compile(chain.batch(BATCH), read="streamed", objective=ObjectiveData(train=(Watched(),)),
+                     examples=23)
+    read = len(seen)
+    assert loader.example_steps(23) is None and len(seen) == read
+
+
+@pytest.mark.parametrize(("schedule", "written"),
+                         [(OneCycle(peak_value=PEAK, warmup_fraction=0.125), 0.125),
+                          (Cosine(peak_value=PEAK, warmup_steps="25%"), "25%")], ids=["one-cycle", "cosine"])
+def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(schedule, written):
+    """A run bounded in examples that counts no steps ahead trains under a schedule whose warmup is a share
+    of the run, which it records at its start as written (`OptimConfig.warmups`), the fraction as the
+    schedule holds it, never rounded (row 2531), there being no updates ahead to count it in; its start
+    records its length, its bound, and each step's log the examples it has consumed, ending at the bound
+    (row 2436)."""
+    state, tracker = clocked_fit(*clocked_records(0), 1, learning_rate=schedule)
+    assert state is not None and int(state.consumed) == CLOCKED_RECORDS
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["warmup_steps.learning_rate"] == written
+    assert started.target_steps is None and started.examples == CLOCKED_RECORDS
+    consumed = [scalars["train/examples_consumed"] for _, scalars in tracker.scalars
+                if "train/loss" in scalars]
+    assert consumed == sorted(consumed) and consumed[-1] == CLOCKED_RECORDS
+
+
+def test_a_clocked_runs_validation_records_the_examples_it_had_consumed():
+    """A run bounded in examples that counts no steps ahead records with each validation, beside its step,
+    the examples it had consumed when it validated (`evaluation/examples_consumed`), the coordinate its
+    own clock places it at: at a share of its examples, each the count its step's log records, rising to
+    its bound; a run counted in steps records none."""
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%")
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    validated = [(step, scalars["evaluation/examples_consumed"]) for step, scalars in tracker.scalars
+                 if "val/loss" in scalars]
+    assert len(validated) > 1 and all(trained[step] == consumed for step, consumed in validated)
+    assert validated[-1][1] == CLOCKED_RECORDS
+    stepped = RecordingTracker()
+    Trainer(Echoed(), optim, key=0, tracker=stepped).fit(clocked_chain(x), steps=4, log_every=1,
+                                                         validation=held, eval_every=2)
+    scored = [scalars for _, scalars in stepped.scalars if "val/loss" in scalars]
+    assert scored and not any("evaluation/examples_consumed" in scalars for scalars in scored)
+
+
+def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_consumed():
+    """A clocked run's cooldown branch, scored once it ends, records the examples it had consumed then
+    under its own name (`cooldown/examples_consumed`): the run's at the step it branched at and the two
+    batches its branch read on from the run's position, which the run reads next, so the run's count two
+    steps on; the run's own validation at that step records the run's count alone
+    (`evaluation/examples_consumed`)."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%",
+        cooldowns=Cooldowns(at=("50%",), length=2))
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    cooled = [(step, scalars["cooldown/examples_consumed"]) for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars]
+    validated = {step: scalars["evaluation/examples_consumed"] for step, scalars in tracker.scalars
+                 if "evaluation/examples_consumed" in scalars}
+    assert cooled and all(consumed == trained[step + 2] for step, consumed in cooled)
+    assert all(validated[step] == trained[step] for step, _ in cooled)
+
+
+def test_each_split_evaluated_at_a_step_records_its_own_counts():
+    """Two splits of unequal size scored at one step each record the batches and records they read under
+    their own names (`evaluation/counts/<split>/records`), so neither's count replaces the other's at
+    that step, nor a summary's named as a count is (`evaluation/summary/records`); a cooldown branch's
+    suites, scored at the step it branched at, record theirs apart from the run's own: no scalar takes
+    two values at one step."""
+    from dew.training import Cooldowns
+    from dew.training.evaluation import Summary
+
+    (x,) = clocked_records(0)
+    small = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    large = Pipeline(Memory({"x": x[:2 * BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    summaries = [Summary(name, {"summary/loss": 1.0, "large/loss": 1.0}, "lower")
+                 for name in ("records", "coordinated_batches")]
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%", summaries=summaries,
+        validation={"summary": small, "large": large}, cooldowns=Cooldowns(at=("50%",), length=2))
+    logged = collections.defaultdict(list)
+    for step, scalars in tracker.scalars:
+        for name, value in scalars.items():
+            logged[step, name].append(value)
+    assert all(len(set(values)) == 1 for values in logged.values())
+    found = {name: values[0] for (_, name), values in logged.items()}
+    assert found["evaluation/counts/summary/records"] == BATCH
+    assert found["evaluation/counts/large/records"] == 2 * BATCH
+    assert found["evaluation/counts/cooldown/large/coordinated_batches"] == 2
+    assert "evaluation/summary/records" in found
+
+
+def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():
+    """A cooldown branch's scores are named under `cooldown/`, which no split's name can hold (`/` stands
+    between a split and its metric): a split called `cooldown_val` beside `val` is the run's own, scored as
+    the run, its examples the run's (`evaluation/examples_consumed`), while the branch scores `val` as
+    `cooldown/val` at the step it branched at, its examples its own (`cooldown/examples_consumed`)."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%",
+        validation={"val": held, "cooldown_val": held}, cooldowns=Cooldowns(at=("50%",), length=2))
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    validated = [(step, scalars) for step, scalars in tracker.scalars if "cooldown_val/loss" in scalars]
+    assert validated and all(scalars["evaluation/examples_consumed"] == trained[step]
+                             and "cooldown/examples_consumed" not in scalars for step, scalars in validated)
+    cooled = [(step, scalars) for step, scalars in tracker.scalars if "cooldown/val/loss" in scalars]
+    assert cooled and all(scalars["cooldown/examples_consumed"] == trained[step + 2]
+                          for step, scalars in cooled)
+
+
+def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
+    """A document whose last token is the last target of the stream's final causal window is consumed by
+    that window, the first that holds it, though the next window's stride would begin at it."""
+    import grain.python as grain
+
+    from dew.data.pipeline import CONSUMED, Windows
+    from dew.data.steps.windows import CausalWindows
+
+    documents = grain.MapDataset.source([{"text": np.arange(1, 6, dtype=np.int32),
+                                          CONSUMED: np.asarray([0, 0, 0, 0, 1], np.int32)}]).to_iter_dataset()
+    windows = list(CausalWindows(documents, Windows(seq_len=4, stride=4, fields=("text", CONSUMED))))
+    assert [window[CONSUMED] for window in windows] == [1]

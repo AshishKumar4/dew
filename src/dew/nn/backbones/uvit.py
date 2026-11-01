@@ -14,7 +14,6 @@ from flax import linen as nn
 
 from dew.nn.dense import Dense, DenseGeneral
 
-from ..attention import LayerNorm
 from ..blocks import sinusoidal_time
 from ..conv import Conv
 from ..dit import (
@@ -25,9 +24,11 @@ from ..dit import (
     RematLadder,
     _TransformerOptions,
     remat_block,
+    scan_ordered,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from ..mlp import GatedMLP
+from ..norms import LayerNorm
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from ..scan_orders import unscanned
@@ -191,7 +192,9 @@ class UViT(_TransformerOptions):
             tokens.append(self.context_embed(text.astype(self.dtype)).astype(patches.dtype))
             positions.append(self.pos_embed[:, 1:1 + text.shape[1]])
         tokens.append(patches)
-        positions.append(self.pos_embed[:, 1 + self.text_tokens:1 + self.text_tokens + num_patches])
+        # Each patch's learned position follows it into the scan order (`scan_ordered`), as its token did.
+        raster = self.pos_embed[:, 1 + self.text_tokens:1 + self.text_tokens + num_patches]
+        positions.append(scan_ordered(raster, self.scan_order, H // self.patch_size, W // self.patch_size)[0])
         x = jnp.concatenate(tokens, axis=1) + jnp.concatenate(positions, axis=1).astype(patches.dtype)
         extras = x.shape[1] - num_patches
 

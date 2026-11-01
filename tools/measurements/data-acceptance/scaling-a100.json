@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "config": {
-    "output": "/home/ubuntu/tightpig-receipt/scaling-a100-host.json",
-    "work": "/home/ubuntu/tightpig-receipt/work",
+    "output": "scaling-a100-host.json",
+    "work": "work",
     "shards": 16,
     "records": 4096,
     "cycles": [

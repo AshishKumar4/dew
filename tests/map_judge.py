@@ -1,0 +1,113 @@
+"""A test's work sharded across armada map tasks and judged by one task that pools them (tools/armada/ci.py's
+`check1_shards` and `shards` marks): each map task does units `start` to `stop` of a site's work and records
+what it found, judging nothing; the judge pools every map task's records and decides, as the site would over
+all its units in one process. Check 1 (tests/reference_error.py's `assert_as_exact`) records its draws so, a
+witness of run options its outcomes; each reads and writes through `record_units` and `pooled_units` alone.
+"""
+
+import hashlib
+import os
+import pickle
+import sys
+from collections.abc import Callable
+from pathlib import Path
+
+DRAWS = "DEW_CHECK1_DRAWS"
+"""The environment variable that runs every sharded site as one map task: `start:stop`, the units the task
+does (check 1's: its seeds), its records written to RECORDS (`record_units`). The site judges nothing there
+and passes once they are written. Check 1's stages take its declared seeds and REDRAW times as many
+further ones, so its map tasks together draw seeds 0 to (1 + REDRAW) times the declared count."""
+
+RECORDS = "DEW_CHECK1_RECORDS"
+"""The directory a map task (DRAWS) writes its records to, one file a site (`site_id`) and range."""
+
+POOL = "DEW_CHECK1_POOL"
+"""The environment variable that runs every sharded site as the judge of its map tasks (DRAWS): a directory
+whose tree holds their records. The site judges them pooled (`pooled_units`), the same units by the same
+rules as a site that does them itself, and refuses what the pool does not hold."""
+
+
+class PoolRefused(AssertionError):
+    """A judge's pool (POOL) short of what the site asks (no record of it, a gap, too few units, or map
+    tasks that disagree on what they ran), never judged; `held`, the units it holds from 0 on."""
+
+    def __init__(self, message: str, held: int = 0):
+        super().__init__(message)
+        self.held = held
+
+
+def drawing() -> bool:
+    """Whether this process is a map task (DRAWS): it records a site's units and judges nothing, so a site
+    leaves to its judge the work only a judge reads (its run's own checks beside its draws), which the judge
+    does in full."""
+    return bool(os.environ.get(DRAWS))
+
+
+def judging() -> bool:
+    """Whether this process is a sharded site's judge (POOL): its draws are its map tasks' records, so it
+    draws none of its own and sizes nothing they carry already."""
+    return bool(os.environ.get(POOL))
+
+
+def site_id(label: str) -> str:
+    """A site's identity across its map tasks and its judge: the Python it runs on, its test's id (pytest's,
+    the same test in each task) and its label, so neither two tests' sites of one label nor one site's runs
+    on two Pythons pool each other's records, whatever directory holds them (a run plans a site on each
+    Python, their judges one job)."""
+    return f"{python()}::{os.environ.get('PYTEST_CURRENT_TEST', '').rsplit(' (', 1)[0]}::{label}"
+
+
+def python() -> str:
+    return ".".join(map(str, sys.version_info[:2]))
+
+
+def _file(site: str) -> str:
+    return hashlib.sha256(site.encode()).hexdigest()[:16]
+
+
+def record_units(label: str, payload: Callable[[int, int], object]) -> bool:
+    """Where DRAWS names a range `start:stop`, `payload(start, stop)` written to RECORDS as the site's
+    record of those units (pickled whole, then moved into place), and True; else False."""
+    span = os.environ.get(DRAWS)
+    if not span:
+        return False
+    start, stop = (int(part) for part in span.split(":"))
+    records = os.environ.get(RECORDS)
+    if not records:
+        raise ValueError(f"{label}: a map task ({DRAWS}={span}) writes its records to {RECORDS}, which is "
+                         f"unset")
+    site = site_id(label)
+    found = payload(start, stop)
+    path = Path(records) / f"{_file(site)}.{start}-{stop}.pkl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = path.with_name(path.name + ".partial")
+    written.write_bytes(pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
+    written.rename(path)
+    return True
+
+
+def pooled_units(label: str, units: int | None = None) -> list[tuple[int, int, object]] | None:
+    """Where POOL names a directory, the site's records under it (`record_units`) as (start, stop, payload),
+    in order, a range recorded twice read once: refused (PoolRefused) unless they hold every unit from 0
+    on, once, without a gap, to `units` where it is given. None where POOL is unset."""
+    root = os.environ.get(POOL)
+    if not root:
+        return None
+    site, found = site_id(label), {}
+    for path in sorted(Path(root).rglob(f"{_file(site)}.*.pkl")):
+        record = pickle.loads(path.read_bytes())
+        if record["site"] == site:
+            found.setdefault((record["start"], record["stop"]), record["payload"])
+    held, pieces = 0, []
+    for (start, stop), payload in sorted(found.items()):
+        if start != held:
+            raise PoolRefused(f"{label}: the map tasks' records under {root} hold units 0 to {held}, and "
+                              f"then {start} to {stop}; a pool holds every unit from 0 on, once", held)
+        pieces.append((start, stop, payload))
+        held = stop
+    if not pieces:
+        raise PoolRefused(f"{label}: no map task's records under {root}")
+    if units is not None and held < units:
+        raise PoolRefused(f"{label}: the map tasks' records under {root} hold units 0 to {held} of {units}",
+                          held)
+    return pieces

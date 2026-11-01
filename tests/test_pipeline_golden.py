@@ -3,24 +3,24 @@
 Each case is a chain of the public presets and verbs, written as the recipe it replaced compiled:
 the frozen references are the batches the old loaders read. Images pin the public steps. Packed
 batches pin host Coordinates; packed text pins documents cut into pieces that share their boundary
-token, where 66beb5305 lost each piece's first next-token target. The other cases pin 66beb5305.
+token, where 7ad0d4079 lost each piece's first next-token target. The other cases pin 7ad0d4079. A
+host batch's documents' firsts (`Coordinates.firsts`, row 1923), which no old loader built, are Dew's
+own, recorded beside the frozen fields they derive from (its starts), every other field unchanged.
 """
 
+import functools
 import gzip
-import hashlib
 import importlib.util
 import itertools
 import json
 from pathlib import Path
 
 import cv2
-import jax
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import tensorflow_datasets as tfds
-from array_record.python.array_record_module import ArrayRecordWriter
 from token_support import write_token_corpus
 
 from dew.data import Memory, images, phases, presets
@@ -33,7 +33,7 @@ from dew.data.sources.tfds import TFDS
 from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Formatting
 
-GOLD = Path(__file__).parent / "fixtures/golden/loaders-66beb5305.json.gz"
+GOLD = Path(__file__).parent / "fixtures/golden/loaders-7ad0d4079.json.gz"
 ORACLE = Path(__file__).parents[1] / "tools/measurements/data-pipeline/data_oracle_legacy.py"
 CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "preferences", "images_memory",
          "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records")
@@ -43,20 +43,11 @@ stages changed on purpose (a waveform and its validity in place of per-frame row
 tests/test_data.py holds a video listing to itself across workers and a resume."""
 
 
-def _digest(batch):
-    leaves = []
-    for value in jax.tree.leaves(batch):
-        array = np.asarray(value)
-        encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
-                   if array.dtype.hasobject else array.tobytes())
-        leaves.append({"shape": list(array.shape), "dtype": array.dtype.str,
-                       "sha256": hashlib.sha256(encoded).hexdigest()})
-    return {"tree": str(jax.tree.structure(batch)), "leaves": leaves}
-
-
+@functools.cache
 def _oracle():
     """The frozen reference's capture script, whose token stores the reference read: the stores this
-    test reads are the ones it wrote (`token_store`)."""
+    test reads are the ones it wrote (`token_store`), and whose digest of a batch (`digest`) this test
+    reads Dew's by."""
     spec = importlib.util.spec_from_file_location("data_oracle_legacy", ORACLE)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -65,15 +56,8 @@ def _oracle():
 
 
 def _image_sources(root, pixels):
-    image_root = root / "images"
-    image_root.mkdir()
-    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
-    for row in pixels:
-        writer.write(pack_dict_of_byte_arrays({"image": row["image"].tobytes(),
-                                               "shape": np.asarray([16, 16], "<i4").tobytes(),
-                                               "caption": row["caption"].encode(),
-                                               "label": np.asarray(row["label"], np.int32).tobytes()}))
-    writer.close()
+    """`pixels` as the frozen reference wrote them (`image_records`), and as a parquet of PNGs."""
+    image_root = _oracle().image_records(root, pixels, pack_dict_of_byte_arrays)
     image_file = root / "images.parquet"
     pq.write_table(pa.Table.from_pylist([
         {**row, "image": {"bytes": cv2.imencode(".png", row["image"][..., ::-1])[1].tobytes(), "path": None}}
@@ -178,9 +162,9 @@ def test_loader_batches_positions_and_rng_match_the_frozen_reference(chains, nam
         partition = DataPartition(share, shares)
         reader = loaded.train(partition)
         try:
-            first = [_digest(row) for row in itertools.islice(reader, 4)]
+            first = [_oracle().digest(row) for row in itertools.islice(reader, 4)]
             state = reader.get_state()
-            rest = [_digest(row) for row in itertools.islice(reader, 4)]
+            rest = [_oracle().digest(row) for row in itertools.islice(reader, 4)]
         finally:
             reader.close()
         assert first == expected["shares"][share]["first"]
@@ -188,13 +172,13 @@ def test_loader_batches_positions_and_rng_match_the_frozen_reference(chains, nam
         resumed = loaded.train(partition)
         try:
             resumed.set_state(state)
-            assert [_digest(row) for row in itertools.islice(resumed, 4)] == rest
+            assert [_oracle().digest(row) for row in itertools.islice(resumed, 4)] == rest
         finally:
             resumed.close()
         if loaded.val is not None:
             held = loaded.val(partition)
             try:
-                observed = [_digest(row) for row in itertools.islice(held, 100)]
+                observed = [_oracle().digest(row) for row in itertools.islice(held, 100)]
                 assert next(held, None) is None
             finally:
                 held.close()

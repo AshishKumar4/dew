@@ -1,11 +1,13 @@
 """Accumulate host-local sufficient statistics for the image metrics."""
 
-from collections.abc import Callable
+import functools
+from collections.abc import Callable, Hashable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
@@ -70,6 +72,29 @@ def metric_device():
     mesh = jax.sharding.Mesh(np.asarray([device]), ("metric",))
     with jax.set_mesh(mesh), jax.default_device(device):
         yield
+
+
+def masked_total(charge: Callable[..., jax.Array], metric: Hashable, rows: np.ndarray,
+                 *arrays: np.ndarray) -> tuple[float, float]:
+    """The total of `charge(metric, *arrays)` over the `rows` it holds and their count, from arrays at
+    their batch's own fixed shape: it runs jitted once per shape and metric (a frozen metric hashes by
+    its fields, so equal metrics share it), on one local device (`metric_device`), its rows outside
+    `rows` selected away, so every batch of one shape, every validation split of a run among them,
+    reads one compiled program, where indexing the held rows first made one per count of them."""
+    held = np.asarray(rows, bool)
+    with metric_device():
+        charged = _jitted_total(charge)(metric, held, *arrays)
+    return float(charged), float(held.sum())
+
+
+@functools.cache
+def _jitted_total(charge: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
+    """`charge`'s total over the rows `held` holds, jitted once a charge, its metric static."""
+
+    def total(metric: Hashable, held: jax.Array, *arrays: jax.Array) -> jax.Array:
+        return jnp.sum(jnp.where(held, charge(metric, *arrays), 0.0))
+
+    return jax.jit(total, static_argnums=0)
 
 
 def frames(artifact: ImageGrid | VideoGrid) -> jax.Array:

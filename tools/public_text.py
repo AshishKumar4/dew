@@ -60,8 +60,11 @@ def added(base: str) -> list[tuple[str, str]]:
 
 
 def written(commit: str) -> datetime.date:
-    """The day `commit` was written: its author date."""
-    return datetime.date.fromisoformat(git("log", "-1", "--format=%as", commit).strip())
+    """The day `commit` was written: its author date, the later of its author's own day and UTC's, as Dew's
+    records date their work in UTC and an evening west of it is already the next day there."""
+    local = datetime.date.fromisoformat(git("log", "-1", "--format=%as", commit).strip())
+    utc = datetime.datetime.fromtimestamp(int(git("log", "-1", "--format=%at", commit)), datetime.UTC).date()
+    return max(local, utc)
 
 
 def messages(base: str) -> list[tuple[str, str, datetime.date]]:

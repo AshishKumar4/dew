@@ -4,14 +4,33 @@ Work to complete or qualify, grouped by area. Numbers and identifiers in bracket
 
 Correctness, contract gaps and duplicated paths come first. After those close, measure single-GPU training on every supported accelerator, then multiple GPUs and hosts. The target is 50–60% or more real-token MFU on each workload that matters; a result below 50% gets a profile and fixes for its three largest losses. Higher utilization targets and new model breadth follow that work. [Performance](performance.md) holds measurements; [design records](design/architecture.md) hold contracts.
 
+## Codebase audit themes
+
+A full audit of `main` on 2026-10-27, each finding re-checked by a second reviewer, grouped by shared cause so each theme lands as one change.
+
+- Check every kernel config against its template's legality before launch, whatever its source, and size every row-bearing operand from the launch plan so no legal tile reads past it. [1866]
+- Decide attention's mainloop for the target being compiled, not the host, and return the empty result for a zero-capacity call before decode launches. [1867]
+- Give positions, cache cursors and rotary origins one owner every layer reads: learned positions, shared-pass loops, DeepSeek V4's windows and compressed keys, every rotary policy, scan-ordered patches, Z-Image's tables and masked diffusion's coordinates. [1868]
+- Give Dew's reverse-only custom derivatives a forward mode through the shared linear-derivative boundary, and keep forward-mode calls off reverse-only kernels. [1869]
+- Advance EMA, effects and token clocks only on emitted optimizer updates, keep complex leaves complex in optimizer state and weight averages, and move the averaging math below training. [1870]
+- Record and verify the content a saved plan actually read: Hub configs, remote shards, completed stages and processor files. [1871]
+- Admit everything fit takes at one boundary: every training and validation signature checked, native Grain datasets and arrays, keys made after process setup, predictors built from the effective encoder. [1872]
+- Keep every record field through assembly, with one packing algorithm through Grain's extension. [1873]
+- Stay finite wherever the reference is finite in guidance, flow densities, sigma solvers and float8 cache scales. [1874]
+- Keep placement, formats and failure classes at the interop and serving boundaries: FP8 publication, host-only exports, harness failures, host-side admission. [1875]
+- Compose nn modules on their shared owners and match their sources: the conditional UNet's dropout, typed memory keys, the towers' training mode, one feed-forward. [1876]
+- Make the off-GPU resource gate fail without evidence: one validator, and records only from a child that succeeded. [1877]
+- Prove behaviour through the shared gates: no prose or whitespace pins, no mocks of Dew internals, learning judged by independent runs. [1878]
+- Answer each decision question's tournament on its own finalists. [1879]
+
 ## Models and interop
 
 - One cross-attention block for every consumer: the language model's gated adapter, the decision model and diffusion conditioning compose the same block and its cache instead of parallel copies. [1629]
 - Pass dense MLA visibility descriptors to the shared attention core. [41]
 - Bind native Flax forward methods explicitly, including the objective's choice of forward method. [171]
 - Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints. [864–867]
-- Carry MaxText's workflows Dew lacks: the pretrain-to-RL chain, named LoRA directories, MaxText checkpoints, replica and live-slice recovery, a host prefix tier and disaggregated serving, DiLoCo, sparse indexed attention, GPT-3 and Engram, audio language models, and remote-topology compilation. [869–879, 881]
-- Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [849–856]
+- Carry MaxText's workflows Dew lacks: the pretrain-to-RL chain, named LoRA directories, MaxText checkpoints, replica and live-slice recovery, a host prefix tier and disaggregated serving, DiLoCo, sparse indexed attention, audio language models, and remote-topology compilation. [869–877, 879, 881]
+- Load the requested families Dew does not load yet: MiniMax M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [851–856]
 - Load any Hugging Face model natively where its parts allow: an unregistered model built from a registered family's parts is assembled from Dew's own modules, matched by code identity, and qualified for training as well as inference. Otherwise transformers' own modeling code runs automatically, with Dew's attention through transformers' `AttentionInterface`, placement from the config's `base_model_tp_plan` and Dew's fsdp rules, and weights streamed by name onto the mesh. Native families stay the fast path. [1493, 1607]
 - Load Gemma 4's unified wrapper and Muse Glimmer's wrapper, and qualify Nemotron-Nano-9B-v2, Nemotron 3.5 Lightning and Qwen3.8's native release at their sizes. [1501, 357]
 - Read a release's per-layer-kind attention overrides from its config. [1497]
@@ -29,7 +48,6 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Reconstruct captured layers with the inverse of pipeline microbatching, including fetched captures. [624]
 - Group an unbound model's banks from its source shapes so unlike rows are never stacked into an invalid bank. [633]
 - Keep decode programs a fixed size in layer and loop depth: retain stacked caches across calls, then scan periodic layer groups and loop passes. [642]
-- Match the reference's highest-precision fp32 products instead of allowing default TF32 to change its arithmetic, a multimodal model's served row included. [644, 828]
 - Finish released-checkpoint nGPT and looped-model qualification against vLLM on real GPUs. Keep the reference engine's approximate-cache behavior distinct from its model code. [596, 638]
 - Route V4 through the shared attention core and preserve the reference's AltUp projection semantics. [NNF-2, NNF-4]
 - Skip quantized payload decoding for shapes-only resumes. Bind diffusion components from lazy tensor sources, including VAE running statistics. [INT-4]
@@ -63,6 +81,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 5. Generated, not picked (owner, 2026-10-25). Each template derives its kernel (tiles, stages, warpgroups, resources) from the device's facts, its instruction family's Family bundle and the call's shape: no lookup tables, ranked config spaces, fitted terms or route ranking. A new GPU of a known family gets a kernel from its facts, and Dew's maintainers add the few per-device facts it needs; a new instruction family gets one bundle. A measured gap is fixed in the derivation for the whole family. An opt-in tuner stays (`Trainer(tune_kernels=True)`), off by default and never needed for good performance: it times a few variants around the derived kernel on the user's GPU, and a tuner win is a derivation gap Dew fixes. [1377]
 6. Scoreboards. Performance means compute time and peak memory (owner, 2026-10-23). Every row records both, measured, beside the accuracy gate's verdict, for the template, the kernel it replaces, the best external kernel and XLA, in one session on one GPU, in [performance](performance.md). [1379]
 7. Record compile time beside execution time, keep programs bounded in depth and remove measured split-KV compiler growth, and show the serving barrier that bounds nGPT's depth leaves its training step unchanged. The persistent compilation cache is on by default, with an opt-out. [635, 641, 829]
+8. Order (owner, 2026-10-30): today's measured gaps first, then new coverage ([design](design/kernel-templates.md), "Today's gaps first"). Correctness qualifies on single GPUs and emulated CPU meshes.
 
 - At each jax bump, check for openxla/xla#49498 (deterministic GPU scatter); then write the paged pool unmapped and drop linear.py's padded-row gather. [951]
 - After the templates are done, take them past one kernel per operation to generated training megakernels: a whole forward and backward pass as one persistent kernel, generated from the device's facts to be near-optimal on most GPUs, so no launch gap or bubble separates operations and memory-bound work overlaps compute-bound work on the same SMs (Hazy Research's megakernels, Mirage's persistent kernel, Flapping Airplanes' framework). It is Dew's own persistent runtime in Pallas/Mosaic over the templates' tile functions, not an XLA patch stack. Steps on the way: a decode step for one model family on H100, measured against vLLM; then rollout inference overlapped with training for RL. It builds on the templates' algebra and toolkit, not beside them.
@@ -84,6 +103,10 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Profile first compilation separately through lowering and XLA passes. [629]
 - Let tuning take only the declared resource-exhaustion and profiler-subscription errors for an unusable config. [764]
 
+## Algebraic optimization
+
+Dew derives the cheapest form of its own math ([design](design/algebra.md)): one e-graph engine (`dew.algebra`) in two modes. At dev time a generator derives the templates' algebra, stable numeric forms and surrogate bodies into checked-in, reviewed modules, with error-aware extraction; at compile time a small, fast pass rewrites every program at its seam, training steps' autodiff output and serving's, evaluation's and rollouts' forwards alike; nothing runs at runtime. Every custom derivative declares its class, so the engine sees through kernels' glue and never undoes numerics or surrogate rules. [3225–3232, 3256–3266, 3272–3275]
+
 ## Data
 
 - Integrate DataTrove once for decontamination and distributed MinHash dedup through publication and snapshots. [201, 203]
@@ -98,7 +121,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Record reconstructible library stages and importable user functions in `run.json`. [213]
 - Qualify deterministic online shard coverage and replay on multiple physical hosts. [227]
 - Add native writers and a Spark handoff through the shared sink interface. [232]
-- Compare augmentation policies on fixed data and measure worker scaling when a corpus has one physical shard. [234, 573]
+- Measure worker scaling when a corpus has one physical shard. [573]
 - Remove duplicated worker-shutdown policy by using Grain's lifecycle interface. [DAT-10]
 - Qualify URL-caption fetching through `images.fetch` and `video.fetch` against the previous online flow on CC3M and WebVid. [155]
 - Cache automatically where a chain's leading steps expand records or reject them in a read by index, and in streamed reads: today a cache there is read back as a stream, slower than the steps it stands for, so only memory and indexed reads of one-for-one maps cache on their own. Key an image decode by the content of an image a record names by path, so decodes cache on their own too. [803]
@@ -116,12 +139,11 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Let the trainer take any gradient estimator, autodiff or a perturbation estimate, through the objective's existing seam, so backprop-free credit assignment (Dust's activation-space perturbation, qlabs.sh/noise) is a choice of estimator on any model, not a separate trainer. [1315]
 - Continual learning as composable primitives: an in-context update any layer can own over a local objective, recurrences in their deep-memory form, and test-time training over the task's own loss in training and serving, so ideas like Nested Learning's continuum memory compose on Dew's layers instead of forking them. [1645–1647]
 - Make second-order and high-precision training compositions of what Dew has: Gauss-Newton as an Optax-style transform over the objective's Jacobian products, float64 as a precision policy, and Fourier-feature pyramids as an input embedding, so work like arXiv 2509.14185 and 2605.24278 is reproducible in Dew. [1316]
-- Make host-memory offload automatic: the memory planner chooses among remat and offloading activations, optimizer state or parameters to pinned host memory, priced by the device's host-link bandwidth (PCIe, NVLink-C2C), and offloads only where the transfer overlaps compute. Explicit XLA host offload, never managed-memory paging. Never slower when a run fits. [1338]
+- Host-memory offload where it pays: the optimizer state and the EMA once XLA:GPU streams the update leaf by leaf, which today holds them whole on the device [1903]; `minimal_offloaded` timed against `full` as its same-memory sibling [1932]; the parameters as a planned rung [1880]. Explicit XLA host offload, never managed-memory paging. Never slower when a run fits.
 - Give serving a host-memory KV tier: evicted prefixes kept on pinned host memory and restored on reuse instead of recomputed, chosen from the link bandwidth and hit rate. [1339]
-- Qualify loss, resume, failure handling and throughput on two physical hosts. [158]
 - Expand training and inference across supported parallelism combinations; replace restrictions with composed support where the mathematics permits it. [226, 245]
 - Move logical-axis declarations to Flax's per-parameter partition metadata while preserving placement and Muon semantics. [429]
-- Run short convolution's mesh contract on two real CUDA devices. [471]
+- Muon at scale: each matrix's Newton-Schulz runs whole on one device, matrices spread across the mesh, at the run's precision policy with an explicit override (bf16 by default; accurate numerics in float32). Opt-in Kimi K3's per-head orthogonalization, Polar Express coefficients and NorMuon; defaults change only on measured A/B runs. [2637, 2685, 2686]
 - Infer ordinary input geometry once while retaining explicit `InputSpec` overrides. [207]
 - Record MFU runs through the configured tracker outside steady-step timing. [285]
 - Find manually quantized towers through a shared module inventory so compilation receives the required options. [594]
@@ -173,7 +195,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 
 ## Tutorials and docs
 
-- Run tutorial 07's real-model data-parallel versus FSDP comparison on multiple GPUs. [619]
 - Publish a pinned multi-source text, code and chat pretraining example. [236]
 - Show a notebook run with prepared data, checkpoints and cache on persistent mounted storage. [233]
 - Re-record the landing example on a matched host within the existing visible training budget. [590]
@@ -208,7 +229,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Keep numerical results keyed by CPU model and qualify CPU-dependent rounding against the reference on that same class. [478]
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
-- The float64 gate is the owner's (2026-10-20): check 1 holds each leaf's RMS error and its worst row within 1.5× the reference's, both measured from float64 truth, over drawn seeds, with no floor. Check 2 holds every element within a certified roundoff bound for Dew's own operation. Both sit behind one assertion, `assert_as_exact`, with `assert_moves` for checks that a change has an effect. [560, 649, 719, 793, 827]
+- The float64 gate is the owner's (2026-10-20): check 1 holds each leaf's RMS error within 1.5× the reference's and its worst row within the calibrated row factors testing.md states (owner, 2026-10-27), both measured from float64 truth, over drawn seeds, with no floor. Check 2 holds every element within a certified roundoff bound for Dew's own operation. Both sit behind one assertion, `assert_as_exact`, with `assert_moves` for checks that a change has an effect. [560, 649, 719, 793, 827]
 - One gate generation. The one-draw rule moves to 1.5×, a conversion tool moves the mechanical sites, and the lanes convert the rest file by file. The old assertion families are then deleted, and the tolerance inventory goes to zero. [650, 668–670, 676, 682, 705, 712, 844, 1305]
 - Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:

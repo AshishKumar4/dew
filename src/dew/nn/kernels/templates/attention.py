@@ -84,10 +84,15 @@ def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax
 
 
 def dense(spans: KeySpans) -> jax.Array:
-    """`visible` over every query and key: `[B, Q, K]` boolean."""
-    queries = jnp.arange(spans.start.shape[1])[:, None]
-    keys = jnp.arange(spans.keys)[None, :]
-    return jax.vmap(lambda row: visible(spans, row, queries, keys))(jnp.arange(spans.start.shape[0]))
+    """`visible` over every query and key: `[B, Q, K]` boolean, by broadcasting alone (`within`), so a
+    batch-sharded call's spans take no gather."""
+    keys = jnp.arange(spans.keys)[None, None, :]
+    ids = (None if spans.query_ids is None or spans.key_ids is None
+           else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
+    # A run axis stays last (`within`), the keys' axis beside the queries'.
+    start, end = ((spans.start[:, :, None, :], spans.end[:, :, None, :]) if spans.start.ndim == 3
+                  else (spans.start[:, :, None], spans.end[:, :, None]))
+    return within(keys, start, end, ids)
 
 
 def reads(spans: KeySpans) -> jax.Array:
@@ -153,7 +158,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
           chunk: int | None = None, positions: tuple[jax.Array, jax.Array] | None = None, segment_ids=None,
           lengths: jax.Array | None = None, starts: jax.Array | None = None,
           block_groups: jax.Array | None = None, image_groups: jax.Array | None = None,
-          valid: jax.Array | None = None, runs: jax.Array | None = None) -> KeySpans:
+          valid: jax.Array | None = None, runs: jax.Array | None = None,
+          slots: jax.Array | None = None) -> KeySpans:
     """The `KeySpans` of a call of `queries` queries over `keys` keys in `batch` rows, in the terms
     `dew.nn.attention.scaled_dot_product_attention` takes them: `causal` keeps query i to keys 0..i (top
     left aligned, as jax's `is_causal`); `sliding_window=w` keeps the keys `window_sides` gives, the w - 1
@@ -180,10 +186,14 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     query's key intervals `[lo, hi)`, R of them, static, whose union it may see, intersected with all the
     rest: a window over `positions` is searched within each run alone, whose key places never decrease
     (its builder's contract: a layout whose places restart, as a decision row's options do, splits its
-    runs there), so the spans keep R intervals a query `[B, Q, R]`. Lengths and starts are int32 token
+    runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which is one
+    interval `[B, Q]` as every mainloop walks it. `slots` `[B, Q]` are the queries' own keys' indices, a cache
+    call's slots (by default each query's index, or a cross call's aligned place): causality ends a query's
+    keys at its slot, a window or a chunk without `positions` counts keys from it and a block reads the
+    block holding it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token
     coordinates; places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
-    from dew.nn.visibility import block_ends, block_starts, window_sides
+    from dew.nn.visibility import chunk_of, window_sides
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
     place = index
@@ -206,6 +216,10 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             # A cross call's query sits at its rank among its document's keys, counted from the
             # document's first key (`cross_document_mask`).
             place = first + aligned_places(segment_ids).astype(jnp.int32)
+    if slots is not None:
+        place = jnp.broadcast_to(jnp.asarray(slots, jnp.int32), (batch, queries))
+        end = jnp.where(place < 0, 0, end)
+        start = jnp.where(place < 0, 0, start)
     if causal:
         end = jnp.minimum(end, place + 1)
     # The query's own key, which its block holds: a query placed before its document's keys has none.
@@ -225,28 +239,19 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         before, after = window_sides(causal, min(sliding_window, queries + keys + 1))
         start = jnp.maximum(start, place - before)
         end = jnp.minimum(end, place + after + 1)
-    for groups, whole in ((block_groups, True), (image_groups, False)):
-        if groups is None or not causal or keys == 0:
-            continue
-        # The block of the query's own key runs on to its end, and a whole block from its start, within
-        # the query's document.
-        groups = jnp.asarray(groups)
-        at = jnp.clip(place, 0, keys - 1)
-        inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
-        ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
-        end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
-        if whole:
-            begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
-            start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
+    if causal and keys > 0:
+        start, end = _grouped(start, end, place, own, (floor, bound), block_groups, image_groups)
     # Each narrowing by places a run takes alone: its keys' values in index order, never decreasing within a
     # run, and each query's least and greatest it keeps (`_within_runs`).
     by_places = []
     if chunk is not None:
+        # Without places a chunk counts a query by its own key's index (`slots`, a cross call's aligned
+        # place, else its own index).
         query_places, key_places = (
-            (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
+            (place, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
-        wanted = _chunk_of(query_places, chunk)
-        by_places.append((_chunk_of(key_places, chunk), wanted, wanted))
+        wanted = chunk_of(query_places, chunk)
+        by_places.append((chunk_of(key_places, chunk), wanted, wanted))
         if runs is None:
             # The query's document's keys of its chunk run together in document order, since their places
             # never decrease along it, and their first and last key indices bound the span.
@@ -263,11 +268,34 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             by_places.append((key_places, _moved(query_places, -before), _moved(query_places, after)))
         start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys, by_places)
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
-    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs)
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs, slots)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     if valid is not None:
         query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
     return KeySpans(start, end, query_ids, key_ids, keys, form)
+
+
+def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
+             document: tuple[jax.Array, jax.Array], block_groups, image_groups
+             ) -> tuple[jax.Array, jax.Array]:
+    """A causal call's `[start, end)` widened by its groups (`spans`): the block or image holding a query's
+    own key (`own`, at `place`) runs on to its end, and a whole block (`block_groups`) from its start, each
+    within the query's `document`, its first key and one past its last."""
+    from dew.nn.visibility import block_ends, block_starts
+
+    floor, bound = document
+    for groups, whole in ((block_groups, True), (image_groups, False)):
+        if groups is None:
+            continue
+        groups = jnp.asarray(groups)
+        at = jnp.clip(place, 0, groups.shape[1] - 1)
+        inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
+        ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
+        end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
+        if whole:
+            begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
+            start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
+    return start, end
 
 
 def _narrowed(start: jax.Array, end: jax.Array, order: jax.Array, run_lo: jax.Array, run_hi: jax.Array,
@@ -284,21 +312,13 @@ def _narrowed(start: jax.Array, end: jax.Array, order: jax.Array, run_lo: jax.Ar
             jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0))
 
 
-def _chunk_of(places, chunk: int) -> jax.Array:
-    """Each place's chunk number in the places' own dtype; a chunk wider than it holds every place of one
-    sign."""
-    places = jnp.asarray(places)
-    if chunk > jnp.iinfo(places.dtype).max:
-        return jnp.where(places >= 0, 0, -1).astype(places.dtype)
-    return places // chunk
-
-
 def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
                  by_places: list[tuple[jax.Array, jax.Array, jax.Array]]) -> tuple[jax.Array, jax.Array]:
-    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each, and
-    each run's keys within each narrowing by places (`by_places`: its keys' values `[B, K]`, a window's
-    places or a chunk's numbers, and each query's least and greatest it keeps `[B, Q]`), searched in the run
-    alone, along which a run's places never decrease where the call's may restart between runs."""
+    """Each query's `runs` `[B, Q, R, 2]` within its interval `[start, end)` `[B, Q]`, `[B, Q, R]` each (one
+    run a query `[B, Q]`, the one interval every mainloop walks), and each run's keys within each narrowing
+    by places (`by_places`: its keys' values `[B, K]`, a window's places or a chunk's numbers, and each
+    query's least and greatest it keeps `[B, Q]`), searched in the run alone, along which a run's places
+    never decrease where the call's may restart between runs."""
     lo = jnp.maximum(jnp.clip(runs[..., 0], 0, keys), start[..., None])
     hi = jnp.maximum(jnp.minimum(jnp.clip(runs[..., 1], 0, keys), end[..., None]), lo)
     batch, _, count = lo.shape
@@ -307,7 +327,7 @@ def _within_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int,
         first = _searched(values, flat_lo, flat_hi, jnp.repeat(least, count, axis=1), "left")
         last = _searched(values, flat_lo, flat_hi, jnp.repeat(greatest, count, axis=1), "right")
         lo, hi = first.reshape(lo.shape), jnp.maximum(last, first).reshape(hi.shape)
-    return lo, hi
+    return (lo[..., 0], hi[..., 0]) if count == 1 else (lo, hi)
 
 
 def _valid_ids(query_ids: jax.Array | None, key_ids: jax.Array | None, valid: jax.Array, batch: int,
@@ -542,11 +562,31 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
 
 
-def capped(softcap: float, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
-    """Gemma 2's logit cap, `softcap * tanh(logits / softcap)`, on the scaled logits as `reference_attention`
-    takes it. It is a score hook as `functools.partial(capped, softcap)`, which reads no position."""
-    del q_pos, k_pos
-    return softcap * jnp.tanh(logits / softcap)
+@dataclasses.dataclass(frozen=True)
+class Capped:
+    """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
+    `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
+    its static facts serves every layer of one cap (`tuning.lowered_once`)."""
+
+    softcap: float
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
+        del q_pos, k_pos
+        return self.softcap * jnp.tanh(logits / self.softcap)
+
+
+@dataclasses.dataclass(frozen=True)
+class Biased:
+    """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
+    tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
+    `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
+    equal inner hooks (`Capped`)."""
+
+    score_mod: Callable | None = None
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, bias: jax.Array) -> jax.Array:
+        capped = logits if self.score_mod is None else self.score_mod(logits, q_pos, k_pos)
+        return capped + bias
 
 
 DROP_DOMAIN = 0x6A09E667
@@ -580,22 +620,35 @@ class Draw:
         every mainloop and the reference share, each taking its own scale for a kept entry. Where the draw
         holds the call's global `queries` and `keys` (a sequence exchange's slice, `DropPlaces`), the indices
         are local and read their global places there."""
+        return self.kept(self.words(queries), keys)
+
+    def words(self, queries: jax.Array) -> jax.Array:
+        """Each query's word of the draw (`keep`): the seed's two words, the domain tag, the row, the head
+        and the query's place mixed, a key's mixed in after (`kept`); a kernel takes it once a query."""
         # A padded tile's places past a table read its fill, and an empty table (a slice of no queries or
         # keys) is read at no place: no real entry draws there.
         if self.queries is not None and self.queries.shape[0]:
             queries = jnp.take(self.queries, queries)
-        if self.keys is not None and self.keys.shape[0]:
-            keys = jnp.take(self.keys, keys)
         word = fmix32(self.seed[0] ^ jnp.uint32(DROP_DOMAIN))
         for part in (self.seed[1], self.row, self.head, queries):
             word = fmix32(word ^ jnp.asarray(part).astype(jnp.uint32))
-        bits = fmix32(word ^ jnp.asarray(keys).astype(jnp.uint32))
+        return word
+
+    def kept(self, words: jax.Array, keys: jax.Array) -> jax.Array:
+        """Whether the draw keeps the entries of queries' `words` (`words`) at `keys`, which broadcast."""
+        if self.keys is not None and self.keys.shape[0]:
+            keys = jnp.take(self.keys, keys)
+        bits = fmix32(words ^ jnp.asarray(keys).astype(jnp.uint32))
         return bits >= jnp.uint32(int(self.rate * 2 ** 32))
 
     def __call__(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
         """The kernels' multiplier of the entries at `queries` and `keys`: `bound` where kept, in fp32, the
         kernels' precision (a reference takes its own scale from `keep`)."""
-        return jnp.where(self.keep(queries, keys), jnp.float32(self.bound), jnp.float32(0.0))
+        return self.multiplied(self.keep(queries, keys))
+
+    def multiplied(self, kept: jax.Array) -> jax.Array:
+        """The multiplier of entries `kept` or not: `bound` where kept, else 0, in fp32."""
+        return jnp.where(kept, jnp.float32(self.bound), jnp.float32(0.0))
 
 
 def dropout_seed(dropout_rng) -> jax.Array:
@@ -607,9 +660,9 @@ def dropout_seed(dropout_rng) -> jax.Array:
 @dataclasses.dataclass(frozen=True)
 class DropPlaces:
     """The global places a slice of a call draws its dropout at, where a sequence exchange holds a slice of
-    its rows, heads, queries or keys (`dew.nn.attention.sequence_parallel_attention`): each local batch
-    row's `rows` `[B]`, query head's `heads` `[H]`, query's `queries` `[Q]` and key's `keys` `[K]` global
-    index, so every device drops the weights one device holding the whole call drops."""
+    its rows, heads, queries or keys (`dew.nn.attention_parallel.sequence_parallel_attention`): each local
+    batch row's `rows` `[B]`, query head's `heads` `[H]`, query's `queries` `[Q]` and key's `keys` `[K]`
+    global index, so every device drops the weights one device holding the whole call drops."""
 
     rows: jax.Array
     heads: jax.Array
@@ -639,9 +692,9 @@ class Dropout:
     and key is kept where its draw keeps it and multiplied by `1 / (1 - rate)`, while the softmax's
     denominator takes the undropped weights, so the output is the softmax over the values `z v`. `seed`
     holds the call's two uint32 words, `rows` `[B]` and `heads` `[H]` each local batch row's and query
-    head's global index (a shard's own positions are not, `_per_shard`), `queries` `[Q]` and `keys` `[K]`
-    each local query's and key's where a sequence exchange holds a slice of them (`DropPlaces`; local are
-    global where None), and `rate` is static."""
+    head's global index (a shard's own positions are not, `dew.nn.attention_parallel.on_attention_shards`),
+    `queries` `[Q]` and `keys` `[K]` each local query's and key's where a sequence exchange holds a slice
+    of them (`DropPlaces`; local are global where None), and `rate` is static."""
 
     seed: jax.Array
     rows: jax.Array
@@ -676,9 +729,26 @@ class Hooks:
     drop: Dropout | None = None
 
 
+def shared_place(shape: tuple[int, ...], row, head) -> tuple:
+    """The batch row and head a query, key or tile parameter of `shape` (`[B or 1, H or 1, ...]`) holds for
+    a program's batch `row` and query `head`: its own where its extent holds every one, else the one it
+    shares (a bias one table for every batch row, T5's `[1, H, Q, K]`), so no caller broadcasts it."""
+    return (row if shape[0] > 1 else 0), (head if shape[1] > 1 else 0)
+
+
+def shared_sum(grad: jax.Array, param: Param) -> jax.Array:
+    """A parameter's gradient `[B, H, ...]` (a mainloop's, a program a batch row and head) summed over the
+    batch rows and heads it shares (`shared_place`), its own shape; a mainloop that adds them in its
+    programs hands it back that shape already."""
+    shared = tuple(axis for axis in (0, 1) if param.value.shape[axis] == 1 and grad.shape[axis] > 1)
+    return grad.sum(axis=shared, keepdims=True) if shared else grad
+
+
 def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
     """`param` as the reference reads it for one batch row and query head, over every query and key."""
     value = param.value
+    if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+        row, head = shared_place(value.shape, row, head)
     match param.kind:
         case Kind.HEAD:
             return value[head]
@@ -692,6 +762,43 @@ def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
             return value[row, :, head]
 
 
+def logit_scale(width: int, scale: float | None) -> float:
+    """A call's logit scale: `scale`, else attention's default, the inverse root of its head `width`."""
+    return width ** -0.5 if scale is None else scale
+
+
+def prescale(dtype, width: int, scale: float | None) -> tuple[float, float]:
+    """The power of two a call's queries take before their products with the keys, and the scale left after it
+    (`scale` the call's, `logit_scale`): where the products of `dtype` operands `width` wide can pass fp32's
+    largest (bf16's and fp32's), `scale`'s power of two at or below its magnitude, so no product the reference
+    keeps finite overflows here (it scales the query before its products, `dew.nn.attention`): Q 2^127 and K 4
+    over a width of 16, a product of 2^129 where the reference's is 2^127; else 1 and `scale` (fp16's products
+    never pass it). A power of two scales exactly, so the logits, the weights and the gradients (`gradients`:
+    the cotangents at the whole scale against the call's own queries and keys, no product taken back by the
+    power) are the unscaled call's bit for bit where every value stays in fp32's normal range and the form is
+    the same: a whole scale below `algebra.RAW_SCALES` leaves one that takes the raw form
+    (`algebra.Forward.raw`), whose differences round otherwise."""
+    scale = logit_scale(width, scale)
+    largest = float(jnp.finfo(dtype).max)
+    if scale == 0 or largest * largest * width < float(jnp.finfo(jnp.float32).max):
+        return 1.0, scale
+    # Never above 1: a scale of 1 or more makes the reference's products no smaller than these.
+    power = min(2.0 ** math.floor(math.log2(abs(scale))), 1.0)
+    return power, scale / power
+
+
+def by_power(query: jax.Array, power: float) -> jax.Array:
+    """`query` taken by its call's power of two (`prescale`) for its products with the keys, in its dtype."""
+    return query if power == 1.0 else query * jnp.asarray(power, query.dtype)
+
+
+def prescaled(query: jax.Array, scale: float | None) -> tuple[jax.Array, float, float]:
+    """`query` taken by its call's power of two before its products (`prescale`, `by_power`), the scale
+    left after it, and the power."""
+    power, left = prescale(query.dtype, query.shape[-1], scale)
+    return by_power(query, power), left, power
+
+
 def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None) -> jax.Array:
     """The scores `[B, H, Q, K]` the template's softmax takes, as `reference` computes them: the products
@@ -701,20 +808,27 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
-    scale = width ** -0.5 if scale is None else scale
+    scale = logit_scale(width, scale)
     seen = dense(spans)
     grouped = query.reshape(batch, queries, kv_heads, heads // kv_heads, width)
     products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
                               preferred_element_type=wide).reshape(batch, heads, queries, spans.keys)
     products = products * jnp.asarray(scale, wide)
+    return jnp.where(seen[:, None], score_modded(products, hooks), -jnp.inf)
+
+
+def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
+    """`hooks.score_mod` over scaled products `[B, H, Q, K]` at their positions, each row and head reading
+    its own parameters (`_per_head`); the products where the hooks have no score_mod."""
+    score_mod = hooks.score_mod
+    if score_mod is None:
+        return products
+    batch, heads, queries, keys = products.shape
+    q_pos, k_pos = jnp.arange(queries)[:, None], jnp.arange(keys)[None, :]
 
     def one(row, head):
-        s = products[row, head]
-        if hooks.score_mod is not None:
-            q_pos = jnp.arange(queries)[:, None]
-            k_pos = jnp.arange(spans.keys)[None, :]
-            s = hooks.score_mod(s, q_pos, k_pos, *(_per_head(p, row, head) for p in hooks.score_params))
-        return jnp.where(seen[row], s, -jnp.inf)
+        params = (_per_head(p, row, head) for p in hooks.score_params)
+        return score_mod(products[row, head], q_pos, k_pos, *params)
 
     return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
 
@@ -833,15 +947,14 @@ def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
 
 def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
     """`a @ b`, fp32, as every CPU arm of the attention template issues it (the plain-JAX mainloop, the
-    interpreted kernels): the product its operands declare at the precision policy's precision
-    (`dew.nn.precision.float32_products`), issued off a GPU by the declaration's owner
+    interpreted kernels): the product its operands declare at JAX's configured precision
+    (`jax_default_matmul_precision`), issued off a GPU by the declaration's owner
     (`product.interpreted`), so an fp32 product accumulates in float64, within that sum's rounding bound
     whatever the tile."""
     from dew.nn.kernels.templates import product
-    from dew.nn.precision import float32_products, products_dtype
+    from dew.nn.precision import products_dtype
 
-    dtype = products_dtype(a, b)
-    declared = product.declared(dtype, float32_products(dtype), outputs=(jnp.float32,))
+    declared = product.declared(products_dtype(a, b), None, outputs=(jnp.float32,))
     return product.interpreted(declared, a, b, (((a.ndim - 1,), (0,)), ((), ())))
 
 
@@ -1045,6 +1158,39 @@ class Split(NamedTuple):
     shift: jax.Array
 
 
+class Kept(enum.Enum):
+    """What a Mosaic forward keeps for a backward (`attention_mosaic.forward`'s `residuals`): nothing, the
+    inference forward's output alone; its anchor's split sums (`Split`, the training forward); or its output
+    for the backward's D, its rows beside it (`takes_output_residuals`, `output_split`)."""
+
+    NONE = enum.auto()
+    SPLIT = enum.auto()
+    OUTPUT = enum.auto()
+
+
+def output_split(out: jax.Array) -> Split:
+    """The split sums of a forward that keeps its output in place of its anchor's
+    (`takes_output_residuals`): its output `[B, Q, H, Dv]` as the normalized sums of every key (shift -1,
+    `attention_algebra.split_residuals`), no anchor's own weight and the others' weights 1, so
+    `attention_algebra.split_delta` takes D as `rowsum(dO ⊙ O)` about 0 with no anchor key (each query's
+    -1)."""
+    others = jnp.swapaxes(out, 1, 2).astype(jnp.float32)
+    rows = jnp.zeros(others.shape[:-1], jnp.float32)
+    return Split(others, rows, rows + 1.0, rows - 1.0)
+
+
+def takes_output_residuals(hooks: Hooks, dtype, *, accurate: bool) -> bool:
+    """Whether a training forward keeps its output for the backward's D (`output_split`, FlashAttention's
+    `rowsum(dO ⊙ O)`) in place of its anchor's split sums: a 16-bit call in the fast form with no initial
+    state, no dropout and no output hook (D is the attention's own output's). Its forward is the inference
+    walk alone, which writes its rows beside the output (ET-KFPROF2-h100: the anchor's peaks pass, its
+    split-sum walk and D's reductions took 1.07 of the template's 3.81 ms Qwen3-8B causal step); the
+    backward's D is then the rounded output's, as FlashAttention's is, which check 1 judges a term at a time.
+    The accurate form, an initial state (whose anchor keeps a sink's share) and fp32 keep the anchor's."""
+    return (jnp.dtype(dtype).itemsize == 2 and not accurate and hooks.initial is None and hooks.drop is None
+            and hooks.output_mod is None)
+
+
 DQ_GRADS = (Kind.HEAD, Kind.QUERY)
 """The parameter kinds whose gradients the dQ program writes: a head's partial sum over its queries and
 its queries' own."""
@@ -1067,36 +1213,20 @@ class Gradients:
     initial: Initial | None
 
 
-def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
-              hooks: Hooks | None, dout: jax.Array,
-              residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
-              scale: float | None = None, rounded: bool = True) -> Gradients:
-    """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
-    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first
-    holding the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's
-    `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
-    `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
-    value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, others, own, others_total,
-    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale)`
-    giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it
-    chose it, the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's
-    (`DKV_GRADS`); each gradient fp32, then rounded to its input's dtype. D is taken two ways, about 0 and
-    about the anchor key's `v_c · dO`, each query the nearer, from the forward's split sums
-    (`attention_algebra.split_delta`) or a first pass of the dQ launch's own over the keys at the
-    forward's maximum (`off_anchor_delta`): the anchor key's `dP - c` enters as exactly 0; the main pass
-    then refines D once from its own sums for the dK/dV launch and the head, query and initial state's
-    gradients (`attention_algebra.refinement`). The output hook is no part of it: a differentiated call
-    applies `output_mod` past the kernel, where its own derivative runs, and passes `dout` before it.
-    Deterministic where `launch` writes every gradient element from one program (the two-launch schedules: a
-    head parameter's partial sums added in a fixed order and a key head's query heads summed in XLA); the
-    Mosaic one-launch schedule adds dQ's tiles atomically, in their arrival order."""
-    hooks = Hooks() if hooks is None else hooks
-    if hooks.output_mod is not None:
-        raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
+
+def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
+                     dout: jax.Array, residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
+                     scale: float | None) -> tuple[tuple, dict, tuple]:
+    """The arrays and parameters `gradients` hands a mainloop's backward launch for this call (padded to
+    whole `block`s), and what it finishes the gradients from (the padded call, the initial state's terms
+    and the cotangent `[B, H, Q, Dv]` fp32): a launch's own fitting reads them before any launch runs
+    (`attention_triton.backward_unfitted`)."""
     batch, queries, heads, width = query.shape
-    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
-    group = heads // kv_heads
-    scale = width ** -0.5 if scale is None else scale
+    group, value_width = heads // key.shape[2], value.shape[-1]
+    # The logits taken as the forward took them (`prescale`): every launch recomputes them from the query
+    # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
+    # against the call's own keys and queries, so no factor of the power is taken back from a product.
+    power, scale = prescale(query.dtype, width, scale)
     # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
     dout = dout.astype(query.dtype)
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
@@ -1125,13 +1255,53 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     others = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened)
     own, others_total = call.rows(split.own), call.rows(split.others_total)
     shift = call.rows(split.shift.astype(jnp.float32))
-    # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
-    anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
-                                       jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
+    # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads; zero
+    # for a query with no anchor key (-1, `output_split`'s).
+    places = jnp.swapaxes(key_index, 1, 2)[..., None]
+    anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2), jnp.maximum(places, 0), axis=1)
+    anchor_value = jnp.where(places >= 0, anchor_value, 0)
     maximum = call.rows(maxima.astype(jnp.float32))
-    outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
-                     shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
-                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
+    arrays = (*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value, shift,
+              others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows)
+    params = {"score_mod": hooks.score_mod, "score_kinds": kinds, "score_dtypes": dtypes, "scale": scale,
+              "prescale": power}
+    return arrays, params, (call, starts, cotangent)
+
+
+def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+              hooks: Hooks | None, dout: jax.Array,
+              residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
+              scale: float | None = None, rounded: bool = True) -> Gradients:
+    """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
+    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first holding
+    the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's `launch` (the
+    Triton one, `attention_triton.backward`; the plain-JAX one, `attention_portable.backward`): the call
+    padded to whole `block`s (`padded_call`), `launch(query, key, value, dout, peak0, total0, initial_term,
+    maximum, key_index, anchor_value, others, own, others_total, total, start, end, query_ids, key_ids,
+    score_params, *, score_mod, score_kinds, score_dtypes, scale, prescale)` giving dQ, the softmax's rows (`D
+    - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook
+    gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then
+    rounded to its input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each
+    query the nearer, from the forward's split sums (`attention_algebra.split_delta`) or a first pass of the
+    dQ launch's own over the keys at the forward's maximum (`off_anchor_delta`): the anchor key's `dP - c`
+    enters as exactly 0; the main pass then refines D once from its own sums for the dK/dV launch and the
+    head, query and initial state's gradients (`attention_algebra.refinement`). The output hook is no part of
+    it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
+    `dout` before it. Deterministic where `launch` writes every gradient element from one program (the
+    two-launch schedules: a head parameter's partial sums added in a fixed order and a key head's query heads
+    summed in XLA); the Mosaic one-launch schedule adds dQ's tiles and a key head's query heads' dK and dV
+    atomically, in their arrival order."""
+    hooks = Hooks() if hooks is None else hooks
+    if hooks.output_mod is not None:
+        raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
+    batch, queries, heads, width = query.shape
+    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
+    group = heads // kv_heads
+    arrays, params, (call, starts, cotangent) = launch_arguments(query, key, value, spans, hooks, dout,
+                                                                 residuals, block=block, scale=scale)
+    state = hooks.initial
+    kinds = params["score_kinds"]
+    outputs = launch(*arrays, **params)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
@@ -1139,19 +1309,22 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
     delta = anchor + delta
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
-    dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
-    dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
+    if dk.shape[2] != kv_heads:
+        # A launch's gradients a query head's each, a key head's summed here (in a fixed order); a launch
+        # that adds them into the key head's own returns them summed.
+        dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
+        dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
     grads = []
     for param in hooks.score_params:
         match param.kind:
             case Kind.HEAD:
                 grads.append(dq_grads.pop(0).sum(axis=(0, 1))[:param.value.shape[0], 0])
             case Kind.QUERY:
-                grads.append(dq_grads.pop(0)[:, :, :queries])
+                grads.append(shared_sum(dq_grads.pop(0)[:, :, :queries], param))
             case Kind.TILE:
-                grads.append(key_grads.pop(0)[:, :, :queries, :keys])
+                grads.append(shared_sum(key_grads.pop(0)[:, :, :queries, :keys], param))
             case Kind.KEY:
-                grads.append(key_grads.pop(0)[:, :, :keys])
+                grads.append(shared_sum(key_grads.pop(0)[:, :, :keys], param))
             case Kind.OUTPUT:
                 raise ValueError("a score hook takes no output parameter")
     initial = None
@@ -1168,8 +1341,12 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
         # Its weight before any product, as the launch takes it (`attention_algebra.refinement`).
         moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
+        # Its denominator's: D over T in one division, as the reference's derivative of its own division
+        # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from
+        # float64 at fp32 sums).
+        share = jnp.where(total > 0, delta / jnp.where(total > 0, total, 1.0), 0.0)
         initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-                          total=(-(delta * inverse) * factor).astype(state.total.dtype),
+                          total=(-share * factor).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).

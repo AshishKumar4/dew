@@ -63,33 +63,55 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
+import itertools
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from check1_statistics import (
+    CONFIDENCE,
+    FACTOR,
+    FEWEST_SEEDS,
+    LOG_ZERO,
+    LOWER_TAIL,
+    NARROW_FACTORS,
+    PARITY,
+    PREVIOUS_TAILS,
+    REDRAW,
+    ROW_FACTOR,
+    UPPER_TAIL,
+    Finding,
+    GateFailure,
+    Inconclusive,
+    ZeroRows,
+    _interval,
+    _over,
+    _paired_rows,
+    _pooled,
+    _scaled_rms,
+    _sized,
+    _status,
+    _typical_status,
+    _unresolved_against_itself,
+    _verdict,
+    log_over,
+    log_ratio,
+    log_sum,
+    pooled_zero_rows,
+    root_mean,
+    shown,
+)
+from float64_terms import float64_terms
+from map_judge import DRAWS, PoolRefused, judging, pooled_units, record_units
 
 from dew.accuracy import distance, reduction_bound, within
-
-FACTOR = 2.0
-
-ROW_FACTOR = 4.0
-"""How far Dew's worst row may sit from float64 against the reference's worst
-row (`rows_over`; check 1's at rows of one or two values is NARROW_FACTORS').
-An RMS over every entry averages a few wrong rows into a
-large tensor, so each comparison also holds Dew's worst row to the
-reference's. The worst of many rows is an extreme value, not an average,
-and parts further by chance: over the suite's 3,660 comparisons whose rows
-differ from float64 at all (99 files), Dew's worst row over the
-reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
-exported logits). A row that differs rather than rounds moves further: the
-suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
-with its sinks zeroed, put their worst rows at 7.1 and 3,419 times the
-reference's."""
+from dew.nn.precision import FP32_SUMS
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
@@ -129,8 +151,9 @@ def _stack_draws(trees):
     return jax.tree.map(stack, *trees)
 
 
-def _stack_host(trees):
-    """An arm's outputs of each window stacked on a new leading axis as host arrays of their own dtypes."""
+def stacked_on_host(trees):
+    """Outputs (an arm's of each window, a site's of each example) stacked on a new leading axis as host
+    arrays of their own dtypes."""
     return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *trees)
 
 
@@ -165,7 +188,7 @@ class _Windowed:
         self.fn = fn
 
     def __call__(self, *arguments):
-        return _stack_host([self.fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+        return stacked_on_host([self.fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
                             for index in range(_window_count(arguments))])
 
 
@@ -199,6 +222,23 @@ check 1 between the two across PARITY by host; without the fusions the verdicts 
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
 SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
 because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def summed_as_run():
+    """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
+    the process's default backend (`jax.default_backend()`), fp32 products summed in fp32
+    (`dew.nn.precision.FP32_SUMS`), as an accelerator sums them and as a CPU does in any process but
+    the suite's, whose wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums Dew's products in float64, so the
+    gate measures each arm as its users run it; elsewhere the process's own precision. A Dew arm that
+    sums wide only under the suite's setting is no nearer float64 here than its users' runs are, and
+    no route is kept off a CPU for summing narrower than that setting. The preset is JAX's default dot
+    algorithm in it: every dot of no stated precision takes float32 operands, a bfloat16's exactly,
+    and sums them in float32, as a GPU's fp32-accumulated product does, and a loop's running sum of
+    them is the plain one (`compensates_loops`); the setting's widened reductions, which are not
+    product sums, stay."""
+    if jax.default_backend() == "cpu":
+        return jax.default_matmul_precision(FP32_SUMS)
+    return contextlib.nullcontext()
 
 
 def without_ynn(fn, **jit_options):
@@ -283,25 +323,128 @@ def _refuse_numpy_arms(draw, *arms) -> None:
                             f"values unconverted")
 
 
-def _compiled(fn, compile):
+def _compiled(fn, compile, pairing=None):
     """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program
     already (another jit around it would nest its compiler options), or compiled by `compile`, a
-    window loop's arm within it (`over_windows`)."""
+    window loop's arm within it (`over_windows`); compiled without YNNPACK's fusions, paired with its
+    check's other arms by `pairing` (`_Paired`)."""
     if _given(fn) or getattr(fn, "without_ynn", False):
         return fn
     if getattr(fn, "dew_programs", False):
-        return fn if compile is jax.jit else _with_ynn_off(fn)
+        return fn if compile is jax.jit else _Paired(pairing, _with_ynn_off(fn), fn)
     if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile))
-    return compile(fn)
+        return _Windowed(_compiled(fn.fn, compile, pairing))
+    return compile(fn) if compile is jax.jit else _Paired(pairing, compile(fn), jax.jit(fn))
+
+
+@dataclasses.dataclass(eq=False)
+class _Pairing:
+    """Whether a check's paired arms (`_Paired`) run with YNNPACK's fusions, decided once a site before it
+    draws (`_ynn_decided`): `refused`, XLA:CPU's refusal of an arm without them where it gave one."""
+
+    decided: bool = False
+    refused: str | None = None
+
+    @property
+    def with_ynn(self) -> bool:
+        return self.refused is not None
+
+
+@dataclasses.dataclass(frozen=True)
+class _Paired:
+    """An arm of a check between two Dew paths (`_arms`): `without`, the arm without YNNPACK's fusions,
+    unless its site's arms were decided otherwise, then `plain`, the arm as Dew's users compile it
+    (`_ynn_decided`): where XLA:CPU cannot compile an arm of the check without the fusions and can with
+    them, every arm of it takes them, so the two still run the same kind of code, here the kind whose
+    microkernels the host picks."""
+
+    pairing: _Pairing
+    without: Callable
+    plain: Callable
+
+    @property
+    def without_ynn(self) -> bool:
+        """Whether the arm runs without YNNPACK's fusions (`without_ynn`'s mark)."""
+        return not self.pairing.with_ynn
+
+    def __call__(self, *inputs, **options):
+        return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
+
+
+def _paired_arms(arms) -> list[_Paired]:
+    """The paired arms among `arms`, a window loop's inner arm for it."""
+    return [arm for arm in (arm.fn if isinstance(arm, _Windowed) else arm for arm in arms)
+            if isinstance(arm, _Paired)]
+
+
+SWITCHED: list[dict] = []
+"""The sites decided onto YNNPACK's fusions (`_ynn_decided`) since the last test's report took them: each its
+label and XLA:CPU's refusal, which tests/conftest.py reports as the test's JUnit property `ynn_switched`."""
+
+
+@functools.cache
+def _ynn_option_held() -> None:
+    """Raise unless XLA:CPU compiles a trivial program with WITHOUT_YNN's options, once a process: where an
+    XLA release refuses the options themselves, every paired site would otherwise move onto the fusions
+    and pass (`_ynn_decided`)."""
+    try:
+        without_ynn(lambda x: x * 2)(jnp.zeros((2, 2), jnp.float32))
+    except jax.errors.JaxRuntimeError as error:
+        raise RuntimeError(f"XLA:CPU refuses WITHOUT_YNN's options {WITHOUT_YNN} on a trivial program: "
+                           f"{str(error).splitlines()[0]}; no check may move its arms onto the fusions"
+                           ) from error
+
+
+def _ynn_decided(label: str, arms, inputs) -> None:
+    """The mode of a site's paired arms (`_Paired`), decided once before its draws: each compiled ahead on
+    its first draw's `inputs` without YNNPACK's fusions; where XLA:CPU refuses one so and compiles it with
+    them (its algebraic simplifier forms a dot of no contracting dimension from a contraction of length
+    one, which only YNNPACK's fusion runs: attention's XLA backward over a single key), every paired arm
+    of the site takes the fusions, logged in its stages' lines (`_logged`), reported (`SWITCHED`) and named in
+    its findings (`_with_mode`). One the fusions refuse too raises, and so does a process whose XLA refuses
+    the options themselves (`_ynn_option_held`). An arm running Dew's own programs through Dew's
+    seam (`dew_programs`) compiles at its call, without them, as does a window loop's arm, whose program
+    takes each window's slices and not the draw (`over_windows`)."""
+    pairings = {arm.pairing for arm in _paired_arms(arms)}
+    if not pairings or all(pairing.decided for pairing in pairings):
+        return
+    _ynn_option_held()
+    refused = None
+    for arm in arms:
+        if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
+            continue
+        try:
+            arm.without.lower(*inputs).compile()
+        except jax.errors.JaxRuntimeError as error:
+            arm.plain.lower(*inputs).compile()
+            refused = refused or str(error).splitlines()[0]
+    for pairing in pairings:
+        pairing.decided, pairing.refused = True, refused
+    if refused is not None:
+        SWITCHED.append({"label": label, "refused": refused})
+
+
+def _mode_of(arms) -> str | None:
+    """XLA:CPU's refusal that moved a site's arms onto YNNPACK's fusions (`_ynn_decided`), or None."""
+    return next((arm.pairing.refused for arm in _paired_arms(arms) if arm.pairing.refused), None)
+
+
+def _with_mode(findings: list, arms) -> list:
+    """`findings`, each naming its site's arms' YNNPACK mode where they were decided onto the fusions
+    (`_ynn_decided`), so a failure says which code its arms ran."""
+    refused = _mode_of(arms)
+    if refused is None:
+        return findings
+    return [dataclasses.replace(finding, message=f"{finding.message} (both arms with YNNPACK's fusions: "
+                                                 f"XLA:CPU refused one without, {refused!r})")
+            for finding in findings]
 
 
 class _Truth:
-    """A check's float64 truth as the gate runs it (`_truth_program`): its first call runs `fn` as it is
-    given and decides the rest, compiled where that call returned JAX values, as given where it
-    returned host values (a NumPy truth). A truth that returns JAX values is traced at that first call,
-    so one that does host work on its inputs (a widening or a conversion on the host) fails there, at
-    its first seed, naming itself; it passes `as_given`."""
+    """A check's float64 truth as the gate runs it (`_truth_program`): compiled from its first call, or,
+    where it cannot be traced and returns host values run as it is given (a NumPy truth), as given. A truth
+    that returns JAX values and cannot be traced does host work on its inputs (a widening or a conversion
+    on the host): it fails at its first seed with its trace's error, naming itself; it passes `as_given`."""
 
     def __init__(self, fn):
         self.fn, self.run = fn, None
@@ -309,12 +452,19 @@ class _Truth:
     def __call__(self, *inputs):
         if self.run is not None:
             return self.run(*inputs)
-        first = self.fn(*inputs)
-        self.run = self.fn
-        if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
-            self.run = jax.jit(self.fn)
-            self.run.trace(*inputs)
-        return first
+        compiled = jax.jit(self.fn)
+        try:
+            # Compiled from the first call on, never run eagerly: a seed's truth is the same whichever seed
+            # a process draws first (a map task's, DRAWS), and a large truth pays no eager run.
+            values = compiled(*inputs)
+        except Exception as untraced:
+            first = self.fn(*inputs)
+            if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
+                raise untraced
+            self.run = self.fn
+            return first
+        self.run = compiled
+        return values
 
 
 def _truth_program(fn):
@@ -350,10 +500,38 @@ def _arms(dew_fn, reference_fn):
     them compiled so through Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a
     recording, a host loop over programs of its own), the other as Dew's users run it, with the
     fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
-    one arm otherwise than its other. One function as both arms compiles once."""
-    compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
-    reference = _compiled(reference_fn, compile)
-    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
+    one arm otherwise than its other. One function as both arms compiles once. A program XLA:CPU cannot
+    compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
+    compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
+    _refuse_owned_policies(compile, dew_fn, reference_fn)
+    reference = _compiled(reference_fn, compile, pairing)
+    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile, pairing)), reference
+
+
+def _arms_with(dew_fn, reference_fn, further: list, label: str):
+    """A site's arms and each further reference's, compiled as `_arms` pairs them, Dew's once beside all:
+    refused where, beside a plain Dew arm, a further reference is not of the reference's kind (plain or
+    as given), as no one compilation of Dew's pairs with both."""
+    if not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in further):
+        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
+                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
+    dew, reference = _arms(dew_fn, reference_fn)
+    return dew, reference, [_arms(dew_fn, fn)[1] for fn in further]
+
+
+def _refuse_owned_policies(compile, *arms) -> None:
+    """Refuse an arm compiled with a policy the gate does not own (row 2287): a `without_ynn` program,
+    which `_compiled` runs as it is, beside an arm run `as_given`, where the gate compiles Dew's arm as
+    its users run it, with the fusions (`jax.jit`) — it would run without them, unseen. A plain
+    `jax.jit` arm the gate's own compile nests, which applies the gate's options; a jit with compiler
+    options of its own refuses that nesting itself (`compiler_options` only at top level). Pass the
+    function plain and the gate compiles it as the pairing asks."""
+    for fn in arms:
+        inner = fn.fn if isinstance(fn, _Windowed) else fn
+        if compile is jax.jit and getattr(inner, "without_ynn", False) and not _given(inner):
+            raise TypeError(f"{getattr(inner, '__qualname__', repr(inner))} is compiled without YNNPACK's "
+                            f"fusions, beside an arm run as given, where the gate compiles Dew's arm with "
+                            f"them: pass it plain, and the gate compiles it as the pairing asks")
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -464,6 +642,19 @@ def equations(graph, *, platform: str | None = None):
             yield from equations(value, platform=platform)
 
 
+def dot_precisions(function, *arguments) -> list:
+    """The precision of every dot_general `function` traces over `arguments` under JAX's own default
+    precision (the test lane sets 'highest' for every product that states none), with the dtype its
+    operands promote to and their shapes, sub-jaxprs included, as a GPU runs them: a CPU's float64
+    sums (`dew.nn.precision.accumulated`) are tests/test_cpu_accumulation.py's."""
+    with jax.default_matmul_precision(None):
+        graph = jax.make_jaxpr(function)(*arguments)
+    return [(equation.params["precision"],
+             jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
+             tuple(variable.aval.shape for variable in equation.invars))
+            for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
+
+
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products))
     (`dew.accuracy.reduction_bound`): `magnitudes` holds the elementwise sum of
@@ -496,281 +687,22 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     truth = np.asarray(truth, np.float64)
     if truth.ndim < 2:
         return np.zeros(0), np.zeros(0)
+    return _row_sizes(truth, terms)[1], _rows_rms(np.asarray(value, np.float64) - truth, truth.shape[-1])
 
-    def rms(values):
-        return _scaled_rms(np.reshape(values, (-1, truth.shape[-1])))
 
-    sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
+def _rows_rms(values, width: int) -> np.ndarray:
+    """Each row's RMS of `values`, a row `width` wide (`_scaled_rms`)."""
+    return _scaled_rms(np.reshape(values, (-1, width)))
+
+
+def _row_sizes(truth: np.ndarray, terms=None) -> tuple[np.ndarray, np.ndarray]:
+    """A truth leaf's rows, of rank two or more: each row's own RMS, and its size as `row_errors` reads
+    it, the RMS (or, with `terms`, the larger of it and its terms') where it is past RESOLUTION of the
+    leaf, else zero."""
+    own = _rows_rms(truth, truth.shape[-1])
+    sized = own if terms is None else np.maximum(own, _rows_rms(terms, truth.shape[-1]))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
-    sizes = np.where(sizes > RESOLUTION * leaf, sizes, 0.0)
-    return sizes, rms(np.asarray(value, np.float64) - truth)
-
-
-def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tuple[str, float, str]]:
-    """Where Dew's rows are further from float64 than ROW_FACTOR times the
-    reference's (`row_errors`): its worst row over its own size against the
-    reference's worst, at least `floor` (an order floor in the rows' units),
-    and each row of size zero, a sum that cancels exactly before anything its
-    terms see (a query that keeps one key), against the reference's distance
-    on that same row, which is all the evidence such a row has: where the
-    reference is exactly the float64 zero, Dew must be too. Each as `(rule,
-    measure, message)`, a `Finding`'s rule, measure and message (RULES)."""
-    sizes, mine = row_errors(dew, truth, terms)
-    _, theirs = row_errors(reference, truth, terms)
-    sized = sizes > 0
-    over = []
-    if sized.any():
-        # Compared by their logs, so a row's error over its size orders where the quotient overflows.
-        row = float(np.max(_log_over(mine[sized], sizes[sized])))
-        their_row = float(np.max(_log_over(theirs[sized], sizes[sized])))
-        allowed = max(their_row, float(_log_over(floor, 1.0)))
-        if not row <= math.log(ROW_FACTOR) + allowed:
-            over.append(("row", row - allowed, f"the worst row is {_shown(row)} from float64 over its size, "
-                         f"the reference's {_shown(their_row)}, allowed "
-                         f"{_shown(math.log(ROW_FACTOR) + allowed)}"))
-    zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
-    if zero.any():
-        at = int(np.flatnonzero(zero)[0])
-        # The measure is the worst of them, the first the example.
-        over.append(("zero rows", log_ratio(mine[zero], theirs[zero]),
-                     f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
-                     f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}"))
-    return over
-
-
-def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
-    """Dew within FACTOR times the reference's RMS distance from float64, and
-    its rows within ROW_FACTOR times the reference's (`rows_over`), each
-    sized by its float64 `terms` where they are given (`float64_terms`)."""
-    mine, theirs = distance(dew, truth), distance(reference, truth)
-    if not (math.isfinite(mine) and math.isfinite(theirs)):
-        raise GateFailure([Finding(label, "not finite", 1, f"{label}: a value of dew, the reference or "
-                                   f"float64 is not finite (dew {mine:.3e} and the reference {theirs:.3e} "
-                                   f"from float64)")])
-    if not theirs > 0:
-        # No measure: Dew's own distance from float64 is what a change can make worse, and none at all
-        # is a site that cannot be judged (`no measure`), never a pass.
-        if mine > 0:
-            raise GateFailure([Finding(label, "exact reference", mine, f"{label}: the reference equals "
-                                       f"float64 and dew is {mine:.3e} from it (rms)")])
-        raise GateFailure([Finding(label, "no measure", 0.0, f"{label}: the reference and dew both equal "
-                                   f"float64, so the site measures nothing")])
-    found = []
-    if not within(mine, FACTOR * theirs):
-        found.append(("pooled", log_ratio(mine, theirs), f"dew is {mine:.3e} from float64 (rms), the "
-                      f"reference {theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})"))
-    # Every rule's findings at once, so a change that eases one rule and breaks another shows both.
-    found += rows_over(dew, reference, truth, terms)
-    if found:
-        raise GateFailure([Finding(label, rule, measure, f"{label}: {message}")
-                           for rule, measure, message in found],
-                          f"{label}: " + "; ".join(message for _, _, message in found))
-
-
-
-PARITY = 1.5
-"""The gate's on-par factor: each leaf's RMS error from float64 within 1.5 times the
-reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
-the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
-
-BOOTSTRAP = 2000
-"""Resamples of a site's seeds for the pooled ratio's interval (`_interval`), drawn by one fixed key so
-an assertion decides alike on every run."""
-CONFIDENCE = 0.999
-"""Check 1's stated confidence in its ratio's decisions: a pass certifies a leaf's RMS ratio no more
-than PARITY², and an over by its ratio that it is above one, each but for a nominal 5e-4 (LOWER_TAIL,
-UPPER_TAIL). A leaf failed by a row, a row of float64 zero or a value not finite is failed by that
-rule, which certifies no ratio."""
-LOWER_TAIL = 5e-4
-"""The lower tail of a leaf's bootstrap interval, the over side's whole 5e-4, spent at stage 2 alone, where
-an over is decided (`_staged`). Nominal: the rates hold as far as the percentile bootstrap's endpoint
-coverage does, and 2,000 resamples interpolate an endpoint this far out."""
-UPPER_TAIL = 2.5e-4
-"""The upper tail at each of check 1's two stages: the pass side's 5e-4 spent equally over them, a pass
-possible at either (nominal, as LOWER_TAIL)."""
-FEWEST_SEEDS = 8
-"""The fewest seeds check 1 judges by, an engineering minimum and no statistical threshold: over very few
-seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
-the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it the measured interval
-decides. `seeds_for` never declares fewer."""
-REDRAW = 4
-"""A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Finding:
-    """One finding of the gate as data, beside its message: the leaf it names (the site's label and the
-    leaf's path), the rule it fails (RULES), and its measure, finite and larger worse: the log of Dew's
-    error over the reference's for a ratio's rule (`log_ratio`, `log_sum`), the seeds a value is not
-    finite on, Dew's own distance from float64 where the reference is exactly float64, and for too few
-    seeds the fewest over the given. What a train matches a candidate's failures to its parent's by:
-    the same leaf and rule, a measure no larger."""
-    leaf: str
-    rule: str
-    measure: float
-    message: str
-
-    def __str__(self) -> str:
-        return self.message
-
-
-RULES = frozenset({"pooled", "row", "zero rows", "not finite", "exact reference", "no measure",
-                   "inconclusive"})
-"""The rules a finding names: the pooled RMS ratio over its factor, the worst row over its factor, a row
-of float64 zero further from it than the reference's, a value not finite, a reference exactly float64
-where Dew is not (measured by Dew's own distance from it), a site where both are (nothing to measure,
-measured 0), and a leaf its seeds leave undecided."""
-
-
-LOG_ZERO = -1075 * math.log(2)
-"""What a finding's measure reads as the log of an error of exactly zero (`log_ratio`): below the log of
-the least positive float64, 2^-1074, so a reference error of zero orders under every positive one and
-a Dew error of zero under every positive one. An order among findings, never a bound any verdict
-reads."""
-
-
-def _logs(values) -> np.ndarray:
-    """Each nonnegative value's natural log, exact for every positive float64, subnormals included, and
-    LOG_ZERO for zero."""
-    values = np.asarray(values, np.float64)
-    with np.errstate(divide="ignore"):
-        return np.where(values > 0, np.log(np.where(values > 0, values, 1.0)), LOG_ZERO)
-
-
-LOG_LARGEST = math.log(np.finfo(np.float64).max)
-"""The log of float64's largest value: a quotient of finite evidence past it is held there where it is
-recorded or shown (`_over`), never where it is judged (`_log_over`)."""
-
-
-def _log_over(numerators, denominators) -> np.ndarray:
-    """The log of each nonnegative numerator over its positive denominator (`_logs`), exact and finite for
-    every finite pair, so a quotient past float64's range (an error of 1e154 over a row of 1e-160) keeps
-    its order against every other; LOG_ZERO for a zero numerator, and not a number for one that is not."""
-    numerators = np.asarray(numerators, np.float64)
-    logs = np.where(numerators > 0, _logs(numerators) - _logs(denominators), LOG_ZERO)
-    return np.where(np.isnan(numerators), np.nan, logs)
-
-
-def _over(numerators, denominators) -> np.ndarray:
-    """Each quotient of `_log_over` as a value, held at float64's largest: a recorded reference's worst
-    row (`RecordedLeaf.worst`) and a message's figure; zero over anything is zero."""
-    quotient = np.exp(np.minimum(_log_over(numerators, denominators), LOG_LARGEST))
-    return np.where(np.asarray(numerators, np.float64) > 0, quotient, 0.0)
-
-
-def _shown(log: float) -> str:
-    """A log quotient as a message shows it, held at float64's largest."""
-    return f"{float(np.exp(np.minimum(log, LOG_LARGEST))):.3e}"
-
-
-def _scaled_rms(rows) -> np.ndarray:
-    """Each row's root mean square of finite values, the row scaled by its largest first, so no square
-    overflows (row 1628): zero for a row of zeros."""
-    rows = np.abs(np.asarray(rows, np.float64))
-    largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
-    scale = np.where(largest > 0, largest, 1.0)
-    return scale[:, 0] * np.sqrt(np.mean(np.square(rows / scale), axis=1))
-
-
-def log_sum(values) -> float:
-    """The natural log of the sum of nonnegative values, scaled by their largest first, so no sum of
-    finite values overflows on the way: LOG_ZERO for a sum of zeros."""
-    values = np.asarray(values, np.float64)
-    largest = float(np.max(values)) if values.size else 0.0
-    if not largest > 0:
-        return LOG_ZERO
-    return math.log(largest) + math.log(float(np.sum(values / largest)))
-
-
-def root_mean(values) -> float:
-    """The root of the mean of nonnegative values (each seed's mean squared error), scaled by their
-    largest first, so no sum of finite values overflows on the way: finite wherever they are."""
-    values = np.asarray(values, np.float64)
-    largest = float(np.max(values)) if values.size else 0.0
-    if not largest > 0:
-        return 0.0
-    return math.sqrt(largest) * math.sqrt(float(np.mean(values / largest)))
-
-
-def log_ratio(mine, theirs) -> float:
-    """A ratio rule's measure: the natural log of Dew's error over the reference's, the largest over its
-    elements, each log exact for every positive error (`_logs`). Finite at every finite error and
-    growing with Dew's, where the ratio itself overflows past an error of 4 over a reference of zero."""
-    return float(np.max(_logs(mine) - _logs(theirs)))
-
-
-class GateFailure(AssertionError):
-    """A site the gate fails, its findings as data (`Finding`), its message theirs, one a line, unless a
-    rule words its findings together. A test's report carries them as the JUnit property
-    `gate_findings` (tests/conftest.py)."""
-
-    def __init__(self, findings, message: str | None = None):
-        self.findings = tuple(findings)
-        super().__init__("\n".join(map(str, self.findings)) if message is None else message)
-
-
-class Inconclusive(GateFailure):
-    """Check 1 could not decide a leaf: its seeds do not resolve PARITY. Never a pass; the site takes
-    larger inputs or more seeds (`seeds_for`)."""
-
-
-def _pooled(mine: np.ndarray, theirs: np.ndarray) -> float:
-    """sqrt(sum a / sum b): the RMS ratio over every draw and element, each draw's mean squared error
-    weighed alike, as the owner's estimand reads it."""
-    return float(np.sqrt(np.sum(mine) / np.sum(theirs))) if np.sum(theirs) > 0 else (
-        0.0 if np.sum(mine) == 0 else float("inf"))
-
-
-def _interval(mine: np.ndarray, theirs: np.ndarray | None = None, control: np.ndarray | None = None,
-              tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float]:
-    """The pooled ratio's bootstrap interval over seeds, its lower and upper `tails` left out: Dew's and
-    the reference's errors resampled by the same seeds, or, for `control`, the reference's errors on
-    two disjoint seed sets resampled apart (the reference compared with itself, an equally exact
-    pair)."""
-    rng = np.random.default_rng(0)
-    count = len(mine)
-    picks = rng.integers(0, count, (BOOTSTRAP, count))
-    if control is None:
-        ratios = np.sqrt(mine[picks].sum(axis=1) / np.maximum(theirs[picks].sum(axis=1), 1e-300))
-    else:
-        other = rng.integers(0, len(control), (BOOTSTRAP, len(control)))
-        ratios = np.sqrt(mine[picks].sum(axis=1) / np.maximum(control[other].sum(axis=1), 1e-300))
-    return float(np.quantile(ratios, tails[0])), float(np.quantile(ratios, 1 - tails[1]))
-
-
-def _resolves(low: float, high: float) -> bool:
-    """Whether a pooled ratio's interval is no wider than PARITY, so it tells an equally exact
-    computation from one PARITY off."""
-    return high <= PARITY * max(low, 1e-300)
-
-
-def _status(ratio: float, low: float, high: float, *, contained: bool = True) -> str:
-    """A leaf's verdict by its pooled ratio and interval: "pass", "over" or "inconclusive". The interval
-    is taken to hold the ratio (low and high widened to it, which no endpoint's coverage loses by), so a
-    pass certifies the ratio's high end at most PARITY², whether the interval lies wholly at or under
-    PARITY or is resolved (no wider than PARITY) with the ratio under it, and an over its low end above
-    one. Straddling PARITY and wider than it, the leaf is inconclusive, as is a ratio or end that is not
-    a number. Not `contained`, the earlier rule: the interval as it is, a leaf over PARITY
-    by its ratio wherever the interval does not straddle it unresolved."""
-    if not contained:
-        if low <= PARITY < high and not _resolves(low, high):
-            return "inconclusive"
-        return "over" if ratio > PARITY else "pass"
-    if not all(np.isfinite(value) for value in (ratio, low, high)):
-        return "inconclusive"
-    low, high = min(low, ratio), max(high, ratio)
-    if high <= PARITY:
-        return "pass"
-    if low > PARITY:
-        return "over"
-    if _resolves(low, high):
-        return "pass" if ratio <= PARITY else "over"
-    return "inconclusive"
-
-
-ZeroRows = tuple[np.ndarray, np.ndarray, np.ndarray]
-"""One seed's rows of float64 zero of a leaf that check 1 judges by the reference's error on them
-(`_paired`): their indices, Dew's RMS errors on them and the reference's."""
+    return own, np.where(sized > RESOLUTION * leaf, sized, 0.0)
 
 NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 
@@ -779,7 +711,7 @@ NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
     float64 (seed by leaf), the log of each seed's worst sized row over its size (Dew's, the
-    reference's; `_log_over`), each
+    reference's; `log_over`), each
     seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
     `pooled_zero_rows`), whether every value of the leaf was finite on every seed, and each leaf's row
     width (its last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
@@ -790,12 +722,48 @@ class _Draws:
     zero_rows: list[list[ZeroRows]]
     finite: np.ndarray
     widths: tuple[int, ...]
+    examples: list[list[np.ndarray | None]] | None = None
+    """A site whose leaves stack independent examples on their first axis (`assert_as_exact`'s
+    `examples`): each seed's per-example log RMS ratios of each leaf (`_example_ratios`), else None."""
+    example_rows: list[list[np.ndarray | None]] | None = None
+    """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
+    on the same example, each over its size (`_example_worst_rows`), else None."""
 
     def joined(self, other: "_Draws") -> "_Draws":
+        examples, example_rows = ((getattr(self, field) + getattr(other, field)
+                                   if getattr(self, field) is not None and getattr(other, field) is not None
+                                   else None) for field in ("examples", "example_rows"))
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
                                     for field in ("mine", "theirs", "worst")),
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
-                      self.widths)
+                      self.widths, examples, example_rows)
+
+    def between(self, start: int, stop: int) -> "_Draws":
+        """These draws' seeds `start` to `stop`, counted from their first."""
+        cut = slice(start, stop)
+        examples, example_rows = (None if getattr(self, field) is None else getattr(self, field)[cut]
+                                  for field in ("examples", "example_rows"))
+        return _Draws(self.names, self.mine[cut], self.theirs[cut], self.worst[cut], self.zero_rows[cut],
+                      self.finite[cut], self.widths, examples, example_rows)
+
+    def of_examples(self, index: int) -> list[np.ndarray] | None:
+        """Leaf `index`'s per-example log ratios a seed, or None where the site stacks none or a seed's
+        are not all paired (`_example_ratios`)."""
+        if self.examples is None:
+            return None
+        found = [seed[index] for seed in self.examples]
+        return None if any(ratios is None for ratios in found) else found
+
+    def of_example_rows(self, index: int) -> np.ndarray | None:
+        """Leaf `index`'s per-example paired worst-row log ratios over every seed, or None where the site
+        stacks no examples or the leaf has no rows (`_example_worst_rows`)."""
+        if self.example_rows is None or any(seed[index] is None for seed in self.example_rows):
+            return None
+        return np.concatenate([seed[index] for seed in self.example_rows])
+
+    def scalar(self, index: int) -> bool:
+        """Whether leaf `index` holds one value an example (its width, the values a row, one)."""
+        return self.widths[index] <= 1
 
     def against_larger(self, library: "_Draws", leaves: Sequence[str]) -> "_Draws":
         """These draws judged against the larger of their reference's error and `library`'s, the same
@@ -816,38 +784,10 @@ class _Draws:
         zero_rows = [[(theirs if chosen else mine)
                       for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
+        # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
+        # one reference.
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
                       self.finite & (library.finite | ~covered), self.widths)
-
-
-def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]:
-    """The rows of float64 zero Dew is further from than ROW_FACTOR times the reference over a run's
-    seeds, as (row, Dew's RMS error, the reference's): each row's squared errors summed over the seeds
-    it is zero on, Dew's within ROW_FACTOR² of the reference's. A row of float64 zero is all residue,
-    float32's rounding of a sum float64 cancels, with no size to judge it at, so it is held to the
-    reference's residue on the same row; one seed's residues are heavy-tailed, and their ratio, a
-    ratio of two, failed equally exact pairs seed by seed where the pooled one does not, while one
-    row held ten times further still fails. Where the reference is exactly the float64 zero on a row
-    over every seed, Dew must be too.
-
-    Calibrated on attention's packed bias gradients, whose key rows are zero (`python
-    tools/gate_null_runs.py attention-key-bias --paired --seeds K --runs N --chunk C`, and `--fault
-    zero-row-10x`): 0 of 15,000 runs failed at 8 seeds (a red rate at most 4.6e-4 at 99.9%) and 0 of
-    3,000 at 40 (at most 2.3e-3), and the 10x row failed every run at both. Judged seed by seed, the
-    same pairs failed on 6.6% of runs of 8 seeds and 42% of 64."""
-    mine: dict[int, list[float]] = {}
-    theirs: dict[int, list[float]] = {}
-    for rows, my_errors, their_errors in evidence:
-        for row, my_error, their_error in zip(rows.tolist(), my_errors.tolist(), their_errors.tolist(),
-                                              strict=True):
-            mine.setdefault(row, []).append(my_error)
-            theirs.setdefault(row, []).append(their_error)
-    # Each row's errors pooled as a scaled root mean square and compared by their logs, so errors near
-    # float64's largest pool and order without a square or a product overflowing.
-    pooled = [(row, float(_scaled_rms([mine[row]])[0]), float(_scaled_rms([theirs[row]])[0]))
-              for row in sorted(mine)]
-    return [(row, my_rms, their_rms) for row, my_rms, their_rms in pooled
-            if not _logs(my_rms) <= math.log(ROW_FACTOR) + _logs(their_rms)]
 
 
 SKETCH = 32
@@ -929,33 +869,235 @@ class RecordedLeaf:
     def log_worst(self) -> float:
         """The log of `worst`, exact where this leaf was read here (`leaf_summary`), which keeps its
         order past float64's range; a recording's, from the value it holds."""
-        return self.worst_log if self.worst_log is not None else float(_log_over(self.worst, 1.0))
+        return self.worst_log if self.worst_log is not None else float(log_over(self.worst, 1.0))
 
 
 def leaf_summary(reference, truth) -> RecordedLeaf:
     """`RecordedLeaf` of a leaf against its float64 truth: check 1's evidence of the reference's leaf, or
-    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact."""
-    dtype = str(jnp.dtype(getattr(reference, "dtype", np.asarray(reference).dtype)))
-    reference, truth = np.asarray(reference, np.float64), np.asarray(truth, np.float64)
-    if not reference.size:
-        assert truth.shape == reference.shape, (f"an empty leaf {reference.shape} against a truth "
-                                                f"{truth.shape}")
-        return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
-    sizes, rows = row_errors(reference, truth)
-    sized = sizes > 0
-    # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
-    # row is exactly its size from it.
-    own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
-    logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
-    return RecordedLeaf(float(np.mean(np.square(reference - truth))),
-                        float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
-                        np.flatnonzero(~sized), rows[~sized],
-                        finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
-                        zero_sizes=own[~sized], worst_log=logged)
+    of Dew's (`_drawn` reads both so, a recorded reference's as recorded), read as `_evidence` reads a
+    draw's (`leaf_summaries`). An empty leaf is exact."""
+    return leaf_summaries([reference], [truth])[0]
+
+
+def leaf_summaries(references, truths) -> list[RecordedLeaf]:
+    """Each reference leaf's `leaf_summary` against its truth, read at once (`_summaries`), each held to
+    its truth's shape first: a recording's record (tools/recorded_references.py)."""
+    for reference, truth in zip(references, truths, strict=True):
+        if np.shape(reference) != np.shape(truth):
+            raise AssertionError(f"a leaf {np.shape(reference)} against a truth {np.shape(truth)}")
+    return _summaries(references, _LaidTruths.of(truths))
+
+
+def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = None) -> RecordedLeaf:
+    """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
+    reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
+    leaf's every axis but the last, in C order): its mean squared error the rows' mean square, every row
+    one width, unless `mse` gives it; `finite` whether the reference's leaf was, and `dtype` its dtype.
+    The truth's rows are read as `_summaries` reads them (`_LaidTruths`), and an empty leaf is exact,
+    as `leaf_summary` reads one."""
+    if not np.size(truth):
+        return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=finite, dtype=dtype)
+    held, rows = _LaidTruths.of([truth]), np.asarray(rows, np.float64)
+    sized = held.sizes > 0
+    logged = float(np.max(log_over(rows[sized], held.sizes[sized]))) if sized.any() else LOG_ZERO
+    return RecordedLeaf(float(np.mean(np.square(rows))) if mse is None else mse,
+                        float(np.max(_over(rows[sized], held.sizes[sized]))) if sized.any() else 0.0,
+                        np.flatnonzero(~sized), rows[~sized], finite=finite and bool(held.finite.all()),
+                        dtype=dtype, zero_sizes=held.own[~sized], worst_log=logged)
+
+
+@dataclasses.dataclass(frozen=True)
+class _LaidTruths:
+    """A draw's truth leaves read at once for both arms (`_summaries`). Every leaf that is not empty lies
+    end to end with the others in C order, by row width (its last axis's, 0 for a leaf of rank under two)
+    and then size: each run of one width and size is one (leaves, size) matrix, and each width's rows one
+    (rows, width) matrix, so a draw takes a few passes where it took a pipeline a leaf (ledger 1848:
+    190 µs a leaf at the gemma3n gradient's tiny leaves). A leaf in another layout is read as its
+    C-ordered copy. Each row has its own RMS (`_scaled_rms`) and its size, the RMS where it is past
+    RESOLUTION of its leaf, else zero (`row_errors`'). `truths` is every leaf in float64 in C order,
+    `laid` the leaves laid in order, `runs` each run's (leaves, size, width), `values` the laid leaves,
+    `own` and `sizes` their rows' own RMS and size, and `finite` whether each laid leaf's every value
+    is."""
+
+    truths: list
+    laid: list[int]
+    runs: list[tuple[int, int, int]]
+    values: np.ndarray
+    own: np.ndarray
+    sizes: np.ndarray
+    finite: np.ndarray
+
+    @staticmethod
+    def of(truths, terms=None) -> "_LaidTruths":
+        """`truths` laid, each row sized by its own RMS or, given each leaf's float64 `terms`
+        (`float64_terms`), by the larger of it and its terms' RMS, as `row_errors` sizes a row that
+        cancels (`assert_as_exact`'s `terms`)."""
+        truths = [np.asarray(truth, np.float64, order="C") for truth in truths]
+        keys = sorted((truth.shape[-1] if truth.ndim >= 2 else 0, truth.size, at)
+                      for at, truth in enumerate(truths) if truth.size)
+        runs = [(len(list(run)), size, width)
+                for (width, size), run in itertools.groupby(keys, lambda key: key[:2])]
+        values = np.concatenate([np.zeros(0), *(truths[at].reshape(-1) for *_, at in keys)])
+        blocks, resolved = _blocks(values, runs), [np.zeros(0)]
+        for (_, size, width), block in zip(runs, blocks, strict=True):
+            if width:
+                # Each leaf's `distance(truth, 0)`, at each of its rows.
+                resolved.append(np.repeat(RESOLUTION * np.sqrt(np.mean(np.square(block - 0.0), axis=1)),
+                                          size // width))
+        own = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(values, runs))])
+        sized = own
+        if terms is not None:
+            # The terms laid as the truths are, leaf by leaf; a leaf no sum made is its own size.
+            laid_terms = [np.abs(np.asarray(term if term is not None else truths[at], np.float64,
+                                            order="C")).reshape(truths[at].shape)
+                          for at, term in enumerate(terms)]
+            termed = np.concatenate([np.zeros(0), *(laid_terms[at].reshape(-1) for *_, at in keys)])
+            sized = np.maximum(own, np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(termed, runs))]))
+        finite = [np.isfinite(block).all(axis=1) for block in blocks]
+        return _LaidTruths(truths, [at for *_, at in keys], runs, values, own,
+                           np.where(sized > np.concatenate(resolved), sized, 0.0),
+                           np.concatenate([np.zeros(0, bool), *finite]))
+
+
+def _blocks(values: np.ndarray, runs) -> list[np.ndarray]:
+    """`values` laid by `runs` (`_LaidTruths`), each run's leaves a (leaves, size) matrix."""
+    ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
+    return [values[start:stop].reshape(leaves, size)
+            for start, stop, (leaves, size, _) in zip(ends[:-1], ends[1:], runs, strict=True)]
+
+
+def _rows(values: np.ndarray, runs) -> list[np.ndarray]:
+    """`values` laid by `runs` (`_LaidTruths`), each width's rows, its runs' together, one (rows, width)
+    matrix."""
+    ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
+    spans = {}
+    for start, stop, (_, _, width) in zip(ends[:-1], ends[1:], runs, strict=True):
+        if width:
+            spans[width] = (spans.get(width, (start,))[0], stop)
+    return [values[start:stop].reshape(-1, width) for width, (start, stop) in spans.items()]
+
+
+def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
+    """Each reference leaf's evidence against its truth in `held` (`_LaidTruths.of`) as check 1 reads it
+    (`RecordedLeaf`), every leaf read in C order with the others in a few passes; None for a reference of
+    None. The caller holds each reference to its truth's shape (`leaf_summaries`, `_evidence`)."""
+    names = {}
+
+    def dtype(reference) -> str:
+        kind = reference.dtype if hasattr(reference, "dtype") else np.asarray(reference).dtype
+        if kind not in names:
+            names[kind] = str(jnp.dtype(kind))
+        return names[kind]
+
+    # An empty leaf is exact; `held` lays every other.
+    summaries, laid = [None] * len(references), set(held.laid)
+    for at, reference in enumerate(references):
+        if reference is not None and at not in laid:
+            summaries[at] = RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True,
+                                         dtype=dtype(reference))
+    read = [references[at] is not None for at in held.laid]
+    if not any(read):
+        return summaries
+    # A leaf of no reference lies as its truth, a zero error never read.
+    values = np.concatenate([np.zeros(0), *(
+        np.asarray(references[at], np.float64, order="C").reshape(-1) if ok else held.truths[at].reshape(-1)
+        for ok, at in zip(read, held.laid, strict=True))])
+    finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
+    errors = values - held.values
+    mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
+    rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
+    # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
+    counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
+                       [leaves for leaves, _, _ in held.runs])
+    starts = np.cumsum(counts) - counts
+    sized = held.sizes > 0
+    before = np.concatenate([[0], np.cumsum(sized)])
+    taken = before[starts + counts] - before[starts]
+    logs, over = log_over(rows[sized], held.sizes[sized]), _over(rows[sized], held.sizes[sized])
+    # The worst sized row of each leaf that has one: the largest of its run of the sized rows.
+    some = taken > 0
+    worst_log, worst = np.full(len(counts), LOG_ZERO), np.zeros(len(counts))
+    if some.any():
+        firsts = (np.cumsum(taken) - taken)[some]
+        worst_log[some] = np.maximum.reduceat(logs, firsts)
+        worst[some] = np.maximum.reduceat(over, firsts)
+    # The rows of float64 zero, each leaf's its span of them.
+    unsized = np.flatnonzero(~sized)
+    zero_rows = unsized - np.repeat(starts, counts - taken)
+    zero_errors, zero_sizes = rows[unsized], held.own[unsized]
+    ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
+    mse, worst, worst_log, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), (
+        finite & held.finite).tolist()
+    for index, at in enumerate(held.laid):
+        if read[index]:
+            span = slice(ends[index], ends[index + 1])
+            summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
+                                         finite=finite[index], dtype=dtype(references[at]),
+                                         zero_sizes=zero_sizes[span], worst_log=worst_log[index])
+    return summaries
+
+
+class UnpairedDraw(AssertionError):
+    """A check's draw or arm that depends on more than its seed or its inputs (`_of_its_seed`,
+    `_of_its_inputs`): randomness of its own, or state a call left, so its arms compare draws no seed
+    pairs."""
+
+
+def _same_bits(one, other) -> str | None:
+    """The first leaf path at which `one` and `other` differ in structure, shape or bits, or None."""
+    if jax.tree.structure(one) != jax.tree.structure(other):
+        return "its structure"
+    for (path, first), second in zip(jax.tree_util.tree_leaves_with_path(one), jax.tree.leaves(other),
+                                     strict=True):
+        if isinstance(first, RecordedLeaf) or not (hasattr(first, "shape")
+                                                    or isinstance(first, (int, float, complex, bool))):
+            # A recording's evidence (`RecordedLeaf`), read from its seed's rows: no values of its own.
+            continue
+        first, second = np.asarray(first), np.asarray(second)
+        if first.shape != second.shape or first.dtype != second.dtype or first.tobytes() != second.tobytes():
+            return jax.tree_util.keystr(path) or "its value"
+    return None
+
+
+def _of_its_seed(label: str, draw, seed, inputs) -> None:
+    """Raise unless `draw` gives `inputs` again at `seed`: a draw of a randomness its seed does not fix (a
+    global generator) gives each run of a site other inputs (ledger 2641)."""
+    if (where := _same_bits(inputs, draw(seed))) is not None:
+        raise UnpairedDraw(f"{label}: the draw at seed {seed} differs at {where} drawn again, so its seed "
+                           f"does not fix it")
+
+
+def _repeat_promised() -> bool:
+    """Whether a run promises its arms a bitwise repeat (docs/design/testing.md, check 1): on a CPU, or in
+    deterministic mode (`dew.devices.deterministic_ops_requested`). A GPU default that reduces with
+    atomics (a backward's dQ summed in arrival order) promises none."""
+    from dew.devices import deterministic_ops_requested
+
+    return jax.default_backend() == "cpu" or deterministic_ops_requested()
+
+
+def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
+    """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
+    draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
+    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842); the
+    CPU lane runs every check-1 site, so each arm is held to it there."""
+    if not _repeat_promised():
+        return
+    if (where := _same_bits(first, fn(*inputs))) is not None:
+        raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
+                           f"depends on more than them")
+
+
+def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
+    """An arm's evidence on a draw (`_evidence`) over two of its orders: each leaf's errors and rows of
+    float64 zero the first order's, its worst rows the worse of the two, its values finite at both."""
+    return [(one[0], one[1], float(np.fmax(one[2], other[2])), float(np.fmax(one[3], other[3])), one[4],
+             one[5] and other[5]) for one, other in zip(first, later, strict=True)]
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
-           library_fn=None, library_leaves: Sequence[str] = ()) -> _Draws:
+           library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
+           label: str = "", examples: bool = False):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -965,25 +1107,55 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     orders, measured rows of float64 zero included, and its values finite at every one; its errors and
     its rows of float64 zero are the draw's own order's. With `library_fn`, the library arm runs beside
     the reference on Dew's own inputs, held to Dew's truth, and the draws are judged against the larger
-    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once."""
-    if orders is not None and getattr(reference_fn, "recorded", False):
+    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
+    `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
+    truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
+    `terms_fn`, the truth is that program's evaluated op by op with each output's terms (`float64_terms`),
+    every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
+    terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
+    widened inputs."""
+    if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
-    arms = [reference_fn] + ([] if library_fn is None else [library_fn])
+    arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
     mine, theirs, worst, zero_rows, finite, names, widths = [], [[] for _ in arms], [[] for _ in arms], \
         [[] for _ in arms], [[] for _ in arms], None, None
+    # Each arm's per-example ratios of the draw being read, and of every draw read (`examples`).
+    stacked: list = [None for _ in arms]
+    stacked_rows: list = [None for _ in arms]
+    per_example: list[list] = [[] for _ in arms]
+    per_example_rows: list[list] = [[] for _ in arms]
 
     def truth_of(inputs):
         with jax.enable_x64(new_val=True):
             return (truth_fn or reference_fn)(*widened(inputs))
 
-    for at, seed in enumerate(seeds):
+    def truth_and_terms(inputs):
+        """The truth of `inputs` and, with `terms_fn`, its terms (else None)."""
+        if terms_fn is None:
+            return truth_of(inputs), None
+        if isinstance(terms_fn, _SiteTerms):
+            truth = truth_of(inputs)
+            with jax.enable_x64(new_val=True):
+                return truth, terms_fn.of(truth, *widened(inputs))
+        with jax.enable_x64(new_val=True):
+            return float64_terms(terms_fn, *widened(inputs))
+
+    def rows_at(at, seed):
+        """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
+        nonlocal names, widths
         inputs = draw(seed)
-        truth = truth_of(inputs)
+        if not at:
+            _of_its_seed(label, draw, seed, inputs)
+        # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own,
+        # on the programs the arms run (their scope, `summed_as_run`).
+        with summed_as_run():
+            _ynn_decided(label, [dew_fn, *arms], inputs)
+        truth, terms = truth_and_terms(inputs)
         if reference_seeds is None:
-            their_inputs, their_truth = inputs, truth
+            their_inputs, their_truth, their_terms = inputs, truth, terms
         else:
             their_inputs = draw(reference_seeds[at])
-            their_truth = truth_of(their_inputs)
+            their_truth, their_terms = truth_and_terms(their_inputs)
         if orders is None:
             ordered = [(inputs, their_inputs)]
         else:
@@ -991,72 +1163,194 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             if len(ordered) < 2:
                 raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
         rows = [None for _ in arms]
+        stacked[:] = [None for _ in arms]
+        stacked_rows[:] = [None for _ in arms]
         for mine_at, theirs_at in ordered:
-            dew = dew_fn(*mine_at)
+            # Each arm, and its replay on the same inputs, in the arithmetic arms run in (`summed_as_run`).
+            with summed_as_run():
+                dew = dew_fn(*mine_at)
+                if not at and mine_at is ordered[0][0]:
+                    _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
                                      for leaf in jax.tree.leaves(dew))
+            # Dew's side read once for every reference (`_prepared`).
+            prepared = _prepared(dew, truth, terms)
             for at_arm, arm in enumerate(arms):
                 # The reference against itself on the same inputs is one evaluation (`seeds_for`'s
                 # sizing); the library arm runs on Dew's own inputs.
-                here, true_here = (theirs_at, their_truth) if arm is reference_fn else (mine_at, truth)
-                other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                evidence = _evidence(dew, other, truth, true_here)
-                rows[at_arm] = evidence if rows[at_arm] is None else [
-                    (first[0], first[1], float(np.fmax(first[2], later[2])),
-                     float(np.fmax(first[3], later[3])), first[4], first[5] and later[5])
-                    for first, later in zip(rows[at_arm], evidence, strict=True)]
+                here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
+                                               else (mine_at, truth, terms))
+                with summed_as_run():
+                    other = dew if dew_fn is arm and here is mine_at else arm(*here)
+                    if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
+                        _of_its_inputs(label, "the reference", arm, here, other)
+                if examples and mine_at is ordered[0][0]:
+                    # The draw's own order's examples, paired where both arms hold the one truth.
+                    held_here = jax.device_get(other)
+                    stacked[at_arm], stacked_rows[at_arm] = (
+                        (_example_ratios(prepared.leaves, held_here, prepared.truths),
+                         _example_worst_rows(prepared.leaves, held_here, prepared.truths))
+                        if true_here is truth else ([None] * len(prepared.leaves),) * 2)
+                evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
+                                     their_terms=terms_here)
+                rows[at_arm] = evidence if rows[at_arm] is None else _over_orders(rows[at_arm], evidence)
+        return rows
+
+    for at, seed in enumerate(seeds):
+        rows = rows_at(at, seed)
         mine.append([entry[0] for entry in rows[0]])
         for at_arm, row in enumerate(rows):
             theirs[at_arm].append([entry[1] for entry in row])
             worst[at_arm].append([(entry[2], entry[3]) for entry in row])
             zero_rows[at_arm].append([entry[4] for entry in row])
             finite[at_arm].append([entry[5] for entry in row])
+            per_example[at_arm].append(stacked[at_arm])
+            per_example_rows[at_arm].append(stacked_rows[at_arm])
     drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
                     np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
-                    np.asarray(finite[at_arm]), widths) for at_arm in range(len(arms))]
-    return drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
+                    np.asarray(finite[at_arm]), widths, per_example[at_arm] if examples else None,
+                    per_example_rows[at_arm] if examples else None)
+             for at_arm in range(len(arms))]
+    first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
+    return [first, *drawn[len(arms) - len(also):]] if also else first
+
+
+def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
+    """Each leaf's per-example log RMS ratios of Dew (`leaves`) against the reference (`references`, a
+    tree of the truth's structure), a leaf's first axis its independent examples (`assert_as_exact`'s
+    `examples`): half the log of each example's mean squared error from its float64 truth over the
+    reference's, examples both arms hold exactly left out. None for a leaf of no axis, or where one arm is
+    exact on an example and the other is not."""
+    found: list[np.ndarray | None] = []
+    for leaf, reference, truth in zip(leaves, jax.tree.leaves(references), truths, strict=True):
+        truth = np.asarray(truth, np.float64)
+        if truth.ndim == 0 or isinstance(reference, RecordedLeaf):
+            found.append(None)
+            continue
+        axes = tuple(range(1, truth.ndim))
+        mine = np.mean(np.square(np.asarray(leaf, np.float64) - truth), axis=axes)
+        theirs = np.mean(np.square(np.asarray(reference, np.float64) - truth), axis=axes)
+        if np.any((mine > 0) != (theirs > 0)):
+            found.append(None)
+            continue
+        kept = mine > 0
+        found.append(0.5 * np.log(mine[kept] / theirs[kept]))
+    return found
+
+
+def _example_worst_rows(leaves, references, truths) -> list[np.ndarray | None]:
+    """Each leaf's per-example paired worst rows at a site that stacks examples (`assert_as_exact`'s
+    `examples`): on each example, the log of Dew's worst row's RMS error from float64 over its size, less
+    the reference's worst row's on the same example, its rows those of the leaf's last axis, sized by their
+    truth's RMS, rows under RESOLUTION of their example's size left out. None for a leaf under rank two (no
+    rows), or an example with no sized row."""
+    found: list[np.ndarray | None] = []
+    for leaf, reference, truth in zip(leaves, jax.tree.leaves(references), truths, strict=True):
+        truth = np.asarray(truth, np.float64)
+        if truth.ndim < 2 or isinstance(reference, RecordedLeaf):
+            found.append(None)
+            continue
+        width = truth.shape[-1]
+        rows = truth.reshape(truth.shape[0], -1, width)
+        sizes = np.stack([_scaled_rms(example) for example in rows])
+        sized = sizes > RESOLUTION * np.sqrt(np.mean(np.square(rows), axis=(1, 2)))[:, None]
+        if not sized.any(axis=1).all():
+            found.append(None)
+            continue
+        worst = []
+        for arm in (leaf, reference):
+            errors = (np.asarray(arm, np.float64) - truth).reshape(rows.shape)
+            logs = log_over(np.stack([_scaled_rms(example) for example in errors]),
+                            np.where(sized, sizes, 1.0))
+            worst.append(np.max(np.where(sized, logs, LOG_ZERO), axis=1))
+        found.append(worst[0] - worst[1])
+    return found
 
 
 def _leaf_paths(tree) -> list[str]:
     return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
-def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
-    """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths. The
-    trees are held alike first: Dew's, the reference's (a recorded one's leaves `RecordedLeaf`) and
-    both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
-    paired with another's truth or compared through broadcasting."""
+@dataclasses.dataclass(frozen=True)
+class _Prepared:
+    """Dew's side of a draw's evidence, read once for every reference (`_evidence`): its leaves and its
+    truth's on the host, their paths, the truth's laid rows and Dew's summaries against them."""
+    truth: object
+    paths: list
+    leaves: list
+    truths: list
+    held: object
+    mine: list
+
+
+def _term_leaves(terms, truth):
+    """A truth's terms tree (`float64_terms`) as its leaves on the host, one a leaf of `truth`, a leaf no
+    sum made None; or None. Read by the truth's own structure, so an output the truth holds as None (a
+    gradient of an input given as None) takes no leaf of the terms either."""
+    if terms is None:
+        return None
+    return jax.tree.structure(truth).flatten_up_to(jax.device_get(terms))
+
+
+def _prepared(dew, truth, terms=None) -> _Prepared:
+    """Dew's leaves and its truth's on the host in one transfer a tree, held alike (the same leaves at the
+    same paths, each the shape of its truth), the truth's rows laid once and Dew's summaries read against
+    them (`_summaries`)."""
+    dew, truth = jax.device_get((dew, truth))
     paths = _leaf_paths(truth)
-    for name, tree in (("dew", dew), ("the reference", reference), ("the reference's truth", their_truth)):
+    if _leaf_paths(dew) != paths:
+        raise AssertionError(f"dew's leaves are {_leaf_paths(dew)}, the truth's {paths}")
+    leaves, truths = jax.tree.leaves(dew), jax.tree.leaves(truth)
+    for path, leaf, true in zip(paths, leaves, truths, strict=True):
+        if np.shape(leaf) != np.shape(true):
+            raise AssertionError(f"{path}: dew's shape is {np.shape(leaf)}, the truth's {np.shape(true)}")
+    held = _LaidTruths.of(truths, _term_leaves(terms, truth))
+    return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held))
+
+
+def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None) -> list[tuple]:
+    """One draw's `_paired` evidence of every leaf of Dew (`prepared`, read once a draw) and `reference`
+    against their truths: the reference's leaves (a recorded one's `RecordedLeaf`) and its truth held to
+    Dew's truth's leaves, paths and shapes, so no leaf is paired with another's truth or compared through
+    broadcasting; its truth the same tree as Dew's where `shared`."""
+    reference = jax.device_get(reference)
+    their_truth = prepared.truth if shared else jax.device_get(their_truth)
+    paths, leaves, truths = prepared.paths, prepared.leaves, prepared.truths
+    for name, tree in (("the reference", reference), ("the reference's truth", their_truth)):
         if _leaf_paths(tree) != paths:
             raise AssertionError(f"{name}'s leaves are {_leaf_paths(tree)}, the truth's {paths}")
-    row = []
-    for (path, leaf), their_leaf, true, their_true in zip(jax.tree_util.tree_leaves_with_path(dew),
-                                                          jax.tree.leaves(reference), jax.tree.leaves(truth),
-                                                          jax.tree.leaves(their_truth), strict=True):
-        recorded = isinstance(their_leaf, RecordedLeaf)
-        shapes = {"dew": np.shape(leaf), "the reference's truth": np.shape(their_true)}
-        if not recorded:
+    references, their_truths = jax.tree.leaves(reference), jax.tree.leaves(their_truth)
+    recorded = [isinstance(their_leaf, RecordedLeaf) for their_leaf in references]
+    for path, their_leaf, true, their_true, was in zip(paths, references, truths, their_truths, recorded,
+                                                       strict=True):
+        shapes = {"the reference's truth": np.shape(their_true)}
+        if not was:
             shapes["the reference"] = np.shape(their_leaf)
         for name, shape in shapes.items():
             if shape != np.shape(true):
-                raise AssertionError(f"{jax.tree_util.keystr(path)}: {name}'s shape is {shape}, the truth's "
-                                     f"{np.shape(true)}")
-        their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
+                raise AssertionError(f"{path}: {name}'s shape is {shape}, the truth's {np.shape(true)}")
+    # The truths' rows are read once a draw, for both arms where the two truths are the same values.
+    same = all(their_true is true for their_true, true in zip(their_truths, truths, strict=True))
+    theirs = _summaries([None if was else leaf for leaf, was in zip(references, recorded, strict=True)],
+                        prepared.held if same else _LaidTruths.of(their_truths,
+                                                                   _term_leaves(their_terms, their_truth)))
+    row = []
+    for path, leaf, their_leaf, true, their_true, was, summary, their_summary in zip(
+            paths, leaves, references, truths, their_truths, recorded, prepared.mine, theirs, strict=True):
+        their = their_leaf if was else their_summary
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
             # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
-            assert kept == their.dtype, (jax.tree_util.keystr(path), kept, their.dtype)
+            assert kept == their.dtype, (path, kept, their.dtype)
             row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
-        paired = (recorded or their_truth is truth
-                  or np.array_equal(np.asarray(true), np.asarray(their_true)))
-        row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+        paired = was or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
+        row.append(_paired(path, summary, their, paired=paired))
     return row
 
 
@@ -1093,9 +1387,11 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
         if at_zero[at] < size:
-            worst = max(worst, float(_log_over(error, size)))
-            their_worst = max(their_worst, float(_log_over(at_zero[at], size)))
-        else:
+            worst = max(worst, float(log_over(error, size)))
+            their_worst = max(their_worst, float(log_over(at_zero[at], size)))
+        elif error or at_zero[at]:
+            # A row both arms hold exactly scales both pooled errors alike and passes on every seed: no
+            # evidence, not carried (a window's untouched embedding rows, 283k a draw at 2469's chunk sites).
             zero.append((at, error, at_zero[at]))
     rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
         zip(*zero, strict=True) if zero else ((), (), ()), (np.int64, np.float64, np.float64), strict=True))
@@ -1111,9 +1407,11 @@ def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL,
 
 
 def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
-               contained: bool = True) -> tuple[list[Finding], list[Finding]]:
+               contained: bool = True, typical: bool = False) -> tuple[list[Finding], list[Finding]]:
     """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY (`_status`), a row or
-    a value it fails, and each leaf its draws leave inconclusive."""
+    a value it fails, and each leaf its draws leave inconclusive; with `typical` (a final verdict), a
+    leaf its pooled ratio leaves inconclusive passed by its typical draw where that decides
+    (`_typical_status`)."""
     over, unresolved = [], []
     for index, name in enumerate(draws.names):
         leaf, count = label + name, len(draws.mine)
@@ -1134,22 +1432,37 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             status = _status(ratio, low, high, contained=contained)
             # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
             measure = (log_sum(a) - log_sum(b)) / 2
+            found = None
+            if status == "inconclusive" and contained and typical:
+                # The pooled ratio's sums unresolved: its draws' paired ratios pass it where they qualify.
+                found = _typical_status(a, b, tails, draws.of_examples(index), draws.scalar(index))
+                status = found[0]
             if status == "inconclusive":
                 unresolved.append(Finding(
                     leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
-                    f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the "
-                    f"site larger inputs or more seeds (`seeds_for`)"))
+                    f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}"
+                    + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s "
+                       f"[{found[2]:.3f}, {found[3]:.3f}]: {found[4]}")
+                    + "; give the site larger inputs or more seeds (`seeds_for`)"))
             elif status == "over":
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
-        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
-        if not my_row <= math.log(factor) + their_row:
+        paired = draws.of_example_rows(index) if contained else None
+        if paired is not None and (found_rows := _paired_rows(paired, factor)) < tails[0]:
+            # A site that stacks examples: each example's worst row against the reference's on it.
+            over.append(Finding(
+                leaf, "row", float(np.quantile(paired, 1 - tails[0])),
+                f"{leaf}: dew's worst row is past {factor} times the reference's on the same example on "
+                f"{int(np.sum(paired > math.log(factor)))} of {len(paired)} examples, the reference's past "
+                f"it on {int(np.sum(paired < -math.log(factor)))} (p {found_rows:.1e}; `_paired_rows`)"))
+        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
+        if paired is None and not my_row <= math.log(factor) + their_row:
             over.append(Finding(leaf, "row", my_row - their_row,
-                                f"{leaf}: the worst row over {count} seeds is {_shown(my_row)} from float64 "
-                                f"over its size, the reference's {_shown(their_row)}, allowed "
-                                f"{_shown(math.log(factor) + their_row)} ({factor} times it)"))
+                                f"{leaf}: the worst row over {count} seeds is {shown(my_row)} from float64 "
+                                f"over its size, the reference's {shown(their_row)}, allowed "
+                                f"{shown(math.log(factor) + their_row)} ({factor} times it)"))
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
         if zero:
             # The measure is the worst of them, the first the example.
@@ -1160,38 +1473,6 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                                 f"{count} seeds than ROW_FACTOR times the reference's own, row {at} by "
                                 f"{my_error:.3e} against {their_error:.3e} (`pooled_zero_rows`)"))
     return over, unresolved
-
-
-NARROW_FACTORS = {1: 90.0, 2: 11.0}
-"""The worst-row rule's factor at rows of one or two values, in place of ROW_FACTOR. At either width
-ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1 (1.5e-2 of
-runs at one value a row, 1.5e-3 at two): a row of few values is sized by a few float64 values, which sit
-near zero far more often than a wide row's RMS does, and the worst row over a site's rows and seeds is
-the row whose truth is smallest. Each factor sits above the 1 - 1e-4 quantile of the factor that would
-fail equally exact pairs at both stages, both arms on one truth (`tools/gate_null_runs.py --rows`, its
-`row_controls`, through `_staged` itself), at every layout measured, 16 to 4,096 rows a draw and 8 to 512
-declared seeds: that quantile is 40 to 53 at one value and 7 to 8 at two (10,000 to 600,000 runs a
-layout), so 90 and 11 stand about 1.7 and 1.4 times above it, at measured rates near 2e-5 and at most
-3.3e-5; 28,000 fresh runs at the 16-row and 256-row layouts bound them within LOWER_TAIL at 99.9% (at
-most 4.7e-4). Rows of three values keep ROW_FACTOR at a measured rate of at most 2.9e-4 over 16 to 2,048
-rows, a point rate, bounded within LOWER_TAIL at 256 rows and 8 seeds (80,000 runs) and not at 2,048. The
-rate is a leaf's: a site of L narrow leaves may fail an equally exact Dew L times as often.
-
-The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
-times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
-judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
-that stage exists to judge on real findings. Check 2 (tests/certified.py `assert_certified`) holds
-each element within its own operation's certified bound where a site runs it, which resolves such an
-error at a pointwise step or a short sum: a sum of n terms is held within γ_n Σ|terms|, about n·u
-Σ|terms| for u the unit roundoff, of its exact value, so its reach in units of the sum's own last place grows
-with n and with the sum's cancellation (for standard normal terms, the smallest error it flagged in a
-review's measurement, the median over 200 sums, was 37 units in the sum's last place at 16 terms, 918 at
-128 and 22,966 at 1,024): past a few dozen terms of that kind an error in this window passes both checks
-wherever the pooled ratio does not see it."""
-
-
-PREVIOUS_TAILS = (5e-4, 5e-4)
-"""The interval's tails before check 1's two stages (`_staged`'s `two_stage=False`)."""
 
 
 def _staged(drawn, seeds: int, label: str, *,
@@ -1211,7 +1492,9 @@ def _staged(drawn, seeds: int, label: str, *,
                       for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
-    return (*_judgement(draws, label, tails, contained=two_stage), 2 if further else 1)
+    # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
+    # their typical draw (`_judgement`'s `typical`).
+    return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
@@ -1220,7 +1503,7 @@ leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a tra
 stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
     import json
     import os
 
@@ -1229,12 +1512,131 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
                                   "label": label, "stage": stage, "verdict": verdict,
-                                  "narrow_leaves": narrow_leaves}) + "\n")
+                                  "narrow_leaves": narrow_leaves, "ynn": ynn}) + "\n")
+
+
+@dataclasses.dataclass(frozen=True)
+class _SiteTerms:
+    """A site's own program of its truth's terms (`assert_as_exact`'s `terms`): `fn` on a draw's inputs
+    widened to float64, the truth's tree of each entry's terms as `float64_terms` sizes them."""
+
+    fn: Callable
+
+    def of(self, truth, *inputs):
+        """The terms of `truth`, the draw's at `inputs`, held to its leaves, paths and shapes."""
+        terms = jax.device_get(self.fn(*inputs))
+        if _leaf_paths(terms) != _leaf_paths(truth):
+            raise ValueError(f"the site's terms are {_leaf_paths(terms)}, the truth's {_leaf_paths(truth)}")
+        for path, term, true in zip(_leaf_paths(truth), jax.tree.leaves(terms), jax.tree.leaves(truth),
+                                    strict=True):
+            if np.shape(term) != np.shape(true):
+                raise ValueError(f"{path}: the site's terms' shape is {np.shape(term)}, the truth's "
+                                 f"{np.shape(true)}")
+        return terms
+
+
+def _cancelling_terms(draw, truth, program=None):
+    """The truth program a site's rows are sized by their terms with (`assert_as_exact`'s `terms`), where
+    its truth holds a row of float64 zero (below RESOLUTION of its leaf) on its first draw, decided from the
+    truth alone before any arm runs (bible §7, ledger 2851): a row whose truth is exactly zero or cancels is
+    judged at the size of what it sums, as the one-draw rule judges it, not held to the reference's residue
+    there (a fused attention's causal first row, whose one key makes its gradient exactly zero in float64,
+    its rounding's residue Dew's and the reference's alike). None where no row is zero, or where the
+    truth is not a JAX program its terms can be traced from (run as given, recorded, a window loop's).
+    `program`, the truth as the draws run it (`_truth_program`), evaluates the first draw's truth, so its
+    first call's run and trace serve the draws too, once a process: a map task's draws (DRAWS) each pay it
+    once, not twice."""
+    if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
+        return None
+    # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
+    # terms are not zero too gains a size, so a site whose zero rows sum nothing (a query that keeps no key)
+    # keeps the reference's residue rule without tracing its terms a draw. A truth whose program cannot be
+    # run or traced so (host work on its values, NumPy or torch; a kernel that refuses float64) has no
+    # terms: it keeps the residue rule and runs as it always has, the gate's own run of it reporting any
+    # failure of its own.
+    try:
+        with jax.enable_x64(new_val=True):
+            leaves = [np.asarray(leaf) for leaf in jax.tree.leaves((program or truth)(*widened(draw(0))))]
+            if not np.any(_LaidTruths.of(leaves).sizes == 0):
+                return None
+            truths, terms = float64_terms(truth, *widened(draw(0)))
+    except Exception as untraced:
+        found = f"untraced: {type(untraced).__name__}"
+    else:
+        plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
+            jax.tree.leaves(truths), _term_leaves(terms, truths))
+        found = bool(np.any((plain.sizes == 0) & (termed.sizes > 0)))
+    return truth if found is True else None
+
+
+def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
+          also, terms):
+    """A check 1 site's arguments held to what it may ask (`assert_as_exact`): its term program, the
+    traced truth (refused run as given or recorded), and its further references; refused below
+    `FEWEST_SEEDS`, or with a library arm not named by its row and leaves."""
+    terms_fn = None
+    if callable(terms):
+        terms_fn = _SiteTerms(terms)
+    elif terms:
+        terms_fn = truth_fn if truth_fn is not None else reference_fn
+        terms_fn = terms_fn.fn if isinstance(terms_fn, _Windowed) else terms_fn
+        if _given(terms_fn) or getattr(terms_fn, "recorded", False):
+            raise ValueError(f"{label}: term sizing traces the truth program; a truth run as given or "
+                             f"recorded has no terms")
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
+                                    f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                                    f"(`seeds_for`)")])
+    if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
+        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
+                         f"the leaves it covers")
+    return terms_fn, dict(also or {})
+
+
+def _recorded(label: str, drawn_for, references: int, arms) -> bool:
+    """A map task's draws (`record_units`): each of a site's `references` draws over its range, with its
+    arms' YNNPACK mode (`_mode_of`). False where the process is no map task."""
+    return record_units(label, lambda start, stop: {
+        "draws": [drawn_for(index)(start, stop) for index in range(references)], "refused": _mode_of(arms)})
+
+
+def _pooled_draws(label: str, references: int, arms):
+    """A judge's draws (`pooled_units`): `drawn_for(index)` over its map tasks' records of this site,
+    `drawn(start, stop)` the pooled draws of those seeds, refused past the seeds the records hold from seed
+    0 on; the site's arms take the mode the map tasks ran them in, which must be one. None where the
+    process is no judge."""
+    pieces = pooled_units(label)
+    if pieces is None:
+        return None
+    held = pieces[-1][1]
+    modes = {payload["refused"] for _, _, payload in pieces}
+    if len(modes) > 1:
+        raise PoolRefused(f"{label}: the map tasks ran the arms in different modes: "
+                          f"{sorted(map(str, modes))}", held)
+    refused = modes.pop()
+    pairings = {arm.pairing for arm in _paired_arms(arms)}
+    for pairing in pairings:
+        pairing.decided, pairing.refused = True, refused
+    if pairings and refused is not None:
+        SWITCHED.append({"label": label, "refused": refused})
+    pooled = [functools.reduce(_Draws.joined, (payload["draws"][index] for _, _, payload in pieces))
+              for index in range(references)]
+
+    def drawn_for(index: int):
+        def drawn(start, stop):
+            if stop > held:
+                raise PoolRefused(f"{label}: its stage draws seeds {start} to {stop}; the map tasks drew 0 "
+                                  f"to {held} ({DRAWS} covers 0 to (1 + REDRAW) times the declared seeds)",
+                                  held)
+            return pooled[index].between(start, stop)
+        return drawn
+    return drawn_for
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
-                    library_leaves: Sequence[str] = ()) -> None:
+                    library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
+                    terms: bool | Callable | None = None, examples: bool = False) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1283,35 +1685,104 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (`library_leaves`, by their paths; `_Draws.against_larger`). Every other leaf, and every other rule,
     is as above; a site without it is judged against the reference alone.
 
+    `also` names further references Dew is held to on the same draws, each judged by its own check 1
+    as the reference is (its label `label`, against its name), Dew and the truth evaluated once a draw
+    for them all (`_drawn`): one Dew arm against several references, the truth as above. Each compiles
+    paired with Dew's arm (`_arms`), and a plain Dew arm,
+    whose compilation its pairing decides, takes references of one kind, plain or `as_given`.
+
+    `examples` declares that every leaf's first axis stacks independent examples, each its own draw of the
+    site's geometry: a leaf its pooled ratio leaves inconclusive is then judged by its examples' paired
+    ratios (`_typical_status`: each draw's statistic its examples' median, and their tail about it).
+
+    `terms` sizes each row by the larger of its float64 truth's RMS and its terms' (owner, 10-29); by
+    default (None) a site whose truth holds a row of float64 zero on its first draw is sized so
+    (`_cancelling_terms`, ledger 2851), False never: the
+    truth program, `truth_fn` or the reference's, evaluated op by op with each output's terms
+    (`float64_terms`), as the one-draw rule sizes a row that cancels (`row_errors`). A row whose truth
+    cancels, exactly or but for one term holding most of its weight (an attention row that keeps one key),
+    is judged at the size of what it sums by the row rule, every arm alike, not by the reference's own
+    distance there; a row whose terms are zero too (a query that keeps no key) has no size and stays held
+    to the reference's distance, exactly zero where the reference is. Every other row, and every leaf's
+    pooled ratio, as without. The truth program is traced, so it is JAX's: a truth run as given has no
+    terms and is refused. The traced terms are those of each leaf's final sums alone, so a row whose
+    cancellation sits behind its final sum has none there: an attention gradient's query that keeps one
+    key, whose logit gradient P (dP - delta) is zero in float64, sums zero terms into dQ. Such a site
+    passes its own terms program as `terms` instead: a function of the draw's inputs widened to float64
+    returning the truth's tree of each entry's terms (`float64_terms`' sizes), carried through that
+    cancellation (tests/attention_oracle.py's `attention_terms`), every arm sized by it alike; the truth
+    is as without, so it may run as given.
+
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
-    if seeds < FEWEST_SEEDS:
-        raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
-                                    f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
-                                    f"(`seeds_for`)")])
+    terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
+                           library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
+    truth_program = _truth_program(truth_fn)
+    terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
+                           truth_program)
     narrow_leaves: list[str] = []
-    if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
-        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
-                         f"the leaves it covers")
-    _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]))
-    dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
+    _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
+                       *also.values())
+    dew_fn, reference_fn, further = compiled
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
-    truth_fn = _truth_program(truth_fn)
+    truth_fn = truth_program
+    # Each range's draws, every reference's, computed once for the stages of them all.
+    ranges: dict[tuple[int, int], list[_Draws]] = {}
 
-    def drawn(start, stop):
-        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
-                       library_fn=library_fn, library_leaves=library_leaves)
-        narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
-                            if width in NARROW_FACTORS]
-        return draws
+    def drawn_for(index: int):
+        def drawn(start, stop):
+            assert not judging(), f"{label}: a judge draws nothing of its own, its draws are its pool's"
+            if (start, stop) not in ranges:
+                draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
+                               library_fn=library_fn, library_leaves=library_leaves, also=further,
+                               terms_fn=terms_fn, label=label, examples=examples)
+                ranges[start, stop] = draws if further else [draws]
+                narrow_leaves[:] = _narrow(ranges[start, stop][0])
+            return ranges[start, stop][index]
+        return drawn
 
-    over, unresolved, stage = _staged(drawn, seeds, label)
-    _logged(label, stage, _verdict(over, unresolved), narrow_leaves)
-    if over:
-        raise GateFailure(over + unresolved)
-    if unresolved:
-        raise Inconclusive(unresolved)
+    arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
+    # A map task of the site's draws, or their judge (DRAWS, POOL).
+    if _recorded(label, drawn_for, 1 + len(further), arms):
+        return
+    pooled = _pooled_draws(label, 1 + len(further), arms)
+    if pooled is not None:
+        drawn_for = pooled
+        narrow_leaves[:] = _narrow(drawn_for(0)(0, 1))
+    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves, arms)
+
+
+def _site_terms(terms_fn, terms, draw, truth, truth_program):
+    """The site's terms program: `terms_fn`, the site's own, or by default (`terms` None) one sized from
+    `truth` where its first draw holds a row of float64 zero (`_cancelling_terms`); none where `terms` is
+    False, or in a judge, whose draws are its map tasks' records, each row sized by the terms its task
+    found (`map_judge.judging`): no truth runs there."""
+    if terms_fn is not None or terms is False or judging():
+        return terms_fn
+    return _cancelling_terms(draw, truth, truth_program if isinstance(truth_program, _Truth) else None)
+
+
+def _narrow(draws: _Draws) -> list[str]:
+    """The leaves of rows of one or two values (NARROW_FACTORS)."""
+    return [name for name, width in zip(draws.names, draws.widths, strict=True) if width in NARROW_FACTORS]
+
+
+def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str], arms) -> None:
+    """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
+    `index`, judged under `labels[index]`), each logged (STAGES_LOG); a GateFailure where any leaf is
+    over, else an Inconclusive where any is left unresolved."""
+    overs, unresolveds = [], []
+    for index, named in enumerate(labels):
+        over, unresolved, stage = _staged(drawn_for(index), seeds, named)
+        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms))
+        overs += over
+        unresolveds += unresolved
+    if overs:
+        raise GateFailure(_with_mode(overs + unresolveds, arms))
+    if unresolveds:
+        raise Inconclusive(_with_mode(unresolveds, arms))
 
 
 def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
@@ -1358,11 +1829,11 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     _refuse_numpy_arms(draw, changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
     truth_fn = _truth_program(truth_fn)
-    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
+    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
         further = range(seeds, (1 + REDRAW) * seeds)
-        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn))
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label))
         moved, kept, unresolved = _moved(draws, 2)
     if not moved:
         found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
@@ -1384,8 +1855,8 @@ takes larger inputs or fewer shared factors, not more seeds."""
 
 def recorded_pilots(reference_fn, draw, count: int):
     """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
-    from SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth
-    from the same inputs: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
+    from SIZING_FROM on, disjoint from every verdict's seeds, the reference and its truth recorded on the
+    inputs Dew's arm takes live: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
     own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
     recording that does not hold them all is refused here, not at the doubling that reaches one."""
     if not getattr(reference_fn, "recorded", False):
@@ -1403,7 +1874,7 @@ def recorded_pilots(reference_fn, draw, count: int):
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
-              truth_fn=None, dew_fn=None) -> int:
+              truth_fn=None, dew_fn=None, orders=None, examples: bool = False) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -1422,15 +1893,18 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first. A recorded reference
     (`indexed_recording`), which holds its recorded seeds alone, is refused, its site keeping its
-    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, recorded
-    with Dew's arm and the truth (`recorded_pilots`): its paired sizing then takes those pilots alone,
+    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, the
+    reference and its truth on the inputs Dew's arm takes live (`recorded_pilots`, or a summarized
+    recording's pilots, `indexed_recording`): its paired sizing then takes those pilots alone,
     up to as many as are held. Fails past `most`, where the site needs larger inputs or fewer shared
     factors, not more seeds.
 
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
     predecessor's and the seeds it adds, twice the count of them with the confirming block, the
     reference compared with itself takes its seeds 0 to four times the count (each block's first half
-    against its second), and the reference on the same inputs runs once."""
+    against its second), and the reference on the same inputs runs once. `orders` sizes a site whose
+    verdict sweeps them (`assert_as_exact`'s `orders`): each seed's evidence is its draw's over every
+    order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         pilots = getattr(reference_fn, "pilots", None)
         if pilots is None:
@@ -1451,42 +1925,57 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         held = 0 if drawn is None else len(drawn.theirs)
         block = 2 * count if dew_fn is None else count
         fresh = _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + held, first + 2 * block),
-                       truth_fn)
+                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None)
         drawn = fresh if drawn is None else drawn.joined(fresh)
         wide = _confirmed(drawn.names, drawn.theirs, count, None if dew_fn is None else drawn.mine)
         if not wide:
             return count
         count *= 2
+    if dew_fn is not None:
+        # The leaves the pooled ratio does not size within `most`, its draws ruled by their largest (each arm
+        # rounding apart, ledger 2469), sized by their typical draw on the draws already held, every other
+        # leaf by its pooled ratio as before: the first count at which each is.
+        stubborn, count = tuple(wide), max(start, FEWEST_SEEDS)
+        while count <= most:
+            wide = _confirmed(drawn.names, drawn.theirs, count, drawn.mine, typical=stubborn,
+                              examples=drawn.examples, scalars=[drawn.scalar(index)
+                                                                for index in range(len(drawn.names))])
+            if not wide:
+                return count
+            count *= 2
     compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
     raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
                          f"give the site larger inputs or fewer shared factors")
 
 
-def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None) -> list[str]:
+def _leaf_examples(examples: list, start: int, count: int, index: int) -> list[np.ndarray] | None:
+    """Leaf `index`'s per-example log ratios over seeds `start` to `start + count` of a sizing's draws
+    (`_Draws.examples`), or None where a seed's are not paired."""
+    found = [seed[index] for seed in examples[start:start + count]]
+    return None if any(ratios is None for ratios in found) else found
+
+
+def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None,
+               typical: tuple = (), examples: list | None = None, scalars: Sequence[bool] = ()) -> list[str]:
     """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
     next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
     `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
-    the reference compared with itself (`_unresolved_against_itself`, each block twice the count)."""
+    the reference compared with itself (`_unresolved_against_itself`, each block twice the count); the
+    leaves named in `typical` sized by their typical draw too (`_sized`), `scalars` saying which leaves hold
+    one value an example."""
     wide: list[str] = []
     for start in (0, count) if mine is not None else (0, 2 * count):
         if mine is not None:
             held, ours = theirs[start:start + count], mine[start:start + count]
             unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
-                          and not _resolves(*_interval(ours[:, index], held[:, index]))]
+                          and not _sized(ours[:, index], held[:, index], name in typical,
+                                         None if examples is None else _leaf_examples(examples, start, count,
+                                                                                      index),
+                                         bool(scalars) and scalars[index])]
         else:
             unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
         wide += [name for name in unresolved if name not in wide]
     return wide
-
-
-def _unresolved_against_itself(errors: np.ndarray, names, count: int) -> list[str]:
-    """The leaves the reference compared with itself does not resolve at `count` seeds: `errors`, its
-    squared errors a seed (rows) and a leaf (columns), on seeds 0 to `count` against `count` to twice
-    it (`_interval`'s control); a leaf with no error on either half is resolved."""
-    halves = errors[:count], errors[count:2 * count]
-    return [name for index, name in enumerate(names)
-            if np.sum(halves[0][:, index]) > 0 and np.sum(halves[1][:, index]) > 0
-            and not _resolves(*_interval(halves[0][:, index], control=halves[1][:, index]))]
 
 
 def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWEST_SEEDS,
@@ -1560,12 +2049,6 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     return verdicts
 
 
-def _verdict(over: list[Finding], unresolved: list[Finding]) -> str:
-    """A judgement's verdict: "over" where any leaf failed, else "inconclusive" where any is unresolved,
-    else "pass"."""
-    return "over" if over else "inconclusive" if unresolved else "pass"
-
-
 def null_rate_bound(reds: int, runs: int, confidence: float = CONFIDENCE) -> float:
     """The one-sided Clopper-Pearson upper bound on a false-red rate at `confidence` after `reds` red
     runs of `runs`: 1 - (1 - confidence)^(1/runs) at none, so 0 of 1,400 bounds it at 0.49%."""
@@ -1595,7 +2078,30 @@ def input_digest(inputs) -> np.uint64:
     return np.frombuffer(digest.digest()[:8], np.uint64)[0]
 
 
-def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None):
+LEAF_ENTRIES = ("reference", "truth", "mse", "worst", "finite", "sketch", "zero_rows", "zero_errors",
+                "zero_offsets", "shape", "dtype")
+"""The kinds of a recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's
+`<site>.pilot.<kind>.<leaf>`): a full recording's outputs and truths, a summarized one's evidence and
+sketches. Every other entry (inputs, digests, counts, provenance) is the whole recording's."""
+
+
+def _of_leaves(stored, site: str, leaves) -> dict:
+    """`stored` with the entries of `leaves` alone of those kept one a leaf (LEAF_ENTRIES), verdict and
+    pilot alike, and every entry the whole recording shares; a leaf the recording lacks is refused."""
+    wanted, found, kept = set(leaves), set(), {}
+    for key, value in stored.items():
+        kind, _, name = key.removeprefix(f"{site}.").removeprefix("pilot.").partition(".")
+        if key.startswith(f"{site}.") and kind in LEAF_ENTRIES and name:
+            if name not in wanted:
+                continue
+            found.add(name)
+        kept[key] = value
+    if wanted - found:
+        raise ValueError(f"{site}: the recording holds no leaves {sorted(wanted - found)}")
+    return kept
+
+
+def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None, leaves=None):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
     `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
@@ -1620,7 +2126,16 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     check 1 never judges Dew against its own float64 path where that path is not the reference's, as
     far as a wrong truth's move is independent of the sketch's signs (SKETCH). A seed whose recomputed
     truth has a row of float64 zero the recording's had not is refused. Its reference and truth are
-    host functions, called as check 1 calls them, not traced."""
+    host functions, called as check 1 calls them, not traced. Where it holds pilots (`<site>.pilot.`,
+    `merge_shards`), seeds from SIZING_FROM on read them, and its reference carries them
+    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`).
+
+    With `leaves`, the recording is read for those leaves alone (`_of_leaves`): a site whose leaves are
+    judged in groups, each its own test, reads each group so, its Dew arm and truth giving that group's
+    leaves. Check 1 judges every leaf on its own tails, so a group draws its second stage on its own
+    leaves' account alone, which looks at a passing leaf no more often than the whole site would."""
+    if leaves is not None:
+        stored = _of_leaves(stored, site, leaves)
     if any(name.startswith(f"{site}.sketch.") for name in stored):
         return _summarized(stored, site, seeds, inputs_of, truth_fn)
 
@@ -1678,15 +2193,18 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "shape", "dtype")
-    mse, worst, finite, sketch, zero_rows, zero_errors, zero_offsets, shapes, dtypes = (
-        tree(kind) for kind in kinds)
+    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets")
+    verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
+    mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
+                                                ("mse", "worst", "finite", "sketch", "zero_offsets"))
+    shapes, dtypes = tree("shape"), tree("dtype")
     if truth_fn is None or inputs_of is None:
         raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
                              f"Dew's float64 path, and `inputs_of`, its inputs drawn again")
     if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
         raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}")
     digests = stored[f"{site}.input_digest"]
+    pilots = len(stored.get(f"{site}.pilot.input_digest", ()))
     count = min([len(value) for part in (mse, worst, finite, sketch) for value in part.values()]
                 + [len(value) - 1 for value in zero_offsets.values()])
     if min(count, len(digests)) < (1 + REDRAW) * seeds:
@@ -1694,25 +2212,38 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
                              f"may draw {(1 + REDRAW) * seeds}")
     roundings = {}
 
+    def held(seed):
+        """`seed`'s evidence, its input digests and its row in them: a verdict seed's, or a pilot's."""
+        if seed < SIZING_FROM:
+            return verdict, digests, seed
+        if seed >= SIZING_FROM + pilots:
+            raise AssertionError(f"{site}: seed {seed} is past the recording's {pilots} pilots from "
+                                 f"SIZING_FROM")
+        return pilot, stored[f"{site}.pilot.input_digest"], seed - SIZING_FROM
+
     def draw(seed):
         drawn = inputs_of(seed)
-        if input_digest(drawn) != digests[seed]:
+        _, recorded, row = held(seed)
+        if input_digest(drawn) != recorded[row]:
             raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
                                  f"digest differs); the generator's draw changed since the recording")
         return np.int32(seed), drawn
 
     def reference(index, inputs):
-        index = int(index)
+        evidence, _, row = held(int(index))
 
         def leaf(name):
-            start, stop = zero_offsets[name][index], zero_offsets[name][index + 1]
-            return RecordedLeaf(float(mse[name][index]), float(worst[name][index]),
-                                zero_rows[name][start:stop], zero_errors[name][start:stop],
-                                finite=bool(finite[name][index]), dtype=str(dtypes[name]))
+            start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
+            return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
+                                evidence["zero_rows"][name][start:stop],
+                                evidence["zero_errors"][name][start:stop],
+                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]))
 
         return {name: leaf(name) for name in mse}
 
     reference.recorded = True
+    if pilots:
+        reference.pilots = range(SIZING_FROM, SIZING_FROM + pilots)
 
     # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
     live = _truth_program(truth_fn)
@@ -1734,7 +2265,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
             if value.shape != tuple(shapes[name].tolist()):
                 raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
                                      f"recorded reference's {tuple(shapes[name].tolist())}")
-            recorded = sketch[name][index]
+            evidence, _, row = held(index)
+            recorded = evidence["sketch"][name][row]
             if not np.isfinite(value).all():
                 raise AssertionError(f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not "
                                      f"finite")
@@ -1763,304 +2295,6 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     return draw, reference, truth
 
 
-def assert_no_less_exact(dew, reference, truth, label: str) -> None:
-    """An unchanged computation has no larger float64 distance than its source."""
-    mine, theirs = distance(dew, truth), distance(reference, truth)
-    assert within(mine, theirs), (
-        f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
-
-
-def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
-                           rows: bool = True) -> None:
-    """Each leaf of the tree `dew` within FACTOR times the matching leaf of
-    `reference`'s RMS distance from float64 (`truth`), the three trees alike.
-
-    A port that sums `reductions` terms the reference sums in another order
-    rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
-    so the reference's distance counts as at least that: one draw of
-    rounding below it is luck, not a bar, and a leaf that lost a term still
-    fails by orders of magnitude. What a leaf sums is its own float64 size,
-    or, where `terms` gives the tree of each leaf's terms (`float64_terms`),
-    the larger of that and their root sum of squares, the size of the
-    partial sums a reordered sum rounds. A leaf whose sum cancels, as a key
-    bias's gradient does under the softmax's shift invariance, is held to
-    its terms' rounding, not to its own near-zero size; one whose terms'
-    signs are independent keeps about its own. Each leaf's rows are held to
-    the reference's too (`rows_over`), unless `rows` is false: after a
-    second training step a row inherits the first step's rounding through
-    the parameters it reads, which its own terms do not see, so such a
-    comparison holds each tensor alone and its first step holds the rows."""
-    unit = float(np.finfo(np.float32).eps)
-    spread = np.sqrt(reductions)
-    sizes = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
-    over = []
-    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
-                 sizes, strict=True)
-    for (path, mine), theirs, true, summed in leaves:
-        scale = max(distance(true, 0), distance(summed, 0))
-        bar = FACTOR * max(distance(theirs, true), spread * unit * scale)
-        if not within(distance(mine, true), bar):
-            over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
-                        f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
-        # Each row over its own terms where they are given, the order floor in those units.
-        over += [f"{jax.tree_util.keystr(path)}: {message}"
-                 for _, _, message in (rows_over(mine, theirs, true, None if terms is None else summed,
-                                                 spread * unit) if rows else ())]
-    assert not over, "\n".join(over)
-
-
-SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
-                  "scatter-add"})
-"""The operations that sum terms: a leaf's terms are those its own sums add,
-taken at their float64 values (`float64_terms`). A ragged dot, an expert
-layer's grouped matmul, sums as a dot does within each group, and its
-transpose, which the kernel's gradient runs, is one too."""
-
-CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
-                     "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
-                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier",
-                     "name", "psum", "psum_invariant", "reduce_scatter", "all_gather", "all_gather_invariant",
-                     "all_to_all", "ppermute", "pvary"})
-"""The operations that carry the terms of sums into a leaf without making
-new ones: sums combined (tied weights, accumulated microbatches, an update
-added to a parameter, devices' partials) and moved, by a remat name
-(`checkpoint_name`) or a collective too.
-A product or quotient of a sum by a value that is none carries them too,
-scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
-`s_i x_ik`; a product of two sums ends them."""
-
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
-                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
-"""The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A
-shard_map's per-device program is too, on each device's blocks (`_mapped`).
-A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
-their own size."""
-
-
-def float64_forward(module, variables, *args, **kwargs):
-    """`module`'s own forward of `args` in float64, and each output's terms
-    (`float64_terms`): the module computing in float64 over its variables
-    widened, integer inputs as they are, `kwargs` given as they are. A
-    reference's float64 truth written elsewhere (a fixture's) is sized by
-    these terms, what Dew's own float64 sums add."""
-    with jax.enable_x64(new_val=True):
-        wide = module.clone(dtype=jnp.float64)
-        return float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
-                             *widened((variables, *args)))
-
-
-def float64_terms(fn, *args):
-    """`fn(*args)` evaluated op by op, as float64 as `args` are, and the tree of
-    each output leaf's terms, alike: the root sum of squares of the terms its
-    final sums add (`SUMS`), at their operands' values, carried into the leaf
-    (`CARRIES`). That is the size of the sum's partial sums, which its
-    rounding scales with in any order: about the leaf's own size where the
-    terms' signs are independent, far above it where they cancel by design
-    (a softmax's shift invariance). A leaf made by any other operation is
-    its own size, and an input carries no terms, so a parameter's terms
-    after an update are the update's. Nothing propagates through the layers
-    behind a sum, which would bound the whole computation."""
-    closed = jax.make_jaxpr(fn)(*args)
-    values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
-    tree = jax.tree.structure(jax.eval_shape(fn, *args))
-    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
-                                                   for energy, value in zip(energies, values, strict=True)])
-
-
-def _evaluated(jaxpr, consts, args, given=None):
-    """`jaxpr`'s outputs and their terms' energies, the sums of their squares
-    (`float64_terms`), from `args` and the energies `given` for them (none for
-    a computation's own inputs). A value no sum made has none."""
-    from jax.extend.core import Literal
-
-    wanted = _carrying(jaxpr)
-    values, energies = {}, {}
-    for var, value, energy in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
-                                  [None] * len(consts) + list(given or [None] * len(args)), strict=True):
-        values[var], energies[var] = value, energy
-
-    def read(var):
-        return var.val if isinstance(var, Literal) else values[var]
-
-    def energy(var):
-        return None if isinstance(var, Literal) else energies.get(var)
-
-    # Each value and energy goes once its last reader has run, as an execution
-    # frees it: a chunked scan's float64 intermediates would otherwise all stay.
-    last = {var: index for index, equation in enumerate(jaxpr.eqns)
-            for var in equation.invars if not isinstance(var, Literal)}
-    for var in jaxpr.outvars:
-        if not isinstance(var, Literal):
-            last.pop(var, None)
-    for index, equation in enumerate(jaxpr.eqns):
-        inputs = [read(var) for var in equation.invars]
-        with equation.ctx.manager:
-            outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
-                                     any(var in wanted for var in equation.outvars))
-        for var in equation.invars:
-            if not isinstance(var, Literal) and last.get(var) == index:
-                values.pop(var, None)
-                energies.pop(var, None)
-        for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
-            values[var], energies[var] = value, made_energy
-    return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
-
-
-def _carrying(jaxpr) -> set:
-    """The variables whose terms reach an output of `jaxpr`."""
-    from jax.extend.core import Var
-
-    wanted = {var for var in jaxpr.outvars if isinstance(var, Var)}
-    for equation in reversed(jaxpr.eqns):
-        if any(var in wanted for var in equation.outvars):
-            wanted.update(equation.invars[index] for index in _carried(equation)
-                          if isinstance(equation.invars[index], Var))
-    return wanted
-
-
-def _real(var) -> bool:
-    return jnp.issubdtype(var.aval.dtype, jnp.floating)
-
-
-def _carried(equation) -> list[int]:
-    """The operands whose terms `equation` carries to its outputs: real floats
-    alone, as a complex value's terms have no order to sum in."""
-    name, operands = equation.primitive.name, equation.invars
-    if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
-        return []
-    floats = [index for index, var in enumerate(operands) if _real(var)]
-    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond", "shard_map"):
-        return floats
-    if name == "reduce_sum":
-        # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
-        return floats if all(operands[0].aval.shape[axis] == 1 for axis in equation.params["axes"]) else []
-    if name in ("mul", "div"):
-        return floats
-    return []
-
-
-def _body(equation):
-    """The jaxpr and constants a call runs (`CALLS`), or None."""
-    if equation.primitive.name not in CALLS:
-        return None
-    for name in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
-        body = equation.params.get(name)
-        if body is not None:
-            return (body.jaxpr, body.consts) if hasattr(body, "consts") else (body, [])
-    return None
-
-
-def _squared(value):
-    return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
-
-
-def _applied(equation, inputs, given, wanted: bool):
-    """`equation`'s outputs from `inputs`, and their energies where `wanted`."""
-    name, params = equation.primitive.name, equation.params
-    body = _body(equation)
-    if wanted and body is not None:
-        return _evaluated(*body, inputs, given)
-    if wanted and name == "scan":
-        return _scanned(params, inputs, given)
-    if wanted and name == "while":
-        return _looped(params, inputs, given)
-    if wanted and name == "shard_map":
-        return _mapped(params, inputs, given)
-    if wanted and name == "cond":
-        branch = params["branches"][int(inputs[0])]
-        return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:])
-    outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
-    outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
-    if not wanted:
-        return outputs, [None] * len(outputs)
-    carried = _carried(equation)
-    if name in SUMS and not carried and all(_real(var) for var in equation.outvars):
-        squares = [_squared(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
-                   else value for var, value in zip(equation.invars, inputs, strict=True)]
-        return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
-    if not carried:
-        return outputs, [None] * len(outputs)
-    if name in ("mul", "div"):
-        summed = [index for index in carried if given[index] is not None]
-        if len(summed) != 1 or (name == "div" and summed != [0]):
-            return outputs, [None] * len(outputs)
-        (index,) = summed
-        scale = jnp.square(jnp.abs(inputs[1 - index]))
-        return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
-    if all(given[index] is None for index in carried):
-        return outputs, [None] * len(outputs)
-    operands = [_or_zero(given[index], value) if index in carried else value
-                for index, value in enumerate(inputs)]
-    primitive = jax.lax.add_p if name == "sub" else equation.primitive
-    made = (primitive.bind(*operands) if name == "sub" else
-            operands[0] if name == "neg" else
-            primitive.bind(*operands, **primitive.get_bind_params(params)))
-    made = list(made) if primitive.multiple_results else [made]
-    return outputs, [energy if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
-                     for energy, value in zip(made, outputs, strict=True)]
-
-
-def _scanned(params, inputs, given):
-    """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
-    body = params["jaxpr"]
-    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
-    consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
-                         inputs[constants + carries:])
-    held, carry_terms, xs_terms = (given[:constants], given[constants:constants + carries],
-                                   given[constants + carries:])
-    ys, ys_terms = [], []
-    steps = range(params["length"])
-    for step in reversed(steps) if params["reverse"] else steps:
-        outputs, made = _evaluated(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)],
-                                   [*held, *carry_terms, *(None if t is None else t[step] for t in xs_terms)])
-        carry, carry_terms = outputs[:carries], made[:carries]
-        ys.append(outputs[carries:])
-        ys_terms.append(made[carries:])
-    if params["reverse"]:
-        ys.reverse()
-        ys_terms.reverse()
-    stacked = [jnp.stack(column) for column in zip(*ys, strict=True)] if ys else []
-    stacked_terms = [None if any(t is None for t in column) else jnp.stack(column)
-                     for column in zip(*ys_terms, strict=True)] if ys_terms else []
-    return [*carry, *stacked], [*carry_terms, *stacked_terms]
-
-
-def _looped(params, inputs, given):
-    """A while loop's carries and energies (`float64_terms`), its body evaluated a step at a time."""
-    condition, body = params["cond_jaxpr"], params["body_jaxpr"]
-    tested, run = params["cond_nconsts"], params["body_nconsts"]
-    condition_consts, body_consts, carry = inputs[:tested], inputs[tested:tested + run], inputs[tested + run:]
-    body_terms, carry_terms = given[tested:tested + run], given[tested + run:]
-    while bool(_evaluated(condition.jaxpr, condition.consts, [*condition_consts, *carry])[0][0]):
-        carry, carry_terms = _evaluated(body.jaxpr, body.consts, [*body_consts, *carry],
-                                        [*body_terms, *carry_terms])
-    return carry, carry_terms
-
-
-def _mapped(params, inputs, given):
-    """A shard_map's outputs and energies (`float64_terms`), its program evaluated
-    op by op on each device's blocks, as the map runs it: an expert layer's
-    dispatch (`dew.nn.moe`), whose grouped matmul and its transpose sum."""
-    body, specs, out_specs = params["jaxpr"], tuple(params["in_specs"]), tuple(params["out_specs"])
-
-    def program(values, energies):
-        return tuple(map(tuple, _evaluated(body.jaxpr, body.consts, values, energies)))
-
-    return jax.shard_map(program, mesh=params["mesh"], in_specs=(specs, specs),
-                         out_specs=(out_specs, out_specs), axis_names=params["newly_manual_axes"],
-                         check_vma=params["check_vma"])(tuple(inputs), tuple(given))
-
-
-def _or_zero(energy, value):
-    return jnp.zeros_like(value) if energy is None else energy
-
-
-def _or_size(energy, value):
-    """An output's energy: the one its sums carried, else its own size's square."""
-    if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
-        return np.zeros(np.shape(value))
-    return _squared(value) if energy is None else energy
 
 
 FALSE_FAILURE = 1e-6

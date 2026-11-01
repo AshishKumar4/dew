@@ -7,15 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_fp32_reduction_bound
+from reference_error import assert_fp32_reduction_bound
 
-from dew.nn.conv import (
-    Conv,
-    _conv_general_dilated,
-    _materialized_depthwise_3x3,
-    _polyphase_depthwise_3x3,
-    _shifted_depthwise_3x3,
-)
+from dew.nn.conv import Conv, _materialized_depthwise_3x3, _polyphase_depthwise_3x3
 from dew.nn.ssm import SpatialFusionConv
 
 
@@ -26,8 +20,7 @@ def convolve(x, kernel, dilation):
         precision=jax.lax.Precision.HIGHEST)
 
 
-@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3,
-                                       _materialized_depthwise_3x3])
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _materialized_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
 def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dilation, operation):
     """Two reductions differ by at most twice gamma_n times sum(abs(products)).
@@ -68,8 +61,7 @@ def test_depthwise_forward_and_gradients_keep_every_term_with_fp32_rounding(dila
     assert_fp32_reduction_bound(actual_loss, expected_loss, loss_magnitude, terms)
 
 
-@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _shifted_depthwise_3x3,
-                                       _materialized_depthwise_3x3])
+@pytest.mark.parametrize('operation', [_polyphase_depthwise_3x3, _materialized_depthwise_3x3])
 @pytest.mark.parametrize('dilation', [1, 2, 3])
 def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
     """Rounding each add to bf16 loses eight half-ulp terms at an interior pixel."""
@@ -87,65 +79,6 @@ def test_bf16_depthwise_accumulates_before_rounding(dilation, operation):
         np.testing.assert_array_equal(lhs, rhs)
     assert float(actual[0][0, dilation, dilation, 0]) == 1.03125
     assert float(actual[1][0, dilation, dilation, 0]) == 1.03125
-
-
-def shared(dilation, features):
-    """Dew's depthwise convolution (`_conv_general_dilated`) of `features` channels at `dilation`,
-    jitted, its padding the one each dilation's layers take."""
-    padding = 'SAME' if dilation != 2 else ((2, 2), (2, 2))
-    return jax.jit(lambda x, kernel: _conv_general_dilated(
-        x, kernel, (1, 1), padding, rhs_dilation=(dilation, dilation),
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=features))
-
-
-def drawn(shape, dtype):
-    """Check 1's draw of an image of `shape` and a depthwise 3x3 kernel at `dtype`."""
-    def draw(seed):
-        rng = np.random.default_rng([0xDC, seed])
-        return (np.asarray(jnp.asarray(rng.normal(size=shape), dtype)),
-                np.asarray(jnp.asarray(rng.normal(size=(3, 3, 1, shape[-1])) * 0.2, dtype)))
-    return draw
-
-
-CPU_SEEDS = {(shape, dtype): 8 for shape in ((2, 16, 16, 768), (1, 7, 8, 17))
-             for dtype in ('float32', 'bfloat16')}
-"""Check 1's declared seeds for the CPU's shifted sum, sized by `seeds_for` (on armada)."""
-
-
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
-@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize('dilation', [1, 2, 3])
-@pytest.mark.parametrize('shape', [(2, 16, 16, 768), (1, 7, 8, 17), (1, 7, 8, 16)])
-def test_cpu_depthwise_runs_the_shifted_sum_above_16_features_and_the_convolution_below(shape, dilation,
-                                                                                          dtype):
-    """On the CPU Dew's depthwise convolution of more than 16 features is its shifted sum
-    (`_shifted_depthwise_3x3`), with no convolution op left, and of 16 or fewer the library
-    convolution, each bit for bit: one computation by two names."""
-    x, kernel = (jnp.asarray(value) for value in drawn(shape, dtype)(0))
-    padding = 'SAME' if dilation != 2 else ((2, 2), (2, 2))
-    if shape[-1] > 16:
-        expected = jax.jit(partial(_shifted_depthwise_3x3, dilation=dilation))(x, kernel)
-    else:
-        expected = jax.jit(lambda x, kernel: jax.lax.conv_general_dilated(
-            x, kernel, (1, 1), padding, rhs_dilation=(dilation, dilation),
-            dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=shape[-1],
-            precision=jax.lax.Precision.HIGHEST if dtype == jnp.float32 else None))(x, kernel)
-    bits = np.uint32 if dtype == jnp.float32 else np.uint16
-    np.testing.assert_array_equal(np.asarray(shared(dilation, shape[-1])(x, kernel)).view(bits),
-                                  np.asarray(expected).view(bits))
-
-
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
-@pytest.mark.parametrize('dtype', ['float32', 'bfloat16'])
-@pytest.mark.parametrize('dilation', [1, 2, 3])
-@pytest.mark.parametrize('shape', [(2, 16, 16, 768), (1, 7, 8, 17)])
-def test_cpu_shifted_depthwise_is_as_exact_as_the_library_convolution(shape, dilation, dtype):
-    """The CPU's shifted sum on par with XLA:CPU's library convolution, which it replaces so a sampled
-    image keeps its accuracy, from the convolution in float64 over drawn images and kernels
-    (check 1)."""
-    assert_as_exact(shared(dilation, shape[-1]), jax.jit(partial(convolve, dilation=dilation)),
-                    drawn(shape, dtype), f"shifted depthwise {shape} dilation {dilation} {dtype}",
-                    seeds=CPU_SEEDS[shape, dtype])
 
 
 @pytest.mark.parametrize('dilation', [1, 2, 3])

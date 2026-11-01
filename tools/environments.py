@@ -106,8 +106,8 @@ def filed(path: Path, seen: frozenset[Path] = frozenset()) -> str | list:
     """The lines of file `path`, and, where it reads others (`NESTED`), however deep, each once along a path
     of reads, its lines and theirs each apart, a list `reference` encodes whole: what installing from it
     reads, so a changed pin in an included file names a new environment, and a pin moved between a file and
-    one it reads is a change too (OrganicMouse: a reference's override read another, whose change reused a
-    stale environment). A file reading none is its lines alone, as it was named before."""
+    one it reads is a change too (the models rows lane: a reference's override read another, whose change
+    reused a stale environment). A file reading none is its lines alone, as it was named before."""
     text = path.read_text()
     reads = []
     for line in text.splitlines():

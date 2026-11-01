@@ -37,10 +37,10 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import valid_order
 
-from .attention import LayerNorm
 from .inputs import MixerCall, PredictionPhase, coordinates_of
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
+from .norms import LayerNorm
 from .precision import at_least_fp32, float32_einsum
 from .sparse_selection import top_k_selection
 
@@ -229,10 +229,10 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
     def setup(self):
         if self.qk_rope_head_dim or self.rotary:
             raise ValueError("the k-pool layer has no rope head: qk_rope_head_dim=0 and rotary=False")
-        if not self.causal or self.yarn is not None or self.index_shared:
+        if not self.causal or self.rope_scaling is not None or self.index_shared:
             raise ValueError(
                 "the k-pool layer attends causally, with no rope to scale and an indexer of its own: "
-                "causal=True, yarn=None and index_shared=False")
+                "causal=True, rope_scaling=None and index_shared=False")
         heads, width = self.index_n_heads, self.index_head_dim
         if self.q_lora_rank is None or heads is None or width is None or self.index_topk is None:
             raise ValueError(
@@ -350,8 +350,10 @@ class KPoolSparseAttentionMixer(MixerBase):
             **latent_refusals(ctx),
             "force_fp32_for_softmax": False,  # forwarded
             "kv_shared": ctx.kv_shared,
+            "sliding_window": ctx.sliding_window,
+            "attention_chunk": ctx.attention_chunk,
         }, "the layer scales by its nope head dim, rotates nothing, attends its own selection of the "
-           "whole sequence and norms its latents, not its values")
+           "whole sequence, no window or chunk of it, and norms its latents, not its values")
         return functools.partial(
             KPoolSparseAttention,
             emb_features=ctx.emb_features,
@@ -375,4 +377,5 @@ class KPoolSparseAttentionMixer(MixerBase):
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax)
+            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
+            kv_cache=ctx.kv_cache)

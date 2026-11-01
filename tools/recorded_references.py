@@ -13,7 +13,8 @@ precision reads the same samples.)
 A summarized recording too slow for one process is made in shards: `record_shard` keeps the evidence of
 a run of seeds, each drawn as one run draws it, and `merge_shards` joins the shards in seed order and
 declares the count their joined evidence resolves (`seeds_resolving`), writing what `record_case`'s
-summary writes.
+summary writes. A reference whose recorder keeps each row's distance from its truth alone, its outputs
+too large to keep over the seeds, is summarized from those by `record_distances`.
 """
 
 import json
@@ -22,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
@@ -29,20 +31,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
 from reference_error import (
     REDRAW,
+    SIZING_FROM,
     as_given,
     input_digest,
-    leaf_summary,
+    leaf_summaries,
+    rows_summary,
     seeds_for,
     seeds_resolving,
     truth_sketch,
+    widened,
 )
 
-__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save"]
+__all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
+           "record_reference", "record_shard", "save", "with_pilots"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
     """A recording's reference, its revision, the device and the public command that reproduces it,
-    as a JSON string array to save beside the recorded arrays."""
+    as a JSON string array to save beside the recorded arrays. The command is published with the
+    recording: a path of the recording machine's own (from the root or the home, but a directory under
+    /tmp the command makes itself) is refused, the argument's name standing in its place."""
+    if any(part.startswith(("/", "~")) and not part.startswith("/tmp/")
+           for word in command.split() for part in word.split("=")[-1].split(":")):
+        raise ValueError(f"a recording's command is public, its machine's paths named, not given: {command}")
     return np.asarray(json.dumps({"reference": reference, "revision": revision, "device": device,
                                   "command": command, **details}))
 
@@ -76,7 +87,7 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
 
 
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
-                summary: bool = False) -> dict[str, np.ndarray]:
+                summary: bool = False, dew=None) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. With no proxy, the recorded reference alone
@@ -89,7 +100,11 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     error from its truth, its worst sized row, its errors on the truth's rows of zero, finiteness) and
     its truth's sketch
     (`truth_sketch`), which the test's own float64 path is held to (`indexed_recording`'s `truth_fn`):
-    kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes."""
+    kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes. With `dew(inputs)`, Dew's
+    own outputs on a seed's inputs, the recorded reference confirms the count paired, as check 1's
+    verdict pairs it (`seeds_for`'s `dew_fn`), for a site whose errors are heavy-tailed across draws
+    alike in both arms (a lognormal training sigma), where the reference compared with itself on other
+    draws never resolves."""
     if proxy is None and truth_proxy is not None:
         raise ValueError("a planning truth requires its proxy")
     # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
@@ -97,41 +112,139 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
                seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
                          truth_fn=None if truth_proxy is None else jax.jit(truth_proxy)))
     print(f"{label}: starting with {planned} seeds", flush=True)
-    records = []
+    # Each seed drawn once, as the sizing reads it: a paired sizing reads its pilots from SIZING_FROM, which a
+    # run of every seed below it would draw too.
+    records = {}
 
-    def ensure(count):
-        for seed in range(len(records), count):
+    def record(seed):
+        if seed not in records:
             inputs = draw(seed)
             reference, truth = evaluate(inputs)
-            records.append((inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)))
+            records[seed] = (inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth))
+        return records[seed]
+
+    def ensure(count):
+        for seed in range(count):
+            record(seed)
 
     def recorded_draw(seed):
-        ensure(seed + 1)
-        return np.int32(seed), records[seed][0]
+        return np.int32(seed), record(int(seed))[0]
 
     ensure((1 + REDRAW) * planned)
     # The recorded reference is read by index from the host's records, as given.
     confirmed = seeds_for(as_given(lambda index, inputs: records[int(index)][1]), recorded_draw, label,
-                          truth_fn=lambda index, inputs: records[int(index)][2])
+                          truth_fn=lambda index, inputs: records[int(index)][2],
+                          dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)))
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
     # than the recorded reference confirms leaves draws the recording does not keep.
     kept = (1 + REDRAW) * confirmed
     ensure(kept)
+    kept_records = [records[seed] for seed in range(kept)]
     if summary:
-        result = _finished(label, _evidence(label, range(kept), records[:kept]), confirmed)
+        result = _finished(label, _evidence(label, range(kept), map(_summarized, kept_records)), confirmed)
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
         return result
     result = {}
     for index, kind in enumerate(("input", "reference", "truth")):
         if kind == "input" and not store_inputs:
             continue
-        for name in records[0][index]:
-            result[f"{label}.{kind}.{name}"] = np.stack([record[index][name] for record in records[:kept]])
+        for name in kept_records[0][index]:
+            result[f"{label}.{kind}.{name}"] = np.stack([entry[index][name] for entry in kept_records])
     if not store_inputs:
-        result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
+        result[f"{label}.input_digest"] = np.asarray([input_digest(entry[0]) for entry in kept_records])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
+
+
+def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,
+                  draw=None, padded: Mapping[str, np.ndarray] | None = None, planned: bool = True,
+                  extra=None, stepped: int | None = None, **details) -> Path:
+    """The tiny decoder at `directory`'s reference recorded over check 1's seeds, which its test reads in
+    the reference's place (a release's remote code or a release apart from the suite's, which the test
+    cannot run; hf_reference.py `write_logits_recording`'s): each seed's ids, `draw(seed)` (`{"input_ids":
+    ids}`, by default tests/interop_support.py `fixture_ids`' in the fixture's shape), the torch causal LM
+    `model`'s fp32 eager logits on the CPU and `wide`'s, its float64 twin's
+    (`torch_precision.float64_twin`), inside `torch_precision.float64`, as the leaf `logits`; and with
+    `padded`, the fields the reference's padded rows take
+    (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
+    padded with 0 where the mask is false, at the mask's valid places; and with `extra`, the leaves
+    `extra(network, tokens)` gives over the unpadded ids (a looped model's exit gates), the reference's
+    alone, so its count is not planned on Dew; and with `stepped`, the leaf `stepped_logits`: the logits at
+    the shapes a decode of a `stepped`-token prefill computes them, the prefill's from one forward over
+    it and each later id's from one over the ids up to it (ledger 1543), which a test's cached steps
+    are judged against. The count is planned on Dew's own
+    load of the fixture, its padded rows under the mask alone, or, not `planned`, where Dew cannot load
+    beside the reference's release (Ouro's transformers 4.56.2 pins a huggingface_hub older than Dew's
+    interop imports), on the reference alone (`record_case`), and confirmed on the reference; the
+    reference's evidence alone is kept with its truth's sketch (`record_case`'s summary), which the
+    test's float64 run of Dew's model is held to, saved as recorded_logits.npz beside the fixture with
+    its provenance, `reference` at `revision` under `license`, and `details`. Returns the file written."""
+    import torch
+    from interop_support import fixture_ids
+    from torch_precision import float64
+
+    mask = None if padded is None else np.asarray(padded["attention_mask"], bool)
+    fields = {name: torch.from_numpy(np.asarray(value, np.int64 if name == "position_ids" else bool))
+              for name, value in (padded or {}).items()}
+    if draw is None:
+        ids_of = fixture_ids(directory)
+
+        def draw(seed):
+            return {"input_ids": ids_of(seed)[0]}
+
+    def logits(network, ids, *, prefixes: bool = True):
+        tokens = torch.from_numpy(ids.astype(np.int64))
+        with torch.no_grad():
+            out = {"logits": network(input_ids=tokens, use_cache=False).logits.numpy()}
+            if mask is not None:
+                rows = torch.from_numpy(np.where(mask, ids, 0).astype(np.int64))
+                out["padded_logits"] = network(input_ids=rows, **fields, use_cache=False).logits.numpy()[mask]
+            if extra is not None:
+                out.update({name: value.numpy() for name, value in extra(network, tokens).items()})
+            if stepped is not None and not prefixes:
+                # A truth's products round alike at every shape: the one forward's.
+                out["stepped_logits"] = out["logits"]
+            elif stepped is not None:
+                out["stepped_logits"] = np.concatenate([
+                    network(input_ids=tokens[:, :stepped], use_cache=False).logits.numpy(),
+                    *(network(input_ids=tokens[:, :length], use_cache=False).logits.numpy()[:, -1:]
+                      for length in range(stepped + 1, tokens.shape[1] + 1))], axis=1)
+        return out
+
+    def evaluate(inputs):
+        with float64():
+            truth = logits(wide, inputs["input_ids"], prefixes=False)
+        return logits(model, inputs["input_ids"]), truth
+
+    def ours(network, variables):
+        def run(inputs):
+            ids = inputs["input_ids"]
+            out = {"logits": network.apply(variables, ids)}
+            if mask is not None:
+                rows = network.apply(variables, jnp.where(mask, ids, 0), attention_mask=mask)
+                out["padded_logits"] = rows[mask]
+            if stepped is not None:
+                out["stepped_logits"] = out["logits"]
+            return out
+        return run
+
+    if planned and extra is not None:
+        raise ValueError("a recording with leaves of the reference's alone is not planned on Dew")
+    proxy = truth_proxy = None
+    if planned:
+        from dew.interop import Pretrained
+
+        native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+        proxy = ours(native.model, native.variables)
+        truth_proxy = ours(native.model.clone(dtype=jnp.float64), widened(native.variables))
+    with jax.enable_x64(new_val=True):
+        recording = record_case("logits", draw, evaluate, proxy, truth_proxy=truth_proxy, store_inputs=False,
+                                summary=True)
+    record = provenance(reference, revision, "cpu", command, torch=torch.__version__, dtype="float32",
+                        attention="eager", **details)
+    return save(directory / "recorded_logits.npz", {**recording, "logits.provenance": record},
+                reference=reference, license=license)
 
 
 def record_shard(label: str, draw, evaluate, seeds: range) -> dict[str, np.ndarray]:
@@ -143,22 +256,56 @@ def record_shard(label: str, draw, evaluate, seeds: range) -> dict[str, np.ndarr
         for seed in seeds:
             inputs = draw(seed)
             reference, truth = evaluate(inputs)
-            yield inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)
+            yield _summarized((inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)))
     return _evidence(label, seeds, records())
+
+
+def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], truth_of,
+                     dtypes: Mapping[str, str]) -> dict[str, np.ndarray]:
+    """`label`'s summarized recording, as `merge_shards` writes it, of a reference that ran apart and kept
+    each row's RMS distance from its float64 truth alone (a recorder whose outputs over the seeds are too
+    large to keep): `distances[name]` `[seeds, rows]` from seed 0 for each leaf, `truth_of(seed)` the seed's
+    float64 truth by leaf, `draw(seed)` its inputs, and `dtypes[name]` the reference's leaf's dtype. The
+    count the evidence resolves is declared (`seeds_resolving`, the reference against itself), and that
+    count's (1 + REDRAW) times kept, each kept seed's evidence read from its rows (`rows_summary`) beside
+    its truth's sketch."""
+    names = list(distances)
+    # A leaf of no rows is exact, its error zero.
+    errors = np.stack([np.mean(np.square(rows), axis=1) if rows.shape[1] else np.zeros(rows.shape[0])
+                       for rows in (np.asarray(distances[name], np.float64) for name in names)], axis=1)
+    confirmed = seeds_resolving(errors, names, label)
+    kept = (1 + REDRAW) * confirmed
+
+    def records():
+        for seed in range(kept):
+            truth = truth_of(seed)
+            summaries = {name: rows_summary(distances[name][seed], truth[name],
+                                            finite=bool(np.isfinite(distances[name][seed]).all()),
+                                            dtype=dtypes[name]) for name in names}
+            yield draw(seed), summaries, truth
+    result = _finished(label, _evidence(label, range(kept), records()), confirmed)
+    print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
+    return result
 
 
 def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
     """`label`'s summarized recording from its shards (`record_shard`), as `record_case`'s summary writes
     it: their seeds joined in order from seed 0, the count the joined evidence resolves
     (`seeds_resolving`, the reference against itself), and that count's (1 + REDRAW) times kept. Shards
-    that leave a seed out or repeat one are refused, and so are too few seeds for the count's redraw."""
-    ordered = sorted(shards, key=lambda shard: int(shard[f"{label}.drawn"][0]))
-    joined = {key: np.concatenate([shard[key] for shard in ordered])
-              for key in ordered[0] if not _whole(label, key)}
-    joined.update({key: ordered[0][key] for key in ordered[0] if _whole(label, key)})
+    that leave a seed out or repeat one are refused, and so are too few seeds for the count's redraw.
+    Shards of seeds from SIZING_FROM on are the recording's pilots, the draws a paired sizing of it takes
+    and no verdict does (`seeds_for`): joined in order from SIZING_FROM, every one kept, under
+    `<label>.pilot.`, their leaves the verdict's in shape and dtype, as a run from seed 0 is."""
+    straddling = [_runs(shard[f"{label}.drawn"]) for shard in shards
+                  if (np.asarray(shard[f"{label}.drawn"]) < SIZING_FROM).any()
+                  and (np.asarray(shard[f"{label}.drawn"]) >= SIZING_FROM).any()]
+    if straddling:
+        raise ValueError(f"{label}: shards of seeds {straddling} hold verdict seeds and pilots from "
+                         f"SIZING_FROM alike")
+    verdict = [shard for shard in shards if int(shard[f"{label}.drawn"][0]) < SIZING_FROM]
+    pilots = [shard for shard in shards if int(shard[f"{label}.drawn"][0]) >= SIZING_FROM]
+    joined = _joined(label, verdict, 0)
     drawn = joined[f"{label}.drawn"]
-    if not np.array_equal(drawn, np.arange(len(drawn))):
-        raise ValueError(f"{label}: the shards hold seeds {_runs(drawn)}, not one run from seed 0")
     names = [key.removeprefix(f"{label}.mse.") for key in joined if key.startswith(f"{label}.mse.")]
     confirmed = seeds_resolving(np.stack([joined[f"{label}.mse.{name}"] for name in names], axis=1),
                                 names, label)
@@ -168,18 +315,64 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
                          f"shards hold {len(drawn)}")
     result = _finished(label, joined, confirmed)
     print(f"{label}: declared {confirmed} seeds; merged {kept} draws' evidence", flush=True)
-    return result
+    return with_pilots(label, result, pilots) if pilots else result
+
+
+def with_pilots(label: str, recording: Mapping[str, np.ndarray],
+                shards: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    """`recording`, a summarized one (`record_case`'s summary or `merge_shards`'), with the pilots of
+    `shards` (`record_shard` over seeds from SIZING_FROM on): joined in order from SIZING_FROM, every one
+    kept, under `<label>.pilot.`, their leaves the recording's in name, shape and dtype. A recording that
+    holds pilots already is refused, as are pilots that leave a seed out of their run."""
+    if f"{label}.pilot.input_digest" in recording:
+        raise ValueError(f"{label}: the recording holds pilots already")
+    held = _joined(label, shards, SIZING_FROM)
+    pilot = _kept(label, held, len(held[f"{label}.drawn"]))
+    whole = {key for key in recording if _whole(label, key)}
+    if {key for key in pilot if _whole(label, key)} != whole or any(
+            not np.array_equal(pilot[key], recording[key]) for key in whole):
+        raise ValueError(f"{label}: the pilots' leaves are not the verdict's in name, shape and dtype")
+    print(f"{label}: with {len(held[f'{label}.drawn'])} pilots", flush=True)
+    return {**recording, **{f"{label}.pilot.{key.removeprefix(f'{label}.')}": value
+                            for key, value in pilot.items() if not _whole(label, key)}}
+
+
+def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) -> dict[str, np.ndarray]:
+    """`shards`' evidence joined in order, refused unless their seeds are one run from `first`."""
+    if not shards:
+        raise ValueError(f"{label}: no shard holds seeds from {first}")
+    ordered = sorted(shards, key=lambda shard: int(shard[f"{label}.drawn"][0]))
+    joined = {key: np.concatenate([shard[key] for shard in ordered])
+              for key in ordered[0] if not _whole(label, key)}
+    joined.update({key: ordered[0][key] for key in ordered[0] if _whole(label, key)})
+    for shard in ordered[1:]:
+        for key in (key for key in shard if _whole(label, key)):
+            if not np.array_equal(shard[key], joined.get(key)):
+                raise ValueError(f"{label}: one shard's {key} is {shard[key]}, another's {joined.get(key)}")
+    drawn = joined[f"{label}.drawn"]
+    if not np.array_equal(drawn, np.arange(first, first + len(drawn))):
+        raise ValueError(f"{label}: the shards hold seeds {_runs(drawn)}, not one run from seed {first}")
+    return joined
+
+
+def _summarized(record):
+    """A record of (inputs, reference, truth) as `_evidence` reads it: each leaf's `leaf_summary`, the
+    record's leaves read at once (`leaf_summaries`)."""
+    inputs, reference, truth = record
+    names = list(reference)
+    summaries = leaf_summaries([reference[name] for name in names], [truth[name] for name in names])
+    return inputs, dict(zip(names, summaries, strict=True)), truth
 
 
 def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
     """`records`' evidence, one row a seed of `seeds`, read one record at a time (an iterable of
-    (inputs, reference, truth)): each leaf's `leaf_summary` (its rows of float64 zero joined, with their
-    count a seed) and its truth's sketch, and each seed's input digest."""
+    (inputs, each leaf's `RecordedLeaf`, truth)): each leaf's summary (its rows of float64 zero joined,
+    with their count a seed) and its truth's sketch, and each seed's input digest."""
     digests, leaves, sketches, shapes = [], {}, {}, {}
-    for seed, (inputs, reference, truth) in zip(seeds, records, strict=True):
+    for seed, (inputs, summaries, truth) in zip(seeds, records, strict=True):
         digests.append(input_digest(inputs))
-        for name in reference:
-            leaves.setdefault(name, []).append(leaf_summary(reference[name], truth[name]))
+        for name in summaries:
+            leaves.setdefault(name, []).append(summaries[name])
             sketches.setdefault(name, []).append(truth_sketch(truth[name], seed))
             shapes.setdefault(name, np.asarray(np.shape(truth[name]), np.int64))
     evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}
@@ -202,7 +395,14 @@ def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
 def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) -> dict[str, np.ndarray]:
     """The recording `evidence` (`_evidence`) makes at `confirmed` declared seeds: its first (1 + REDRAW)
     times that many seeds, each leaf's rows of float64 zero by their span a seed (`zero_offsets`)."""
-    kept = (1 + REDRAW) * confirmed
+    result = _kept(label, evidence, (1 + REDRAW) * confirmed)
+    result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+    return result
+
+
+def _kept(label: str, evidence: Mapping[str, np.ndarray], kept: int) -> dict[str, np.ndarray]:
+    """`evidence`'s (`_evidence`) first `kept` seeds, each leaf's rows of float64 zero by their span a seed
+    (`zero_offsets`)."""
     result = {f"{label}.input_digest": evidence[f"{label}.input_digest"][:kept]}
     names = [key.removeprefix(f"{label}.mse.") for key in evidence if key.startswith(f"{label}.mse.")]
     for name in names:
@@ -214,7 +414,6 @@ def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) ->
                        f"{label}.zero_offsets.{name}": offsets,
                        f"{label}.shape.{name}": evidence[f"{label}.shape.{name}"],
                        f"{label}.dtype.{name}": evidence[f"{label}.dtype.{name}"]})
-    result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     return result
 
 
@@ -228,3 +427,16 @@ def _runs(seeds: np.ndarray) -> str:
     ordered = np.unique(seeds)
     breaks = np.flatnonzero(np.diff(ordered) != 1) + 1
     return ", ".join(f"{run[0]}-{run[-1]}" for run in np.split(ordered, breaks))
+
+
+def held_to_the_oracle(exact_run, arrays, truth: dict, roundings: int, label: str) -> None:
+    """Dew's float64 path `exact_run` on a seed's `arrays` held to the oracle's `truth`, leaf by leaf, within
+    float64's rounding of `roundings` operations (`assert_computes_the_oracle`): a recorder's cross-check
+    that its truth and the test's own float64 path compute the same function."""
+    from reference_error import assert_computes_the_oracle, widened
+
+    with jax.enable_x64(new_val=True):
+        twin = jax.tree.map(np.asarray, exact_run(widened(arrays)))
+    for name in truth:
+        assert_computes_the_oracle(twin[name], truth[name], f"{label} float64 {name}", roundings=roundings)
+

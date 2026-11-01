@@ -241,8 +241,9 @@ source = Hub('acme/records', name='named', revision='frozen')
 try:
     source.builder
 except ImportError as error:
-    assert "pip install 'dewml[streaming]'" in str(error)
-    assert isinstance(error.__cause__, ModuleNotFoundError)
+    # Refused for the optional package itself, which the extra installs.
+    assert isinstance(error.__cause__, ModuleNotFoundError) and error.__cause__.name == 'datasets'
+
 else:
     raise AssertionError('opening Arrow without datasets succeeded')
 """

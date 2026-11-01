@@ -27,17 +27,13 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from float64_terms import float64_terms
 from interop_support import fixture_with_meta, recorded_gradients
-from reference_error import (
-    assert_as_exact_as_the_reference,
-    assert_as_exact_over_orders,
-    distance,
-    float64_terms,
-    widened,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_over_orders, distance, widened
 
 from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection
-from dew.nn.attention import Stage
+from dew.nn.attention_blocks import Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
 from dew.nn.backbones.unet import Unet

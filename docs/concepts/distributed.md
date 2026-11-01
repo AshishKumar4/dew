@@ -59,6 +59,7 @@ Each `MeshSpec` field sets how many devices one axis gets, and the `data` axis g
 
 | Axis | `MeshSpec` field | Splits |
 |---|---|---|
+| `diloco` | `diloco` | DiLoCo's replica groups (`Trainer(diloco=DiLoCo(every))`): each group trains its own copy of the model on its own batch rows, and the groups average every `every` updates |
 | `data` | (the remainder) | Batch rows; parameters are replicated over it |
 | `expert` | `expert` | The expert dimension of mixture-of-experts layers, and batch rows |
 | `fsdp` | `fsdp` | Parameter dimensions the layout assigns to it, and batch rows |
@@ -75,9 +76,9 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 ```
 
 ```text
-{'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
+{'diloco': 1, 'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
 ```
 
 `MeshSpec` also has `replicas` (host groups the data axis spans; see [Multiple hosts](../guides/multi-node.md)).
@@ -114,6 +115,17 @@ Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and 
 | `host_parameters` | `()` | Globs of variables an inference placement keeps in pinned host memory |
 | `frozen_whole` | `False` | Keep the frozen collection (a LoRA run's base) whole over `fsdp`, split only over the other axes its rules give it |
 
+To change one name's placement and keep every other, drop the default table's rules for that name and put yours ahead of the rest. This keeps the vocabulary off the `tensor` axis, whether `fsdp` can split it or not:
+
+```python
+from dew.mesh import DEFAULT_RULES
+from dew.training import Layout
+
+layout = Layout(rules=(("vocab", "fsdp"), *(rule for rule in DEFAULT_RULES if rule[0] != "vocab")))
+```
+
+A rule put ahead of the defaults without dropping theirs is only a preference: where it cannot place the dimension (its axis has size 1, or does not divide it), the default rules for the name behind it still apply. A rules mapping, or a sequence without the defaults, replaces the table whole. The defaults name some logical axes more than once as fallbacks, and a mapping keeps one rule per name, so build a variant from them as above and not as `dict(DEFAULT_RULES)`.
+
 A parameter that no module declares logical axes for is split on its largest dimension that the `fsdp` size divides. `Layout.check` raises `LayoutRefused` when more than `tolerance` of the shardable elements stay replicated, and it lists the largest replicated parameters. Raising `tolerance` only hides the problem, so fix the placement. A rule that puts a parameter on `data` or `stage` is refused.
 
 The `sequence` axis's devices compute their own positions with the same weights, as `fsdp`'s compute their own rows, so the two hold the training state between them. Whatever the rules put on `fsdp` is split over `fsdp` and `sequence` together wherever their product divides that dimension and the pair leaves the other axes' splits as they are, and over `fsdp` alone otherwise. On `MeshSpec(fsdp=2, sequence=2)` a parameter the pair splits lies on each device as on `MeshSpec(fsdp=4)`, a quarter of it, and so do its optimizer moments, its EMA copy and its gradient; on `MeshSpec(sequence=N)` an N-th. Parameters below `min_shard` stay replicated, and `frozen_whole` keeps the frozen collection whole over both. A step reads such a weight as it reads an `fsdp` split. torchtitan's FSDP shards over its `dp_shard` and `cp` axes together in the same way. `Layout.check` counts the axes the rules name, so a `sequence` size that divides none of a parameter's dimensions leaves that parameter whole over `sequence` without a refusal.
@@ -134,7 +146,7 @@ So where the tensor axis's link is fast enough, these projections run on each te
 
 `dew.nn.sharding.down_projection` decides for each projection while the step is traced. It spreads when the link can move those extra bytes in no more time than the device, running at its peak rate, would take for the FLOPs saved. The peak rate is the fastest the device can run those FLOPs, so at any real utilisation they take at least that long, and spreading cannot slow the step. The trainer measures the link once per mesh with an all-gather over the tensor axis (`dew.training.distributed.link_bandwidth`). Every process uses the lowest figure in the pool, so they all compile the same program. For each axis it measured, `StepCompiled` records that figure and whether a projection spread.
 
-At DeepSeek-V3's widths in bf16, with 16384 tokens per microbatch, an RTX 3090 needs 20.3 GB/s. On 4x RTX 3090 (PCIe 3.0, one host), the all-gather over the NVLink pair moved 31.0 GB/s, so that pair spreads; the PCIe pair moved 5.8 GB/s, so it does not. An H100 SXM needs 283 GB/s, under NVLink 4's nominal 450 GB/s per direction. No spread step has been timed on NVLink or on a TPU. Nothing is measured on a device that the peak table in `dew.telemetry.instrumentation` does not name, a CPU among them, so there the projections stay on every token. To decide for such devices, or as another machine would, state the link: `Trainer(..., links={"tensor": Link(bytes_per_second, flops_per_second)})`, with `Link` from `dew.nn.sharding`, and the same rule weighs it. To keep these projections on every token whatever the link, map `activation_spread` to the sequence axis alone in your rules.
+At DeepSeek-V3's widths in bf16, with 16384 tokens per microbatch, an RTX 3090 needs 20.3 GB/s. On 4x RTX 3090 (PCIe 3.0, one host), the all-gather over the NVLink pair moved 31.0 GB/s, so that pair spreads; the PCIe pair moved 5.8 GB/s, so it does not. An H100 SXM needs 283 GB/s, under NVLink 4's nominal 450 GB/s per direction. No spread step has been timed on NVLink or on a TPU. Nothing is measured on a device that the peak table in `dew.telemetry.instrumentation` does not name, a CPU among them, so there the projections stay on every token. To decide for such devices, or as another machine would, state the link: `Trainer(..., links={"tensor": Link(bytes_per_second, flops_per_second)})`, with `Link` from `dew.nn.sharding`, or on a run `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`, and the same rule weighs it. To keep these projections on every token whatever the link, map `activation_spread` to the sequence axis alone in your rules.
 
 The sequence axis has the same problem with a cross-attention's context, such as SD's 77 text tokens. The sequence axis does not divide a length like that, so every sequence shard projects the whole context into keys and values. On a CPU mesh under `sequence=4`, before the split below, that made the conditional UNet's step cost 1.57 times one device's FLOPs. `dew.nn.sharding.split_positions` decides by the same rule, using the sequence axis's measured link. Where splitting pays, each shard projects its share of the positions, padded with zero rows to a multiple of the shard count.
 
@@ -174,6 +186,30 @@ Host-parameter placement works only for decoder stack variables. Dew rejects a s
 Every host-resident weight you select is copied to the device on each forward pass, including every decode step, so PCIe transfers can take most of the time per token. `tools/benchmark_host_offload.py` reports local addressable-shard bytes, the device and host compiled-memory fields, process RSS and execution times. Its bytes per token divided by the decode latency is an end-to-end effective rate, not a measurement of PCIe bandwidth alone.
 
 An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_layers=8`) reported 18.74 GiB final RSS and 37.9 GiB peak RSS. The saved load probe synchronized every bank, so a backlog of asynchronous work alone cannot explain that peak. The numbers do not separate temporary storage, allocator reservation and duplicate driver mappings. There is no completed result yet for generating on a GPU with a model larger than device memory, and no throughput result. Looking further into the allocator needs a small process tree with a hard memory cap, swap accounting and RSS/PSS measurements. The earlier oversized runs with an RSS watchdog are not a safe way to do it.
+
+## GPU memory outside XLA's pool
+
+XLA preallocates a share of each GPU's memory as its pool. A step's collectives also allocate NCCL communicators, and those buffers live outside the pool: NCCL takes no allocator from its caller. cuBLAS's workspaces and the loaded kernels sit outside the pool as well. XLA keys a communicator by its devices and its kind, so a step whose collectives use another device grouping, or a collective-permute beside an all-gather, makes another communicator over the same GPUs.
+
+`import dew` sets `NCCL_RUNTIME_CONNECT=0` unless you set it yourself. NCCL then connects a communicator's rings, trees and NVLS peers, and allocates their buffers, as it creates the communicator, where XLA returns a failure to every rank as an error. Under NCCL's own default since 2.22, those peers connect at a collective's first launch. There, a GPU that fails to allocate leaves its peer waiting inside XLA's first-call rendezvous, and XLA ends the process after 40 seconds. Connecting at creation allocates those buffers at once, even for a collective the program never runs, and it takes longer to create the communicator. Point-to-point connections, which an all-to-all and a collective-permute make, still connect when a peer is first sent to, whatever the setting, so Dew leaves room for them as well.
+
+On a host of two or more GPUs, before the backend opens, `prepare_process` sizes the pool to leave the communicators their room at NCCL's full speed:
+
+1. A child process (`python -m dew.communicators`) measures each group size that divides the host's GPUs. For each size it makes a collective's communicator, connects an all-to-all to every peer, and connects a permute along each directed pair of GPUs in turn, in a communicator of its first GPUs and in one of each pair alone. NCCL picks each peer's transport separately and can route a connection through a third GPU of the communicator, so each pair keeps its bytes on its two GPUs and the most on any other; a communicator is charged a pair's bytes on its ends, and the most beside it on every other member, since NCCL may route the pair through any of them. It reports the bytes each step took on a GPU, and the bytes the runtime took beside its pool.
+2. The answer is kept in Dew's cache under `communicators/`. It is keyed by the GPUs' names and PCI places, the driver, NCCL's version, every `NCCL_*` setting, every XLA flag that sets NCCL's communicators, and the JAX version. A host pays for the measurement once per configuration.
+3. The pool's upper bound is the share your run names, read in one place (`dew.devices.pool_bound`): your `XLA_PYTHON_CLIENT_MEM_FRACTION`; Dew's 95% if you name nothing; or JAX's 75% if you name preallocation or the allocator without a fraction. The pool shrinks below that bound only as far as it must to leave room for a collective's communicator, an all-to-all's peers and a permute's peers over every GPU, plus the runtime's. No NCCL channel or buffer is cut to fit. The pool only has to hold the compiled step, and the fit check holds the step to it as before. Dew logs the share it took once, and the fit check's record carries it into the run record (`pool`).
+4. Every program Dew compiles, steps and evaluations alike, passes one compile point. There, its communicators are read from its program: each device group of its collectives, each all-to-all's group and each GPU's permute peers. Those communicators stay made, so they are held together with those of the programs compiled before. A program that needs more than the room left is refused before it runs, with an error naming the bytes, instead of stalling in a collective.
+
+None of this happens in five cases:
+- a process that joins a pool of processes, whose communicators span hosts and so need network buffers a single host's child does not make;
+- a pool of no fixed share (`XLA_PYTHON_CLIENT_PREALLOCATE=false`, or `XLA_PYTHON_CLIENT_ALLOCATOR=platform`);
+- a host of fewer than two GPUs;
+- a process that asks JAX for no GPU;
+- a process whose backend has already opened.
+
+If a step that fit fails on its first run anyway, Dew raises the failure as the step's (`dew.training.memory.FirstRunFailed`). The error includes each GPU's free bytes outside the pool, labelled `outside`, both at the fit check and after the failure.
+
+An example of the failure this prevents: a LoRA fine-tune of Qwen3.5-9B on two H100s with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.97` left 2,264 MiB free outside the pool on a GPU. Its step's collectives used two communicators, each with 24 collective channels, 32 point-to-point channels per peer and 16 NVLS channels. One GPU entered the first all-to-all, and the other never did.
 
 ## Rematerialization
 

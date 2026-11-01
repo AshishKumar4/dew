@@ -28,6 +28,7 @@ from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
 from dew.training import Trainer
+from dew.training.interval import Interval
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -198,10 +199,7 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     assert trainer.step_flops.hardware * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
-@pytest.mark.gpu("cuDNN's fused attention runs on a CUDA GPU alone")
-@pytest.mark.mesh(devices=1)
-@pytest.mark.parametrize("window", [None, 64])
-def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
+def a_fused_attention_counts_the_pairs_its_mask_computes(window):
     """A causal kernel computes about half the scores, a sliding window fewer: the forward's two
     products and the backward's four count one multiply-add per pair it reaches, head and width.
     On an H100 FlashAttention-3 counted the whole square of a causal call, twice its work."""
@@ -298,6 +296,57 @@ def test_fit_reports_throughput_to_the_tracker():
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
 
 
+class Pending(np.ndarray):
+    """A step's loss the test says is computed or not (`is_ready`), as one on the devices says."""
+
+    finished = False
+
+    def is_ready(self) -> bool:
+        return self.finished
+
+
+def test_a_log_its_reader_reads_late_ends_where_the_loop_saw_its_step_done():
+    """A log whose step had not finished at its take ends its interval where the loop first saw the step
+    done as it stepped (`Interval.seen`), not where a reader that runs late reads it: read after the loop
+    took the next log, whose step was done at its take, it leaves that next interval its own seconds and
+    rates, which a read's own clock would leave none (row 2786: a loaded process's last tick logged no
+    `train/step_time_ms`, and a test gated on each tick's waited on one that never came)."""
+    interval = Interval(last_log_time=time.time(), last_saved=None)
+    first, second = (np.asarray(1.0).view(Pending) for _ in range(2))
+
+    def take(step, loss):
+        return interval.take(step, loss, {}, np.asarray(a=True), (None, None), {}, {})
+
+    early = take(1, first)
+    first.finished = True
+    time.sleep(0.05)
+    interval.seen()
+    seen = time.time()
+    time.sleep(0.05)
+    second.finished = True
+    late = take(2, second)
+    time.sleep(0.05)
+    # The reader reads the first log only now, after the loop took the second.
+    _, _, done = early.read(None, None)
+    _, elapsed, _ = late.read(None, done)
+    assert done <= seen and elapsed >= 0.05
+    # A step found done at its take notes every watched step before it, though the earlier one has not yet
+    # said so, no later than itself.
+    fourth, fifth = (np.asarray(1.0).view(Pending) for _ in range(2))
+    pending = take(4, fourth)
+    fifth.finished = True
+    found = take(5, fifth)
+    _, _, before = pending.read(None, done)
+    assert found.done is not None and before <= found.done
+    found.read(None, before)
+    # A step the loop notes done after its log was read is noted for no log: nothing waits on it.
+    third = np.asarray(1.0).view(Pending)
+    take(6, third).read(None, done)
+    third.finished = True
+    interval.seen()
+    assert not interval.finished and not interval.watched
+
+
 class TickGatedTracker(RecordingTracker):
     """Marks each step's tick, so an input can start a batch's delay only
     when the loop is about to ask for it: the loop reads a step's log once
@@ -366,9 +415,7 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
         jax.config.update("jax_compilation_cache_dir", previous)
 
 
-@pytest.mark.gpu
-@pytest.mark.mesh(devices=1)
-def test_a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them(tmp_path):
+def a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them(tmp_path):
     """A run `prepare_process` readies with no directory of its own caches under the user's cache
     directory, and its GPU compile writes the autotuner's picks to this jaxlib's own directory there
     (`autotune_dir`), which its XLA_FLAGS name before the backend opens; JAX puts none of its own in
@@ -405,7 +452,8 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from tool_support import load
 
-    from dew.telemetry.instrumentation import collective, hlo_instructions
+    from dew.telemetry.instrumentation import hlo_instructions
+    from dew.telemetry.trace import collective
 
     mesh = Mesh(np.asarray(jax.devices()[:8]), ("data",))
 
@@ -426,6 +474,21 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
     counted = load("cluster_vs_gpu").collectives(text)
     assert {kind: (entry["ops"], entry["bytes"]) for kind, entry in counted.items()} == {
         "all-gather": (1, 64 * 32 * 4), "all-reduce": (1, 16 * 4)}
+
+
+def test_an_instructions_result_is_read_as_its_element_type_and_dimensions():
+    """A compiled program that rounds an f32 array to bf16 reads an f32 parameter of the array's
+    dimensions and makes a bf16 result of them; a tuple's result names no element type."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    x = jnp.ones((3, 5), jnp.float32)
+    text = jax.jit(lambda x: (x.astype(jnp.bfloat16), jnp.sum(x))).lower(x).compile().as_text()
+    instructions = hlo_instructions(text).values()
+    results = {(instruction.op, instruction.element, instruction.dims) for instruction in instructions}
+    assert ("parameter", "f32", (3, 5)) in results
+    assert any(element == "bf16" and dims == (3, 5) for _, element, dims in results), results
+    tuples = [element for op, element, _ in results if op == "tuple"]
+    assert tuples and not any(tuples), results
 
 
 def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():

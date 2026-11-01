@@ -117,7 +117,7 @@ def test_a_packed_order_names_the_gate_and_up_projections():
 def test_a_transformer_with_dropout_trains_and_evaluates_without_a_dropout_key():
     """A nonzero-dropout spatial transformer trains with sampled masks and evaluates with them
     disabled. Its update reaches both attentions and the feed-forward; evaluation needs no RNG."""
-    from dew.nn.attention import BasicTransformerBlock
+    from dew.nn.attention_blocks import BasicTransformerBlock
 
     block = BasicTransformerBlock(8, heads=2, dim_head=4, norm="layer", dropout_rate=0.1,
                                   attention_impl="reference")

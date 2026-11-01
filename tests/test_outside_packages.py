@@ -179,8 +179,7 @@ class ActivityRun(RunConfig):
         data = Memory({"x": rows}).read("memory").shuffle().repeat().batch(8).loading(loading)
         held = Memory({"x": rows[:20]}).read("memory").batch(8).loading(loading)
         objective = Rate(self.model.build(), self.target)
-        return Prepared(self, lambda name: self.train(objective, data, name=name, metrics=(MeanRate(),),
-                                                      validation=held))
+        return Prepared(self, objective, data, metrics=(MeanRate(),), validation=held)
 '''
 
 TRAIN_RUN = '''
@@ -205,7 +204,6 @@ def test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_
     with nothing in Dew naming any of it. A new process trains the run again
     from its `run.json` alone once it trusts the package, to the same losses,
     and refuses it until then."""
-    import json
 
     _install(tmp_path, "toypackage", PACKAGE_RUN)
     devices = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
@@ -217,9 +215,10 @@ def test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_
                               env={**devices, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
 
     def scalars(directory, name):
-        rows = [json.loads(row)["scalars"] for row in
-                (directory / "activity" / "tracking" / "scalars.jsonl").read_text().splitlines()]
-        return [row[name] for row in rows if name in row]
+        from dew.training import LocalTracker
+
+        reports = LocalTracker(directory / "activity" / "tracking").scalars()
+        return [values[name] for _, values in reports if name in values]
 
     trained = run("-c", TRAIN_RUN, str(tmp_path / "first"))
     assert trained.returncode == 0, trained.stderr[-3000:]

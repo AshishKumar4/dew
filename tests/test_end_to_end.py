@@ -16,12 +16,8 @@ import optax
 import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
-from reference_error import (
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_computes_the_oracle,
-    chain_roundings,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
 from test_lpips import drawn_weights
 from test_mean_flow import CLASSES
 

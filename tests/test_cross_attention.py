@@ -21,7 +21,7 @@ import numpy as np
 import optax
 import pytest
 import torch
-from model_support import TINY_DECODER, Digits, decoder, flat_tree
+from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
 
@@ -49,6 +49,7 @@ from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
+from dew.nn.precision import WIDE_CPU_ARITHMETIC
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec, Trainer
@@ -81,12 +82,18 @@ SEEDS = {"block float32": 512, "block bfloat16": 512, "base": 16, "decode": 16, 
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
+@functools.cache
+def block_shapes():
+    """The block's parameters' shapes, traced once for every draw."""
+    return jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
+                          CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32)))["params"]
+
+
 def block_draw(seed, dtype=np.float32):
     """The residual, a context, each row's real context tokens (one or more), the block's parameters
     with its gates away from zero, and a cotangent on its output, drawn from `seed` in `dtype`."""
     rng = np.random.default_rng(seed)
-    shapes = jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
-                            CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32)))["params"]
+    shapes = block_shapes()
 
     def leaf(path, shape):
         name = path[-1].key
@@ -120,12 +127,19 @@ def idefics_block(wide: bool):
 
     from tools.torch_precision import float64
 
-    def forward(x, context, params, *, lengths):
+    @functools.cache
+    def built(dtype):
+        """The layer in `dtype`, built once under the arm's precision: every parameter it computes with is
+        the draw's (`functional_call`), so one build serves every draw."""
         with float64() if wide else contextlib.nullcontext():
             config = IdeficsConfig(hidden_size=D, num_attention_heads=H, intermediate_size=WIDTH,
                                    rms_norm_eps=EPS, hidden_act="silu", vision_config={"embed_dim": FEATURES},
                                    attn_implementation="eager")
-            layer = IdeficsGatedCrossAttentionLayer(config).to(x.dtype)
+            return IdeficsGatedCrossAttentionLayer(config).to(dtype)
+
+    def forward(x, context, params, *, lengths):
+        layer = built(x.dtype)
+        with float64() if wide else contextlib.nullcontext():
             mlp = params["mlp"]
             weights = {
                 "input_layernorm.weight": params["input_layernorm"]["scale"],
@@ -148,11 +162,12 @@ def idefics_block(wide: bool):
     return run
 
 
-@pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
-def test_the_block_computes_and_differentiates_as_idefics(dtype):
+@pytest.mark.parametrize("precision", ["float32", "bfloat16"])
+def test_the_block_computes_and_differentiates_as_idefics(precision):
     """Through both gated branches, the output and the gradients into the residual, the context and
     every parameter on par with IDEFICS's in float32 and in bfloat16 (check 1), over contexts of
     every length; the gates' products are at least float32."""
+    dtype = {"float32": np.float32, "bfloat16": jnp.bfloat16}[precision]
     label = f"block {np.dtype(dtype).name}"
     assert_as_exact(dew_block, idefics_block(wide=False), functools.partial(block_draw, dtype=dtype), label,
                     seeds=SEEDS[label], truth_fn=idefics_block(wide=True))
@@ -177,16 +192,37 @@ def test_zero_gates_and_an_empty_context_leave_the_residual_as_it_is():
     assert not np.array_equal(np.asarray(out)[0], x[0]), "a row with a context moves"
 
 
+def test_a_block_whose_every_row_reads_one_context_token_moves_neither_its_query_nor_its_key_projection(
+        monkeypatch):
+    """A row that reads one context token attends it whatever the scores, so when every row does the
+    gradients into the block's query and key projections are exactly zero, as IDEFICS's and float64's are,
+    while its value projection moves: through jax.nn's xla kernel too, whose scaled logits XLA:CPU contracts
+    with the subtraction of their maximum into one FMA in this program, leaving each token's weight a
+    rounding off 1 (3e-7 of query and key gradient), where `_fused_attention` has its softmax take the
+    textbook derivative, zero for any such weight (two of the 2,560 seeds of
+    `test_the_block_computes_and_differentiates_as_idefics` draw every row of one token), under a process's
+    own CPU arithmetic (the suite's wide one hands every xla call on, `XLA_SUPPORTS`)."""
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    x, context, params, _, cotangent = block_draw(0)
+    _, _, _, gradients = dew_block(x, context, params, np.ones(B, np.int32), cotangent)
+    for name in ("q_proj", "k_proj"):
+        assert not np.any(np.asarray(gradients[name]["kernel"])), name
+    assert np.any(np.asarray(gradients["v_proj"]["kernel"]))
+
+
 def model_draw(model: CausalTransformer, *, gated: bool = True):
     """Check 1's draw for `model`: a seed's variables, their gates drawn away from zero where
     `gated`, and its tokens, a context and each row's context tokens, a row of none among them."""
     init = jax.jit(model.init)
 
+    cross = model.cross_attention
+    assert cross is not None
+
     def draw(seed):
         rng = np.random.default_rng(seed)
         ids = rng.integers(0, VOCAB, (B, SEQ)).astype(np.int32)
-        context = rng.standard_normal((B, CROSS.context_length, CROSS.context_features)).astype(np.float32)
-        lengths = rng.integers(0, CROSS.context_length + 1, B).astype(np.int32)
+        context = rng.standard_normal((B, cross.context_length, model.context_width)).astype(np.float32)
+        lengths = rng.integers(0, cross.context_length + 1, B).astype(np.int32)
         lengths[0] = 0
         variables = init(jax.random.key(seed), ids)
         if gated:
@@ -210,9 +246,10 @@ def float64(model):
     return model.clone(dtype=jnp.float64, attention_impl="reference")
 
 
-def fresh_against_base(model: CausalTransformer, label: str):
+def fresh_against_base(model: CausalTransformer, label: str, seeds: int | None = None):
     """Check 1: `model` drawn at zero gates, reading a context, on par with the decoder without its
-    blocks from that decoder's float64: the same function in two programs."""
+    blocks from that decoder's float64: the same function in two programs, over `seeds` (this file's
+    `SEEDS[label]` unless given)."""
     base = dataclasses.replace(model, cross_attention=None)
 
     def base_logits(model):
@@ -220,7 +257,7 @@ def fresh_against_base(model: CausalTransformer, label: str):
         return lambda variables, ids, context, lengths: run(_without_blocks(variables), ids)
 
     assert_as_exact(logits(model), base_logits(base), model_draw(model, gated=False), label,
-                    seeds=SEEDS[label], truth_fn=base_logits(float64(base)))
+                    seeds=SEEDS[label] if seeds is None else seeds, truth_fn=base_logits(float64(base)))
 
 
 def test_a_fresh_block_computes_the_decoder_it_was_attached_to():
@@ -258,39 +295,56 @@ def _without_blocks(variables):
     return kept(dict(variables))
 
 
-@jax.jit
-def _decoded(variables, ids, context, lengths):
-    """The prompt prefilled with its context into a fresh cache, then each later token a step with
-    none: the logits from the prompt's last position on."""
-    _, made = MODEL.apply(variables, ids.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])
-    out, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
-                            conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
-    steps = [out[:, -1]]
-    for position in range(PROMPT, SEQ):
-        out, held = MODEL.apply({**variables, **held}, ids[:, position:position + 1], decode=True,
-                                mutable=["cache"])
-        steps.append(out[:, -1])
-    return jnp.stack(steps, axis=1)
+def decoded(model: CausalTransformer):
+    """`model`'s prompt prefilled with its context into a fresh cache, then each later token a step
+    with none: the logits from the prompt's last position on, compiled."""
+    @jax.jit
+    def run(variables, ids, context, lengths):
+        _, made = model.apply(variables, ids.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])
+        out, held = model.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
+                                conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
+        steps = [out[:, -1]]
+        for position in range(PROMPT, SEQ):
+            out, held = model.apply({**variables, **held}, ids[:, position:position + 1], decode=True,
+                                    mutable=["cache"])
+            steps.append(out[:, -1])
+        return jnp.stack(steps, axis=1)
+    return run
+
+
+def assert_a_cached_context_decodes_as_the_full_forward(model: CausalTransformer, label: str,
+                                                        seeds: int | None = None):
+    """The context a prefill carries stays in `model`'s cache, its count a row with it, and each later
+    step attends over it without it: the steps' logits on par with the full forwards', each step's at
+    the width it reads (`stepped_outputs`), from the float64 forward (check 1), over `seeds` (this
+    file's `SEEDS["decode"]` unless given)."""
+    def full(model):
+        run = logits(model)
+        return lambda variables, ids, context, lengths: run(variables, ids, context, lengths)[:, PROMPT - 1:]
+
+    run = logits(model)
+
+    def passes(variables, ids, context, lengths):
+        return stepped_outputs(lambda length: run(variables, ids[:, :length], context, lengths),
+                               ids.shape[1], PROMPT)[:, PROMPT - 1:]
+
+    draw = model_draw(model)
+    assert_as_exact(decoded(model), passes, draw, label,
+                    seeds=SEEDS["decode"] if seeds is None else seeds, truth_fn=full(float64(model)))
+    variables, ids, context, lengths = draw(0)
+    _, made = model.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
+    _, held = model.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
+                          conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
+    kept = [leaf for path, leaf in flat_tree(held["cache"]).items() if path.endswith(CROSS_LENGTHS)]
+    assert model.cross_attention is not None and len(kept) == len(model.cross_attention.layer_ids)
+    for leaf in kept:
+        np.testing.assert_array_equal(np.asarray(leaf), lengths)
 
 
 def test_a_cached_context_decodes_as_the_full_forward():
     """The context a prefill carries stays in the cache, and each later step attends over it without
     it: the steps' logits on par with the full forward's from the float64 forward (check 1)."""
-    def full(model):
-        run = logits(model)
-        return lambda variables, ids, context, lengths: run(variables, ids, context, lengths)[:, PROMPT - 1:]
-
-    draw = model_draw(MODEL)
-    assert_as_exact(_decoded, full(MODEL), draw, "cached context", seeds=SEEDS["decode"],
-                    truth_fn=full(float64(MODEL)))
-    variables, ids, context, lengths = draw(0)
-    _, made = MODEL.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
-    _, held = MODEL.apply({**variables, **made}, ids[:, :PROMPT], decode=True, mutable=["cache"],
-                          conditioning={CONTEXT: context, CONTEXT_LENGTHS: lengths})
-    kept = [leaf for path, leaf in flat_tree(held["cache"]).items() if path.endswith(CROSS_LENGTHS)]
-    assert len(kept) == len(CROSS.layer_ids)
-    for leaf in kept:
-        np.testing.assert_array_equal(np.asarray(leaf), lengths)
+    assert_a_cached_context_decodes_as_the_full_forward(MODEL, "cached context")
 
 
 def test_a_scanned_stack_runs_its_blocks_as_the_plain_one():
@@ -492,23 +546,23 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
     server = Server.from_task(served_task(), slots=2, capacity=128)
     wide = request(0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 4, 7))}), 2, key=0)
     with pytest.raises(ValueError):
-        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2)
+        server.submit(dataclasses.replace(wide, conditioning={CONTEXT: jnp.zeros((1, 5, 6))}), 2, key=0)
     for length in (-1, 3):
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2, key=0)
     model = decoder().clone(max_seq_len=128)
     plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
-        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2)
+        Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2, key=0)
     with jax.enable_x64(new_val=True):
         wrapped = np.asarray([2 ** 32 + 1], np.int64)
         with pytest.raises(ValueError):
             server.submit(dataclasses.replace(wide, conditioning={
-                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2)
+                CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: wrapped}), 2, key=0)
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
@@ -722,3 +776,34 @@ def test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pas
         encode_context(model.with_cross_attention(None), variables, tokens, lengths, encoder="table")
     with pytest.raises(ValueError):
         encode_context(model, variables, tokens, lengths, encoder="other")
+
+
+def test_a_served_requests_host_context_is_checked_on_the_host():
+    """A request whose context is host NumPy is checked where it is at submit, nothing of it copied to
+    a device and back before admission places the batch (ledger 1875), and draws what the same
+    request on the device draws."""
+    bound = served_task()
+    given = request(0)
+    host = ModelInputs(np.asarray(given.tokens), conditioning={
+        name: np.asarray(value) for name, value in given.conditioning.items()})
+    server = Server.from_task(bound, slots=2, capacity=128)
+    with jax.transfer_guard_host_to_device("disallow_explicit"):
+        ticket = server.submit(host, BUDGETS[0], key=0)
+    server.run()
+    assert_same_generation(ticket.result(), bound(given, BUDGETS[0], key=0))
+
+
+def test_a_tokens_context_is_present_where_its_document_holds_keys_whatever_their_order():
+    """A token reads the cross-attention where its document holds any of the context's keys (`holds_keys`),
+    the keys in any order and with padding (0) anywhere among them, and a padding token never does: as
+    the membership of every query among the keys says, over drawn ids (exact, booleans)."""
+    from dew.nn.documents import CrossDocuments, holds_keys
+
+    rng = np.random.default_rng(0)
+    queries = rng.integers(0, 6, (4, 32)).astype(np.int32)
+    keys = rng.integers(0, 6, (4, 48)).astype(np.int32)
+    keys[:, ::7] = 0
+    member = np.any((queries[:, :, None] == keys[:, None, :]) & (keys[:, None, :] > 0), axis=-1)
+    held = holds_keys(CrossDocuments(jnp.asarray(queries), jnp.asarray(keys)))
+    np.testing.assert_array_equal(np.asarray(held), member & (queries > 0))
+    assert member.any() and not member.all()

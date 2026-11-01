@@ -49,6 +49,7 @@ export const groups = [
 		label: 'Language models',
 		items: [
 			{ source: 'docs/concepts/language_models.md', slug: 'guides/language-models', label: 'Training' },
+			{ source: 'docs/concepts/diffusion_language_models.md', slug: 'guides/diffusion-language-models', label: 'Diffusion language models' },
 			{ source: 'docs/concepts/moe.md', slug: 'concepts/moe', label: 'Mixture of experts' },
 			{ source: 'docs/concepts/post_training.md', slug: 'guides/post-training', label: 'Post-training' },
 			{ source: 'docs/concepts/inference.md', slug: 'guides/inference', label: 'Generation and serving' },

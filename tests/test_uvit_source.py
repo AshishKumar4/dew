@@ -18,7 +18,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import fixture_with_meta, recorded_gradients
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 from torch_layout import QKV, case_arrays, dew_leaf, join_qkv, leaf, split_qkv, torch_leaf
 
 from dew.nn.backbones.uvit import UViT

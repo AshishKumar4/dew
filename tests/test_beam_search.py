@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import initialized_decoder
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs

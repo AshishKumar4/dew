@@ -55,6 +55,7 @@ The pages assume you know Python, NumPy and the basics of training with gradient
 | Diffusion processes, presets, solvers and guidance | [Diffusion processes and solvers](concepts/diffusion.md) |
 | Training an image diffusion model | [Diffusion training](guides/diffusion.md) |
 | Language models: training, loading published checkpoints | [Language models](concepts/language_models.md) |
+| Diffusion language models: masked diffusion, DiffusionGemma | [Diffusion language models](concepts/diffusion_language_models.md) |
 | Mixture-of-experts layers | [Mixture of experts](concepts/moe.md) |
 | SFT, DPO, GRPO and PPO | [Post-training](concepts/post_training.md) |
 | Text generation and serving | [Generation and serving](concepts/inference.md) |
@@ -67,4 +68,4 @@ The pages assume you know Python, NumPy and the basics of training with gradient
 
 Dew is research software before version 1.0, so the API and checkpoint formats can change between versions. I have run it on CPU, on pools of local processes, on single GPUs, on one host with four GPUs and on one TPU v6e chip, but not on two physical nodes. [Multiple hosts](guides/multi-node.md) lists what has and has not been run. The [roadmap](roadmap.md) lists work still to complete or qualify.
 
-[Papers and attribution](references.md) lists the papers and upstream code behind the models and methods. The binding [architecture](design/architecture.md), [training](design/training.md), [data](design/data.md), [post-training](design/post-training.md) and [testing](design/testing.md) specs stay in the repository under `docs/design`. Research notes stay under `docs/research`.
+[Papers and attribution](references.md) lists the papers and upstream code behind the models and methods. The binding [architecture](design/architecture.md), [training](design/training.md), [data](design/data.md), [post-training](design/post-training.md), [testing](design/testing.md) and [algebraic optimization](design/algebra.md) specs stay in the repository under `docs/design`. Research notes stay under `docs/research`.

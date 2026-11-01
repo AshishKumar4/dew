@@ -4,7 +4,9 @@ A model's logits over a vocabulary, a classifier's over its classes, a decision'
 options and a sampler's over its next token are each a categorical distribution over the last axis.
 Every log-likelihood Dew takes of one composes on this module: the normalized log probabilities
 (`log_probs`), a label's cross entropy (`cross_entropy`), a soft target's (`soft_cross_entropy`), a
-divergence from a reference distribution (`kl_divergence`), the entropy (`entropy`), the divergence
+divergence from a reference distribution (`kl_divergence`), the entropy (`entropy`), the proper scoring
+rules' charges of a forecast against a target distribution beside the logarithmic one (`brier`,
+`spherical`, `ranked_probability`) and a target smoothed toward the even one (`smoothed`), the divergence
 among a group's members over the classes they share (`group_divergence`), and, for a head
 that reads its vocabulary in blocks (`dew.objectives.lm.chunked`), the running partition it combines
 block by block (`rescaled`), a label's cross entropy from it (`target_loss`) and the log partition of
@@ -28,9 +30,9 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.precision import at_least_fp32
 
-__all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative", "label_entry",
-           "log_probs", "probabilities", "rescaled", "segment_log_partition", "soft_cross_entropy",
-           "target_loss"]
+__all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
+           "label_entry", "log_probs", "partition", "probabilities", "ranked_probability", "rescaled",
+           "segment_log_partition", "smoothed", "soft_cross_entropy", "spherical", "target_loss"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -71,17 +73,36 @@ def _probabilities_tangent(primals, tangents):
 
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`-log p[labels]` over the last axis, `labels` of `logits.shape[:-1]`: the log partition less the
-    label's logit, as Optax takes it, which reads the label's logit without building the normalized
-    row. Its derivative is Barron, Gnanapragasam and Tschannen's (arXiv:2610.31642, eq. 7): each other
-    class's probability, and at the label minus their sum, so the row's derivative sums to zero. The
-    label's `p - 1` collapses to 0 once its margin over the other classes passes the dtype's precision
-    (eq. 4; 16.6 in float32), while the others' probabilities stay until they underflow."""
+    label's logit, each taken from the row's maximum (`target_loss`), which reads the label's logit
+    without building the normalized row. Optax's `softmax_cross_entropy_with_integer_labels` subtracts
+    the label's logit from the whole log partition, maximum included, which rounds at the logits'
+    magnitude rather than the loss's: mamba-tiny's drawn tokens' raw scores sat 1.47 times as far from
+    float64 as `log_softmax`'s, and 1.00 times so taken here. Its derivative is Barron, Gnanapragasam
+    and Tschannen's (arXiv:2610.31642, eq. 7): each other class's probability, and at the label minus
+    their sum, so the row's derivative sums to zero. The label's `p - 1` collapses to 0 once its margin
+    over the other classes passes the dtype's precision (eq. 4; 16.6 in float32), while the others'
+    probabilities stay until they underflow."""
     return _label_loss(widened(logits, where), labels)
+
+
+def partition(logits: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Each row's maximum over the last axis, the sum of its exponentials scaled to it, and those
+    exponentials: the terms every whole-row label loss takes its log partition from (`target_loss`;
+    `cross_entropy`, `dew.objectives.lm.chunked`'s whole head).
+
+    The maximum is finite, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
+    holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
+    """
+    largest = jnp.max(logits, axis=-1)
+    peak = jnp.where(jnp.isfinite(largest), largest, 0)
+    shifted = jnp.exp(logits - peak[..., None])
+    return peak, jnp.sum(shifted, axis=-1), shifted
 
 
 @jax.custom_jvp
 def _label_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    return optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    peak, mass, _ = partition(logits)
+    return target_loss(peak, mass, jnp.take_along_axis(logits, labels[..., None], axis=-1)[..., 0])
 
 
 @_label_loss.defjvp
@@ -265,6 +286,41 @@ def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
     return -(jnp.exp(log_p) * held).sum(axis=-1)
 
 
+def smoothed(targets: jax.Array, where: jax.Array | None = None, share: float = 0.0) -> jax.Array:
+    """`targets` over the last axis with `share` of their mass spread evenly over the classes `where`
+    holds, `(1 - share) t_k + share / K` for a row of K classes, and nothing on the others."""
+    held = jnp.ones(targets.shape, bool) if where is None else where
+    count = jnp.sum(held, axis=-1, keepdims=True)
+    return jnp.where(held, (1.0 - share) * targets + share / count, 0.0)
+
+
+def brier(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
+    """The quadratic score as a charge, `sum_k (p_k - t_k)^2` over the last axis, between 0 and 2."""
+    p = probabilities(logits, where)
+    gaps = (p - targets) ** 2
+    return jnp.sum(gaps if where is None else jnp.where(where, gaps, 0.0), axis=-1)
+
+
+def spherical(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
+    """The spherical score as a charge, `1 - (t . p) / |p|` over the last axis, between 0 and 1."""
+    p = probabilities(logits, where)
+    return 1.0 - jnp.sum(targets * p, axis=-1) / jnp.linalg.norm(p, axis=-1)
+
+
+def ranked_probability(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
+    """The ranked probability score of classes that are ordered levels: the squared gaps between the
+    forecast's and the target's cumulative distributions over the K - 1 cuts between a row's K levels,
+    `sum_k (P_k - T_k)^2 / (K - 1)` over the last axis, the levels `where` holds leading the row."""
+    p = probabilities(logits, where)
+    held = jnp.ones(targets.shape, bool) if where is None else where
+    # The target's cumulative sum at the forecast's precision or wider, never a bfloat16 target's own.
+    target = jnp.where(held, targets, 0.0).astype(jnp.result_type(p.dtype, targets.dtype))
+    gaps = (jnp.cumsum(p, axis=-1) - jnp.cumsum(target, axis=-1)) ** 2
+    cuts = jnp.maximum(jnp.sum(held, axis=-1) - 1, 1)
+    # The last cut, past every level, is always zero.
+    return jnp.sum(jnp.where(held, gaps, 0.0), axis=-1) / cuts
+
+
 def group_divergence(logits: jax.Array, groups: jax.Array, classes: jax.Array,
                      where: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
     """Each member's share of its group's generalized Jensen-Shannon divergence, and its share of the
@@ -324,10 +380,12 @@ def _wide(*operands: jax.Array) -> tuple[jax.Array, ...]:
 
 def rescaled(maximum: jax.Array, total: jax.Array, larger: jax.Array) -> jax.Array:
     """A sum of exponentials moved from its own maximum to the larger one, as a blockwise partition
-    combines its blocks; unchanged where they agree, so two sums whose maximum is -inf add rather than
-    turn NaN."""
+    combines its blocks: where the two agree the shift is exactly 0 and the sum unchanged, its derivative
+    still the moved sum's, so two blocks whose maxima tie each move by their own maximum's tangent less
+    the larger's; two sums whose maximum is -inf add as they are rather than turn NaN."""
     maximum, total, larger = _wide(maximum, total, larger)
-    return jnp.where(maximum == larger, total, total * jnp.exp(maximum - larger))
+    empty = (maximum == larger) & ~jnp.isfinite(larger)
+    return jnp.where(empty, total, total * jnp.exp(jnp.where(empty, 0, maximum - larger)))
 
 
 def target_loss(peak: jax.Array, mass: jax.Array, target: jax.Array) -> jax.Array:

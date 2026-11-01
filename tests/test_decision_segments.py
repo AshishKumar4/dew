@@ -14,7 +14,15 @@ from dew._records import JSON
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, JointLayout, Layout, Media, Noul, Schema, State, Text
 from dew.decision.head import Head, JointSchemaHead
-from dew.decision.layout import JOINT_SEGMENTS, Specials
+from dew.decision.layout import (
+    JOINT_SEGMENTS,
+    AnswerCue,
+    Instructions,
+    Labels,
+    OptionLines,
+    Specials,
+    StateFirstLayout,
+)
 from dew.registry import from_record, to_record
 
 QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "holds": Noul("Does it hold?")}
@@ -75,6 +83,44 @@ def test_a_row_holds_the_schema_once_and_the_images_at_most_once():
     with pytest.raises(ValueError):
         JointLayout(segments=(Text("STATE:\n"), State(), Schema())).rows(TOKENIZER, SPECIALS, "s", QUESTIONS,
                                                                          media=(1, 2))
+
+
+HEADERS = dict.fromkeys(("choice", "noul", "score"), "Q: {}\n")
+"""A question row's header of each kind, its instructions in its place."""
+
+
+@pytest.mark.parametrize("part", [Instructions(HEADERS), OptionLines(), AnswerCue()],
+                         ids=lambda part: type(part).__name__)
+def test_a_joint_row_refuses_a_part_it_cannot_render(part):
+    """A joint row writes its questions, their instructions and options, in its schema and reads no cue:
+    a question row's part among its segments is refused when the layout is built, never rendered as
+    nothing (row 1943)."""
+    with pytest.raises(ValueError):
+        JointLayout(segments=(Schema(), State(), part))
+
+
+@dataclasses.dataclass(frozen=True)
+class KeptState(State):
+    """A state part of a kind of its own, which a joint row renders as the state it is."""
+
+
+def test_a_part_whose_kind_a_layout_renders_is_rendered_whatever_its_subclass():
+    """A joint row's part of a kind of its own, a state's subclass, is built and rendered as the state
+    itself, its row the same tokens."""
+    [own] = JointLayout(segments=(Schema(), KeptState())).rows(TOKENIZER, SPECIALS, "abc", QUESTIONS)
+    [plain] = JointLayout(segments=(Schema(), State())).rows(TOKENIZER, SPECIALS, "abc", QUESTIONS)
+    assert own.tokens == plain.tokens
+
+
+@pytest.mark.parametrize("part", [Schema(), Media()], ids=lambda part: type(part).__name__)
+def test_a_question_row_refuses_a_part_it_cannot_render(part):
+    """A question row holds no schema and no images: a joint row's part among its segments is refused
+    when the layout is built, its own parts alone built (row 1943)."""
+    own = (Instructions(HEADERS), OptionLines(), State(render="state"), AnswerCue())
+    labels = Labels(variants=("{}",))
+    StateFirstLayout(max_len=256, labels=labels, segments=own)
+    with pytest.raises(ValueError):
+        StateFirstLayout(max_len=256, labels=labels, segments=(*own, part))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,6 +208,49 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
         Decide.from_run(str(tmp_path / "unread"))
 
 
+def test_an_earlier_record_of_a_segmented_question_layout_loads_without_the_budgets_it_ignored(tmp_path):
+    """A run of a lettered question layout of segments, saved as an earlier Dew saved it, its record
+    holding the question budgets it wrote at their defaults (192 and 48) and its rows ignored, and not
+    yet the row's order, loads through the pinned run boundary (`earlier_shapes`) and answers as the run
+    of today's record does (row 2006); a record of today, which states the order, keeps the budgets it
+    states, which a row of segments now takes (row 2007)."""
+    import numpy as np
+    import optax
+    from decision_support import decision_rows
+    from test_decision_objective import EXAMPLES, INTENT, tiny_backbone
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import Decide, DecisionObjective
+    from dew.decision.head import LabelReadout
+    from dew.training import Trainer
+
+    labels = Labels(names=("A", "B", "C"), variants=("{}",))
+    segments = (Instructions(HEADERS), OptionLines(), State(render="state"), AnswerCue())
+    layout = StateFirstLayout(max_len=256, labels=labels, segments=segments)
+    head = LabelReadout(32, labels.ids(TOKENIZER, 3))
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, head=head)
+    state = Trainer(objective, optax.adam(1e-3), key=0).fit(
+        decision_rows(EXAMPLES, 8, objective=objective.data()), steps=1, log_every=100)
+    record = objective.inference_record()
+    assert isinstance(record, dict)
+    fields = record["layout"]["fields"]
+    budgets = {"head_max_len": 192, "option_tokens": 48}
+    written = {**{name: value for name, value in fields.items() if name not in ("order", "split")}, **budgets}
+    earlier = {**record, "layout": {**record["layout"], "fields": written}}
+    budgeted = {**record, "layout": {**record["layout"], "fields": {**fields, **budgets}}}
+    for name, artifact in (("today", record), ("earlier", earlier), ("budgeted", budgeted)):
+        with Checkpoints(str(tmp_path / name)) as checkpoints:
+            checkpoints.save(1, state, artifact=artifact)
+            checkpoints.wait()
+    today, loaded, kept = (Decide.from_run(str(tmp_path / name)) for name in ("today", "earlier", "budgeted"))
+    assert loaded.layout == today.layout
+    assert kept.layout == dataclasses.replace(today.layout, **budgets)
+    asked = {"team": INTENT}
+    np.testing.assert_array_equal(loaded(EXAMPLES[0].state, asked)["team"].probabilities,
+                                  today(EXAMPLES[0].state, asked)["team"].probabilities)
+
+
 def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
     """A layout whose segments write no state keeps none of it, so a scoring task that answers only
     whole requests refuses a request with a state, as it refuses one whose state the row cut."""
@@ -212,3 +301,18 @@ def test_a_joint_row_holds_the_state_twice_each_copy_cut_to_its_own_budget():
             == again.rows(TOKENIZER, SPECIALS, state, QUESTIONS))
     with pytest.raises(ValueError):
         JointLayout(segments=(State(render="state"), Schema()))
+
+
+def test_a_joint_row_keeps_a_conversations_end_where_its_state_keeps_a_conversations_end():
+    """A joint row's state that keeps a conversation's end (`end_if_conversation`) keeps a list state's
+    last turns, as a copy kept at its end does, and a record state's start, as a copy kept at its start
+    does."""
+    conversation = [{"role": "user", "content": f"turn {turn}"} for turn in range(20)]
+    record = {"history": list(range(40))}
+
+    def row(keep, state):
+        layout = JointLayout(max_len=1 << 20, segments=(State(keep=keep, max_tokens=12), Schema()))
+        return layout.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+
+    assert row("end_if_conversation", conversation) == row("end", conversation) != row("start", conversation)
+    assert row("end_if_conversation", record) == row("start", record) != row("end", record)

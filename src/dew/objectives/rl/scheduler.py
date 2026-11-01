@@ -73,10 +73,23 @@ without the carry-over. With `admit` below the task batch size, the
 scheduler admits the first `admit` groups to complete and fit, and cancels
 the others, as slime's over-sampling batch does. Both select by completion
 time, which favors short rollouts; that bias is the price of not waiting on
-the tail. Rollouts that are running when new weights are pushed keep
-running. Their later calls are stamped with the new version, and a
-rollout's staleness is that of its oldest call, as in Kimi K2's partial
-rollouts (arXiv:2507.20534 section 3.3.4).
+the tail. With `varied`, DAPO's dynamic sampling (arXiv:2503.14476 equation
+11 and Algorithm 1), a complete group whose members' returns all agree is
+left out, since it gives each of them a zero advantage, and admission goes
+on through the batch's other groups, drawn under the same weights, until
+`admit` groups are admitted or the batch has none left: a batch of more
+tasks than `admit` is DAPO's generation batch over its training batch. With
+`generation_batches` above one, a call still short of its groups draws the
+data stream's next batch, as many as that in all, and admits from its groups
+too, until the step's batch is full (DAPO's Algorithm 1, verl's
+`max_num_gen_batches`): every process draws while any share's first reader
+is short, so the streams read alike, and the step's checkpoint saves the
+stream's position after the last batch drawn.
+
+Rollouts that are running when new weights are pushed keep running. Their
+later calls are stamped with the new version, and a rollout's staleness is
+that of its oldest call, as in Kimi K2's partial rollouts (arXiv:2507.20534
+section 3.3.4).
 
 Asynchronously, the scheduler pushes weights through `weights` when the
 served version falls `sync_every` updates behind the trainer, or is ahead
@@ -98,8 +111,13 @@ is all the processes' rows together, sharded as the trainer shards any
 batch, and no rollout moves between processes. The processes act together
 at a few points in each call, each an agreement point over the trainer's
 mesh where every process raises if one failed, in this order: the call's
-preparation, the acquisition and its admission, the packing, the engine
-records' layout, the first reader's rows and the proximal rescoring. A
+preparation, the acquisition and its admission, the `global` estimator's
+moments, which every share's pool so its advantages are whitened over the
+step's whole batch, the packing, the engine records' layout, the first
+reader's rows and the proximal rescoring; with a reward-side reference
+penalty (`reference`), the moments wait for it, and the rows' scoring
+under the reference, the moments, the repacked advantages and the first
+reader's rows follow the rescoring. A
 weight push is one call every process makes, so the publisher has to agree
 on it across processes. When a tensor or sequence axis spans processes,
 several processes read the same share of the data. Then only the share's
@@ -113,6 +131,7 @@ on its own.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import threading
@@ -126,11 +145,13 @@ from typing import ClassVar, Protocol
 import jax
 import numpy as np
 
-from dew._coordination import agreed
+from dew._coordination import agreed, agreed_count, from_every_process
 from dew.batch import Batch, Variables
+from dew.cleanup import attempted
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
+from dew.nn.progress import Progress
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
 from dew.state import TrainState
@@ -141,24 +162,30 @@ from .grpo import GRPOObjective
 from .journal import EpisodeJournal
 from .rollout import PolicyCollector, Reward, prompt_tasks
 from .sessions import (
+    ADVANTAGES_KEY,
     OLD_LOG_PROBS_KEY,
     RESPONSE_MASK_KEY,
     Collector,
+    Moments,
     Session,
     SessionSource,
     Snapshot,
     Status,
     Task,
     agreed_records,
+    centred_moments,
     chain_lengths,
     check_credit,
     check_estimator,
     check_truncation,
     local_task_ids,
     pack,
+    pooled,
+    reference_penalties,
     rows_needed,
     sampled_values,
     session_metrics,
+    varies,
 )
 
 
@@ -251,6 +278,9 @@ class _Entry:
     tasks: tuple[Task, ...]
     groups: list[_Group] = field(default_factory=list)
     complete: list[_Group] = field(default_factory=list)
+    packs: _Entry | None = None
+    """The entry whose rows this one's groups pack into: a call's first, for a batch it drew further
+    (`RolloutScheduler.generation_batches`); None for its own."""
 
 
 @dataclass
@@ -259,6 +289,8 @@ class _Tally:
     cancelled: int = 0
     abandoned: int = 0
     cut: int = 0
+    uniform: int = 0
+    """Complete groups left out whose returns all agreed (`RolloutScheduler.varied`)."""
 
 
 def _done(session: Session) -> Future[Session]:
@@ -480,16 +512,28 @@ class Asynchronous:
     def stale(self, sample: _Sample, updates: int) -> bool:
         return updates - sample.submitted > self.lag
 
-    def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray]) -> np.ndarray:
-        """The packed ids' proximal log-probabilities under `variables`, the trainer's weights.
+    def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray], progress: Progress
+                ) -> np.ndarray:
+        """The packed ids' proximal log-probabilities under `variables`, the trainer's weights, at the
+        run's `progress` the step's loss reads (`GRPOObjective.loss`), so the two policies agree where
+        their weights do.
 
         Over a mesh the rows are placed as the step places the batch, every
         process's rows together, so the rescoring runs once over the pool's
         batch and each process reads its own rows back."""
-        mesh = mesh_of(variables)
-        rescore = self.objective.program("packed log probs", self.objective.packed_log_probs)
-        scored = rescore(variables, packed if mesh is None else shard_batch(mesh, dict(packed)))
-        return local_rows(scored).astype(np.float32) * packed[RESPONSE_MASK_KEY]
+        return scored_rows(self.objective, variables, packed, progress)
+
+
+def scored_rows(objective: GRPOObjective, variables: Variables, packed: Mapping[str, np.ndarray],
+                progress: Progress) -> np.ndarray:
+    """This process's packed rows' sampled ids' log-probabilities under `variables` (`packed_log_probs`)
+    at the run's `progress`, over a mesh scored once over the pool's rows, placed as the step places the
+    batch."""
+    mesh = mesh_of(variables)
+    rescore = objective.program("packed log probs", objective.packed_log_probs)
+    placed = packed if mesh is None else shard_batch(mesh, dict(packed))
+    scored = rescore(variables, placed, progress=progress)
+    return local_rows(scored).astype(np.float32) * packed[RESPONSE_MASK_KEY]
 
 
 def _within[T](mesh, phase: str, operation: Callable[[], T]) -> T:
@@ -513,6 +557,16 @@ class RolloutScheduler:
     - `log`, when given, receives a `SchedulerRecord` of this process's
       rollouts after each call. A process that is not the first reader of
       its share packs nothing and logs nothing.
+    - `varied` is DAPO's dynamic sampling (the module docstring), and
+      `overlong` its soft overlong punishment, `(L_max, L_cache)`
+      (`sessions.overlong_penalty`). `generation_batches` is the most data
+      batches a call admits groups from, its step's and those it draws
+      further (`further`, the trainer's read of its stream).
+    - `reference` is the objective whose reward-side reference penalty
+      (`GRPOObjective.reward_kl`) each call's reward pays before the
+      estimator compares returns: the packed rows are scored under its
+      reference, the state's frozen starting policy, and repacked with
+      `sessions.reference_penalties`.
 
     `metrics` holds the latest call's numbers, which the trainer logs as
     `rollout/<name>`.
@@ -529,8 +583,11 @@ class RolloutScheduler:
                  tasks: Callable[[Batch], Sequence[Task]] = task_ids, groups: int = 4, oversample: int = 0,
                  admit: int | None = None, estimator: str = "group", truncation: str = "mask",
                  credit: str = "session", support_capacity: int | None = None,
-                 log: Callable[[SchedulerRecord], None] | None = None):
-        for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0)):
+                 log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
+                 overlong: tuple[int, int] | None = None, reference: GRPOObjective | None = None,
+                 generation_batches: int = 1):
+        for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0),
+                                   ("generation_batches", generation_batches, 1)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
         check_truncation(truncation)
@@ -542,21 +599,52 @@ class RolloutScheduler:
         self.groups, self.oversample, self.admit = groups, oversample, admit
         self.estimator, self.truncation, self.credit, self.log = estimator, truncation, credit, log
         self.support_capacity = support_capacity
+        self.varied = varied
+        if overlong is not None and not (len(overlong) == 2 and 0 < overlong[1] <= overlong[0]):
+            raise ValueError("overlong is (L_max, L_cache), a positive cache within the budget")
+        self.overlong = overlong
+        if reference is not None and not reference.reward_kl > 0:
+            raise ValueError("reference names the objective whose reward-side penalty (reward_kl) the "
+                             "rewards pay, and this one's is 0")
+        self.reference = reference
+        self.generation_batches = generation_batches
         self.metrics: dict[str, float] = {}
+        self._branch: str | None = None
+
+    @property
+    def draws_further(self) -> bool:
+        """Whether a call may draw data batches past its step's (`generation_batches`), which the trainer
+        hands it a read of (`dew.training.rollout.Rollout`)."""
+        return self.generation_batches > 1
 
     @classmethod
     def sampled(cls, objective: TokenScorer, reward: Reward, *,
                 decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids),
                 groups: int = 4, max_new_tokens: int = 32, estimator: str = "group",
                 truncation: str = "score", sampling: Sampling | None = None,
-                log: Callable[[SchedulerRecord], None] | None = None) -> RolloutScheduler:
+                log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
+                overlong: tuple[int, int] | None = None, admit: int | None = None,
+                generation_batches: int = 1) -> RolloutScheduler:
         """Draw `groups` completions of each prompt row from `objective`'s policy at every call and
         train on them (`PolicyCollector` over `prompt_tasks`; GRPO's synchronous loop). A completion
-        that runs out of `max_new_tokens` trains on its reward, as `truncation='score'` says."""
+        that runs out of `max_new_tokens` trains on its reward, as `truncation='score'` says. A reward-side
+        reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own (`reference`).
+
+        The calls' raw likelihoods are the proximal policy's (`Synchronous.rescore`), the policy at
+        temperature 1 over the whole vocabulary: a GRPO objective whose ratio reads its policy at another
+        `sampling_temperature` is refused, since its unchanged weights would not give a ratio of 1."""
+        if isinstance(objective, GRPOObjective) and objective.sampling_temperature != 1.0:
+            raise ValueError(
+                "a synchronous collection's proximal likelihoods are the policy's raw ones, at temperature "
+                f"1, and this objective reads its ratio at sampling_temperature="
+                f"{objective.sampling_temperature}; set it to 1.0, or collect asynchronously, where the "
+                "proximal policy is rescored")
         collector = PolicyCollector(objective, reward, decode, max_new_tokens,
                                     Sampling() if sampling is None else sampling)
         return cls(Synchronous(collector), tasks=prompt_tasks, groups=groups, estimator=estimator,
-                   truncation=truncation, log=log)
+                   truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
+                   reference=objective if isinstance(objective, GRPOObjective) and objective.reward_kl > 0
+                   else None, generation_batches=generation_batches)
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
@@ -578,6 +666,30 @@ class RolloutScheduler:
     def close(self) -> None:
         """Cancel every rollout in flight. The caller closes the source; this method does not."""
         self.acquisition.close()
+
+    @contextlib.contextmanager
+    def branch(self, name: str) -> Iterator[None]:
+        """The calls of the cooldown branch `name` (`dew.training.rollout`): drawn under the branch's
+        states, on its own branch of a collector's records (`Snapshot.branch`: an `EpisodeJournal`'s
+        cohorts, which a resumed branch reads back as its own), its records reach no `log`, and the
+        run's latest `metrics` stand after it. The run closes its own stream for the branch and opens
+        it again at its position after (`Trainer.fit`), and an asynchronous acquisition's stream
+        cancels the rollouts in flight as it opens (`tasks`): the run's as the branch's opens, which
+        the branch's weights would otherwise finish, and the branch's, cancelled here, as it ends. The
+        engines serve the branch's weights meanwhile, and the run's again from its next call
+        (`Asynchronous.begin`: a served version ahead of the run's updates is out of date)."""
+        metrics, log, branch = self.metrics, self.log, self._branch
+        self.log, self._branch = None, name
+        try:
+            yield
+        except BaseException as failure:
+            # The branch's failure stays the one raised; a cancellation's is noted on it.
+            attempted([("cancelling the branch's rollouts", self.close)], primary=failure)
+            raise
+        else:
+            self.close()
+        finally:
+            self.metrics, self.log, self._branch = metrics, log, branch
 
     def _replace(self, group: _Group, sample: _Sample, cause: str, tally: _Tally) -> None:
         """Draw a sample that cannot join its group again, or abandon the group where the
@@ -651,7 +763,8 @@ class RolloutScheduler:
         A session whose calls do not extend each other packs as one chain
         per call, so the rows a group needs are known only once it is done.
         """
-        width, rows = self.acquisition.width, self.acquisition.rows(len(entry.tasks), self.groups)
+        home = entry.packs or entry
+        width, rows = self.acquisition.width, self.acquisition.rows(len(home.tasks), self.groups)
         group.lengths = chain_lengths(group.done, width, truncation=self.truncation)
         alone = rows_needed(group.lengths, width)
         if alone > rows:
@@ -659,18 +772,28 @@ class RolloutScheduler:
                 f"one group of task {group.task.id} needs {alone} rows of {width} ids, "
                 f"more than rows={rows}; size rows for sessions whose calls split into chains"
             )
-        admitted = [length for complete in entry.complete for length in complete.lengths]
+        if self.varied and not varies(group.done, truncation=self.truncation, credit=self.credit,
+                                      overlong=self.overlong):
+            tally.uniform += 1
+            return
+        admitted = [length for complete in home.complete for length in complete.lengths]
         if rows_needed([*admitted, *group.lengths], width) <= rows:
-            entry.complete.append(group)
+            home.complete.append(group)
             return
         tally.cut += 1
         tally.cancelled += len(group.live)
         self.acquisition.cancel(group.live)
         group.live.clear()
 
-    def _admit(self, entry: _Entry, updates: int, tally: _Tally) -> list[_Group]:
-        """Wait for the entry's first `admit` complete groups that fit, then cancel the rest."""
-        target = len(entry.groups) if self.admit is None else min(self.admit, len(entry.groups))
+    def _target(self, home: _Entry) -> int:
+        """The groups a call admits: `admit`, or every task of its step's batch (`home`)."""
+        return len(home.groups) if self.admit is None else min(self.admit, len(home.groups))
+
+    def _admit(self, entry: _Entry, updates: int, tally: _Tally) -> None:
+        """Wait until the call's first entry holds its `_target` complete groups that fit, or `entry`
+        has none left to complete, then cancel the rest of `entry`'s."""
+        home = entry.packs or entry
+        target = self._target(home)
         try:
             while True:
                 pending = [group for group in entry.groups
@@ -680,7 +803,7 @@ class RolloutScheduler:
                 pending = [
                     group for group in pending if not group.abandoned and len(group.done) < self.groups
                 ]
-                if len(entry.complete) >= target or not pending:
+                if len(home.complete) >= target or not pending:
                     break
                 live = [sample.future for group in pending for sample in group.live]
                 wait(live, return_when=FIRST_COMPLETED)
@@ -690,28 +813,48 @@ class RolloutScheduler:
             self.acquisition.cancel(leftover)
             for group in entry.groups:
                 group.live.clear()
-        if not entry.complete:
-            raise RuntimeError(f"no group of batch {entry.serial} completed: every one was abandoned")
-        return entry.complete[:target]
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
+    def _admitted_groups(self, home: _Entry, tally: _Tally, drawn: int) -> list[_Group]:
+        """The call's admitted groups, its first `_target` complete ones; refused where none completed."""
+        if not home.complete and tally.uniform:
+            raise RuntimeError(
+                f"no group of batch {home.serial} varied: the members of each of the {tally.uniform} "
+                f"complete groups of the {drawn} batches it drew earned one return (varied); a batch of "
+                "more tasks than admit=, or generation_batches= above 1, draws the groups that replace "
+                "them")
+        if not home.complete:
+            raise RuntimeError(f"no group of batch {home.serial} completed: every one was abandoned")
+        return home.complete[:self._target(home)]
+
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array,
+                 further: Callable[[], Batch | None] | None = None) -> dict[str, np.ndarray]:
+        if self.draws_further and further is None:
+            raise ValueError("generation_batches above 1 draws further batches through the trainer's read of "
+                             "its stream (further=), and this call was handed none")
         mesh = mesh_of(state.variables)
         partition = DataPartition() if mesh is None else DataPartition.of(mesh)
-        snapshot = Snapshot(state.variables, int(state.step), int(state.updates), key)
+        snapshot = Snapshot(state.variables, int(state.step), int(state.updates), key, self._branch)
         self.acquisition.begin(snapshot, partition)
         entries = _within(mesh, "rollout preparation", lambda: self.acquisition.entries(batch, self.tasks_of))
         acquiring = self.acquisition.acquires(partition)
-        rollouts, latencies, groups, tally, waited = _within(
-            mesh, "rollout admission",
-            lambda: self._admitted(entries, snapshot, partition) if acquiring else ([], [], 0, _Tally(), 0.0))
+        rollouts, latencies, groups, tally, waited, drawn = self._admitted(
+            mesh, entries, snapshot, partition, acquiring, further)
         sampling = partition.reader == 0
+        mine = rollouts if sampling else []
+        # Rewards that pay the reference penalty are known once the packed rows are scored (`_penalized`).
+        whitening = (self._whitening(mesh, mine, None)
+                     if self.estimator == "global" and self.reference is None else None)
         # A share's packing that fails (a support past its capacity) fails every process, not one.
         packed = _within(mesh, "rollout packing",
-                         lambda: self._packed(entries[0], rollouts) if sampling else {})
+                         lambda: self._packed(entries[0], rollouts, whitening=whitening) if sampling else {})
         if mesh is not None:
             packed = first_reader_batch(mesh, agreed_records(packed, self.support_capacity))
         if self.acquisition.rescore is not None:
-            packed[OLD_LOG_PROBS_KEY] = self.acquisition.rescore(state.variables, packed)
+            # At the updates the step's loss reads its policy at (`Objective.progress`).
+            packed[OLD_LOG_PROBS_KEY] = self.acquisition.rescore(state.variables, packed,
+                                                                 Progress(state.updates))
+        if self.reference is not None:
+            packed = self._penalized(state, mesh, entries[0], mine if sampling else None, packed)
         if sampling:
             updates = snapshot.updates
             versions = [call.version for rollout in rollouts for call in rollout.calls]
@@ -722,36 +865,113 @@ class RolloutScheduler:
                                      tally.cancelled, tally.abandoned, tally.cut, waited, metrics)
             self.metrics = {**metrics, "lag": float(record.lag), "groups": float(groups),
                             "resubmitted": float(sum(record.resubmitted.values())),
-                            "waited_seconds": waited}
+                            "waited_seconds": waited, "uniform_groups": float(tally.uniform),
+                            "generation_batches": float(drawn)}
             if self.log is not None:
                 self.log(record)
         return packed
 
-    def _admitted(self, entries: Sequence[_Entry], snapshot: Snapshot, partition: DataPartition
-                  ) -> tuple[list[Session], list[float], int, _Tally, float]:
-        """This process's admitted rollouts for the call's entry, their latencies, the group count,
-        the tally and the wait, the entries ahead of it opened as well. A share's later reader opens
-        what the first does and admits nothing: it trains on the first reader's rows."""
-        # The wait counts a synchronous collection, which opening its entry runs.
+    def _admitted(self, mesh, entries: Sequence[_Entry], snapshot: Snapshot, partition: DataPartition,
+                  acquiring: bool, further: Callable[[], Batch | None] | None
+                  ) -> tuple[list[Session], list[float], int, _Tally, float, int]:
+        """This process's admitted rollouts for the call, their latencies, the group count, the tally,
+        the wait and the data batches drawn. The call's first entry is its step's batch, whose rows
+        every admitted group packs into; while its first reader is short of groups on some share, every
+        process draws the stream's next batch (`further`), up to `generation_batches` in all, and admits
+        from it too. A share's later reader opens what the first does and admits nothing: it trains on
+        the first reader's rows."""
+        home, tally, drawn = entries[0], _Tally(), 1
+        admitting = acquiring and partition.reader == 0
+        # The wait counts a synchronous collection, which opening an entry runs.
         began = time.perf_counter()
-        for pending in entries:
-            self.acquisition.open(pending, self.groups + self.oversample, snapshot)
-        if partition.reader != 0:
-            return [], [], 0, _Tally(), time.perf_counter() - began
-        tally = _Tally()
-        admitted = self._admit(entries[0], snapshot.updates, tally)
-        waited = time.perf_counter() - began
-        return ([rollout for group in admitted for rollout in group.done[:self.groups]],
-                [latency for group in admitted for latency in group.latencies[:self.groups]],
-                len(admitted), tally, waited)
 
-    def _packed(self, entry: _Entry, rollouts: Sequence[Session]) -> dict[str, np.ndarray]:
+        def admitted(opened: Sequence[_Entry], drawn: int) -> None:
+            # A batch drawn further samples from its own key, apart from the step's batch's draws.
+            keyed = snapshot if drawn == 1 else dataclasses.replace(
+                snapshot, key=jax.random.fold_in(snapshot.key, drawn - 1))
+            for pending in opened:
+                self.acquisition.open(pending, self.groups + self.oversample, keyed)
+            if admitting:
+                self._admit(opened[0], snapshot.updates, tally)
+
+        def short() -> bool:
+            return admitting and len(home.complete) < self._target(home)
+
+        def drawn_entries(batch: Batch) -> list[_Entry]:
+            opened = self.acquisition.entries(batch, self.tasks_of)
+            opened[0].packs = home
+            return opened
+
+        opened: Sequence[_Entry] = entries
+        while True:
+            admission = functools.partial(admitted, opened, drawn) if acquiring else list
+            _within(mesh, "rollout admission", admission)
+            if drawn == self.generation_batches or not agreed_count("rollout draw", short, bool)[1]:
+                break
+            assert further is not None
+            batch = further()
+            if batch is None:
+                break
+            drawn += 1
+            opened = _within(mesh, "rollout preparation", functools.partial(drawn_entries, batch))
+        groups = _within(mesh, "rollout admission",
+                         lambda: self._admitted_groups(home, tally, drawn) if admitting else [])
+        if not admitting:
+            return [], [], 0, _Tally(), time.perf_counter() - began, drawn
+        waited = time.perf_counter() - began
+        return ([rollout for group in groups for rollout in group.done[:self.groups]],
+                [latency for group in groups for latency in group.latencies[:self.groups]],
+                len(groups), tally, waited, drawn)
+
+    def _whitening(self, mesh, rollouts: Sequence[Session], shaping: Mapping[int, Sequence[float]] | None
+                   ) -> tuple[float, float]:
+        """The `global` estimator's mean and deviation over the step's whole batch: this share's
+        `centred_moments` pooled with every other share's, a later reader's counting none. Over a mesh
+        every process calls it, in the order of its other coordination rounds."""
+        moments = centred_moments(rollouts, truncation=self.truncation, credit=self.credit,
+                                  overlong=self.overlong, shaping=shaping)
+        if mesh is None:
+            return pooled([moments])
+        return pooled([Moments(**share) for share in from_every_process(dataclasses.asdict(moments))])
+
+    def _penalized(self, state: TrainState, mesh, entry: _Entry, rollouts: Sequence[Session] | None,
+                   packed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """`packed` with the advantages of rewards that pay `reference`'s reward-side penalty: its rows
+        scored under the reference, the state's frozen starting policy, once over the pool's rows, and
+        each first reader's rollouts repacked with each call's penalty (`reference_penalties`), which
+        its share's later readers take from it. `rollouts` is None on a later reader."""
+        assert self.reference is not None
+        from dew.training.transaction import with_ema
+
+        frozen = with_ema(state.variables, state.ema)
+        if frozen is None:
+            raise ValueError("the rewards' reference penalty reads the frozen starting policy, and the "
+                             "state holds none; build it from the objective that names the penalty")
+        # At the progress the proximal column is read at, so the penalty is nil where the weights are alike.
+        reference = scored_rows(self.reference, frozen, packed, Progress(state.updates))
+        shaping = (None if rollouts is None else
+                   reference_penalties(rollouts, packed, reference, self.reference.reward_kl))
+        whitening = self._whitening(mesh, rollouts or [], shaping) if self.estimator == "global" else None
+
+        def repacked() -> dict[str, np.ndarray]:
+            if rollouts is None:
+                return packed
+            again = self._packed(entry, rollouts, shaping=shaping, whitening=whitening)
+            return {**packed, ADVANTAGES_KEY: again[ADVANTAGES_KEY]}
+
+        packed = _within(mesh, "reference penalty", repacked)
+        return packed if mesh is None else first_reader_batch(mesh, packed)
+
+    def _packed(self, entry: _Entry, rollouts: Sequence[Session], *,
+                shaping: Mapping[int, Sequence[float]] | None = None,
+                whitening: tuple[float, float] | None = None) -> dict[str, np.ndarray]:
         """The admitted rollouts packed into this call's rows, with the proximal likelihoods the
         calls recorded where the acquisition drew them from the step's variables."""
         packed = pack(rollouts, self.acquisition.width,
                       rows=self.acquisition.rows(len(entry.tasks), self.groups),
                       estimator=self.estimator, truncation=self.truncation, credit=self.credit,
-                      support_capacity=self.support_capacity)
+                      support_capacity=self.support_capacity, overlong=self.overlong, shaping=shaping,
+                      whitening=whitening)
         if self.acquisition.rescore is None:
             packed[OLD_LOG_PROBS_KEY] = sampled_values(
                 packed, lambda index, call: _recorded(rollouts[index], call))

@@ -13,18 +13,26 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import GEMMA4_TYPES
-from dew.batch import Coordinates, coordinates as build_coordinates
+from dew.batch import (
+    POSITIONS_FIELD,
+    Coordinates,
+    coordinates as build_coordinates,
+    prefix_sum,
+    token_coordinates,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
-from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
+from dew.nn.progress import Progress
+from dew.nn.protocols import OutputTable, ProjectionGroup, ReadsTrain, held_groups
 from dew.nn.sharding import explicit_spec
-from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase, TowerGeometry
+from dew.nn.vision import ProjectorBase, TowerBase, TowerGeometry
 from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
-    from dew.nn.cross_attention import CrossAttention
+    from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.dex import DifferentialExtension
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
 
@@ -73,8 +81,8 @@ class VisionConditioner(nn.Module):
     Pixels have shape [batch, images, channels, height, width]. All images
     in a numeric batch share their processed resolution; the processor keeps
     per-image lengths and does not substitute preprocessing inside the model.
-    `train` reaches the one tower with stochastic layers, Gemma 3n's
-    MobileNet and its drop-path.
+    `train` reaches a tower that reads it (`ReadsTrain`), as Gemma 3n's
+    MobileNet does for its drop path, whichever inputs it takes.
     """
 
     vision: TowerBase
@@ -96,15 +104,14 @@ class VisionConditioner(nn.Module):
             raise ValueError("pixel_values must be row-aligned NCHW images or positioned patch pixels")
         batch, images = pixels.shape[:2]
         flat = pixels.reshape(batch * images, *pixels.shape[2:])
+        stochastic = {"train": train} if isinstance(self.tower, ReadsTrain) and self.tower.reads_train else {}
         if grid is not None:
-            features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3))
-        elif isinstance(self.vision, Gemma3nVision):
-            features = self.tower(flat, train=train)
+            features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3), **stochastic)
         elif positions is None:
-            features = self.tower(flat)
+            features = self.tower(flat, **stochastic)
         else:
             features = self.tower(
-                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:])
+                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:]), **stochastic
             )
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
@@ -251,7 +258,7 @@ class MultimodalTransformer(DecoderWrapper):
         return parameter_flops(self.language_model, lengths)
 
     @property
-    def cross_attention(self) -> CrossAttention | None:
+    def cross_attention(self) -> CrossBlocks | None:
         return self.language_model.cross_attention
 
     @property
@@ -267,8 +274,33 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.cross_flops(lengths, context_lengths)
 
     @nn.nowrap
-    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        return self.language_model.held_cross_flops(lengths, context_lengths)
+
+    @nn.nowrap
+    def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         return self._over(self.language_model.with_cross_attention(cross))
+
+    @property
+    def dex(self) -> DifferentialExtension | None:
+        return self.language_model.dex
+
+    @nn.nowrap
+    def with_dex(self, extension: DifferentialExtension | None) -> Self:
+        return self._over(self.language_model.with_dex(extension))
+
+    @nn.nowrap
+    def with_scanned_layers(self) -> Self:
+        return self._over(self.language_model.with_scanned_layers())
+
+    @nn.nowrap
+    def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+        return self.language_model.dex_exported(variables)
+
+    @nn.nowrap
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        held, attention = self.language_model.dex_sites()
+        return ("language_model", *held), attention
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
@@ -342,8 +374,10 @@ class MultimodalTransformer(DecoderWrapper):
             )
         else:
             decoder_tokens = jnp.where(media, 0, tokens)
+        # The decoder's own lookup (`token_embeddings`), so a placeholder no media fills reads as its
+        # decoder reads it.
         embeddings = self.language_model.scaled_embeddings(
-            self.language_model.embed_tokens(decoder_tokens))
+            self.language_model.token_embeddings(decoder_tokens))
         if self.family == "gemma3n":
             embedders = [self.conditioner.projector]
             if self.audio is not None:
@@ -360,21 +394,24 @@ class MultimodalTransformer(DecoderWrapper):
             if self.audio_projection is None:
                 raise ValueError("audio_indices require an audio projector")
             embeddings = _place(embeddings, self.audio_conditioner(conditioning), audio_indices)
+        # A decoder hashing n-grams of its prompt's own ids reads the placeholders media fill, as
+        # Qwen4-Exp's per-layer embedding does (`ple_input_ids`, modeling_qwen4_exp.py:2269-2275).
+        engram = self.language_model.engram
+        if engram is not None and not engram.media_stops:
+            decoder_tokens = jnp.where(media, tokens, decoder_tokens)
         return Fusion(decoder_tokens, embeddings, media)
 
-    def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
-                          segment_ids=None, image_indices=None, conditioning=None,
-                          attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False, image_indices=None, conditioning=None,
+                          image_groups=None, block_groups=None, rotary_positions=None,
                           audio_indices=None, coordinates: Coordinates | None = None):
         """Run the multi-token prediction layers over the same media embeddings and
-        token fields as the main decoder (`hidden_states`)."""
+        token fields as the main decoder (`hidden_states`), its tokens laid out by their
+        `coordinates`."""
         _, media = CrossContext.parted(conditioning)
         fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
         return self.language_model.mtp_hidden_states(
-            hidden, fused.tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=fused.embeddings, attention_mask=attention_mask,
-            image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
-            coordinates=coordinates)
+            hidden, fused.tokens, train=train, input_embeddings=fused.embeddings, image_groups=image_groups,
+            block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """Return the shared language head's logits for each media-aware prediction depth."""
@@ -393,21 +430,22 @@ class MultimodalTransformer(DecoderWrapper):
         prepared = fused.embeddings if input_embeddings is None else input_embeddings
         return self.language_model.mtp_step(hidden, fused.tokens, input_embeddings=prepared, **kwargs)
 
-    def token_embeddings(self, tokens):
-        """Return the decoder's own embeddings of `tokens`; a sampled token is always text, never media."""
-        return self.language_model.token_embeddings(tokens)
+    def stream_embeddings(self, tokens):
+        """Return the decoder's own embeddings of `tokens` at its stream's width (`stream_embeddings`); a
+        sampled token is always text, never media."""
+        return self.language_model.stream_embeddings(tokens)
 
     def init_mtp_cache(self, batch_size: int):
         self.language_model.init_mtp_cache(batch_size)
 
 
     @nn.compact
-    def hidden_states(self, tokens, train: bool = False, decode: bool = False,
-                      positions=None, segment_ids=None, image_indices=None,
+    def hidden_states(self, tokens, train: bool = False, decode: bool = False, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
-                      attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
-                      audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False,
-                      coordinates: Coordinates | None = None):
+                      image_groups=None, block_groups=None, rotary_positions=None,
+                      audio_indices=None, routed_experts=None, routed=None,
+                      coordinates: Coordinates | None = None, whole_blocks: bool = False,
+                      progress: Progress | None = None):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads, and `image_indices` and
@@ -417,15 +455,10 @@ class MultimodalTransformer(DecoderWrapper):
         `routed_experts` and `routed` replay a routing record and go to the
         language model unchanged. Engines record a row for every placeholder
         position too, so the `[B, S, layers, top_k]` layout matches the text.
-        `right_padded` and `coordinates` are the language model's
-        (`CausalTransformer.hidden_and_mtp_inputs`).
+        `coordinates`, `whole_blocks` and `progress` are the language model's
+        (`CausalTransformer.hidden_and_mtp_inputs`): the tokens as the decoder reads them, so the
+        cursor counts the places the layers do.
         """
-        # The tokens as the decoder reads them (`Coordinates`), whichever fields the caller gave
-        # them in, so the cursor counts the places the layers do.
-        if coordinates is None and (segment_ids is not None or attention_mask is not None
-                                    or positions is not None or right_padded):
-            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
-                                            positions=positions, right_padded=right_padded)
         if decode:
             allocated = self.has_variable("cache", POSITION)
             cursor = self.variable("cache", POSITION, jnp.zeros, (tokens.shape[0],), jnp.int32)
@@ -433,13 +466,13 @@ class MultimodalTransformer(DecoderWrapper):
                      else coordinates.valid)
             positions = None if coordinates is None else coordinates.positions
             if rotary_positions is None and positions is None:
-                positions = cursor.value[:, None] + jnp.cumsum(valid, axis=1) - 1
+                positions = cursor.value[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
                 coordinates = (build_coordinates(tokens.shape, positions=positions) if coordinates is None
                                else dataclasses.replace(coordinates, positions=positions))
             # The response's rule (`next_position`): past the last real token's position, or past
             # the largest coordinate of a multi-axis one.
             fields = {name: value for name, value in (("rotary_positions", rotary_positions),
-                                                      ("positions", positions)) if value is not None}
+                                                      (POSITIONS_FIELD, positions)) if value is not None}
             following = next_position(fields, valid)
             assert following is not None
             if allocated:
@@ -455,29 +488,29 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
             image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
-            media_mask=fused.media,
-            routed_experts=routed_experts, routed=routed, coordinates=coordinates, conditioning=context)
+            media_mask=fused.media, routed_experts=routed_experts, routed=routed, coordinates=coordinates,
+            conditioning=context, whole_blocks=whole_blocks, progress=progress)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
                  conditioning: Mapping[str, jax.Array] | None = None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
-                 audio_indices=None, coordinates: Coordinates | None = None):
-        hidden = self.hidden_states(tokens, train=train, decode=decode, positions=positions,
-                                    segment_ids=segment_ids, image_indices=image_indices,
-                                    conditioning=conditioning, attention_mask=attention_mask,
-                                    image_groups=image_groups, block_groups=block_groups,
-                                    rotary_positions=rotary_positions, audio_indices=audio_indices,
-                                    coordinates=coordinates)
+                 audio_indices=None, coordinates: Coordinates | None = None,
+                 progress: Progress | None = None):
+        # The call's token layout converted once (`token_coordinates`), read alone from here on.
+        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
+                                        positions=positions)
+        hidden = self.hidden_states(tokens, train=train, decode=decode, image_indices=image_indices,
+                                    conditioning=conditioning, image_groups=image_groups,
+                                    block_groups=block_groups, rotary_positions=rotary_positions,
+                                    audio_indices=audio_indices, coordinates=coordinates, progress=progress)
         if self.is_initializing() and self.language_model.dspark is not None:
             self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:
-            self.mtp_hidden_states(hidden, tokens, train=train, positions=positions,
-                                   segment_ids=segment_ids, image_indices=image_indices,
-                                   conditioning=conditioning, attention_mask=attention_mask,
-                                   image_groups=image_groups, block_groups=block_groups,
-                                   rotary_positions=rotary_positions, audio_indices=audio_indices,
-                                   coordinates=coordinates)
+            self.mtp_hidden_states(hidden, tokens, train=train, image_indices=image_indices,
+                                   conditioning=conditioning, image_groups=image_groups,
+                                   block_groups=block_groups, rotary_positions=rotary_positions,
+                                   audio_indices=audio_indices, coordinates=coordinates)
         return self.language_model.logits_from_hidden(hidden)
 
     def logits(self, tokens, *, train: bool = False, **fields):
@@ -494,6 +527,10 @@ class MultimodalTransformer(DecoderWrapper):
     def in_context(self) -> bool:
         """Whether the decoder holds a continuum level (`SteppedInContext`)."""
         return self.language_model.in_context
+
+    def affine_head(self) -> bool:
+        """Whether the decoder's head past its level is affine in its states (`SteppedInContext`)."""
+        return self.language_model.affine_head()
 
     @nn.nowrap
     def in_context_level(self, variables):

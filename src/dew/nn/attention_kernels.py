@@ -13,10 +13,11 @@ import numpy as np
 from dew.devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
-from .kernels.generation import INHERENT, Refusal, bf16_dot_runs, capability, device_generation, gpu_placed
-from .kernels.selection import Kernel, Op, Requirement
-from .kernels.templates import attention_mosaic_program, attention_route
+from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_generation, gpu_placed
+from .kernels.selection import Kernel, Op, Refusal, Requirement
+from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
+from .precision import wide_cpu_arithmetic
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 
@@ -102,8 +103,7 @@ class AttentionCase:
     generic paths take as their mask; `mask` is an arbitrary mask only the generic path takes.
     `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
-    below its query's precision or its process's CPU arithmetic (`_xla_kernel_narrows`,
-    `_xla_kernel_widens_less`), `folds`
+    below its query's precision (`_xla_kernel_narrows`), `folds`
     one of few query positions `folded_attention` reads on a GPU, and `splash_mask` one whose mask
     splash's descriptor describes, formed only where splash may run, under a name that may choose it
     on a TPU (`TPU_BACKEND`), and False elsewhere."""
@@ -126,6 +126,17 @@ class AttentionCase:
     spans_only: bool
     mask: bool
     bias: bool
+    bias_hook: bool
+    """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
+    template_attention`): 4-D, one term a key `[B or 1, H or 1, 1, K]` (ALiBi's) or dense `[B or 1, H or 1,
+    Q, K]`, its rows and heads the call's or one for them all (a key head's `[B, Hk, Q, K]` broadcasts to
+    none of them, row 2578), of at most fp32's width."""
+    dense_bias: bool
+    """Whether the call's bias varies by query (`[B or 1, H or 1, Q, K]`), which the template reads a tile at
+    a time (`template.Biased`)."""
+    row_bias: bool
+    """Whether that dense bias varies by batch row too (`[B, H or 1, Q, K]`); a table every row shares (T5's
+    `[1, H, Q, K]`) the Mosaic mainloop reads once a tile (`template.shared_place`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -134,13 +145,20 @@ class AttentionCase:
     dropout: bool
     splash_mask: bool
     shards: int
+    form: str = "fast"
+    """The form the template computes in where it runs the call (`attention_route.FORMS`), as the
+    run's numerics name it (`generation.numerics().forms`): the old routes compute their own arithmetic
+    and take only 'fast', so an accurate call runs the template, or the reference path where the
+    template does not take it."""
 
     @property
     def cell(self) -> tuple[str | None, str]:
         """The call's cell among attention's declared ones (`DECLARED`): the target's instruction family and
-        attention's one kind of call, its forward and its training alike, as the kernel is chosen before
-        the call is differentiated (`attention_route.attend`'s `custom_vjp`)."""
-        return generation.family(device_generation()), 'attention'
+        the kind of call, a 16-bit call's or an fp32 call's ('float32 attention'), each its forward and its
+        training alike, as the kernel is chosen before the call is differentiated (`attention_route.attend`'s
+        `custom_vjp`)."""
+        kind = 'attention' if self.dtype in CUDNN_DTYPES else f"{jnp.dtype(self.dtype).name} attention"
+        return generation.family(device_generation()), kind
 
 
 _Need = Requirement[AttentionCase]
@@ -162,13 +180,13 @@ def _on_gpu(case: AttentionCase) -> bool:
 def _flash_installed(case: AttentionCase) -> bool:
     # A step traced for an assumed GPU on a host without the wheel takes the wheel its target
     # installs: what the host lacks shows as what it ran (`_hosted`), not as the target's refusal.
-    return flash_architectures() is not None or generation.ASSUMED.get() is not None
+    return flash_architectures() is not None or generation.assumption() is not None
 
 
 def _flash_built(case: AttentionCase) -> bool:
     # A step traced for an assumed GPU takes the wheel its target installs, as `_flash_installed` holds.
     architectures = flash_architectures()
-    return (architectures is None or generation.ASSUMED.get() is not None
+    return (architectures is None or generation.assumption() is not None
             or flash_built_for(device_generation(), architectures))
 
 
@@ -176,8 +194,12 @@ _ARITHMETIC = _Need('arithmetic', lambda case: not case.arithmetic,
                           "the call asks for arithmetic only the reference path computes "
                           "(`reference_only`)", row=INHERENT)
 _ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", row=INHERENT)
+_FAST = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT)
+_FAST_HANDOFF = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT,
+                      kind='handoff')
 
 FLASH_SUPPORTS = (
+    _FAST,
     _ON_GPU,
     _Need('document_bound', lambda case: case.documents is None or case.max_segments is not None,
                 "the call packs documents with no bound on a row's (`Coordinates.max_segments`), which its "
@@ -214,6 +236,13 @@ FLASH_SUPPORTS = (
     _Need('dropout', lambda case: not case.dropout,
           "the call drops attention weights, which FlashAttention's path here does not take",
           row='roadmap: attention dropout in FlashAttention'),
+    # Its backward's D is rowsum(dO·O) of the rounded output, so a row whose sink holds most of its
+    # softmax, dP - D the sink's share of dP, takes O's rounding at 2^-8 over that share (512 times the
+    # reference's error at packed rows with a window, gate-g02-judged-h100, row 2410); the template's D
+    # cancels.
+    _Need('sinks', lambda case: not case.sinks,
+          "the call has attention sinks, whose rows FlashAttention's backward misreads where a sink holds "
+          "most of the softmax", row=INHERENT),
     _ARITHMETIC,
     _Need('not_installed', _flash_installed, "dew_flash_attn is not installed", row=INHERENT),
     _Need('binary_arch', _flash_built,
@@ -222,8 +251,8 @@ FLASH_SUPPORTS = (
 )
 """FlashAttention's requirements (`flash_attention`): a GPU, bf16 or fp16 heads a multiple of 8 up to the
 width its backward takes, a causal or windowed call square or over another sequence's documents (which it
-aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias or softcap, no
-deterministic ops, and a wheel holding code for the target."""
+aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias, softcap or sinks,
+no deterministic ops, and a wheel holding code for the target."""
 
 CUDNN_SUPPORTS = (
     _ON_GPU,
@@ -245,7 +274,7 @@ CUDNN_SUPPORTS = (
                 "named)", row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('mask', lambda case: not case.mask,
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
-                "mask but in a forward-only cache call (`kernel_for_materialized_mask`)",
+                "mask but for a window's band or a forward-only cache call (`attention.mask_kernel`)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('spans_only', lambda case: not case.spans_only,
                 "cuDNN takes block groups, key validity or counted places only as the mask the call's spans "
@@ -271,6 +300,7 @@ ops. Every
 fused kernel runs at the query's head width, values included (`widen_value_heads`)."""
 
 TRITON_SUPPORTS = (
+    _FAST,
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "tokamax's Triton kernel needs sm80",
                 row=INHERENT),
@@ -318,6 +348,7 @@ TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it r
 descriptor (`AttentionCase.splash_mask`), the one fact that costs host-side work."""
 
 TPU_SUPPORTS = (
+    _FAST,
     # Elsewhere it runs interpreted, where 'tpu' is named.
     TPU_BACKEND,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
@@ -357,13 +388,30 @@ XLA_SUPPORTS = (
     _Need('softcap', lambda case: case.softcap is None, "jax.nn's attention has no softcap",
                 row=INHERENT, kind='handoff'),
     _Need('narrows', lambda case: not case.narrows,
-                "jax.nn's xla kernel would compute the call below its query's precision or its process's "
-                "CPU arithmetic",
+                "jax.nn's xla kernel would compute the call below its query's precision",
                 row=INHERENT, kind='handoff'),
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
                 row=INHERENT, kind='handoff'),
     _Need('dropout', lambda case: not case.dropout, "jax.nn's attention takes no probability dropout",
+          row=INHERENT, kind='handoff'),
+    _Need('dtypes', lambda case: case.key_dtype == case.dtype,
+          lambda case: f"jax.nn's attention takes a query of its keys' dtype, not {case.dtype} over "
+                       f"{case.key_dtype} (`dot_product_attention`'s `_check_shape_and_dtype`)",
+          row=INHERENT, kind='handoff'),
+    _Need('wide_cpu', lambda case: not (wide_cpu_arithmetic() and generation.backend() == 'cpu'),
+          "a CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums fp32 products in float64 "
+          "(`precision.accumulated`), where jax.nn's attention sums them in fp32: its reference path keeps "
+          "them, so a run under it records the products it computed (a process without the setting runs "
+          "jax.nn's kernel on a CPU as on any platform)",
+          row=INHERENT, kind='handoff'),
+    _Need('float64', lambda case: case.dtype != np.float64,
+          "jax.nn's attention takes its softmax in float32 whatever its operands' dtype "
+          "(`_dot_product_attention_core`'s `astype(np.float32)`), which a float64 call does not keep",
+          row=INHERENT, kind='handoff'),
+    _Need('cpu_float16', lambda case: not (case.dtype == np.float16 and generation.backend() == 'cpu'),
+          "XLA's CPU compiler has no float16 dot into float32 (F16_F16_F32), the algorithm jax.nn's "
+          "attention names for a float16 query (`_dot_product_attention_core`), past its trace-time fallback",
           row=INHERENT, kind='handoff'),
 )
 """jax.nn's xla attention's requirements: the generic kernel, which hands what it cannot honour to
@@ -377,9 +425,18 @@ TEMPLATE_SUPPORTS = (
     _Need('mask', lambda case: not case.mask,
           "the call has an arbitrary mask, which the template reads as spans and never as a mask",
           row=INHERENT),
-    _Need('bias', lambda case: not case.bias,
-          "the call has a bias, a dense term beside the spans that carry the template's validity",
+    _Need('bias', lambda case: not case.bias or case.bias_hook,
+          "the call's bias is not 4-D one term a key or a query's every key, its rows and heads the call's "
+          "or one for them all, or is wider than fp32, which the template's score hook reads it in",
           row=INHERENT),
+    _Need('dense_bias',
+          lambda case: not case.dense_bias or (not case.row_bias
+                                               and generation.gpu_target().architecture.wgmma),
+          "the call's bias varies by query: by batch row too, which the xla kernel runs 7% faster on an "
+          "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's frozen "
+          "Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
+          "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
+          row='2625', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
@@ -390,10 +447,10 @@ TEMPLATE_SUPPORTS = (
 """The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
-starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). The
-call runs it by default on a family whose Mosaic template has a routed mainloop, where its declared old
-route does not take the call (`_attention_preferred`); elsewhere where a call names it
-(`implementation='template'`, or `generation.chosen(attention='template')`)."""
+starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). A call
+on a GPU or a TPU runs it by default, where its cell's declared old route does not take the call
+(`_attention_preferred`, `DECLARED`), and anywhere a call names it (`implementation='template'`, or
+`generation.chosen(attention='template')`)."""
 
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
@@ -402,34 +459,36 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
                  "2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): forward 0.588 "
                  "against 0.761 ms causal and 1.094 against 1.296 full, training forward and backward 2.53 "
                  "against 11.45 causal and 4.49 against 16.48 full (receipts DERIVED-benchx-h100, "
-                 "BWDSTAGES-h100)"),
+                 "BWDSTAGES-h100); a training step's attention at Qwen3-8B's widths, 2 x 4096 bf16, 2.44 "
+                 "against 11.38 ms causal and 4.26 against 15.61 full (CELLS-h100)"),
+    ('wgmma', 'float32 attention'): (
+        'xla', "jax.nn's xla attention measured faster than the template's fp32 route on an H100: a training "
+               "step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms causal and 2.19 "
+               "against 46.21 full (CELLS-h100)"),
+    ('mma.sync', 'attention'): (
+        'flash', "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
+                 "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
+                 "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
+    ('mma.sync', 'float32 attention'): (
+        'xla', "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, does not compile on an "
+               "A100 (its Triton launch asks 182272 bytes of shared memory, past the 166912 a block holds: "
+               "CELLS-a100), where jax.nn's xla attention runs"),
 }
 """Attention's declared cells (bible §4, owner 10-25; `Op.declared`), by (instruction family, kind of call)
-(`AttentionCase.cell`): where an old route measured faster than the family's Mosaic template, the old route
-and its receipt. Attention has one kind of call: its kernel is chosen before the call is differentiated
+(`AttentionCase.cell`): where an old route measured faster than the template, the old route and its receipt.
+A call's kind is its dtype's, 16-bit or fp32: its kernel is chosen before the call is differentiated
 (`attention_route.attend`'s `custom_vjp`), so its forward and its training run one kernel, and the receipts
-cover both. Every other call of a family whose Mosaic template has a routed mainloop
-(`attention_mosaic_program.bundle`) takes the template; a family with none (mma.sync's today) takes the
-op's order by legality. Nothing is ranked at runtime: the list shrinks as the template wins."""
+cover both. Every other call takes the template (`_attention_preferred`). Nothing is ranked at runtime: the
+list shrinks as the template wins."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
-    """The kernel `case` runs where its cell declares no old route that takes it (`DECLARED`): splash on a
-    TPU and xla on a CPU; on a GPU xla for a query no fused kernel takes the dtype of (the Mosaic template
-    takes 16-bit operands alone, so no family routes it another); the template on a family whose Mosaic
-    template has a routed mainloop, which hands a call it does not take to the next kernel by legality; and
-    elsewhere the op's order by legality, FlashAttention first (measured faster than cuDNN and tokamax's
-    Triton kernel on an A100 and an A10), a call with block groups, key validity or counted places, which no
-    old kernel's spans express, taking the generic path over the mask its spans mean (ledger 1537)."""
-    backend = generation.backend()
-    if backend != 'gpu':
-        return 'tpu' if backend == 'tpu' else 'xla'
-    if case.dtype not in CUDNN_DTYPES:
-        # No fused GPU kernel takes another dtype, so no measurement prefers one.
-        return 'xla'
-    if attention_mosaic_program.bundle(device_generation(), case.dtype) is not None:
-        return 'template'
-    return ATTENTION.kernels[0].name
+    """The kernel `case` runs where its cell declares no old route that takes it (`DECLARED`): the template
+    on every GPU, which hands a call it does not take to the next kernel by legality; splash on a TPU, until
+    a receipt (CELLS-v5e) measures the template there (theme A10); xla on a CPU, which has no instruction
+    family."""
+    del case
+    return {'gpu': 'template', 'tpu': 'tpu'}.get(generation.backend(), 'xla')
 
 
 def _hosted(kernel: str) -> str:
@@ -443,17 +502,18 @@ def _hosted(kernel: str) -> str:
 ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('flash', FLASH_SUPPORTS),
     Kernel[AttentionCase]('triton', TRITON_SUPPORTS),
-    Kernel[AttentionCase]('cudnn', CUDNN_SUPPORTS),
+    Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS)),
     Kernel[AttentionCase]('tpu', TPU_SUPPORTS),
-    Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
+    Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
-kernel (`_attention_preferred`: the template on a family with a routed Mosaic mainloop), then flash, triton,
-cuDNN, splash, xla and the reference path, the first that takes the call. The template comes last, after
-the reference path, which takes every call, so it runs where the preference names it (a templated family's
-calls) or a call names it."""
+kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
+splash, xla and the reference path, the first that takes the call. The old routes take only the fast
+form (`AttentionCase.form`): an accurate call runs the template, or the reference path on a CPU; a
+decode call keeps its own kernels whatever the form (`DECODE`). The template comes last, after the
+reference path, which takes every call, so it runs where the preference names it or a call names it."""
 
 
 
@@ -492,4 +552,4 @@ def decodes(case: AttentionCase) -> bool:
 
 def kernel_refusals(op: Op[AttentionCase], kernel: str, case: AttentionCase) -> list[Refusal]:
     """Every requirement of `op`'s `kernel` that `case` fails, as refusals, in order."""
-    return [requirement.refusal(case) for requirement in op.kernel(kernel).failed(case)]
+    return op.kernel(kernel).failed(case)

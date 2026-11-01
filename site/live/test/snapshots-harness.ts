@@ -25,6 +25,8 @@ export class Preparer extends DurableObject<Env> {
 	async freeAsAnswering() { await this.ctx.storage.put('freeAsAnswering', true); }
 	async hold(busy: boolean) { await this.ctx.storage.put('busy', busy); }
 	async trial(commit: string, reply: Reply) {
+		// As the preparer does: no job while it holds one.
+		if (await this.ctx.storage.get('job')) throw new Error('snapshot preparation is already running');
 		if (await this.ctx.storage.get('reject')) {
 			await this.ctx.storage.delete('reject');
 			await scheduler.wait(200);
@@ -145,6 +147,12 @@ export default {
 			await trials.finish();
 			return Response.json({ pending, cut, trialled: await registry.trialled(), active: await registry.previous(),
 				renewal, alarm: (await registry.status()).alarm, trialCalls: await trials.calls(), trustedCalls: await preparer.calls() });
+		}
+		if (scenario === 'refused') {
+			// A trial asked while the preparer runs another.
+			await registry.trial(A);
+			const refused = await registry.trial(B);
+			return Response.json({ refused, trialled: await registry.trialled() });
 		}
 		if (scenario === 'overlap') {
 			// The first trial's preparer answers late, with an error, after a second trial began.

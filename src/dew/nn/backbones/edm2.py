@@ -20,7 +20,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, attention_flops, patch_lengths
@@ -60,7 +60,7 @@ class Block(nn.Module):
     res_balance: float = 0.3
     attn_balance: float = 0.3
     clip_act: float | None = 256.0
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _residual_conv(self, **scope):
@@ -149,7 +149,7 @@ class EDM2UNet(nn.Module):
     attn_balance: float = 0.3
     clip_act: float | None = 256.0
     dtype: Dtype | None = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @property
     def channels(self) -> list[int]:

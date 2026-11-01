@@ -26,31 +26,42 @@ and backward took 43.1 ms against 44.4 with the forward in whole chunks at a
 (1024, 8192) tile, and 35.6 against 36.3 at (4096, 8192), holding 0.18 and
 0.41 GiB of temporaries against 0.18 and 0.42.
 
-First-order reverse mode only: there is no JVP rule. On one RTX 4080, fp32,
-1,024 tokens by 2,816 features by 262,144 columns in four chunks, the default
-tile runs the head forward and backward in 250 ms holding 1.07 GiB of
-temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
+Each head's backward is its own, and its forward derivative JAX's of its tiled
+forward, a tangent that transposes to that backward (`linear_tangent`). On one
+RTX 4080, fp32, 1,024 tokens by 2,816 features by 262,144 columns in four
+chunks, the default tile runs the head forward and backward in 250 ms holding
+1.07 GiB of temporaries, against 249 ms and 3.55 GiB for recomputing whole
+chunks.
 """
 
+import functools
 import math
 from collections.abc import Callable
 from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
+from jax.custom_derivatives import zero_from_primal
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
-from dew.nn.categorical import label_derivative, label_entry, rescaled, segment_log_partition, target_loss
-from dew.nn.kernels.generation import gpu_target
+from dew.nn.categorical import (
+    label_derivative,
+    label_entry,
+    partition,
+    rescaled,
+    segment_log_partition,
+    target_loss,
+)
+from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import (
     added_to,
     at_least_fp32,
     bf16_product,
     capped_logits,
     compensated_sum,
+    exact_float32,
     float32_einsum,
-    float32_products,
     head_product,
     paired_sum,
     rounded_operand,
@@ -361,7 +372,9 @@ def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
         return outputs, normalizer
     first, best, log_z = outputs
     peak, mass, rests = normalizer
-    larger = jax.lax.pmax(peak, group)
+    # A row's terms are free of the shift its sums are taken against, so the largest maximum takes no
+    # tangent, and each shard moves its sums to it by its own maximum's (`rescaled`).
+    larger = jax.lax.pmax(jax.lax.stop_gradient(peak), group)
     mass = jax.lax.psum(rescaled(peak, mass, larger), group)
     rests = jax.lax.psum(rescaled(peak, rests, larger), group)
     loss = target_loss(larger, mass, jax.lax.psum(first, group))
@@ -423,25 +436,36 @@ def _head_backward(pullback, cotangent, product_matrix, states, precision: jax.l
     return d_states, d_matrix, d_cap, d_terms
 
 
-def _bounded_head_impl(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int],
-                       softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float,
-                       columns: _Columns, picked: bool, group: tuple[str, ...]):
-    """Run `_forward` behind a backward that recomputes its logits."""
+def _bounded_head(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int], softcap,
+                  precision: jax.lax.PrecisionLike, predict: bool, temperature: float, columns: _Columns,
+                  picked: bool, group: tuple[str, ...]):
+    """`_forward`'s outputs behind a backward that recomputes its logits a tile at a time
+    (`_bounded_head_bwd`), and forward mode through the tiled forward itself (`linear_tangent`)."""
+    statics = (chunks, tile, precision, predict, temperature, picked, group)
+    return linear_tangent(functools.partial(_bounded_head_fwd, *statics),
+                          functools.partial(_bounded_head_bwd, *statics),
+                          functools.partial(_bounded_head_impl, *statics))(
+        hidden, table, targets, excluded, softcap, columns)
+
+
+def _bounded_head_impl(chunks: int, tile: tuple[int, int], precision: jax.lax.PrecisionLike, predict: bool,
+                       temperature: float, picked: bool, group: tuple[str, ...], hidden, table, targets,
+                       excluded, softcap, columns: _Columns):
+    """`_forward`'s outputs, each row's partition the whole row's over `group` (`_shared_partition`)."""
+    return _bounded_head_fwd(chunks, tile, precision, predict, temperature, picked, group, hidden, table,
+                             targets, excluded, softcap, columns)[0]
+
+
+def _bounded_head_fwd(chunks, tile, precision, predict, temperature, picked, group, hidden, table, targets,
+                      excluded, softcap, columns):
+    # What the backward reads beyond the operands is two numbers per token and a row's rest. Everything
+    # else it needs is a recomputed tile.
     return _shared_partition(*_forward(hidden, table, targets, excluded, chunks, tile, softcap, precision,
-                                       predict, temperature, columns, picked), group)[0]
+                                       predict, temperature, columns, picked), group)
 
 
-def _bounded_head_fwd(hidden, table, targets, excluded, chunks, tile, softcap, precision, predict,
-                      temperature, columns, picked, group):
-    outputs, normalizer = _shared_partition(*_forward(
-        hidden, table, targets, excluded, chunks, tile, softcap, precision, predict, temperature, columns,
-        picked), group)
-    # The residuals are the inputs and two numbers per token. Everything the
-    # backward needs beyond them is a recomputed tile.
-    return outputs, (hidden, table, targets, excluded, normalizer, softcap, columns)
-
-
-def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, group, residuals, cotangents):
+def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, group, normalizer, operands,
+                      cotangents):
     """Pull the cotangents back through logits recomputed one tile at a time.
 
     The outer loop walks vocabulary tiles carrying `(d_states, d_table,
@@ -453,7 +477,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
     short token tiles (`_token_sum`).
     """
     del predict  # Argmax has no gradient.
-    hidden, table, targets, excluded, normalizer, softcap, columns = residuals
+    hidden, table, targets, excluded, softcap, columns = operands
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     loss_cotangent, _, partition_cotangent = _shared_cotangents(cotangents, group)
@@ -532,13 +556,8 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
     d_columns = jax.tree.map(lambda gradient, terms: gradient.astype(terms.dtype), d_columns, columns)
     d_states = running_total(d_states)
     d_cap = None if d_cap is None else running_total(d_cap).astype(jnp.asarray(softcap).dtype)
-    return d_states.reshape(hidden.shape).astype(hidden.dtype), d_table, None, None, d_cap, d_columns
-
-
-# `jax.custom_vjp` is generic in its return type, and a `functools.partial`
-# decorator loses that binding, so it is built by hand.
-_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(4, 5, 7, 8, 9, 11, 12))
-_bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
+    return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table, zero_from_primal(targets),
+            zero_from_primal(excluded), d_cap, d_columns)
 
 
 def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_first, d_partition,
@@ -602,16 +621,28 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     return raw, normalizer, (first.reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
-def _whole_head_impl(hidden, table, targets, excluded, softcap, chunks, precision, predict,
-                     temperature, columns, picked, group):
-    """With nothing to differentiate, the tiled forward: no backward needs
-    the whole logits, so an evaluation or a scoring pass stays bounded."""
-    return _shared_partition(*_forward(hidden, table, targets, excluded, chunks, (1024, table.shape[0]),
-                                       softcap, precision, predict, temperature, columns, picked), group)[0]
+def _whole_head(hidden, table, targets, excluded, softcap, chunks: int, precision: jax.lax.PrecisionLike,
+                predict: bool, temperature: float, columns: _Columns, picked: bool, group: tuple[str, ...]):
+    """The whole head's outputs behind a backward that keeps its fp32 logits (`_whole_head_bwd`), which a
+    derivative's own forward forms whole; with nothing to differentiate, the tiled forward over one
+    vocabulary tile, a token tile's logits at a time, so an evaluation or a scoring pass holds no whole
+    logits, and a tangent is that tiled forward's (`linear_tangent`)."""
+    statics = (chunks, precision, predict, temperature, picked, group)
+    tiled = functools.partial(_whole_head_impl, *statics)
+    return linear_tangent(functools.partial(_whole_head_fwd, *statics),
+                          functools.partial(_whole_head_bwd, *statics), tiled, primal=tiled)(
+        hidden, table, targets, excluded, softcap, columns)
 
 
-def _whole_head_fwd(hidden, table, targets, excluded, softcap, chunks, precision, predict, temperature,
-                    columns, picked, group):
+def _whole_head_impl(chunks, precision, predict, temperature, picked, group, hidden, table, targets, excluded,
+                     softcap, columns):
+    """The tiled forward over one vocabulary tile (`_bounded_head_impl`)."""
+    return _bounded_head_impl(chunks, (1024, table.shape[0]), precision, predict, temperature, picked, group,
+                              hidden, table, targets, excluded, softcap, columns)
+
+
+def _whole_head_fwd(chunks, precision, predict, temperature, picked, group, hidden, table, targets, excluded,
+                    softcap, columns):
     del chunks
     raw, normalizer, outputs = _whole_head_terms(hidden, table, targets, excluded, softcap, precision,
                                                  predict, temperature, columns, picked)
@@ -619,16 +650,17 @@ def _whole_head_fwd(hidden, table, targets, excluded, softcap, chunks, precision
     # The fp32 product before the per-column terms and the cap is kept, so
     # the backward multiplies nothing it did not have to: the state and head
     # products alone.
-    return outputs, (hidden, table, targets, excluded, raw, normalizer, softcap, columns)
+    return outputs, (raw, normalizer)
 
 
-def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, residuals, cotangents):
+def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, saved, operands, cotangents):
     """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
     logits: the logits' cotangent as `_logits_cotangent` gives it to both
     products, the head's gradient accumulated in fp32 once, and an fp32 head's
     state gradient over the tiled head's column tiles (`_state_product`)."""
     del predict
-    hidden, table, targets, excluded, raw, (peaks, masses, rests), softcap, columns = residuals
+    raw, (peaks, masses, rests) = saved
+    hidden, table, targets, excluded, softcap, columns = operands
     loss_cotangent, _, partition_cotangent = _shared_cotangents(cotangents, group)
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
@@ -640,7 +672,7 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
                                      loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked),
         table.astype(operands), hidden.reshape(-1, features).astype(operands), precision, work, width)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
-            None, None, d_cap, d_columns)
+            zero_from_primal(targets), zero_from_primal(excluded), d_cap, d_columns)
 
 
 def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Array:
@@ -663,30 +695,21 @@ def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Arra
                                      width, columns))
 
 
-_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
-_whole_head.defvjp(_whole_head_fwd, _whole_head_bwd)
-
-
 def chunked_tile() -> tuple[int, int]:
-    """The chunked head's `(tokens, columns)` tile on the pool's hardware
-    generation: its target row's (`GpuTarget.head_tile`), else 1024 x 8192. The
-    generation is `device_generation`'s, the assumed one's or the placed
-    platform's where a call sets one, else global device 0's, which every process
-    sees alike, so a pool's processes agree on the tile and compile one program.
-
-    A100 and Ada rows name 4096 x 8192, measured to beat the default. On one
-    A100, Qwen3-0.6B's head (vocabulary 151936, 1024 wide, 4096 tokens, bf16)
-    forward and backward took 48.7 ms at 4096 x 8192 and 60.2 ms at 1024 x
-    8192, at 0.46 and 0.21 GiB of temporaries. On an RTX 4080, a whole
-    training step at those widths (2 layers, bf16): at 4096 tokens 114.6 ms
-    against 123.4 at 1024 x 8192, 119.7 at 2048 x 8192 and 116.6 at 4096 x
-    4096; at 8192 tokens 219.1 against 228.3 (1024 x 8192), 227.8 (2048 x
-    16384) and 219.3 (8192 x 4096) with less memory. The whole logits beat the
-    4096 x 8192 tile where they fit once the step compiles without XLA's
-    Triton GEMM fusions (`gpu_target().kernels['xla_triton_gemm']`): 53.5
-    against 65.5 ms at 2048 tokens, 93.4 against 110.2 at 4096. With the
-    fusions, exactly 4096 whole took 286.0 ms."""
-    return gpu_target().head_tile or (1024, 8192)
+    """The chunked head's `(tokens, columns)` tile, 4096 x 8192: fewer, larger tiles are faster for as long
+    as their fp32 logits fit beside the step, and 4096 tokens beat 1024 on every GPU measured. On an H100,
+    Qwen3-0.6B's head (vocabulary 151936, 1024 wide, 4096 tokens, bf16) took 13.4 ms forward and backward
+    at 4096 x 8192 against 19.9 at 1024 x 8192 (16.5 at 2048, 13.4 at 8192), and Qwen3.5-4B's (248320, 2560
+    wide, 24576 tokens) 282 against 350 ms (305 at 2048, 272 at 8192 for 0.26 GB more), 1.30 GB of
+    temporaries (JS-headtile-h100-f5a0f8bef). On one A100, Qwen3-0.6B's took 48.7 ms at 4096 x 8192 and 60.2
+    ms at 1024 x 8192, at 0.46 and 0.21 GiB of temporaries. On an RTX 4080, a whole training step at those
+    widths (2 layers, bf16): at 4096 tokens 114.6 ms against 123.4 at 1024 x 8192, 119.7 at 2048 x 8192 and
+    116.6 at 4096 x 4096; at 8192 tokens 219.1 against 228.3 (1024 x 8192), 227.8 (2048 x 16384) and 219.3
+    (8192 x 4096) with less memory. The whole logits beat the 4096 x 8192 tile where they fit once the step
+    compiles without XLA's Triton GEMM fusions (`GpuTarget.triton_gemm_fusions`): 53.5 against
+    65.5 ms at 2048 tokens, 93.4 against 110.2 at 4096. With the fusions, exactly 4096 whole took 286.0 ms.
+    No TPU is measured."""
+    return 4096, 8192
 
 
 def _token_spec(shape: tuple[int, ...]) -> P:
@@ -786,7 +809,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     # held vocabulary-major so a column tile is a row slice.
     cap = None if head.softcap is None else jnp.asarray(head.softcap, at_least_fp32(hidden.dtype))
     table = head.matrix if vocab_major else head.matrix.T
-    product = BF16 if rounds_to_bf16(compute, precision) else float32_products(compute, precision)
+    product = BF16 if rounds_to_bf16(compute, precision) else exact_float32(precision)
 
     def scored(hidden, table, targets, excluded, cap, columns, *, picked: bool = False,
                group: tuple[str, ...] = ()):
@@ -799,7 +822,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     def column_logits(states, rows, cap, columns):
         """The capped logit of each state against its own row of the head,
         as the head's tiles score it."""
-        effective = BF16 if rounds_to_bf16(compute, precision) else float32_products(compute, precision)
+        effective = BF16 if rounds_to_bf16(compute, precision) else exact_float32(precision)
         operands = _operand_dtype(effective, at_least_fp32(states.dtype))
         logits = jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows)
@@ -874,37 +897,55 @@ def _fused_total(losses, log_z, weights, z_loss: float):
     return compensated_sum(terms, (0,))
 
 
-def _fused_impl(hidden, table, labels, weights, columns, z_loss, cap, chunk, precision, predict, temperature,
-                excluded):
+def _fused(hidden, table, labels, weights, columns, z_loss: float, cap, chunk: int,
+           precision: jax.lax.PrecisionLike, predict: bool, temperature: float, excluded: int | None):
+    """The weighted sum and each token's terms (`_fused_terms`), the sum's gradients taken in the forward
+    and scaled by its cotangent in reverse (`_fused_bwd`); in forward mode the sum's derivative along the
+    states, the head and the columns, the weights and the per-token terms carrying none, as in reverse
+    (`_fused_moved`, `linear_tangent`)."""
+    statics = (z_loss, cap, chunk, precision, predict, temperature, excluded)
+    return linear_tangent(functools.partial(_fused_fwd, *statics), functools.partial(_fused_bwd, *statics),
+                          functools.partial(_fused_moved, *statics),
+                          primal=functools.partial(_fused_impl, *statics))(hidden, table, labels, weights,
+                                                                           columns)
+
+
+def _fused_impl(z_loss, cap, chunk, precision, predict, temperature, excluded, hidden, table, labels, weights,
+                columns):
     (losses, log_z, *predicted), _, _ = _fused_terms(
         hidden, table, labels, weights, z_loss, cap, columns, chunk, precision, predict, temperature,
         excluded, gradients=False)
     return _fused_total(losses, log_z, weights, z_loss), (losses, predicted[0] if predict else None, log_z)
 
 
-def _fused_fwd(hidden, table, labels, weights, columns, z_loss, cap, chunk, precision, predict, temperature,
-               excluded):
+def _fused_moved(z_loss, cap, chunk, precision, predict, temperature, excluded, hidden, table, labels,
+                 weights, columns):
+    """`_fused_impl` with what its backward gives no gradient held still: the weights, and each token's
+    terms beside the sum."""
+    total, terms = _fused_impl(z_loss, cap, chunk, precision, predict, temperature, excluded, hidden, table,
+                               labels, jax.lax.stop_gradient(weights), columns)
+    return total, jax.lax.stop_gradient(terms)
+
+
+def _fused_fwd(z_loss, cap, chunk, precision, predict, temperature, excluded, hidden, table, labels, weights,
+               columns):
     (losses, log_z, *rest), d_table, d_columns = _fused_terms(
         hidden, table, labels, weights, z_loss, cap, columns, chunk, precision, predict, temperature,
         excluded, gradients=True)
     predicted, d_states = (rest[0], rest[1]) if predict else (None, rest[0])
     total = _fused_total(losses, log_z, weights, z_loss)
-    # Empty arrays carry the inputs' dtypes, which the gradients return in.
-    dtypes = (jnp.zeros((0,), hidden.dtype), jnp.zeros((0,), table.dtype))
-    return (total, (losses, predicted, log_z)), (d_states, d_table, d_columns, dtypes)
+    return (total, (losses, predicted, log_z)), (d_states, d_table, d_columns)
 
 
-def _fused_bwd(z_loss, cap, chunk, precision, predict, temperature, excluded, residuals, cotangents):
+def _fused_bwd(z_loss, cap, chunk, precision, predict, temperature, excluded, saved, operands, cotangents):
     """The gradients the forward took, times the total's cotangent; the
     per-token outputs carry none."""
-    d_states, d_table, d_columns, (states_dtype, table_dtype) = residuals
+    d_states, d_table, d_columns = saved
+    hidden, table, labels, weights, _ = operands
     scale = cotangents[0]
-    return ((scale * d_states).astype(states_dtype.dtype), (scale * d_table).astype(table_dtype.dtype), None,
-            None, jax.tree.map(lambda gradient: scale * gradient, d_columns))
-
-
-_fused = jax.custom_vjp(_fused_impl, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11))
-_fused.defvjp(_fused_fwd, _fused_bwd)
+    return ((scale * d_states).astype(hidden.dtype), (scale * d_table).astype(table.dtype),
+            zero_from_primal(labels), zero_from_primal(weights),
+            jax.tree.map(lambda gradient: scale * gradient, d_columns))
 
 
 FUSED_LOGIT_BYTES = 2 << 30
@@ -953,7 +994,7 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
         raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
     states = head.states(hidden)
     compute = states.dtype if head.compute is None else head.compute
-    precision = BF16 if rounds_to_bf16(compute, head.precision) else float32_products(compute, head.precision)
+    precision = BF16 if rounds_to_bf16(compute, head.precision) else exact_float32(head.precision)
     table = head.matrix if head.vocab_major else head.matrix.T
     columns = _Columns.of(head, at_least_fp32(states.dtype))
     statics = (float(z_loss), head.softcap)
@@ -1023,18 +1064,6 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     return losses, jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
-def _whole_partition(logits):
-    """Each row's maximum, the sum of its exponentials scaled to it, and those exponentials.
-
-    The maximum is finite, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
-    holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
-    """
-    largest = jnp.max(logits, axis=-1)
-    peak = jnp.where(jnp.isfinite(largest), largest, 0)
-    shifted = jnp.exp(logits - peak[..., None])
-    return peak, jnp.sum(shifted, axis=-1), shifted
-
-
 @jax.custom_jvp
 def _whole_losses(logits, targets):
     """Each row's cross entropy and log partition of whole logits, differentiated by `_whole_losses_tangent`.
@@ -1042,7 +1071,7 @@ def _whole_losses(logits, targets):
     Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, and these losses are differentiated
     (a distilled student's prediction, a whole-logit model).
     """
-    peak, mass, _ = _whole_partition(logits)
+    peak, mass, _ = partition(logits)
     return target_loss(peak, mass, _target_logits(logits, targets)), peak + jnp.log(mass)
 
 
@@ -1052,7 +1081,7 @@ def _whole_losses_tangent(primals, tangents):
     arXiv:2610.31642's eq. 7), and of its log partition, the row's probabilities."""
     logits, targets = primals
     losses, log_z = _whole_losses(logits, targets)
-    _, mass, shifted = _whole_partition(logits)
+    _, mass, shifted = partition(logits)
     probability = shifted / mass[..., None]
     d_losses = jnp.sum(label_derivative(probability, targets) * tangents[0], axis=-1)
     d_log_z = jnp.sum(probability * tangents[0], axis=-1)

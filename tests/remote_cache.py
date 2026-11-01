@@ -21,6 +21,9 @@ gains are its own whole writes, never another worker's half-written one.
 
 A bundle is a file's in one execution partition (conftest's `bundle`): a split file's group, or an
 xdist worker, has its own, so partitions that compile apart never replace each other's programs. A
+group with no bundle yet, its file's cut changed, seeds the programs of up to `SIBLINGS` groups of its
+file's other cuts whose share of the file overlaps its own (`_siblings`), and writes its own bundle
+under its own cut (2026-10-28: 565 of 1,182 recut groups restored nothing after CI's target moved). A
 bundle and not a program at a time, as a test that runs a model eagerly compiles thousands of
 programs of a few milliseconds each (14,068 of the A100 tier's 16,537, under 50 ms), quicker to
 compile than to ask a Worker for: asking about each one took a DeepSeek drafting test from 103 s to
@@ -36,9 +39,11 @@ background thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 """
 
 import importlib.util
+import itertools
 import logging
 import os
 import queue
+import re
 import struct
 import sys
 import tempfile
@@ -60,6 +65,12 @@ HOST = importlib.util.module_from_spec(_HOST)
 _HOST.loader.exec_module(HOST)  # the host's CPU class, which keys a bundle (tools/armada/host.py)
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
+SIBLINGS = 3
+"""The most other-cut groups a recut group seeds from, nearest overlap first, within one `MAX_BYTES`."""
+SIBLING_KEYS = 64
+"""The most bundle keys a recut group lists for its file's other cuts."""
+GROUP = re.compile(r"^(?P<path>.+?)/(?P<index>\d+)-of-(?P<count>\d+)(?P<rest>(?:/.*)?)$")
+"""A split group's bundle: its file, its group G of N (`bundle`) and any worker after it."""
 SUFFIX = "-cache"
 """What JAX's cache names a program's file after its key (jax/_src/lru_cache.py)."""
 UNREACHABLE = (OSError, r2.R2Error)
@@ -103,6 +114,8 @@ class RemoteCache:
         self.uploader.start()
         self.programs_fetched = self.uploaded = 0
         """The programs the remote's bundles put in the directory, and the bundles it took."""
+        self.bytes_fetched = self.bytes_uploaded = 0
+        """The bundles' bytes read and sent, which the summary reports."""
 
     @property
     def available(self) -> bool:
@@ -151,6 +164,7 @@ class RemoteCache:
                     return
                 self.held[file] = set()
             entries = self._fetched(file)
+            borrowed = [] if entries else self._siblings(file)
         except UNREACHABLE as error:
             self._failed(error)
             return
@@ -167,11 +181,18 @@ class RemoteCache:
                     if self._seeded(key, value):
                         new += 1
                         self.seen.add(key)
+                # Another cut's programs: fetched for this group, which holds none of them yet, so
+                # `closed` writes them into its own bundle under its own cut, once.
+                for key, value in borrowed:
+                    keys.append(key)
+                    if self._seeded(key, value):
+                        new += 1
+                        self.seen.add(key)
             except UNREACHABLE as error:
                 self.unrestored.add(file)
                 self._failed(error)
             self.fetched[file] = keys
-            self.held[file] = set(keys)
+            self.held[file] = {key for key, _ in entries}
         if keys and file not in self.unrestored:
             self._answered()
         with self.lock:
@@ -183,7 +204,44 @@ class RemoteCache:
         if self.given_up:  # checked as each request is made
             return []
         bundle = self.store.get(self._key(file), limit=MAX_BYTES)
-        return [] if bundle is None else unpacked(bundle)
+        if bundle is None:
+            return []
+        with self.lock:
+            self.bytes_fetched += len(bundle)
+        return unpacked(bundle)
+
+    def _siblings(self, file: str) -> list[tuple[str, bytes]]:
+        """For split group `file` with no bundle of its own, the entries of up to SIBLINGS groups of its
+        file's other cuts whose share of the file overlaps its own, the nearest overlap first, together
+        within MAX_BYTES; none for a file that is no split group."""
+        group = GROUP.match(file)
+        if group is None or self.given_up:
+            return []
+        index, count = int(group["index"]), int(group["count"])
+        start, end = (index - 1) / count, index / count
+        overlaps = []
+        for name in itertools.islice(self.store.keys(f"{self._key(group['path'])}/"), SIBLING_KEYS):
+            other = GROUP.match(f"{group['path']}/{name}")
+            if other is None or other["rest"] != group["rest"] or int(other["count"]) == count:
+                continue
+            at, of = int(other["index"]), int(other["count"])
+            low, high = (at - 1) / of, at / of
+            if low < end and high > start:
+                overlaps.append((min(end, high) - max(start, low), name))
+        entries, left = [], MAX_BYTES
+        for _, name in sorted(overlaps, reverse=True)[:SIBLINGS]:
+            if self.given_up or left <= 0:
+                break
+            try:
+                bundle = self.store.get(self._key(f"{group['path']}/{name}"), limit=left)
+            except ValueError:  # past what is left, or no whole bundle: the next may fit
+                continue
+            if bundle is not None:
+                left -= len(bundle)
+                with self.lock:
+                    self.bytes_fetched += len(bundle)
+                entries += unpacked(bundle)
+        return entries
 
     def _seeded(self, key: str, value: bytes) -> bool:
         """`value` as program `key`'s file, written to a name of its own and linked in whole, so a
@@ -210,9 +268,11 @@ class RemoteCache:
                 if file == self.file:
                     self._moved_on()
                 written = list(self.written.get(file, []))
-                if not set(written) - self.held.get(file, set()) - self.queued.get(file, set()):
-                    return
                 fetched = list(self.fetched.get(file, []))
+                # Its own bundle's fetched programs are held already; a recut group's, borrowed from
+                # its file's other cuts (`_siblings`), are not, and are written under its own cut once.
+                if not {*written, *fetched} - self.held.get(file, set()) - self.queued.get(file, set()):
+                    return
             entries, size = [], 0
             for key in dict.fromkeys([*written, *fetched]):
                 path = self.directory / f"{key}{SUFFIX}"
@@ -228,7 +288,7 @@ class RemoteCache:
             self._failed(error)
             return
         with self.state:
-            self.queued[file] = set(written)
+            self.queued[file] = {*written, *fetched}
             if not {key for key, _ in entries} - self.held.get(file, set()):
                 return  # nothing new fits: the Worker's bundle stays as it is
             self.held[file] = {key for key, _ in entries}
@@ -243,6 +303,7 @@ class RemoteCache:
                     self._answered()
                     with self.lock:
                         self.uploaded += 1
+                        self.bytes_uploaded += len(bundle)
             except (*UNREACHABLE, ValueError) as error:  # a bundle that does not reach it is compiled again
                 self._failed(error)
             finally:
@@ -251,8 +312,10 @@ class RemoteCache:
     def summary(self) -> str:
         """What the remote did for this process, which a task's log ends with: a slow task whose
         compilations missed it says so."""
-        return (f"shared XLA cache: {self.programs_fetched} programs fetched, "
-                f"{self.uploaded} bundles uploaded" + ("" if self.available else ", given up as unreachable"))
+        return (f"shared XLA cache: {self.programs_fetched} programs fetched "
+                f"({self.bytes_fetched / 1e6:.1f} MB read), {self.uploaded} bundles uploaded "
+                f"({self.bytes_uploaded / 1e6:.1f} MB)"
+                + ("" if self.available else ", given up as unreachable"))
 
     def drain(self, seconds: float = DRAIN_SECONDS) -> None:
         """Every bundle written back, waiting up to `seconds` for the uploads, at the end of pytest's

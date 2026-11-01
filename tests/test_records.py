@@ -15,7 +15,7 @@ def test_integer_reads_a_width_and_refuses_the_flag_python_calls_an_int():
 
 def test_number_reads_an_integer_as_a_real_and_refuses_a_flag():
     assert _records.number(1, 'rope_theta') == 1.0
-    assert _records.number(1e-5, 'norm_eps') == pytest.approx(1e-5)
+    assert _records.number(1e-5, 'norm_eps') == 1e-5
     with pytest.raises(ValueError):
         _records.number(value=False, key='norm_eps')
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Check built distributions for what PyPI refuses and `twine check` passes.
+"""Check built distributions for what an index refuses and `twine check` passes.
 
-PyPI refuses a distribution whose requirements name a URL, and `twine check`
-reads only the description. This reads each wheel's METADATA and each sdist's
-PKG-INFO, prints their requirements, and fails naming any that has a URL.
+An index (PyPI, Dew's) refuses a distribution whose requirements name a URL, and
+installers will not resolve one, while `twine check` reads only the description.
+This reads each wheel's METADATA and each sdist's PKG-INFO, prints their
+requirements, and fails naming any that has a URL.
 
 Usage:
     python -m build
@@ -47,7 +48,8 @@ def main() -> None:
         print(f"{path.name}: {len(lines)} requirements")
         refused += [f"{path.name}: {line}" for line in lines if Requirement(line).url is not None]
     if refused:
-        sys.exit("PyPI refuses a requirement that names a URL:\n  " + "\n  ".join(refused))
+        sys.exit("An index refuses, and an installer will not resolve, a requirement that names a URL:\n  "
+                 + "\n  ".join(refused))
 
 
 if __name__ == "__main__":

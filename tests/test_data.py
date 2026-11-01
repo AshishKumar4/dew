@@ -466,6 +466,20 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
         stored_source(str(tmp_path / "missing"), format="files").records("memory")
 
 
+@pytest.mark.parametrize("named", ["path", "video_path"])
+def test_a_listed_video_keeps_every_field_its_record_holds_beside_its_path(named):
+    """A media record's path moves to `mp4` and its caption is its own or the default, and every other
+    field it holds (a label, an id, a path it does not read) reaches the batch as it is (row 1873)."""
+    from dew.data import video
+
+    listed = {named: "file:///clips/a.mp4", "label": 3, "id": "a", "caption": "its own"}
+    unread = {} if named == "path" else {"path": "file:///elsewhere"}
+    assert video.Row(caption="a clip").map({**listed, **unread}) == {
+        "label": 3, "id": "a", "caption": "its own", "mp4": "file:///clips/a.mp4", **unread}
+    assert video.Row(caption="a clip").map({named: "file:///clips/b.mp4", "label": 1}) == {
+        "label": 1, "mp4": "file:///clips/b.mp4", "caption": "a clip"}
+
+
 @pytest.mark.parametrize("rate", [16000, 48000])
 def test_a_video_listing_reads_frames_and_the_sound_around_them_at_the_rate_asked(tmp_path, rate):
     """Every clip under the directory, and nothing else, gives one record of `frames` frames fitted

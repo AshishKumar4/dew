@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from lane_environment import outside_any_cluster
+from process_support import running
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # The launches below stand in for Slurm, Open MPI or a plain host with
@@ -195,16 +196,6 @@ def test_a_pool_that_exits_zero_leaves_none_of_its_ranks_processes_running(tmp_p
     while any(running(worker) for worker in workers) and time.monotonic() < deadline:
         time.sleep(0.1)
     assert not any(running(worker) for worker in workers)
-
-
-def running(pid: int) -> bool:
-    """Whether `pid` runs: an exited process its new parent has not reaped yet (a zombie, state Z in
-    /proc) has stopped, though a signal still finds it."""
-    try:
-        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    except FileNotFoundError:
-        return False
-    return state != "Z"
 
 
 # ssh -tt as the launcher runs it, to a host that is this machine: the remote command runs under a

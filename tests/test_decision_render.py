@@ -114,6 +114,39 @@ def test_a_noul_asks_yes_first_with_the_releases_descriptions(qwen):
                                                         "question yes?")
 
 
+def test_labels_named_by_none_take_the_names_their_tokenizer_spells_as_one_token():
+    """Labels that name none (`Labels.spelled`) take, in `LABEL_NAMES`' order, the names whose every
+    variant a real BPE vocabulary (GPT-2's, committed) spells as one token, past those it spells as
+    two: each chosen name's ids are one token a variant, the names it passes over are two or more, and
+    they letter as many options as the vocabulary can, where `LABEL_NAMES` in order stops at its first
+    name of two tokens; more than it spells as one are refused."""
+    from dew.data.text import HFTokenizer
+    from dew.decision.layout import LABEL_NAMES
+
+    gpt2 = HFTokenizer(str(Path(__file__).parent / "fixtures" / "tokenizers" / "gpt2"), local_files_only=True)
+    labels = Labels()
+
+    def one_token(name):
+        return all(len(gpt2.encode(variant.format(name), add_special_tokens=False)) == 1
+                   for variant in labels.variants)
+
+    first_gap = next(index for index, name in enumerate(LABEL_NAMES) if not one_token(name))
+    count = first_gap + 8
+    spelled = labels.spelled(gpt2, count)
+    assert spelled.names is not None and len(spelled.names) == count
+    assert all(one_token(name) for name in spelled.names)
+    chosen = [LABEL_NAMES.index(name) for name in spelled.names]
+    assert chosen == sorted(chosen)
+    assert all(not one_token(LABEL_NAMES[index]) for index in range(chosen[-1]) if index not in chosen)
+    assert all(len(ids) == len(labels.variants) for ids in spelled.ids(gpt2, count))
+    with pytest.raises(ValueError):
+        labels.ids(gpt2, count)
+    with pytest.raises(ValueError):
+        labels.spelled(gpt2, sum(one_token(name) for name in LABEL_NAMES) + 1)
+    named = Labels(names=("A", "B"))
+    assert named.spelled(gpt2, 2) == named
+
+
 def test_more_options_than_letters_ask_for_one_label_their_structures_indented(qwen):
     """A choice of more options than letters asks for one label, by the cue past them, each line under
     the layout's own label; a structured description and a structured state are indented JSON."""

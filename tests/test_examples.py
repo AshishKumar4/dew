@@ -18,6 +18,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from lane_environment import outside_suite
 from diffusion_stubs import RES, TOKENS, StubText
 from PIL import Image
 from process_support import dew_train, logged_losses
@@ -31,6 +32,7 @@ from dew.diffusion.presets import Flow
 from dew.inference import TextToImage
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
+from dew.training import LocalTracker
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -42,9 +44,8 @@ def single_device(offline=True, devices=1) -> dict[str, str]:
     run asks for the network and carries the marker. No smoke reaches a paid
     endpoint, so none is handed the caller's OpenAI key.
     """
-    return {**{key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"},
+    return {**{key: value for key, value in outside_suite(os.environ).items() if key != "OPENAI_API_KEY"},
             "PYTHONPATH": str(REPO_ROOT / "src"),
-            "JAX_PLATFORMS": "cpu",
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}",
             "HF_HUB_OFFLINE": "1" if offline else "0",
             "TOKENIZERS_PARALLELISM": "false"}
@@ -118,7 +119,8 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
           "--batch-size", "8", "--sequence-length", "12", "--experts", "2", "--top-k", "1",
           smoke_args=False, devices=8)
     record = json.loads((out / "moe-mesh.json").read_text())
-    assert record["mesh"] == {"data": 2, "expert": 2, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}
+    assert record["mesh"] == {"diloco": 1, "data": 2, "expert": 2, "fsdp": 2, "tensor": 1, "sequence": 1,
+                              "stage": 1}
     assert len(record["devices"]) == 8 and record["dispatch"] == "exchange" and record["all_to_all_ops"] > 0
     assert [step["step"] for step in record["steps"]] == [1, 2]
     assert all(np.isfinite(step["loss"]) for step in record["steps"])
@@ -294,8 +296,8 @@ def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_
                  if real]
     assert sorted(captioned) == sorted(ids["test"])
     run = tmp_path / "checkpoints" / "flowers-caption"
-    journal = [json.loads(row) for row in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
-    losses = [row["scalars"]["train/loss"] for row in journal if "train/loss" in row["scalars"]]
+    losses = [values["train/loss"] for _, values in LocalTracker(run / "tracking").scalars()
+              if "train/loss" in values]
     assert len(losses) == 4 and all(math.isfinite(loss) for loss in losses)
     checkpoints = Checkpoints(str(run))
     early, _ = checkpoints.restore(step=2)
@@ -427,31 +429,33 @@ def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
     assert (tmp_path / "run" / "export" / "model.safetensors").is_file()
 
 
+def commits_both_updates_one_behind(example, tmp_path, summary, *arguments):
+    """`example`'s smoke, then its `summary` file's account: both updates committed, the second on draws
+    submitted one update earlier."""
+    smoke(example, tmp_path, *arguments)
+    written = json.loads((tmp_path / summary).read_text())
+    assert written["updates"] == 2 and written["max_lag"] == 1
+
+
 def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
     """The smoke's completions all run out of their eight tokens, so a run
     that masked truncations would commit nothing and never push. The
     example scores them: both updates commit, and the second trains on
     draws submitted one update earlier."""
-    smoke("train_rlvr", tmp_path)
-    summary = json.loads((tmp_path / "rewards.json").read_text())
-    assert summary["updates"] == 2 and summary["max_lag"] == 1
+    commits_both_updates_one_behind("train_rlvr", tmp_path, "rewards.json")
 
 
 def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
     """`--turns 2` runs its sessions through EnvironmentSource and commits both updates, one behind.
     The tiny model's attempts end on the token budget, so the feedback path
     is the next test's."""
-    smoke("train_rlvr", tmp_path, "--turns", "2")
-    summary = json.loads((tmp_path / "rewards.json").read_text())
-    assert summary["updates"] == 2 and summary["max_lag"] == 1
+    commits_both_updates_one_behind("train_rlvr", tmp_path, "rewards.json", "--turns", "2")
 
 
 def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
     """Two updates of Harbor trials whose model calls the stand-in gateway records from the policy's
     own draws; the second trains on sessions submitted one update earlier."""
-    smoke("train_harbor", tmp_path)
-    summary = json.loads((tmp_path / "summary.json").read_text())
-    assert summary["updates"] == 2 and summary["max_lag"] == 1
+    commits_both_updates_one_behind("train_harbor", tmp_path, "summary.json")
 
 
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
@@ -496,3 +500,63 @@ def test_evaluate_and_serve_smoke_runs_an_lm_eval_harness_task(tmp_path):
     harness = json.loads((tmp_path / "report.json").read_text())["harness"]
     assert {name.split("/")[0] for name in harness} == {"hellaswag"}
     assert all(0.0 <= value <= 1.0 for name, value in harness.items() if name.endswith("acc,none"))
+
+
+@pytest.mark.parametrize("arguments", [(), ("--damping", "1e-8")], ids=["adam", "gauss-newton"])
+def test_pinn_burgers_smoke_trains_the_profile_in_float64_and_reports_its_residuals(tmp_path, arguments):
+    """The self-similar Burgers profile through a four-level Fourier feature pyramid, by Adam and by
+    Gauss-Newton, in float64: the run writes the paper's two figures on its diagnostic grid, finite."""
+    out = tmp_path / "burgers"
+    smoke("pinn_burgers", out, *arguments)
+    metrics = json.loads((out / "metrics.json").read_text())
+    assert metrics["steps"] == 20 and np.isfinite(metrics["pde_mse"])
+    assert np.isfinite(metrics["log10_max_residual"])
+
+
+BURGERS_PIECES = """
+import importlib.util, json, sys
+import jax, jax.numpy as jnp, numpy as np
+
+spec = importlib.util.spec_from_file_location("pinn_burgers_under_test", sys.argv[1])
+burgers = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = burgers
+spec.loader.exec_module(burgers)
+model = burgers.Profile(pyramid=0, width=5, depth=3)
+profile = burgers.BurgersProfile(model)
+variables = profile.fresh_variables(jax.random.key(0), None)
+value, slope = jax.value_and_grad(lambda at: profile.equation(variables, at))(jnp.float64(0.0))
+drawn = [model.init(jax.random.key(seed), jnp.zeros((1,), jnp.float64))["params"] for seed in range(200)]
+largest = {layer: float(max(np.abs(np.asarray(params[layer]["bias"])).max() for params in drawn))
+           for layer in ("Dense_0", "Dense_2")}
+print(json.dumps({"zero": [float(value), float(slope)], "largest": largest}))
+"""
+"""The Burgers example's residual and its slope at eta = 0, and its layers' largest bias of 200 draws."""
+
+
+def test_the_burgers_residual_is_finite_where_its_points_start_and_its_biases_are_bounded_by_their_inputs(
+        tmp_path):
+    """The profile equation and its derivative are finite at eta = 0, inside the points' [0, c), where
+    the tail's factored form gave a negative power of zero times zero (row 1993). Each layer's bias is
+    drawn as PyTorch's Linear draws it, within 1 / sqrt of its inputs: the first layer's one input lets
+    a bias past 1 / sqrt(5), and the last layer's five inputs keep one within it, where the bias was
+    bounded by its output width (row 1994)."""
+    script = tmp_path / "burgers_pieces.py"
+    script.write_text(BURGERS_PIECES)
+    finished = smoke("pinn_burgers", tmp_path, str(REPO_ROOT / "examples" / "pinn_burgers.py"), script=script,
+                     smoke_args=False)
+    pieces = json.loads(finished.stdout.strip().splitlines()[-1])
+    assert np.isfinite(pieces["zero"]).all()
+    bound = 1 / math.sqrt(5)
+    assert pieces["largest"]["Dense_0"] > bound >= pieces["largest"]["Dense_2"]
+
+
+@pytest.mark.parametrize("method", ["perturbation", "backprop"])
+def test_forward_only_lm_smoke_trains_a_decoder_with_and_without_backpropagation(tmp_path, method):
+    """A two-layer decoder of Dust's layout on random rows, by node perturbation and by backpropagation:
+    each run writes its training and validation losses, finite, for every step and every evaluation."""
+    out = tmp_path / method
+    smoke("forward_only_lm", out, "--method", method)
+    curves = json.loads((out / "curves.json").read_text())
+    assert curves["method"] == method and curves["steps"] == 4
+    assert [step for step, _ in curves["train"]] == [1, 2, 3, 4] and curves["val"]
+    assert np.isfinite([loss for _, loss in curves["train"] + curves["val"]]).all()

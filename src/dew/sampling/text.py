@@ -34,11 +34,28 @@ from typing_extensions import TypeVar
 
 from dew._hashing import array_fingerprint
 from dew._records import finite
-from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
+from dew.batch import (
+    VALIDITY_FIELD,
+    Variables,
+    coordinates as laid_out,
+    flat_field,
+    prefix_sum,
+    real_slots,
+    token_positions,
+    valid_order,
+    with_validity,
+)
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
-from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
+from dew.nn.kv_cache import (
+    gather_cache_rows,
+    refuse_unassigned,
+    with_rounding_keys,
+    with_rounding_keys_of,
+    write_cache,
+)
+from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import (
     BlockDenoiser,
     BlockDrafting,
@@ -55,6 +72,7 @@ from dew.nn.protocols import (
     refuse_prefix,
 )
 from dew.nn.visibility import with_served_blocks
+from dew.objectives.base import ROUNDING_STREAM
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -340,8 +358,23 @@ def row_texts(decoder, generation, prompt_width: int | None) -> tuple[str, ...]:
     return decoder(rows.tokens, rows.lengths, prompt_width)
 
 
+def rounding_keys(keys: jax.Array) -> jax.Array:
+    """Each row's key data of its stochastic-rounding stream (`dew.nn.kv_cache.ROUNDING_KEYS`) from its
+    request's `keys`: a default-impl key, `ROUNDING_STREAM`'s, folded with each word of the row's key
+    in turn, so it is apart from the sampling stream whatever that key's implementation, as a training
+    step's rounding stream is apart from its dropout (`dew.objectives.base.training_rngs`)."""
+    def derived(words: jax.Array) -> jax.Array:
+        key = jax.random.key(ROUNDING_STREAM)
+        for index in range(words.shape[0]):
+            key = jax.random.fold_in(key, words[index])
+        return jax.random.key_data(key)
+
+    return jax.vmap(derived)(jax.random.key_data(keys))
+
+
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
-             cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
+                  cache: Variables | None = None, rounding: jax.Array | None = None,
+                  progress: Progress = END) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
     A `Selective` decoder skips the prompt-wide head, the largest array a
@@ -349,10 +382,14 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     cache seeded over the prompt (`_seeded_depths`), so the first block does
     not draft from nothing, and a block drafter's windows take every real
     prompt position's context. `cache` continues a cache the caller holds,
-    whose cursors say where each prompt resumes; None allocates an empty one.
+    whose cursors say where each prompt resumes; None allocates an empty one. `rounding` is each
+    row's stochastic-rounding key data (`rounding_keys`), which the cache then holds for every later
+    call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's.
     """
     batch, width = inputs.tokens.shape
-    held = _empty_cache(model, params, batch, ops) if cache is None else cache
+    held = _empty_cache(model, params, batch, ops.depths, ops.record is not None) if cache is None else cache
+    if rounding is not None:
+        held = with_rounding_keys(held, rounding)
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     real = real_slots(inputs.token_fields, (batch, width))
@@ -368,13 +405,14 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
         capture_intermediates=False,
         **inputs.kwargs(),
+        **progressed(model, progress),
     )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
         states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
-    rotary = inputs.token_fields.get("rotary_positions")
-    logical = rotary if rotary is not None else token_positions(inputs.token_fields)
+    rotary = flat_field(inputs.token_fields, "rotary_positions")
+    logical = jnp.asarray(rotary) if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:
@@ -382,10 +420,10 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
                              'without custom coordinates')
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
-        slots = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1, -1)
+        slots = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
                               inputs.tokens, slots)
-        state = dataclasses.replace(state, tokens=history, lengths=lengths)
+        state = dataclasses.replace(state, tokens=history, lengths=lengths, rebuilt=jnp.zeros(batch, bool))
     prepared = jax.tree.leaves(updated.get("embeddings", {}))
     if ops.depths > 1 and states is not None:
         # Every later depth needs a predecessor slot in the carry from the
@@ -399,15 +437,16 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     return state, last >= 0
 
 
-def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps) -> Variables:
-    """A zeroed decode cache for `batch` rows, with the drafter's own beside it. A decoder whose every
-    mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
+def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, drafter: bool) -> Variables:
+    """A zeroed decode cache for `batch` rows, with the prediction depths' (`depths`) and the block
+    drafter's own (`drafter`) beside it. A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no
+    cache, and its collection is empty."""
     def initialized(method: str) -> dict:
         _, mutated = model.apply(params, batch, method=method, mutable=["cache"])
         return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
-    for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
+    for method in ("init_mtp_cache",) * bool(depths) + ("init_draft_cache",) * drafter:
         cache.update(initialized(method))
     return unflatten_dict(cache)
 
@@ -468,7 +507,8 @@ def _refuse_generation(model: nn.Module) -> None:
         raise ValueError(refusal)
 
 
-def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None) -> DecodeOps:
+def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None,
+               progress: Progress = END) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
 
     `depths` is the prediction depths a drafting strategy runs, beside the
@@ -480,9 +520,18 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     the cache moves with the rows. A model with a block drafter hands its
     drafter's context back as the states `verify` returns.
     A LongRoPE crossing costs one full-prefix forward over the whole batch
-    to keep static shapes; it happens once per request.
+    to keep static shapes; it happens once per request. It rebuilds every
+    cache the decode keeps: the trunk's over the history, and the prediction
+    depths' and a block drafter's reseeded from it as `prefill_state` seeds
+    them, the crossing rows marked (`DecoderState.rebuilt`). A call whose
+    tokens cross answers each as the walk a token at a time does: those up
+    to the change at the short table, over the cache as it stands, and those
+    past it from the rebuilt history.
     """
     exposed = isinstance(model, Exposing)
+    # The target's forwards read the run's progress where it reads one; a drafter's proposals, which the
+    # target verifies, read none.
+    at = progressed(model, progress)
     blocks = (_block_drafting(model, params)
               if depths is not None and isinstance(model, BlockDrafting) and model.dspark else None)
     depths = depths or 0
@@ -491,63 +540,50 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
-        positions = ({} if state.positions is None else
-                     {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
-        def append():
+
+        def append(valid):
+            # The step's tokens laid out once (`Coordinates`): the real ones, at the places the rows reach.
+            laid = laid_out(tokens.shape, valid=valid, positions=None if state.positions is None else
+                            state.positions[:, None] + jnp.arange(width)[None, :])
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
-                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
-                method="states_and_logits" if exposed else None,
-                capture_intermediates=False, **positions)
+                decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
+                method="states_and_logits" if exposed else None, capture_intermediates=False, **at)
 
-        history, lengths = state.tokens, state.lengths
+        history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         original = rebuild_position(model)
         if original is not None and history is not None and lengths is not None:
-            slots = lengths[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+            slots = lengths[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
             crossing = (lengths <= original) & (following > original)
-            ordinary = append()
+            # A crossing row's tokens up to the change, which the walk answers at the short table
+            # (its rotary reads a row's last real place); the rest come from the rebuilt history.
+            before = slots < original
+            answer, updated = append(valid & (before | ~crossing[:, None]))
+            ordinary = (answer, updated["cache"], drafts,
+                        None if blocks is None else _context(model, params, updated))
 
             def rebuild():
-                """Recompute the prefix at its new table, Phi-3's intended policy.
+                fresh = _rebuilt(model, params, made, state, history, following, slots, progress)
+                # A crossing row's tokens up to the change answer at the short table, the rest rebuilt.
+                answer, context = jax.tree.map(lambda fresh, held: _chosen(before, held, fresh),
+                                               (fresh[0], fresh[3]), (ordinary[0], ordinary[3]))
+                return jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
+                                    (answer, fresh[1], fresh[2], context), ordinary)
 
-                Transformers 5.16.1 slices to one token before clearing KV:
-                at the tiny fixture's position 8 its hook sees [[32], [59]],
-                no cache, and predicts 2 where its full-prefix forward predicts
-                32. Rebuilding the prefix retains the prompt's information.
-                https://github.com/huggingface/transformers/issues/49334
-                """
-                empty = model.apply(params, tokens.shape[0],
-                                     method='init_cache', mutable=['cache'])[1]['cache']
-                answer, updated = model.apply(
-                    {**params, 'cache': empty}, history,
-                    attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
-                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
-                rows = jnp.arange(tokens.shape[0])[:, None]
-                # The same answer `append` gives: states beside the logits where the model exposes them.
-                picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
-                rebuilt = picked, updated
-
-                def replaced(fresh, held):
-                    selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))
-                    return jnp.where(selected, fresh, held)
-
-                return jax.tree.map(replaced, rebuilt, ordinary)
-
-            answer, updated = jax.lax.cond(
-                jnp.any(crossing), rebuild, lambda: ordinary)
-            lengths = following
+            answer, cache, drafts, context = jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
+            lengths, rebuilt = following, crossing
         else:
-            answer, updated = append()
+            answer, updated = append(valid)
+            cache, context = updated["cache"], None if blocks is None else _context(model, params, updated)
         states, logits = answer if exposed else (None, answer)
         if blocks is not None:
-            states = _context(model, params, updated)
+            states = context
         moved = (None if state.positions is None else
                  state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
-        return (dataclasses.replace(state, cache=updated["cache"], logits=logits[:, -1],
-                                    positions=moved,
-                                    tokens=history, lengths=lengths,
+        return (dataclasses.replace(state, cache=cache, logits=logits[:, -1], positions=moved,
+                                    tokens=history, lengths=lengths, drafts=drafts, rebuilt=rebuilt,
                                     hidden=None if states is None else states[:, -1]),
                 logits, states)
 
@@ -562,11 +598,64 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                          dataclasses.replace(state, cache={})),
             cache=gather_cache_rows(state.cache, rows))
 
+    # `run`'s rebuild reseeds the depths through these ops, bound once they are made.
     if blocks is not None:
-        return DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1])
-    if not depths or not exposed:
-        return DecodeOps(advance, reindex, run)
-    return DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
+        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1])
+    elif not depths or not exposed:
+        made = DecodeOps(advance, reindex, run)
+    else:
+        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
+    return made
+
+
+type _Answer = jax.Array | tuple[jax.Array, jax.Array]
+"""A decode call's answer: its logits, or its states beside them where the model exposes them."""
+
+
+def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: DecoderState, history: jax.Array,
+             following: jax.Array, slots: jax.Array, progress: Progress = END
+             ) -> tuple[_Answer, Variables, tuple[jax.Array, ...], jax.Array | None]:
+    """Recompute the prefix at its new table, Phi-3's intended policy, every cache with it, at the run's
+    `progress` a model that reads one draws at (`generate`): the answer
+    at each of a call's `slots` from the `history` of `following` tokens a row, the trunk's cache over it,
+    the prediction depths' and a block drafter's reseeded from it as `prefill_state` seeds them, and
+    the drafter's context at the slots, None without one.
+
+    Transformers 5.16.1 slices to one token before clearing KV:
+    at the tiny fixture's position 8 its hook sees [[32], [59]],
+    no cache, and predicts 2 where its full-prefix forward predicts
+    32. Rebuilding the prefix retains the prompt's information.
+    https://github.com/huggingface/transformers/issues/49334
+    """
+    exposed, drafter = isinstance(model, Exposing), ops.record is not None
+    (batch, width), rows = history.shape, jnp.arange(history.shape[0])[:, None]
+    real = jnp.arange(width)[None, :] < following[:, None]
+    empty = with_rounding_keys_of(_empty_cache(model, params, batch, ops.depths, drafter), state.cache)
+    answer, updated = model.apply(
+        {**params, 'cache': empty}, history, coordinates=laid_out(history.shape, valid=real), decode=True,
+        mutable=['cache', *(['embeddings'] if ops.depths else []),
+                 *(['prediction_inputs'] if drafter else [])],
+        method='states_and_logits' if exposed else None, **progressed(model, progress))
+    states = answer[0] if exposed else None
+    reseeded = dataclasses.replace(state, cache=updated['cache'])
+    context = None
+    if ops.record is not None:
+        # The drafter's windows over the history's context, as a prefill records them.
+        context = _context(model, params, updated)
+        reseeded = ops.record(reseeded, context, real)
+        context = context[rows, slots]
+    if ops.depths and states is not None:
+        # The depths' caches and predecessors over the history, as a prefill seeds them.
+        reseeded = dataclasses.replace(reseeded,
+                                       drafts=(states[rows[:, 0], following - 1],) * (ops.depths - 1))
+        embedded = jax.tree.leaves(updated['embeddings'])[0]
+        reseeded = _seeded_depths(ops, reseeded, states, embedded, real, None, batch, width)
+    return jax.tree.map(lambda leaf: leaf[rows, slots], answer), reseeded.cache, reseeded.drafts, context
+
+
+def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array) -> jax.Array:
+    """`chosen` where `where` holds over its leading axes, else `otherwise`."""
+    return jnp.where(where.reshape(*where.shape, *(1,) * (chosen.ndim - where.ndim)), chosen, otherwise)
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):
@@ -575,19 +664,20 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
                 embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
                 depth: int, prediction_phase: PredictionPhase) -> tuple[DecoderState, jax.Array, jax.Array]:
         ids = jnp.zeros(valid.shape, jnp.int32) if tokens is None else jnp.where(valid, tokens, pad_id)
-        # Multi-axis rotary metadata is not a scalar position, and a depth
-        # takes it under its own name.
-        placed = ({"rotary_positions": positions} if positions.ndim == 3
-                  else {"positions": positions})
+        # The step's tokens laid out once (`Coordinates`); multi-axis rotary metadata is not a scalar
+        # position, and a depth takes it under its own name.
+        rotary = positions.ndim == 3
+        rows, width = valid.shape
+        laid = laid_out((rows, width), valid=valid, positions=None if rotary else positions)
         (logits, states), updated = model.apply(
-            {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
-            input_embeddings=embeds, decode=True, mutable=["cache"], rngs=None,
-            prediction_phase=prediction_phase,
-            method="mtp_step", capture_intermediates=False, **placed)
+            {**params, "cache": state.cache}, hidden, ids, depth=depth, coordinates=laid,
+            rotary_positions=positions if rotary else None, input_embeddings=embeds, decode=True,
+            mutable=["cache"], rngs=None, prediction_phase=prediction_phase,
+            method="mtp_step", capture_intermediates=False)
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
     def embed(tokens: jax.Array) -> jax.Array:
-        prepared = model.apply(params, tokens, method="token_embeddings")
+        prepared = model.apply(params, tokens, method="stream_embeddings")
         assert isinstance(prepared, jax.Array)
         return prepared
 
@@ -597,8 +687,9 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
 def _block_drafting(model: nn.Module, params: Variables):
     """`DecodeOps.record` and `DecodeOps.draft` over the model's block drafter."""
     def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
-        _, updated = model.apply({**params, "cache": state.cache}, context, None, valid=valid,
-                                 method="draft", mutable=["cache"])
+        _, updated = model.apply({**params, "cache": state.cache}, context, None,
+                                 coordinates=laid_out(valid.shape, valid=valid), method="draft",
+                                 mutable=["cache"])
         return dataclasses.replace(state, cache=updated["cache"])
 
     def draft(state: DecoderState, tokens: jax.Array,
@@ -612,7 +703,7 @@ def _block_drafting(model: nn.Module, params: Variables):
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
               trips: int, budget: jax.Array, pad_id: int, n: int,
               transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-              strategy: Strategy) -> Generation:
+              strategy: Strategy, progress: Progress = END) -> Generation:
     """One fixed compiled loop of `trips` draws; finished rows do not mutate
     their cache state. `budget` is the tokens the request may draw, at most
     `trips`, which the steps read (`StepState.budget`).
@@ -628,8 +719,8 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
     drafting = isinstance(strategy, Speculative)
-    ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None)
-    state, real = prefill_state(model, params, inputs, ops)
+    ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None, progress)
+    state, real = prefill_state(model, params, inputs, ops, rounding=rounding_keys(keys), progress=progress)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
         valid=jnp.concatenate([real_slots(inputs.token_fields, (batch, width)),
@@ -664,7 +755,7 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
         raise ValueError("max_new_tokens must be a non-negative integer")
     if type(n) is not int or n < 1:
         raise ValueError("n must be a positive integer number of continuations")
-    mask = fields.get("attention_mask")
+    mask = fields.get(VALIDITY_FIELD)
     if mask is not None and (mask.shape != ids.shape or not np.all((mask == 0) | (mask == 1))):
         raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
     valid = real_slots(fields, ids.shape, xp=np)
@@ -836,7 +927,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-             strategy: Strategy,
+             strategy: Strategy, progress: Progress,
              packing: tuple[ProjectionGroup, ...] = ()) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
 
@@ -849,13 +940,13 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     # dew.inference imports this module, so its packing is imported here.
     from dew.inference.projections import packed_in_call
 
-    def run(params, inputs, keys, budget, transforms, stopping, strategy):
+    def run(params, inputs, keys, budget, transforms, stopping, strategy, progress):
         # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`).
         return _generate(model, packed_in_call(params, packing), inputs, keys, trips, budget, pad_id, n,
-                         transforms, stopping, strategy)
+                         transforms, stopping, strategy, progress)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
-        params, inputs, keys, budget, transforms, stopping, strategy)
+        params, inputs, keys, budget, transforms, stopping, strategy, progress)
 
 
 
@@ -868,7 +959,8 @@ def generate(model: nn.Module, params: Variables,
              *, key: int | jax.Array,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None,
-             trips: int | None = None, prefix: int | Literal["prompt"] | None = None) -> Generation:
+             trips: int | None = None, prefix: int | Literal["prompt"] | None = None,
+             progress: Progress = END) -> Generation:
     """Generate continuations from model inputs, or from token ids for a text-only prompt.
 
     ``params`` is the full variables dict, ``{'params': ...}``.
@@ -909,6 +1001,11 @@ def generate(model: nn.Module, params: Variables,
     transform or a search reads it (``ForcedEOS``, ``Beam``), and the
     columns past it come back for the caller to cut.
 
+    ``progress`` is the run's progress a model that reads one draws at
+    (``dew.nn.progress``): its prefill's and every step's forward read it, an
+    input of the compiled loop like the weights, so a run's collection draws
+    from its policy at the updates it committed; ``END``, a finished run's.
+
     ``prefix`` serves a prefix run (``LMObjective``'s): each prompt that
     carries no blocks of its own reads its first ``prefix`` real tokens, or
     with ``"prompt"`` all of them, as one block (``served_blocks``). They are
@@ -933,12 +1030,12 @@ def generate(model: nn.Module, params: Variables,
     from dew.inference.projections import pending
 
     compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
-                       in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None),
+                       in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None, None),
                        out_shardings=(None, plan.sharding))
     # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
     failure, output = compiled(model, decoding_storage(model, params), plan.place(request.padded()),
                                plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                               *components, pending(model, params))
+                               *components, progress, pending(model, params))
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

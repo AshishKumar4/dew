@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from interop_support import fetch
+from interop_support import fetch, respelled
 
 from dew.interop import Pretrained
 from dew.interop.codecs import (
@@ -187,11 +187,8 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path, block):
     everything else is as it was. `Pretrained.load` lands the dequantized
     weight, transposed as every kernel is, and the untouched tensors bit for bit."""
     from dew.interop.safetensors_io import read_file
-    directory = tmp_path / "fp8"
-    shutil.copytree(FIXTURE, directory)
-    config = json.loads((directory / "config.json").read_text())
-    config["quantization_config"] = {**DEEPSEEK_V3, "weight_block_size": list(block)}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURE, tmp_path / "fp8", lambda config: {
+        **config, "quantization_config": {**DEEPSEEK_V3, "weight_block_size": list(block)}})
     tensors, _ = read_file(directory / "model.safetensors")
     quantized = ("model.layers.0.mlp.up_proj.weight",        # [48, 32]: 3 x 2 blocks
                  "model.layers.0.self_attn.kv_b_proj.weight")  # [64, 8]: a partial column block
@@ -220,11 +217,8 @@ def test_an_fp8_checkpoint_loads_and_saves_without_the_prediction_depths_it_drop
     leaves the depth's quantized weights and scales unread, so the load binds the trunk's scales alone,
     and its save requantizes the trunk and reloads to the same logits."""
     from dew.interop.safetensors_io import read_file
-    directory = tmp_path / "fp8"
-    shutil.copytree(FIXTURE.parent / "glm4-moe-tiny", directory)
-    config = json.loads((directory / "config.json").read_text())
-    config["quantization_config"] = {**DEEPSEEK_V3, "weight_block_size": [16, 16]}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURE.parent / "glm4-moe-tiny", tmp_path / "fp8", lambda config: {
+        **config, "quantization_config": {**DEEPSEEK_V3, "weight_block_size": [16, 16]}})
     tensors, _ = read_file(directory / "model.safetensors")
     shipped = dict(tensors)
     for name in ("model.layers.0.self_attn.q_proj.weight", "model.layers.2.eh_proj.weight"):
@@ -387,13 +381,11 @@ def reexport(request, tmp_path_factory):
     from dew.interop.sources import load_shards
     ue8m0 = request.param
     root = tmp_path_factory.mktemp("fp8-reexport")
-    directory, destination = root / "source", root / "reexport"
-    shutil.copytree(FIXTURE, directory)
+    destination = root / "reexport"
     quantization = {**DEEPSEEK_V3, "weight_block_size": [REEXPORT_BLOCK] * 2,
                     **({"scale_fmt": "ue8m0"} if ue8m0 else {})}
-    config = {**json.loads((directory / "config.json").read_text()),
-              "quantization_config": quantization}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURE, root / "source",
+                          lambda config: {**config, "quantization_config": quantization})
     shipped = dict(read_file(directory / "model.safetensors")[0])
     for name in QUANTIZED_TENSORS:
         shipped[name], shipped[name + SCALE_SUFFIX] = quantize_fp8_blocks(

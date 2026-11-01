@@ -13,11 +13,12 @@ delete those buffers while the task is using them.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -28,15 +29,28 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
 from dew._coordination import agreed
-from dew._records import integer, record as named_fields, strings, text as named
-from dew.batch import PARAMETER_ROOTS, Variables, thaw
+from dew._records import earlier_fields, integer, json_value, record as named_fields, strings, text as named
+from dew.batch import (
+    COORDINATES_FIELD,
+    PARAMETER_ROOTS,
+    POSITIONS_FIELD,
+    VALIDITY_FIELD,
+    Variables,
+    laid_coordinates,
+    thaw,
+    token_positions,
+    token_validity,
+)
 from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
-from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
+from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
+from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, pad_token_rows, request_key
+from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
+from dew.nn.progress import END, Progress
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
@@ -58,6 +72,9 @@ from dew.telemetry.profile import region
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    # A run processor's tokenizer is read through its methods alone, so image generation, which builds none,
+    # reads no tokenizer library (tests/test_imports.py's optional backends).
+    from dew.data.text import Tokenizer
     from dew.distributed.placement import Layout, MeshSpec
     from dew.quantization import Quantization
     from dew.registry import ModelConfig
@@ -79,6 +96,19 @@ whose buckets would exceed `max_seq_len` keeps its own shapes, so the model
 refuses exactly the requests it would refuse without buckets. A request with
 media or multi-axis positions also keeps its own shapes.
 """
+
+
+SCORING_RUNGS = 4
+"""How many lengths a task that scores whole requests pads its passes to (`length_ladder`)."""
+
+
+def length_ladder(top: int, smallest: int, rungs: int = SCORING_RUNGS) -> tuple[int, ...]:
+    """The lengths a task that scores whole requests compiles its passes at, shortest first: `top`, the
+    layout's window, so a request at the training window reads training's shape, and its halvings, `rungs`
+    of them at most and none shorter than `smallest`, the shortest row the layout lays out. Each length is
+    one program, which the task compiles once, up front, rather than one per power of two of every
+    request's length, rows and options (`dew.decision.task.Decide.pass_shapes`)."""
+    return tuple(sorted({max(min(smallest, top), top >> step) for step in range(rungs)}))
 
 
 class Processor(Protocol):
@@ -139,7 +169,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
                  collective: bool, max_new_tokens: int | None, default_tokens: int | None,
-                 max_length: int | None, key: int | jax.Array | None) -> tuple[ModelInputs, int, jax.Array]:
+                 max_length: int | None, key: int | jax.Array) -> tuple[ModelInputs, int, jax.Array]:
     def prepared() -> tuple[ModelInputs, int, jax.Array]:
         """Tokenize the request, size its budget and draw its key."""
         random_key = request_key(key)
@@ -200,8 +230,11 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
     """
     if ceiling is None or budget < 1:
         return inputs, budget, None
-    positions = inputs.token_fields.get("positions")
-    if (set(inputs.token_fields) - {"attention_mask", "positions"} or inputs.conditioning
+    # The rows' layout, their coordinates or their flat fields (`laid_coordinates`): one document a row.
+    laid = laid_coordinates(inputs.token_fields)
+    positions = token_positions(inputs.token_fields)
+    if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD, COORDINATES_FIELD} or inputs.conditioning
+            or (laid is not None and laid.segments is not None)
             or (positions is not None and positions.shape != inputs.tokens.shape)):
         return inputs, budget, None
     width = shape_bucket(inputs.tokens.shape[1], 64)
@@ -213,17 +246,19 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
 
 
 def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
-    """Return `inputs` left-padded to `width` slots, with the filler marked invalid."""
+    """Return `inputs` left-padded to `width` slots, with the filler marked invalid, laid out again
+    (`ModelInputs.laid`)."""
     extra = width - inputs.tokens.shape[1]
     if extra < 1:
         return inputs
-    valid = inputs.token_fields.get("attention_mask")
+    valid = token_validity(inputs.token_fields)
     if valid is None:
         valid = jnp.ones(inputs.tokens.shape, bool)
+    positions = token_positions(inputs.token_fields)
     left = ((0, 0), (extra, 0))
-    fields = {name: jnp.pad(value, left) for name, value in inputs.token_fields.items()}
-    return replace(inputs, tokens=jnp.pad(inputs.tokens, left),
-                   token_fields={**fields, "attention_mask": jnp.pad(valid, left)})
+    fields = {VALIDITY_FIELD: jnp.pad(valid, left),
+              **({} if positions is None else {POSITIONS_FIELD: jnp.pad(positions, left)})}
+    return replace(inputs, tokens=jnp.pad(inputs.tokens, left), token_fields=fields).laid()
 
 
 @functools.cache
@@ -275,11 +310,45 @@ class SavedRun:
     record: Mapping[str, object]
     step: int
 
+    @property
+    def precision(self) -> Numerics | None:
+        """The numerics the run's step trained in (`Objective.inference_record`,
+        `dew.nn.precision.Numerics`); None for a record written before it named them."""
+        from dew.registry import from_record
+
+        recorded = self.record.get("precision")
+        return None if recorded is None else from_record(Numerics, named_fields(recorded, "precision"))
+
+    def formed[TaskT](self, task: TaskT) -> TaskT:
+        """`task`, built from this run (`from_saved`), under the numerics its step trained in where it
+        traces under them (`InItsForm`); a task of another class reads `precision` itself."""
+        if not isinstance(task, InItsForm) or task.precision == self.precision:
+            return task
+        return replace(task, precision=self.precision)
+
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
-        """The selected checkpoint of the run in `directory`, its latest or `step`. A task loaded
+        """The selected checkpoint of the run in `directory`: `step`, or where none is asked the step its
+        task loads by default (`SavedRunTask.default_step`), its latest unless the task names another, so
+        every reader of a run (a task, `dew.pipeline`, `dew export`) pins the one step. A task loaded
         from it compiles into the persistent cache (`persist_compilations`). `trust` names the
         packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
+        run = cls.at(directory, step, trust)
+        task = run.objective.saved_task
+        chosen = (task.default_step(directory) if step is None and task is not None
+                  and issubclass(task, SavedRunTask) else None)
+        if chosen is None:
+            return run
+        again = cls.at(directory, chosen, trust)
+        if again.objective.saved_task is not task:
+            raise ValueError(f"step {chosen} of {directory}, which its task loads by default, was written by "
+                             f"{again.objective.__name__}, whose task is another; load a step with `step`")
+        return again
+
+    @classmethod
+    def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The checkpoint of the run in `directory` at `step`, its latest where None, whatever step its task
+        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`)."""
         from dew.checkpoints import Checkpoints
         from dew.registry import import_trusted, objectives
         persist_compilations()
@@ -295,7 +364,7 @@ class SavedRun:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = objectives[named(record['objective'], 'objective')]
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-        stray = set(record) - {'objective', 'model', UNREAD, *declared}
+        stray = set(record) - {'objective', 'model', 'precision', UNREAD, *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
@@ -331,10 +400,42 @@ class SavedRun:
         return objective.model_tree(variables)
 
 
+@dataclass(frozen=True, kw_only=True)
+class InItsForm:
+    """A task whose calls trace under the numerics its run trained in (`precision`, `traced`),
+    as Dew's saved tasks do: a task built from a run (`SavedRun.formed`) takes the form the run's record
+    names, and a task built otherwise, a preview's during its run's fit, traces in the form chosen
+    around it."""
+
+    precision: Numerics | None = None
+    """The run's numerics its calls trace under (`dew.nn.precision.Numerics`), as the loaded step was
+    trained under them (`Objective.inference_record`): its products' precision and its ops' forms;
+    None traces under the numerics in effect around the call."""
+
+    def traced(self) -> contextlib.AbstractContextManager[None]:
+        """The block a call of this task traces in: its run's numerics (`generation.run_precision`), which
+        JAX keys its trace and compile caches on, so another policy's task traces its own programs."""
+        if self.precision is None:
+            return contextlib.nullcontext()
+        return generation.run_precision(self.precision)
+
+
+def traced_in_its_form[TaskT: InItsForm, **P, R](
+        call: Callable[Concatenate[TaskT, P], R]) -> Callable[Concatenate[TaskT, P], R]:
+    """`call`, a method of a task or its helper, traced under its run's numerics (`InItsForm.traced`),
+    on whichever thread runs it."""
+    @functools.wraps(call)
+    def traced(task: TaskT, *arguments: P.args, **keywords: P.kwargs) -> R:
+        with task.traced():
+            return call(task, *arguments, **keywords)
+    return traced
+
+
 class SavedRunTask:
     """A task a saved run loads as (`dew.objectives.base.SavedTask`): `from_run` pins the run's checkpoint
     once (`SavedRun.pinned`) and builds the task from it with the class's `from_saved`, which
-    `dew.pipeline` and `dew export` call on the run they pinned themselves."""
+    `dew.pipeline` and `dew export` call on the run they pinned themselves, in the attention form its run
+    trained in where the task traces in one (`InItsForm`, `SavedRun.formed`)."""
 
     if TYPE_CHECKING:
         @classmethod
@@ -343,15 +444,24 @@ class SavedRunTask:
                        param_dtype: DTypeLike | None = None) -> Self: ...
 
     @classmethod
+    def default_step(cls, directory: str) -> int | None:
+        """The step this task loads of the run in `directory` where none is asked: its latest (None),
+        unless the task names one it was fitted on (`Decide`'s calibration, of a run that ended on its
+        best step)."""
+        del directory
+        return None
+
+    @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> Self:
-        """Load the run in `directory` as this task (`from_saved`), at its latest checkpoint or at
-        `step`. `trust` names the packages outside Dew the run's record may import, as
-        `trust_remote_code` does in transformers."""
-        return cls.from_saved(SavedRun.pinned(directory, step, trust), ema=ema, mesh=mesh, layout=layout,
-                              dtype=dtype, param_dtype=param_dtype)
+        """Load the run in `directory` as this task (`from_saved`), at the step it loads by default
+        (`default_step`, `SavedRun.pinned`) or at `step`. `trust` names the packages outside Dew the run's
+        record may import, as `trust_remote_code` does in transformers."""
+        run = SavedRun.pinned(directory, step, trust)
+        return run.formed(cls.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
+                                         param_dtype=param_dtype))
 
 
 _EARLIER_AUTOENCODERS = {
@@ -373,9 +483,12 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), a
     decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
     and refused where it holds more than its name and fields (ledger 1239),
-    a processor's source as its encoded string (ledger 1641), and a Qwen or MiMo projector's earlier
-    fields (`_earlier_projectors`, ledger 1622). A record in today's shapes passes as it is. Carried to
-    1.0, when it is deleted (ledger 1552)."""
+    a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
+    fields, a decoder's or kind's YaRN field beside its rope scaling and a decoder's cross-attention
+    by its fields alone (`earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
+    question budgets, which it ignored and an earlier record wrote at their defaults (row 2006), and a
+    step's attention form, which its numerics' forms hold now (row 2500). A record in today's shapes
+    passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
@@ -400,6 +513,15 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
         current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
                              "fields": named_fields(layout.get("fields", {}), "layout.fields")}
+    laid = current.get("layout")
+    fields = laid.get("fields") if isinstance(laid, Mapping) else None
+    if isinstance(laid, Mapping) and isinstance(fields, Mapping) and fields.get("segments") is not None and (
+            "order" not in fields) and (
+            fields.get("head_max_len") is not None or fields.get("option_tokens") is not None):
+        # A row of segments kept its question whole and ignored the question budgets an earlier record
+        # wrote at their defaults (192 and 48) (row 2006). A record that states the row's order (2007)
+        # was written since a row of segments takes its budgets, so it keeps them.
+        current["layout"] = {**laid, "fields": {**fields, "head_max_len": None, "option_tokens": None}}
     processor = record.get("processor")
     if isinstance(processor, str):
         # A source's identity was an encoded string before typed component references (ledger 1641).
@@ -407,31 +529,123 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         from dew.registry import to_record
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
+    laid = current.get("layout")
+    if isinstance(laid, Mapping) and isinstance(laid.get("fields"), Mapping):
+        fields = laid["fields"]
+        segments = fields.get("segments")
+        if isinstance(segments, list | tuple):
+            # The layout's segments, each component in today's fields (`earlier_fields`).
+            migrated = earlier_fields(json_value(segments, "layout segments"))
+            assert isinstance(migrated, list)
+            current["layout"] = {**laid, "fields": {**fields, "segments": migrated}}
+    if "attention_form" in current:
+        # The form a step trained in, which its numerics' forms hold now (ledger 2500).
+        current["precision"] = {"forms": current.pop("attention_form")}
     if "model" in current:
-        current = _earlier_projectors(current)
+        current = earlier_model(current)
     return current
 
 
-def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A record's earlier Qwen or MiMo projector fields read as today's (`earlier_shapes`), wherever the
-    model nests the projector through another recorded wrapper. Carried until 1.0 (ledger 1622);
-    current constructors and source codecs accept only their current schema."""
+_EARLIER_PROJECTORS = ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector")
+_DECODER = ("dew.nn.backbones.causal_transformer:CausalTransformer", "causal_transformer")
+"""The decoder's import path and its registry alias, either of which a record names it by."""
+
+
+def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
+    nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
+    and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
+    1898), whether the decoder names its class or a wrapper declares the field it fills
+    (`MultimodalTransformer.language_model`, `DiffusionGemma.text`), which records its fields alone
+    (ledger 2274). Carried until 1.0 (ledger 1552); current constructors and source codecs accept only
+    their current schema."""
     def current(value):
-        if isinstance(value, Mapping):
-            component = {key: current(field) for key, field in value.items()}
-            name, fields = component.get("class"), component.get("fields")
-            if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
-                    and isinstance(fields, dict) and "vision_width" in fields:
-                width, merge = fields.pop("vision_width"), fields.pop("merge_size")
-                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
-                                     "width": width * merge ** 2,
-                                     "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
-            return component
         if isinstance(value, list | tuple):
             return [current(field) for field in value]
-        return value
+        if not isinstance(value, Mapping):
+            return value
+        component = {key: current(field) for key, field in value.items()}
+        # A component record names its class; the run's model record (`ModelConfig`) names it too, and
+        # holds the fields it defaulted beside the ones it was given.
+        name, fields = component.get("class", component.get("name")), component.get("fields")
+        if not isinstance(fields, dict):
+            return component
+        if name in _EARLIER_PROJECTORS and "vision_width" in fields:
+            width, merge = fields.pop("vision_width"), fields.pop("merge_size")
+            component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                                   "width": width * merge ** 2, "bias": name == _EARLIER_PROJECTORS[0]}
+        elif name in _DECODER:
+            component["fields"] = _decoder_fields(fields)
+            defaults = component.get("defaults")
+            if isinstance(defaults, Mapping):
+                component["defaults"] = _one_scaling(defaults)
+        elif isinstance(name, str):
+            component["fields"] = _declared_decoders(name, fields)
+        return component
 
     return {**record, "model": current(record["model"])}
+
+
+def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
+    """The fields of the component class `name`, by import path or by its alias of any kind (a mixer's
+    `attention`), with each decoder its fields declare (`dew.registry.declared_type`) and record as
+    their fields alone translated (`_decoder_fields`); unchanged where `name` names no one class."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import KINDS, declared_type, imported
+
+    named = [imported(name)] if ":" in name else [imported(kind.paths[name]) for kind in KINDS
+                                                   if name in kind.paths]
+    classes = [member for member in named if isinstance(member, type)]
+    if len(classes) != 1:
+        return fields
+    (owner,) = classes
+    return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
+                    and declared_type(owner, field) is CausalTransformer else value)
+            for field, value in fields.items()}
+
+
+_LAYER_DISPATCH = ("implementation", "dispatch", "capacity_factor")
+"""The routed MLP's dispatch an earlier record wrote into its value experts' fields, which run under
+the layer's `Mixture` alone today (`dew.nn.value_experts.RoutedValues.mixture`, ledger 2751)."""
+
+
+def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
+    """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
+    (`_one_scaling`), an earlier cross-attention, IDEFICS's block recorded by its fields alone
+    when the field declared that class, as its class record (`dew.nn.cross_attention.CrossBlocks`,
+    ledger 2320), and earlier value experts without the layer dispatch they recorded at its defaults
+    (`_LAYER_DISPATCH`)."""
+    kinds, cross, values = fields.get("kinds"), fields.get("cross_attention"), fields.get("value_experts")
+    return {**_one_scaling(fields), **({"value_experts": _without_dispatch(values)}
+                                       if isinstance(values, Mapping) else {}), **({"kinds": {
+        kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
+               else _one_scaling(held)) if isinstance(held, Mapping) else held
+        for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {}),
+        **({"cross_attention": {"class": "dew.nn.cross_attention:CrossAttention", "fields": dict(cross)}}
+           if isinstance(cross, Mapping) and "class" not in cross else {})}
+
+
+def _without_dispatch(values: Mapping[str, object]) -> Mapping[str, object]:
+    """Value experts' record without the layer dispatch an earlier one wrote (`_LAYER_DISPATCH`), in its
+    class record's fields where it has one."""
+    held = values.get("fields")
+    if "class" in values and isinstance(held, Mapping):
+        return {**values, "fields": _without_dispatch(held)}
+    return {name: value for name, value in values.items() if name not in _LAYER_DISPATCH}
+
+
+def _one_scaling(fields: Mapping[str, object]) -> Mapping[str, object]:
+    """A decoder's or layer kind's fields with an earlier `yarn` field read as its `rope_scaling`: the
+    fields it wrote, as YaRN's record. Fields setting both are refused: they were two scalings."""
+    current = dict(fields)
+    yarn = current.pop("yarn", None)
+    if yarn is None:
+        return current
+    if current.get("rope_scaling") is not None:
+        raise ValueError("an earlier record sets yarn and rope_scaling, two rope scalings")
+    held = yarn.get("fields", yarn) if isinstance(yarn, Mapping) else yarn
+    current["rope_scaling"] = {"rope_type": "yarn", **held} if isinstance(held, Mapping) else held
+    return current
 
 
 def settings_fields(settings: type) -> frozenset[str]:
@@ -453,13 +667,13 @@ class TaskSettings:
     """What every generation run records beside its model: `seq_len`, its training row length,
     `max_new_tokens`, its task's response budget (0 for none), and its host processor's source:
     `tokenizer` names the run tokenizer (`recorded_tokenizer`) and `processor` a checkpoint's own
-    processor source (`recorded_processor`); either may be None. Each task's settings add what its
-    generation reads."""
+    processor source (`recorded_processor`), the run's source's; either may be None. Each task's settings
+    add what its generation reads."""
 
     seq_len: int
     max_new_tokens: int
     tokenizer: str | None
-    processor: SourceReference | None
+    processor: SourceReference | None = dataclasses.field(metadata={"derived": "source"})
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -478,30 +692,36 @@ class TextSettings(TaskSettings):
 
 @dataclass(frozen=True, kw_only=True)
 class MaskedSettings(TaskSettings):
-    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
-    the unmasking solver and its step count, and the end-of-sequence ids a response stops at,
-    beside the common ones."""
+    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process, the
+    run's over its model's mask id, the unmasking solver (`Unmask`, or `Confident` for a release's
+    blockwise walk) and its step count, the places a blockwise walk unmasks together (`block`; None
+    walks the whole response), and the end-of-sequence ids a response stops at, beside the common
+    ones."""
 
-    process: DiscreteProcess
+    process: DiscreteProcess = dataclasses.field(metadata={"derived": "model"})
     solver: Solver
     sampling_steps: int
     eos_token_ids: tuple[int, ...] = ()
+    block: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
         if len(self.eos_token_ids):
             object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
-        if not isinstance(self.solver, Unmask):
-            raise ValueError("a masked run's task unmasks with an Unmask solver")
+        if not isinstance(self.solver, Unmask | Confident):
+            raise ValueError("a masked run's task unmasks with an Unmask or a Confident solver")
+        if self.block is not None:
+            integer(self.block, "block")
 
 
 @dataclass(frozen=True, kw_only=True)
 class BlockSettings(TaskSettings):
-    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the
-    pad id and the end-of-sequence ids a response stops at beside the common ones."""
+    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the run's
+    over its model's canvas and vocabulary, the pad id and the end-of-sequence ids a response stops at
+    beside the common ones."""
 
-    process: BlockProcess
+    process: BlockProcess = dataclasses.field(metadata={"derived": "model"})
     pad_token_id: int
     eos_token_ids: tuple[int, ...] = ()
 
@@ -520,13 +740,50 @@ def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelC
     return config.with_dtype(dtype_name(resolve_dtype(dtype)))
 
 
+@dataclass(frozen=True)
+class RunProcessor:
+    """Adapts a run's tokenizer to the `Processor` interface a task uses.
+
+    Calling it encodes each text prompt and left-pads the rows into
+    `ModelInputs`; a text run takes no images or audio. `decode` returns one
+    string per token row.
+    """
+
+    tokenizer: Tokenizer
+
+    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
+                 audio: Media | None = None) -> ModelInputs:
+        if images is not None or audio is not None:
+            raise ValueError("a text run takes no images or audio")
+        rows = [text] if isinstance(text, str) else list(text)
+        ids = [self.tokenizer.encode(row) for row in rows]
+        tokens, fields = pad_token_rows(ids)
+        return ModelInputs(jnp.asarray(tokens), jax.tree.map(jnp.asarray, fields))
+
+    def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
+        return [self.tokenizer.decode(row) for row in np.asarray(tokens)]
+
+    def encode(self, text: str, *, specials: bool) -> list[int]:
+        """`text`'s ids from the run's tokenizer, with the special tokens it adds around a sequence
+        where `specials`, and none otherwise."""
+        return self.tokenizer.encode(text, add_special_tokens=specials)
+
+    def spelling(self, ids: Sequence[int]) -> str:
+        """The text the run's tokenizer decodes `ids` to, its special tokens spelled out."""
+        return self.tokenizer.decode(list(ids))
+
+    @property
+    def bos_id(self) -> int | None:
+        """The id the run's tokenizer starts a sequence with, or None."""
+        return self.tokenizer.bos_id
+
+
 def recorded_tokenizer(processor: Processor | None) -> str | None:
     """The tokenizer name a run's record keeps for `processor`, which
     `_saved_processor` rebuilds through `tokenizer_for`: a run tokenizer's
     own name, byte or Hugging Face. Any other processor records none, and the
     run loads as weights that take ids."""
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.loading import RunProcessor
 
     if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
         return processor.tokenizer.name
@@ -546,7 +803,6 @@ def _saved_processor(settings: TaskSettings, config: ModelConfig) -> Processor |
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
-    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
@@ -578,7 +834,7 @@ def held(variables: Variables) -> Variables:
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=False)
 
 
-class _NativeTextTask(SavedRunTask):
+class _NativeTextTask(SavedRunTask, InItsForm):
     """The lifecycle Dew's three text tasks share, over their own `model`,
     `variables` and `processor`: frozen weights, rebinding, loading a run
     (`SavedRunTask`), and the row decoder their generations carry. Each task
@@ -690,6 +946,9 @@ class TextGeneration(_NativeTextTask):
     prefix: int | Literal["prompt"] | None = None
     """The prefix run the model trained (`LMObjective(prefix=...)`): a prompt's first tokens, or all of it
     under "prompt", form one block the model reads whole. A request's own blocks stand; None is causal."""
+    progress: Progress = END
+    """The run's progress a model that reads one draws at (`dew.nn.progress`): a run's collection's, the
+    updates it committed before its step (`LMObjective.policy`); a finished run's end otherwise."""
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -707,6 +966,12 @@ class TextGeneration(_NativeTextTask):
                              "that lists its vocabulary; pass processor=")
         return (decoding.stop_strings(self.processor, strings,
                                       self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+
+    def bind(self, variables: Variables, progress: Progress | None = None) -> Self:
+        """This task over `variables` (`_NativeTextTask.bind`), drawing at the run's `progress` where one
+        is given, a collection's step's (`EpisodeInference.bind`), else at its own."""
+        bound = super().bind(variables)
+        return bound if progress is None else dataclasses.replace(bound, progress=progress)
 
     def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
                   ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
@@ -773,8 +1038,9 @@ class TextGeneration(_NativeTextTask):
         return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
@@ -788,7 +1054,7 @@ class TextGeneration(_NativeTextTask):
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
-                                 trips=trips, prefix=self.prefix)
+                                 trips=trips, prefix=self.prefix, progress=self.progress)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return self._decoded(_requested(generated, budget, padding))
 
@@ -857,8 +1123,9 @@ class BlockGeneration(_NativeTextTask):
 
 
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.block"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
@@ -877,22 +1144,24 @@ class BlockGeneration(_NativeTextTask):
 
 @dataclass(frozen=True)
 class MaskedGeneration(_NativeTextTask):
-    """Samples a whole response with native MDLM, holding the prompt fixed.
+    """Samples a response with native MDLM, holding the prompt fixed: the whole response at once
+    (`Unmask`), or a block of `block` places at a time as LLaDA2's releases walk
+    (`DiscreteProcess.generate`'s `block`, `Confident`'s reveal).
 
-    It does not reproduce the source-specific remasking recipes of LLaDA or
-    Dream. EOS trims the finished response after the bidirectional
-    denoising, and does not end that denoising early. Results hold
-    refinement counts and no autoregressive action likelihoods. When a call
-    passes none, it uses the task's `steps`, its `max_new_tokens` response
-    length and its `n` continuations per prompt.
+    It does not reproduce LLaDA's or Dream's own remasking recipes. A whole-response walk's EOS
+    trims the finished response and does not end its denoising early; a blockwise walk stops a
+    row after the block that revealed its end. Results hold refinement counts and no
+    autoregressive action likelihoods. When a call passes none, it uses the task's `steps`, its
+    `max_new_tokens` response length and its `n` continuations per prompt.
     """
 
     model: nn.Module
     variables: Variables
     process: DiscreteProcess
     processor: Processor | None = None
-    solver: Unmask = dataclasses.field(default_factory=Unmask)
+    solver: Unmask | Confident = dataclasses.field(default_factory=Unmask)
     steps: int = MDLM_STEPS
+    block: int | None = None
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
     max_new_tokens: int | None = None
@@ -938,15 +1207,16 @@ class MaskedGeneration(_NativeTextTask):
         `processor`: their process, solver, step count, end-of-sequence ids and response budget. A
         live objective (`MaskedDiffusionObjective.build_task`) and a saved run (`from_saved`) build it
         alike."""
-        assert isinstance(settings.solver, Unmask)
+        assert isinstance(settings.solver, Unmask | Confident)
         return cls(model, variables, settings.process, processor, solver=settings.solver,
-                   steps=settings.sampling_steps, eos_token_ids=settings.eos_token_ids,
+                   steps=settings.sampling_steps, block=settings.block, eos_token_ids=settings.eos_token_ids,
                    max_new_tokens=settings.max_new_tokens or None)
 
 
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: int | jax.Array | None = None, n: int | None = None,
+                 key: int | jax.Array, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
         with region("inference.masked"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
@@ -955,7 +1225,7 @@ class MaskedGeneration(_NativeTextTask):
             generated = self.process.generate(self.model, self.placed, inputs, budget, key=random_key,
                 solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
-                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id, block=self.block)
             return self._decoded(generated)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:

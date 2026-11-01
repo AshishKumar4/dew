@@ -28,6 +28,7 @@ twin's distance from the truth.
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import flax
@@ -37,14 +38,23 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
+from model_support import decode_through
+from one_draw import assert_as_exact_as_the_reference
+from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, distance
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config, translate_wrapper_config
+from dew.nn.deepseek_v4 import DRAFT_CONTEXT, DeepseekV4Attention, DSparkAttention
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import MixerCall, ModelInputs
+from dew.nn.kv_cache import KVCache
+from dew.nn.precision import at_least_fp32
+from dew.nn.rope import LongRopeScaling, RopeScaling, rotary_freqs
+from dew.nn.sharding import down_projection
+from dew.nn.visibility import visible
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
@@ -167,6 +177,24 @@ def test_the_engram_hash_is_the_releases_int64_arithmetic():
     np.testing.assert_array_equal(ids, np.concatenate(expected, -1) + offsets)
 
 
+def test_a_packed_documents_engram_lookback_stops_at_its_start_whatever_its_positions():
+    """Each token hashes with its own document's predecessors alone (`EngramHashes`, review of ledger
+    1122): a packed row's second document hashes as it does alone, though its logical positions run on
+    from 10, which a lookback bounded by positions read as a predecessor of the first document's."""
+    from dew.nn.engram import EngramHashes
+
+    spec = Engram(layer_ids=(0,), num_embeddings=(88,), max_ngram_size=3, vocab_size=16, n_heads=2,
+                  head_dim=4, compressed_vocab_size=16)
+    hashes = EngramHashes(spec, 16)
+    packed = jnp.asarray([[3, 5, 7, 9, 11]], jnp.int32)
+    laid = coordinates(packed.shape, segments=jnp.asarray([[1, 1, 2, 2, 2]]),
+                       positions=jnp.asarray([[0, 1, 10, 11, 12]]), max_segments=2)
+    variables = hashes.init(jax.random.key(0), packed, laid, decode=False)
+    together = hashes.apply(variables, packed, laid, decode=False)
+    alone = hashes.apply(variables, packed[:, 2:], None, decode=False)
+    np.testing.assert_array_equal(together[:, 2:], alone)
+
+
 @pytest.fixture(scope="module")
 def released():
     """The released bundle's config, its wrapper record, the model it builds
@@ -234,11 +262,112 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
     assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 
+def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source):
+    """Uncached, three padding slots inside each row leave each real token's sliding window counting
+    its row's real tokens (`counted_places`), as a cache's slots count them, and its compressed windows
+    and n-grams on them: the real tokens' logits are as exact as the reference's of the rows without the
+    gap (`assert_as_exact_as_the_reference`, the truth its float64 run), where a window counted by index
+    let the gap crowd out the keys before it (audit NN-02)."""
+    loaded, plain, reference = source
+    ids, at, gap = jnp.asarray(reference["input_ids"]), 5, 3
+    tokens = jnp.concatenate([ids[:, :at], jnp.zeros((ids.shape[0], gap), ids.dtype), ids[:, at:]], axis=1)
+    slots = jnp.arange(tokens.shape[1])
+    real = (slots < at) | (slots >= at + gap)
+    logits = plain.apply(loaded.variables, tokens, attention_mask=jnp.broadcast_to(real, tokens.shape))
+    assert_as_exact_as_the_reference(logits[:, real], reference["logits"], TRUTH["logits"], "an interior gap")
+
+
+SHIFT = 8
+"""How far the shifted rows' given positions sit past their indices: a multiple of every compression
+rate, so a query that read entries by its given place would see SHIFT // rate windows of later tokens."""
+
+
+def test_shifted_positions_compute_the_unshifted_rows_logits(source):
+    """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
+    compressed entry is visible by its window's tokens' ranks and rotates at its window's first given
+    place, where its queries rotate (`window_origins`), so the logits are as exact as the reference's
+    of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64 run);
+    entries visible by the given places showed each query windows of later tokens, and entries rotated
+    at zero-based origins sat SHIFT away from their queries (audit NN-03)."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    positions = jnp.broadcast_to(jnp.arange(ids.shape[1]) + SHIFT, ids.shape)
+    logits = plain.apply(loaded.variables, ids, positions=positions)
+    assert_as_exact_as_the_reference(logits, reference["logits"], TRUTH["logits"], "shifted positions")
+
+
+def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
+    """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
+    time: each compressed entry rotates at its window's first given place, which the cache carries
+    across the calls a window spans (`append_windows`), so every step's logits are as exact as the
+    reference's of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64
+    run), where entries rotated at their slots sat SHIFT away from their queries (audit NN-03)."""
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ops = decode_ops(plain, loaded.variables, 0, None)
+    positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
+    inputs = ModelInputs(ids[:, :prompt], {"positions": positions})
+    state, _ = prefill_state(plain, loaded.variables, inputs, ops)
+    steps = [np.asarray(state.logits)]
+    for column in range(prompt, ids.shape[1]):
+        state = ops.advance(state, ids[:, column], jnp.ones(ids.shape[0], bool))
+        steps.append(np.asarray(state.logits))
+    assert_as_exact_as_the_reference(np.stack(steps, axis=1), reference["logits"][:, prompt - 1:],
+                                     TRUTH["logits"][:, prompt - 1:], "a shifted cached walk")
+
+
+def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
+    """V4's layers take the model's one rope scaling (`MixerContext.rope_scaling`), each kind's own
+    in its place where the kind gives one (`kind_of`), as the compressed kinds give their YaRN ramp: a
+    Llama 3.1 ramp makes the decoder compute otherwise than the unscaled one, where the layers
+    forwarded YaRN alone, rotated at the plain frequencies and left the logits bit for bit the same.
+    LongRoPE, whose factors a call's reach picks and which the compressed entries do not see, is
+    refused by name (audit NN-04)."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    ramp = RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
+                       original_max_position_embeddings=4)
+    scaled, unscaled = (plain.clone(rope_scaling=scaling).apply(loaded.variables, ids)
+                        for scaling in (ramp, None))
+    assert not np.array_equal(scaled, unscaled)
+    longrope = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
+                               original_max_position_embeddings=4)
+    with pytest.raises(ValueError):
+        plain.clone(rope_scaling=longrope).apply(loaded.variables, ids)
+
+
+def test_a_prefilled_decode_cache_holds_no_payload_twice(source):
+    """After a prompt's prefill for drafting, the target's and the drafter's decode caches hold no
+    payload twice: V4's window head, which serves as its keys and its values, and the drafter's context
+    are each kept once (`KVStore`'s `keys_as_values`), where both were allocated and written and every
+    window layer held each of its tokens' heads twice (ledger 1921)."""
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ops = decode_ops(plain, loaded.variables, 0, 1)
+    state, _ = prefill_state(plain, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+
+    def twice(node):
+        if not isinstance(node, Mapping):
+            return []
+        payloads = [leaf for leaf in node.values() if not isinstance(leaf, Mapping) and np.ndim(leaf) >= 3]
+        found = [index for index, leaf in enumerate(payloads)
+                 if any(np.array_equal(leaf, other) and np.any(leaf) for other in payloads[:index])]
+        return found + [held for child in node.values() for held in twice(child)]
+
+    assert not twice(jax.device_get(state.cache))
+
+
 def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
     before it in the other, as after the context alone: its real positions keep their ranks, the
     padding is no key, and the block follows the last real position. The two drafts' logits, each
-    within FACTOR of the reference's rounding, lie within twice that of each other."""
+    within FACTOR of the reference's rounding, lie within twice that of each other. Padding a layout
+    marks as document 0 instead (`real_slots`) drafts as its validity does, bit for bit, and a context
+    of two documents a row is refused (review of ledger 1122)."""
     loaded, plain, reference = source
     ids, prompt, pad = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"]), 3
     _, sown = plain.apply(loaded.variables, ids[:, :prompt], mutable=["prediction_inputs"])
@@ -248,8 +377,16 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     padded = jnp.stack([jnp.pad(context[0], ((0, pad), (0, 0))), jnp.pad(context[1], ((pad, 0), (0, 0)))])
     places = jnp.arange(prompt + pad)
     valid = jnp.stack([places < prompt, places >= pad])
-    _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False, valid=valid, method="draft")
+    _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False,
+                                coordinates=coordinates(valid.shape, valid=valid), method="draft")
     assert distance(drafted, alone) <= 2 * FACTOR * rounding("draft_logits")
+    documents = coordinates(valid.shape, segments=valid.astype(jnp.int32), max_segments=1)
+    _, by_documents, _ = plain.apply(loaded.variables, padded, drawn, decode=False, coordinates=documents,
+                                     method="draft")
+    np.testing.assert_array_equal(by_documents, drafted)
+    two = coordinates(valid.shape, segments=1 + jnp.broadcast_to(places >= prompt // 2, valid.shape))
+    with pytest.raises(ValueError):
+        plain.apply(loaded.variables, padded, drawn, decode=False, coordinates=two, method="draft")
 
 
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):
@@ -299,6 +436,180 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
         _, logits, _ = plain.apply(loaded.variables, whole, drawn[row:row + 1], decode=False,
                                    method="draft")
         assert distance(jnp.stack(scored, 1)[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
+
+
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+def test_a_paged_window_cache_decodes_what_the_compact_cache_decodes(source, quantized):
+    """The tiny V4.1 checkpoint's window cache takes the decoder's layout: paged, it draws the compact
+    cache's greedy tokens at the same format, full precision and quantized, its compressors' entries,
+    buffers and index keys kept compact beside it."""
+    loaded, plain, reference = source
+    prompts = jnp.asarray(reference["input_ids"])[:, :7]
+
+    def decoded(layout: KVCache) -> np.ndarray:
+        return np.asarray(generate(plain.with_kv_cache(layout), loaded.variables, prompts, 9,
+                                   key=jax.random.key(1), sampling=Sampling(temperature=0)).tokens)
+
+    np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
+                                  decoded(KVCache(quantized=quantized)))
+
+
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, quantized):
+    """The DSpark drafter's window cache takes the decoder's layout: after a prefill and a verified
+    stretch recorded into it, a paged cache drafts the compact cache's logits at the same format, bit
+    for bit, its context written as the stage's keys and values and read back in their basis."""
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+
+    def drafted(layout: KVCache) -> np.ndarray:
+        model = plain.with_kv_cache(layout)
+        ops = decode_ops(model, loaded.variables, 0, 0)
+        state, _ = prefill_state(model, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+        keep = jnp.arange(3)[None, :] < jnp.asarray([3, 1])[:, None]
+        state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)
+        state = ops.record(state, context, keep)
+        scored = []
+
+        def choose(index, logits):
+            scored.append(logits)
+            return jnp.argmax(logits, axis=-1)
+
+        ops.draft(state, ids[:, prompt + 3], choose)
+        return np.asarray(jnp.stack(scored, 1))
+
+    np.testing.assert_array_equal(drafted(KVCache(quantized=quantized, page_size=4)),
+                                  drafted(KVCache(quantized=quantized)))
+
+
+def uncached_window_steps(module, variables, hidden, quantized: str):
+    """A sliding V4 layer's per-step outputs over `hidden` with no cache: every position's
+    projections computed once, the shared window head dequantized in its own basis as the keys
+    and, where a rotated layout keeps it twice, unrotated as the values (a float8 layout stores
+    it once, its values its keys), and each step's query attending its window of the slots up
+    to its own in a cache-shaped row, so a cached decode is held to a computation that never
+    enters the stored basis."""
+    def steps(m, x):
+        batch, length, _ = x.shape
+        capacity = m.max_seq_len
+        positions = jnp.broadcast_to(jnp.arange(length)[None], (batch, length))
+        cos, sin = rotary_freqs(positions, m.rope_dim, m.rope_theta, rope_scaling=m.rope_scaling,
+                                dtype=at_least_fp32(x.dtype))
+        place = down_projection(x, m.q_lora_rank + m.head_dim)
+        query, _ = m._queries(x, cos, sin, place)
+        head = m._window_keys(x, cos, sin, place)
+        keys = dequantized_in_own_basis(head, quantized, keys=True)
+        values = keys if quantized != "int8" else dequantized_in_own_basis(head, quantized, keys=False)
+        slots = jnp.arange(capacity)
+
+        def slotted(values):
+            """`values` [B, length, D] in `capacity` slots, zero past them, as an unwritten
+            cache slot reads."""
+            return jnp.pad(values, ((0, 0), (0, capacity - length), (0, 0)))
+
+        keys, values = slotted(keys), slotted(values)
+        outputs = []
+        for step in range(length):
+            written = (slots <= step)[None, :, None]
+            allowed = jnp.broadcast_to(
+                ((slots <= step) & (step - slots < m.sliding_window))[None, None], (batch, 1, capacity))
+            outputs.append(m._attend(query[:, step:step + 1], jnp.where(written, keys, 0),
+                                     jnp.where(written, values, 0), allowed,
+                                     cos[:, step:step + 1], sin[:, step:step + 1]))
+        return jnp.concatenate(outputs, axis=1)
+
+    return module.apply(variables, hidden, method=lambda m, x: steps(m, x))
+
+
+@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
+def test_a_quantized_window_cache_decodes_what_dequantizing_in_the_own_basis_computes(quantized):
+    """A sliding V4 layer's quantized window cache, its shared head stored as keys and values
+    and its keys read back plain, held to no cache at all: each step as the layer computes it
+    over the head dequantized in its own basis (`dequantized_in_own_basis`, plain jnp from the
+    layout's rule), bit for bit. Dropping the plain read-back leaves the int8 keys in their
+    rotated basis and moves every step off this computation, where a paged-against-compact
+    comparison at one format reads them back plain on both arms."""
+    module = DeepseekV4Attention(emb_features=32, num_heads=2, head_dim=16, q_lora_rank=8, o_groups=1,
+                                 o_lora_rank=8, rope_dim=8, sliding_window=3, max_seq_len=16,
+                                 kv_cache=KVCache(quantized=quantized))
+    hidden = jax.random.normal(jax.random.key(7), (2, 6, 32))
+    variables = {"params": module.init(jax.random.key(3), hidden[:, :1],
+                                       MixerCall(decode=True))["params"]}
+    decoded = np.asarray(jax.jit(
+        lambda variables, hidden: decode_through(module, variables, hidden, prefill=1)[0])(variables, hidden))
+    own = np.asarray(jax.jit(
+        lambda variables, hidden: uncached_window_steps(module, variables, hidden, quantized))(
+        variables, hidden))
+    np.testing.assert_array_equal(decoded, own)
+
+
+DRAFTING = DSparkAttention(emb_features=32, num_heads=2, head_dim=16, q_lora_rank=8, o_groups=1,
+                           o_lora_rank=8, rope_dim=8, sliding_window=4, max_seq_len=16)
+"""A small DSpark stage's attention, its window shorter than the context it drafts after."""
+
+
+def cached_draft(module, variables, context, block):
+    """A DSpark stage's draft of `block` after `context`, cached: the context written by an empty block,
+    then the block drafted after it with none."""
+    writing = MixerCall(decode=True, kv_store={DRAFT_CONTEXT: context})
+    # The call that allocates the cache writes nothing (`cache_positions`), as a decoder's first does.
+    state = {**module.init(jax.random.key(0), block, writing), "params": variables["params"]}
+    _, written = module.apply(state, block[:, :0], writing, mutable=["cache"])
+    return module.apply({**state, "cache": written["cache"]}, block, MixerCall(decode=True))
+
+
+def uncached_own_basis_draft(module, variables, context, block, quantized: str):
+    """The draft as the cached stage computes it, its context's shared head never entering the stored
+    basis: the head projected at the context's slots and dequantized in its own basis as the keys and,
+    where a rotated layout keeps it twice, unrotated as the values (`dequantized_in_own_basis`), in a
+    cache-shaped row, and the block attending its window of them and all of itself."""
+    def drafted(m, context, x):
+        batch, written = context.shape[:2]
+        slots = jnp.broadcast_to(jnp.arange(written)[None], (batch, written))
+        freqs = rotary_freqs(slots, m.rope_dim, m.rope_theta, rope_scaling=m.rope_scaling,
+                             dtype=at_least_fp32(context.dtype))
+        head = m._window_keys(context, *freqs, down_projection(context, m.head_dim))
+        keys = dequantized_in_own_basis(head, quantized, keys=True)
+        values = keys if quantized != "int8" else dequantized_in_own_basis(head, quantized, keys=False)
+        padding = ((0, 0), (0, m.max_seq_len - written), (0, 0))
+        keys, values = jnp.pad(keys, padding), jnp.pad(values, padding)
+        last = jnp.full((batch,), written - 1)
+        places = jnp.arange(m.max_seq_len)[None]
+        length = x.shape[1]
+        positions = last[:, None] + 1 + jnp.arange(length)
+        cos, sin = rotary_freqs(positions, m.rope_dim, m.rope_theta, rope_scaling=m.rope_scaling,
+                                dtype=at_least_fp32(x.dtype))
+        place = down_projection(x, m.q_lora_rank + m.head_dim)
+        query, _ = m._queries(x, cos, sin, place)
+        window = visible(last[:, None], places, causal=True, window=m.sliding_window)
+        allowed = jnp.concatenate([jnp.broadcast_to(window[:, None], (batch, length, m.max_seq_len)),
+                                   jnp.ones((batch, length, length), bool)], axis=-1)
+        own = m._window_keys(x, cos, sin, place)
+        return m._attend(query, jnp.concatenate([keys, own], axis=1),
+                         jnp.concatenate([values, own], axis=1), allowed, cos, sin)
+
+    return module.apply(variables, context, block, method=drafted)
+
+
+@pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
+def test_a_quantized_drafting_cache_drafts_what_dequantizing_in_the_own_basis_computes(quantized):
+    """A DSpark stage's quantized window cache, the target's context stored as its shared head and its
+    keys read back plain (`held.plain`), held to no cache at all: the block drafted over the context's
+    head dequantized in its own basis (`uncached_own_basis_draft`), bit for bit. Dropping the plain
+    read-back leaves the int8 keys in their rotated basis and moves the draft off this computation, where
+    a paged-against-compact comparison at one format reads them back plain on both arms."""
+    module = DRAFTING.clone(kv_cache=KVCache(quantized=quantized))
+    context = jax.random.normal(jax.random.key(7), (2, 6, 32))
+    block = jax.random.normal(jax.random.key(8), (2, 3, 32))
+    variables = {"params": module.init(jax.random.key(3), block,
+                                       MixerCall(decode=True, kv_store={DRAFT_CONTEXT: context}))["params"]}
+    decoded = jax.jit(lambda variables, context, block: cached_draft(module, variables, context, block))
+    own = jax.jit(lambda variables, context, block: uncached_own_basis_draft(
+        module, variables, context, block, quantized))
+    np.testing.assert_array_equal(np.asarray(decoded(variables, context, block)),
+                                  np.asarray(own(variables, context, block)))
 
 
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
@@ -372,6 +683,61 @@ def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeyp
     assert wrapper_route("embed.weight", record) == ("language_model", "embed.weight")
 
 
+def test_a_bundle_loaded_text_only_is_its_text_checkpoint(tmp_path):
+    """The bundle with its ViT, loaded `text_only`, reads as the family's text checkpoint: the model the
+    text-only checkpoint builds, its variables leaf for leaf that checkpoint's, so neither the tower, the
+    aligner nor the routers' image-span bias is read, and its logits bit for bit."""
+    text = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference",
+                           text_only=True)
+    plain = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    assert text.model == plain.model
+    assert jax.tree.structure(text.variables) == jax.tree.structure(plain.variables)
+    jax.tree.map(np.testing.assert_array_equal, text.variables, plain.variables)
+    ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
+    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
+
+
+def quantized_as_released(directory: Path) -> Path:
+    """The checkpoint at `directory` stored as the release stores its decoder: its quantization_config's
+    `.scale` format (FP8 blocks of 32 under E8M0 scales, routed experts as FP4 pairs), over every
+    projection the blocks cover, the rest as they are."""
+    from safetensors.numpy import load_file
+
+    from dew.interop.codecs import deepseek_v4
+    from dew.interop.safetensors_io import write_file
+
+    released = json.loads((RELEASED / "config.json").read_text())["quantization_config"]
+    codec = deepseek_v4(32, fp4_experts=True)
+    stored = {}
+    for name, tensor in load_file(directory / "model.safetensors").items():
+        covered = (name.endswith(".weight") and tensor.ndim == 2
+                   and not name.startswith(("embed", "head", "vision"))
+                   and tensor.shape[0] % 32 == 0 and tensor.shape[1] % 32 == 0)
+        stored.update(codec.encode(name, tensor) if covered else {name: tensor})
+    write_file(stored, directory / "model.safetensors", {"format": "pt"})
+    config = json.loads((directory / "config.json").read_text())
+    (directory / "config.json").write_text(json.dumps({**config, "quantization_config": released}))
+    return directory
+
+
+def test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint(tmp_path):
+    """A bundle stored as the release stores its decoder (FP8 and FP4 under its quantization_config),
+    loaded `text_only`, is the quantized text-only checkpoint loaded: its codec reads the decoder's names
+    unchanged, so its variables are that checkpoint's leaf for leaf."""
+    import shutil
+
+    (tmp_path / "bundle").mkdir()
+    bundle = quantized_as_released(vision_bundle(tmp_path / "bundle"))
+    text = tmp_path / "text"
+    shutil.copytree(TINY, text, ignore=shutil.ignore_patterns("vision*"))
+    quantized_as_released(text)
+    taken = Pretrained.load(bundle, dtype="float32", attention_impl="reference", text_only=True)
+    plain = Pretrained.load(text, dtype="float32", attention_impl="reference")
+    assert taken.model == plain.model
+    jax.tree.map(np.testing.assert_array_equal, taken.variables, plain.variables)
+
+
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
     """Routing the image span by the text bias moves the prefill's logits
     further from the float64 truth than rounding can, and the image
@@ -387,10 +753,11 @@ def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path
     ids = jnp.asarray(reference["input_ids"])
     media = jnp.asarray(reference["token_types"] >= 0)
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
+    laid = coordinates(ids.shape, valid=jnp.ones(ids.shape, bool),
+                       positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape))
     hashed = [np.asarray(loaded.model.language_model.apply(
-        language, ids, jnp.ones(ids.shape, bool), jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape),
-        decode=False, media=mask,
-        method=lambda module, tokens, valid, positions, *, decode, media: module.engram_hashes(
-            tokens, valid, positions, decode=decode, media=media))) for mask in (media, None)]
+        language, ids, laid, decode=False, media=mask,
+        method=lambda module, tokens, laid, *, decode, media: module.engram_hashes(
+            tokens, laid, decode=decode, media=media))) for mask in (media, None)]
     after = int(np.flatnonzero(reference["token_types"][0] >= 0)[-1]) + 1
     assert np.any(hashed[0][:, after] != hashed[1][:, after])

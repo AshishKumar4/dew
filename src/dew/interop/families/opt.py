@@ -1,4 +1,5 @@
-"""OPT's biased pre-norm decoder and two reserved learned-position rows."""
+"""OPT's biased decoder, pre-norm or post-LN (OPT-350m's), its embedding at a width of its own where the
+release projects it in and out, and two reserved learned-position rows."""
 
 from collections.abc import Mapping
 from functools import partial
@@ -30,15 +31,13 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                  'prefix', 'activation_dropout'))
     if hf.get('activation_dropout', 0):
         refuse('activation_dropout', 'OPT only exposes residual and attention-probability dropout')
-    if hf.get('do_layer_norm_before', True) is not True:
-        refuse('do_layer_norm_before=False', 'OPT post-residual LayerNorm is not represented')
-    if hf.get('_remove_final_layer_norm', False):
-        refuse('_remove_final_layer_norm', 'the pre-norm decoder ends with LayerNorm')
+    # A post-LN decoder (do_layer_norm_before False, OPT-350m) norms its stream after each sublayer and
+    # ends with no final norm, as one stated without it does (modeling_opt.py, OPTDecoder).
+    before = hf.get('do_layer_norm_before', True) is True
+    used.add('_remove_final_layer_norm')
     if hf.get('layer_norm_elementwise_affine', True) is not True:
         refuse('layer_norm_elementwise_affine=False', 'the decoder LayerNorm carries scale and bias')
     embedding = _records.integer(hf.get('word_embed_proj_dim') or hidden, 'word_embed_proj_dim')
-    if embedding != hidden:
-        refuse('word_embed_proj_dim', 'the embedding-to-decoder projections are not represented')
     if hf.get('layerdrop', 0):
         refuse('layerdrop', 'stochastic decoder-layer dropping is not represented')
     activation = _records.text(hf.get('activation_function', 'relu'), 'activation_function')
@@ -52,6 +51,9 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         mlp=mlp, mlp_bias=bool(hf.get('enable_bias', True)),
         norm_type='layer', norm_bias=True, norm_eps=1e-5,
         qk_norm=False, attention_bias=bool(hf.get('enable_bias', True)),
+        pre_norms=before, post_residual_norms=not before,
+        final_norm=before and not hf.get('_remove_final_layer_norm', False),
+        embedding_features=None if embedding == hidden else embedding,
         position_embedding='learned', position_embedding_size=positions + 2,
         max_seq_len=context_lengths(hf, 2048)[0],
         position_embedding_offset=2,
@@ -70,9 +72,12 @@ _OPT_NAMES: Renames = (
 def _opt_export(model: CausalTransformer) -> Mapping[str, object]:
     activation = hf_ungated(model.mlp, 'OPT')
     fields: dict[str, object] = {
-        'ffn_dim': model.hidden_features, 'word_embed_proj_dim': model.emb_features,
+        'ffn_dim': model.hidden_features,
+        'word_embed_proj_dim': model.embedding_features or model.emb_features,
         'enable_bias': model.attention_bias, 'layer_norm_elementwise_affine': True,
-        'do_layer_norm_before': True, 'dropout': model.dropout_rate,
+        'do_layer_norm_before': not model.post_residual_norms,
+        '_remove_final_layer_norm': not model.post_residual_norms and not model.final_norm,
+        'dropout': model.dropout_rate,
         'attention_dropout': model.attention_dropout_rate,
         'max_position_embeddings': (model.position_embedding_size or model.max_seq_len + 2) - 2,
         'activation_function': activation,
@@ -82,6 +87,10 @@ def _opt_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
+_OPT_LEAVES = {'model.project_in.weight': ('project_in', 'kernel'),
+               'model.project_out.weight': ('project_out', 'kernel')}
+"""The projections between an embedding of its own width and the stream, past the shared map."""
+
 OPT = DecoderFamily(
     ('opt',),
     _opt_config,
@@ -89,8 +98,8 @@ OPT = DecoderFamily(
     'opt',
     'OPTForCausalLM',
     _opt_export,
-    weight_path=partial(renamed_path, _OPT_NAMES),
-    export_path=partial(renamed_name, _OPT_NAMES),
+    weight_path=partial(renamed_path, _OPT_NAMES, leaves=_OPT_LEAVES),
+    export_path=partial(renamed_name, _OPT_NAMES, leaves=_OPT_LEAVES),
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'model.decoder.embed_tokens.weight'),
     defaults={'pad_token_id': 1},

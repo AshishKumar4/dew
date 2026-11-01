@@ -94,9 +94,6 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # float64 (`widened_reduction`).
     # Dew's test setting, never the library's default.
     environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
-    # A frontier's first plan, untimed (`dew.training.planning.UNTIMED_FRONTIER`): two pools a run and
-    # its resume would otherwise each time their own. Dew's test setting, never the library's default.
-    environ.setdefault("DEW_UNTIMED_FRONTIER", "1")
 
 
 def configured(environ: Mapping[str, str]) -> dict[str, str]:
@@ -106,6 +103,14 @@ def configured(environ: Mapping[str, str]) -> dict[str, str]:
     lane = dict(environ)
     configure_lane(lane)
     return lane
+
+
+def outside_suite(environ: Mapping[str, str]) -> dict[str, str]:
+    """`environ` as a user's process on one CPU device sees it: without every setting `configure_lane` gives
+    the suite (its simulated devices and their threads, its matmul precision, its wide CPU arithmetic), JAX
+    on the CPU, for a page, an example or a tool a test runs as a reader would (ledgers 2510, 2736)."""
+    suite = configured({})
+    return {**{name: value for name, value in environ.items() if name not in suite}, "JAX_PLATFORMS": "cpu"}
 
 
 def _local_gpus(environ: MutableMapping[str, str]) -> int:
@@ -154,3 +159,20 @@ def outside_any_cluster(environ: Mapping[str, str]) -> dict[str, str]:
                              "TPU_PROCESS_ADDRESSES_PATH", "KUBERNETES_SERVICE_HOST",
                              "DEW_PROCESS_COUNT", "DEW_PROCESS_ID", "JAX_COORDINATOR_ADDRESS")}
     return {**kept, "TPU_SKIP_MDS_QUERY": "1"}
+
+
+def per_test_settings(patch, directory, *, network: bool = False) -> None:
+    """A test's own settings, as the suite runs it (tests/conftest.py's `own_settings`) and as a GPU flow
+    runs a cell (tests/gpu_flow.py's `isolated`): its own rung records (`dew.training.rungs`: the suite shares
+    one compilation cache, beside which a run records its step's rung, and a rung one test forces would be
+    another's floor), its own automatic data cache (`dew.data.cache.automatic_root`), its own recorded Hub
+    answers (`dew.cache.hub_answer`), and, where it reaches no network, its own Hub cache, whose refs its
+    stand-ins' answers write (`dew.cache.hub_commit`), never the runner's. Each is `directory(name)`, set
+    through `patch` (a pytest MonkeyPatch, undone after the test)."""
+    patch.setenv("DEW_RUNG_RECORDS", str(directory("rungs")))
+    patch.setenv("DEW_DATA_CACHE", str(directory("data-cache")))
+    patch.setenv("DEW_HUB_ANSWERS", str(directory("hub-answers")))
+    if not network:
+        from huggingface_hub import constants
+
+        patch.setattr(constants, "HF_HUB_CACHE", str(directory("hub-cache")))

@@ -11,7 +11,8 @@ import dataclasses
 import fnmatch
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from typing import Protocol, runtime_checkable
 
 import jax
 import numpy as np
@@ -23,6 +24,7 @@ from dew.batch import FROZEN, Variables
 from dew.mesh import (
     DATA_AXIS,
     DEFAULT_RULES,
+    DILOCO_AXIS,
     EXPERT_AXIS,
     FSDP_AXIS,
     MESH_AXES,
@@ -39,13 +41,13 @@ from dew.mesh import (
 from dew.nn.sharding import Suffix, boxed, boxed_axes, current_boxes, declarations, declared_axes, ruled_boxes
 from dew.state import VARIABLE_FIELDS
 
-# The role axes no rule splits a parameter over: data holds a batch's replicas,
-# and stage a pipeline's stages, whose runs the trainer stacks by stage onto it
-# itself (`dew.training.stages`). `Layout` refuses a rule placing a parameter
-# there. Every other axis a mesh
-# has, Dew's own (expert, fsdp, tensor, sequence) or a native mesh's, holds a
-# parameter where the rules put one.
-UNSPLIT_AXES = (DATA_AXIS, STAGE_AXIS)
+# The role axes no parameter splits over: diloco holds DiLoCo's replica
+# groups, each with its own copy, data holds a batch's replicas, and stage a
+# pipeline's stages, whose runs the trainer stacks by stage onto it itself
+# (`dew.training.stages`). `Layout` refuses a rule placing a parameter there.
+# Every other axis a mesh has, Dew's own (expert, fsdp, tensor, sequence) or a
+# native mesh's, holds a parameter where the rules put one.
+UNSPLIT_AXES = (DILOCO_AXIS, DATA_AXIS, STAGE_AXIS)
 
 
 STATE_AXES = (FSDP_AXIS, SEQUENCE_AXIS)
@@ -163,6 +165,12 @@ class MeshSpec:
     same slice. At 1, `jax.make_mesh` places the devices of a single slice;
     devices on several slices still take the hybrid layout, with each slice
     as one replica when the slice count divides the data axis."""
+    diloco: int = 1
+    """DiLoCo's replica groups (`dew.training.diloco`), the mesh's outermost axis: each trains its own
+    inner copy of the model on its own share of every batch's rows over the devices of the rest of the
+    mesh, and the groups meet only when the outer model averages them, every few updates. Across several
+    slices, the groups take whole slices where they divide them, so only that average crosses the slow
+    network. 1 is no DiLoCo."""
     explicit: tuple[str, ...] = ()
     """The axes whose sharding an array's type carries (JAX's Explicit mode),
     where every other axis is left to the partitioner (Auto). An Explicit
@@ -177,9 +185,11 @@ class MeshSpec:
             raise ValueError(f"stage counts pipeline stages, got {self.stage}")
         if self.replicas < 1:
             raise ValueError(f"replicas counts host groups, got {self.replicas}")
+        if self.diloco < 1:
+            raise ValueError(f"diloco counts replica groups, got {self.diloco}")
 
-    def build(self, devices: list | None = None) -> Mesh:
-        """Build the six-axis device mesh this spec describes.
+    def build(self, devices: Sequence | None = None) -> Mesh:
+        """Build the seven-axis device mesh this spec describes.
 
         Parameters shard over 'fsdp', 'expert' and 'tensor'. A batch's rows
         shard over 'data', 'expert' and 'fsdp', its sequence dimension over
@@ -197,10 +207,11 @@ class MeshSpec:
         without a flag. The axes are Auto, so GSPMD infers the collectives,
         but for those `explicit` names.
 
-        `devices` lists the devices of one slice in the order to use them. The
-        mesh takes them row-major over `MESH_AXES`, so neighbouring entries
-        land on the last axes. When it is unset, the mesh uses every device, in
-        the order `jax.make_mesh` gives the platform's topology.
+        `devices` lists the devices of one slice in the order to use them, any
+        devices a mesh holds (a compile-only GPU's among them). The mesh takes
+        them row-major over `MESH_AXES`, so neighbouring entries land on the
+        last axes. When it is unset, the mesh uses every device, in the order
+        `jax.make_mesh` gives the platform's topology.
 
         When `replicas` is above 1, or the devices are on several slices, the
         mesh is built the way MaxText builds a multislice one, through
@@ -218,7 +229,7 @@ class MeshSpec:
         """
         named = devices is not None
         devices = list(devices) if devices is not None else jax.devices()
-        sizes = {"expert": self.expert, "fsdp": self.fsdp, "tensor": self.tensor,
+        sizes = {"diloco": self.diloco, "expert": self.expert, "fsdp": self.fsdp, "tensor": self.tensor,
                  "sequence": self.sequence, "stage": self.stage}
         sharded = math.prod(sizes.values())
         if any(size < 1 for size in sizes.values()):
@@ -227,7 +238,7 @@ class MeshSpec:
             split = " x ".join(f"{axis} {size}" for axis, size in sizes.items() if size > 1)
             raise LayoutRefused(f"{split} is {sharded} devices a data replica, which does not divide "
                                 f"the {len(devices)} devices")
-        shape = (len(devices) // sharded, self.expert, self.fsdp, self.tensor, self.sequence,
+        shape = (self.diloco, len(devices) // sharded, self.expert, self.fsdp, self.tensor, self.sequence,
                  self.stage)
         # `jax.make_mesh` lays one slice out by the platform's topology, which on
         # GPU is the devices sorted by id whatever order they came in; a list the
@@ -235,7 +246,7 @@ class MeshSpec:
         # several slices, every GPU host its own, take the hybrid layout even as
         # one replica.
         types = tuple(AxisType.Explicit if axis in self.explicit else AxisType.Auto for axis in MESH_AXES)
-        if self.replicas == 1 and len({_slice(device) for device in devices}) == 1:
+        if self.replicas == 1 and self.diloco == 1 and len({_slice(device) for device in devices}) == 1:
             if named:
                 return Mesh(np.asarray(devices).reshape(shape), MESH_AXES, axis_types=types)
             return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=types)
@@ -280,7 +291,10 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     by_process = len({_slice(device) for device in devices}) == 1
     granules = len({device.process_index if by_process else device.slice_index
                     for device in devices})
-    data_width = shape[0]
+    # DiLoCo's groups take whole granules where they divide them, the rest of the mesh inside each.
+    groups = spec.diloco if granules % spec.diloco == 0 else 1
+    granules //= groups
+    data_width = shape[1]
     replicas = spec.replicas
     if replicas == 1 and not by_process and data_width % granules == 0:
         replicas = granules
@@ -294,7 +308,7 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
             f"each of the {replicas} replicas spans {per_replica} granules, "
             f"which only the fsdp axis may cross, and fsdp {spec.fsdp} does not "
             "divide over them")
-    dcn = (replicas, 1, per_replica, 1, 1, 1)
+    dcn = (groups, replicas, 1, per_replica, 1, 1, 1)
     ici = tuple(size // outer for size, outer in zip(shape, dcn, strict=True))
     return mesh_utils.create_hybrid_device_mesh(
         ici, dcn, devices, process_is_granule=by_process, allow_split_physical_axes=True)
@@ -728,9 +742,12 @@ class Layout:
         for ids, size in totals.items():
             for device in ids:
                 device_bytes[device] += size
+        # A compile-only device (`dew.training.ahead.compile_only_gpus`) is none of this process's
+        # own, and holds no memory to read a limit from.
+        attached = set(jax.local_devices())
         limits = (dict.fromkeys(device_bytes, capacity) if capacity is not None else
-                  {device.id: limit for device in mesh.local_devices
-                   if (limit := (device.memory_stats() or {}).get("bytes_limit")) is not None})
+                  {device.id: limit for device in mesh.local_devices if device in attached
+                   and (limit := (device.memory_stats() or {}).get("bytes_limit")) is not None})
         _refuse_overfull(held, device_bytes, limits)
         with nn.logical_axis_rules(self.axis_rules):
             rows = batch_axes(mesh)
@@ -756,7 +773,7 @@ class Layout:
 
 def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> dict[str, tuple[str, ...]]:
     """The collectives a training step runs over each axis of `mesh` above size one, by the role a
-    placement gives the axis, in HLO's names (`dew.telemetry.instrumentation.COLLECTIVES`).
+    placement gives the axis, in HLO's names (`dew.telemetry.trace.COLLECTIVES`).
 
     An axis whose devices each compute their own share of a batch, its rows (`rows`) or the
     sequence axis's positions, sums the step's loss and the gradients of what it holds whole
@@ -772,7 +789,7 @@ def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> 
     other stage sums. How the experts on the expert axis meet their tokens, an
     all-to-all or a gather by the layer's dispatch (`dew.nn.moe`), and the attention's exchange
     over the sequence axis, an all-to-all or a gather by its heads and lengths
-    (`dew.nn.attention.sequence_parallel_attention`), are the model's choice, not the
+    (`dew.nn.attention_parallel.sequence_parallel_attention`), are the model's choice, not the
     placement's, and are not named."""
     implied = {}
     for axis, size in mesh.shape.items():
@@ -845,6 +862,16 @@ def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT]) -> TreeT:
                                                                     sharding=sharding), tree, placement)
 
 
+@runtime_checkable
+class RefinesLayout(Protocol):
+    """A model that places its own tree's leaves: a tier-3 model's torch-named tree, which no module
+    declares axes for, placed by its tensor-parallel plan (`dew.interop.torchax_fallback.TorchLayout`).
+    A run's objective (`Objective.placement`) and a source's load hand it the run's layout, and it keeps
+    every choice the layout makes."""
+
+    def placement(self, layout: Layout) -> Layout: ...
+
+
 def link_topology(mesh: Mesh, axis: str) -> str:
     """What a figure of `mesh`'s `axis` is a figure of: the axis, the mesh's axes and their widths in
     order, and its devices in the mesh's order, each by id, process, kind and slice. A device's id is
@@ -856,4 +883,4 @@ def link_topology(mesh: Mesh, axis: str) -> str:
     return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
 
 
-__all__ = ["Layout", "LeafPlacement", "MeshSpec", "Validation"]
+__all__ = ["Layout", "LeafPlacement", "MeshSpec", "RefinesLayout", "Validation"]

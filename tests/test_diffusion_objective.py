@@ -25,7 +25,10 @@ from diffusion_support import (
 from flax import linen as nn
 from reference_error import as_given
 
-from dew.data.dataset import Loader
+from dew.data import Memory
+from dew.data.compile import fitted
+from dew.data.dataset import DataPartition, Loader
+from dew.data.pipeline import phases
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
@@ -425,6 +428,19 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     np.testing.assert_array_equal(actual, expected)
 
 
+def test_an_image_task_walks_under_cfg_plus_plus_and_a_brownian_solver(conditional_mmdit):
+    """An image task built from the objective walks under CFG++ guidance and an SDE solver with a seed,
+    each a struct whose data leaf a lowered program describes (`jax.stages.ArgInfo`), which their checks
+    leave alone, as jit's tracers (train 329's review: CFG++ raised TypeError once programs lowered)."""
+    from dew.sampling import CFGPlusPlus, DPMSolverSDE
+
+    objective, variables, _, _ = conditional_mmdit
+    task = objective.build_task(variables)
+    images = task(["ab", "cd"], steps=2, guidance=CFGPlusPlus(0.6), key=0).host().images
+    seeded = task(["ab", "cd"], steps=2, solver=DPMSolverSDE(seed=3), key=0).host().images
+    assert np.isfinite(images).all() and np.isfinite(seeded).all()
+
+
 def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     """A step's draws are each example's own (`Step.sample`): the batch whole on one device, its two
     halves pooled in an accumulation window, and the batch read in two microbatches give every
@@ -457,7 +473,8 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     whole = taped([(0, 1, batch)])
     pooled = taped([(slot, 1, half) for slot, half in enumerate(halves)])
     split = taped([(part, 2, rows) for part, rows in enumerate(microbatches)])
-    assert set(whole) == {"condition dropout", "times", "noise", "noised input", "target", "loss weights"}
+    assert set(whole) == {"condition dropout", "unconditioned", "times", "noise", "noised input", "target",
+                          "model times", "loss weights"}
     for name in whole:
         for layout in (pooled, split):
             np.testing.assert_array_equal(np.asarray(layout[name]), np.asarray(whole[name]), err_msg=name)
@@ -518,8 +535,9 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
 
     @as_given
     def pooled(variables):
-        # The step donates its state: each draw steps a copy of the untouched template.
-        state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.asarray, variables))
+        # The step donates its state: each draw steps a copy of the untouched template and of the draw,
+        # which the other arm reads.
+        state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.copy, variables))
         partial, *_ = run(state, halves[0])
         stepped, *_ = run(partial, halves[1])
         assert int(stepped.updates) == 1
@@ -565,8 +583,10 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
 
         @as_given
         def stepped(variables):
-            # The step donates its state: each draw steps a copy of the untouched template.
-            state = jax.tree.map(jnp.copy, template).replace(variables=jax.device_put(variables, where))
+            # The step donates its state: each draw steps a copy of the untouched template and of the
+            # draw, which the other arm reads.
+            state = jax.tree.map(jnp.copy, template).replace(
+                variables=jax.device_put(variables, where, may_alias=False))
             state, *_ = run(state, batch)
             after = jax.tree.map(np.asarray, state.variables["params"])
             return jax.tree.map(applied, variables["params"], after)
@@ -581,3 +601,38 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     assert_as_exact(host, resident, moved_weights(template.variables), "host-master update",
                     seeds=HOST_MASTER_SEEDS,
                     truth_fn=lambda variables: truth(variables, float64_pixels(batch)))
+
+
+def captioned(count):
+    """`count` records as a source holds them: an image and its caption, which a diffusion objective
+    encodes a batch at a time (`EncodeCaptions`)."""
+    images = np.random.default_rng(count).integers(0, 256, (count, RES, RES, 3), dtype=np.uint8)
+    return {"image": images, "caption": np.asarray(["a bird", "cat", "two dogs", "x"] * (count // 4))}
+
+
+def test_a_fit_validates_on_an_unbatched_dataset_in_trainings_batches_its_caption_steps_after_them():
+    """A fit of a captioned diffusion objective over a batched training chain validates on a dataset that
+    states no batch of its own, read in training's batches, the objective's caption-encoding batch steps
+    after its batch as in training (row 2085: the validation chain was measured before its batch, so its
+    batch steps stood ahead of it and preparation refused the fit)."""
+    state = Trainer(make_objective(guidance=None), optax.sgd(0.0), key=0).fit(
+        Memory(captioned(8)).batch(8), validation=Memory(captioned(16)), steps=1, eval_every=1, log_every=1)
+    assert int(state.step) == 1
+
+
+def test_a_validation_set_beside_phases_that_batch_their_own_is_read_in_their_batch_its_captions_encoded():
+    """Training in phases that each batch their own states its batch only as each phase compiles, so a
+    validation set that states none is measured unbatched (`fitted`) and batched as it is read: in the
+    phases' batch of 8, every record once, each batch's captions encoded after its batch by the
+    objective's own steps (rows 2085, 2178)."""
+
+    training = phases((Memory(captioned(8)).batch(8), 1), (Memory(captioned(16)).batch(8), None))
+    loader, readers = fitted(training, Memory(captioned(16)), objective=make_objective(guidance=None).data())
+    assert loader.batch == 8
+    reader = readers["val"](DataPartition())
+    try:
+        batches = list(reader)
+    finally:
+        reader.close()
+    assert [len(batch["image"]) for batch in batches] == [8, 8]
+    assert all("input_ids" in batch["text"] and "caption" not in batch for batch in batches)

@@ -23,8 +23,8 @@ import numpy as np
 import openenv_support
 import pytest
 import uvicorn
-from episode_support import ToolPolicy
 from openenv.core import GenericEnvClient
+from tool_policy import ToolPolicy
 
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server

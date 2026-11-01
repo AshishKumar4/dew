@@ -18,6 +18,7 @@ embed, mlp]` and `mlp/experts/down_proj/kernel` `[exp, mlp, embed]`, the
 layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 """
 
+import contextlib
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -37,15 +38,11 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels import grouped_matmul
-from .kernels.generation import triton_runs
-from .kernels.grouped_matmul import GROUPED, portable_projection
-from .kernels.selection import select, selected
+from .kernels import generation
 from .kernels.templates.gemm import template
-from .kernels.templates.product import declared
-from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
+from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
-from .sharding import logical_axes, seen_whole
+from .sharding import logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -75,7 +72,8 @@ EXPERT_BIAS = 'e_score_correction_bias'
 # whose sigmoid scores are all zero stays finite
 # (modeling_deepseek_v3.py:166, maxtext layers/moe.py:839). In fp32 the term
 # changes no bit of a denominator above 1e-12. A softmax's choices renormalize
-# as the softmax of their own logits instead (`renormalized_softmax`).
+# as the softmax of their own logits instead (`renormalized_softmax`). A
+# router states another as its `weight_sum_epsilon` (LFM2-MoE's 1e-6).
 WEIGHT_SUM_EPSILON = 1e-20
 
 
@@ -243,6 +241,11 @@ class Router(nn.Module):
     routing_block: int | None = None
     block_experts: int | None = None
     hash_vocab: int | None = None
+    weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
+    weight_sum_min: float = 0.0
+    """The least a renormalization divides the chosen weights by (ERNIE 4.5's `moe_norm_min`, which
+    clamps their sum from below where a biased selection picks weights that sum to less): above 0, the
+    chosen weights divide by `max(sum + weight_sum_epsilon, weight_sum_min)`, a softmax's too."""
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
@@ -330,13 +333,17 @@ class Router(nn.Module):
             self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.
             self.sow(ROUTER_COLLECTION, ROUTER_LOG_Z, jax.nn.logsumexp(logits, axis=-1))
-        if self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights:
+        if (self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights
+                and not self.weight_sum_min):
             weights = renormalized_softmax(logits, indices)
         else:
             gating = scores + self.bias.value if self.bias_in_weights else scores
             weights = jnp.take_along_axis(gating, indices, axis=-1)
             if self.normalize_weights:
-                weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + WEIGHT_SUM_EPSILON)
+                total = jnp.sum(weights, axis=-1, keepdims=True) + self.weight_sum_epsilon
+                if self.weight_sum_min:
+                    total = jnp.maximum(total, self.weight_sum_min)
+                weights = weights / total
         return weights * self.routed_scaling_factor, indices
 
     def _selected(self, scores, tokens, media, blocks):
@@ -348,7 +355,8 @@ class Router(nn.Module):
         if self.hash_vocab is not None:
             if tokens is None:
                 raise ValueError("hash routing selects by the token ids, which the caller passes")
-            return self.tid2eid.value[jnp.asarray(tokens)]
+            # The table as it is held, a host array among them, indexed by traced ids.
+            return jnp.asarray(self.tid2eid.value)[jnp.asarray(tokens)]
         if tokens is not None:
             raise ValueError("only a hash router reads the token ids")
         selection = self.selection(scores, media, blocks)
@@ -369,9 +377,11 @@ class Router(nn.Module):
 
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
-        `[..., num_experts]`."""
+        `[..., num_experts]`. They multiply in IEEE float32 where nothing states a precision
+        (`exact_float32`): a top-k choice flips between experts whose logits TF32's rounding moves
+        past each other, where the references' float32 routers multiply in IEEE float32."""
         return float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
-                          precision=self.precision)
+                              precision=exact_float32(self.precision))
 
     def _activated(self, logits):
         if self.score_function == 'softmax':
@@ -453,47 +463,30 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     dtype, an input gradient its input's, both accumulating over the widest of
     the compute, input and kernel dtypes, whatever the placement.
 
-    'xla' runs `jax.lax.ragged_dot`; 'auto' and 'pallas' the GEMM template
-    (`dew.nn.kernels.templates.gemm.template.gemm`), its launches where they run
-    the call (a GPU of sm80 on that states the tensor rate their cost model
-    reads, and for 'pallas' a CPU process that states the GPU it emulates,
-    `generation.assumed`, which interprets them) and XLA's program
-    elsewhere, a TPU's above all, which the route reports with the reason; both
-    hold it in every differentiation mode. A call no launch takes here (the
-    grouped selector's requirements, `grouped_matmul.GROUPED`: a product the
-    kernels cannot compute exactly, a trace they cannot take, `seen_whole`)
-    runs 'xla', reported; `generation.chosen(grouped_matmul=...)` names a kernel
-    after the call's own 'xla', a launch's name raising where it cannot run the
-    call (`selection.KernelRefused`). XLA's ragged dot runs a product over every
-    expert, 70 to 200 times the kernels' time on an H100 at Qwen3-30B-A3B's and
-    Kimi Linear's experts (GMM-h100-2), so where the kernels run they are the
-    choice. tests/test_moe_precision.py measures it against float64 sums and
-    three Adam steps on every expert/fsdp layout.
+    Every implementation runs the GEMM template
+    (`dew.nn.kernels.templates.gemm.template.gemm`), which selects each of its
+    launches where it runs (`grouped_matmul.GROUPED`: the template's kernels on
+    a GPU, an old route on a declared cell, XLA's program off a GPU and on a
+    call no launch takes, each route reported with its reason) and holds the
+    law in every differentiation mode; 'xla' names XLA's ragged dot for every
+    launch (`generation.chosen`), and 'auto' and 'pallas' alike leave the
+    choice to the template. `generation.chosen(grouped_matmul=...)` names a
+    kernel, a launch's name raising where it cannot run the call
+    (`selection.KernelRefused`). A CPU process runs XLA's program: a test
+    interprets the kernels by calling the template's interpreter itself. XLA's
+    ragged dot runs a product over every expert, 70 to 200 times the kernels'
+    time on an H100 at Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2),
+    so where the kernels run they are the choice. tests/test_moe_precision.py
+    measures it against float64 sums and three Adam steps on every expert/fsdp
+    layout.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    resolved = float32_products(compute, precision)
-    named = 'xla' if implementation == 'xla' else None
-    # The template's forward launches as the call leaves them, which take it or leave it to XLA here,
-    # before the template's dispatch selects each of its launches: the kernels run in a GPU's process,
-    # or interpreted in a CPU's emulating an assumed GPU where 'pallas' asks.
-    def spec(array):
-        return jax.ShapeDtypeStruct(array.shape, compute)
-
-    product = declared(compute, resolved, outputs=(compute,), operands=(compute, kernel.dtype))
-    case = grouped_matmul.grouped_case(*grouped_matmul.gmm_call(
-        spec(x), spec(kernel), jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32), out_dtype=compute,
-        trans_rhs=False, interpret=not triton_runs(), promoted=product.promoted), product=product,
-        whole=seen_whole(x) and seen_whole(kernel),
-        placed=triton_runs())
-    if not selected(GROUPED, case, named).generic:
-        # The GEMM template: its launches where they run the call (each reports its route), XLA's
-        # program elsewhere, differentiable at every order.
-        return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved,
-                             interpret_on_cpu=implementation == 'pallas')
-    select(GROUPED, case, named)
-    return portable_projection(x, kernel, group_sizes, dtype, resolved)
+    resolved = precision
+    xla = implementation == 'xla'
+    with generation.chosen(grouped_matmul='xla') if xla else contextlib.nullcontext():
+        return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved)
 
 
 
@@ -560,11 +553,12 @@ def expert_dispatch[Parameters](
     token order.
 
     `project` takes rows sorted by expert, the group sizes, the sorted expert
-    ids and the expert-major parameters, and returns rows of the same width;
-    `parameter_axes` names the parameters' dimensions. The caller owns the
-    activation, biases and output weights; `input_weights` scales each expert's
-    input instead, as Llama 4 does. `x` is `[batch, length, width]` or
-    `[tokens, width]`.
+    ids and the expert-major parameters, and returns a row per slot, of its own
+    width, which may differ from the tokens' (MoVA's values,
+    `dew.nn.value_experts`); `parameter_axes` names the parameters' dimensions.
+    The caller owns the activation, biases and output weights; `input_weights`
+    scales each expert's input instead, as Llama 4 does. `x` is
+    `[batch, length, width]` or `[tokens, width]`.
 
     `dispatch='global'` routes the tokens where they are, in a `shard_map` that
     holds them as the residual stream does, so each device runs its own rows
@@ -763,7 +757,7 @@ def _sorted_locally[Parameters](
     projected = project(grouped, jnp.bincount(experts, length=num_experts),
                         experts[order], parameters)
     projected = jnp.where((experts[order] < num_experts)[:, None], projected, 0)
-    return projected[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
+    return projected[jnp.argsort(order)].reshape(*indices.shape, projected.shape[-1])
 
 
 def _exchange_shard[Parameters](
@@ -829,7 +823,8 @@ def _exchange_shard[Parameters](
         return returned, jnp.where(valid, order[addresses], slots)
 
     returned, targets = exchange_round(0)
-    combined = jnp.zeros((slots, tokens.shape[-1]), output_dtype).at[targets].set(
+    # A projection's rows may be wider or narrower than the tokens' (MoVA's values).
+    combined = jnp.zeros((slots, returned.shape[-1]), output_dtype).at[targets].set(
         returned, mode='drop')
     if capacity is None and slots > first:
         rounds = -(-(slots - first) // first)
@@ -846,7 +841,7 @@ def _exchange_shard[Parameters](
             return jax.lax.cond(iteration < needed, active, lambda out: out, out), None
 
         combined, _ = jax.lax.scan(step, combined, jnp.arange(rounds))
-    return combined.reshape(*indices.shape, tokens.shape[-1])
+    return combined.reshape(*indices.shape, combined.shape[-1])
 
 
 def _widened[Tree](parameters: Tree) -> Tree:
@@ -1027,6 +1022,8 @@ class SparseMLP(nn.Module):
     routing_block: int | None = None
     block_experts: int | None = None
     hash_vocab: int | None = None
+    weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
+    weight_sum_min: float = 0.0
     swiglu_limit: float | None = None
     scale_inputs: bool = False
     shared: Callable[..., nn.Module] | None = None
@@ -1075,6 +1072,7 @@ class SparseMLP(nn.Module):
                            media_bias=self.media_bias,
                            routing_block=self.routing_block,
                            block_experts=self.block_experts,
+                           weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features

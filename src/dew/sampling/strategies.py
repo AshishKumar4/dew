@@ -23,10 +23,10 @@ from jax import lax
 from jax.experimental import checkify
 
 from dew._distributions import row_draw, wellformed
-from dew.batch import Variables
+from dew.batch import Variables, prefix_sum
 from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
-from dew.nn.scatter import DROPPED
+from dew.nn.scatter import DROPPED, gather_positions
 from dew.objectives.base import token_log_probs
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
@@ -56,6 +56,10 @@ class DecoderState:
     tokens: jax.Array | None = None
     lengths: jax.Array | None = None
     """Compact token history for a positional table change that invalidates KV."""
+    rebuilt: jax.Array | None = None
+    """The rows whose last step crossed that change and rebuilt every cache from the history, the
+    prediction depths' reseeded as a prefill seeds them (`text.decode_ops`); None where no row can
+    cross."""
 
 
 
@@ -155,7 +159,7 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
     propose = ops.propose
     if propose is None:
         return state, tuple(entry for entry in carry if entry is not None)
-    ordinal = prior_tokens[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    ordinal = prior_tokens[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
     upstream, tails = states, []
     for depth in range(ops.depths):
         head = carry[depth] if depth < len(carry) else None
@@ -381,12 +385,6 @@ class Beam:
         return _beam_search(state, start, ops, transform, stopping, budget, n, self)
 
 
-def _pick(leaf, index):
-    """`leaf[:, index]` per prompt, over a `[prompts, count, ...]` leaf."""
-    return jnp.take_along_axis(leaf, index.reshape(index.shape + (1,) * (leaf.ndim - 2)),
-                               axis=1)
-
-
 def _beam_rows(parent, prompts: int, width: int):
     """Cache rows of a `[prompts, count]` parent-beam index."""
     return (parent + jnp.arange(prompts)[:, None] * width).reshape(-1)
@@ -396,8 +394,8 @@ def _beam_continue(state: DecoderState, beams: StepState, ops: DecodeOps, parent
                    forward, real, prompts: int, width: int):
     """The `width` beams the step carries on with, each parent's decode state
     gathered onto its child's row before the child's token is committed."""
-    parents = _pick(parent, forward)
-    selected = _pick(token, forward).reshape(-1)
+    parents = gather_positions(parent, forward)
+    selected = gather_positions(token, forward).reshape(-1)
     state = ops.reindex(state, _beam_rows(parents, prompts, width))
     beams = jax.tree.map(lambda leaf: jnp.take(leaf, _beam_rows(parents, prompts, width), axis=0),
                          beams)
@@ -422,8 +420,8 @@ def _completed(done: Completed, search: Beam, top, extending, position: int, *,
     order = lax.top_k(merged, width)[1]
     return Completed(
         score=jnp.take_along_axis(merged, order, axis=1),
-        tokens=_pick(jnp.concatenate([done.tokens, tokens], axis=1), order),
-        raw=_pick(jnp.concatenate([done.raw, raw], axis=1), order),
+        tokens=gather_positions(jnp.concatenate([done.tokens, tokens], axis=1), order),
+        raw=gather_positions(jnp.concatenate([done.raw, raw], axis=1), order),
         flag=jnp.take_along_axis(jnp.concatenate([done.flag, hit & top], axis=1), order, axis=1),
         length=jnp.take_along_axis(
             jnp.concatenate([done.length,
@@ -489,7 +487,7 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         done = _completed(carry.done, search, top, carry.extending & (position < limit), position,
                           best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
-        live = _pick(alive, forward)
+        live = gather_positions(alive, forward)
         # `never` estimates the best score still reachable from the whole
         # budget where the penalty rewards length; otherwise from here.
         reach = limit.astype(jnp.float32) if never and penalty > 0 else (position + 1.0)
@@ -497,8 +495,8 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         extending = carry.extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)
         state = ops.advance(state, selected, real)
-        drawn = _pick(grown, forward).reshape(prompts * width, budget)
-        scored = _pick(traced, forward).reshape(prompts * width, budget)
+        drawn = gather_positions(grown, forward).reshape(prompts * width, budget)
+        scored = gather_positions(traced, forward).reshape(prompts * width, budget)
         return _BeamCarry(state, beams, live, drawn, scored, extending, done), None
 
     initial = _beam_start(state, start, ops, prompts, width, budget)
@@ -856,17 +854,27 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
     following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
     assert seen is not None
     last = jnp.maximum(count - 1, 0)
+    # A row whose replay rebuilt its caches across a positional table change was reseeded over its
+    # whole history, the emitted tokens among it (`DecoderState.rebuilt`): its stretch is not written
+    # again, and its predecessors are the rebuilt ones.
+    rebuilt = (jnp.zeros(keep.shape[0], bool) if following.rebuilt is None else following.rebuilt)
+    stretch = keep & ~rebuilt[:, None]
     if ops.record is not None:
-        following = ops.record(following, seen, keep)
+        following = ops.record(following, seen, stretch)
     else:
         assert ops.embed is not None
         # The tails reseed hands back are every depth's predecessor at the
         # last emitted slot, the target's own state first; a row that
         # emitted nothing keeps what it had.
-        following, carried = reseed(
+        replayed, carried = reseed(
             ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
-            keep, base, last, prior_tokens=step.total())
-        following = dataclasses.replace(following, hidden=carried[0], drafts=carried[1:])
+            stretch, base, last, prior_tokens=step.total())
+
+        def kept(fresh, held):
+            return jnp.where(rebuilt.reshape(-1, *(1,) * (fresh.ndim - 1)), held, fresh)
+
+        drafts = tuple(kept(fresh, held) for fresh, held in zip(carried[1:], following.drafts, strict=True))
+        following = dataclasses.replace(replayed, hidden=kept(carried[0], following.hidden), drafts=drafts)
     following = dataclasses.replace(
         following, logits=jnp.where((count > 0)[:, None],
                                     jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],

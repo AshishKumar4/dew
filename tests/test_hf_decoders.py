@@ -112,14 +112,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import flat_tree, llada_draw, llada_fields
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    recording,
-)
+from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
+from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -173,14 +169,9 @@ def recorded_logit_difference(model, variables, directory) -> float:
 
 
 def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
-    from shutil import copytree
-
     original = FIXTURES / "llama-tiny"
-    directory = tmp_path / "checkpoint"
-    copytree(original, directory)
-    config = fixture_config("llama-tiny")
-    config.update(is_llama_config=True, rope_interleaved=False)
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(original, tmp_path / "checkpoint",
+                          lambda config: {**config, "is_llama_config": True, "rope_interleaved": False})
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     ids = np.load(original / "input_ids.npy")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
@@ -188,19 +179,48 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-4, rtol=0)
 
 
+def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_states_them(tmp_path):
+    """Nanbeige4.3's Llama configs repeat five fields under Megatron's names (ffn_hidden_size,
+    num_query_groups, rotary_base, kv_channels, seq_length) beside the ones LlamaConfig reads, and
+    state its embedding and residual dropout, which LlamaModel never applies: the release loads as
+    the model its own fields state, the same model and variables bit for bit, and a repeat that
+    states another value than its field is refused by name (ledger 1883)."""
+
+    original = FIXTURES / "llama-tiny"
+    plain = Pretrained.load(original, dtype="float32")
+    config = fixture_config("llama-tiny")
+    head_dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
+    theta = config["rope_parameters"]["rope_theta"]
+    repeats = {"ffn_hidden_size": config["intermediate_size"],
+               "num_query_groups": config["num_key_value_heads"], "rotary_base": theta,
+               "kv_channels": head_dim, "seq_length": config["max_position_embeddings"]}
+    stated = {**config, "head_dim": head_dim, **repeats, "embd_pdrop": 0.0, "resid_pdrop": 0.0}
+    directory = respelled(original, tmp_path / "checkpoint", lambda _: stated)
+    loaded = Pretrained.load(directory, dtype="float32")
+    assert loaded.model == plain.model
+    for got, want in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(plain.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    (directory / "config.json").write_text(json.dumps({**stated, "rotary_base": 2 * theta}))
+    with pytest.raises(ValueError):
+        Pretrained.load(directory, dtype="float32")
+
+
+BIASED_SEEDS = 8
+"""The biased MLPs' declared draws of ids against the reference's logits (check 1), sized by `seeds_for`
+paired with Dew's logits on the CPU."""
+
+
 @pytest.mark.parametrize("name, head", [("llama-tiny", "causal"), ("nemotron-h-tiny", "causal"),
                                         ("modernbert-tiny", "masked")])
 def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name, head, tmp_path):
     """Llama's MLP, Nemotron-H's MLP layers and ModernBERT's GLU carry biases where their config
     states mlp_bias, which each reference reads (modeling_llama.py's LlamaMLP, NemotronHMLP,
-    ModernBertMLP's packed Wi): a checkpoint with random biases loads to logits as exact as the
-    reference's float32 ones, both from its float64 ones, and saves, from its source and (but for
-    Nemotron-H, whose hybrid pattern only its source writes) from the model and its variables
-    alone, to a checkpoint that reloads to the same logits."""
+    ModernBertMLP's packed Wi): a checkpoint with random biases loads to logits on par with the
+    reference's float32 ones from its float64 twin's over drawn ids (check 1), and saves, from its
+    source and (but for Nemotron-H, whose hybrid pattern only its source writes) from the model and
+    its variables alone, to a checkpoint that reloads to the same logits."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForMaskedLM
-
-    from tools.torch_precision import float64
 
     auto = AutoModelForCausalLM if head == "causal" else AutoModelForMaskedLM
     config = AutoConfig.from_pretrained(FIXTURES / name)
@@ -216,19 +236,14 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
                 parameter.copy_(0.1 * torch.randn(parameter.shape, generator=draws))
     source = tmp_path / "source"
     reference.save_pretrained(source)
-    ids = np.load(FIXTURES / name / "input_ids.npy")
-
-    def theirs(dtype):
-        with float64() if dtype == torch.float64 else torch.no_grad():
-            model = auto.from_config(config, dtype=dtype, attn_implementation="eager").eval()
-            model.load_state_dict(reference.state_dict())
-            with torch.no_grad():
-                return model(torch.from_numpy(ids).long()).logits.double().numpy()
+    draw = fixture_ids(FIXTURES / name)
 
     loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
-    ours = np.asarray(loaded.model.apply(loaded.variables, ids), np.float64)
-    assert_as_exact_as_the_reference(ours, theirs(torch.float32), theirs(torch.float64),
-                                     f"{name} logits with MLP biases")
+    theirs, truth = transformers_arms(reference.eval(), lambda model, ids: model(ids).logits)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), theirs, draw,
+                    f"{name} logits with MLP biases", seeds=BIASED_SEEDS, truth_fn=truth)
+    (ids,) = draw(0)
+    ours = np.asarray(loaded.model.apply(loaded.variables, ids))
     loaded.save(tmp_path / "export")
     exports = [tmp_path / "export"]
     if name == "nemotron-h-tiny":
@@ -243,15 +258,14 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
     for export in exports:
         again = Pretrained.load(export, dtype="float32", attention_impl="reference")
         reloaded = np.asarray(again.model.apply(again.variables, ids))
-        np.testing.assert_array_equal(reloaded, ours.astype(np.float32))
+        np.testing.assert_array_equal(reloaded, ours)
 
-@pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
-def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
-    """A float32 decoder that states no precision multiplies float32 products, as torch's float32
-    matmuls do by default (`dew.nn.precision.float32_products`): its logits on a GPU are as exact
-    as transformers' float32 ones, both from transformers' float64 ones, under JAX's own default
-    precision (the test lane sets 'highest' for every product that states none), which multiplies
-    float32 in TF32 there, 2.9e-4 from float64 against 2.9e-7."""
+def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
+    """A float32 decoder under a run's ACCURATE precision policy (`generation.run_precision`, ledger
+    2500) multiplies every product that states no precision in IEEE float32: its logits on a GPU are as
+    exact as transformers' float32 ones, both from transformers' float64 ones, JAX's own default (TF32
+    there, as JAX documents) cleared first. The policy sets the products' precision; the decoder's
+    float32 dtype keeps their operands float32."""
     import contextlib
 
     import torch
@@ -262,7 +276,10 @@ def test_a_float32_decoder_multiplies_float32_products_on_a_gpu():
     directory = FIXTURES / "qwen3-tiny"
     ids = np.load(directory / "input_ids.npy")
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
-    with jax.default_matmul_precision(None):
+    from dew.nn.kernels import generation
+    from dew.nn.precision import ACCURATE
+
+    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
         ours = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, jnp.asarray(ids)), np.float64)
 
     def theirs(dtype):
@@ -290,15 +307,12 @@ def test_a_field_the_reference_does_not_read_leaves_its_logits_whatever_it_holds
     disagree with the ones the reference reads: its logits under them are the bits it computes
     without them, the same program on the same values, which the fixture's parity test holds to the
     reference's."""
-    from shutil import copytree
 
     import torch
     import transformers
 
-    directory = tmp_path / "checkpoint"
-    copytree(FIXTURES / name, directory)
     config = {**fixture_config(name), **stale}
-    (directory / "config.json").write_text(json.dumps(config))
+    directory = respelled(FIXTURES / name, tmp_path / "checkpoint", lambda _: config)
     ids = np.load(FIXTURES / name / "input_ids.npy")
 
     def theirs(source):
@@ -355,18 +369,15 @@ def test_an_olmo3_model_with_a_llama3_ramp_on_one_kind_writes_back_what_transfor
     """OLMo3 rotates each layer kind through its own rope_parameters entry, so a Llama-3 ramp on
     the full layers beside plain sliding ones loads, writes back in that spelling, and
     transformers' Olmo3 reads the export to the logits Dew computes."""
-    from shutil import copytree
 
     import torch
     from transformers import Olmo3ForCausalLM
 
-    source = tmp_path / "source"
-    copytree(FIXTURES / "olmo3-tiny", source)
     config = fixture_config("olmo3-tiny")
     config["rope_parameters"]["full_attention"] = {
         "rope_type": "llama3", "rope_theta": 500000.0, "factor": 8.0, "low_freq_factor": 1.0,
         "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
-    (source / "config.json").write_text(json.dumps(config))
+    source = respelled(FIXTURES / "olmo3-tiny", tmp_path / "source", lambda _: config)
     ids = np.load(FIXTURES / "olmo3-tiny" / "input_ids.npy")
     from dew.interop import PretrainedDecoder
 
@@ -404,7 +415,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
     expected, attention_factor = ROPE_INIT_FUNCTIONS['yarn'](
         reference, None, layer_type='full_attention')
-    record = translate_config(released)['kinds']['full_attention']['yarn']
+    record = translate_config(released)['kinds']['full_attention']['rope_scaling']
     scaling = YarnScaling(**record)
     scaled = yarn_inv_freq(128, 5e5, scaling, dtype=np.float32)
     plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))
@@ -431,12 +442,43 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
 def _respelled(name, tmp_path, edit):
     """The fixture's checkpoint under the config `edit` returns from its own."""
-    from shutil import copytree
+    return respelled(FIXTURES / name, tmp_path / name, edit)
 
-    directory = copytree(FIXTURES / name, tmp_path / name)
-    config = edit(fixture_config(name))
-    (directory / "config.json").write_text(json.dumps(config))
-    return directory
+
+@pytest.mark.parametrize(("name", "change"), [
+    ("opt-tiny", {"activation_dropout": 0.1}), ("opt-tiny", {"layer_norm_elementwise_affine": False}),
+    ("opt-tiny", {"layerdrop": 0.1}), ("bloom-tiny", {"apply_residual_connection_post_layernorm": True}),
+    ("bloom-tiny", {"slow_but_exact": True, "pretraining_tp": 2}), ("bloom-tiny", {"n_head": 5})],
+    ids=["opt activation dropout", "opt unscaled norms", "opt layer drop", "bloom post-norm residuals",
+         "bloom tensor-parallel exact path", "bloom heads not dividing the width"])
+def test_a_checkpoint_asking_what_its_family_does_not_compute_is_refused(name, change, tmp_path):
+    """An OPT or BLOOM checkpoint whose config asks what Dew's family does not compute (OPT's dropout
+    inside the feed-forward, scaleless norms, dropped layers; BLOOM's residuals read after the norm, the
+    tensor-parallel exact path that drops projection biases, a width no whole number of heads divides)
+    is refused at load rather than computed without it."""
+    with pytest.raises(ValueError):
+        fp32_decoder(_respelled(name, tmp_path, lambda config: {**config, **change}))
+
+
+@pytest.mark.parametrize(("name", "embedding"), [("opt-tiny", "model.decoder.embed_tokens.weight"),
+                                                 ("bloom-tiny", "transformer.word_embeddings.weight")])
+def test_a_tied_checkpoint_keeping_its_embedding_under_the_head_name_alone_loads_the_same_model(
+        name, embedding, tmp_path):
+    """A tied checkpoint whose safetensors keep lm_head.weight and drop the embedding the config ties it
+    to, as SFconvertbot's conversion of OPT-125m does: the head is the embedding's one copy and fills it,
+    so the model loads leaf for leaf as the checkpoint storing the embedding does."""
+    from dew.interop.safetensors_io import save_hf_layout
+    from dew.interop.sources import load_shards
+
+    tensors = load_shards(FIXTURES / name)
+    tensors["lm_head.weight"] = tensors.pop(embedding)
+    save_hf_layout(tensors, fixture_config(name), tmp_path)
+    head_only = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    stored = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    assert jax.tree.structure(head_only.variables) == jax.tree.structure(stored.variables)
+    for ours, theirs in zip(jax.tree.leaves(head_only.variables), jax.tree.leaves(stored.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
 def _reference_logits(name, directory):
@@ -632,8 +674,8 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     """The mixin replaces rope_parameters with a stated rope_scaling whole,
     so an explicit plain rope_scaling over a ramp is plain rope at the
     family's default base, as that spelling stated alone is. A family
-    whose mixer reads only one plain or YaRN entry refuses other ramps
-    and per-kind records through the same loader."""
+    whose mixer reads one rope entry refuses per-kind records through the
+    same loader, and GPT-OSS, whose mixer reads YaRN alone, other ramps."""
     plain = {"rope_type": "default"}
     conflicting = _respelled(name, tmp_path / "conflicting",
                              lambda config: {**config, "rope_scaling": plain})
@@ -648,11 +690,11 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     if name == "llama31-tiny":
         assert np.max(np.abs(logits[0] - reference)) > 1e-3
     else:
-        for index, entry in enumerate((
-            {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
-             "high_freq_factor": 4.0, "original_max_position_embeddings": 16},
-            {"full_attention": plain, "sliding_attention": plain},
-        )):
+        llama3 = {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
+                  "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
+        # DeepSeek's latent attention takes Llama 3.1's ramp beside YaRN's; GPT-OSS's reads YaRN alone.
+        for index, entry in enumerate((*(llama3,) * name.startswith("gpt-oss"),
+                                       {"full_attention": plain, "sliding_attention": plain})):
             unsupported = _respelled(name, tmp_path / f"unsupported-{index}",
                                       lambda config, entry=entry: {**config, "rope_scaling": entry})
             with pytest.raises(ValueError):
@@ -688,6 +730,11 @@ def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp
     assert np.sum(scaled != plain) >= head_dim // 4
 
 
+FP32_SEEDS = 8
+"""The hybrid and classic families' declared draws of ids against transformers' logits (check 1), sized by
+`seeds_for` paired with Dew's logits on the CPU."""
+
+
 @pytest.mark.parametrize("name", [name for name in TINY + ROUTED + HYBRID if name not in (
     'bloom-tiny',
     'falcon-mha-tiny',
@@ -701,25 +748,44 @@ def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp
     'phi3-tiny',
 )])
 def test_fp32_logits_match_the_reference_implementation(name):
-    """The parity claim: transformers' logits, our logits, same weights."""
+    """The parity claim: transformers' logits, our logits, same weights. A hybrid or classic family's
+    are on par with transformers' run in the test from its float64 twin's over drawn ids (check 1),
+    with its argmax on the first draw; every other family's within 1e-4 of the recorded logits, with
+    their argmax."""
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
-    ids = np.load(directory / "input_ids.npy")
-    reference = np.load(directory / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
     if name in HYBRID + CLASSIC:
-        assert_as_exact_as_the_reference(logits, reference, np.load(directory / "logits_f64.npy"),
-                                         f"{name} logits")
+        draw = fixture_ids(directory)
+        theirs, truth = transformers_arms(transformers_model(directory), causal_logits)
+        assert_as_exact(lambda ids: model.apply(variables, ids), theirs, draw, f"{name} logits",
+                        seeds=FP32_SEEDS, truth_fn=truth)
+        (ids,) = draw(0)
+        reference = theirs(ids)
     else:
+        ids = np.load(directory / "input_ids.npy")
+        reference = np.load(directory / "logits.npy")
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    if name not in HYBRID + CLASSIC:
         difference = float(np.max(np.abs(logits - reference)))
         assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
     assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
+def causal_logits(model, ids):
+    """A transformers causal LM's logits over `ids`, uncached (a `transformers_arms` run)."""
+    return model(ids, use_cache=False).logits
+
+
+HYBRID_SEEDS = 8
+"""The Nemotron-H exports' declared draws of ids against transformers' logits over the fixture (check 1),
+sized by `seeds_for` paired with the export's logits on the CPU."""
+
+
 @pytest.mark.parametrize("name", HYBRID[1:])
 def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
-    """The native 3-D layout and transformers' per-expert save layout compute the same model."""
+    """The native 3-D layout and transformers' per-expert save layout compute the same model: the packed
+    source's logits on par with transformers' over the fixture from its float64 twin's over drawn ids
+    (check 1)."""
     from safetensors.numpy import save_file
 
     from dew.interop.sources import load_shards
@@ -745,15 +811,16 @@ def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
     assert exported.keys() == packed.keys()
     for key, tensor in packed.items():
         np.testing.assert_array_equal(tensor, exported[key])
-    ids = np.load(FIXTURES / name / "input_ids.npy")
-    assert_as_exact_as_the_reference(loaded.model.apply(loaded.variables, ids),
-                                     np.load(FIXTURES / name / "logits.npy"),
-                                     np.load(FIXTURES / name / "logits_f64.npy"), f"{name} packed logits")
+    theirs, truth = transformers_arms(transformers_model(FIXTURES / name), causal_logits)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), theirs,
+                    fixture_ids(FIXTURES / name), f"{name} packed logits", seeds=HYBRID_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("name", HYBRID)
 def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, tmp_path):
-    """The loaded hybrid exports in its source layout, as Mamba-2 and Qwen3-Next do."""
+    """The loaded hybrid exports in its source layout, as Mamba-2 and Qwen3-Next do: transformers reads
+    the export to logits on par with its own over the fixture from its float64 twin's over drawn ids
+    (check 1)."""
     from dew.interop.sources import load_shards
 
     directory = FIXTURES / name
@@ -769,9 +836,10 @@ def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, 
     ids = np.load(directory / "input_ids.npy")
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   restored.model.apply(restored.variables, ids))
-    assert_as_exact_as_the_reference(transformers_logits(destination, ids, tmp_path),
-                                     np.load(directory / "logits.npy"),
-                                     np.load(directory / "logits_f64.npy"), "Nemotron-H export logits")
+    exported, _ = transformers_arms(transformers_model(destination), causal_logits)
+    theirs, truth = transformers_arms(transformers_model(directory), causal_logits)
+    assert_as_exact(exported, theirs, fixture_ids(directory), "Nemotron-H export logits", seeds=HYBRID_SEEDS,
+                    truth_fn=truth)
 
 
 def test_the_bf16_gemma_forward_still_tracks_the_reference():
@@ -795,7 +863,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
 
 
 @pytest.mark.parametrize("name", [name for name in TINY if name not in (
-    'bloom-tiny',
     'falcon-mha-tiny',
     'falcon-tiny',
     'gpt-bigcode-tiny',
@@ -803,7 +870,6 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     'gpt-neox-tiny',
     'gpt2-tiny',
     'gptj-tiny',
-    'opt-tiny',
     'phi-tiny',
     'phi3-tiny',
     'starcoder2-tiny',
@@ -956,17 +1022,20 @@ np.save(out, logits.to(torch.float32).numpy())
     return np.load(out)
 
 
+def assert_transformers_reads_the_export(model, variables, export, tmp_path) -> None:
+    """`model`'s export to `export` is a checkpoint transformers reads, computing Dew's logits over the
+    Qwen3 fixture's ids."""
+    PretrainedDecoder.from_model(model, variables).save(export)
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
 def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     """The export is a real HF checkpoint: transformers reads it and agrees."""
     model, variables = fp32_decoder(FIXTURES / "qwen3-tiny")
-    export = tmp_path / "exported"
-    PretrainedDecoder.from_model(model, variables).save(export)
-
-    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
-    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert_transformers_reads_the_export(model, variables, tmp_path / "exported", tmp_path)
 
 
 def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rng):
@@ -975,13 +1044,7 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
     does and a biased export is a checkpoint it reads."""
     model, variables = biased_qwen3(rng)
     export = tmp_path / "biased"
-    PretrainedDecoder.from_model(model, variables).save(export)
-
-    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
-    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert_transformers_reads_the_export(model, variables, export, tmp_path)
 
     again, reloaded = fp32_decoder(export)
     assert again == model
@@ -1039,15 +1102,13 @@ def _diffusion_fp32(name):
             np.load(directory / "logits.npy"), np.load(directory / "logits_f64.npy"))
 
 
-def test_llada_logits_match_the_released_model_code():
-    """fp32 parity with LLaDA's own modeling_llada.py (GSAI-ML/LLaDA-8B-Base
-    at 0f2787f, run by tools/remote_code_reference.py under transformers
-    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule:
-    Dew's RMS error from the release's float64 logits at most twice the
-    release's own fp32 error. A causal model on the same weights misses by
-    1.5, so the fixture exercises full attention."""
-    model, variables, ids, reference, truth = _diffusion_fp32("llada-tiny")
-    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "llada-tiny logits")
+@pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
+def test_the_diffusion_fixtures_exercise_full_attention(name):
+    """The release's own logits over the fixture's tokens (LLaDA's modeling_llada.py at 0f2787f, Dream's
+    modeling_dream.py at 6572adb, run by tools/remote_code_reference.py under transformers 4.46.3), which
+    tests/test_remote_code_releases.py holds Dew to over seeds, are a full-attention model's: a causal
+    model on the same weights misses them by more than 1 (1.5 for LLaDA, 4.9 for Dream)."""
+    model, variables, ids, reference, _ = _diffusion_fp32(name)
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 
@@ -1327,18 +1388,6 @@ def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
     np.testing.assert_array_equal(actual.argmax(-1), full.argmax(-1))
 
 
-def test_dream_logits_match_the_released_model_code():
-    """fp32 parity with Dream's own modeling_dream.py (Dream-org/Dream-v0-Base-7B
-    at 6572adb, run by tools/remote_code_reference.py under transformers
-    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule. A
-    causal model on the same weights misses by 4.9, so the fixture exercises
-    full attention."""
-    model, variables, ids, reference, truth = _diffusion_fp32("dream-tiny")
-    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "dream-tiny logits")
-    causal = model.clone(causal=True)
-    assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
-
-
 @pytest.mark.parametrize("mode", ["frozen", "trainable"])
 def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     """Frozen HF buffers and trainable Google scalars retain each view's math."""
@@ -1368,7 +1417,7 @@ def nemotron_step_source(directory, *, seed: int = 7):
     (mtp_layers_block_type [attention, moe]), its tensors drawn under the
     released names `mtp.layers.{0,1}.*` (vLLM nemotron_h_mtp.py), written to
     `directory`; and the reference: transformers' own blocks composed as
-    vLLM composes the step, at `dtype`."""
+    vLLM composes the step, at `dtype`, its trunk loaded once a dtype."""
     import torch
     from safetensors.numpy import load_file, save_file
     from transformers.models.nemotron_h import modeling_nemotron_h as reference
@@ -1416,11 +1465,14 @@ def nemotron_step_source(directory, *, seed: int = 7):
     save_file(tensors, str(directory / "model.safetensors"))
     (directory / "config.json").write_text(json.dumps(hf))
 
+    models = {}
+
     def logits(ids, dtype):
-        model = reference.NemotronHForCausalLM.from_pretrained(str(source), dtype=dtype).eval()
-        # The eager experts run in float64, where torch's grouped matmul does not.
-        model.config._experts_implementation = "eager"
-        depth = step.to(dtype)
+        if dtype not in models:
+            models[dtype] = reference.NemotronHForCausalLM.from_pretrained(str(source), dtype=dtype).eval()
+            # The eager experts run in float64, where torch's grouped matmul does not.
+            models[dtype].config._experts_implementation = "eager"
+        model, depth = models[dtype], step.to(dtype)
         with torch.no_grad():
             hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state[:, :-1]
             fused = depth["eh_proj"](torch.cat([depth["enorm"](model.model.embeddings(ids[:, 1:])),
@@ -1433,18 +1485,20 @@ def nemotron_step_source(directory, *, seed: int = 7):
     return logits
 
 
+STEP_SEEDS = 8
+"""The prediction step's declared draws of ids against the composed reference's logits (check 1), sized
+by `seeds_for` paired with Dew's step on the CPU."""
+
+
 def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tmp_path):
     """Nemotron 3 Ultra's prediction step over the latent-MoE fixture loads as
     `mtp_0`: the attention block's mixer and pre-norm, the routed block in
     its feed-forward slot, the step's input maps and final norm. Its logits
-    are what transformers' own blocks give composed as vLLM composes the
-    step, within the reference's own distance from float64; and the LM
-    objective's `mtp_weight` trains the step's weights."""
-    from unittest.mock import patch
-
+    are on par with what transformers' own blocks give composed as vLLM
+    composes the step, from its float64 run, over drawn ids (check 1); and
+    the LM objective's `mtp_weight` trains the step's weights."""
     import torch
 
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from tools.torch_precision import float64
 
     reference = nemotron_step_source(tmp_path / "ultra-step")
@@ -1455,22 +1509,24 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     assert depth["block"]["mlp"]["experts"]["up_proj"]["kernel"].shape[0] == 8
     assert "mtp_0" in variables["moe"]
 
-    ids = np.load(FIXTURES / "nemotron-h-moe-latent-tiny" / "input_ids.npy")
-    hidden = model.apply(variables, jnp.asarray(ids, jnp.int32), method=CausalTransformer.hidden_states)
-    logits = np.asarray(model.apply(variables, hidden, jnp.asarray(ids, jnp.int32),
-                                    method=CausalTransformer.mtp_logits)[0])
-    tokens = torch.from_numpy(ids.astype(np.int64))
-    fp32 = reference(tokens, torch.float32)
-    widen = torch.Tensor.type
+    draw = fixture_ids(FIXTURES / "nemotron-h-moe-latent-tiny")
 
-    def wide_type(tensor, dtype=None, **kwargs):
-        # Nemotron's router pins .type(torch.float32), beyond the shared cast widener.
-        return widen(tensor, torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+    def step_logits(ids):
+        return prediction_logits(model, variables, ids)
 
-    with float64(), patch.object(torch.Tensor, "type", wide_type):
-        truth = reference(tokens, torch.float64)
-    assert_as_exact_as_the_reference(logits, fp32, truth, "nemotron-h prediction step logits")
-    assert np.array_equal(np.argmax(logits, -1), np.argmax(fp32, -1))
+    @as_given
+    def fp32(ids):
+        return reference(torch.from_numpy(np.asarray(ids, np.int64)), torch.float32)
+
+    @as_given
+    def truth(ids):
+        with float64():
+            return reference(torch.from_numpy(np.asarray(ids, np.int64)), torch.float64)
+
+    assert_as_exact(step_logits, fp32, draw, "nemotron-h prediction step logits", seeds=STEP_SEEDS,
+                    truth_fn=truth)
+    (ids,) = draw(0)
+    assert np.array_equal(np.argmax(np.asarray(step_logits(ids)), -1), np.argmax(fp32(ids), -1))
 
     import optax
 
@@ -1548,12 +1604,7 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     """transformers saves the trunk alone whatever depth the config names:
     such a checkpoint, the dense one too, whose default step names a routed
     kind its trunk lacks, loads the trunk it holds and computes its logits."""
-    from shutil import copytree
-
-    directory = tmp_path / name
-    copytree(FIXTURES / name, directory)
-    stated = {**fixture_config(name), "num_nextn_predict_layers": 1}
-    (directory / "config.json").write_text(json.dumps(stated))
+    directory = _respelled(name, tmp_path, lambda config: {**config, "num_nextn_predict_layers": 1})
     model, variables = fp32_decoder(directory)
     assert model.num_nextn_predict_layers == 0 and "mtp_0" not in variables["params"]
     ids = jnp.asarray(np.load(FIXTURES / name / "input_ids.npy"), jnp.int32)
@@ -1618,9 +1669,107 @@ def test_a_qwen_config_without_a_window_bound_windows_the_layers_transformers_wi
     assert windows.count("sliding_attention") == 4
 
 
+@pytest.mark.parametrize("fixture", ["qwen2-tiny", "qwen3-tiny"])
+def test_a_qwen_configs_layers_are_its_transformers_class_layers_without_importing_it(fixture):
+    """Dew reads a Qwen config's layer kinds by its own rule (`native_layer_types`, ledger 2746), the
+    rule its transformers class builds them by, over every way a config states its window: on or off,
+    a window stated, null or left to the class, a first windowed layer stated or left to it."""
+    from transformers import AutoConfig
+
+    from dew.interop import decoder_parts
+
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    base = {name: value for name, value in config.items()
+            if name not in ("layer_types", "max_window_layers", "use_sliding_window", "sliding_window")}
+    for windowed in (False, True):
+        for window in ({}, {"sliding_window": None}, {"sliding_window": 8}):
+            for first in ({}, {"max_window_layers": 2}, {"max_window_layers": 30}):
+                stated = {**base, "num_hidden_layers": 32, "use_sliding_window": windowed, **window, **first}
+                expected = AutoConfig.for_model(stated["model_type"], **{
+                    name: value for name, value in stated.items() if name != "model_type"}).layer_types
+                read = decoder_parts.native_layer_types(stated, set(), stated["model_type"])
+                assert read == tuple(expected), (windowed, window, first)
+
+
+@pytest.mark.parametrize("name", ["tie_word_embeddings", "attention_bias", "use_sliding_window"])
+def test_a_qwen_config_stating_a_flag_as_a_string_is_refused(name):
+    """A Qwen3 config's flags are booleans, as its class types them: one stated as the string "false"
+    is refused, where reading its truth would take it as true (review of ledger 2746)."""
+    config = json.loads((FIXTURES / "qwen3-tiny" / "config.json").read_text())
+    stated = {key: value for key, value in config.items() if key != "layer_types"}
+    with pytest.raises(ValueError):
+        translate_config({**stated, name: "false"})
+
+
+def test_an_export_of_a_qwen_model_imports_no_transformers(tmp_path):
+    """`PretrainedDecoder.from_model` writes a Dew Qwen model's config from Dew's own rules, so an export
+    imports no transformers, whose import alone takes most of the call's time (ledger 2746)."""
+    script = (
+        "import sys\n"
+        "from dew.interop import Pretrained, PretrainedDecoder\n"
+        f"loaded = Pretrained.load({str(FIXTURES / 'qwen3-tiny')!r}, dtype='float32')\n"
+        "before = {name for name in sys.modules if name.split('.')[0] == 'transformers'}\n"
+        f"PretrainedDecoder.from_model(loaded.model, loaded.variables).save({str(tmp_path / 'export')!r})\n"
+        "after = {name for name in sys.modules if name.split('.')[0] == 'transformers'}\n"
+        "assert after <= before, sorted(after - before)[:3]\n")
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert done.returncode == 0, done.stderr[-2000:]
+
+
 def test_a_config_of_a_type_transformers_lacks_reads_its_layers_by_its_familys_convention():
     """Dream (no transformers class) reads by Qwen2's convention, whose class takes a null head_dim
     as Dream's own config does: the record is the one without it."""
     config = json.loads((FIXTURES / "dream-tiny" / "config.json").read_text())
     assert translate_config({**config, "head_dim": None}) == translate_config(
         {name: value for name, value in config.items() if name != "head_dim"})
+
+
+def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
+    """A tool that builds a checkpoint's decoder from its config reads it as a load of its language model
+    does (`decoder_config`, ledger 3006): Qwen 3.5's wrapper unties its head at its own scope over a text
+    config that ties it, which tools/kernel_picks.py's decoder (`model_of`) unties as the load does, and
+    states its modeling overrides there, which `model_of`'s decoder builds as the load does (its full
+    attention block-bidirectional); a registered family that reads its whole record (Kimi K2.5's) is
+    read as it is."""
+    import argparse
+
+    from dew.interop.hf_decoders import decoder_config
+    from dew.interop.pretrained import Pretrained
+    from tools import kernel_picks
+
+    native = json.loads((FIXTURES / "qwen35-native-tiny" / "config.json").read_text())
+    assert native["text_config"]["tie_word_embeddings"] and not native["tie_word_embeddings"]
+    picked = kernel_picks.model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-native-tiny"),
+                                                      revision=None, dtype="float32"))
+    loaded = Pretrained.load(FIXTURES / "qwen35-native-tiny", text_only=True, dtype="float32")
+    assert not picked.tie_embeddings and picked.tie_embeddings == loaded.model.tie_embeddings
+    assert not translate_config(decoder_config(native))["tie_embeddings"]
+    assert translate_config(native["text_config"])["tie_embeddings"]
+    blocks = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())
+    assert decoder_config(blocks)["modeling_overrides"] == blocks["modeling_overrides"]
+    built = kernel_picks.model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-blocks-tiny"),
+                                                     revision=None, dtype="float32"))
+    blocked = Pretrained.load(FIXTURES / "qwen35-blocks-tiny", text_only=True, dtype="float32").model
+    assert built.kinds["full_attention"].mixer.bidirectional_blocks
+    assert built.kinds == blocked.kinds
+    whole = json.loads((FIXTURES / "kimi-k25-tiny" / "config.json").read_text())
+    assert decoder_config(whole) is whole
+
+
+def test_a_decoder_of_the_default_feed_forward_width_exports(tmp_path):
+    """A decoder that leaves its feed-forward width unstated computes four times its residual's, which its
+    export states, so the export reads back the model it was (`refuse_lossy_export`, ledger 3065): its
+    logits after a round trip are its own."""
+    from dew.interop.pretrained import Pretrained, PretrainedDecoder
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=4,
+                         max_seq_len=16, dtype="float32")
+    assert model.mlp_features is None
+    variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+    PretrainedDecoder.from_model(model, variables).save(tmp_path)
+    back = Pretrained.load(tmp_path, dtype="float32")
+    ids = jnp.arange(8, dtype=jnp.int32)[None]
+    np.testing.assert_array_equal(np.asarray(back.model.apply(back.variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))

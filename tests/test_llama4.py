@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_arrays
+from model_support import as_stepped
 from reference_error import assert_as_exact
 
 from dew.batch import coordinates
@@ -248,7 +249,8 @@ def tuned_equation(hidden, params, dtype):
 def test_a_windowed_kind_tunes_its_temperature_as_written():
     """A windowed attention kind rotating halves and tuning its query temperature computes its written
     equation (`tuned_equation`), full and through a cache (a prefill, then a token a call), on par
-    with the equation in float32 against float64 (check 1)."""
+    with the equation in float32, the cached steps' each at the width it reads (`as_stepped`), against
+    float64 (check 1)."""
     module = tuned_layer()
     length = TUNED_LENGTH
     draw = drawn_layer(module, 1614)
@@ -274,8 +276,12 @@ def test_a_windowed_kind_tunes_its_temperature_as_written():
     def truth(hidden, params):
         return tuned_equation(hidden, params, jnp.float64)
 
-    for ours, label in ((full, "tuned windowed layer"), (cached, "tuned windowed layer, cached")):
-        assert_as_exact(ours, jax.jit(written), draw, label, seeds=TUNED_SEEDS, truth_fn=truth)
+    def stepped(hidden, params):
+        return as_stepped(lambda held: written(held, params), hidden, 7)
+
+    for ours, reference, label in ((full, written, "tuned windowed layer"),
+                                   (cached, stepped, "tuned windowed layer, cached")):
+        assert_as_exact(ours, jax.jit(reference), draw, label, seeds=TUNED_SEEDS, truth_fn=truth)
 
 
 def test_a_llama4_of_unrotated_layers_alone_translates_as_llama4():

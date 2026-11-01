@@ -186,6 +186,8 @@ for checkpoint in trainer.checkpoints.kept():
 
 `restore_best=True` on `fit` returns the model the run ranked best: the final state with the best step's variables, EMA and counters (`step`, `microstep`, `updates`), while the optimizer state, RNG and the rest stay the final step's. It is the best model, not a point to resume training from; a resume reads the run's checkpoints. Without `Checkpoints`, the run holds a host copy of the best step's counters, variables and EMA, and no optimizer state: 4 GB for a 1B fp32 model, plus its EMA's leaves where it keeps one, where Adam's moments would add 8 GB. Without `restore_best`, `fit` returns the final state as usual.
 
+A recorded run states the same choices in its `TrainerConfig`. A run's command line stops it on a plateau of a metric named as `--trainer.best` names one, `trainer.stop:plateau --trainer.stop.metric val/loss --trainer.stop.evals 3`, ends it on the best model with `--trainer.restore-best`, and writes the local tier beside the persistent checkpoints with `--trainer.local-directory /scratch/run --trainer.local-every 5%`; `dew train run.json --set trainer.restore_best=True` sets them in a saved run. `dew export run_dir out --step best` (or `--step best:val/clip_score`) exports the step a ranking chose.
+
 `Best(fid, weights_only=True)` writes only the parameters, the EMA and the counters for a winner that falls between checkpoint steps. Such a snapshot is for inference, and a full-state restore refuses it; `restore_best=True` reads it as the model state it holds. When a winner falls on a full-checkpoint step, the one full save also serves the best tracker, so nothing is written twice. Latest-N retention counts only full states, so a small inference snapshot cannot replace the state a run resumes from.
 
 With several validation splits, each split has an explicit reader name, given as its key in `validation`, and a metric selector has to name its split. A callable uses `(split, metric)` keys.
@@ -237,7 +239,7 @@ How much the XOR saves depends on how close a run's EMA is to its weights, and t
 
 I ran three processes of three saves and restores each, alternating with processes that stored the EMA as itself. After compilation, a save blocked the step for 0.19 to 0.46 s, against 0.04 to 0.14 s, and the difference is the time to compute the planes. Saves landed on disk in 1.9 to 3.7 s, against 1.8 to 2.3 s, apart from saves that took 17 to 74 s in both cases while the shared disk was busy. Restores took 1.45 to 1.59 s, against 1.31 to 1.71 s. The first save and the first restore in a process each compile one small program per distinct EMA leaf shape, 19 for this model. Those first saves blocked for 1.0 to 2.7 s, and the first restores took 2.0 to 3.0 s.
 
-On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2, I timed the same checkpoint's weights and EMA (175.6M fp32 parameters, step 1.35M). The two variants were interleaved in one process for five saves and restores each. The table gives medians of attempts 1 to 4, excluding the first calls.
+On an NVIDIA A100 at integration commit `f41039b9`, with JAX 0.11.2, I timed the same checkpoint's weights and EMA (175.6M fp32 parameters, step 1.35M). The two variants were interleaved in one process for five saves and restores each. The table gives medians of attempts 1 to 4, excluding the first calls.
 
 | EMA storage | Weights and EMA | Save blocks the step | Save becomes durable | Restore |
 |---|---|---|---|---|
@@ -263,13 +265,13 @@ averaged = checkpoints.posthoc_ema(0.07)               # at the latest snapshot
 averaged = checkpoints.posthoc_ema(0.07, step=40000)
 ```
 
-`posthoc_ema` returns the `params` collection as host arrays, in the weights' structure and dtypes. It reads one snapshot at a time and weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.training.posthoc.coefficients`). On the paper's setting, those weights match NVlabs' `phema.py` to the last bit.
+`posthoc_ema` returns the `params` collection as host arrays, in the weights' structure and dtypes. It reads one snapshot at a time and weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.averaging.coefficients`). On the paper's setting, those weights match NVlabs' `phema.py` to the last bit.
 
 The accuracy depends on how many snapshots there are. In a 96-step CPU run tracking 0.05 and 0.10, I rebuilt an average of 0.07 and compared it with one tracked directly, on weights of scale 2. From snapshots every 4 steps the two differed by at most 1.2e-7, from every 8 steps by 4.8e-7, and from every 16 steps by 5.7e-6. For comparison, the tracked 0.05 average was 1.3e-4 from the directly tracked 0.07.
 
 Each profile holds one more copy of the weights in memory, and retaining whole checkpoints costs disk. With fp32 weights, an ordinary EMA, fp32 Adam moments, two power profiles and no accumulation buffers, a 176M model holds six weight-sized trees per snapshot, about 4.2 GB before compression. A 1.35M-update run saving every 10k updates keeps 135 snapshots, about 570 GB raw. Keeping only the two averages would take about 190 GB. A separate checkpoint manager for the averages added blocking setup and a gap between commits, though, so Dew keeps the state and the profiles in one atomic checkpoint. With empty `ema_profiles`, the ordinary `keep` policy applies.
 
-In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state blocked for a median of 14.9 ms with snapshot retention and 15.2 ms without it, over six warmed pairs. A snapshot transfers and serializes no extra parameter bytes. On an NVIDIA A100 at integration commit `845b75bc`, with JAX 0.11.2 and 175.6M fp32 parameters, snapshot retention also added no measured blocking cost. The full state held weights, EMA, Adam moments and two power profiles. The variants were interleaved for five saves each, and the table gives medians of attempts 1 to 4. I did not time restores for this comparison.
+In paired, interleaved CPU saves of an 8.4M-parameter fp32 tree, the same state blocked for a median of 14.9 ms with snapshot retention and 15.2 ms without it, over six warmed pairs. A snapshot transfers and serializes no extra parameter bytes. On an NVIDIA A100 at integration commit `f41039b9`, with JAX 0.11.2 and 175.6M fp32 parameters, snapshot retention also added no measured blocking cost. The full state held weights, EMA, Adam moments and two power profiles. The variants were interleaved for five saves each, and the table gives medians of attempts 1 to 4. I did not time restores for this comparison.
 
 | Retention | Full checkpoint | Save blocks the step | Save becomes durable |
 |---|---|---|---|
@@ -291,6 +293,34 @@ Two runs of a CIFAR-10 LADD distillation with deterministic ops alone differed f
 On a CPU with performance and efficiency cores, such as Intel's hybrid parts, XLA's float32 convolution rounds one of two ways for the life of a process. The core type that ran the process's first convolution decides which ([openxla/xla#50022](https://github.com/openxla/xla/issues/50022)), so a resumed process can get the other one. Pinning the run to one core type with `taskset` removes the choice.
 
 The grace period has to cover one step and one checkpoint write. When `dew launch` is told to stop a pool, it waits 300 seconds before it kills the ranks, and a second signal kills them at once ([Training on several nodes](multi-node.md)).
+
+## A run that outlives its Colab runtime
+
+A Colab runtime's disk goes with the runtime. Mounted Google Drive is a directory like any other to Dew, so a run that should resume on the next runtime keeps there what it cannot make again cheaply, and keeps the rest on the runtime's disk:
+
+<!-- not run: needs a Colab runtime with Google Drive; its objective, optimizer and key are the run's -->
+```python
+import tensorflow_datasets as tfds
+from google.colab import drive
+
+import dew
+from dew.cache import enable_compilation_cache
+from dew.data import TFDS, presets
+
+drive.mount("/content/drive")
+root = "/content/drive/MyDrive/runs/flowers"
+
+enable_compilation_cache(f"{root}/xla")                      # compiled steps and the GPU's kernel picks
+# Prepared on the first runtime; a later one finds it there and prepares nothing.
+tfds.builder("oxford_flowers102", data_dir=f"{root}/data").download_and_prepare(file_format="array_record")
+train = TFDS("oxford_flowers102", path=f"{root}/data")
+trainer = dew.Trainer(objective, optimizer, key=key, checkpoints=dew.Checkpoints(
+    f"{root}/checkpoints", local_directory="/content/checkpoints", local_every=200))
+trainer.fit(train.pipe(presets.images, 64, batch=16, augment=True, cache=f"{root}/images"), steps=10_000,
+            checkpoint_every=1_000)
+```
+
+On a new runtime the same cell mounts Drive again and calls `fit` with the same directory, which resumes from the latest checkpoint and its data position ([Preemption](#preemption) covers the stop). The compilation cache spares the new runtime its compiles only on the same GPU model and jaxlib, which a Colab runtime does not promise. Drive is slower than the runtime's disk and counts against its quota, so the run writes its frequent checkpoint to the runtime's disk (`local_directory`, every 200 steps) and the ones it keeps to Drive every 1,000 steps (`checkpoint_every`), `keep` of them ([Time cadence and retention](#time-cadence-and-retention)). A runtime that ends loses only the steps since the last one on Drive, which the next resumes from. `TFDS(path=...)` reads data already prepared there and prepares none, so the cell prepares it with TFDS (Colab has TensorFlow) before reading it.
 
 ## Data position
 

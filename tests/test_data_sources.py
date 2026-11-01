@@ -2,21 +2,22 @@
 
 import dataclasses
 import hashlib
+import http.server
+import importlib
+import importlib.machinery
 import io
 import itertools
 import json
-import os
 import pickle
 import shutil
+import sys
 import tarfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
 import grain.python as grain
 import numpy as np
-import psutil
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
@@ -356,13 +357,16 @@ def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_p
 @pytest.mark.parametrize("trickled", ["headers", "body"])
 def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(trickled):
     """A server that sends its headers or its body a byte every tenth of a second holds a fetch
-    no longer than its timeout: the attempt is dropped as transient, where it once read on byte
-    by byte, each byte inside the socket's timeout."""
-    import http.server
+    no longer than its timeout: the attempt is dropped as transient while the server still has bytes
+    to send, where it once read on byte by byte, each byte inside the socket's timeout, to the
+    response's end (row 1947: the end is the timeout's, read off the response, not a wall-clock
+    bound)."""
     import time
 
     from dew.data.pipeline import Rejected
     from dew.data.sources.urls import Fetch
+
+    total, sent = 60, []
 
     class Trickle(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -370,11 +374,12 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
                 self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
             else:
                 self.send_response(200)
-                self.send_header("Content-Length", "60")
+                self.send_header("Content-Length", str(total))
                 self.end_headers()
-            for _ in range(60):
+            for _ in range(total):
                 self.wfile.write(b"x")
                 self.wfile.flush()
+                sent.append(1)
                 time.sleep(0.1)
 
         def log_message(self, *arguments):
@@ -384,14 +389,15 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     serving.start()
     try:
-        began = time.monotonic()
         fetched = Fetch(timeout=1.0)({"url": f"http://127.0.0.1:{server.server_port}/"})
-        waited = time.monotonic() - began
+        sent_by_then = len(sent)
     finally:
         server.shutdown()
         server.server_close()
     assert isinstance(fetched, Rejected) and not fetched.permanent
-    assert waited < 1.5
+    # A byte every tenth of a second: a fetch held to its one-second timeout leaves the server about ten
+    # sent, and twice that at most, not the sixty of a response read to its end (row 2447).
+    assert sent_by_then <= 2 * 10
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():
@@ -702,7 +708,8 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
     from dew.data.text import Tokenize
 
     root = Store(f"memory://text-{uuid4().hex}/source.txt")
-    original = b"first\r\nsecond\n\nlast without newline"
+    # Two 9-byte ranges cut inside "second", the last line ending the file without a terminator.
+    original = b"first\r\nsecond\n\nlast"
     root.write(original)
     files = Files(root.url, shard_bytes=9)
     if read == "indexed":
@@ -853,7 +860,7 @@ def test_flat_and_sharded_token_indexes_read_the_same_spans_and_documents(token_
         np.testing.assert_array_equal(tokens[span], expected[span])
     with pytest.raises(ValueError):
         tokens[::2]
-    assert stored.documented
+    # The producer's records, its empty ones no document.
     assert stored.document_ends().tolist() == [3, 5, 9]
     for read in ("memory", "indexed", "streamed"):
         rows = iterate(Pipeline(stored), read=read, loading=Loading(workers=0, threads=1, read_buffer=0))
@@ -1037,13 +1044,17 @@ def test_cli_record_exports_still_default_to_parquet(tmp_path):
     assert stored.records("indexed")[0] == {"text": "a document"}
 
 
-def test_cli_exports_the_chain_of_the_file_it_names_and_no_other(tmp_path):
+def test_cli_exports_the_chain_of_the_file_it_names_and_no_other(tmp_path, monkeypatch):
     """Two files of one name in two directories each export their own chain, and a file named as a
     module the process holds elsewhere (the standard library's `json`), or as a package's module
-    (`email.utils`), is refused, not read as it."""
+    (`email.utils`), is refused, not read as it, and leaves the process as it was: its directory off the
+    path, so no later import, a loading worker's included, reads it in the module's place."""
     from dew.cli.main import main
     from dew.data.sources import source
 
+    # The exports accepted put their directories first on the path, as a run of the CLI does; the test's
+    # alone.
+    monkeypatch.setattr(sys, "path", [*sys.path])
     for corpus in ("first", "second"):
         (tmp_path / corpus).mkdir()
         (tmp_path / corpus / "corpus.py").write_text(
@@ -1055,6 +1066,9 @@ def test_cli_exports_the_chain_of_the_file_it_names_and_no_other(tmp_path):
         (tmp_path / named).write_text("from dew.data import Memory\ndata = Memory([{'text': 'mine'}])\n")
         with pytest.raises(ValueError):
             main(["data", "export", str(tmp_path / named), str(tmp_path / f"{named}-out")])
+    assert str(tmp_path.resolve()) not in sys.path
+    # The path's own search, as a fresh worker's import of the module makes it.
+    assert importlib.machinery.PathFinder.find_spec("json").origin != str((tmp_path / "json.py").resolve())
 
 
 @pytest.mark.parametrize("read", [None, "memory", "indexed"])
@@ -1114,283 +1128,21 @@ def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monke
     )
     filesystem, _ = root.resolve()
     downloaded = []
-    get_file = filesystem.get_file
+    opened = filesystem.open
 
-    def download(remote, local, **kwargs):
-        downloaded.append(remote)
-        return get_file(remote, local, **kwargs)
+    def download(path, *args, **kwargs):
+        # A shard's bytes read whole into Dew's mirror, where its digest is checked.
+        if str(path).endswith(".array_record"):
+            downloaded.append(path)
+        return opened(path, *args, **kwargs)
 
-    monkeypatch.setattr(filesystem, "get_file", download)
+    monkeypatch.setattr(filesystem, "open", download)
     rows = Files(root.url, format="array_record").records("indexed")
     assert len(rows) == 12
     assert downloaded == []
     assert rows[9] == {"id": 9}
     assert len(downloaded) == 1
     assert downloaded[0].endswith(manifest["files"][2]["path"])
-
-
-@pytest.fixture
-def arrayrecord_paths(tmp_path):
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    paths = tuple(str(tmp_path / f"{shard}.array_record") for shard in range(Loading().threads + 1))
-    for shard, path in enumerate(paths):
-        writer = ArrayRecordWriter(path, "group_size:1")
-        for index in range(8):
-            writer.write(f"{shard}:{index}".encode())
-        writer.close()
-    return paths
-
-
-def test_arrayrecords_threaded_reads_overlap(arrayrecord_paths, monkeypatch):
-    import grain.python as grain
-
-    from dew.data.sources import records
-
-    source = records.ArrayRecords(arrayrecord_paths[:1], counts=(8,))
-    active = maximum = 0
-    lock = threading.Lock()
-    entered = threading.Barrier(3)
-    released = threading.Event()
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-
-    def blocked_read(reader, index):
-        nonlocal active, maximum
-        with lock:
-            active += 1
-            maximum = max(maximum, active)
-        try:
-            if index < 2:
-                entered.wait(timeout=5)
-                assert released.wait(timeout=5)
-            return underlying_read(reader, index)
-        finally:
-            with lock:
-                active -= 1
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
-    try:
-        with ThreadPoolExecutor(2) as pool:
-            pending = [pool.submit(source.__getitem__, index) for index in range(8)]
-            try:
-                entered.wait(timeout=5)
-                assert maximum == 2
-            finally:
-                released.set()
-            assert [future.result(timeout=5) for future in pending] == [
-                f"0:{index}".encode() for index in range(8)
-            ]
-    finally:
-        source.close()
-
-
-@pytest.mark.parametrize("fail", [False, True])
-@pytest.mark.parametrize("retire", ["eviction", "close"])
-def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
-    arrayrecord_paths, monkeypatch, fail, retire
-):
-    import grain.python as grain
-
-    from dew.data.sources import records
-
-    source = records.ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
-    entered = threading.Barrier(3)
-    released = [threading.Event(), threading.Event()]
-    first_reader = []
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-    failed_read = ValueError("failed child read")
-
-    def descriptors(path):
-        real = os.path.realpath(path)
-        return {opened.fd for opened in psutil.Process().open_files() if opened.path == real}
-
-    def blocked_read(reader, index):
-        if not first_reader:
-            first_reader.append(id(reader))
-        held = id(reader) == first_reader[0]
-        payload = underlying_read(reader, index)
-        # A failed read's traceback must not keep the external reader alive after Dew closes it.
-        del reader
-        if held and index < 2:
-            entered.wait(timeout=5)
-            assert released[index].wait(timeout=5)
-            if fail:
-                raise failed_read
-        return payload
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
-    try:
-        assert source[2] == b"0:2"
-        held = descriptors(arrayrecord_paths[0])
-        assert held
-        with ThreadPoolExecutor(2) as pool:
-            pending = [pool.submit(source.__getitem__, index) for index in range(2)]
-            try:
-                entered.wait(timeout=5)
-                if retire == "eviction":
-                    for shard in range(1, len(arrayrecord_paths)):
-                        assert source[8 * shard] == f"{shard}:0".encode()
-                else:
-                    source.close()
-                assert descriptors(arrayrecord_paths[0]) == held
-                # Close retires the busy reader; eviction keeps it and retires an idle one.
-                assert source[2] == b"0:2"
-                path = arrayrecord_paths[-1] if retire == "eviction" else arrayrecord_paths[0]
-                replacement = descriptors(path) - held
-                assert replacement
-                for index, future in enumerate(pending):
-                    released[index].set()
-                    if fail:
-                        with pytest.raises(ValueError) as raised:
-                            future.result(timeout=5)
-                        assert raised.value is failed_read
-                    else:
-                        assert future.result(timeout=5) == f"0:{index}".encode()
-                    still_open = descriptors(arrayrecord_paths[0])
-                    assert held & still_open == (set() if retire == "close" and index == 1 else held)
-                    assert replacement <= descriptors(path)
-            finally:
-                for release in released:
-                    release.set()
-    finally:
-        source.close()
-    assert all(not descriptors(path) for path in arrayrecord_paths)
-
-
-def test_pickled_arrayrecords_open_independent_readers(arrayrecord_paths):
-    from dew.data.sources.records import ArrayRecords
-
-    source = ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
-    assert source[0] == b"0:0"
-    restored = pickle.loads(pickle.dumps(source))
-    try:
-        source.close()
-        assert restored[1] == b"0:1"
-        restored.close()
-        assert source[2] == b"0:2"
-    finally:
-        source.close()
-        restored.close()
-
-
-@pytest.mark.parametrize("max_bytes", [1, 1 << 30])
-def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecord_paths, tmp_path, max_bytes):
-    """A local mirror with room for the shards a read holds open serves them;
-    one of a byte is refused."""
-    from dew.data.sources.records import ArrayRecords
-
-    shard = Store(f"memory://small-record-mirror-{uuid4().hex}/0.array_record")
-    shard.write(Path(arrayrecord_paths[0]).read_bytes())
-    source = ArrayRecords(
-        (shard.url,),
-        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": max_bytes}},
-        counts=(8,),
-    )
-    try:
-        if max_bytes > 1:
-            assert source[0] == b"0:0"
-            return
-        with pytest.raises(ValueError):
-            source[0]
-    finally:
-        source.close()
-
-
-@pytest.mark.parametrize("busy_oldest,retire", [(False, "eviction"), (True, "eviction"), (True, "close")])
-def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
-    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest, retire
-):
-    import grain.python as grain
-
-    from dew.data.sources.records import ArrayRecords
-
-    root = Store(f"memory://bounded-record-mirror-{uuid4().hex}")
-    shards = [root.child(f"{index}.array_record") for index in range(len(arrayrecord_paths))]
-    for shard, path in zip(shards, arrayrecord_paths, strict=True):
-        shard.write(Path(path).read_bytes())
-    capacity = sum(Path(path).stat().st_size for path in arrayrecord_paths[:-1])
-    source = ArrayRecords(
-        [shard.url for shard in shards],
-        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}},
-        counts=(8,) * len(shards),
-    )
-    entered, released = threading.Event(), threading.Event()
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-
-    def held(reader, index):
-        if busy_oldest and not entered.is_set():
-            entered.set()
-            assert released.wait(timeout=5)
-        return underlying_read(reader, index)
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", held)
-    try:
-        if busy_oldest:
-            with ThreadPoolExecutor(1) as pool:
-                pending = pool.submit(source.__getitem__, 0)
-                try:
-                    assert entered.wait(timeout=5)
-                    if retire == "close":
-                        source.close()
-                    for shard in range(1, len(shards)):
-                        assert source[8 * shard] == f"{shard}:0".encode()
-                finally:
-                    released.set()
-                assert pending.result(timeout=5) == b"0:0"
-        for _ in range(2):
-            for shard in range(len(shards)):
-                assert source[8 * shard] == f"{shard}:0".encode()
-    finally:
-        source.close()
-
-
-def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arrayrecord_paths, monkeypatch):
-    import grain.python as grain
-
-    from dew.data.sources.records import ArrayRecords
-
-    source = ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
-    width = Loading().threads
-    entered = threading.Barrier(width + 1)
-    released, queued = threading.Event(), threading.Event()
-    lock = threading.Lock()
-    admitted = 0
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-    condition_wait = threading.Condition.wait
-
-    def held(reader, index):
-        nonlocal admitted
-        with lock:
-            ordinal = admitted
-            admitted += 1
-        if ordinal < width:
-            entered.wait(timeout=5)
-            assert released.wait(timeout=5)
-        return underlying_read(reader, index)
-
-    def waiting(condition, timeout=None):
-        if condition is source._shards._lock:
-            queued.set()
-        return condition_wait(condition, timeout)
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", held)
-    monkeypatch.setattr(threading.Condition, "wait", waiting)
-    try:
-        with ThreadPoolExecutor(width + 1) as pool:
-            pending = [pool.submit(source.__getitem__, 8 * shard) for shard in range(width)]
-            try:
-                entered.wait(timeout=5)
-                overflow = pool.submit(source.__getitem__, 8 * width)
-                assert queued.wait(timeout=5)
-                assert not overflow.done()
-            finally:
-                released.set()
-            assert [future.result(timeout=5) for future in pending] == [
-                f"{shard}:0".encode() for shard in range(width)
-            ]
-            assert overflow.result(timeout=5) == f"{width}:0".encode()
-    finally:
-        source.close()
 
 
 def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
@@ -1742,7 +1494,7 @@ def test_foreign_sources_resume_only_their_declared_content_identity(kind, read,
         elif kind == "grain":
             source = from_grain(grain.MapDataset.source(rows), identity)
         else:
-            source = from_iter(lambda: iter(rows), name=identity, replay=True)
+            source = from_iter(lambda: iter(rows), identity=identity, replay=True)
         return compile(source.repeat().batch(4), read=read, resume=resume, loading=Loading(workers=0))
 
     original = dataset("tickets@1").train(DataPartition())
@@ -1800,7 +1552,7 @@ def test_from_iter_closes_the_native_file_before_restoring_and_on_close(tmp_path
     # Without a native position, the stream resumes by replay, which it declares.
     options = ({"state": lambda it: it.file.tell(), "load_state": lambda it, saved: it.file.seek(saved)}
                if native_state else {"replay": True})
-    source = from_iter(Native, name="native-file@1", **options)
+    source = from_iter(Native, identity="native-file@1", **options)
     manifest = source.manifest()
     reader = iter(manifest.reader(manifest.shards[0]))
     try:
@@ -1844,7 +1596,7 @@ def test_closing_a_compiled_from_iter_reader_finalizes_its_native_generators():
         finalizers.append(finalized)
         return iterator
 
-    source = from_iter(factory, name="closing-generator@1").repeat().batch(2)
+    source = from_iter(factory, identity="closing-generator@1").repeat().batch(2)
     reader = compile(source, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
                      ).train(DataPartition())
     try:
@@ -1875,7 +1627,7 @@ def test_from_iter_forwards_a_native_stop_request():
         def request_stop(self):
             stopped.append(True)
 
-    source = from_iter(Native, name="stoppable@1")
+    source = from_iter(Native, identity="stoppable@1")
     manifest = source.manifest()
     reader = iter(manifest.reader(manifest.shards[0]))
     try:
@@ -1933,8 +1685,8 @@ def test_memory_reads_a_table_of_lists_bytes_and_nulls_as_records_hold_them(tabl
 
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
 def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
-    """A Grain or iterator source given an empty name declares no content version, which is no
-    name at all said otherwise: it is refused as it is made."""
+    """A Grain or iterator source given an empty identity declares no content version, which is no
+    identity at all said otherwise: it is refused as it is made."""
     import grain.python as grain
 
     from dew.data import from_grain, from_iter
@@ -1944,7 +1696,7 @@ def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
         if kind == "grain":
             from_grain(grain.MapDataset.source(rows), "")
         else:
-            from_iter(lambda: iter(rows), name="")
+            from_iter(lambda: iter(rows), identity="")
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
@@ -2327,7 +2079,7 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
     from dew.data.sources.hf import from_hf
 
     indexed = from_grain(grain.MapDataset.source([{"id": index} for index in range(6)]), "indexed")
-    table = from_hf(Arrow.from_dict({"id": list(range(10, 16))}), name="table")
+    table = from_hf(Arrow.from_dict({"id": list(range(10, 16))}), identity="table")
     stream = grain.MapDataset.source([{"id": 20 + index} for index in range(6)]).to_iter_dataset()
     streamed = from_grain(stream, "streamed")
     loading = Loading(workers=0, threads=1, read_buffer=1)

@@ -14,8 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from episode_support import ToolPolicy
 from process_support import assert_exits_cleanly
+from tool_policy import ToolPolicy
 
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
@@ -166,7 +166,7 @@ def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
     the id that completes it, terminated, and the draw keeps that id, as `TextGeneration` and the
     remote engines do; a policy whose string the draw never spells ends on its EOS id, and one with
     neither runs to its budget."""
-    from dew.inference.loading import RunProcessor
+    from dew.inference.tasks import RunProcessor
     from dew.objectives.rl.rollout import prompt_tasks
     from dew.objectives.rl.sources import PromptSource
 

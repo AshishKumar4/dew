@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.diffusion import expand, presets
 from dew.inputs import Field, InputSpec, unit_range

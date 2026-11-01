@@ -6,6 +6,7 @@ configuration and checkpoint files; no external model implementation runs.
 """
 
 import json
+import logging
 import os
 from collections.abc import Sequence
 from functools import partial
@@ -13,38 +14,23 @@ from pathlib import Path
 from typing import Literal
 
 import flax.linen as nn
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
-from dew.interop.weights import ParamTree, indexed_path, translate_parameters
-from dew.nn.attention import GroupNorm, NormalAttention
+from dew.interop.weights import ParamTree, indexed_path, stored_shape, translate_parameters
+from dew.nn.attention_blocks import NormalAttention
 from dew.nn.autoencoders.api import check_class
-from dew.nn.blocks import ResidualBlock
+from dew.nn.blocks import ResidualBlock, Upsample
 from dew.nn.conv import Conv
+from dew.nn.norms import GroupNorm
+
+_log = logging.getLogger(__name__)
 
 
 def _conv(features: int, dtype, name: str) -> Conv:
     """A 3x3 convolution padded to keep the size."""
     return Conv(features, (3, 3), strides=(1, 1), padding=((1, 1), (1, 1)), dtype=dtype, name=name)
-
-
-class FlaxUpsample2D(nn.Module):
-    """Double each spatial axis by nearest-neighbour resize, then a 3x3 conv."""
-
-    in_channels: int
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, hidden_states):
-        batch, height, width, channels = hidden_states.shape
-        hidden_states = jax.image.resize(
-            hidden_states,
-            shape=(batch, height * 2, width * 2, channels),
-            method="nearest",
-        )
-        return _conv(self.in_channels, self.dtype, "conv")(hidden_states)
 
 
 class FlaxDownsample2D(nn.Module):
@@ -112,7 +98,8 @@ class _Level(nn.Module):
         if self.resample == "down":
             return FlaxDownsample2D(self.out_channels, dtype=self.dtype, name="downsamplers_0")(hidden_states)
         if self.resample == "up":
-            return FlaxUpsample2D(self.out_channels, dtype=self.dtype, name="upsamplers_0")(hidden_states)
+            return Upsample(self.out_channels, 2, dtype=self.dtype, conv="conv",
+                            name="upsamplers_0")(hidden_states)
         return hidden_states
 
 
@@ -189,6 +176,7 @@ class FlaxDecoder(nn.Module):
 
 
 _VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
+_FLAX_ATTENTION = {flax: torch for torch, flax in _VAE_ATTENTION.items()}
 
 
 def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
@@ -306,11 +294,10 @@ def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> N
             "load once with the Hub online, or put the weight file in the cache")
 
 
-def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict | None:
-    """The first candidate with a config and weights, as `load_pretrained_vae`
-    reads it, or None. Every miss is appended to `errors`, so the caller can
-    raise the last one."""
-    from flax.serialization import msgpack_restore
+def _located(modelname: str, revision: str, params) -> tuple[Path, dict, str] | None:
+    """The first candidate with a config and weights, as `located_vae` finds it: its directory in the
+    Hub's cache, its config and its weight file's name (fetched where `params` are not supplied); None
+    where no candidate has both. A candidate's miss is logged."""
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
@@ -321,24 +308,19 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
                                           revision=candidate_revision, subfolder=subfolder)
             # A foreign autoencoder's config is refused before any of its weights is fetched.
             with open(config_path) as handle:
-                check_class(json.load(handle), PUBLISHED, modelname, nameless=True)
+                config = json.load(handle)
+            check_class(config, PUBLISHED, modelname, nameless=True)
             # Candidate eligibility must match a source load even when a
             # config exists in a revision that carries no matching weights.
             if params is not None:
                 _check_weights(modelname, candidates, index)
-            weights_path = None if params is not None else hf_hub_download(
-                modelname, weights, revision=candidate_revision, subfolder=subfolder)
-        except (EntryNotFoundError, RevisionNotFoundError) as e:
-            errors.append(e)
+            else:
+                hf_hub_download(modelname, weights, revision=candidate_revision, subfolder=subfolder)
+        except (EntryNotFoundError, RevisionNotFoundError) as missing:
+            _log.debug("%s has no VAE at %s (%s)", modelname, (weights, candidate_revision, subfolder),
+                       missing)
             continue
-        with open(config_path) as handle:
-            config = json.load(handle)
-        if weights_path is None:
-            return {"config": config, "params": params}
-        if weights == FLAX_WEIGHTS:
-            with open(weights_path, "rb") as handle:
-                return {"config": config, "params": msgpack_restore(handle.read())}
-        return {"config": config, "params": _read_vae_weights(Path(config_path).parent)}
+        return Path(config_path).parent, config, weights
     return None
 
 
@@ -347,16 +329,18 @@ PUBLISHED = ("AutoencoderKL", "FlaxAutoencoderKL")
 names none (`check_class`'s `nameless`)."""
 
 
-def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
-    """Read a pretrained AutoencoderKL's config and params, local or from the Hub.
+def located_vae(modelname: str, revision: str = "bf16", *, params=None) -> tuple[Path, dict, str]:
+    """Where a standalone AutoencoderKL's config and weights are, local or on the Hub: its directory, its
+    config and its weight file's name (`FLAX_WEIGHTS` or `TORCH_WEIGHTS`).
 
     Two weight layouts reach the same tree. The SD1-era repos ship flax
     `diffusion_flax_model.msgpack`, sometimes under a `vae` subfolder on a
     `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
-    `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
-    reads. Supplied `params` are authoritative: only the configuration and
-    the repository's file metadata are read then, never weight bytes. A config naming another
-    autoencoder's class is refused by that name before any weight is read (`check_class`).
+    `diffusion_pytorch_model.safetensors` only. A local directory holding
+    both reads the flax layout. Supplied `params` are authoritative: only the
+    configuration and the repository's file metadata are read then, never
+    weight bytes. A config naming another autoencoder's class is refused by
+    that name before any weight is read (`check_class`).
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
     the torch path then reads the repo's default branch. Any other revision
@@ -368,40 +352,50 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
         with open(directory / "config.json") as handle:
             config = json.load(handle)
         check_class(config, PUBLISHED, directory, nameless=True)
-        return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
-
-    errors: list[Exception] = []
-    loaded = _load_from_hub(modelname, revision, params, errors)
-    if loaded is not None:
-        return loaded
-    last_error = errors[-1] if errors else None
+        return directory, config, FLAX_WEIGHTS if (directory / FLAX_WEIGHTS).exists() else TORCH_WEIGHTS
+    located = _located(modelname, revision, params)
+    if located is not None:
+        return located
     pinned = revision not in FLAX_REVISIONS
     raise FileNotFoundError(
         f"no VAE weights in {modelname}"
         + (f" at revision {revision!r}" if pinned else "")
         + ": neither flax diffusion_flax_model.msgpack nor torch "
         "diffusion_pytorch_model.safetensors"
-    ) from last_error
+    )
 
 
-def _read_vae_weights(directory: Path) -> dict:
-    """Read the params in `directory`, whichever of the two layouts it holds."""
+def flax_vae(msgpack: Path) -> tuple[dict, dict[str, tuple[int, ...]]]:
+    """diffusers' Flax VAE params in `msgpack`, the tree this module's is, and each leaf's diffusers
+    tensor name with the shape the torch layout stores it in (`_vae_path`'s inverse, `stored_shape`),
+    the layouts a bound tree writes back by (`bind_component`'s `shapes`)."""
     from flax.serialization import msgpack_restore
+    from flax.traverse_util import flatten_dict
 
-    msgpack = directory / "diffusion_flax_model.msgpack"
-    if msgpack.exists():
-        with open(msgpack, "rb") as handle:
-            restored = msgpack_restore(handle.read())
-        if not isinstance(restored, dict):
-            raise ValueError(f"{msgpack} does not hold a param tree")
-        return restored
-    from dew.interop.safetensors_io import read_weights
+    restored = msgpack_restore(msgpack.read_bytes())
+    if not isinstance(restored, dict):
+        raise ValueError(f"{msgpack} does not hold a param tree")
+    shapes = {}
+    for path, leaf in flatten_dict(restored).items():
+        if not isinstance(leaf, np.ndarray):
+            raise ValueError(f"{msgpack}: {'/'.join(path)} holds no array")
+        name, shape = _torch_name(path), stored_shape(path, leaf.shape)
+        if _vae_path(name, len(shape)) != path:
+            raise ValueError(f"{msgpack}: {'/'.join(path)} names no diffusers tensor ({name} reads into "
+                             f"{'/'.join(_vae_path(name, len(shape)))})")
+        shapes[name] = shape
+    return restored, shapes
 
-    try:
-        tensors: ParamTree = dict(read_weights(directory))
-    except FileNotFoundError as error:
-        raise FileNotFoundError(
-            f"no VAE weights in {directory}: neither diffusion_flax_model.msgpack "
-            "nor diffusion_pytorch_model.safetensors (or its index)") from error
-    # A diffusers name has no '/', so the flat table is the one translated.
-    return translate_vae_weights(tensors)
+
+def _torch_name(path: tuple[str, ...]) -> str:
+    """The diffusers tensor name a leaf at `path` of this tree reads from (`_vae_path`'s inverse)."""
+    *names, leaf = path
+    tokens: list[str] = []
+    for name in names:
+        if name == "proj_attn":
+            tokens += ["to_out", "0"]
+            continue
+        name = _FLAX_ATTENTION.get(name, name)
+        head, _, index = name.rpartition("_")
+        tokens += [head, index] if head and index.isdigit() else [name]
+    return ".".join([*tokens, "bias" if leaf == "bias" else "weight"])

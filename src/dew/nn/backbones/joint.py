@@ -19,17 +19,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import (
-    LayerNorm,
-    RMSNorm,
-    projected_heads,
-    projected_output,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.attention_blocks import projected_heads, projected_output
 from dew.nn.blocks import Modulation
 from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.mlp import GatedMLP
+from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
 
@@ -170,7 +166,7 @@ class JointAttention(nn.Module):
     families' adjacent pairs, or the rotate-half halves of Dew's own MM-DiT."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
 
     @property
@@ -291,7 +287,7 @@ class DoubleStreamBlock(nn.Module):
     dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
 
     @nn.nowrap

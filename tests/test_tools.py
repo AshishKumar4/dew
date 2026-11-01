@@ -14,6 +14,7 @@ import dataclasses
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,12 +22,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, chain_roundings
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
 from tool_support import FIXTURES, REPO_ROOT, load
+
+from dew.telemetry.trace import window_split
 
 CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
@@ -358,6 +362,32 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
 # tools/layout_parity.py
 # ---------------------------------------------------------------------------
 
+def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
+    """The layout tool's default judge (the floor judge, `floored`), from its command line on eight host
+    devices, runs a model under the mixture and the objective the command gives and writes its rows to
+    --out; --window, which is check 1's, without --seeds is refused."""
+    import json
+    import subprocess
+    import sys
+
+    from process_support import worker_env
+
+    environment = worker_env(8)
+
+    def tool(*flags):
+        return subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), *flags],
+                              env=environment, capture_output=True, text=True, check=False)
+
+    out = tmp_path / "rows.json"
+    done = tool("--models", "moe", "--layouts", "expert4", "--out", str(out), "--mixture", '{"top_k": 1}',
+                "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
+    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+    (row,) = json.loads(out.read_text())
+    assert (row["status"], row["mixture"]["top_k"], row["objective"]["balance"]["aux_loss_alpha"]) == (
+        "works", 1, 0.01)
+    assert tool("--models", "dense", "--layouts", "data4", "--window", "2").returncode != 0
+
+
 def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
     from residual_orders import permuted
 
@@ -435,28 +465,217 @@ def test_residual_orders_preserve_a_looped_ngpt():
                                            float(reordered.sum()), float(truth.sum()), roundings=roundings)
 
 
-@pytest.mark.parametrize("model", ["dit", "dense_mdlm"])
-def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(model):
-    """The fp64 anchor is the reference's step with every sum in fp64, the
-    noise and masks the trainer's first step draws included, so each leaf is a
-    rounding of the reference's: an fp32 distance, not a different step. A
-    diffusion objective and a masked one draw by row, so their floor rests on
-    the anchor alone; the anchor built only decoders, and computed no step for
-    these (765a6f97)."""
+class Drawing:
+    """A loss of one weight against each row's own uniform draw and the boundary of its noised target,
+    as `tools/layout_parity.py`'s arms record them, with one of the departures a layout tool must refuse
+    before it judges a ratio: `transform` of the draw, a `loose` draw from the step's key past every
+    draw, the target `narrowed` to float32 past its boundary, or the draw read `unbounded`, past no
+    boundary."""
+
+    def __init__(self, transform=lambda noise: noise, *, loose=False, narrowed=False, unbounded=False):
+        self.transform, self.loose, self.narrowed, self.unbounded = transform, loose, narrowed, unbounded
+
+    def objective(self):
+        from dew.objectives.base import Aux, Objective
+
+        drawing = self
+
+        class Drawn(Objective):
+            def fresh_variables(self, key, held):
+                return {"params": {"w": jnp.asarray(.2)}}
+
+            def loss(self, variables, batch, step):
+                w, rows = variables["params"]["w"], batch["y"].shape[0]
+                noise = drawing.transform(step.sample("noise", jax.random.uniform, (), dtype=jnp.float32,
+                                                      rows=rows))
+                target = step.boundary("target", batch["y"] + noise)
+                if drawing.narrowed:
+                    target = target * jnp.float32(2)
+                if drawing.loose:
+                    target = target + jax.random.normal(step.key, target.shape, target.dtype)
+                if drawing.unbounded:
+                    target = target + noise * noise
+                return jnp.sum((w - target) ** 2), Aux({})
+
+        return Drawn()
+
+    def recorded(self, tool, *, wide: bool):
+        """The loss over draw 0's batch of four rows, audited (`audited`) by the loaded `tool` as it
+        audits an arm, or its float64 anchor where `wide`, and what it drew and started from
+        (`witnessed`)."""
+        params = {"w": jnp.asarray(.2, jnp.float64 if wide else jnp.float32)}
+        batch = {"y": np.arange(4, dtype=np.float32)}
+        places = jnp.arange(4, dtype=jnp.int32)
+        from dew.objectives.base import Step
+
+        step = Step(jnp.asarray(0), jax.random.key(3), None, example_key=jax.random.key(4),
+                    example_index=places, example_count=4)
+        loss, kinds = tool.recording_loss(self.objective(), {}, step)
+        tool.audited(loss, kinds, params, batch, "drawing", wide=wide)
+        _, values = loss(params, batch)
+        return tool.witnessed({"values": values, "example_index": places}, "drawing")
+
+
+def test_layout_parity_reads_the_first_step_as_the_trainer_does():
+    """The tool's first step is the trainer's (`first_step`, `attempt_step`, ledger 3057): after updates
+    the run committed, the step its arms and its float64 anchor read states them, as a model reading the
+    run's progress reads them, where a step built by hand stated none and traced the run's end."""
+    import optax
+
+    from dew.training import Trainer
+
     tool = load("layout_parity")
-    import benchmark_models
+    state = Trainer(Drawing().objective(), optax.sgd(0.1), key=jax.random.key(0)).initial_state()
+    state = state.replace(updates=jnp.asarray(5, jnp.int32))
+    batch = {"y": np.arange(4, dtype=np.float32)}
+    step = tool.first_step(state, state.variables, None, batch)
+    assert int(step.committed) == 5 and step.example_count == 4
 
-    case = dataclasses.replace(tool.zoo()[model], dtype="float32")
-    # As the tool runs: the reference and the anchor both under x64.
+
+def test_layout_parity_holds_every_arm_to_the_references_sample():
+    """An arm that drew and started from the reference's values, at every example, is coupled to it; one
+    whose draw is transformed for one example, or that records a name the reference does not, is
+    refused before any ratio is taken (`coupled`)."""
+    tool = load("layout_parity")
     with jax.enable_x64(new_val=True):
-        batch = benchmark_models.global_batch(case)
-        reference = tool.computed_reference(case, batch, 1)
-        loss, gradient = tool.anchor_step(case, batch)
+        reference = Drawing().recorded(tool, wide=False)
+        tool.coupled(reference, Drawing().recorded(tool, wide=False), "the same arm")
+        moved = Drawing(lambda noise: noise.at[2].multiply(1 + 2 ** -20)).recorded(tool, wide=False)
+        with pytest.raises(tool.CouplingRefused):
+            tool.coupled(reference, moved, "one example's draw transformed")
+        with pytest.raises(tool.CouplingRefused):
+            tool.coupled(reference, {**reference, "extra": reference["noise"]}, "a name the reference lacks")
 
-    assert loss == pytest.approx(reference.losses[0], rel=1e-5)
-    errors = tool.leaf_errors(gradient, reference.gradient, "float32")
-    assert max(errors.values()) <= tool.rounding_limit("float32"), max(
-        errors.items(), key=lambda item: item[1])
+
+@pytest.mark.parametrize("departure", ["loose", "narrowed", "unbounded"])
+def test_layout_parity_refuses_a_loss_whose_randomness_or_rounding_escapes_its_witness(departure):
+    """A draw from the step's key past every draw is refused in any arm; a float32 rounding past the
+    float64 anchor's boundaries, or a draw read past no boundary, is refused in the anchor, where the
+    oracle's function starts at its boundaries, and the same loss without the departure is audited
+    clean."""
+    tool = load("layout_parity")
+    wide = departure != "loose"
+    with jax.enable_x64(new_val=True):
+        Drawing().recorded(tool, wide=wide)
+        with pytest.raises(tool.CouplingRefused):
+            Drawing(**{departure: True}).recorded(tool, wide=wide)
+
+
+def test_layout_parity_refuses_a_recording_step_whose_rows_sit_apart_from_their_column():
+    """A recording step that ran two evaluations, one of whose rows sat at a place its slot and the
+    batch's column do not give it (`column_ok` false, as `Transaction` reports a layout that moved rows
+    apart from their column), is refused before its record is read (`witnessed`); the same record with
+    every row in place is read whole."""
+    tool = load("layout_parity")
+    record = {"values": {"noise": np.zeros((2, 4), np.float32)},
+              "example_index": np.tile(np.arange(4), (2, 1)), "column_ok": np.asarray([True, True]),
+              "evaluated": np.asarray([True, True])}
+    assert sorted(tool.witnessed(record, "in place")["noise"]) == [0, 1, 2, 3]
+    with pytest.raises(tool.CouplingRefused):
+        tool.witnessed({**record, "column_ok": np.asarray([True, False])}, "rows apart")
+
+
+@pytest.mark.parametrize("model", ["dense_sft", "jepa"])
+def test_layout_parity_anchors_a_model_on_the_references_own_sample(model):
+    """A model's float64 anchor is the reference's first step in float64 on each draw: it draws and
+    starts from the reference's values, bit for bit (`Judge.anchor`), its loss read past its boundaries
+    in float64, and a draw cached under its seed is read back as computed, its record bit for bit, never
+    under another seed's name."""
+    tool = load("layout_parity")
+    _, reference = tool.model_case(model, "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        held = tool.References(Path(directory), prepare=True)
+        judge = tool.Judge(reference, held, model)
+        judge.audit()
+        anchored = judge.anchor(1)
+        read = tool.Judge(reference, tool.References(Path(directory)), model)
+        tool.coupled(judge.reference(1).record, read.reference(1).record, "read back")
+        assert read.anchor(1).loss == anchored.loss
+        with pytest.raises(FileNotFoundError):
+            read.reference(2)
+
+
+def test_a_shared_draw_cache_computes_past_its_disk_reserve_and_keeps_nothing_there():
+    """A cache of draws that a task's cells share keeps a draw only while its disk keeps `reserve` free:
+    past it the draw is computed, as it would be kept, and nothing is written, so the cells of a model
+    of thousands of draws never fill the task's disk (moe_grpo's filled a 6 GB tmpfs)."""
+    import shutil
+
+    tool = load("layout_parity")
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        full = tool.References(Path(directory), prepare=True, reserve=shutil.disk_usage(directory).free)
+        computed = tool.Judge(reference, full, "jepa").reference(1)
+        assert not any(Path(directory).iterdir())
+        kept = tool.Judge(reference, tool.References(Path(directory), prepare=True), "jepa").reference(1)
+        tool.coupled(computed.record, kept.record, "computed past the reserve")
+        assert computed.loss == kept.loss and any(Path(directory).iterdir())
+
+
+def test_the_layout_parity_command_runs_its_main():
+    """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
+    directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
+    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--prepare"]
+    finished = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    assert finished.returncode != 0, finished.stdout[-2000:]
+
+
+def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
+    """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
+    redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
+    the last draw a windowed check reads, and none past it."""
+    from reference_error import REDRAW
+
+    tool = load("layout_parity")
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    last = (1 + REDRAW) * 2 * 2 - 1
+    with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
+        prepare = tool.References(Path(directory), prepare=True)
+        assert tool.prepared(["jepa"], dtype="float32", seeds=2, windows=2, mixture={}, objective={},
+                             references=prepare, speak=lambda line: None)
+        read = tool.Judge(reference, tool.References(Path(directory)), "jepa")
+        read.anchor(last)  # read where it is kept: a run of layouts that misses a draw is refused
+        with pytest.raises(FileNotFoundError):
+            read.reference(last + 1)
+
+
+def test_a_judges_draws_ahead_keep_every_pending_draw_and_only_the_window():
+    """A judge's draws ahead are held in the order they were last asked for and let go only once
+    finished: while every draw is still pending, asking past twice `AHEAD` drops none, so each later
+    read waits on the draw already submitted rather than drawing it again, and a later layout restarting
+    at draw 0 finds it held (ledgers 2166, 2167)."""
+    import threading
+
+    tool = load("layout_parity")
+    _, reference = tool.model_case("jepa", "float32", {}, {})
+    with jax.enable_x64(new_val=True):
+        judge = tool.Judge(reference, tool.References(), "jepa")
+        released, drawn = threading.Event(), []
+
+        def held(seed, draw=judge._drawn_reference):
+            drawn.append(seed)
+            released.wait()
+            return draw(seed)
+
+        judge._drawn_reference = held
+        for seed in range(0, 3 * judge.AHEAD, judge.AHEAD):
+            judge.ahead(seed)  # every draw submitted is still pending
+        submitted = dict(judge._ahead)
+        judge.ahead(0)  # a later layout restarting at draw 0
+        assert all(judge._ahead.get(at) is pair for at, pair in submitted.items()), sorted(judge._ahead)
+        released.set()
+        for seed in range(3 * judge.AHEAD):
+            judge.reference(seed)
+        assert len(drawn) == len(set(drawn)), sorted(drawn)
+
+
+def test_layout_parity_fails_a_run_with_an_inconclusive_row():
+    """An inconclusive layout, or a model whose reference is refused, fails the run as a mismatch does;
+    only a working or a refused-by-design layout passes it."""
+    tool = load("layout_parity")
+    assert tool.verdict([{"status": "works"}, {"status": "refused"}]) == 0
+    for status in ("INCONCLUSIVE", "MISMATCH", "REDUNDANT", "error"):
+        assert tool.verdict([{"status": "works"}, {"status": status}]) == 1
 
 
 def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output_to_zeros():
@@ -602,26 +821,6 @@ def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_nam
 # tools/trace_window.py
 # ---------------------------------------------------------------------------
 
-def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
-    """One device's kernels, in microseconds: an all-reduce half hidden
-    behind compute, a gap a batch's host-to-device copy ends, and a gap
-    compute ends. benchmark_step and the reference runs both report these
-    figures, and the window is their sum."""
-    tool = load("trace_window")
-    events = [("loop_add_fusion", 0, 10), ("ncclDevKernel_AllReduce_Sum_bf16_RING_LL", 5, 20),
-              ("MemcpyH2D", 25, 26), ("gemm_fusion_dot", 26, 30), ("loop_multiply_fusion", 40, 50)]
-    split = tool.window_split([(name, start * 1000, end * 1000) for name, start, end in events])
-
-    assert {key: value / 1000 for key, value in split.items()
-            if key in ("window", "busy", "compute", "communication", "exposed_communication",
-                       "idle_input", "idle_host", "AllReduce", "AllGather")} == {
-        "window": 50, "busy": 35, "compute": 25, "communication": 15,
-        "exposed_communication": 10, "idle_input": 5, "idle_host": 10, "AllReduce": 15,
-        "AllGather": 0}
-    assert split["window"] == (split["compute"] + split["exposed_communication"]
-                               + split["idle_input"] + split["idle_host"])
-
-
 def test_trace_reports_keep_global_busy_time_separate_from_per_device_averages():
     tool = load("benchmark_step")
     common = load("reference_runs/common")
@@ -695,19 +894,46 @@ def test_kernel_sums_preserve_decode_categories_counts_and_overlapping_streams(s
     assert class_counts == {"attention": 2, "gemm": 1, "reduction": 1, "random": 1, "other": 3}
     assert {kind: duration / scale for kind, duration in training.items()} == pytest.approx(
         {"conv": 30, "attention": 10, "gemm": 10, "other": 35, "collective": 5})
-    split = tool.window_split(events)
+    split = window_split(events)
     assert split["busy"] / scale == pytest.approx(80)
     assert split["window"] / scale == pytest.approx(95)
     assert sum(durations.values()) == sum(classes.values()) == sum(training.values())
     assert sum(durations.values()) > split["busy"]
 
 
-def test_a_nested_last_kernel_does_not_shorten_a_traced_window():
-    tool = load("trace_window")
-    split = tool.window_split([("nested", 30.5, 40.25), ("long_kernel", 10.25, 100.75)])
-    assert (split["busy"], split["compute"], split["window"]) == (90.5, 90.5, 90.5)
-    assert split["idle_input"] == split["idle_host"] == 0
 
+def test_the_shared_image_set_reads_its_shards_in_the_order_given_as_dew_decodes_a_prepared_image(
+        tmp_path, monkeypatch):
+    """tools/reference_runs/image_set.py reads its prepared ArrayRecord shards through Dew's reader in the
+    order its command line names them, each record's pixels as Dew decodes a prepared image
+    (`DecodeImage`, its integers little-endian), and draws its epochs from its seed (row 3030)."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+
+    images = [np.arange(18, dtype=np.uint8).reshape(2, 3, 3) + 20 * value for value in range(5)]
+    shards = [str(tmp_path / f"{name}.array_record") for name in ("b", "a")]
+    for path, held in zip(shards, (images[:3], images[3:]), strict=True):
+        writer = ArrayRecordWriter(path, "group_size:1")
+        for image in held:
+            writer.write(pack_dict_of_byte_arrays({"shape": np.asarray([2, 3], "<i4").tobytes(),
+                                                   "image": image.tobytes(),
+                                                   "label": np.asarray([7], "<i4").tobytes()}))
+        writer.close()
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    tool = load("reference_runs/image_set")
+    out = tmp_path / "set.npz"
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "4", "--epochs", "2",
+                                      "--seed", "3", "--out", str(out)])
+    tool.main()
+    saved = np.load(out)
+    generator = np.random.default_rng(3)
+    np.testing.assert_array_equal(saved["images"], np.stack(images[:4]))
+    np.testing.assert_array_equal(saved["order"], np.stack([generator.permutation(4) for _ in range(2)]))
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "6",
+                                      "--out", str(out)])
+    with pytest.raises(ValueError):
+        tool.main()
 
 # ---------------------------------------------------------------------------
 # tools/reference_runs/scoreboard.py
@@ -733,7 +959,7 @@ def test_the_host_offload_benchmark_counts_each_parameter_in_the_memory_space_it
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
 
-def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows():
+def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows(tmp_path):
     """The benchmark's samples are the task's own walk and decode, read back as their real rows: a
     pixel-space model's too, which has no autoencoder, and its twelve prompts once on eight devices,
     which the walk pads to sixteen rows, so quality() scores twelve images against twelve prompts."""
@@ -754,6 +980,24 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
     pixels, found = tool.sample(pipe, 0)
     assert pixels.shape == (len(tool.PROMPTS), 2, 2, 1) and pixels.dtype == np.uint8
     assert found == {"latents": 0, "pixels": 0}
+    # Its timed forward is the denoiser's program over the model, which sampling compiles through (3032).
+    class Scaled(nn.Module):
+        @nn.compact
+        def __call__(self, x, time, train=False):
+            return x * self.param("scale", nn.initializers.ones, ())
+
+    scaled = TextToImage(Scaled(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
+                         InputSpec(Field("image", (2, 2, 1))), {"params": {"scale": jnp.ones(())}}, steps=1,
+                         guidance=None, solver=Euler())
+    # The model's program's options reach the timed executable: an option `compiled_with` adds is one of
+    # them, and a bare jit of the step dumps nothing (row 3062); the prompts' own programs dump apart.
+    dumps = tmp_path / "dumps"
+    from dew.nn.kernels import options
+
+    with options.compiled_with({"xla_dump_to": str(dumps)}):
+        row = tool.forward(scaled)
+    assert row["forward_ms"] > 0 and row["weights_mib"] >= 0
+    assert any(dumps.glob("*jit_step*.txt"))
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1174,49 @@ def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_bo
             "    monkeypatch.setattr('sparx.graph.subprocess.run', print)\n"),
     })
     assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
+
+
+ROW_1878_LINTS = {
+    "SLOP008": ({
+        "src/sparx/store.py": "class Store:\n    def _open(self):\n        pass\ndef open(path):\n    pass\n",
+        "tests/test_store.py": (
+            "from sparx.store import Store\n"
+            "import sparx.store as store\n"
+            "def test_private(monkeypatch):\n"
+            "    monkeypatch.setattr(Store, '_open', lambda self: None)\n"
+            "def test_public(monkeypatch):\n"
+            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"
+            "def test_a_seams_own_private(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"
+            "def test_a_first_party_private_under_a_seam_word(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.sources.hub.Hub._selected', lambda self: None)\n"),
+    }, "tests/test_store.py", (4, 10)),
+    "SLOP011": ({
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "def test_table(table):\n"
+            "    assert report.table().splitlines() == ['   a  b', 'x  1  2']\n"
+            "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
+            "    assert '4,824' in table.split()\n"
+            "    assert table.title == 'data rows'\n"
+            "    assert table.index('b') + 1 == len('   a  b')\n"
+            "    assert json.loads(payload) == ['a  b']\n"
+            "    assert parsed.name == 'two  spaces'\n"),
+    }, "tests/test_graph.py", (2, 3)),
+}
+"""Row 1878's two lint cases, by code: the files linted, the file the findings are in, their lines.
+SLOP008: a private attribute of a first-party object is the code under test, so replacing it is
+reported even where its name holds a seam's (`Checkpoints._open`); a public seam of the same name and a
+standard-library module's own private attribute are not. SLOP011: a rendering (its text read through
+`plain`, `table()`, captured output or `str`) compared whole with a string, or a list of strings, with a
+run of two or more spaces between words is a spacing snapshot; its words and numbers looked for, a
+one-space string, a column end measured and parsed data holding two spaces are not."""
+
+
+@pytest.mark.parametrize("code", sorted(ROW_1878_LINTS))
+def test_row_1878s_lints_report_their_cases_and_spare_the_rest(code, tmp_path):
+    files, where, lines = ROW_1878_LINTS[code]
+    assert _linted(tmp_path, files) == [(where, line, code) for line in lines]
 
 
 def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
@@ -1562,6 +1849,27 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "    return yaml\n"), "SLOP019", (5, 17, 22, 37, 54, 81))
 
 
+def test_a_bare_jit_in_a_package_that_compiles_through_dews_compile_point_is_reported(tmp_path):
+    """SLOP025: in a package whose programs compile through `OuterProgram` (RL's, serving's), a bare
+    `jax.jit` as a decorator, a call, within functools.partial or imported by its own name, is
+    reported; a program that compiles through `OuterProgram` is not, nor a jit in another package."""
+    rollout = ("import functools\n"
+               "import jax\n"
+               "from jax import jit\n"
+               "from dew.nn.kernels.options import OuterProgram\n"
+               "@jax.jit\n"
+               "def acted(x): return x\n"
+               "stepped = jax.jit(acted)\n"
+               "partial = functools.partial(jax.jit, static_argnums=0)\n"
+               "imported = jit(acted)\n"
+               "@OuterProgram\n"
+               "def compiled(x): return x\n")
+    for package in ("rl", "objectives/rl", "inference"):
+        assert_reported(tmp_path / package.replace("/", "-"), f"src/sparx/{package}/rollout.py", rollout,
+                        "SLOP025", (5, 7, 8, 9))
+    assert _linted(tmp_path / "other", {"src/sparx/training/step.py": rollout}) == []
+
+
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
     """SLOP012: a script that replaces or deletes the package's own functions,
     by any assignment or `setattr`, and a library that does so to anything it
@@ -1665,6 +1973,47 @@ def test_the_data_benchmark_checks_the_device_timelines_idle_and_reports_the_hos
     assert checked == (None if timeline is None else timeline < 0.05)
 
 
+def test_a_fixture_archive_names_nothing_of_the_machine_that_wrote_it_and_packs_as_xz_does_best(tmp_path):
+    """Every reference tool writes its archive through tools/fixture_archive: no member names its
+    writer's user, group or time, a saved config's absolute `_name_or_path` is emptied, a member a tool
+    leaves out stays out, and xz packs it at its strongest preset (a repack at tarfile's default grew a
+    fixture 3.2 times)."""
+    import tarfile
+
+    tool = load("fixture_archive")
+    saved = tmp_path / "saved" / "text_encoder"
+    saved.mkdir(parents=True)
+    (saved / "config.json").write_text(
+        '{\n  "_name_or_path": "/tmp/dew-reference-xl/text_encoder",\n  "dim": 8\n}\n')
+    (saved / "weights.bin").write_bytes(b"\x00" * 64)
+    (saved / "model.safetensors").write_bytes(bytes(range(256)) * 64)
+    destination = tmp_path / "fixture.tar.xz"
+    tool.write(destination, [(tmp_path / "saved", "saved")], kept=lambda name: not name.endswith(".bin"))
+    with tarfile.open(destination) as archive:
+        members = archive.getmembers()
+        config = archive.extractfile("saved/text_encoder/config.json").read().decode()
+    assert sorted(member.name for member in members) == [
+        "saved", "saved/text_encoder", "saved/text_encoder/config.json",
+        "saved/text_encoder/model.safetensors"]
+    assert {(member.uid, member.gid, member.uname, member.gname, member.mtime) for member in members} == {
+        (0, 0, "", "", 0)}
+    assert config == '{\n  "_name_or_path": "",\n  "dim": 8\n}\n'
+    # The first block's LZMA2 filter (0x21) names a 64 MiB dictionary (property 0x1c), preset 9's; preset
+    # 6's is 8 MiB.
+    assert destination.read_bytes()[13:17] == bytes([0x00, 0x21, 0x01, 0x1C])
+
+
+def test_a_data_scaling_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):
+    """The scaling receipt records its config's paths by their names outside the checkout (relative to it
+    within), so a receipt written on a CI host or a workstation names none of its directories (bible §2: a
+    receipt recorded /home/ci/work/... and /armada/task/... paths)."""
+    tool = load("benchmark_data")
+    tool.run_scaling(tool.Scaling(output=tmp_path / "scaling.json", work=tmp_path / "work", shards=2,
+                                  records=8, cycles=(1,), steps=2, warmup=0, batch=2, image_size=8))
+    config = json.loads((tmp_path / "scaling.json").read_text())["config"]
+    assert (config["output"], config["work"]) == ("scaling.json", "work")
+
+
 def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
     """The data benchmark counts a batch's tokens and work as the run's objective counts them
     (`real_lengths`, `training_flops`), whichever packer laid the batch out: Grain's first-fit
@@ -1708,6 +2057,57 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
         "rows": 2, "tokens": 2, "model_flops": None}
 
 
+def test_the_data_benchmark_rates_its_training_window_over_the_whole_mesh_as_the_trainer_does():
+    """The data benchmark's training window is rated as the trainer's interval rates its steps
+    (`dew.training.interval.throughput`): the objective's work on the host's whole batch over the peak of
+    every device the step's mesh spans, not over one device's, and the compiled work, each device's, a
+    lower bound beside the launches it left out (row 3023)."""
+    from dew.nn.kernels.generation import gpu_target
+    from dew.telemetry.instrumentation import StepFlops
+
+    tool = load("benchmark_data")
+    peak = gpu_target("a100").bf16_peak
+    work, compiled = 3.0e13, StepFlops(2.0e12, 4.0e12)
+    rates = tool.rated(2.0, 2, 16, compiled, work, 8, peak=peak)
+    assert rates["model_mfu_bf16_peak"] == work / 8 / 2 / (2.0 / 2) / peak
+    assert rates["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert rates["unsized_kernels_per_step"] == 0
+    uncounted = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 6.0), None, 8, peak=peak)
+    assert uncounted["model_mfu_bf16_peak"] is None
+    assert uncounted["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert uncounted["unsized_kernels_per_step"] == 3.0
+
+
+@pytest.mark.mesh
+def test_the_data_benchmark_reports_a_steps_uncounted_launches_beside_its_utilization():
+    """A step that runs a launch no count sizes (here LAPACK's Cholesky on a CPU, which no table
+    knows) is reported as the trainer reports it, beside the launches it left out, so its compiled work
+    reads as the lower bound it is, never as a complete count (row 3023)."""
+    import itertools
+
+    from flax import linen as nn
+
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.supervised import Supervised
+
+    class Factored(nn.Module):
+        @nn.compact
+        def __call__(self, image):
+            values = nn.Dense(3)(jnp.mean(image.astype(jnp.float32), axis=(1, 2)))
+            gram = values.T @ values + jnp.eye(3)
+            return values @ jnp.linalg.cholesky(gram)
+
+    tool = load("benchmark_data")
+    worker = tool.Worker("dew", "image", Path("in"), Path("out"),
+                         tool.Measurement(batch=8, image_size=4, warmup=1, train_steps=2))
+    objective = Supervised(Factored(), lambda outputs, batch: jnp.mean(jnp.square(outputs), axis=-1),
+                           inputs=InputSpec(Field("image", (4, 4, 3))))
+    batch = {"image": np.ones((8, 4, 4, 3), np.uint8)}
+    measured = tool.training_measure(lambda: itertools.repeat(batch), objective, worker)
+    assert measured["unsized_kernels_per_step"] >= 1
+    assert measured["model_mfu_bf16_peak"] is None
+
+
 def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypatch):
     """Each remote-code release, the loader's own and those the LLaDA-MoE tool merges into it, is the
     four fields `released_model` reads: the Hub repo, its commit, the files its code is, and the auto
@@ -1718,3 +2118,54 @@ def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypat
         for name, (repo, revision, files, auto) in load(tool).RELEASES.items():
             assert (repo.count("/"), len(revision), auto.startswith("Auto")) == (1, 40, True), name
             assert files and all(file.endswith(".py") for file in files), name
+
+
+def test_a_float64_twin_rotates_by_its_whole_complex_table():
+    """A float64 twin keeps a complex table its constructor computes complex (Llama 4's vision
+    `freqs_ci`): it rotates by the table's cosines and sines both, so its output is the float64
+    product of its input and the table, which a table cast to a real dtype is not."""
+    import torch
+
+    from tools.torch_precision import float64, float64_twin
+
+    class Rotation(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            angles = torch.arange(1, 5).float()
+            self.table = torch.nn.Buffer(torch.polar(torch.ones_like(angles), angles), persistent=False)
+            self.gain = torch.nn.Parameter(torch.ones(4))
+
+        def forward(self, pairs):
+            return torch.view_as_real(torch.view_as_complex(pairs.float()) * self.table * self.gain)
+
+    pairs = torch.from_numpy(np.random.default_rng(0).standard_normal((4, 2)))
+    with float64():
+        rotated = float64_twin(Rotation(), Rotation)(pairs)
+    angles = torch.arange(1, 5, dtype=torch.float64)
+    table = torch.polar(torch.ones_like(angles), angles)
+    assert torch.equal(rotated, torch.view_as_real(torch.view_as_complex(pairs) * table))
+
+
+FRESH_DEVICE_CONTEXT = """
+import torch
+from tools.torch_precision import dtype_widened, replaced
+
+with replaced((torch, "arange", dtype_widened(torch.arange))):
+    with torch.device("meta"):
+        inside = torch.arange(4, dtype=torch.float32)
+with torch.device("meta"):
+    after = torch.arange(4)
+print(inside.device, inside.dtype, after.device, after.dtype)
+"""
+"""A fresh process whose first device context runs inside `replaced` (ledger 1553)."""
+
+
+def test_a_replaced_constructor_leaves_device_contexts_their_own_in_a_fresh_process():
+    """torch's device contexts learn their constructors at their first use in a process. In a fresh
+    process whose first `torch.device("meta")` runs inside a block that widens `torch.arange`, the widened
+    arange still makes its tensor on the meta device, in float64, and after the block a meta-device arange
+    is torch's own again: on meta, at its own int64 (`replaced` primes the contexts first)."""
+    done = subprocess.run([sys.executable, "-c", FRESH_DEVICE_CONTEXT], cwd=REPO_ROOT, capture_output=True,
+                          text=True, check=False)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.split() == ["meta", "torch.float64", "meta", "torch.int64"]

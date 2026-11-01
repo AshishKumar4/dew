@@ -125,6 +125,9 @@ class Options:
     whole: bool = False
     """Refuse a request rather than cut it to fit."""
     dtype: str = "float32"
+    param_dtype: str | None = None
+    """The weights' storage dtype; None stores them in `dtype`, the dtype they serve in, so a run's
+    weights take the memory they are served in, not the float32 a run trains them in."""
     max_len: int | None = None
     head_max_len: int | None = None
     """For a layout of one row per question: the tokens its instructions and options share."""
@@ -136,13 +139,20 @@ class Options:
     """The most rows one pass holds."""
 
 
+def loaded(options: Options) -> Decide:
+    """The task `options` name, a run's (`run`) or a release's (`model`), its weights restored in
+    `param_dtype`, else in the dtype they serve in."""
+    param_dtype = options.param_dtype or options.dtype
+    if options.run is not None:
+        return Decide.from_run(options.run, dtype=options.dtype, param_dtype=param_dtype)
+    return Decide.from_pretrained(options.model or "convaiinnovations/laya", subfolder=options.subfolder,
+                                  revision=options.revision, dtype=options.dtype, param_dtype=param_dtype)
+
+
 def main(options: Options) -> None:
     import uvicorn
 
-    decide = (Decide.from_run(options.run, dtype=options.dtype) if options.run is not None
-              else Decide.from_pretrained(options.model or "convaiinnovations/laya",
-                                          subfolder=options.subfolder, revision=options.revision,
-                                          dtype=options.dtype))
+    decide = loaded(options)
     budgets = {"max_len": options.max_len, "head_max_len": options.head_max_len,
                "option_tokens": options.option_tokens}
     widened = {name: value for name, value in budgets.items() if value is not None}

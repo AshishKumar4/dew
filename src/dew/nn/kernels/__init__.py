@@ -14,14 +14,14 @@ from .generation import (
     assumed,
     backend,
     bf16_dot_runs,
+    chosen_kernel,
     device_generation,
     gpu_mesh,
     gpu_target,
-    measured_kernel,
     triton_runs,
 )
 from .ssd import ssd_chunk_scan, ssd_kernel_platform, ssd_kernel_runs
 
-__all__ = ["PALLAS_CHOICES", "TARGETS", "GpuTarget", "assumed", "backend", "bf16_dot_runs",
-           "device_generation", "gpu_mesh", "gpu_target", "measured_kernel", "ssd_chunk_scan",
-           "ssd_kernel_platform", "ssd_kernel_runs", "triton_runs"]
+__all__ = ["PALLAS_CHOICES", "TARGETS", "GpuTarget", "assumed", "backend", "bf16_dot_runs", "chosen_kernel",
+           "device_generation", "gpu_mesh", "gpu_target", "ssd_chunk_scan", "ssd_kernel_platform",
+           "ssd_kernel_runs", "triton_runs"]

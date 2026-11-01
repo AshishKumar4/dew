@@ -17,11 +17,11 @@ import optax
 import pytest
 from diffusion_support import as_a_step, float64_gradient, moved_weights, objective_gradient
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, stacked_on_host
 from safetensors.numpy import load_file
 
 from dew import Trainer
-from dew.batch import FROZEN, freeze, select, thaw
+from dew.batch import FROZEN, coordinates, freeze, laid_coordinates, select, thaw, token_layout
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -102,21 +102,26 @@ def trainer_update(obj, batch, run_key, optimizer):
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
                 **example_fields(initial, 0, 1, batch))
     run = trainer.compile(jax.tree.map(jnp.copy, initial), batch)
+    # One program copies a tree, so an example's copies are one dispatch, not one a leaf.
+    copied = jax.jit(lambda tree: jax.tree.map(jnp.copy, tree))
 
     def stepped(values, rows=batch):
         # The step consumes its state: it steps copies.
-        state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.copy, values))
+        state = copied(initial).replace(variables=copied(values))
         state, *_ = run(state, rows)
         return state
 
     return stepped, step, trainer
 
 
-UPDATE_SEEDS = {"text": 8, "image": 16}
+UPDATE_SEEDS = {"text": 512, "image": 512}
 """Check 1's declared seeds for the trainer's gradient of each SFT model, sized paired (`seeds_for` with
-the trainer's step as `dew_fn`). The text model's, over drawn batches (`varied`), is the most of three
-platforms': its two arms took bitwise the same gradient at every draw on JAX 0.11's and 0.12's CPU and
-on an A100, and each sized it at 8 (run-tests sf-1546v-paired-main-c464b5df0 and
+the trainer's step as `dew_fn`). Over draws of `STACKED` examples under FP32 sums the text model's sized at
+512 (sf-size-2469k at d6d809517, 762 s on one core), and the image model's at 512 too, passing whole
+(sf-size-2469l at a95158863, 4463 s on one core), drawn as armada's map tasks and judged pooled
+(`reference_error.DRAWS`, ledger 2469). Before those, the text model's, over drawn batches (`varied`),
+was the most of three platforms': its two arms took bitwise the same gradient at every draw on JAX 0.11's
+and 0.12's CPU and on an A100, and each sized it at 8 (run-tests sf-1546v-paired-main-c464b5df0 and
 sf-1546v-paired-jax012-f65f56d57, node receipts SF-1546v-a100). Its error is heavy-tailed, alike in
 both arms: four draws of 320 held at most 72% of a leaf's pooled error on 0.11, 87% on 0.12 and 86% on
 the A100 (sf-1546v-tail-main-c464b5df0, sf-1546v-tail-jax012-f65f56d57), so the reference against
@@ -144,39 +149,69 @@ def varied(batch, rows: int):
     return drawn
 
 
-def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, seeds: int, batches=None):
-    """The trainer's update is the objective's at the step's draws. The gradient its step takes, which
-    sgd with a momentum of zero keeps as its trace, is on par with the objective's own over drawn
-    weights (check 1), and over drawn batches of `batch`'s shapes where `batches(seed)` draws them,
-    `twin`, the objective over its model in float64, at the same draws the truth; they are two
-    programs, which round otherwise, the objective's compiled with the step's compiler options
-    (`as_a_step`). The gradients are compared as they are, not through an update applied to the
-    weights, whose rounding at the weights' magnitude would swamp theirs; at each draw the step's
-    weights are then sgd(1)'s rule of that trace to the bit, the weights less the trace in float32, so
-    the update applies the gradient it holds. The run's own path, its loader, plan and marked rows,
-    takes the trainer's own update on one device, to the bit: the same program on the same values."""
+STACKED = 32
+"""The examples each draw of the trainer's gradient stacks (`stacked`), each its own weights and batch: a
+norm's scale or a layer's scalar sums its gradient over every token, one value an example, whose error
+is one Gaussian a draw, its log squared error spread pi / sqrt(2) wide, so two arms' ratio of it is a
+Cauchy no count of draws within MOST_SEEDS resolves (ledger 2469: 2.17 to 2.31 measured,
+tmp/Gate/sizing/noise-2469.json). Stacked, every leaf holds a row an example, its error a draw's mean
+of them, paired example by example (`assert_as_exact`'s `examples`), each draw's median spread inside
+the gate's 0.40. Each example keeps the site's geometry, its rows and shapes."""
+
+
+def stacked(fn, *, given: bool = False):
+    """`fn(values, rows)` over a draw's stacked examples (`STACKED`): each example's leaves stacked as rows
+    of one, as the gate reads a draw. A `given` arm stays one the gate runs as given (`as_given`)."""
+    def each(examples):
+        return stacked_on_host([fn(*example) for example in examples])
+
+    return as_given(each) if given else each
+
+
+def assert_the_objectives_gradient(obj, twin, batch, run_key, variables, seeds: int, batches=None):
+    """The trainer's update is the objective's at the step's draws (check 1), over draws of `STACKED`
+    examples each. The gradient its step takes, which sgd with a momentum of zero keeps as its trace, is on
+    par with the objective's own over drawn weights, and over drawn batches of `batch`'s shapes where
+    `batches(seed)` draws them, `twin`, the objective over its model in float64, at the same draws the
+    truth; they are two programs, which round otherwise, the objective's compiled with the step's compiler
+    options (`as_a_step`). The gradients are compared as they are, not through an update applied to the
+    weights, whose rounding at the weights' magnitude would swamp theirs; at each draw the step's weights
+    are then sgd(1)'s rule of that trace to the bit, the weights less the trace in float32, so the update
+    applies the gradient it holds. The run's own path takes it too
+    (`assert_the_runs_path_takes_the_trainers_update`)."""
     drawn = (lambda seed: batch) if batches is None else batches
     stepped, step, trainer = trainer_update(obj, drawn(0), run_key, optax.sgd(1.0, momentum=0.0))
     weights = moved_weights(variables)
 
     def draw(seed):
-        return (*weights(seed), drawn(seed))
+        return (tuple((*weights(seed * STACKED + index), drawn(seed * STACKED + index))
+                      for index in range(STACKED)),)
+
+    def trace(state):
+        return jax.tree.map(np.asarray, optax.tree_utils.tree_get(state.opt_state, "trace"))
 
     @as_given
-    def trained(values, rows):
-        state = stepped(values, rows)
-        trace = jax.tree.map(np.asarray, optax.tree_utils.tree_get(state.opt_state, "trace"))
+    def trained(examples):
+        states = [stepped(values, rows) for values, rows in examples]
+        # sgd(1)'s rule to the bit at each draw's first example: every example steps through the one
+        # compiled program, so each draw checks it once.
+        (values, _), state = examples[0], states[0]
         rule = jax.tree.map(lambda before, gradient: (np.asarray(before) - gradient).astype(np.float32),
-                            values["params"], trace)
+                            values["params"], trace(state))
         assert_tree_equal(jax.tree.map(np.asarray, state.variables["params"]), rule)
-        return trace
+        return stacked_on_host([trace(state) for state in states])
 
     gradient = as_a_step(trainer, variables, drawn(0),
                          lambda values, rows: objective_gradient(obj, values, rows, step))
     # The producer marks its options-bearing jit as given, so the gate never nests it (row 1800).
     assert gradient.as_given
-    assert_as_exact(trained, gradient, draw, "trainer update", seeds=seeds,
-                    truth_fn=float64_gradient(twin, step))
+    assert_as_exact(trained, stacked(gradient, given=True), draw, "trainer update",
+                    seeds=seeds, truth_fn=stacked(float64_gradient(twin, step)), examples=True)
+
+
+def assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables):
+    """The run's own path, its loader, plan and marked rows, takes the trainer's own update on one
+    device, to the bit: the same program on the same values."""
     taken, _, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
     solo.device_mesh = MeshSpec().build(jax.devices()[:1])
@@ -261,6 +296,23 @@ def test_loss_weights_apply_after_independent_row_normalization(source):
     assert abs(float(loss) - wrong) > 1e-3
 
 
+def test_a_block_step_passes_a_decoder_that_reads_the_runs_progress_the_steps(source):
+    """A block diffusion step passes a DiffusionGemma whose decoder reads the run's progress the step's,
+    at the encoder's pass and each denoising pass (`BlockDiffusionObjective.passes_progress`; review of
+    ledger 2537): a DEX decoder trains through its anneal, its loss half way through it no longer its loss
+    at the start, where the step refused it."""
+    from dew.nn.dex import DifferentialExtension
+
+    loaded, batch, step, _ = source
+    extension = DifferentialExtension(((0, (0, 1)),), anneal_steps=10)
+    obj = BlockDiffusionObjective(loaded.model.clone(text=loaded.model.text.with_dex(extension)),
+                                  prompt_length=4, num_canvases=2)
+    variables = obj.init(jax.random.key(0))
+    started, halfway = (float(obj.scalar_loss(variables, batch, replace(
+        step, committed=jnp.asarray(updates, jnp.int32)))[0]) for updates in (0, 5))
+    assert started != halfway
+
+
 def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(source):
     """A validation pass scores each row's selected canvas under the same draw
     training makes from the key, so the weights are the reference's selected
@@ -339,17 +391,37 @@ def dataset(batch):
     return Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
 
 
-def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
+def text_run(source):
+    """The text SFT run's objective, its batch tiled to a multiple of the devices, its data, key and drawn
+    start."""
     loaded, original_batch, _, reference = source
     rows = math.lcm(2, jax.device_count())
     batch = jax.tree.map(lambda value: np.concatenate([value] * (rows // 2), axis=0), original_batch)
     obj = objective(loaded)
-    run_key = jax.random.key(int(reference["run_seed"]))
-    data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    return obj, batch, dataset(batch), jax.random.key(int(reference["run_seed"])), variables
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=80)
+def test_a_text_sft_trainers_gradient_is_the_objectives(source):
+    """The text SFT trainer's gradient is the objective's at the step's draws over drawn batches
+    (`varied`), the float64 twin of the loaded fixture the truth (`assert_the_objectives_gradient`)."""
+    obj, batch, _, run_key, variables = text_run(source)
     wide = objective(Pretrained.load(FIXTURE, dtype="float64", attention_impl="xla", max_seq_len=32))
-    assert_updates_as_the_objective(obj, wide, batch, data, run_key, variables, UPDATE_SEEDS["text"],
-                                    batches=varied(batch, UPDATE_ROWS))
+    assert_the_objectives_gradient(obj, wide, batch, run_key, variables, UPDATE_SEEDS["text"],
+                                   batches=varied(batch, UPDATE_ROWS))
+
+
+def test_a_text_sft_runs_own_path_takes_the_trainers_update(source):
+    """The text SFT run's own path takes the trainer's update to the bit
+    (`assert_the_runs_path_takes_the_trainers_update`)."""
+    obj, batch, data, run_key, variables = text_run(source)
+    assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
+
+
+def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
+    loaded = source[0]
+    obj, _, data, run_key, _ = text_run(source)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
@@ -467,18 +539,39 @@ def test_denoiser_image_gradient_obeys_encoder_detachment(image_source):
     assert norms[0] > 1e-6
     assert norms[1] == 0
 
-def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
-    """Native lifecycle evidence, not an official image-conditioned SFT oracle."""
-    loaded, inputs, obj, variables, _ = image_source
+def image_run(inputs):
+    """The image SFT run's batch, its data and its key."""
     rows = math.lcm(2, jax.device_count())
     batch = {"text": jax.tree.map(lambda leaf: np.concatenate([leaf] * (rows // 2)), inputs)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
-    run_key = jax.random.key(2)
+    return batch, data, jax.random.key(2)
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=15)
+def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
+    """The image SFT trainer's gradient is the objective's at the step's draws, the float64 twin of the
+    loaded multimodal fixture the truth (`assert_the_objectives_gradient`)."""
+    _, inputs, obj, variables, _ = image_source
+    batch, _, run_key = image_run(inputs)
     wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64", attention_impl="xla",
                            max_seq_len=32)
     twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
-    assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, UPDATE_SEEDS["image"])
+    assert_the_objectives_gradient(obj, twin, batch, run_key, variables, UPDATE_SEEDS["image"])
+
+
+def test_an_image_sft_runs_own_path_takes_the_trainers_update(image_source):
+    """The image SFT run's own path takes the trainer's update to the bit
+    (`assert_the_runs_path_takes_the_trainers_update`)."""
+    _, inputs, obj, variables, _ = image_source
+    batch, data, run_key = image_run(inputs)
+    assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
+
+
+def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
+    """Native lifecycle evidence, not an official image-conditioned SFT oracle."""
+    loaded, inputs, obj, variables, _ = image_source
+    batch, data, run_key = image_run(inputs)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
@@ -605,8 +698,11 @@ def sown_passes(obj, variables, batch, step):
     model, params = obj.training_model, thaw(variables)
     rngs = model_rngs(step.key, training=step.training)
     cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
-    encoder_kwargs = prepared.kwargs()
-    encoder_kwargs.update(positions=positions, attention_mask=full_valid)
+    _, segments = token_layout(prepared.token_fields)
+    given = laid_coordinates(prepared.token_fields)
+    encoder_kwargs = {**prepared.kwargs(), "coordinates": coordinates(
+        tokens.shape[:2], segments=segments, valid=full_valid, positions=positions,
+        max_segments=None if given is None else given.max_segments)}
     encoder_states, encoded = model.apply(
         {**params, "cache": cache}, tokens, **encoder_kwargs, attention_pairwise_mask=encoder_mask,
         attention_key_positions=encoder_keys, method=model.encode, train=step.training, states=True,

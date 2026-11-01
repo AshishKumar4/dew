@@ -5,12 +5,12 @@ dropout, EMA, two-micro-step accumulation, dynamic loss scaling and a clipped
 AdamW, and checkpoints every CHECKPOINT_STEP. The `interrupted` run blocks
 after step INTERRUPT_STEP, once that checkpoint has landed, for the test to
 SIGKILL it. The `resumed` run restores that checkpoint in the middle of an
-accumulation. The runs share one persistent compilation cache, so the resumed
-run's fit finds every program it needs there, as the earlier runs compiled
-them. Each finished run writes its whole state, its export, the export's fp32
-logits and its fit's cache hits and misses; the baseline also writes the fp32
-loss and the gradient of every source tensor, for the test to hold to
-transformers.
+accumulation. The interrupted and the resumed run share one persistent
+compilation cache, so the resumed run's fit finds every program it needs
+there, as the interrupted run compiled them. Each finished run writes its
+whole state, its export, the export's fp32 logits and its fit's cache hits
+and misses; the baseline also writes the fp32 loss and the gradient of every
+source tensor, for the test to hold to transformers.
 
     python tests/qualification_worker.py <directory> baseline|interrupted|resumed
 """
@@ -104,7 +104,10 @@ def export(run: Path, source, variables, probe) -> None:
 
 
 def run(directory: Path, mode: str) -> None:
-    prepare_process(compilation_cache_dir=str(directory / "compiled"))
+    # The baseline runs beside the interrupted run, so it compiles into a cache of its own; the resumed
+    # run reads the interrupted run's.
+    prepare_process(compilation_cache_dir=str(directory / ("baseline-compiled" if mode == "baseline"
+                                                            else "compiled")))
     out = directory / ("baseline" if mode == "baseline" else "restarted")
     out.mkdir(parents=True, exist_ok=True)
     checkpoints = Checkpoints(str(out / "checkpoints"), keep=2)

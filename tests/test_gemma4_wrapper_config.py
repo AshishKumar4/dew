@@ -1,13 +1,11 @@
 """Raw Gemma 4 configs retain the text class their wrapper declares."""
 
-import json
 from pathlib import Path
-from shutil import copytree
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import without_config_field
+from interop_support import respelled, without_config_field
 
 from dew.interop import Pretrained
 
@@ -24,12 +22,11 @@ def test_gemma4_wrapper_supplies_the_missing_nested_text_type(tmp_path):
 
 
 def test_gemma4_unshared_layers_ignore_the_double_width_flag(tmp_path):
-    checkpoint = tmp_path / 'unshared'
-    copytree(SOURCE, checkpoint)
-    config = json.loads((checkpoint / 'config.json').read_text())
-    assert config['text_config']['num_kv_shared_layers'] == 0
-    config['text_config']['use_double_wide_mlp'] = True
-    (checkpoint / 'config.json').write_text(json.dumps(config))
+    def doubled(config):
+        assert config['text_config']['num_kv_shared_layers'] == 0
+        return {**config, 'text_config': {**config['text_config'], 'use_double_wide_mlp': True}}
+
+    checkpoint = respelled(SOURCE, tmp_path / 'unshared', doubled)
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
     original = Pretrained.load(SOURCE, dtype='float32', attention_impl='reference')
     ids = jnp.asarray(np.load(SOURCE / 'input_ids.npy'))

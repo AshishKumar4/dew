@@ -11,6 +11,8 @@ velocities, a walk's recorded densities and their rescoring alike; what is one
 computation, or exact arithmetic, is held exactly.
 """
 
+import contextlib
+import dataclasses
 import itertools
 import math
 from pathlib import Path
@@ -22,12 +24,14 @@ import optax
 import pytest
 from certified import assert_certified
 from flax import linen as nn
+from model_support import moved
+from one_draw import assert_as_exact_as_the_reference
 from recording import RecordingTracker
 from reference_error import (
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
+    chain_roundings,
     declared_seeds,
     indexed_recording,
     recording,
@@ -49,7 +53,8 @@ from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 
 SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 16, 'clipping': 32, 'kl': 8, 'rollout': 64,
-         'inpainting': 32, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 16}
+         'inpainting': 32, 'inpainting update': 512, 'live policy': 64, 'mixed precision': 32,
+         'prompt evaluation': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
@@ -80,18 +85,19 @@ class AffineVelocity(nn.Module):
         return gain * x + (temb / 1000)[:, None] * 0.1 + offset
 
 
-def sde_density(x, action, sigma, following, velocity, noise, dtype):
+def sde_density(x, action, sigma, following, velocity, noise, dtype, *, xp=np):
     """The authors' SDE log density of a transition from `x` to `action` [rows, ...] between the noise
     rates `sigma` and `following` (one each, or one a row) at the policy's `velocity` there, its noise
-    level `noise`, in NumPy at `dtype`: their `sde_step_with_logprob`, summed over a state's values."""
-    x, action, velocity = (np.asarray(value, dtype) for value in (x, action, velocity))
+    level `noise`, in NumPy at `dtype`, or in `xp` (jnp, which a gradient differentiates): their
+    `sde_step_with_logprob`, summed over a state's values."""
+    x, action, velocity = (xp.asarray(value, dtype) for value in (x, action, velocity))
     shape = (-1,) + (1,) * (x.ndim - 1)
-    sigma, following = (np.asarray(rate, dtype).reshape(shape) for rate in (sigma, following))
+    sigma, following = (xp.asarray(rate, dtype).reshape(shape) for rate in (sigma, following))
     dt = following - sigma
-    g_squared = noise**2 * sigma / (1 - np.where(sigma == 1, following, sigma))
+    g_squared = noise**2 * sigma / (1 - xp.where(sigma == 1, following, sigma))
     mean = x + (velocity + g_squared / (2 * sigma) * (x + (1 - sigma) * velocity)) * dt
     variance = g_squared * -dt
-    density = -0.5 * ((action - mean)**2 / variance + np.log(2 * math.pi * variance))
+    density = -0.5 * ((action - mean)**2 / variance + xp.log(2 * math.pi * variance))
     return density.sum(tuple(range(1, x.ndim)))
 
 
@@ -300,10 +306,17 @@ def clipped_terms(gain, frozen, states, times, advantages):
     old, current, reference = mean(jnp.asarray(0.25, dtype)), mean(gain), mean(jnp.asarray(frozen, dtype))
     log_ratio = (-jnp.square(following - current) + jnp.square(following - old)).mean(-1) / (2 * variance)
     ratio = jnp.exp(log_ratio)
-    advantage = jnp.clip(jnp.asarray(advantages, dtype), -2, 2)[:, None]
-    policy = jnp.maximum(-advantage * ratio, -advantage * jnp.clip(ratio, 0.999, 1.001))
+    policy, advantage = clipped_surrogate(ratio, jnp.asarray(advantages, dtype)[:, None], 0.001, 2)
     kl = jnp.square(current - reference).mean(-1) / (2 * variance)
     return policy, kl, ratio, advantage
+
+
+def clipped_surrogate(ratio, advantages, clip_range: float, most: float):
+    """Flow-GRPO's clipped policy term of each transition, PPO's without its dual cap, at the likelihood
+    ratio `ratio`, its advantages clipped to `most` first, and the clipped advantages beside it."""
+    advantage = jnp.clip(advantages, -most, most)
+    clipped = jnp.clip(ratio, 1 - clip_range, 1 + clip_range)
+    return jnp.maximum(-advantage * ratio, -advantage * clipped), advantage
 
 
 def clipped_objective(gain, frozen, states, times, advantages, mask, *, beta):
@@ -473,10 +486,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     initial = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7).init(jax.random.key(20))
     # The DiT starts with its output zeroed, which no condition moves; noise in
     # every weight lets a guided transition part from an unguided one.
-    leaves, tree = jax.tree.flatten(initial["params"])
-    noise = jax.random.split(jax.random.key(22), len(leaves))
-    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                       for leaf, key in zip(leaves, noise, strict=True)])
+    params = moved(initial["params"], jax.random.key(22), 0.1)
     objective = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7,
                                   variables={**initial, "params": params})
 
@@ -528,19 +538,19 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     assert np.isfinite(float(loss)) and np.isfinite(norm) and norm > 1e-5
 
 
-def recorded_density(batch, rate, velocity, noise, dtype):
+def recorded_density(batch, rate, velocity, noise, dtype, *, xp=np):
     """`sde_density` of each transition a rollout's batch records, from its own states and times, at the
     noise rate `rate(t)` of each time and the velocity `velocity(column, x, sigma)` at column `column`'s
-    state `x`, `sigma` its rates shaped against it, in NumPy at `dtype`."""
+    state `x`, `sigma` its rates shaped against it, in NumPy at `dtype`, or in `xp`."""
     columns = []
     for column in range(np.shape(batch["timesteps"])[1]):
-        x = np.asarray(batch["latents"][:, column], dtype)
+        x = xp.asarray(batch["latents"][:, column], dtype)
         shape = (-1,) + (1,) * (x.ndim - 1)
-        sigma, following = (rate(np.asarray(batch[name][:, column], dtype)).reshape(shape)
+        sigma, following = (rate(xp.asarray(batch[name][:, column], dtype)).reshape(shape)
                             for name in ("timesteps", "next_timesteps"))
         columns.append(sde_density(x, batch["next_latents"][:, column], sigma, following,
-                                   velocity(column, x, sigma), noise, dtype))
-    return np.stack(columns, 1)
+                                   velocity(column, x, sigma), noise, dtype, xp=xp))
+    return xp.stack(columns, 1)
 
 
 def assert_rescores_as_walked(objective, variables, rollout_of, density, label: str, seeds: int):
@@ -598,11 +608,34 @@ class Pooled(AutoEncoder):
         return 1
 
 
+def inpainting_loss(gain, batch, dtype):
+    """Flow-GRPO's clipped loss over a rollout's recorded transitions at the `Inpainting` policy of `gain`,
+    in closed form, in jnp at `dtype`: each transition's log density the authors' Gaussian at the velocity
+    of its masked-image inputs (`sde_density`'s, noise 0.7), its likelihood ratio to the recorded one per
+    latent value, PPO's clip at the objective's 1e-4 on advantages clipped to 5, averaged over the
+    selected transitions."""
+    gain = jnp.asarray(gain, dtype)
+    spatial = {name: jnp.asarray(value, dtype) for name, value in batch["spatial"].items()}
+    held = 0.3 * spatial["masked_image"] * (1 - spatial["mask"])
+    current = recorded_density(batch, lambda t: t, lambda column, x, sigma: gain * x + held + 0.1 * sigma,
+                               0.7, dtype, xp=jnp)
+    values = math.prod(np.shape(batch["latents"])[2:])
+    ratio = jnp.exp((current - jnp.asarray(batch["old_log_probs"], dtype)) / values)
+    advantages = jnp.asarray(batch["advantages"], dtype)
+    surrogate, _ = clipped_surrogate(ratio, advantages[:, None] if advantages.ndim == 1 else advantages,
+                                     1e-4, 5)
+    kept = jnp.asarray(batch["transition_mask"], dtype)
+    return jnp.sum(kept * surrogate) / jnp.sum(kept)
+
+
 def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
     """Flow-GRPO samples an inpainting model with the masked image and mask its inputs give,
     records them with each transition and rescores the transitions with them: the recorded
     likelihoods and their rescoring are on par with the authors' Gaussian at the model's velocity of
-    those inputs over rollouts (check 1), and a policy step through them has a gradient."""
+    those inputs over rollouts (check 1), and another mask rescores them otherwise. The first policy
+    update through them, its loss and its gradient in the policy, is on par with the closed form's
+    (`inpainting_loss`) from its float64 evaluation over rollouts (check 1), and a trained step moves
+    the policy (ledger 667)."""
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     inputs = InputSpec(Field("image", (4, 4, 3)), mask=Field("mask", (4, 4, 1)))
     objective = FlowGRPOObjective(Inpainting(), process, inputs, autoencoder=Pooled(), guidance=None, steps=4)
@@ -628,10 +661,51 @@ def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
                                 0.7, dtype)
 
     assert_rescores_as_walked(objective, variables, rolled, inpainted, "inpainting", SEEDS['inpainting'])
+    # The mask reaches the scoring: the batch's transitions under the other half masked score otherwise.
+    rescore = jax.jit(objective.log_probs)
+    flipped = {**batch, "spatial": {**batch["spatial"], "mask": 1 - batch["spatial"]["mask"]}}
+    other, own = np.asarray(rescore(variables, flipped)), np.asarray(rescore(variables, batch))
+    assert np.all(np.isfinite(other)) and np.all(np.isfinite(own))
+    assert np.all(other != own)
+
     step = Step(jnp.asarray(0), jax.random.key(43), None)
-    gradients = jax.grad(lambda p: objective.scalar_loss({**variables, "params": p}, batch, step)[0])(
-        variables["params"])
-    assert np.isfinite(float(optax.tree.norm(gradients)))
+    gain = objective.model_variables(variables)["params"]["gain"]
+
+    def updated(batch, one):
+        """Dew's first update: the loss at the rollout's own policy, and its gradient in the gain."""
+        def loss(params):
+            return objective.scalar_loss({**variables, "params": params}, batch, step)[0]
+        value, gradient = with_gradients(loss)(variables["params"], one)
+        return {"loss": value, "gradient": objective.model_variables({"params": gradient})["params"]["gain"]}
+
+    def closed(batch, one, dtype):
+        value, gradient = with_gradients(lambda gain: inpainting_loss(gain, batch, dtype))(
+            jnp.asarray(gain, dtype), jnp.asarray(one, dtype))
+        return {"loss": value, "gradient": gradient}
+
+    @as_given
+    def truth(batch, one):
+        with jax.enable_x64(new_val=True):
+            return closed(batch, one, jnp.float64)
+
+    assert_as_exact(updated, lambda batch, one: closed(batch, one, jnp.float32),
+                    lambda seed: (rolled(seed), np.float32(1)), "inpainting update",
+                    seeds=SEEDS['inpainting update'], truth_fn=truth)
+
+    # A trained step, the rollout its own, moves the policy: a row of the images a device.
+    from dew.data.dataset import Loader
+
+    trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(44), rollout=rollout)
+    initial = trainer.place()[0]
+    rows = np.arange(jax.device_count()) % len(pixels)
+    source = {"image": pixels[rows], "mask": mask[rows]}
+    data = Loader(train=lambda partition: itertools.repeat(source), val=None, records=len(rows),
+                  batch=len(rows))
+    final = trainer.fit(data, steps=1, log_every=1)
+    assert int(final.updates) == 1
+    step_size = (objective.model_variables(final.variables)["params"]["gain"]
+                 - objective.model_variables(initial.variables)["params"]["gain"])
+    assert np.isfinite(float(step_size)) and float(step_size) != 0
 
 
 def test_transition_matches_released_sampler_and_torch_distribution():
@@ -912,10 +986,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     untrained = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3).init(
         jax.random.key(100))
     # Noise in every weight, the zeroed output head's too, so the evaluation reads its prompts.
-    leaves, tree = jax.tree.flatten(untrained["params"])
-    noise = jax.random.split(jax.random.key(103), len(leaves))
-    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                       for leaf, key in zip(leaves, noise, strict=True)])
+    params = moved(untrained["params"], jax.random.key(103), 0.1)
     objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3,
                                   variables={**untrained, "params": params})
     rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)
@@ -982,7 +1053,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     # The metric's own sums, batch by batch in float64, merged in order, over its count.
     totals = [float(images.sum(dtype=np.float64)) for images in metric.images]
     assert logged["val/pixel_mean"] == sum(totals) / observed.size
-    assert logged["evaluation/records"] == count * 2
+    assert logged["evaluation/counts/val/records"] == count * 2
     previews = [value for _, value in tracker.artifacts if not isinstance(value, RECORD_TYPES)]
     assert previews[0].images.shape == (min(4, count), 4, 4, 1)
 
@@ -1002,25 +1073,33 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
     density = np.asarray(transition.log_prob(jnp.asarray(mean)))
     assert np.all(np.isfinite(density))
-    half_log = np.float32(6) * (np.log(np.float32(2 * math.pi)) + np.log(variance))
-    truth = [reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance]
-    assert_as_exact_as_the_reference(density, -half_log, np.asarray(truth), "a wide transition's density")
-    away = np.full_like(mean, 1e18)
-    kl = np.asarray(transition.kl(jnp.asarray(away)))
+    truth = np.asarray([reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance])
+    # The oracle rule for a fixed input: within float32's rounding over each call's chain of roundings of
+    # its float64 value's terms (`_held_by_its_roundings`).
+    half_log = 6 * (abs(math.log(2 * math.pi)) + np.abs(np.log(variance.astype(np.float64))))
+    _held_by_its_roundings(density, truth, half_log, transition.log_prob, jnp.asarray(mean))
+    away = jnp.full_like(jnp.asarray(mean), 1e18)
+    kl = np.asarray(transition.kl(away))
     assert np.all(np.isfinite(kl))
-    error = np.float32(12) * np.float32(1e18) ** 2
-    assert_as_exact_as_the_reference(kl, error / np.float32(2) / variance,
-                                     12 * 1e36 / (2 * variance.astype(np.float64)), "a wide transition's KL")
+    wide = 12 * 1e36 / (2 * variance.astype(np.float64))
+    _held_by_its_roundings(kl, wide, wide, transition.kl, away)
     # A variance near float32's least: the KL, about 2e38, fits, where its twice the quotient would not.
     narrow = np.asarray([2e-38, 3e-38], np.float32)
     near = GaussianTransition(jnp.asarray(mean), jnp.asarray(narrow))
-    step = np.float32(np.sqrt(8 / 12))
-    kl = np.asarray(near.kl(jnp.full_like(jnp.asarray(mean), step)))
+    step = jnp.full_like(jnp.asarray(mean), np.float32(np.sqrt(8 / 12)))
+    kl = np.asarray(near.kl(step))
     assert np.all(np.isfinite(kl))
-    error = np.sum(np.full(12, step) ** 2, dtype=np.float32)
-    assert_as_exact_as_the_reference(kl, error / np.float32(2) / narrow,
-                                     12 * float(step) ** 2 / (2 * narrow.astype(np.float64)),
-                                     "a narrow transition's KL")
+    small = 12 * float(np.float32(np.sqrt(8 / 12))) ** 2 / (2 * narrow.astype(np.float64))
+    _held_by_its_roundings(kl, small, small, near.kl, step)
+
+
+def _held_by_its_roundings(found, truth, magnitude, fn, *arguments):
+    """The oracle rule for a fixed input, which no draw varies: `found` within float32's rounding of
+    `magnitude` (the float64 value's terms' size) over `fn`'s longest chain of roundings
+    (`chain_roundings`), and finite."""
+    assert np.all(np.isfinite(found))
+    assert_fp32_reduction_bound(found, truth, np.broadcast_to(magnitude, np.shape(truth)),
+                                chain_roundings(jax.make_jaxpr(fn)(*arguments)))
 
 
 def _kl_truth(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
@@ -1159,7 +1238,7 @@ KL_LEVELS = (-126, -125, -100, -63, -26, -1, 0, 1, 26, 63, 100, 126, 127)
 FIXED_ROWS = (
     # (mean, reference, variance, mean tangent, reference tangent, variance tangent, cotangent), three
     # coordinates: each a review's or the second opinion's input. A JVP of products [2**120, -2**120,
-    # 2**-100], which a plain float32 sum keeps and aligning to the largest flushed (Main, 1778).
+    # 2**-100], which a plain float32 sum keeps and aligning to the largest flushed (the maintainer, 1778).
     ([2.0**60, 2.0**60, 2.0**-100], [0, 0, 0], 1, [2.0**60, -2.0**60, 1], [0, 0, 0], 0, 1),
     ([2.0**60, 2.0**60, 1], [0, 0, 0], 1, [2.0**60, -2.0**60, 2.0**-5], [0, 0, 0],
      (1 + 2.0**-23) * 2.0**-125, 1),
@@ -1264,3 +1343,189 @@ def test_a_transitions_kl_and_its_derivatives_hold_at_each_reviewed_input(case):
                            _kl_truth(*inputs), _kl_bounds(*inputs), case)
 
 
+
+
+def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
+    """A residual of 2**64 under a variance of 2**126: its square passes float32's largest, its square
+    over the variance is 4, and the density is finite as the reference's is, the half-Mahalanobis term
+    taken range-safe as the KL takes it (ledger 1874)."""
+    from dew.sampling.flow import GaussianTransition
+
+    transition = GaussianTransition(jnp.zeros((1, 1), jnp.float32), jnp.asarray([2.0 ** 126], jnp.float32))
+    residual = jnp.full((1, 1), 2.0 ** 64, jnp.float32)
+    density = np.asarray(transition.log_prob(residual))
+    # The density on the standardized square, 4, in float64, held by the oracle rule for its fixed input.
+    half_log = 0.5 * (math.log(2 * math.pi) + 126 * math.log(2))
+    _held_by_its_roundings(density, np.asarray([-(2 + half_log)]), 2 + half_log, transition.log_prob,
+                           residual)
+    # Differentiable at every order, as the plain density: at unit variance its Hessian in the mean is -I.
+    unit = GaussianTransition(jnp.zeros((1, 3), jnp.float32), jnp.ones((1,), jnp.float32))
+    def density(mean):
+        return GaussianTransition(mean, unit.variance).log_prob(jnp.ones((1, 3), jnp.float32)).sum()
+
+    for second in (jax.jacfwd(jax.jacrev(density)), jax.jacrev(jax.jacfwd(density))):
+        np.testing.assert_array_equal(np.asarray(second(unit.mean)).reshape(3, 3), -np.eye(3))
+    # Finite wherever the term is: a residual of 2**64 under unit variance, half its square 2**127, and
+    # a value of 2**127 beside a mean of -2**127 under float32's largest variance.
+    for value, mean, variance, term in ((2.0 ** 64, 0.0, 1.0, 2.0 ** 127),
+                                        (2.0 ** 127, -(2.0 ** 127), float(np.finfo(np.float32).max),
+                                         2.0 ** 255 / float(np.finfo(np.float32).max))):
+        edge = GaussianTransition(jnp.full((1, 1), mean, jnp.float32), jnp.asarray([variance], jnp.float32))
+        density = edge.log_prob(jnp.full((1, 1), value, jnp.float32))
+        truth = -(term + 0.5 * (math.log(2 * math.pi) + math.log(variance)))
+        # The term rounds once, a quotient of powers of two over a significand, and the log terms fall
+        # below its last place: the float32 rounding of the float64 density.
+        np.testing.assert_array_equal(np.asarray(density), [np.float32(truth)])
+        # Its derivative in the mean is finite there too, the residual over the variance.
+        slope = jax.grad(lambda centre, edge=edge, value=value: edge.replace(mean=centre).log_prob(
+            jnp.full((1, 1), value, jnp.float32)).sum())(edge.mean)
+        np.testing.assert_array_equal(np.asarray(slope), [[np.float32((value - mean) / variance)]])
+    # A residual of 2**-30 under a variance of 2**-120: the variance's derivative, -term / variance, passes
+    # float32's largest, and the density's tangent along the mean alone, in forward mode and reverse,
+    # is the residual over the variance, 2**90, finite, no inf times zero (ledger 1916).
+    small = GaussianTransition(jnp.zeros((1, 1), jnp.float32), jnp.asarray([2.0 ** -120], jnp.float32))
+
+    def along_mean(centre):
+        return small.replace(mean=centre).log_prob(jnp.full((1, 1), 2.0 ** -30, jnp.float32)).sum()
+
+    _, moved = jax.jvp(along_mean, (small.mean,), (jnp.ones((1, 1), jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(moved), 2.0 ** 90)
+    np.testing.assert_array_equal(np.asarray(jax.grad(along_mean)(small.mean)), [[2.0 ** 90]])
+
+
+class Branched:
+    """A custom guidance that calls its denoiser inside a `lax.cond` of its own, returning what the call
+    opened through the cond's outputs, as the `Guidance` protocol asks."""
+
+    def walk(self, denoise, steps):
+        from dew.sampling.guidance import Walk
+
+        def predict(x, t):
+            return jax.lax.cond(jnp.asarray(1) > 0, denoise.predict, denoise.predict, x, t)
+        return Walk.stateless(lambda index: predict)
+
+
+@pytest.mark.parametrize("guided", ["unguided", "unguided-over-a-guide", "autoguidance", "branched"])
+def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
+    """A sampled Flow-GRPO step watching its policy model summarizes that model's output on the inputs
+    its walk hands it at each trajectory's first transition, its own call's to the bit: unguided, over a
+    tree that holds an autoguidance's guide it does not read, under an autoguidance whose main model
+    holds the guide out (2317), and under a custom guidance that calls its policy inside a `lax.cond` of
+    its own (2511)."""
+    from dew.nn.inspection import Watched, flattened, watching
+    from dew.sampling.guidance import Autoguidance
+
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = {"autoguidance": Autoguidance(2.0, AffineVelocity()), "branched": Branched()}.get(guided)
+    objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
+                                  sde=FlowSDE(0.5), guidance=guidance)
+    own = objective.init(jax.random.key(30))
+    variables = own if guided == "unguided" else {**own, "guide": AffineVelocity().init(
+        jax.random.key(31), jnp.zeros((rows, 2)), jnp.ones(rows))}
+    bound = own if guided == "autoguidance" else variables
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                watched=Watched(("AffineVelocity",)))
+    # The step's loss under the watcher its trainer enters (`Objective._loss`).
+    with watching(("AffineVelocity",)):
+        _, aux = objective.loss(variables, batch, step)
+    outputs = []
+
+    def kept(next_fun, args, kwargs, context):
+        output = next_fun(*args, **kwargs)
+        if not outputs and context.method_name == "__call__" and {id(leaf) for leaf in jax.tree.leaves(
+                context.module.scope.variables())} == {id(leaf) for leaf in jax.tree.leaves(bound)}:
+            outputs.append(output)
+        return output
+
+    # The policy's own call, run eagerly through any transform its guidance wraps it in.
+    with nn.intercept_methods(kept), jax.disable_jit():
+        objective._walk(variables, batch).at((), 0)(batch["latents"][:, 0], batch["timesteps"][:, 0])
+    # Its largest magnitude, which no order of a reduction rounds: a sum's order is the compiled program's
+    # own, which a scan's body and a call of its own need not share.
+    expected = np.asarray(outputs[0], np.float32)
+    assert flattened(aux.inspected)["activations/abs_max"] == np.abs(expected).max()
+
+
+class DenseVelocity(nn.Module):
+    """A velocity through one dense layer, whose matmuls a step's work counts."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return nn.Dense(x.shape[-1])(x) + (temb / 1000)[:, None] * 0.1
+
+
+@pytest.mark.parametrize("guided", ["unguided", "branched"])
+def test_a_watched_flow_step_runs_its_unwatched_steps_matmuls(guided):
+    """A sampled Flow-GRPO step summarizes its policy's trained call, returned out of its scan, and runs
+    the unwatched step's matmuls alone (`step_flops`): no forward more at the first transition's inputs
+    (2512), under a custom guidance that calls its policy inside a `lax.cond` of its own too (2511)."""
+    from dew.nn.inspection import Watched, watching
+    from dew.telemetry.instrumentation import step_flops
+
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = Branched() if guided == "branched" else None
+    objective = FlowGRPOObjective(DenseVelocity(), process, InputSpec(Field("image", (2,))), sde=FlowSDE(0.5),
+                                  guidance=guidance)
+    variables = objective.init(jax.random.key(30))
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                watched=Watched(("DenseVelocity",)))
+
+    def work(watched: bool) -> float:
+        def loss(params):
+            with watching(("DenseVelocity",)) if watched else contextlib.nullcontext():
+                stats, aux = objective.loss({**variables, "params": params}, batch,
+                                            step if watched else dataclasses.replace(step, watched=None))
+            return objective.reduce_loss(stats)[0], aux.inspected
+        flops = step_flops(jax.jit(jax.grad(loss, has_aux=True)).lower(variables["params"]).compile())
+        assert flops is not None
+        return flops.hardware
+
+    assert work(watched=True) == work(watched=False)
+
+
+@pytest.mark.parametrize("guided", ["unguided", "branched"])
+def test_a_flow_steps_watched_cotangents_reach_its_policys_calls(guided):
+    """A Flow-GRPO step that summarizes its watched policy's cotangents (row 2324) carries its probe to
+    the policy's call at every transition its scan takes, under a custom guidance's own `lax.cond` too: the
+    loss's cotangent reaches it from each, rows by features by transitions entries, and the parameters'
+    gradient is the unprobed step's to the bit."""
+    from dew.nn.inspection import Watched
+    from dew.training.transaction import probed_loss
+
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = {"branched": Branched()}.get(guided)
+    objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
+                                  sde=FlowSDE(0.5), guidance=guidance)
+    variables = objective.init(jax.random.key(30))
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+
+    def step(cotangents):
+        return Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                    watched=Watched(("AffineVelocity",), cotangents=cotangents))
+
+    def reduced(stats):
+        return objective.reduce_loss(stats)[0]
+
+    def gradients():
+        stats, back, _ = probed_loss(objective, variables, batch, step(cotangents=True))
+        _, seed = jax.vjp(reduced, stats)
+        return back(seed(jnp.ones(()))[0])
+
+    def plain():
+        return jax.grad(lambda params: reduced(objective._loss({**variables, "params": params}, batch,
+                                                                step(cotangents=False))[0]))(variables["params"])
+
+    (params, probes), expected = jax.jit(gradients)(), jax.jit(plain)()
+    (probe,) = jax.tree.leaves(probes)
+    transitions = batch["latents"].shape[1]
+    assert probe[0] == rows * 2 * transitions and np.isfinite(probe[2])
+    assert all((left == right).all()
+               for left, right in zip(jax.tree.leaves(params), jax.tree.leaves(expected), strict=True))

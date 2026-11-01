@@ -23,7 +23,7 @@ from dew._records import JSON
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
-from dew.inference.tasks import SavedRun, SavedRunTask
+from dew.inference.tasks import InItsForm, SavedRun, SavedRunTask, traced_in_its_form
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
@@ -31,8 +31,8 @@ from dew.nn.kernels.options import program
 from dew.objectives.base import OMITTED, Omitted
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.sample import sampling_modules, walk_and_decode
 from dew.sampling.solvers import DDIM, Solver
+from dew.sampling.walks import sampling_modules, walk_and_decode
 from dew.telemetry.profile import region
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
@@ -157,7 +157,7 @@ class ImageSettings:
 
 
 @dataclass(frozen=True, eq=False)
-class TextToImage(SavedRunTask):
+class TextToImage(SavedRunTask, InItsForm):
     """Generates images from text prompts with a trained diffusion model and its encoders.
 
     Call it as `pipe(prompts, key=0)` or
@@ -234,7 +234,7 @@ class TextToImage(SavedRunTask):
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                    layout: Layout | None = None, dtype: DTypeLike | None = None,
-                   param_dtype: DTypeLike | None = None) -> TextToImage:
+                   param_dtype: DTypeLike | None = None, variables: Variables | None = None) -> TextToImage:
         """Load the run `run` (its checkpoint pinned, `SavedRun.pinned`), built from the inference record
         its checkpoint holds (`Checkpoints.artifact`) the way the recipe built it; the run's `run.json`
         is not read. `from_run` loads one from its directory.
@@ -249,7 +249,9 @@ class TextToImage(SavedRunTask):
 
         `dtype` sets the compute dtype of the model, the encoders and the VAE.
         `param_dtype` sets the dtype the parameters are stored in; None keeps
-        the checkpoint's dtypes exactly.
+        the checkpoint's dtypes exactly. Supplied `variables`, a tree of the
+        run's own form (a run that started from it saved them), are bound in
+        place of the checkpoint's, which is not read.
         """
         from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
@@ -273,8 +275,8 @@ class TextToImage(SavedRunTask):
                 for keyword, condition in conditions.items()}}
             if autoencoder_record is not None:
                 autoencoder_record = _computing(autoencoder_record, compute)
-        params = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype,
-                               parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
+        params = (restored_tree(run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+                  if variables is None else variables)
         inputs = InputSpec.bound(inputs_record, params=params.get('encoders', {}))
         end_to_end = settings.end_to_end
         autoencoder = None
@@ -407,6 +409,7 @@ class TextToImage(SavedRunTask):
                                          "image input shapes and sampling must agree across processes")
         return self._inputs(settled, owns_grid=self.grid is not None or times is not None)
 
+    @traced_in_its_form
     def _inputs(self, settled: _Resolved, *, owns_grid: bool) -> DenoisingInputs:
         """The conditions encoded and the initial state built for `settled`, placed for its rows. A grid
         the task or the caller chose (`owns_grid`) travels with them."""
@@ -609,6 +612,7 @@ class TextToImage(SavedRunTask):
             samples["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
         return samples
 
+    @traced_in_its_form
     def _encoded(self, settled: _Resolved) -> tuple[dict, dict, jax.Array]:
         """The two encoded conditioning branches and the initial state.
 
@@ -650,6 +654,7 @@ class TextToImage(SavedRunTask):
         return given, null, initial_state
 
 
+    @traced_in_its_form
     def __call__(
         self,
         prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs,
@@ -710,6 +715,22 @@ class TextToImage(SavedRunTask):
         return replace(generated, rows=plan.rows)
 
 
+def restored_tree(run: SavedRun, *, ema: bool | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+                  param_dtype: DTypeLike | None) -> Variables:
+    """The diffusion run `run`'s tree as its checkpoint holds it, an adapter's split of it kept
+    (`SavedRun.variables`), each parameter root its record names (`_parameter_roots`) stored in
+    `param_dtype` (as saved where None), restored where `mesh` and `layout` place it:
+    what `TextToImage.from_saved` binds, and what a run that starts from `run` trains
+    (`dew.interop.saved_sources.pipeline_of_run`)."""
+    from dew._records import record as fields
+    from dew.inference.tasks import saved_settings
+
+    settings = saved_settings(run.record, ImageSettings)
+    autoencoder = None if settings.autoencoder is None else fields(settings.autoencoder, 'autoencoder')
+    return run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype,
+                         parameter_roots=_parameter_roots(fields(settings.inputs, 'inputs'), autoencoder))
+
+
 def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, object] | None
                      ) -> tuple[tuple[str, ...], ...]:
     """The parameter roots of a recorded run's tree, which a storage override
@@ -717,7 +738,7 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
     autoencoder's. The rest keep the dtypes they were saved in."""
     from dew._records import record
     from dew.batch import PARAMETER_ROOTS
-    from dew.inputs.encoders import ConditionEncoder
+    from dew.inputs.condition import ConditionEncoder
     from dew.registry import component
 
     roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)

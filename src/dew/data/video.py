@@ -46,7 +46,8 @@ def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes
 @contextlib.contextmanager
 def local_file(value: bytes | str) -> Iterator[str]:
     """A local file a decoder reads for a record's media `value`, its bytes or a local or remote path,
-    kept while the context is open."""
+    kept while the context is open: a remote one's copy in Dew's mirror (`dew.data.declared.mirrored`),
+    refused (`Unmirrored`, a ValueError a decoder's rejects take) where the mirror has no room for it."""
     if isinstance(value, bytes):
         with tempfile.NamedTemporaryFile() as file:
             file.write(value)
@@ -55,10 +56,10 @@ def local_file(value: bytes | str) -> Iterator[str]:
         return
     path = str(value)
     if "://" in path and not path.startswith("file://"):
+        from dew.data.declared import mirrored
         from dew.data.storage import Store
 
-        fs, target = Store(path if "::" in path else "dewcache::" + path).resolve()
-        with fs.open(target, "rb") as cached:
+        with mirrored(Store(path)) as cached:
             yield cached.name
         return
     yield path.removeprefix("file://")
@@ -159,16 +160,19 @@ class DecodeVideo(grain.MapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class Row(grain.MapTransform):
-    """A listed media file's path (`video_path`, else `path`) under `mp4`, where the decoders read it,
-    and its caption, `caption` where it states none."""
+    """A listed media file's record with its path (`video_path`, else `path`) moved to `mp4`, where the
+    decoders read it, and its caption, `caption` where it states none: every other field the record
+    holds (a label, an id) reaches the batch as it is."""
 
     caption: str = ""
 
     def map(self, element: Batch) -> Batch:
         from dew._records import text
 
-        path = text(element.get("video_path", element.get("path")), "video_path")
-        return {"mp4": path, "caption": element.get("caption", self.caption)}
+        named = "video_path" if "video_path" in element else "path"
+        path = text(element.get(named), named)
+        kept = {key: value for key, value in element.items() if key != named}
+        return {**kept, "mp4": path, "caption": element.get("caption", self.caption)}
 
 
 def media(listing: Files, extensions: Sequence[str] = (".mp4", ".avi", ".mov", ".webm")) -> Files:

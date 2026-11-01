@@ -36,6 +36,7 @@ from dew.artifacts import Representations
 from dew.batch import Variables, dicts, part, thaw, under
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
+from dew.nn.inspection import INSPECTED
 from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.protocols import StagedStacks
 from dew.nn.sharding import explicit_spec, whole_spec
@@ -116,7 +117,9 @@ class JepaObjective(Objective[Ratio]):
     Evaluation returns the pooled target-encoder embeddings of a batch with
     its labels, which the probe metrics score. `momentum` is the target
     encoder's EMA decay, which rises linearly from its first value to its
-    second over `momentum_steps` updates.
+    second over `momentum_steps` updates, or where None over the run's
+    progress, a run bounded in examples that no plan counts ahead
+    (`EMASpec.progressed`).
 
     `encoder_variables` and `predictor_variables` are the trees each module
     starts from, as `model.init`, `Pretrained.load` or `LoRA.apply` return
@@ -140,7 +143,7 @@ class JepaObjective(Objective[Ratio]):
         mask: MultiBlockMask,
         sample: Field,
         momentum: tuple[float, float] = (0.996, 1.0),
-        momentum_steps: int = 100_000,
+        momentum_steps: int | None = 100_000,
         label_key: str = LABEL_KEY,
         encoder_variables: Variables | None = None,
         predictor_variables: Variables | None = None,
@@ -161,8 +164,11 @@ class JepaObjective(Objective[Ratio]):
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(
-            decay=optax.linear_schedule(momentum[0], momentum[1], momentum_steps),
+            # Over the run's progress, from 0 to 1, where it names no updates; an explicit 0 holds the first.
+            decay=optax.linear_schedule(momentum[0], momentum[1],
+                                        1 if momentum_steps is None else momentum_steps),
             select=under("params", CONTEXT_ENCODER),
+            progressed=momentum_steps is None,
         )
 
     def program_key(self) -> tuple[ProgramModule, ...]:
@@ -210,10 +216,14 @@ class JepaObjective(Objective[Ratio]):
     def encode(self, encoder_variables, samples, token_idx=None, train=False, rngs=None) -> jax.Array:
         """The encoder over `encoder_variables`, its own tree in every collection,
         a frozen split merged back."""
-        features = self.encoder.apply(thaw(encoder_variables), samples, token_idx, train=train, rngs=rngs)
-        # `mutable` is unset, so apply returns the output alone, not a pair.
-        assert not isinstance(features, tuple)
-        return features
+        return self.encoded(encoder_variables, samples, token_idx, train=train, rngs=rngs)[0]
+
+    def encoded(self, encoder_variables, samples, token_idx=None, *, train=False, rngs=None,
+                opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
+        """The encoder's features (`encode`), and what its pass sowed into the `opened` collections."""
+        features, sown = self.encoder.apply(thaw(encoder_variables), samples, token_idx, train=train,
+                                            rngs=rngs, mutable=list(opened))
+        return features, sown
 
     def _target_variables(self, step: Step):
         """The target encoder's variables: the EMA copy of the context
@@ -245,29 +255,30 @@ class JepaObjective(Objective[Ratio]):
         targets = jax.lax.stop_gradient(
             jnp.take_along_axis(full[:, None], gather_idx, axis=-2))
 
-        context = self.encode(
+        context, encoder = self.encoded(
             part(variables, CONTEXT_ENCODER), samples, context_idx,
-            train=step.training, rngs=model_rngs(dropout_key, training=step.training))
+            train=step.training, rngs=model_rngs(dropout_key, training=step.training), opened=step.sown())
 
         # Each target block is predicted from the same context. Fold the block
         # axis into the batch so one predictor call covers all M of them
         repeated = jnp.repeat(context, num_targets, axis=0, out_sharding=explicit_spec(context))
-        predictions = self.predictor.apply(
+        predictions, predictor = self.predictor.apply(
             thaw(part(variables, PREDICTOR)),
             repeated,
             jnp.repeat(context_idx, num_targets, axis=0, out_sharding=explicit_spec(context_idx)),
             target_idx.reshape(batch_size * num_targets, -1),
-            train=step.training, rngs=model_rngs(dropout_key, training=step.training),
+            train=step.training, rngs=model_rngs(dropout_key, training=step.training), mutable=step.sown(),
         )
-        # `mutable` is unset, so apply returns the output alone, not a pair.
-        assert not isinstance(predictions, tuple)
         predictions = predictions.reshape(targets.shape)
 
         wide = at_least_fp32(jnp.result_type(predictions, targets))
         squared = (predictions.astype(wide) - targets.astype(wide)) ** 2
         loss = self.row_mean(squared, batch)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
-        return loss, Aux(representation_health(pooled))
+        # Each part's under the name its variables take (`part`), which its cotangent probes are cut by.
+        inspected = None if step.watched is None else {CONTEXT_ENCODER: encoder.get(INSPECTED, {}),
+                                                       PREDICTOR: predictor.get(INSPECTED, {})}
+        return loss, Aux(representation_health(pooled), inspected=inspected)
 
     def evaluate(self, params, batch, step: Step):
         """Return the pooled embeddings of the target encoder, the EMA copy, with the batch labels."""

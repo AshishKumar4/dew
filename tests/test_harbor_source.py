@@ -28,6 +28,8 @@ import httpx
 import jax
 import numpy as np
 import pytest
+from process_support import running
+from rl_support import Published
 
 from dew.interop.gateway import Gateway, calls
 from dew.interop.harbor import HARBOR_KEY, Harbor, outcome
@@ -387,7 +389,7 @@ def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
                                          arguments=("-e", "docker")), gateway)
     try:
         futures = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 2, version=5, key=KEY)
-        rollouts = [future.result(timeout=60) for future in futures]
+        rollouts = [future.result() for future in futures]
     finally:
         source.close()
     assert [rollout.sample for rollout in rollouts] == [0, 1]
@@ -426,7 +428,7 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
             time.sleep(0.05)
         began = time.monotonic()
         source.cancel([future])
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
@@ -446,7 +448,7 @@ def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_p
         while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
             time.sleep(0.05)
         source.cancel([future])
-        assert future.result(timeout=15).status is Status.CANCELLED
+        assert future.result().status is Status.CANCELLED
         # Cancelling a resolved future again is a no-op, not a signal to a reaped process group.
         source.cancel([future])
     finally:
@@ -465,12 +467,6 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     from dew.objectives.rl.scheduler import task_ids
     from dew.training import Layout, Trainer
 
-    class Publisher:
-        version = 0
-
-        def load(self, variables, version):
-            self.version = version
-
     hanging = tmp_path / "once"
     hanging.mkdir()
     gateway, _ = fake_gateway(version=None)
@@ -480,7 +476,7 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     objective = GRPOObjective(model, seq_len=7)
     tasks, records = jax.device_count(), []
     scheduler = RolloutScheduler(
-        Asynchronous(source, Publisher(), objective, width=8, rows=2 * tasks, max_lag=0, ahead=0),
+        Asynchronous(source, Published(), objective, width=8, rows=2 * tasks, max_lag=0, ahead=0),
         tasks=lambda batch: [Task(task.id, {HARBOR_KEY: str(hanging)}) for task in task_ids(batch)],
         groups=2, log=records.append)
     data = scheduler.tasks(Loader(train=lambda partition: iter(
@@ -503,14 +499,6 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     assert len(list((tmp_path / "trials").glob("*/result.json"))) == 2 * tasks
 
 
-def ended(pid):
-    """Whether process `pid` is gone or a zombie waiting to be reaped."""
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except FileNotFoundError:
-        return True
-
-
 def test_a_finished_trial_ends_what_it_left_running_in_its_group(tmp_path, harbor):
     """Harbor finishes its trial and exits with a server it started still running in its process
     group, its output elsewhere: the trial completes, and the server ends with it."""
@@ -520,11 +508,11 @@ def test_a_finished_trial_ends_what_it_left_running_in_its_group(tmp_path, harbo
     try:
         (future,) = source.submit(Task("leaves", {HARBOR_KEY: str(tmp_path / "leaves")}), 1, version=0,
                                   key=KEY)
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     (child,) = (tmp_path / "trials").glob("*/child.json")
-    assert rollout.status is Status.COMPLETED and ended(json.loads(child.read_text()))
+    assert rollout.status is Status.COMPLETED and not running(json.loads(child.read_text()))
 
 
 @pytest.mark.parametrize("task", ["lingering-exits", "lingering-waits", "lingering-detached-waits"])
@@ -541,7 +529,7 @@ def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, h
     began = time.monotonic()
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     resolved = time.monotonic() - began
@@ -550,7 +538,7 @@ def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, h
     if "detached" in task:
         os.kill(pid, 9)
     else:
-        assert ended(pid)
+        assert not running(pid)
     assert rollout.status is Status.INFRA_ERROR and resolved < 20
 
 
@@ -565,53 +553,56 @@ def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(t
     began = time.monotonic()
     try:
         (future,) = source.submit(Task(task, {HARBOR_KEY: str(tmp_path / task)}), 1, version=0, key=KEY)
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     (seen,) = (tmp_path / "trials").glob("*/seen.json")
-    assert ended(json.loads(seen.read_text())["pid"])
+    assert not running(json.loads(seen.read_text())["pid"])
     assert rollout.status is Status.INFRA_ERROR and time.monotonic() - began < 20
 
 
-def test_a_trial_without_a_descriptor_for_its_wake_pipe_fails_and_frees_its_worker(tmp_path, harbor):
-    """A trial that cannot make its wake pipe, every descriptor taken, fails its future with that
-    OSError, and the source's one worker goes on to run the next trial once descriptors are free.
-    In a process of its own, whose descriptor limit it lowers (`descriptorless_flow`)."""
+def test_a_trial_without_a_descriptor_for_its_wake_pipe_is_infra_and_frees_its_worker(tmp_path, harbor):
+    """A trial that cannot make its wake pipe, every descriptor taken, resolves an INFRA_ERROR session
+    naming that OSError, which the scheduler retries (ledger 1875), and the source's one worker goes
+    on to run the next trial once descriptors are free. In a process of its own, whose descriptor
+    limit it lowers (`descriptorless_flow`)."""
     (tmp_path / "task").mkdir()
     here = Path(__file__).resolve().parent
     script = (f"import test_harbor_source as tests; "
               f"tests.descriptorless_flow({str(harbor)!r}, {str(tmp_path)!r})")
-    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
                          cwd=here, env={**os.environ,
                                         "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
     assert run.returncode == 0, run.stderr[-4000:]
-    assert json.loads(run.stdout.splitlines()[-1]) == ["COMPLETED", "OSError", "COMPLETED"]
+    assert json.loads(run.stdout.splitlines()[-1]) == ["COMPLETED", "INFRA_ERROR", "OSError", "COMPLETED"]
 
 
 def descriptorless_flow(harbor: str, root: str) -> None:
     """Run a trial, take every descriptor and submit one, free them and submit another, on one
-    worker; print the first's and last's statuses and the middle one's error class."""
+    worker; print the first's and last's statuses, the middle one's and the error class its detail
+    names."""
     import resource
 
     task = Task("hello", {HARBOR_KEY: str(Path(root) / "task")})
     source = HarnessSource(harbor_trials(harbor, Path(root) / "trials"), fake_gateway()[0], workers=1)
     try:
         (first,) = source.submit(task, 1, version=0, key=KEY)
-        before = first.result(timeout=120)
+        before = first.result()
         resource.setrlimit(resource.RLIMIT_NOFILE, (256, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
         taken = []
         with contextlib.suppress(OSError):
             while True:
                 taken.append(os.open(os.devnull, os.O_RDONLY))
         (starved,) = source.submit(task, 1, version=0, key=KEY)
-        error = starved.exception(timeout=120)
+        failed = starved.result()
         for descriptor in taken:
             os.close(descriptor)
         (after,) = source.submit(task, 1, version=0, key=KEY)
-        rollout = after.result(timeout=120)
+        rollout = after.result()
     finally:
         source.close()
-    print(json.dumps([before.status.name, type(error).__name__, rollout.status.name]))
+    print(json.dumps([before.status.name, failed.status.name, failed.detail.split(":")[1].strip(),
+                      rollout.status.name]))
 
 
 def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp_path, harbor):
@@ -629,7 +620,7 @@ def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp
             time.sleep(0.05)
         began = time.monotonic()
         source.cancel([future])
-        rollout = future.result(timeout=30)
+        rollout = future.result()
         resolved = time.monotonic() - began
     finally:
         source.close()
@@ -653,7 +644,7 @@ def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     closer.start()
     closer.join(20)
     assert not closer.is_alive() and time.monotonic() - began < 20
-    assert [future.result(timeout=1).status for future in futures] == [Status.CANCELLED, Status.CANCELLED]
+    assert [future.result().status for future in futures] == [Status.CANCELLED, Status.CANCELLED]
     # The queued sample never started a trial.
     assert len(list((tmp_path / "trials").glob("*/seen.json"))) == 1
 
@@ -664,7 +655,7 @@ def test_the_first_submission_waits_for_a_healthy_gateway_worker(tmp_path, harbo
     source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway, ready_poll=0.01)
     try:
         (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
-        assert future.result(timeout=60).status is Status.COMPLETED
+        assert future.result().status is Status.COMPLETED
     finally:
         source.close()
     # No trial started until the gateway reported a healthy worker, and it asked only once per source.
@@ -678,7 +669,7 @@ def test_a_gateway_that_reports_healthy_before_its_engine_listens_is_waited_for(
     source = HarnessSource(harbor_trials(harbor, tmp_path / "trials", model="m/p"), gateway, ready_poll=0.01)
     try:
         (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0, key=KEY)
-        assert future.result(timeout=60).status is Status.COMPLETED
+        assert future.result().status is Status.COMPLETED
     finally:
         source.close()
     # The model listing went through the gateway to the engine and answered before any trial ran.
@@ -745,7 +736,7 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
                                      tests=str(Path(__file__).parent), root=str(tmp_path), task=task,
                                      ready="*/child.json" if task.startswith("lingering") else "*/seen.json"))
     began = time.monotonic()
-    trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120,
+    trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
                              env={**os.environ, "JAX_PLATFORMS": "cpu"})
     # An uncaught KeyboardInterrupt ends CPython by SIGINT, so any other failure shows as itself.
     assert trainer.returncode == -signal.SIGINT, trainer.stderr[-2000:]
@@ -757,9 +748,9 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
     # trainer, it is reparented to the namespace's init, which may leave it a zombie for longer.
     pid = json.loads(seen.read_text())["pid"]
     deadline = time.monotonic() + 10
-    while not ended(pid) and time.monotonic() < deadline:
+    while running(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
-    alive = not ended(pid)
+    alive = running(pid)
     if alive:
         os.kill(pid, 9)
     assert not alive, "the interrupted trainer's running trial outlived it"
@@ -767,9 +758,9 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
         (child,) = (tmp_path / "trials").glob("*/child.json")
         pid = json.loads(child.read_text())
         deadline = time.monotonic() + 10
-        while not ended(pid) and time.monotonic() < deadline:
+        while running(pid) and time.monotonic() < deadline:
             time.sleep(0.1)
-        lingering = not ended(pid)
+        lingering = running(pid)
         if lingering:
             os.kill(pid, 9)
         assert not lingering, "a child of the interrupted trainer's trial outlived it"
@@ -812,7 +803,7 @@ def test_an_agent_command_runs_in_its_own_directory_against_its_own_session(tmp_
     gateway, asked = fake_gateway()
     source = HarnessSource(agent_command(tmp_path), gateway)
     try:
-        rollouts = [future.result(timeout=60) for future in source.submit(Task(task), 2, version=3, key=KEY)]
+        rollouts = [future.result() for future in source.submit(Task(task), 2, version=3, key=KEY)]
     finally:
         source.close()
     for rollout in rollouts:
@@ -836,7 +827,7 @@ def test_an_agent_command_the_verifier_cannot_score_is_infra_however_the_session
                            fake_gateway(extra=extra)[0])
     try:
         (unscored,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        assert unscored.result(timeout=60).status is Status.INFRA_ERROR
+        assert unscored.result().status is Status.INFRA_ERROR
     finally:
         source.close()
 
@@ -850,7 +841,7 @@ def test_an_agent_command_is_judged_by_what_the_engine_said_first(tmp_path, extr
     source = HarnessSource(agent_command(tmp_path), fake_gateway(extra=extra)[0])
     try:
         (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        rollout = future.result(timeout=60)
+        rollout = future.result()
     finally:
         source.close()
     assert rollout.status is status and rollout.reward == (None if status is Status.INFRA_ERROR else 1.0)
@@ -872,7 +863,7 @@ def test_an_agent_command_in_a_relative_workspace_runs_what_it_put_in_its_direct
     source = HarnessSource(command, fake_gateway()[0])
     try:
         (future,) = source.submit(Task("adds"), 1, version=0, key=KEY)
-        rollout = future.result(timeout=60)
+        rollout = future.result()
     finally:
         source.close()
     assert (rollout.status, rollout.reward) == (Status.COMPLETED, 1.0)
@@ -887,7 +878,7 @@ def test_a_cancelled_agent_command_is_interrupted_and_resolves_cancelled(tmp_pat
             time.sleep(0.05)
         began = time.monotonic()
         source.cancel([future])
-        rollout = future.result(timeout=30)
+        rollout = future.result()
     finally:
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
@@ -928,3 +919,31 @@ def test_a_trace_whose_transcript_is_not_the_gateways_json_leaves_the_trial_infr
     finally:
         source.close()
     assert rollout.status is Status.INFRA_ERROR
+
+
+def test_an_agent_command_that_cannot_start_is_infra(tmp_path):
+    """A command whose executable is missing raises OSError at its launch, the trial's own external
+    boundary: the session is INFRA_ERROR naming it, which the scheduler retries, not a failed future
+    that aborts the rollout (ledger 1875)."""
+    command = Command(lambda task, directory: [str(tmp_path / "missing-agent")],
+                      lambda task, directory, code: 1.0, tmp_path / "work")
+    source = HarnessSource(command, fake_gateway()[0])
+    try:
+        (rollout,) = source.submit(Task("adds"), 1, version=0, key=KEY)
+        failed = rollout.result()
+    finally:
+        source.close()
+    assert failed.status is Status.INFRA_ERROR and "FileNotFoundError" in failed.detail
+
+
+def test_harbor_judges_an_unreadable_result_as_infra(tmp_path):
+    """A trial whose result.json is not JSON is an infrastructure failure of the trial, an
+    INFRA_ERROR naming it, not a decode error that aborts the rollout (ledger 1875)."""
+    from dew.interop.harness import Trial
+
+    artifacts = tmp_path / "trial"
+    artifacts.mkdir()
+    (artifacts / "result.json").write_text("{not json")
+    harbor = harbor_trials(sys.executable, tmp_path / "trials")
+    judged = harbor.judge(Task("hello"), Trial((), artifacts), "", 0, calls([], unstamped=0))
+    assert judged.status is Status.INFRA_ERROR and "result.json" in judged.detail

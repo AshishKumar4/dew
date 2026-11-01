@@ -33,13 +33,17 @@ def keeping_picks() -> str:
     return without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
 
 
-def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src"):
+def fresh(script: str | Path, *arguments: str, cache_dir=None, flags: str | None = None,
+          source: Path = REPO_ROOT / "src", cwd: Path | None = None):
     """`script`'s last printed JSON, run by a fresh interpreter on the package at `source` (this
-    checkout's) and these tests, compiling into `cache_dir` under XLA `flags`."""
-    environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(cache_dir), "XLA_FLAGS": flags,
-                   "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests")))}
-    run = subprocess.run([sys.executable, "-c", script, *arguments], env=environment, check=False,
-                         capture_output=True, text=True)
+    checkout's) and these tests: its text, or the file at its path, in `cwd` where given, compiling into
+    `cache_dir` under XLA `flags` where given, else into this process's cache under its flags."""
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests"))),
+                   **({} if cache_dir is None else {"JAX_COMPILATION_CACHE_DIR": str(cache_dir)}),
+                   **({} if flags is None else {"XLA_FLAGS": flags})}
+    command = [str(script)] if isinstance(script, Path) else ["-c", script]
+    run = subprocess.run([sys.executable, *command, *arguments], env=environment, check=False,
+                         capture_output=True, text=True, cwd=cwd)
     assert run.returncode == 0, run.stderr[-3000:]
     return json.loads(run.stdout.splitlines()[-1])
 
@@ -234,7 +238,21 @@ def dew_train(directory, environment: Mapping[str, str], *arguments: str) -> Non
 
 
 def logged_losses(run_directory) -> list[float]:
-    """The training losses a run in `run_directory` logged, in step order (its tracking's scalars)."""
-    rows = (Path(run_directory) / "tracking" / "scalars.jsonl").read_text().splitlines()
-    scalars = [json.loads(row)["scalars"] for row in rows]
-    return [row["train/loss"] for row in scalars if "train/loss" in row]
+    """The training losses a run in `run_directory` logged, in step order (its tracking's scalars,
+    `LocalTracker.scalars`)."""
+    from dew.training import LocalTracker
+
+    reports = LocalTracker(Path(run_directory) / "tracking").scalars()
+    return [values["train/loss"] for _, values in reports if "train/loss" in values]
+
+
+def running(pid: int) -> bool:
+    """Whether process `pid` runs: it exists and has not ended. A zombie has ended: it waits only for its
+    reaper, which for an orphan may be a child subreaper that reaps when its own job ends, as a GPU node's
+    job runner does. One that ends between the open of its state and the read fails the read with ESRCH,
+    and has ended too."""
+    try:
+        status = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return status.rsplit(")", 1)[1].split()[0] != "Z"

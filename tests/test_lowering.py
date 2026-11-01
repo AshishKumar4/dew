@@ -2,10 +2,10 @@
 
 import json
 import logging
+import math
 import os
-import subprocess
+import re
 import sys
-import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,26 +20,39 @@ from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
     GpuTarget,
-    Refusal,
     Route,
     architecture,
     assumed,
     chosen as kernel_choices,
+    chosen_kernel,
     device_generation,
     family,
     fp8_tensor_cores,
     gpu_mesh,
     gpu_target,
-    measured_kernel,
     route,
     routes,
     runtime_facts,
     triton_runs,
 )
-from dew.nn.kernels.templates import bundles
-from dew.training._lowering import triton_kernels
+from dew.nn.kernels.selection import Refusal
+from dew.telemetry import instrumentation
+from dew.training._lowering import KernelReport, custom_calls, kernel_report, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_a_kernel_report_keeps_distinct_refusals_with_the_same_message():
+    first = Route("ssd", "xla", "pallas", Refusal("width", "unsupported", "workspace"),
+                  "xla", "sm90", "training", forced="pallas")
+    second = Route("ssd", "xla", "pallas", Refusal("dtype", "unsupported", "arithmetic"),
+                   "xla", "sm90", "training")
+    counted = {}
+    for entry in KernelReport((first, second, first), ()).record()["routes"]:
+        count = entry.pop("count")
+        entry["refusal"] = Refusal(**entry["refusal"])
+        counted[Route(**entry)] = count
+    assert counted == {first: 2, second: 1}
 
 
 def _doubled(x):
@@ -63,7 +76,7 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
         assert triton_kernels(jax.jit(_doubled).lower(x)) == {}
 
 
-# The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
+# The Triton kernels each Pallas kernel a selector can take lowers to, by their `pallas_call` names,
 # and the probe that runs them: an expert layer's forward and backward (`_experts_lowered`), a
 # Mamba-2 layer's (`_mamba2_lowered`), or a model step ("step").
 FAMILIES = {
@@ -81,26 +94,218 @@ FAMILIES = {
         "chunk_cumsum_bwd")}),
 }
 
-GPUS = sorted({generation for generation, target in TARGETS.items()
-               if generation.startswith('sm') and target.kernels}
-              | {'sm80', 'sm120'}, key=lambda generation: int(generation[2:]))
-"""Every CUDA generation a KERNELS row names, and the A100's and the G4's, which Dew's sessions take."""
+GPUS = ['sm80', 'sm89', 'sm90', 'sm120']
+"""The CUDA generations Dew's sessions take and its measured cells name: the A100's, the L4's, the H100's
+and the G4's."""
 
-SHORT_CONV = {"short_conv_forward", "short_conv_backward"}
-"""The short conv's kernels (`causal_conv1d`), which every GPU step with a recurrent mixer calls."""
-
-
-def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
-    """The Pallas choices `generation`'s rows name whose kernels `probe` runs."""
-    return {(choice, kernel) for choice, kernel in gpu_target(generation).kernels.items()
-            if (choice, kernel) in FAMILIES and FAMILIES[choice, kernel][0] == probe}
+GMM = 2 * 256 * 128 * 128
+"""The multiply-adds of each grouped product of the step `_reported` lowers: forward, input and weight
+gradients of 256 rows by 128 by 128."""
 
 
-def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
-    """A Pallas kernel KERNELS chooses for some GPU is one this file lowers for that GPU on a CPU: a new
-    row needs its kernels in FAMILIES, so no Triton lowering first runs in a GPU session's compile."""
-    named = {(choice, kernel) for target in TARGETS.values() for choice, kernel in target.kernels.items()
-             if kernel in PALLAS_CHOICES}
+def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
+    """A grouped GEMM's forward and backward, `layers` times over one shape (as a model's same-shape layers
+    each call it, its kernels lowered once, `tuning.lowered_once`), unrolled or under a scan (`scanned`, as
+    `scan_layers=True` runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
+    `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
+    from dew.nn.kernels.templates.gemm import template
+
+    def step(x, w, sizes):
+        def layer(x, w, scale):
+            return template.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+
+        def loss(x, w):
+            if scanned:
+                scales = jnp.arange(1, layers + 1, dtype=x.dtype)
+                return jax.lax.scan(lambda total, scale: (total + layer(x, w, scale), None),
+                                    jnp.float32(0), scales)[0]
+            return sum(layer(x, w, layer_index + 1) for layer_index in range(layers))
+
+        return jax.grad(loss, argnums=(0, 1))(x, w), _doubled(x)
+
+    x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+        lowered = jax.jit(step).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
+    return lowered, found
+
+
+def templated_calls(record) -> dict[str, int]:
+    """A kernel report's template launches, by kernel name, with the calls of each."""
+    return {entry["name"]: entry["calls"] for entry in record["launches"] if entry["kind"] == "mosaic_gpu"}
+
+
+@pytest.mark.parametrize("stacked", ["one", "unrolled", "scanned"])
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_as_it_does(generation,
+                                                                                             stacked):
+    """A grouped GEMM's step lowered for the GPU (row 1895): its kernel report lists the program's
+    launches, the template's by kernel name with the FLOPs each states, a Triton launch's stating none,
+    and the FLOP count of the same program counts the stated FLOPs and leaves out, as unsized, the
+    launches the report does. Two same-shape layers, whose kernels lower once and run from each layer's
+    call (row 2905), or under a scan whose body runs them once a trip (row 2933), make twice one layer's
+    launches and FLOPs in both."""
+    from dew.telemetry.instrumentation import hlo_flops
+
+    layers = 1 if stacked == "one" else 2
+    lowered, found = _reported(generation, layers, scanned=stacked == "scanned")
+    record = kernel_report(found, lowered).record()
+    if layers > 1:
+        lowered_alone, found_alone = _reported(generation)
+        once = templated_calls(kernel_report(found_alone, lowered_alone).record())
+        assert once and templated_calls(record) == {name: layers * calls for name, calls in once.items()}
+    launches = {entry["name"]: entry for entry in record["launches"]}
+    templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
+    assert all(entry["flops"] == entry["calls"] * GMM for entry in templated)
+    assert launches["doubled"]["kind"] == "triton" and launches["doubled"]["flops"] is None
+    unstated = sum(entry["calls"] for entry in record["launches"] if entry["flops"] is None)
+    assert record["unsized"] == unstated
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None
+    assert (flops.hardware, flops.unsized) == (sum(entry["flops"] for entry in templated), unstated)
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(generation):
+    """A grouped GEMM's forward in a while loop of no trips, its counter counting from 0 while below 0: the
+    template's kernels, lowered once in a function of their own (`tuning.lowered_once`), which JAX lowers
+    and compiles, so the compile gate's inventory holds them (`kernel_calls(..., unrun=True)`), and which
+    launch none, so the kernel report and the FLOP count leave them out alike, the step's Triton kernel its
+    one launch (2958's review: a kernel of no runs once turned a live kernel's stated FLOPs unknown)."""
+    from dew.nn.kernels.templates.gemm import template
+    from dew.telemetry.instrumentation import hlo_flops
+    from dew.training._lowering import kernel_calls
+
+    def step(x, w, sizes):
+        def body(carry):
+            trip, total = carry
+            product = template.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            return trip + 1, total + product
+
+        _, total = jax.lax.while_loop(lambda carry: carry[0] < 0, body, (jnp.int32(0), jnp.float32(0)))
+        return total, _doubled(x)
+
+    x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+        lowered = jax.jit(step).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
+    assert any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered, unrun=True))
+    assert not any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered))
+    record = kernel_report(found, lowered).record()
+    assert not templated_calls(record)
+    assert triton_kernels(lowered) == {"doubled": 1}
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None and flops.hardware == 0
+    assert record["unsized"] == flops.unsized
+
+
+@pytest.mark.parametrize(("start", "bound", "step", "bits", "signed", "trips"), [
+    (0, 12, 1, 32, True, 12), (0, 12, 5, 32, True, 3), (4, 2, 1, 32, True, 0), (0, 12, 0, 32, True, math.inf),
+    (0, 127, 1, 8, True, 127), (0, 128, 1, 8, True, math.inf), (0, 128, 1, 8, False, 128),
+    (250, 260, 3, 8, False, math.inf)])
+def test_a_counted_loops_trips_are_one_rule_for_an_executable_and_a_lowered_program(start, bound, step, bits,
+                                                                                    signed, trips):
+    """The trips of a loop counting an integer from `start` by `step` below `bound`, by the one rule both an
+    executable's loop and a lowered program's are read by (`instrumentation.counted_trips`, row 2945): the
+    ceiling of the span over the step, none for a bound below the start, and infinite for a step that is not
+    positive or a last step its counter's type cannot hold (signed or not), which a wrapped counter need
+    never reach."""
+    from dew.telemetry.instrumentation import counted_trips
+
+    assert counted_trips(start, bound, step, bits, signed=signed) == trips
+
+
+def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
+    """A function's runs from the entry (`instrumentation.call_weights`) take nothing from a call that runs
+    none: one in a loop of no trips inside a function of unknown runs (a loop of no static count around
+    it), so a kernel the entry also calls once runs once, known, not unknown (row 2933's review)."""
+    from dew.telemetry.instrumentation import call_weights
+
+    weights = call_weights({"main": {"f": math.inf, "k": 1.0}, "f": {"k": 0.0}, "k": {}}, "main")
+    assert weights == {"main": 1.0, "f": math.inf, "k": 1.0}
+
+
+def test_a_kernel_is_named_from_its_location_wherever_the_location_nests_the_name():
+    """A Mosaic GPU call's kernel name and launch (`_lowering._kernel_name`) from its location's name stack
+    wherever the location nests it: its own, a call site's callee's, a fused location's part (a rewrite
+    that merged operations); a location that carries no name gives none, and the report names the call by
+    its hash."""
+    from jax.extend.mlir import ir
+
+    from dew.training import _lowering
+
+    with ir.Context():
+        named = ir.Location.name("jit(step)/attention_forward__l0123456789/mpmd_map")
+        source = ir.Location.file("model.py", 1, 1)
+        for location in (named, ir.Location.callsite(named, [source]), ir.Location.fused([source, named])):
+            assert _lowering._kernel_name(location) == ("attention_forward", "0123456789")
+        assert _lowering._kernel_name(ir.Location.fused([source])) is None
+
+
+def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_unsized():
+    """dew_cutlass's grouped GEMMs, lowered for the GPU, count each token row's product once in the FLOP
+    count and in the kernel report; a custom call nothing sizes counts as an unsized launch in both."""
+    from dew.telemetry.instrumentation import hlo_flops
+
+    tokens, kernel = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 64),
+                                                                                          jnp.bfloat16)
+    cotangent, sizes = jax.ShapeDtypeStruct((256, 64), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    def step(tokens, kernel, cotangent, sizes):
+        out = jax.ffi.ffi_call("dew_cutlass_grouped_gemm", jax.ShapeDtypeStruct((256, 64), jnp.bfloat16))(
+            tokens, kernel, sizes, transpose_w=False)
+        gradient = jax.ffi.ffi_call("dew_cutlass_grouped_gemm_k", jax.ShapeDtypeStruct(
+            (2, 128, 64), jnp.bfloat16))(tokens, cotangent, sizes)
+        unknown = jax.ffi.ffi_call("an_unknown_kernel", jax.ShapeDtypeStruct((256, 64), jnp.bfloat16))(out)
+        return unknown, gradient
+
+    lowered = jax.jit(step).trace(tokens, kernel, cotangent, sizes).lower(lowering_platforms=("cuda",))
+    record = kernel_report((), lowered).record()
+    assert [(entry["kind"], entry["name"], entry["calls"]) for entry in record["launches"]] == [
+        (None, "an_unknown_kernel", 1), ("grouped_gemm", "dew_cutlass_grouped_gemm", 1),
+        ("grouped_gemm", "dew_cutlass_grouped_gemm_k", 1)]
+    assert record["unsized"] == 1
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None
+    assert (flops.hardware, flops.unsized) == (2 * 2 * 256 * 128 * 64, 1)
+
+
+def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
+    """The TPU grouped GEMM's two launches, lowered for a TPU on this CPU, state their products'
+    FLOPs (`templates.gemm.cost`), which the kernel report and the FLOP count both read."""
+    from dew.nn.kernels.templates.gemm import mosaic_tpu
+    from dew.telemetry.instrumentation import hlo_flops
+
+    blocks = mosaic_tpu.Blocks(128, 128, 128)
+    lhs, rhs = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128),
+                                                                                    jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    def step(lhs, rhs, sizes):
+        out = mosaic_tpu.gmm(lhs, rhs, sizes, blocks=blocks, transpose_rhs=False, out_dtype=jnp.bfloat16)
+        return out, mosaic_tpu.tgmm(lhs, out, sizes, blocks=blocks, out_dtype=jnp.bfloat16)
+
+    with assumed("v6e"):
+        lowered = jax.jit(step).trace(lhs, rhs, sizes).lower(lowering_platforms=("tpu",))
+    record = kernel_report((), lowered).record()
+    assert [(entry["kind"], entry["name"], entry["flops"]) for entry in record["launches"]] == [
+        ("mosaic_tpu", "dew_gmm", GMM), ("mosaic_tpu", "dew_tgmm", GMM)]
+    assert record["unsized"] == 0
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None
+    assert (flops.hardware, flops.unsized) == (2 * GMM, 0)
+
+
+def test_every_pallas_kernel_a_measured_cell_runs_has_a_lowering_probe():
+    """A Pallas kernel a selector's measured cell runs on some GPU (`Op.declared`) is one this file lowers
+    for that GPU on a CPU: a new cell needs its kernels in FAMILIES, so no Triton lowering first runs in a
+    GPU session's compile."""
+    from dew.nn.kernels import grouped_matmul, norm_swiglu
+
+    named = {(op.choice, kernel) for op in (norm_swiglu.NORM, norm_swiglu.SWIGLU, grouped_matmul.GROUPED)
+             for kernel, _ in op.declared.values() if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
 
 
@@ -110,9 +315,8 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
 
     The reverse pass's compensated sums and their rounded assembly must lower
     too; interpreting on CPU cannot expose broken multi-result GPU assembly.
-    The programs' partial sums meet in an XLA reduction, not a third kernel.
     """
-    from dew.nn.attention import rms_normalized
+    from dew.nn.norms import rms_normalized
 
     def forward_backward(x, scale, seed):
         def norm(x, scale):
@@ -125,15 +329,14 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
     scale = jax.ShapeDtypeStruct((17,), jnp.float32)
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
-    assert triton_kernels(lowered) == {'rms_norm_forward': 1, 'rms_norm_backward': 1}
+        jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
 
 
 def _step_lowered(generation: str):
     """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
     delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
     model's and the short conv's kernels take), lowered for `generation` from abstract state as
-    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`)."""
+    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`): the `Lowered` its dry run raises."""
     import optax
 
     from dew.interop.hf_decoders import translate_config
@@ -152,27 +355,59 @@ def _step_lowered(generation: str):
     with pytest.raises(Lowered) as lowered:
         # A row for each of the host's devices, which the trainer's data axis splits.
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
-    return lowered.value.lowered
+    return lowered.value
 
 
 @pytest.mark.parametrize("generation", GPUS)
-def test_a_hybrid_language_model_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation):
-    """A Qwen 3.5 hybrid's training step, lowered on this CPU for the GPU, calls the short conv's
-    kernels, those of every Pallas choice the generation's row names for a step's layers (the norms and
-    SwiGLU), and the gated delta rule's training kernels (`recurrence_chunk.GATED_DELTA`, no row read):
-    the recurrence template's Mosaic launches on a warpgroup-MMA GPU, whose training cell it takes, no
-    Triton kernel among them, else the port's, so none was interpreted or refused there."""
-    delta = set() if family(generation) == 'wgmma' else FAMILIES['gated_delta_rule', 'fla'][1]
-    expected = SHORT_CONV | delta | set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
-    assert set(triton_kernels(_step_lowered(generation))) == expected
+def test_a_hybrid_language_model_step_lowers_for_every_gpu(generation):
+    """A Qwen 3.5 hybrid's training step, its gated delta nets, attention, norms and SwiGLU, lowers on this
+    CPU for every GPU Dew's sessions take (`GPUS`): its dry run raises the `Lowered` program."""
+    _step_lowered(generation)
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop_count_does(generation):
+    """A bf16 language model of two like layers, its stack scanned (`scan_layers=True`, as host and bank
+    layouts require) or unrolled, its training step lowered for the GPU through `lower_for`
+    (`--trainer.lower-for`'s dry run): its kernel report counts each kernel's launches and FLOPs alike both
+    ways, every layer's, and as the FLOP count of the same program counts them (row 2933: a scan's body
+    once, its kernels at half)."""
+    import optax
+
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.telemetry.instrumentation import hlo_flops
+    from dew.training import Trainer
+    from dew.training._lowering import Lowered
+
+    def reported(scanned: bool) -> tuple[dict, object]:
+        model = CausalTransformer(vocab_size=256, emb_features=128, num_layers=2, num_heads=2,
+                                  mlp_features=256, max_seq_len=128, dtype=jnp.bfloat16, scan_layers=scanned)
+        trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
+                          lower_for=generation)
+        state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+        with pytest.raises(Lowered) as lowered:
+            trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
+        return lowered.value.kernels.record(), hlo_flops(lowered.value.lowered.as_text(dialect="hlo"))
+
+    (scanned, counted), (unrolled, alike) = reported(scanned=True), reported(scanned=False)
+
+    def launches(record) -> dict[str, tuple]:
+        return {entry["name"]: (entry["calls"], entry["flops"]) for entry in record["launches"]}
+
+    assert launches(scanned) and launches(scanned) == launches(unrolled)
+    # The FLOP count sizes the launches the report states and leaves out the ones it leaves unsized, so
+    # both count every layer's: the same FLOPs and the same unsized launches scanned as unrolled.
+    assert counted is not None and alike is not None
+    assert (counted.hardware, counted.unsized) == (alike.hardware, alike.unsized)
+    assert scanned["unsized"] == unrolled["unsized"] == counted.unsized
 
 
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
-def test_a_packed_delta_net_lowers_onto_the_port_whatever_documents_its_rows_declare(bound):
+def test_a_packed_delta_net_lowers_for_an_a100_whatever_documents_its_rows_declare(bound):
     """A bf16 gated delta net over packed rows of 128 tokens in 8 documents, their bound undeclared
-    (so the row's length, 128, far more than its two chunks) or declared at 64, lowered for an A100 on
-    this CPU: its forward and backward run on the port's kernels, which keep only the memories passing
-    between a document's chunks, whatever the bound."""
+    (so the row's length, 128, far more than its two chunks) or declared at 64: its forward and backward
+    lower for an A100 on this CPU, whatever the bound."""
     from dew.batch import coordinates
     from dew.nn.inputs import AttentionMetadata, MixerCall
     from dew.nn.linear import GatedDeltaNet
@@ -189,8 +424,7 @@ def test_a_packed_delta_net_lowers_onto_the_port_whatever_documents_its_rows_dec
 
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), "sm80")
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
-    assert FAMILIES[('gated_delta_rule', 'fla')][1] <= set(triton_kernels(lowered))
+        jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
 
 
 def _experts_lowered(generation: str, implementation: str):
@@ -213,30 +447,178 @@ def _experts_lowered(generation: str, implementation: str):
         return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
 
 
+COLLECTIVES = re.compile(r"stablehlo\.(all_gather|all_reduce|all_to_all|reduce_scatter|collective_permute|"
+                         r"collective_broadcast)")
+"""The collectives a lowered program states itself (a `shard_map`'s; XLA's partitioner adds its own later)."""
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_kernel_launches_only_where_every_axis_of_its_mesh_is_manual(generation):
+    """Row 1923: the toolkit's launch point refuses, as it traces, a kernel under a mesh axis larger than
+    one device that XLA's partitioner would split around it (`sharding.per_shard`); inside a `shard_map`
+    holding that axis manual, each device's launch reads its own rows and lowers."""
+    from jax.sharding import AbstractMesh, AxisType, PartitionSpec
+
+    from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    x, w = jax.ShapeDtypeStruct((512, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    with assumed(generation):
+        target = gpu_target(generation)
+        launch = grouped_matmul.MosaicGmm()
+        bound = launch.bind(x, w, sizes, interpret=False, out_dtype="bfloat16", trans_rhs=False)
+        tile = launch.derived(bound, target)
+
+    def launched(x, w, sizes):
+        return mosaic_gpu.gmm(x, w, sizes, tiles=tile, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                              multiprocessors=target.multiprocessors)
+
+    mesh = gpu_mesh(AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        with pytest.raises(ValueError):
+            jax.jit(launched).trace(x, w, sizes)
+        per_device = jax.shard_map(launched, mesh=mesh, in_specs=(PartitionSpec("data"), PartitionSpec(),
+                                                                  PartitionSpec()),
+                                   out_specs=PartitionSpec("data"), check_vma=False)
+        jax.jit(per_device).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
+
+
+def _expert_layer_step(rows: int):
+    """An expert layer's loss and its arguments over `rows` tokens, top-2 of 8 experts: its grouped GEMM
+    launches' rows are the routed slots, two a token."""
+    from dew.nn.moe import ExpertMLP
+
+    experts = ExpertMLP(num_experts=8, hidden_features=128, out_features=64, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((rows, 64), jnp.bfloat16)
+    indices = jnp.asarray(np.arange(rows * 2).reshape(rows, 2) % 8, jnp.int32)
+    weights = jnp.full((rows, 2), 0.5, jnp.float32)
+    variables = jax.eval_shape(lambda: experts.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype), weights,
+                                                    indices))
+
+    def loss(variables, x):
+        return experts.apply(variables, x, weights, indices).astype(jnp.float32).sum()
+
+    return loss, (variables, x)
+
+
+def _norm_step(rows: int):
+    """A residual stream's fused RMSNorm over `[2, rows / 2, 256]`, its scale replicated."""
+    from dew.nn.kernels import norm_swiglu
+
+    def portable(x, scale):
+        wide = x.astype(jnp.float32)
+        return (wide * jax.lax.rsqrt(jnp.mean(wide * wide, -1, keepdims=True) + 1e-6) * scale).astype(x.dtype)
+
+    def loss(x, scale):
+        y = norm_swiglu.rms_norm(x, scale, 1e-6, jnp.bfloat16, offset=False, after_cast=False,
+                                 portable=portable,
+                                 axes=("activation_batch", "activation_length", "activation_embed"))
+        return y.astype(jnp.float32).sum()
+
+    return loss, (jax.ShapeDtypeStruct((2, rows // 2, 256), jnp.bfloat16),
+                  jax.ShapeDtypeStruct((256,), jnp.float32))
+
+
+def _swiglu_step(rows: int):
+    """A feed-forward's fused SiLU product over `[2, rows / 2, 512]`."""
+    from dew.nn.kernels import norm_swiglu
+
+    def loss(gate, up):
+        def portable(gate, up):
+            return (jax.nn.silu(gate.astype(jnp.float32)) * up).astype(gate.dtype)
+
+        y = norm_swiglu.swiglu(gate, up, portable,
+                               axes=("activation_batch", "activation_length", "activation_mlp"))
+        return y.astype(jnp.float32).sum()
+
+    shaped = jax.ShapeDtypeStruct((2, rows // 2, 512), jnp.bfloat16)
+    return loss, (shaped, shaped)
+
+
+def _short_conv_step(rows: int):
+    """A depthwise causal conv over `[2, rows / 2, 256]` with its taps and bias replicated."""
+    from dew.nn.linear import causal_conv1d
+
+    def loss(x, taps, bias):
+        return causal_conv1d(x, taps, activation=True, bias=bias).astype(jnp.float32).sum()
+
+    return loss, (jax.ShapeDtypeStruct((2, rows // 2, 256), jnp.bfloat16),
+                  jax.ShapeDtypeStruct((256, 4), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+
+
+def _selective_step(rows: int):
+    """A bf16 Mamba layer over `[2, rows / 2, 64]`, one channel block of 128 wide, its scan the template's
+    (`generation.chosen`): its scan runs per shard of rows, B and C every channel's (`manual_map`)."""
+    from dew.nn.mixers.mamba import Mamba
+
+    layer = Mamba(emb_features=64, intermediate_size=128, state_size=16, time_step_rank=8, chunk_size=32,
+                  dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, rows // 2, 64), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    from dew.nn.kernels.generation import chosen
+
+    def loss(variables, x):
+        with chosen(selective_scan="mosaic_gpu"):
+            return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    return loss, (variables, x)
+
+
+PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "swiglu": _swiglu_step,
+                   "short conv": _short_conv_step, "selective scan": _selective_step}
+
+UNTAKEN = {("sm80", "selective scan")}
+"""The steps whose template a GPU's kernel refuses whatever a call names: an A100's selective scan, its
+strided channel blocks' untiled copies wrong until the jax fork's post42 (`recurrence_chunk.SELECTIVE`)."""
+"""Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
+ops here."""
+
+
+def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
+    """The Pallas launches (`custom_calls`) of `loss`'s value and gradient lowered for `generation`'s GPU on
+    an abstract mesh of `devices` that splits the rows, and the program's text."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    mesh = gpu_mesh(AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.value_and_grad(loss, argnums=tuple(range(len(args))))).trace(*args).lower(
+            lowering_platforms=("cuda",))
+    calls = [call for call in custom_calls(lowered)
+             if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
+    return calls, lowered.as_text()
+
+
+@pytest.mark.parametrize(("generation", "op"),
+                         [(generation, op) for generation in ("sm80", "sm90") for op in PER_SHARD_STEPS
+                          if (generation, op) not in UNTAKEN])
+def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(generation, op):
+    """Bible §7, row 1923: an op's forward and backward, lowered for the GPU on an abstract two-device mesh
+    that splits its rows, launches the kernels it launches on one device, each reading fewer elements than
+    there (its device's rows, its replicated parameters whole), never the whole batch; and the program's
+    only collective is the reduction of its replicated parameters' gradients over the data axis."""
+    loss, args = PER_SHARD_STEPS[op](384)
+    whole, _ = _kernel_launches(loss, args, generation, 1)
+    split, text = _kernel_launches(loss, args, generation, 2)
+
+    def elements(call) -> int:
+        return sum(math.prod(shape) for shape in call.operands)
+
+    pairs = list(zip(split, whole, strict=True)) if len(split) == len(whole) else []
+    assert whole and pairs, (op, [call.target for call in whole], [call.target for call in split])
+    assert all(elements(on_two) < elements(on_one) for on_two, on_one in pairs), (
+        op, [(elements(on_two), elements(on_one)) for on_two, on_one in pairs])
+    assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
+
+
 @pytest.mark.parametrize("generation", GPUS)
-def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
-    """'auto' runs the grouped matmul's kernels on every GPU generation, each forward and backward
-    launch of each projection the route its cell takes there (its route says which): the template's
-    Mosaic GPU launch, or the old route `grouped_matmul.DECLARED` lists. On an Ampere-class GPU the
-    forward runs Mosaic GPU's and the gradients Triton's, whose two kernels lower; on one whose family has
-    no bundle (`bundles.of`: consumer Blackwell's) Triton's runs all three; on Hopper Triton's runs only
-    where a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts'
-    SiLU product takes the fused SwiGLU where the row names it, forward and backward, as every fused
-    kernel is differentiated through its portable arithmetic (`generation.linear_tangent`)."""
-    with routes() as taken:
-        lowered = _experts_lowered(generation, 'auto')
-    # The layer's own launches, as traced for `generation`; its initialization runs on the CPU.
-    kernels = {route.kernel for route in taken
-               if route.choice == 'grouped_matmul' and route.target == generation}
-    grouped = {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}
-    assert kernels and kernels <= {'triton', 'mosaic_gpu'}
-    lowered_grouped = set(triton_kernels(lowered)) & grouped
-    if not gpu_target(generation).wgmma:
-        bundled = bundles.of(generation, jnp.bfloat16) is not None
-        assert kernels == ({'mosaic_gpu', 'triton'} if bundled else {'triton'}) and lowered_grouped == grouped
-    assert bool(lowered_grouped) == ('triton' in kernels)
-    swiglu = set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
-    assert set(triton_kernels(lowered)) - grouped == swiglu
+def test_an_expert_layer_lowers_for_every_gpu(generation):
+    """An expert layer's bf16 forward and backward under 'auto', its grouped matmul and SiLU product as
+    the generation's cells run them, lowers on this CPU for every GPU a row names, and the A100's and the
+    G4's."""
+    _experts_lowered(generation, 'auto')
 
 
 def _mamba2_lowered(generation: str):
@@ -262,15 +644,61 @@ def _mamba2_lowered(generation: str):
         return tuning.tune(lower)[0]
 
 
+def _mamba1_lowered(generation_name: str, layers: int = 1):
+    """`layers` bf16 Mamba layers of one shape in series, forward and backward, their selective scans the
+    template's where its selector takes the call (`recurrence_chunk.SELECTIVE`, the template chosen), lowered
+    for `generation_name` after its launches are settled as the trainer settles a step's (`tuning.tune`)."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import chosen
+    from dew.nn.mixers.mamba import Mamba
+
+    layer = Mamba(emb_features=64, intermediate_size=256, state_size=16, time_step_rank=8, chunk_size=32,
+                  dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 128, 64), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        for _ in range(layers):
+            x = layer.apply(variables, x)
+        return jnp.asarray(x).astype(jnp.float32).sum()
+
+    def lower():
+        return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation_name)
+    with assumed(generation_name), jax.sharding.use_abstract_mesh(mesh), chosen(selective_scan="mosaic_gpu"):
+        return tuning.tune(lower)[0]
+
+
+@pytest.mark.parametrize("generation_name", ["sm90"])
+def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation_name):
+    """A Mamba layer, its selective scan the template's and its launches settled as the trainer settles
+    them, lowers on this CPU for each GPU the template takes it on (an H100; an A100's strided copies wait
+    for post42, `UNTAKEN`), forward and backward each a Mosaic GPU launch."""
+    from dew.training._lowering import kernel_calls
+
+    names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))
+             if call.kind == "mosaic_gpu"}
+    assert {"selective_scan", "selective_scan_backward"} <= names, names
+
+
+def test_two_mamba_layers_lower_the_template_scans_launches_once():
+    """Two Mamba layers of one shape, forward and backward, lowered for an H100: each of the selective
+    template's launches is one Mosaic GPU call in the lowered program, which both layers call
+    (`tuning.lowered_once`), as many as one layer's. Built in each call, a model's layers' identical
+    launches were each traced and lowered again (row 2969)."""
+    def launches(layers: int) -> int:
+        return len(_mosaic_calls(_operations(_mamba1_lowered("sm90", layers))))
+
+    one = launches(1)
+    assert one > 0 and launches(2) == one
+
+
 @pytest.mark.parametrize("generation", GPUS)
-def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_chooses(generation):
-    """A Mamba-2 layer, its launches settled as the trainer settles them, lowers to the short conv's
-    kernels and mamba_ssm's fourteen ported kernels, which take the scan on any GPU Dew's Triton kernels
-    run on (`recurrence_chunk.SCAN`, no row read). Its unweighted norm takes the fused RMSNorm where the
-    row names it."""
-    expected = SHORT_CONV | FAMILIES['ssd', 'pallas'][1]
-    expected |= set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == "rms_norm"))
-    assert set(triton_kernels(_mamba2_lowered(generation))) == expected
+def test_a_mamba2_layer_lowers_for_every_gpu(generation):
+    """A Mamba-2 layer, its launches settled as the trainer settles them, lowers on this CPU for every GPU
+    a row names, and the A100's and the G4's, its scan, short conv and unweighted norm included."""
+    _mamba2_lowered(generation)
 
 
 def test_a_mamba2_layer_lowers_its_ssd_scan_on_each_shard_of_a_tpu_mesh():
@@ -293,11 +721,219 @@ def test_a_mamba2_layer_lowers_its_ssd_scan_on_each_shard_of_a_tpu_mesh():
     mesh = AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
     with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=("tpu",))
-    calls = [line for line in lowered.as_text().splitlines()
-             if "tpu_custom_call" in line and "stablehlo.custom_call" in line]
+    calls = [call for call in custom_calls(lowered) if call.target == "tpu_custom_call"]
     assert len(calls) == 2, calls
     for call in calls:
-        assert "tensor<1x128x4x64xf32>" in call or "tensor<1x4x128x64xf32>" in call, call
+        assert {(1, 128, 4, 64), (1, 4, 128, 64)} & {*call.operands, *call.results}, call
+
+
+Shapes = set[tuple[int, ...]]
+
+
+def _packed_step(rows: int, devices: int) -> tuple[jax.stages.Lowered, Shapes]:
+    """A bf16 gated delta net's forward and gradient over `rows` rows of 128 tokens, each three packed
+    documents, its token coordinates built in the step as a trainer builds them once a batch
+    (`dew.batch.coordinates`), lowered for an assumed H100 over an abstract mesh of `devices` splitting its
+    rows (the recurrence template takes the H100's training cell), and its parameters' shapes."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(256, 1, 2, 128, 128, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((rows, 128, 256), jnp.bfloat16)
+    segments = np.repeat(np.searchsorted([40, 100], np.arange(128), side="right")[None] + 1, rows, axis=0)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x, segments):
+        metadata = AttentionMetadata(coordinates=coordinates(segments=segments, max_segments=3))
+        return jnp.asarray(layer.apply(variables, x, MixerCall(metadata=metadata))).astype(jnp.float32).sum()
+
+    device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90").abstract_device
+    mesh = AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    given = jax.ShapeDtypeStruct(segments.shape, jnp.int32)
+    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        traced = jax.jit(jax.value_and_grad(loss)).trace(variables, x, given)
+    shapes = {_squeezed(leaf.shape) for leaf in jax.tree.leaves(variables)}
+    return traced.lower(lowering_platforms=("cuda",)), shapes
+
+
+Operation = tuple[str, str, tuple, tuple]
+"""A lowered operation: its name, its callee or custom call's target, and its operands' and results'
+`(shape, element type)`."""
+
+
+def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
+    """Every operation of a lowered program in program order (its StableHLO module's walk, as
+    `dew.training._lowering.triton_calls` reads it)."""
+    from jax.extend.mlir import ir
+
+    found: list[Operation] = []
+
+    def typed(values) -> tuple:
+        tensors = [value.type for value in values if isinstance(value.type, ir.RankedTensorType)]
+        return tuple((tuple(tensor.shape), str(tensor.element_type)) for tensor in tensors)
+
+    def visit(operation: ir.Operation) -> ir.WalkResult:
+        attributes = operation.attributes
+        target = ""
+        if "call_target_name" in attributes:
+            target = ir.StringAttr(attributes["call_target_name"]).value
+        elif "callee" in attributes:
+            target = attributes["callee"].value
+        found.append((operation.name, target, typed(operation.operands), typed(operation.results)))
+        return ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None
+    with module.context:
+        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return found
+
+
+def _mosaic_calls(operations: list[Operation]) -> list[tuple]:
+    """The Mosaic GPU calls among a lowered program's `operations` (`_operations`), each its operands' and
+    results' shapes."""
+    return [(operands, results) for name, target, operands, results in operations
+            if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
+
+
+def _collective(name: str) -> str | None:
+    """The collective a lowered operation `name` is (`instrumentation.collective`, its StableHLO dialect's
+    name in HLO's spelling), None for any other."""
+    return instrumentation.collective(name.removeprefix("stablehlo.").replace("_", "-"))
+
+
+def _squeezed(shape) -> tuple[int, ...]:
+    """`shape` without its unit dimensions: a gradient's sum may reduce a parameter reshaped so (the short
+    conv's `[512, 1, 4]` weight as `[512, 4]`)."""
+    return tuple(size for size in shape if size != 1)
+
+
+def _template_launches(policy) -> int:
+    """The recurrence template's Mosaic GPU calls in a bf16 gated delta net's forward and gradient,
+    lowered for an assumed H100 (whose training cell the template takes), the loss under the remat rung
+    `policy` (`decoder_block.RematPolicy`; None, none)."""
+    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(256, 1, 2, 128, 128, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((1, 128, 256), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    if policy is not None:
+        loss = jax.checkpoint(loss, policy=RematPolicy(save=policy).checkpoint_policy())
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=("cuda",))
+    return sum(name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")
+               for name, target, *_ in _operations(lowered))
+
+
+def test_a_remat_rung_keeping_the_delta_rules_residuals_runs_the_templates_forward_once():
+    """A gated delta net under a remat rung that saves its delta rule's names (`DELTA_RULE_RESIDUALS`: its
+    output and the template's inverse and memory, named as the port names its own) runs the template's
+    forward launches once, as the layer without remat does, where the rung that saves nothing ('full')
+    replays them in the backward: a Qwen3.5-4B training step at 4x6,144 tokens a device under 'full' ran
+    each GDN layer's forward twice, 63.6 ms of its 1.6 s on an H100 (row 2023)."""
+    from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
+
+    unrematted, saved, full = (_template_launches(policy) for policy in (None, DELTA_RULE_RESIDUALS, ()))
+    assert unrematted == saved < full, (unrematted, saved, full)
+
+
+def test_a_packed_recurrence_runs_on_each_devices_own_rows():
+    """A packed gated delta net on a mesh splitting its rows runs on each device's rows, as its lowered GPU
+    program states it: lowered for an H100 over two devices and two rows, its recurrence template's Mosaic
+    GPU calls are one device's over one row, operand for operand (`recurrence_chunk.template_rule`, a
+    per-shard map); no scan (a cumsum, a reduce window) runs along the batch's flattened tokens, whose split
+    over a mesh XLA's GPU partitioner expands into a loop a token (the packed documents' offsets come from
+    the batch's `Coordinates.firsts`, a sort of each row's slots); and its only collectives are its
+    parameters' gradients' sums. On the whole batch every device of a 2xH100 FSDP run ran the
+    template on the global rows, and each layer's offsets took 97 loops of a token an iteration (row 1897,
+    bible 7's multi-device lowering). The final executable's loops need a GPU's compile; this proves their
+    cause absent from the program it compiles."""
+    (sharded, parameters), (local, _) = _packed_step(rows=2, devices=2), _packed_step(rows=1, devices=1)
+    operations = _operations(sharded)
+    calls = _mosaic_calls(operations)
+    assert calls and calls == _mosaic_calls(_operations(local))
+    scanned = [operands for name, target, operands, _ in operations
+               if name == "stablehlo.reduce_window" or (name == "func.call" and target.startswith("cumsum"))]
+    assert scanned and all(2 * 128 not in shape for operand in scanned for shape, _ in operand), scanned
+    reduced = {_squeezed(shape) for name, _, _, results in operations if _collective(name)
+               for shape, _ in results}
+    assert reduced <= parameters, (reduced, parameters)
+
+
+def _split_delta_forward(length: int, devices: int) -> jax.stages.Lowered:
+    """A bf16 gated delta net's forward over one row of `length` tokens, lowered for an assumed H100 over an
+    abstract mesh whose sequence axis splits it `devices` ways."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(256, 1, 2, 128, 128, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+    device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90").abstract_device
+    mesh = AbstractMesh((devices,), ("sequence",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        return jax.jit(layer.apply).trace(variables, x).lower(lowering_platforms=("cuda",))
+
+
+def test_a_gated_delta_net_split_over_the_sequence_runs_each_devices_own_slice():
+    """A gated delta net on a mesh splitting its sequence runs the recurrence on each device's slice, as its
+    lowered H100 program states it: over two devices and 384 tokens, every kernel call of the layer over one
+    device's 192 tokens is among its calls, operand for operand, but the conv's, which reads its three-token
+    halo too, beside its slice's summary (the rule from `[0 | I]`), where the rule ran the whole sequence on
+    every device before (row 1437); and its collectives are the halo's and the summaries' gathers alone, no
+    activation reduced (`recurrence_chunk.entering_memory`, `linear.sequence_conv`)."""
+    def kernels(operations: list[Operation]) -> list[tuple]:
+        return [(target, operands) for name, target, operands, _ in operations
+                if name == "stablehlo.custom_call"]
+
+    operations = _operations(_split_delta_forward(384, 2))
+    calls, local = kernels(operations), kernels(_operations(_split_delta_forward(192, 1)))
+    convolved = [(target, (((1, 195, 512), dtype), *rest)) for target, ((shape, dtype), *rest) in local
+                 if shape == (1, 192, 512)]
+    assert convolved and all(call in calls for call in convolved), (calls, local)
+    assert all(call in calls for call in local if call[1][0][0] != (1, 192, 512)), (calls, local)
+    collectives = {_collective(name) for name, *_ in operations if _collective(name)}
+    assert collectives <= {"all-gather", "collective-permute"}, collectives
+
+
+def _ssd_forward(generation: str, rows: int, devices: int) -> jax.stages.Lowered:
+    """A bf16 Mamba-2 layer's forward over `rows` rows of 128 tokens, its scan on the recurrence template
+    (`SCAN`'s 'mosaic_gpu', named: a declared cell may give the port the generation's forward), lowered for
+    an assumed `generation` over an abstract mesh of `devices` splitting its rows."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.mixers.mamba2 import Mamba2
+
+    layer = Mamba2(emb_features=128, num_heads=4, head_dim=64, state_size=64, chunk_size=64,
+                   dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((rows, 128, 128), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+    device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation).abstract_device
+    mesh = AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), kernel_choices(ssd="mosaic_gpu"):
+        return jax.jit(layer.apply).trace(variables, x).lower(lowering_platforms=("cuda",))
+
+
+def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows():
+    """A Mamba-2 layer's forward on a mesh splitting its rows runs the recurrence template's scan on each
+    device's rows (`SCAN`'s template, `recurrence_chunk.template_rule`, a per-shard map), as its lowered H100
+    program states it: lowered over two devices and two rows, its Mosaic GPU calls are one device's over one
+    row, operand for operand, and it holds no collective (bible 7's multi-device lowering, row 1963). An
+    A100's template refuses this scan: no config of mma.sync's fits it."""
+    sharded = _operations(_ssd_forward("sm90", rows=2, devices=2))
+    calls = _mosaic_calls(sharded)
+    assert calls and calls == _mosaic_calls(_operations(_ssd_forward("sm90", rows=1, devices=1)))
+    assert not [name for name, *_ in sharded if _collective(name)]
 
 
 @pytest.mark.parametrize("generation, cores", [
@@ -350,8 +986,7 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
 
-@pytest.mark.gpu(reason="reads a CUDA device's attributes")
-def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
+def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
     """The default device's shared memory a block and multiprocessors come from JAX's device: a bare
     target of its generation, holding none of the table's resources, takes the same ones the
     default device's target reports, and the row's own where the table records them."""
@@ -366,8 +1001,7 @@ def test_a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_
         assert named.shared_limit == row.shared_limit
 
 
-@pytest.mark.gpu(reason="reads a CUDA device's clocks from its driver")
-def test_a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
+def a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
     """The default device's multiprocessor clock and memory bandwidth, which JAX's device does not
     carry, come from the CUDA driver at the device's own ordinal (`local_hardware_id`, which a process
     seeing a subset of the GPUs numbers from zero): positive, and a GPU's bandwidth between that of the
@@ -378,9 +1012,7 @@ def test_a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver():
     assert min(rows) / 2 < target.memory_bandwidth < 2 * max(rows)
 
 
-@pytest.mark.gpu(reason="two processes, each seeing one of two GPUs")
-@pytest.mark.skipif(jax.default_backend() != "gpu" or len(jax.devices()) < 2, reason="needs two GPUs")
-def test_each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
+def each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
     """Two processes, each seeing one GPU (`CUDA_VISIBLE_DEVICES`): the second's device is global id 1
     and its own ordinal 0, and each process's kernel target holds the CUDA driver's clock, bandwidth and
     multiprocessors for that GPU, the same in both, as GPUs of one kind give."""
@@ -429,23 +1061,22 @@ def test_a_run_over_gpus_of_two_kinds_is_refused():
         _one_kind([gpu(0, 0, h100), gpu(1, 1, a100)])
 
 
-def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():
+def test_chosen_kernels_keep_other_choices_and_restore_them_after_an_exception():
     with assumed("sm80"):
-        measured = measured_kernel("attention", "xla")
         with kernel_choices(attention="xla", ssd="pallas"):
-            assert measured_kernel("attention", "flash") == "xla"
+            assert chosen_kernel("attention", "flash") == "xla"
             with pytest.raises(RuntimeError), kernel_choices(attention="flash"):
-                assert measured_kernel("attention", "xla") == "flash"
-                assert measured_kernel("ssd", "xla") == "pallas"
+                assert chosen_kernel("attention", "xla") == "flash"
+                assert chosen_kernel("ssd", "xla") == "pallas"
                 raise RuntimeError("the comparison ended")
-            assert measured_kernel("attention", "flash") == "xla"
-        assert measured_kernel("attention", "xla") == measured
+            assert chosen_kernel("attention", "flash") == "xla"
+        assert chosen_kernel("attention", "flash") == "flash"
 
 
 def test_a_function_jitted_before_a_choice_traces_again_within_it():
     @jax.jit
     def ported(x):
-        return x + (measured_kernel("ssd", "xla") == "pallas")
+        return x + (chosen_kernel("ssd", "xla") == "pallas")
 
     x = jnp.zeros((), jnp.int32)
     with kernel_choices(ssd="xla"):
@@ -460,94 +1091,49 @@ def test_a_choice_no_dispatch_reads_is_refused_by_name():
         pass
 
 
-def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_call_not_at_all():
-    """FlashAttention takes no float32 query, so a float32 call declines nothing and says so nowhere; a
-    bf16 call the dispatch sends off the kernel measured fastest for the call's own facts (packed
-    documents with no bound on a row's, on an A100) is the dispatch's own choice, logged once at INFO,
-    which a run's console does not show. The kernel it names is the target's, xla, as cuDNN takes no
-    segment ids."""
-    program = textwrap.dedent('''
-        import json
-        import logging
-        import jax.numpy as jnp
-        from dew.nn import attention
-        from dew.nn.kernels import generation
-
-        records = []
-        class Capture(logging.Handler):
-            def emit(self, record):
-                records.append([record.levelno, record.args[:3]])
-
-        logger = logging.getLogger(generation.__name__)
-        logger.setLevel(logging.INFO)
-        logger.addHandler(Capture())
-        with generation.assumed("sm80"), generation.routes() as found:
-            for dtype in (jnp.float32, jnp.bfloat16, jnp.bfloat16):
-                query = jnp.zeros((1, 8, 2, 64), dtype)
-                attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)))
-        print(json.dumps({"selected": found[-1].kernel, "records": records}))
-    ''')
-    fresh = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, check=True,
-                           timeout=120, env={**os.environ, "PYTHONPATH": str(ROOT / "src")})
-    logged = json.loads(fresh.stdout)
-    assert logged["selected"] == "xla"
-    assert logged["records"] == [[logging.INFO, ["attention", "xla", "flash"]]]
-
-
 def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     """`route` records a dispatch's decision in every `routes` block open, an inner block's in the
-    outer's too, as the target decides it: its generation within `assumed`, the kernel the row or
-    `chosen` prefers, a refusal's stable code and the row that tracks it, what the host ran, and the
+    outer's too, as the target decides it: its generation within `assumed`, the kernel `chosen` prefers
+    (else the one it ran), a refusal's stable code and the row that tracks it, what the host ran, and the
     reporting function."""
     def dispatch(kernel, refusal=None, ran=None):
         return route("ssd", kernel=kernel, refusal=refusal, ran=ran)
 
     with assumed("sm90"), routes() as outer:
         assert dispatch("pallas").kernel == "pallas"
-        row = measured_kernel("ssd", "pallas")
         head_dim = Refusal("head_dim", "a 320-wide head", "inherent")
         with kernel_choices(ssd="pallas"), routes() as inner:
             dispatch("xla", head_dim, ran="xla")
     test = test_a_route_records_the_targets_decision_where_its_dispatch_reports_it
     site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
     assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site)]
-    assert outer == [Route("ssd", "pallas", row, None, "pallas", "sm90", site), *inner]
+    assert outer == [Route("ssd", "pallas", "pallas", None, "pallas", "sm90", site), *inner]
 
 
-def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route(without_deterministic_ops):
-    """The attention dispatch, sending a packed bf16 call with no bound on a row's documents off the
-    flash kernel an A100 measured fastest, reports through the attention selector the target's route:
-    xla, as cuDNN takes no segment ids, the refusal's code and its declaration (inherent), and xla as
-    what ran, never a host fact as a refusal; a call flash takes reports flash and no refusal."""
-    from dew.nn import attention
+def test_a_route_off_its_preferred_kernel_is_logged_once_at_info_and_one_on_it_not_at_all():
+    """A dispatch off the kernel it prefers is its own choice, logged once a process at INFO for each kernel
+    and refusal, naming both (`route`); a dispatch that runs its preferred kernel logs nothing, so a run's
+    console shows neither."""
+    from dew.nn.kernels import generation
 
-    query = jnp.zeros((1, 8, 2, 64), jnp.bfloat16)
-    with assumed("sm80"), routes() as found:
-        ran = attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)))
-        attention.resolve_implementation("auto", query, query, segment_ids=jnp.ones((1, 8)), max_segments=2)
-    off, taken = [found_route for found_route in found if found_route.choice == "attention"]
-    assert (off.kernel, off.preferred, off.ran, off.target) == ("xla", "flash", ran, "sm80")
-    assert (off.refusal.code, off.refusal.row) == ("document_bound", "inherent")
-    assert off.site == "dew.nn.attention:resolve_implementation"
-    assert (taken.kernel, taken.preferred, taken.refusal) == ("flash", "flash", None)
+    logger, records = logging.getLogger(generation.__name__), []
 
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append((record.levelno, record.args[:3]))
 
-def test_a_call_off_a_kernel_for_its_cost_is_a_tracked_gap_and_one_past_its_tiles_inherent(
-        without_deterministic_ops):
-    """A packed call past FlashAttention's measured document cap goes off it for its cost, which the route
-    report counts as a gap tracked by its measurement's row, not as a limit; heads wider than any fused
-    kernel tiles are a limit no implementation of flash lifts, inherent (`tools/kernel_routes.verdict`)."""
-    from dew.nn import attention
-    from tools.kernel_routes import verdict
-
-    packed, wide = jnp.zeros((1, 8, 2, 64), jnp.bfloat16), jnp.zeros((1, 8, 2, 512), jnp.bfloat16)
-    with assumed("sm80"), routes() as found:
-        attention.resolve_implementation("auto", packed, packed, segment_ids=jnp.ones((1, 8)),
-                                         max_segments=99)
-        attention.resolve_implementation("auto", wide, wide, causal=True)
-    capped, widest = [found_route for found_route in found if found_route.choice == "attention"]
-    assert capped.refusal.code == "packed_documents" and verdict(capped).startswith("gap: measured")
-    assert widest.refusal.code == "head_dim" and verdict(widest) == "inherent"
+    capture, level = Capture(), logger.level
+    logger.addHandler(capture)
+    logger.setLevel(logging.INFO)
+    try:
+        off = Refusal("head_dim", "this test's own 300-wide head", "inherent")
+        for _ in range(2):
+            route("ssd", kernel="xla", preferred="pallas", refusal=off)
+        route("ssd", kernel="pallas", preferred="pallas")
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(level)
+    assert records == [(logging.INFO, ("ssd", "xla", "pallas"))]
 
 
 def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
@@ -568,3 +1154,216 @@ def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
         with routes() as found:
             jax.block_until_ready(outer(x))
         assert [found_route.choice for found_route in found] == ["ssd"]
+
+
+@pytest.mark.parametrize("scan", ["sum", "max", "min"])
+def test_a_blocked_prefix_scan_is_the_running_scan(scan):
+    """`prefix_sum`, `prefix_max` and `prefix_min` (forward and from the end) are numpy's running sum,
+    maximum and minimum, integer for integer, along either axis, over lengths short of one block, short of
+    whole blocks and of whole ones (`SCAN_BLOCKS`)."""
+    from dew.batch import SCAN_BLOCKS, prefix_max, prefix_min, prefix_sum
+
+    rng = np.random.default_rng(0)
+    for length in (5, SCAN_BLOCKS * 3 + 7, SCAN_BLOCKS * 8):
+        for axis in (0, 1):
+            values = rng.integers(-50, 50, (3, length) if axis else (length, 3)).astype(np.int32)
+            if scan == "sum":
+                np.testing.assert_array_equal(prefix_sum(values, axis), np.cumsum(values, axis))
+            elif scan == "max":
+                np.testing.assert_array_equal(prefix_max(values, axis), np.maximum.accumulate(values, axis))
+            else:
+                np.testing.assert_array_equal(prefix_min(values, axis), np.minimum.accumulate(values, axis))
+                reversed_min = np.flip(np.minimum.accumulate(np.flip(values, axis), axis), axis)
+                np.testing.assert_array_equal(prefix_min(values, axis, reverse=True), reversed_min)
+    empty = np.zeros((2, 0), np.int32)
+    for scanned in (prefix_sum(empty), prefix_max(empty), prefix_min(empty), prefix_min(empty, reverse=True)):
+        assert scanned.shape == (2, 0)
+
+
+def test_a_blocked_prefix_scan_keeps_cumsums_dtype_and_infinities():
+    """A blocked running sum sums in `cumsum`'s dtype throughout, so a requested int8 wraps as `cumsum`'s
+    does and a bool counts in the default integer; a running maximum or minimum of infinities is
+    infinite, as numpy's is."""
+    import jax.numpy as jnp
+
+    from dew.batch import prefix_max, prefix_min, prefix_sum
+
+    wrapped = prefix_sum(np.full((1, 200), 1, np.int8), dtype=jnp.int8)
+    expected = jnp.cumsum(jnp.full((1, 200), 1, jnp.int8), axis=1, dtype=jnp.int8)
+    np.testing.assert_array_equal(wrapped, expected)
+    assert wrapped.dtype == jnp.int8
+    counted = prefix_sum(np.ones((1, 130), bool))
+    assert counted.dtype == jnp.cumsum(jnp.ones((1, 130), bool), axis=1).dtype and int(counted[0, -1]) == 130
+    lows, highs = np.full((1, 130), -np.inf, np.float32), np.full((1, 130), np.inf, np.float32)
+    np.testing.assert_array_equal(prefix_max(lows), lows)
+    np.testing.assert_array_equal(prefix_min(highs), highs)
+    np.testing.assert_array_equal(prefix_min(highs, reverse=True), highs)
+
+
+def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
+    """The token layout a step builds from a packed, padded batch (its documents' starts, each token's
+    rank in its document and in its row, the layers' counted places, block numbers and ends, and learned
+    positions' places), compiled by XLA's CUDA pipeline for two H100s with the batch's token axis split
+    between them (`compile_only_gpus`, no GPU attached), runs no loop: a running scan along a split axis
+    became a loop of one iteration a token in XLA's GPU partitioner, a 2xH100 training step's tenfold
+    slowdown (ledger 1905); each runs in blocks no mesh splits (`dew.batch.prefix_sum`)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.batch import coordinates, real_places
+    from dew.decision.model import key_runs
+    from dew.nn.inputs import counted_places, numbered_blocks
+    from dew.nn.visibility import block_ends
+    from dew.training.ahead import compile_only_gpus
+
+    def layout(segments, valid):
+        tokens = coordinates(segments=segments, valid=valid, max_segments=4)
+        return (tokens.positions, tokens.starts, real_places(valid), counted_places(segments, valid, None),
+                numbered_blocks(tokens, segments.shape, 16), block_ends(segments),
+                key_runs(jnp.minimum(segments, 2), segments, 2))
+
+    mesh = Mesh(np.array(compile_only_gpus("sm90", 2)), ("sequence",))
+    split = NamedSharding(mesh, PartitionSpec(None, "sequence"))
+    shapes = (jax.ShapeDtypeStruct((4, 8192), jnp.int32, sharding=split),
+              jax.ShapeDtypeStruct((4, 8192), jnp.bool_, sharding=split))
+    program = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile().as_text()
+    assert not re.findall(r"\bwhile\(", program), re.findall(r"known_trip_count[^\n]*", program)[:4]
+
+
+
+
+# ------------------------------------------------------------------ a TPU topology, compiled ahead here
+
+
+def _topology_trainer(topology: str, **options):
+    """A tiny Llama's language-model trainer over the TPU `topology`'s compile-only devices
+    (`compile_only_tpus`), its state sharded whole over them."""
+    import optax
+
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.ahead import compile_only_tpus
+
+    devices = compile_only_tpus(topology)
+    model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
+                              dtype=jnp.bfloat16)
+    return Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0),
+                   **{"mesh": MeshSpec(fsdp=len(devices)).build(devices), "layout": Layout(min_shard=1),
+                      **options})
+
+
+def _topology_ahead(topology: str):
+    """`_topology_trainer`'s first step compiled ahead for `topology` here (`compile_ahead`)."""
+    from dew.training.ahead import compile_ahead
+
+    trainer = _topology_trainer(topology)
+    return compile_ahead(trainer, {"text": np.zeros((trainer.device_mesh.devices.size, 65), np.int32)})
+
+
+def test_a_step_compiles_ahead_here_for_a_tpu_topology_and_states_each_devices_memory(tmp_path):
+    """A run's step compiles ahead on this CPU host for a TPU topology it is not running on, its mesh
+    built over the topology's devices (`compile_only_tpus`, `jax.experimental.topologies`), as MaxText's
+    train_compile compiles, through the plan a run takes (`compile_ahead`, `Trainer._compiled_plan`):
+    each device's memory is XLA's own for that TPU, and a topology of more devices holds less of the
+    sharded state on each. It saves as any step compiled ahead does (`AheadOfTime`), loads back as the
+    same program, and runs on that many TPUs of its chip alone (ledger 2551)."""
+    from dew.training.ahead import AheadOfTime
+
+    small, large = (_topology_ahead(name) for name in ("v5e:2x2", "v5e:4x4"))
+    for ahead, count in ((small, 4), (large, 16)):
+        assert (ahead.generation, ahead.devices) == ("v5e", count) and ahead.plan is not None
+        assert ahead.argument_bytes > 0 and ahead.temp_bytes > 0
+    assert large.argument_bytes < small.argument_bytes
+    small.save(tmp_path / "step.dew-aot")
+    loaded = AheadOfTime.load(tmp_path / "step.dew-aot")
+    assert loaded.program == small.program
+    with pytest.raises(ValueError):
+        loaded.loaded()
+
+
+class _Placed:
+    """A reader of token rows that keeps its place (`get_state`) and has no `close`, noting in `read`
+    each place it reads a batch at."""
+
+    def __init__(self, read: list[int]):
+        self.at, self.read = 0, read
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.read.append(self.at)
+        self.at += 1
+        return {"text": np.full((4, 65), self.at % 256, np.int32)}
+
+    def get_state(self):
+        return json.dumps(self.at).encode()
+
+    def set_state(self, state):
+        self.at = json.loads(state)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_left_it(tmp_path):
+    """A run trained a step here and compiled ahead for a TPU topology from its checkpoint
+    (`AheadTarget.compiled`) compiles the step its resume takes: its stream, a reader with no `close`,
+    reads its first batch from the checkpoint's position, not the start, at the rung its checkpoint
+    records, and nothing is placed on the topology's devices (train 325's review of ledger 2551)."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+    from dew.training.ahead import AheadTarget
+
+    read: list[int] = []
+    data = Loader(train=lambda partition: _Placed(read), val=None, batch=4, records=None)
+    model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
+                              dtype=jnp.bfloat16)
+    here = Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0),
+                   mesh=Mesh(np.asarray(jax.devices()[:4]), ("fsdp",)), layout=Layout(min_shard=1),
+                   checkpoints=Checkpoints(str(tmp_path / "run")))
+    here.fit(data, steps=1, checkpoint_every=1)
+    assert read[0] == 0
+    read.clear()
+    target = AheadTarget("v5e:2x2", 4, str(tmp_path / "step.dew-aot"))
+    resumed = _topology_trainer("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run")))
+    ended = target.compiled(resumed, data, steps=2)
+    assert read and read[0] == 1
+    assert ended.ahead.plan is not None and ended.ahead.devices == 4
+
+
+def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
+    """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
+    is out of its way (`dew.cache.uncached`): a cache that a program here writes to gains nothing from
+    the topology's compile, and the next program here writes to it again. The trainer is built before
+    the cache is read, as its key is drawn by a program of this host's, which the cache keeps (ledger
+    3174: alone in its process the test saw that program's entries)."""
+    from jax.experimental.compilation_cache import compilation_cache
+
+    from dew.cache import enable_compilation_cache
+    from dew.training.ahead import compile_ahead
+
+    monkeypatch.setenv("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))
+    settings = ("jax_compilation_cache_dir", "jax_enable_compilation_cache",
+                "jax_persistent_cache_min_compile_time_secs", "jax_persistent_cache_min_entry_size_bytes")
+    previous = {name: getattr(jax.config, name) for name in settings}
+    try:
+        jax.config.update("jax_enable_compilation_cache", val=True)
+        enable_compilation_cache(str(tmp_path / "cache"))
+        compilation_cache.reset_cache()
+        trainer = _topology_trainer("v5e:2x2")
+        jax.jit(lambda x: x * 3.0).lower(1.0).compile()
+        written = sorted((tmp_path / "cache").iterdir())
+        assert written
+        rows = np.zeros((trainer.device_mesh.devices.size, 65), np.int32)
+        assert compile_ahead(trainer, {"text": rows}).executable
+        assert sorted((tmp_path / "cache").iterdir()) == written
+        jax.jit(lambda x: x * 5.0).lower(1.0).compile()
+        assert len(list((tmp_path / "cache").iterdir())) > len(written)
+    finally:
+        for name, value in previous.items():
+            jax.config.update(name, val=value)
+        compilation_cache.reset_cache()

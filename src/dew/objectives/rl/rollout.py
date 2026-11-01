@@ -13,8 +13,9 @@ from dew._coordination import agreed
 from dew.batch import Batch
 from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
-from dew.inference.rollouts import Draw, InfrastructureError, response
+from dew.inference.rollouts import INFRASTRUCTURE, Draw, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
+from dew.nn.progress import Progress
 from dew.sampling.text import Sampling
 
 from ..lm import TokenScorer
@@ -30,15 +31,16 @@ def scored_draw(task: str, sample: int, call: Call, text: str, record: PromptRec
                 reward: Reward) -> Session:
     """One draw's one-call session: COMPLETED where its call stopped, TRUNCATED where it ran out,
     scored by `reward(text, record)` on its decoded `text`. A reward whose external boundary failed
-    (an `InfrastructureError` or an `OSError`: a sandbox, a service) leaves an INFRA_ERROR session
-    naming it, which a scheduler retries; a non-finite score is refused."""
+    (`INFRASTRUCTURE`: a sandbox, a service) leaves an INFRA_ERROR session
+    naming it, which a scheduler retries; a non-finite score is refused. Either names the record's
+    `data_source`, the source its rewards and statuses report under (`source_metrics`)."""
     try:
         score = reward(text, record)
-    except (InfrastructureError, OSError) as error:
+    except INFRASTRUCTURE as error:
         return Session(task, "", sample, 0, (call,), Status.INFRA_ERROR, None, {},
-                       f"reward: {type(error).__name__}: {error}")
+                       f"reward: {type(error).__name__}: {error}", record.data_source)
     status = Status.COMPLETED if call.terminated else Status.TRUNCATED
-    return Session(task, "", sample, 0, (call,), status, finite_reward(score))
+    return Session(task, "", sample, 0, (call,), status, finite_reward(score), source=record.data_source)
 
 
 def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[PromptRecord]]:
@@ -150,7 +152,10 @@ class PolicyCollector:
         mesh = mesh_of(snapshot.variables)
         prompts, width, inputs = (self._prepared(tasks) if mesh is None
                                   else agreed("rollout input preparation", lambda: self._prepared(tasks)))
-        generated = self.objective.policy(snapshot.variables, self.sampling)(
+        # The policy the step's loss reads, at the updates the run committed (`Objective.progress`), whose
+        # likelihoods are the proximal column's.
+        progress = Progress(jnp.asarray(snapshot.updates, jnp.int32))
+        generated = self.objective.policy(snapshot.variables, self.sampling, progress)(
             inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
         if mesh is not None and DataPartition.of(mesh).reader != 0:
             # A share's later reader drew its part of the program; the first reader scores the share.

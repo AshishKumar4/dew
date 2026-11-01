@@ -78,6 +78,37 @@ def test_finite_token_budget_keeps_its_geometry_and_every_real_row(entry, read):
         reader.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Counted:
+    """An objective's evaluation batch step, as a diffusion objective's caption encoding is one: each
+    batch's rows counted into a column, which only a step after the batch sees whole."""
+
+    def __call__(self, batch):
+        return {**batch, "rows": np.full(len(batch["id"]), len(batch["id"]), np.int32)}
+
+
+def test_an_unbatched_validation_beside_a_token_budget_reads_in_its_training_batch():
+    """Training batched by a token budget states its rows only as it compiles, so a validation set that
+    states no batch is measured before it (`fitted`) and batched as it is read: in training's rows, every
+    record once and the short last batch filled and marked, not one row a batch, the objective's
+    evaluation batch steps after that batch (rows 2085, 2178)."""
+    rows = [{"id": np.int32(index + 1), "length": np.int32(4)} for index in range(6)]
+    train = Memory(rows).map(Tokens()).batch(tokens=64).read("memory")
+    held = Memory([{"id": np.int32(index + 1), "length": np.int32(3)} for index in range(6)]).map(Tokens())
+    data, readers = fitted(train, held, objective=ObjectiveData(evaluate_batch=(Counted(),)))
+    assert data.batch == 4
+    reader = readers["val"](DataPartition())
+    try:
+        batches = list(reader)
+        assert [batch["id"].shape for batch in batches] == [(4,), (4,)]
+        # The step read each batch whole: its batch's rows, a short last one's included.
+        assert all(np.all(batch["rows"] == len(batch["id"])) for batch in batches)
+        assert sorted(int(value) for batch in batches
+                      for value in batch["id"][batch.get(VALID_ROWS, np.ones(4, bool))]) == list(range(1, 7))
+    finally:
+        reader.close()
+
+
 def held_rows():
     return iter([{"id": np.int32(index)} for index in range(5)])
 
@@ -90,7 +121,7 @@ def held_tokens():
 def test_fit_reads_validation_with_its_own_mode_loading_and_batch(named):
     train = from_grain(grain.MapDataset.source([{"id": np.int32(index)} for index in range(8)]),
                        "indexed-train").batch(4).read("indexed").workers(0)
-    held = from_iter(held_rows, name="streamed-held").batch(2).read("streamed").workers(0)
+    held = from_iter(held_rows, identity="streamed-held").batch(2).read("streamed").workers(0)
     data, readers = fitted(train, {"val": held} if named else held, objective=ObjectiveData())
     stream = data.train(DataPartition())
     try:
@@ -112,7 +143,7 @@ def test_fit_reads_validation_with_its_own_mode_loading_and_batch(named):
 def test_fit_trains_indexed_tokens_and_scores_its_independent_streamed_split(named):
     train = from_grain(grain.MapDataset.source(list(held_tokens())), "indexed-tokens")
     train = train.batch(16).read("indexed").workers(0)
-    held = from_iter(held_tokens, name="streamed-tokens").batch(8).read("streamed").workers(0)
+    held = from_iter(held_tokens, identity="streamed-tokens").batch(8).read("streamed").workers(0)
     objective = LMObjective(CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
                             num_heads=2, mlp_features=16, max_seq_len=8, attention_impl="xla"), seq_len=4)
     tracker = RecordingTracker()
@@ -121,8 +152,8 @@ def test_fit_trains_indexed_tokens_and_scores_its_independent_streamed_split(nam
         metrics=(Perplexity(),))
     scores = [scalars for _, scalars in tracker.scalars if "val/perplexity" in scalars]
     assert int(state.step) == 1 and scores
-    assert scores[-1]["evaluation/records"] == 17
-    assert scores[-1]["evaluation/coordinated_batches"] == 3
+    assert scores[-1]["evaluation/counts/val/records"] == 17
+    assert scores[-1]["evaluation/counts/val/coordinated_batches"] == 3
     assert np.isfinite(scores[-1]["val/perplexity"])
 
 

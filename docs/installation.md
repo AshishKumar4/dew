@@ -48,7 +48,7 @@ UV_SYSTEM_CERTS=true uv self update
 ```
 <!-- END pip -->
 
-Without the index the install stops before it installs anything, at resolving jax, since PyPI has no JAX build Dew accepts ([Dew's JAX build](#dews-jax-build)): uv reports `No solution found when resolving dependencies` and names dewml's jax requirement, and pip reports `No matching distribution found for jax`. Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
+Without the index the install stops before it installs anything: dewml's releases are on Dew's index beside [Dew's JAX build](#dews-jax-build), which PyPI does not hold, and PyPI's `dewml` is a pointer whose build stops with `dewml is not installed from PyPI.` and the command to run. Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
 
 [Which CUDA build](#which-cuda-build) explains the choice between the two. With uv, make an environment first:
 
@@ -99,13 +99,13 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post28,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post42,<0.12.1`.
 <!-- END JAX requirement -->
 
-It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) are Dew's builds of the same release, carrying the Mosaic GPU fixes below that live in the plugin, and the index serves them too. Every other package, jaxlib and the CUDA PJRT plugins included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
-- The device-to-host transfer guard holds on a CPU array's implicit host read (`float`, `item`, `np.asarray`, its buffer) as on an accelerator's copy, which a steady state's guard needs on the CPU suite.
+- The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
 - Pallas Triton divides 16-bit floats and computes `erf_inv` through float32, correctly rounded, which a GEMM template's prologue dividing in bfloat16 needs on CUDA.
 - A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
 - Mosaic GPU relays an MMA's accumulator out to a 16-bit MMA's left operand in registers, and an abstract device states its compute capability, which Mosaic GPU lowers for: the templates' Mosaic kernels need both on sm80.
@@ -115,6 +115,29 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU's layout inference solves groups of unknowns that no constraint relates separately, so sm80's `mma.sync` GEMM tiles find their layouts.
 - A Mosaic GPU MMA may state its warpgroup's warp split (`plgpu.mma(..., m_warps=...)`), for Ampere GEMM tiles that split their warps 2 x 2.
 - A platform-dependent conditional whose lowering keeps one branch lowers that branch inline, so a collective inside it is not a runtime conditional; on the CPU, devices diverged on such a conditional.
+- A block's Mosaic GPU warpgroups each take their own share of the reduction scratch.
+- A Mosaic GPU kernel's debug info stays out of the persistent compilation cache key, so the same kernel compiled from two checkouts keys alike.
+- A compile-only Mosaic GPU target is held to its own default shared memory limit, not the attached device's.
+- A transformation keeps a wide dtype its trace already holds, while a Python type asked of a wide value still narrows as a user's request.
+- Pallas's Mosaic GPU interpreter transfers a thread map's constants and inputs to the device once, shared by its threads.
+- Pallas's Mosaic GPU slices, applies pointwise ops to and broadcasts a unit row or column of a tiled array.
+- Mosaic GPU's CP_ASYNC copies a head's `[S, D]` block of `[B, S, H, D]`, a squeezed dimension between sliced ones, under a tile transform.
+- Mosaic GPU's `emit_pipeline` carries its ring slots rather than recomputing them each step.
+- Mosaic GPU's WGMMA forms its shared-operand descriptors at its instructions rather than hoisting them out of an enclosing loop.
+- Mosaic GPU's TMA load coordinates reach ptxas as values it cannot fold: ptxas had miscompiled a literal coordinate into a misaligned copy, which stopped the attention training forward at head dim 128 on an H100 on an illegal instruction.
+- A persistent compilation cache entry is written aside and renamed into place, so a process reading the cache beside its writer, as packed jobs on one GPU do, sees the whole entry or none of it.
+- Resetting the compilation cache (`jax.experimental.compilation_cache.compilation_cache.reset_cache`) takes the lock its initialization holds, so a compile that sets the cache up while a reset runs is waited for, and the reset never leaves a cache behind that its flags call uninitialized.
+- `JAX_EXPLAIN_CACHE_MISSES` explains, rather than fails, a Pallas Triton reduction, whose body's earlier traces are keyed by keyword.
+- Mosaic GPU compiles a kernel's PTX with nvJitLink off, so ptxas honours its warpgroups' register raises (`setmaxnreg`), which it ignored in a relocatable compile (ptxas warning C7504; upstream f365a65e3a). This fix lives in the CUDA plugin.
+- A Mosaic GPU kernel may state its minimum resident blocks per SM (`min_blocks_per_sm`), which bounds the registers ptxas gives each thread. This fix lives in the CUDA plugin.
+- Mosaic GPU's untiled CP_ASYNC copies follow the source's strides and alignment, so a block narrower than its row reads the rows it names.
+- A Mosaic GPU `mma.sync` multiplies float32 operands as TF32 (`m16n8k8.tf32`), each rounded to nearest first, and transfers 32-bit operands without `ldmatrix`.
+- Mosaic GPU issues scoped and ordered atomics, memory fences and `griddepcontrol` (programmatic dependent launch), and Pallas Mosaic GPU's `barrier_wait` takes an explicit parity, checked by its interpreter.
+- Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
+- Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, preventing the full-band and partial-tail divisors from becoming one runtime divisor.
+- A compiled executable keeps the SHA-256 of its exact serialized bytes, taken where the persistent compilation cache writes or reads them, so an executable loaded from the cache names the artifact its writer compiled.
+- Ragged products differentiate through contracting and batch dimensions at higher orders, preserving explicit sharding, metadata prefixes and the requested accumulation precision; grouped expert products can take reverse-over-reverse derivatives.
+- A reduction's forward derivative keeps a symbolic zero tangent zero instead of materializing it, and Mosaic GPU's warpgroup loads preserve their requested fragment layout.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
@@ -146,6 +169,8 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `inference-clients` | The Ollama and OpenAI Python clients, including vLLM-compatible endpoints |
 | `serve` | Starlette and uvicorn, for serving a decision model in Jev's wire format (`examples/serve_decisions.py`) |
 | `environments` | Agent environments and remote sandboxes for rollouts: OpenEnv and the Modal, E2B and Daytona SDKs |
+| `playground` | MuJoCo Playground's MJX environments as Dew environments (`dew.rl.playground`) |
+| `hyperlux` | HyperLux's ray tracer drawing the gate race's cameras (`dew.rl.hyperlux`), on an NVIDIA GPU with OptiX |
 | `hpo` | Optuna, for `dew.config.sweep` |
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
@@ -179,7 +204,7 @@ torchvision from the wrong index. A package extra cannot select an index.
 
 The `profile` extra installs XProf, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
-FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64. With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls `dew.nn.attention.flash_refusal` admits; a call it turns down on such a GPU is logged once, with why.
+FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64 and aarch64 (a GH200). With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls `dew.nn.attention.flash_refusal` admits; a call it turns down on such a GPU is logged once, with why.
 
 tokamax comes with Dew: Dew's Pallas kernels take the config they derive from the GPU's facts, which is fast without tuning. The opt-in tuner (`dew.nn.kernels.tuning`), `python tools/kernel_picks.py` or `Trainer(tune_kernels=True)`, times a few tested variants of each kernel's config on a GPU it has to itself and stores the fastest for the GPU model; a later compile takes those picks, else the nearest measured shape's, else the derived config, and measures nothing. And `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
 
@@ -199,7 +224,7 @@ The `ci` extra is the test suite's environment, every package a test file import
 
 CI runs on CPUs, so a JAX bump first runs these on a GPU, on Colab, in one session:
 
-- `tests/test_linear_attention.py::test_the_decode_kernel_steps_as_the_recurrence_does` and `tests/test_decode_attention.py::test_the_decode_kernel_reads_each_row_to_its_length_at_every_config`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
+- `tests/test_gpu_recurrence.py`'s cell "a gated delta net decodes on its step kernel" and `tests/test_decode_attention.py::test_the_decode_kernel_reads_each_row_to_its_length_at_every_config`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
 - `python tools/gpu_profile_check.py --out out/profile-check`, about a minute: a warmed step captured under `dew.Profiler` with command buffers on and off. It fails unless the capture with them off attributes device time to HLO ops and every capture's device time a step is positive and within its wall time. It records whether the default capture attributes ops (none on 0.11.2) and whether XLA ran its command buffers op by op for the session, so a release that changes either shows. While the cause of the default capture's missing attribution is open, every Colab GPU session runs it first too.
 
 ## Compilation cache

@@ -97,7 +97,7 @@ def save_json(path, value):
 
 
 def border_bands(pixels):
-    """Flat edge strips, counted per edge (ObedientKite's curation filter)."""
+    """Flat edge strips, counted per edge (the docs lane's curation filter)."""
     pixels = pixels.astype(np.float32)
     columns = pixels.transpose(1, 0, 2)
     result = {}
@@ -373,7 +373,7 @@ def records(out):
 
 
 def rank(rows):
-    """ObedientKite's ranking plus a small colourfulness term; the eye makes the picks."""
+    """The docs lane's ranking plus a small colourfulness term; the eye makes the picks."""
     for row in rows:
         row["rank_score"] = row["aesthetic"] + 0.07 * row["clip_score"] + 0.01 * row["colorfulness"]
     return sorted(rows, key=lambda row: row["rank_score"], reverse=True)

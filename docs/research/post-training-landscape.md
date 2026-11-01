@@ -1,6 +1,6 @@
 # Post-training landscape
 
-Research date: 2026-09-06. Dew revision: `65fd2f4`. Dew columns re-checked on 2026-10-14 at `a1dc36b85`.
+Research date: 2026-09-06. Dew revision: `cb9ce8f`. Dew columns re-checked on 2026-10-14 at `2a56b2a82`.
 
 This note covers methods, rollout systems, agent environments, model reports, and data contracts. It makes fit recommendations. It does not select an implementation or change an API.
 
@@ -10,7 +10,7 @@ Paper citations name a version and section. Repository snapshots are listed unde
 
 ## Re-check, 2026-10-14
 
-Every row's "What Dew has today" and "The gap" cells were re-checked against main `a1dc36b85`. They replace the description of `65fd2f4`; the other columns still describe the research date. Each gap names two kinds of shortfall. "Missing code" is what Dew has no implementation of. "Missing evidence" is what exists as code but is shown only by unit tests, fixed-tensor parity, small models, simulated engines or two-process CPU pools; it names the tests that exist. "None to report without the code" means there is nothing to measure yet. A named test shows the check it makes, not learned behavior at scale ([post-training scope and numerical checks](../concepts/post_training.md#scope-and-numerical-checks)).
+Every row's "What Dew has today" and "The gap" cells were re-checked against main `2a56b2a82`. They replace the description of `cb9ce8f`; the other columns still describe the research date. Each gap names two kinds of shortfall. "Missing code" is what Dew has no implementation of. "Missing evidence" is what exists as code but is shown only by unit tests, fixed-tensor parity, small models, simulated engines or two-process CPU pools; it names the tests that exist. "None to report without the code" means there is nothing to measure yet. A named test shows the check it makes, not learned behavior at scale ([post-training scope and numerical checks](../concepts/post_training.md#scope-and-numerical-checks)).
 
 ## Dew today
 

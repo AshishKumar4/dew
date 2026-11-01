@@ -37,15 +37,16 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.mesh import LayoutRefused
 from dew.nn.dense import Dense
 
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed, recurrent_delta_rule
-from .linear import DepthwiseConv1d, RMSNormGated, held_scan
+from .linear import DepthwiseConv1d, RMSNormGated, held_scan, over_sequence, split_delta_rule
 from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
-from .sharding import logical_axes
+from .sharding import logical_axes, sequence_shards
 
 
 # q/k/v_proj and o_proj carry the attention mixer's declarations under the
@@ -182,9 +183,10 @@ class KimiDeltaAttention(nn.Module):
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
             # A held history can make the convolved operands vary where the projections did not, so the
             # route is asked again of them.
+            # The batch's documents' firsts, built once with it (`Coordinates.firsts`).
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
                                           starts=starts, max_segments=tokens.max_segments,
-                                          floor=self.lower_bound)
+                                          floor=self.lower_bound, write_bound=1.0, firsts=tokens.firsts)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
@@ -192,12 +194,26 @@ class KimiDeltaAttention(nn.Module):
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
         rows, keys, values = (split(part) for part in jnp.split(projected, 3, axis=-1))
-        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound)
+        # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
-        out = held_scan(self, projected, taps, None, scan,
-                        (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
-                        state='recurrent_state', state_dtype=wide, conv_dtype=wide, parts=heads,
-                        dtype=projected.dtype if ported else wide)
+        shards = sequence_shards()
+        if shards > 1:
+            if decode:
+                raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
+                                    f"training sequences; a decode step holds one state per row. Decode on a "
+                                    f"mesh with sequence=1.")
+            rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
+                                     max_segments=tokens.max_segments, floor=self.lower_bound,
+                                     write_bound=1.0)
+            out = over_sequence(functools.partial(split_delta_rule, widths=(self.head_dim,) * 3, parts=heads,
+                                                  dtype=projected.dtype if ported else wide, rule=rule),
+                                shards, (projected, g, beta, tokens.segments, tokens.starts, valid), (taps,))
+        else:
+            out = held_scan(self, projected, taps, None, scan,
+                            (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
+                            state='recurrent_state', state_dtype=wide, conv_dtype=wide, parts=heads,
+                            dtype=projected.dtype if ported else wide)
         if out is None:
             return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
         gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))

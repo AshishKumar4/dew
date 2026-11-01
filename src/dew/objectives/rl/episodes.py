@@ -32,6 +32,7 @@ from dew.batch import Variables, token_id
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
+from dew.nn.progress import Progress
 from dew.sampling.text import Generation, Sampling
 
 from .sessions import Call, Session, Snapshot, Status, Task, Transcript, finite_reward, json_objects
@@ -52,7 +53,10 @@ class EpisodeId:
     """The identity of one sample within an attempt, reproducible from checkpointed work.
 
     `task` is the task id, `attempt` the trainer step that collected the
-    sample, `sample` its global index, and `seed` the key data drawn for it.
+    sample, `sample` its global index, `seed` the key data drawn for it, and
+    `branch` the cooldown branch that drew it (`Snapshot.branch`), None for
+    the run's own: a branch draws at the run's steps and keys under other
+    weights, and its episodes are its own.
     The harness can use this identity for its own idempotency records. Dew
     does not guarantee exactly-once external effects across process failure.
     """
@@ -61,6 +65,7 @@ class EpisodeId:
     attempt: int
     sample: int
     seed: tuple[int, ...]
+    branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,14 @@ class Observation:
     chat messages, as JSON, the environment's context holds that it added
     here (a tool's result, a user's turn), which each later call's
     `Transcript` lists; the context's ids stay what the model reads.
+    `compacted` marks a context the harness compacted: it replaces the
+    history before it, so a later call's transcript lists this
+    observation's messages and none before them, and its ids start a chain
+    of their own (`sessions.pack`), the lineage the record keeps.
+    `request` is the structured assistant message the environment parsed
+    from the action that led here (its tool calls, as JSON): the call's
+    transcript gives it as its response, and later calls' list it before
+    this observation's messages.
     """
 
     context: tuple[int, ...]
@@ -83,6 +96,8 @@ class Observation:
     detail: str = ""
     reward: float | None = None
     messages: tuple[Mapping[str, object], ...] = ()
+    compacted: bool = False
+    request: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, EpisodeStatus):
@@ -90,6 +105,9 @@ class Observation:
         if self.reward is not None:
             object.__setattr__(self, "reward", finite_reward(self.reward))
         object.__setattr__(self, "messages", json_objects(self.messages, "an observation's messages"))
+        if self.request is not None:
+            (request,) = json_objects((self.request,), "an observation's request")
+            object.__setattr__(self, "request", request)
         object.__setattr__(self, "context", tuple(token_id(token, where="an observation's context")
                                                   for token in self.context))
         if self.status == EpisodeStatus.RUNNING and not self.context:
@@ -163,11 +181,12 @@ EpisodeRecorder = Callable[[Episode], None]
 class EpisodeInference(Protocol):
     """Draws actions from a bound policy and returns the actual sampling likelihoods.
 
-    `bind(variables)` returns an inference that generates from that one
-    weight snapshot.
+    `bind(variables, progress)` returns an inference that generates from that one
+    weight snapshot, at the run's `progress` a model that reads one draws at (`dew.nn.progress`), or at
+    its own where none is given.
     """
 
-    def bind(self, variables: Variables, /) -> EpisodeInference: ...
+    def bind(self, variables: Variables, /, progress: Progress | None = None) -> EpisodeInference: ...
 
     def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
                  *, key: jax.Array, sampling: Sampling) -> Generation: ...
@@ -559,7 +578,8 @@ class EpisodeCollector:
                 sample = (rank * tasks.size + index) * samples + group
                 draw = jax.random.fold_in(snapshot.key, sample)
                 slots.append(EpisodeProgress(EpisodeId(int(task), snapshot.step, int(sample),
-                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw)))), self.sampling))
+                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw))), snapshot.branch),
+                    self.sampling))
         return slots
 
     def _bound_journal(self, journal_stack: ExitStack, snapshot: Snapshot, tasks: np.ndarray,
@@ -576,7 +596,9 @@ class EpisodeCollector:
         def open_journal():
             from .journal import policy_digest
 
-            cohort = repr((snapshot.step, tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())))
+            clock = (snapshot.step, tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist()))
+            # A cooldown branch's cohorts are its own, apart from the run's at the same step and key.
+            cohort = repr(clock if snapshot.branch is None else (snapshot.branch, *clock))
             fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
                                 policy_digest(snapshot.variables)))
             return journal_stack.enter_context(journal.open(cohort, fingerprint, binding))
@@ -630,7 +652,8 @@ class EpisodeCollector:
             if not all(task.id.removeprefix("-").isdigit() for task in tasks):
                 raise ValueError("an episode collection's tasks are integer task ids (`task_ids`)")
             ids = np.asarray([int(task.id) for task in tasks], np.int64)
-            policy = self.policy.bind(snapshot.variables)
+            # The policy the step's loss reads, at the updates the run committed (`Objective.progress`).
+            policy = self.policy.bind(snapshot.variables, Progress(jnp.asarray(snapshot.updates, jnp.int32)))
             key_words = tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())
             signature = (ids.size, samples, self.max_turns, self.max_prompt_tokens, self.max_new_tokens,
                          self.sampling, snapshot.step, snapshot.updates, key_words, self.journal is not None)
@@ -672,7 +695,9 @@ def session_of(episode: Episode, *, group: str) -> Session:
 
     Each transition's draw becomes one call (`Call.of`), its reward the step
     reward the observation after it carries and its transcript the messages
-    the observations before it carried (none where they carried none). An
+    the observations before it carried since the last compacted one, each
+    earlier call's parsed request before its observation's (none where
+    they carried none), its response its own parsed request. An
     error the environment reports becomes `INFRA_ERROR`, because the
     verifier's reward, not the status, says how well the agent did.
     """
@@ -685,9 +710,16 @@ def session_of(episode: Episode, *, group: str) -> Session:
     said = list(() if episode.initial is None else episode.initial.messages)
     calls = []
     for turn in episode.transitions:
+        request = turn.observation.request
         calls.append(Call.of(turn.action, reward=turn.observation.reward,
-                             transcript=Transcript(tuple(said)) if said else None))
-        said.extend(turn.observation.messages)
+                             transcript=Transcript(tuple(said), request)
+                             if said or request is not None else None))
+        # A compacted context replaces the history, the transcript restarting from its messages; another
+        # extends it with the call's request and what the environment answered.
+        if turn.observation.compacted:
+            said = list(turn.observation.messages)
+        else:
+            said = [*said, *([] if request is None else [request]), *turn.observation.messages]
     identity = episode.identity
     return Session(str(identity.task), group, identity.sample, identity.attempt, tuple(calls), status,
                    episode.reward, detail=episode.detail)

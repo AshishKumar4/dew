@@ -132,8 +132,7 @@ def audited() -> tuple[str, ...]:
     return (*taken, *(name for name in ("sm100", "v6e") if name not in taken))
 
 
-LAYOUT_GAPS = {"mla": "ledger 830", "kpool_sparse_attention": "ledger 830",
-               "deepseek_v4": "ledger 831", "llama4": "ledger 784", "attention": "ledger 838"}
+LAYOUT_GAPS = {"attention": "ledger 838"}
 """The ledger row of each mixer that takes no cache layout but the default (`MixerRefused` for
 `kv_cache`)."""
 
@@ -294,11 +293,8 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None,
                     cell["error"] = f"{type(refusal).__name__}: {refusal}"
                     yield cell
                     continue
-                rows = {(r.choice, r.site, r.kernel, r.refusal.code if r.refusal else None): r for r in seen}
-                cell["routes"] = [{"choice": r.choice, "site": r.site, "kernel": r.kernel,
-                                   "preferred": r.preferred, "ran": r.ran, "verdict": verdict(r),
-                                   "refusal": dataclasses.asdict(r.refusal) if r.refusal else None}
-                                  for r in rows.values()]
+                cell["routes"] = [{**dataclasses.asdict(r), "verdict": verdict(r)}
+                                  for r in dict.fromkeys(seen)]
                 yield cell
 
 

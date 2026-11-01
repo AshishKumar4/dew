@@ -49,13 +49,30 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     except MissingFlopsCount:
         counted = None
     assert row["training_flops"] == counted
+    # The CPU step runs no launch its count leaves out; one that does is reported (row 3023).
+    assert row["unsized_kernels"] == 0
 
 
-def peak_row(tmp_path, platform: str, *arguments: str) -> dict:
+def test_a_steps_count_some_launches_work_is_missing_from_reads_as_a_lower_bound():
+    """A row whose step runs launches no count sizes (`StepFlops.unsized`) shows its FLOPs and
+    utilization as the lower bounds they are, as the trainer names them train/hfu_lower_bound; a
+    complete count shows as it is (row 3023)."""
+    tool = load("benchmark_step")
+    row = {"architecture": "causal_transformer", "flops_per_step": 2e9, "utilization": 0.25, "mfu": 0.2}
+    counted, uncounted = (tool.format_table([{**row, "unsized_kernels": unsized}]).splitlines()[-1].split()
+                          for unsized in (0.0, 2.0))
+    assert [cell for cell in counted if cell in ("2.0", "25.0", "20.0")] == ["2.0", "25.0", "20.0"]
+    assert [cell for cell in uncounted if cell.endswith(("2.0", "25.0", "20.0"))] == [
+        ">=2.0", ">=25.0", "20.0"]
+
+
+def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] | None = None) -> dict:
     """The causal_transformer smoke case's row, the tool run as a person runs it on one device of
-    `platform` with `arguments`, its peak measured in a process of the case's own."""
+    `platform` with `arguments` and the environment's `settings`, its peak measured in a process of the
+    case's own."""
     out = tmp_path / "rows.json"
     environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
+    environment |= settings or {}
     tool = str(REPO_ROOT / "tools/benchmark_step.py")
     done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
                            "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
@@ -83,9 +100,19 @@ def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context(t
     assert len(set((tmp_path / "entered").read_text().split())) == 3, "this process and both peak processes"
 
 
-@pytest.mark.gpu(reason="a GPU's allocator keeps the high-water the measured peak reads")
-@pytest.mark.mesh(devices=1)
-def test_a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
+def test_a_cache_its_caller_names_keeps_what_the_step_compiled_and_a_run_alone_compiles_cold(tmp_path):
+    """perf_gate names each tree's compile cache, so its later rounds load what its first compiled: the step
+    compiled into it; run alone, the tool compiles cold, writing nothing to Dew's own cache (row 1577)."""
+    named, own = tmp_path / "tree-cache", tmp_path / "home-cache"
+    peak_row(tmp_path, "cpu", settings={
+        "JAX_COMPILATION_CACHE_DIR": str(named), "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1", "XDG_CACHE_HOME": str(own)})
+    assert [entry for entry in named.iterdir() if entry.name.startswith("jit_")]
+    peak_row(tmp_path, "cpu", settings={"XDG_CACHE_HOME": str(own)})
+    assert not list(own.rglob("jit_*"))
+
+
+def a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     """On a GPU the measured peak is each device's allocator high-water over the case's run, its native
     workspaces and its profiled steps included (their traces apart): at least what XLA planned."""
     row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")

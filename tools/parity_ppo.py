@@ -41,6 +41,7 @@ def main() -> None:
 
     native = import_module("test_ppo")
     support = import_module("episode_support")
+    policy = import_module("tool_policy")
     trainer, rollout = native.build_ppo()
     state = trainer.initial_state()
     episodes = support.collect(rollout.episodes, state)
@@ -48,17 +49,17 @@ def main() -> None:
     # layout from the actions and read Dew's packed critic values into it.
     packed = rollout.rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
     packed_values = np.asarray(rollout.objective.values(state.variables, packed))
-    turns, width = native.TURNS, native.PROMPT + native.RESPONSE
+    turns, width = policy.TURNS, policy.PROMPT + policy.RESPONSE
     batch = {"input_ids": np.zeros((len(episodes) * turns, width), np.int32),
-             "response_mask": np.zeros((len(episodes) * turns, native.RESPONSE), np.float32)}
+             "response_mask": np.zeros((len(episodes) * turns, policy.RESPONSE), np.float32)}
     batch["old_log_probs"] = np.zeros_like(batch["response_mask"])
     values = np.zeros_like(batch["response_mask"])
     for index, episode in enumerate(episodes):
         for turn, transition in enumerate(episode.transitions):
             action, row = transition.action, index * turns + turn
             count = len(action.tokens)
-            batch["input_ids"][row, native.PROMPT - len(action.prompt):native.PROMPT] = action.prompt
-            batch["input_ids"][row, native.PROMPT:native.PROMPT + count] = action.tokens
+            batch["input_ids"][row, policy.PROMPT - len(action.prompt):policy.PROMPT] = action.prompt
+            batch["input_ids"][row, policy.PROMPT:policy.PROMPT + count] = action.tokens
             batch["response_mask"][row, :count] = 1
             batch["old_log_probs"][row, :count] = action.raw_log_probs
             where = (packed["session_index"] == index) & (packed["call_index"] == turn)
@@ -80,8 +81,8 @@ def main() -> None:
     kernel = (1.2 * kernel + torch.linspace(.5, -.4, kernel.shape[0])[:, None]).requires_grad_()
     scale = torch.tensor(np.asarray(weights["backbone"]["scale"]), requires_grad=True)
     bias = torch.tensor(np.asarray(weights["value"]["bias"]), requires_grad=True)
-    previous = torch.tensor(batch["input_ids"][:, native.PROMPT - 1:native.PROMPT + native.RESPONSE - 1], dtype=torch.long)
-    actions = torch.tensor(batch["input_ids"][:, native.PROMPT:], dtype=torch.long)
+    previous = torch.tensor(batch["input_ids"][:, policy.PROMPT - 1:policy.PROMPT + policy.RESPONSE - 1], dtype=torch.long)
+    actions = torch.tensor(batch["input_ids"][:, policy.PROMPT:], dtype=torch.long)
     policy_probs = torch.log_softmax(policy_table, dim=-1)[previous, actions]
     ref_table = torch.tensor(np.asarray(state.variables["params"]["policy"]["table"]))
     ref_probs = torch.log_softmax(ref_table, dim=-1)[previous, actions]

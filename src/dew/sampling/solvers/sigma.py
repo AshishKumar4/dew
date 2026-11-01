@@ -11,7 +11,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.schedules.common import ancestral_variance
 from dew.nn.precision import divided
 
-from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
+from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator, _unit_noise
 
 
 def _euler_step(x, denoised, source, target):
@@ -36,11 +36,6 @@ def _euler_step(x, denoised, source, target):
     # the clean prediction itself. A step of no length leaves x exactly as it is.
     stepped = alpha_s * denoised + divided(x - alpha_t * denoised, sigma_t) * sigma_s
     return jnp.where(dt == 0, x, stepped), derivative, x_0_coeff, dt
-
-
-def _ancestral_noise(key: jax.Array, x: jax.Array) -> jax.Array:
-    """The unit normal an ancestral step draws from its key and scales by sigma_up."""
-    return jax.random.normal(key, x.shape)
 
 
 def _ancestral(sigma_t, sigma_s):
@@ -82,7 +77,7 @@ class EulerAncestral:
         _, sigma_s = process.rates(t_next, like=x)
         sigma_down, sigma_up = _ancestral(sigma_t, sigma_s)
         dx = (x - denoised) / sigma_t
-        dW = _ancestral_noise(key, x) * sigma_up
+        dW = _unit_noise(key, x) * sigma_up
         return x + dx * (sigma_down - sigma_t) + dW, state
 
 
@@ -122,11 +117,12 @@ class Heun:
         with jax.ensure_compile_time_eval():
             sigmas = schedule.sigmas(jnp.asarray(times[:-1], jnp.float32))
             churned = (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax)
-            if bool(jnp.any(churned & (sigmas * (1 + gamma) > schedule.sigma_max))):
+            top = schedule.sigma_range[1]
+            if bool(jnp.any(churned & (sigmas * (1 + gamma) > top))):
                 raise ValueError(
-                    f"the churn raises sigma past the schedule's top, {schedule.sigma_max}, "
+                    f"the churn raises sigma past the schedule's top, {top}, "
                     f"where the model has no time; keep s_tmax below "
-                    f"{schedule.sigma_max / (1 + gamma):.4g}")
+                    f"{top / (1 + gamma):.4g}")
         return jnp.asarray(gamma, jnp.float32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -135,7 +131,7 @@ class Heun:
             sigma = schedule.sigmas(t)
             gamma = jnp.where((sigma >= self.s_tmin) & (sigma <= self.s_tmax), state, 0.0)
             raised = sigma * (1 + gamma)
-            noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+            noise = _unit_noise(key, x)
             # sqrt(raised^2 - sigma^2), in a form that stays zero at gamma 0
             # under a fused multiply-add.
             spread = sigma * jnp.sqrt(gamma * (2 + gamma)) * self.s_noise
@@ -227,7 +223,7 @@ class KDPM2:
             denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
             stepped = x + (x_mid - denoised_mid) / sigma_mid * (target - sigma_t)
             if self.ancestral:
-                stepped = stepped + _ancestral_noise(key, x) * sigma_up
+                stepped = stepped + _unit_noise(key, x) * sigma_up
             return jnp.where(positive, stepped, denoised)
 
         return lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None), state
@@ -243,7 +239,10 @@ class MultiStepDPM:
         orders = [min(index, 2) + 1 for index in range(times.shape[0] - 1)]
         _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
                     reason="its finite differences divide by")
-        coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
+        # The history in the dtype the rates take at the run's times, as each step carries them, so a
+        # float64 walk scans in float64 (ledger 2063).
+        sigma = process.rates(times[0], like=x)[1]
+        coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), sigma.dtype)
         return (jnp.zeros_like(x), coefficient, jnp.zeros_like(x), coefficient,
                 jnp.zeros((), jnp.int32))
 
@@ -272,19 +271,24 @@ class MultiStepDPM:
 
 def _lagrange_integral(nodes: list, j: int, a, b):
     """The integral from a to b of the Lagrange basis polynomial that is 1 at
-    `nodes[j]` and 0 at the other nodes, in closed form."""
+    `nodes[j]` and 0 at the other nodes, in closed form on the step itself:
+    with x = a + (b - a) s, each factor (x - node_m) / (node_j - node_m) is
+    alpha_m + beta_m s, alpha_m = (a - node_m) / (node_j - node_m) and beta_m =
+    (b - a) / (node_j - node_m), ratios of the grid's own spacings, so it is
+    (b - a) times the integral over s in [0, 1] of their product. No power of
+    a sigma is formed (VE sigmas near 2**70 cube past float32's largest), no
+    spacing is measured against a wider one (a tiny step beside a distant
+    node keeps its coefficient), and an empty step integrates to zero with
+    the basis at its end as its derivative."""
+    width = b - a
     polynomial = [1.0]
-    scale = 1.0
     for m, node in enumerate(nodes):
         if m == j:
             continue
-        polynomial = [0.0, *polynomial]
-        polynomial = [polynomial[i] - node * (polynomial[i + 1] if i + 1 < len(polynomial) else 0.0)
-                      for i in range(len(polynomial))]
-        scale = scale * (nodes[j] - node)
-    integral = sum(coefficient * (b ** (i + 1) - a ** (i + 1)) / (i + 1)
-                   for i, coefficient in enumerate(polynomial))
-    return integral / scale
+        alpha, beta = (a - node) / (nodes[j] - node), width / (nodes[j] - node)
+        polynomial = [(polynomial[i] if i < len(polynomial) else 0.0) * alpha
+                      + (polynomial[i - 1] * beta if i > 0 else 0.0) for i in range(len(polynomial) + 1)]
+    return width * sum(coefficient / (i + 1) for i, coefficient in enumerate(polynomial))
 
 
 @struct.dataclass
@@ -307,7 +311,9 @@ class LMS:
         orders = [min(index, self.order - 1) + 1 for index in range(times.shape[0] - 1)]
         _check_gaps(_grid_levels(process, times)[1], _history_gaps(orders),
                     reason="LMS's Lagrange basis divides by")
-        sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
+        # The sigmas in the dtype the rates take at the run's times, as each step pushes them (2063).
+        sigma = process.rates(times[0], like=x)[1]
+        sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), sigma.dtype)
         return jnp.zeros((self.order, *x.shape), x.dtype), sigmas, jnp.zeros((), jnp.int32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):

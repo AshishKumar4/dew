@@ -22,19 +22,21 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
+from whole_suite import timed
 
 from dew.batch import coordinates
 from dew.nn import linear
-from dew.nn.attention import alibi_bias
+from dew.nn.attention_masks import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.cross_attention import CrossAttention
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall
 from dew.nn.kernels.generation import chosen
 from dew.nn.memory import Gate, InContextMemory, MLPMemory
-from dew.nn.mixer_base import MixerRefused
+from dew.nn.mixer_base import MLP_RESIDUALS, MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
@@ -231,6 +233,11 @@ def packed_and_alone(model, variables, tokens, cotangent):
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
                "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 32}, {}),
+               "lightning_attention": ({"block_size": 64}, {"num_heads": 8, "head_dim": 16}),
+               # QSA keeps two blocks of two keys and the last one: it picks among a document's keys from
+               # six on.
+               "qsa_attention": ({"indexer_n_heads": 2, "indexer_head_dim": 16, "indexer_budget": 4,
+                                  "indexer_compress_ratio": 2}, {}),
                "mamba2": ({"num_heads": 8, "head_dim": 32, "state_size": 32, "n_groups": 4,
                            "chunk_size": 64}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
@@ -245,8 +252,10 @@ per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
-SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
-         "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64, "mlp": 64}
+SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
+         "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
+         "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
+         "mlp": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
 armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
@@ -258,10 +267,20 @@ and the port pads every key width below 64 to 64 (`recurrence_chunk._blocked_rul
 tests/test_fla_gdn.py's any-width site holds at 32. The packed row no longer runs a 16-wide Kimi layer or
 Mamba2's defaults (128 heads of 64 over a state of 128 in 256-token chunks, where these documents sit in
 one chunk); the scan's packed resets within a chunk stay held by tests/test_mamba2.py and
-tests/test_mamba_ssd.py at their own geometries."""
+tests/test_mamba_ssd.py at their own geometries. Lightning attention runs 8 heads of 16 in 64-token chunks
+(`KIND_FIELDS`): at the model's 4 heads, of 8, 16 or 32 channels, the reference compared with itself did
+not resolve within 512 seeds (2048 at 8); at 8 or 16 heads of 16, or 4 of 64, it resolves at 64. Kimi delta
+attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm, on armada, ledger 2828):
+compared with themselves its documents alone take 512."""
 
 
-@pytest.mark.parametrize("kind", sorted(mixers.paths))
+PAST_TARGET = {"packed": {"memory": 122}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (ddee96234, ledger 2160):
+the memory mixer's packed row; every train packs every other mixer's, and test_memory_composition.py
+packs the memory decoder's."""
+
+
+@pytest.mark.parametrize("kind", timed(PAST_TARGET, "packed", sorted(mixers.paths)))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     """Every mixer in the registry: a row packing documents (segment ids, positions restarting),
     one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients
@@ -283,6 +302,41 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
         with pytest.raises(ValueError):
             packed_and_alone(model, variables, tokens, cotangent)
         return
+    assert_packed_as_alone(model, variables, f"packed {kind}", SEEDS[kind])
+
+
+COMPRESSED = {"hca": {"compressor": "hca", "compress_rate": 4},
+              "csa": {"compressor": "csa", "compress_rate": 4, "index_topk": 2, "index_n_heads": 2,
+                      "index_head_dim": 16},
+              "csa2": {"compressor": "csa2", "compress_rate": 4, "index_topk": 2, "index_n_heads": 2,
+                       "index_head_dim": 16}}
+"""DeepSeek V4's compressed windows, a layer of each compressor at a rate of 4, so the documents' windows
+straddle each other's boundaries packed: the first's one window and its partial second, the second's
+seventeen, the third's one."""
+
+
+@pytest.mark.parametrize("compressor", sorted(COMPRESSED))
+def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(compressor):
+    """DeepSeek V4's compressed windows over a packed row (`document_windows`, ledger 2679): each
+    document's windows pool its own real tokens from its first, rotate at its own places and are read by
+    its own queries alone, an indexer selecting among them alone, so a row packing documents gives each
+    document's logits and the parameters' gradients its documents give run one at a time, from float64
+    (check 1), as `test_a_packed_row_computes_what_its_documents_compute_alone` holds every mixer."""
+    fields, overrides = KIND_FIELDS["deepseek_v4"]
+    total = sum(DOCUMENTS)
+    model = tiny(mixer=mixers.build("deepseek_v4", **fields, **COMPRESSED[compressor]),
+                 max_seq_len=max(128, total + PADDING), **overrides)
+    variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
+    assert_packed_as_alone(model, variables, f"packed deepseek_v4 {compressor}",
+                           SEEDS[f"deepseek_v4 {compressor}"])
+
+
+def assert_packed_as_alone(model, variables, what: str, seeds: int):
+    """Check 1 of `model`'s packed row of `DOCUMENTS` against each document run alone, logits and
+    parameter gradients, each draw fresh tokens, parameters and cotangents with the residual channels
+    consistently permuted (`residual_orders`), the float64 truth each document alone."""
+    documents = DOCUMENTS
+    total = sum(documents)
     initialize = jax.jit(model.init)
     width = residual_width(variables)
 
@@ -303,7 +357,7 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     dew = jax.jit(functools.partial(evaluated, model, packed=True))
     reference = jax.jit(functools.partial(evaluated, model, packed=False))
     truth = jax.jit(functools.partial(evaluated, model.clone(dtype=jnp.float64), packed=False))
-    assert_as_exact(dew, reference, draw, f"packed {kind}", seeds=SEEDS[kind], truth_fn=truth)
+    assert_as_exact(dew, reference, draw, what, seeds=seeds, truth_fn=truth)
 
 
 def embedded(module, tokens):
@@ -364,7 +418,8 @@ POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "a
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
 """Layer fields a kind needs to build at all, beyond the test's context."""
 
-ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory"}
+ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "lightning_attention", "mamba", "mamba2",
+                  "memory", "short_conv"}
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
@@ -423,6 +478,20 @@ def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
     assert [rung.recompute_record() for rung in climbed] == rungs
 
 
+def test_a_cross_attention_feed_forward_keeps_its_rungs_where_the_trunk_has_none():
+    """A decoder with no trunk MLP, Mamba-2's layout, marks its gated cross-attention's feed-forward
+    (`marked_residuals`): 'minimal', which keeps that MLP's projections, climbs on to 'full', which
+    recomputes them, whether it starts there or a record restores it."""
+    fields, overrides = KIND_FIELDS["mamba2"]
+    model = tiny(mixer=mixers.build("mamba2", **fields), max_seq_len=64, mlp_features=0,
+                 cross_attention=CrossAttention(layer_ids=(0,), context_length=4, context_features=16,
+                                                intermediate_size=32), **overrides)
+    assert set(MLP_RESIDUALS) <= model.marked_residuals()
+    minimal = model.restore_recompute(model.clone(remat="minimal").recompute_record())
+    climbed = minimal.recompute_more()
+    assert climbed is not None and climbed.recompute_record() == "full"
+
+
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
 @chosen(gated_delta_rule="fla")
 def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
@@ -469,20 +538,31 @@ def one_tap(kind):
                                      conv_kernel=1)}[kind]()
 
 
+ONE_TAP_SEEDS = {"gated_delta_net": 8, "kimi_delta_attention": 8, "mamba": 8, "mamba2": 8}
+"""Each one-tap mixer's declared draws for its decode against its whole pass (check 1), sized by
+`seeds_for` paired with the decode on the CPU."""
+
+
 @pytest.mark.parametrize("kind", ["gated_delta_net", "kimi_delta_attention", "mamba", "mamba2"])
 def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(kind):
     """A one-tap causal conv is a scale per channel with no history to hold: each recurrent mixer
-    builds with one, and its decode (a 3-token prefill, then one token a step) is within
-    tests/reference_error.py's rule of its whole pass against the float64 whole pass."""
-    from model_support import decode_through
-    from reference_error import assert_as_exact_as_the_reference
+    builds with one, and its decode (a 3-token prefill, then one token a step) is on par with its
+    passes, each step's at the width it reads (`as_stepped`), from the float64 whole pass over drawn
+    inputs (check 1)."""
+    from model_support import as_stepped, decode_through
 
     module = one_tap(kind)
-    hidden = jax.random.normal(jax.random.key(4), (2, 9, module.emb_features), jnp.float32)
-    variables = module.init(jax.random.key(5), hidden)
-    whole = np.asarray(module.apply(variables, hidden), np.float64)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        truth = np.asarray(module.clone(dtype=jnp.float64).apply(wide, jnp.asarray(hidden, jnp.float64)))
-    decoded = np.asarray(decode_through(module, variables, hidden, prefill=3)[0], np.float64)
-    assert_as_exact_as_the_reference(decoded, whole, truth, f"{kind} decode")
+    shape = (2, 9, module.emb_features)
+    variables = module.init(jax.random.key(5), jnp.zeros(shape, jnp.float32))
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), shape, jnp.float32),)
+
+    def truth(hidden):
+        return module.clone(dtype=jnp.float64).apply(widened(variables), hidden)
+
+    assert_as_exact(lambda hidden: decode_through(module, variables, hidden, prefill=3)[0],
+                    jax.jit(lambda hidden: as_stepped(lambda held: module.apply(variables, held), hidden,
+                                                      3)),
+                    draw, f"{kind} decode",
+                    seeds=ONE_TAP_SEEDS[kind], truth_fn=truth)

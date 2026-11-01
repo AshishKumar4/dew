@@ -96,3 +96,162 @@ def test_the_export_writes_back_the_source_tensors_and_config(checkpoint, tmp_pa
     reloaded = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(pretrained.model.apply(pretrained.variables, ids)))
+
+
+VISION = {
+    "num_hidden_layers": 2, "hidden_size": 32, "intermediate_size": 48, "num_attention_heads": 4,
+    "hidden_act": "gelu", "patch_size": 2, "patch_temporal": 2, "merge_size": 2, "pos_emb_height": 4,
+    "pos_emb_width": 4, "layer_norm_eps": 1e-5, "layer_types": ["window_attention", "full_attention"],
+    "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0}}
+IMAGE_TOKEN, IMAGE_SIDE = 250, 8
+"""The wrapper's image placeholder, and the side of a drawn image: 4 x 4 patches of 2, merged 2 x 2 into
+4 soft tokens."""
+WRAPPER_SEEDS = {"text": 8, "image": 8, "video": 8}
+"""Check 1's declared seeds for the wrapper's logits over drawn ids, over drawn images among them, and
+over drawn videos among them."""
+FRAMES = 3
+"""A drawn video's frames: two temporal patches, the last frame repeated to fill the second, as the video
+processor pads it."""
+
+
+@pytest.fixture(scope="module")
+def wrapper(tmp_path_factory):
+    """A tiny Muse Glimmer wrapper as transformers saves one, every weight drawn away from its initial
+    value, and its float32 and float64 models."""
+    import pathlib
+    import shutil
+
+    from transformers import MuseGlimmerConfig, MuseGlimmerForConditionalGeneration
+    from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
+
+    from tools.torch_precision import float64_twin
+
+    text = {key: value for key, value in TEXT.items() if key not in ("model_type", "architectures")}
+    config = MuseGlimmerConfig(text_config=text, vision_config=VISION, image_token_id=IMAGE_TOKEN,
+                               video_token_id=IMAGE_TOKEN + 1, out_hidden_size=VISION["hidden_size"] * 4,
+                               projector_hidden_size=24, projector_hidden_act="gelu")
+    torch.manual_seed(0)
+    model = MuseGlimmerForConditionalGeneration(config).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.1)
+    directory = tmp_path_factory.mktemp("muse-glimmer-wrapper")
+    model.save_pretrained(directory)
+    # The processor a release ships beside it: the image processor's config, and a tokenizer, which
+    # `Processor.from_hf` never reads for given ids (a tiny fixture's).
+    MuseGlimmerImageProcessor(patch_size=VISION["patch_size"], temporal_patch_size=VISION["patch_temporal"],
+                              merge_size=VISION["merge_size"]).save_pretrained(directory)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(pathlib.Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny" / name,
+                    directory / name)
+    return directory, model, float64_twin(model)
+
+
+GEOMETRY = {"patch_size": VISION["patch_size"], "temporal_patch_size": VISION["patch_temporal"],
+            "merge_size": VISION["merge_size"], "do_resize": False, "do_rescale": False,
+            "do_normalize": False, "do_convert_rgb": False}
+"""The image and video processors' patch geometry, the tower's, with every step before patching off: a
+drawn image or video is already the tower's size and range."""
+
+
+def packed_image(image) -> dict[str, np.ndarray]:
+    """`image` `[1, 3, H, W]` as the image processor packs it: its patch vectors and its grid."""
+    from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
+
+    packed = MuseGlimmerImageProcessor(**GEOMETRY)(images=[torch.from_numpy(np.asarray(image)[0])],
+                                                    return_tensors="np")
+    return {"pixel_values": packed["pixel_values"], "image_grid_thw": packed["image_grid_thw"]}
+
+
+def packed_video(video) -> dict[str, np.ndarray]:
+    """`video` `[1, T, 3, H, W]` as the video processor packs it, its frames as they are: its patch
+    vectors, each a temporal patch's (the last frame repeated to fill the last), and its grid."""
+    from transformers.models.muse_glimmer.video_processing_muse_glimmer import MuseGlimmerVideoProcessor
+
+    packed = MuseGlimmerVideoProcessor(**GEOMETRY, do_sample_frames=False)(
+        videos=[torch.from_numpy(np.asarray(video)[0])], return_tensors="np")
+    return {"pixel_values_videos": packed["pixel_values_videos"], "video_grid_thw": packed["video_grid_thw"]}
+
+
+def wrapper_logits(model, ids, image=None, video=None):
+    """`model`'s logits over `ids` `[1, S]`, its image `[1, 3, H, W]` packed as the image processor
+    packs one where given (`packed_image`), or its video `[1, T, 3, H, W]` as the video processor does
+    (`packed_video`); a float64 model run inside `float64`."""
+    import contextlib
+
+    from tools.torch_precision import float64
+
+    dtype = next(model.parameters()).dtype
+    media = {}
+    if image is not None:
+        packed = packed_image(image)
+        media = {"pixel_values": torch.from_numpy(packed["pixel_values"]).to(dtype),
+                 "image_grid_thw": torch.from_numpy(packed["image_grid_thw"])}
+    if video is not None:
+        packed = packed_video(video)
+        media = {"pixel_values_videos": torch.from_numpy(packed["pixel_values_videos"]).to(dtype),
+                 "video_grid_thw": torch.from_numpy(packed["video_grid_thw"])}
+    with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+        return {"logits": model(input_ids=torch.from_numpy(np.asarray(ids)).long(), **media).logits.numpy()}
+
+
+def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
+    """The wrapper loads as its trunk, adapter, projection and decoder, each released tensor mapped and
+    exported bit for bit, and its logits over drawn ids, an unfilled video placeholder among them (as
+    a decode step may draw one), over drawn images placed among them and over drawn videos placed among
+    them, each packed as the image or video processor packs it and read by the source's processor
+    (`Processor.from_hf`, ledger 1919), are on par
+    with transformers' float32 ones from its float64 ones (check 1); its language model alone
+    (`text_only`) computes the wrapper's text logits bit for bit on ids without placeholders (ledger
+    1883)."""
+    import jax
+    import jax.numpy as jnp
+    from reference_error import as_given, assert_as_exact
+
+    directory, reference, truth = wrapper
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    exported = loaded.export()
+    # Untied, as the wrapper's config leaves its head (transformers ties by its unset field).
+    stored = {name: tensor.detach().numpy() for name, tensor in reference.state_dict().items()}
+    assert sorted(exported) == sorted(stored)
+    for name, tensor in stored.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name)
+
+    def drawn(seed, *, media):
+        rng = np.random.default_rng([0x1883, seed])
+        ids = rng.integers(3, IMAGE_TOKEN, (1, 20)).astype(np.int32)
+        if media == "text":
+            # A video placeholder no video fills, as a decode step may draw it: the wrapper embeds it
+            # as token zero.
+            ids[0, 2] = IMAGE_TOKEN + 1
+            return (ids,)
+        if media == "image":
+            ids[0, 5:9] = IMAGE_TOKEN
+            return ids, rng.random((1, 3, IMAGE_SIDE, IMAGE_SIDE)).astype(np.float32)
+        # Two temporal patches of four soft tokens each, one run of placeholders a frame (ledger 1919).
+        ids[0, 5:9] = ids[0, 11:15] = IMAGE_TOKEN + 1
+        return ids, None, rng.random((1, FRAMES, 3, IMAGE_SIDE, IMAGE_SIDE)).astype(np.float32)
+
+    # The wrapper's forward compiled, one program a media's shapes, as a served wrapper runs it.
+    forward = jax.jit(loaded.model.apply)
+
+    @as_given
+    def ours(ids, image=None, video=None):
+        if image is None and video is None:
+            return {"logits": forward(loaded.variables, jnp.asarray(ids))}
+        # The processor's packing, read by the source's processor (`Processor.from_hf`).
+        packed = packed_image(image) if video is None else packed_video(video)
+        batch = loaded.processor.from_hf({"input_ids": np.asarray(ids), "attention_mask": np.ones(
+            np.shape(ids), bool), **packed})
+        return {"logits": forward(loaded.variables, batch.tokens, **batch.kwargs())}
+
+    for media in ("text", "image", "video"):
+        assert_as_exact(ours, as_given(lambda *inputs: wrapper_logits(reference, *inputs)),
+                        lambda seed, media=media: drawn(seed, media=media),
+                        f"Muse Glimmer {media}", seeds=WRAPPER_SEEDS[media],
+                        truth_fn=as_given(lambda *inputs: wrapper_logits(truth, *inputs)))
+
+    text = Pretrained.load(str(directory), dtype="float32", attention_impl="reference", text_only=True)
+    ids = np.random.default_rng(0x1883).integers(3, IMAGE_TOKEN, (1, 20)).astype(np.int32)
+    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
+                                  np.asarray(loaded.model.apply(loaded.variables, ids)))

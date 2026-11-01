@@ -153,8 +153,10 @@ export default {
 		if (url.pathname === '/v1/operator/trial') {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
 			const registry = env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global'));
-			if (request.method === 'POST') await registry.trial(new URL(request.url).searchParams.get('commit') ?? '');
-			return Response.json(await registry.trialled());
+			// A trial the preparer refused (it runs one already) is said here, and the one it runs stays reported.
+			const refused = request.method === 'POST'
+				? await registry.trial(new URL(request.url).searchParams.get('commit') ?? '') : null;
+			return Response.json({ ...(await registry.trialled()), ...(refused ? { refused } : {}) });
 		}
 		if (url.pathname === '/v1/operator/warm' || url.pathname === '/v1/operator/status') {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });

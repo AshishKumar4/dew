@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import pytest
 
-from dew.inference import Engine, Scored, ScoringServer
+from dew.inference import Engine, ScoringRequest, ScoringServer
 
 
 @dataclass(frozen=True)
@@ -24,18 +24,33 @@ class Named:
     short: int = 0
     width: int = 64
 
-    def admit(self, request: str) -> Scored[str, str]:
-        return Scored(tuple(request), self.name)
+    def admit(self, request: str) -> ScoringRequest[str, str]:
+        return ScoringRequest(tuple(request), self.name)
 
-    def fits(self, rows) -> bool:
-        return len(rows) <= self.width
+    def planned(self) -> "Counted":
+        return Counted(self.width)
 
     def forward(self, variables, rows):
         weight = float(variables["w"])
         return [(row, weight) for row in rows][:len(rows) - self.short]
 
+    def compile(self, variables):
+        # Its passes compile nothing.
+        return ()
+
     def answer(self, payload: str, outputs):
         return self.name, payload, "".join(row for row, _ in outputs), *(outputs[0][1:] if outputs else ())
+
+
+class Counted:
+    """A pass of at most `width` rows, taking them one at a time (`Scoring.planned`)."""
+
+    def __init__(self, width: int):
+        self.width, self.rows = width, 0
+
+    def add(self, row) -> bool:
+        self.rows += 1
+        return self.rows <= self.width
 
 
 def weights(value: float):

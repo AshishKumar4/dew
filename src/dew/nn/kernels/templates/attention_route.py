@@ -4,7 +4,7 @@ the template's forward and backward under one `jax.custom_vjp`, on the mainloops
 On a GPU the process places calls on, of sm80 or later (`generation.bf16_dot_runs`), the forward and the
 backward run on the Mosaic template, Mosaic GPU's mainloop, where it runs the call on the device
 (`attention_mosaic.forward_takes`, `attention_mosaic.backward_takes`: its family has a bundle there, the call
-is one it takes and a config fits), else by legality on the frozen Triton mainloop (`attention_triton`, which
+is one it takes and a config fits), else by legality on the Pallas-Triton mainloop (`attention_triton`, which
 walks no call's runs, `attention_triton.refused`). Everywhere else, or where neither takes the call, both run
 the plain-JAX mainloop (`attention_portable`). Every mainloop's training forward gives the same residuals, so
 the backward runs on whichever takes it by legality (a 16-bit call's fp16 backward on Triton's, which Mosaic's
@@ -22,7 +22,18 @@ import jax.numpy as jnp
 
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates import attention_mosaic, attention_portable, attention_triton
-from dew.nn.kernels.templates.attention import ACCURATE, NATURAL, Gradients, Hooks, KeySpans, Split
+from dew.nn.kernels.templates.attention import (
+    ACCURATE,
+    NATURAL,
+    Gradients,
+    Hooks,
+    Kept,
+    KeySpans,
+    Kind,
+    Split,
+    shared_sum,
+    takes_output_residuals,
+)
 
 PLAIN_TILE = attention_triton.BLOCK
 """The plain-JAX mainloop's tile: the query and key blocks a call walks, and the padding it takes to whole
@@ -36,8 +47,8 @@ Residuals = tuple[jax.Array, jax.Array, jax.Array, Split]
 FORMS = ("fast", "accurate")
 """The template's forms (kernel-templates.md §1, testing.md): the default, fast (the base-2 fold and
 FlashAttention's arithmetic, `NATURAL`, `ACCURATE`), and the accurate form one option away (natural logits and
-the accurate products), which `generation.chosen(attention_form='accurate')` names for every template call in
-its block."""
+the accurate products), which a run's numerics name for every template call in their block
+(`generation.run_precision`, `Numerics.forms`)."""
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -51,20 +62,17 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     default. An output hook is refused: a differentiated call applies `output_mod` to the output past the
     kernel, where its own derivative runs, so the caller applies it.
 
-    `natural` and `accurate` name its form, each where None the one `generation.chosen(attention_form=...)`
-    names (`FORMS`; 'accurate' takes both), else the default's. `operand_dtype`, where the key and value
-    arrive wider than the mainloops compute them (a sharding wrapper's, so its partial gradients sum wide),
-    narrows the operands to it and hands back the key's and value's gradients unrounded, in their own dtype:
-    the wrapper sums them and rounds once.
+    `natural` and `accurate` name its form, each where None the one the run's numerics name
+    (`generation.numerics().forms`, `FORMS`; 'accurate' takes both), else the default's.
+    `operand_dtype`, where the key and value arrive wider than the mainloops compute them (a sharding
+    wrapper's, so its partial gradients sum wide), narrows the operands to it and hands back the key's
+    and value's gradients unrounded, in their own dtype: the wrapper sums them and rounds once.
     """
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
-    form = generation.measured_kernel('attention_form', 'fast')
-    if form not in FORMS:
-        raise ValueError(f"attention_form {form!r}: the template's forms are {', '.join(FORMS)}")
-    wide = form == 'accurate'
+    wide = generation.numerics().forms == 'accurate'
     config = _Config(scale, NATURAL or wide if natural is None else natural,
                      ACCURATE or wide if accurate is None else accurate,
                      None if operand_dtype is None else jnp.dtype(operand_dtype).name)
@@ -90,8 +98,11 @@ class _Config:
 
 
 def _on_gpu() -> bool:
-    """Whether calls run on a GPU of sm80 or later, where the Triton mainloop runs (`bf16_dot_runs`)."""
-    return generation.gpu_placed() and generation.bf16_dot_runs()
+    """Whether calls are chosen for a GPU of sm80 or later, where the GPU mainloops run (`bf16_dot_runs`):
+    the target's backend (`generation.backend`), which an assumed GPU answers for, so a step a Trainer or an
+    AOT lowering traces under `generation.assumed` compiles the mainloop the GPU runs, not the host's (audit
+    K5: the host's placement, `gpu_placed`, sent such a step to the plain-JAX mainloop)."""
+    return generation.backend() == 'gpu' and generation.bf16_dot_runs()
 
 
 DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop is frozen, "
@@ -143,18 +154,17 @@ class _Pass:
     it takes it) and why the Triton one refuses its spans (`attention_triton.refused`)."""
 
     on_gpu: bool
-    mosaic: str | None
-    triton: str | None
+    mosaic: selection.Refusal | None
+    triton: selection.Refusal | None
 
 
 _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
                                        generation.INHERENT)
 MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
-    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.Requirement[_Pass](
-        'declined', lambda case: case.mosaic is None, lambda case: str(case.mosaic),
-        'roadmap: the Mosaic template takes every call'))),
-    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.Requirement[_Pass](
-        'spans', lambda case: case.triton is None, lambda case: str(case.triton), generation.INHERENT))),
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.analysed(
+        'declined', lambda case: case.mosaic, 'roadmap: the Mosaic template takes every call'))),
+    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.analysed(
+        'spans', lambda case: case.triton, generation.INHERENT))),
     selection.Kernel[_Pass]('portable', (), generic=True),
 ), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
 """The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the frozen
@@ -164,24 +174,36 @@ route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic tem
 reason."""
 
 
-def _mainloop(declined: str | None, spans: KeySpans) -> str:
-    """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass."""
+def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:
+    """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
+    Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
+    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting)."""
     on_gpu = _on_gpu()
-    case = _Pass(on_gpu, declined, attention_triton.refused(spans) if on_gpu else None)
-    return selection.select(MAINLOOP, case).kernel
+    triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
+    return selection.select(MAINLOOP, _Pass(on_gpu, declined, triton)).kernel
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
              config: _Config, *, residuals: bool):
-    """The forward on its mainloop (`_mainloop`)."""
+    """The forward on its mainloop (`_mainloop`): the Mosaic one's training forward keeping its output for the
+    backward's D where the call takes that (`takes_output_residuals`), whichever mainloop runs the backward
+    (the residuals are every mainloop's, `output_split`)."""
     form = {"scale": config.scale, "natural": config.natural}
-    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
+    if not residuals:
+        kept = Kept.NONE
+    elif takes_output_residuals(hooks, query.dtype, accurate=config.accurate):
+        kept = Kept.OUTPUT
+    else:
+        kept = Kept.SPLIT
+    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
                                                  **form) if _on_gpu() else None
-    mainloop = _mainloop(declined, spans)
+    mainloop = _mainloop(declined, spans, hooks, functools.partial(
+        attention_triton.unfitted, query, key, value, spans, hooks, residuals=residuals, **form))
     if mainloop == 'mosaic':
-        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
+        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
     if mainloop == 'triton':
-        return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
+        return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=residuals,
+                                        **form)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, residuals=residuals, **form)
 
@@ -207,13 +229,30 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     rounded = config.operand_dtype is None
     declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
                 else None)
-    mainloop = _mainloop(declined, spans)
+    mainloop = _mainloop(declined, spans, hooks, functools.partial(
+        attention_triton.backward_unfitted, *call, residuals=residuals, scale=config.scale,
+        natural=config.natural, accurate=config.accurate))
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if mainloop == 'triton':
-        return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
+        grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
+                                          residuals=residuals, rounded=rounded, **form)
+        return dataclasses.replace(grads, score_params=tuple(
+            shared_sum(grad, param) for grad, param in zip(grads.score_params, hooks.score_params,
+                                                           strict=True)))
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, rounded=rounded, **form)
+
+
+def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
+    """`hooks` with each query, key or tile parameter spread over the batch rows and query heads it shares
+    (`template.shared_place`), as the Pallas-Triton mainloop indexes them; the other mainloops read them
+    shared."""
+    batch, heads = query.shape[0], query.shape[2]
+    return dataclasses.replace(hooks, score_params=tuple(
+        dataclasses.replace(param, value=jnp.broadcast_to(param.value,
+                                                          (batch, heads, *param.value.shape[2:])))
+        if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE) else param for param in hooks.score_params))
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

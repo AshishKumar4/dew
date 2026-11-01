@@ -21,7 +21,7 @@ def run():
         from dew.training import prepare_process
         prepare_process(multi_host=False)
     import jax
-    from affine_run import fit_one_step
+    from affine_training import fit_one_step
     fit_one_step()
     return jax.config.jax_compilation_cache_dir
 
@@ -56,3 +56,55 @@ def test_a_run_caches_its_compilations_under_the_users_cache_directory(tmp_path,
     else:
         assert not directory
         assert not (tmp_path / "dew" / "xla").exists()
+
+
+def test_a_tests_child_process_compiles_into_the_suites_cache():
+    """A process a test starts (a checker run as a script, a CLI) compiles into the cache the suite's
+    process keeps, under the same settings, so its programs reach the shared bundles and its next run is
+    warm: tools/check_native_diffusion.py's xl case compiled cold each run, 139.6 s, and warm 43.3 s
+    (2026-10-29: row 2323). Under DEW_TEST_NO_CACHE neither caches."""
+    import jax
+
+    names = ("jax_enable_compilation_cache", "jax_compilation_cache_dir",
+             "jax_persistent_cache_min_compile_time_secs", "jax_persistent_cache_min_entry_size_bytes")
+    read = f"import jax, json; print(json.dumps([getattr(jax.config, name) for name in {list(names)!r}]))"
+    child = json.loads(subprocess.run([sys.executable, "-c", read], capture_output=True, text=True,
+                                      check=True).stdout)
+    assert child == [getattr(jax.config, name) for name in names]
+
+
+LATE = """
+import json
+import sys
+
+from dew.cache import enable_compilation_cache
+
+import jax
+
+# The cache on, every program kept, whatever the suite's own cache policy hands this process.
+jax.config.update("jax_enable_compilation_cache", True)
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+enable_compilation_cache(sys.argv[1])
+jax.jit(lambda x: x * 3)(1).block_until_ready()
+enable_compilation_cache(sys.argv[2])
+jax.jit(lambda x: x - 5)(1).block_until_ready()
+print(json.dumps({"directory": jax.config.jax_compilation_cache_dir}))
+"""
+
+
+def test_a_cache_directory_named_after_the_first_compile_holds_the_programs_compiled_after(tmp_path):
+    """JAX settles its persistent cache at the process's first compile; a directory a run names after it
+    (`prepare_process` in a process that compiled, as a second run in a notebook does) holds the
+    programs compiled after, not the first directory (row 2836)."""
+    from process_support import fresh
+
+    first, later = tmp_path / "first", tmp_path / "later"
+    held = fresh(LATE, str(first), str(later), cache_dir=first, flags="")
+    assert held["directory"] == str(later)
+
+    def programs(directory):
+        return {path.name for path in directory.glob("*-cache")}
+
+    assert len(programs(first)) == 1 and len(programs(later)) == 1
+

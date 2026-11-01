@@ -143,6 +143,34 @@ def test_a_request_refuses_a_bool_row_beside_integer_rows():
         [4, 5], [2, 3]]
 
 
+def test_tokens_laid_out_both_as_coordinates_and_as_fields_are_refused():
+    """A call that lays its tokens out twice, as `Coordinates` and as a flat field beside them, is refused
+    wherever it enters, a ModelInputs or the decoder's call, where the coordinates silently dropped the
+    field (ledger 1122). Either form alone reads as before."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.batch import COORDINATES_FIELD, coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import ModelInputs
+
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
+                              attention_impl="reference")
+    tokens = jnp.asarray([[0, 3, 4, 5], [6, 7, 8, 9]], jnp.int32)
+    valid = jnp.asarray([[False, True, True, True], [True, True, True, True]])
+    laid = coordinates(tokens.shape, valid=valid)
+    variables = model.init(jax.random.key(0), tokens)
+    for field, value in (("attention_mask", valid), ("segment_ids", jnp.ones(tokens.shape, jnp.int32)),
+                         ("positions", jnp.zeros(tokens.shape, jnp.int32))):
+        with pytest.raises(ValueError):
+            ModelInputs(tokens, {COORDINATES_FIELD: laid, field: value}).validate()
+        with pytest.raises(ValueError):
+            model.apply(variables, tokens, coordinates=laid, **{field: value})
+    np.testing.assert_array_equal(model.apply(variables, tokens, coordinates=laid),
+                                  model.apply(variables, tokens, attention_mask=valid))
+
+
 def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     """The same packed, left-padded rows, as `Coordinates` (a data pipeline's
     packing) or as the validity, segment and position fields (a rollout's), are
@@ -152,7 +180,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     import jax
     import jax.numpy as jnp
 
-    from dew.batch import COORDINATES_FIELD, coordinates
+    from dew.batch import COORDINATES_FIELD, coordinates, real_slots
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
 
@@ -175,7 +203,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
         fields, laid = (step(ModelInputs.from_value(form)) for form in forms)
         expected, actual = (model.apply(params, inputs.tokens, **inputs.kwargs())
                             for inputs in (fields, laid))
-        real = np.asarray(jnp.asarray(fields.token_fields["attention_mask"]))
+        real = np.asarray(real_slots(fields.token_fields, fields.tokens.shape))
         np.testing.assert_array_equal(np.asarray(actual)[real], np.asarray(expected)[real])
 
 
@@ -232,3 +260,105 @@ def test_a_feed_forward_reads_blocks_of_its_own_size_from_the_layers_metadata():
     np.testing.assert_array_equal(four, [[0, 0, 0, 0, 1, 1, 1, 1]])
     np.testing.assert_array_equal(two, [[0, 0, 1, 1, 2, 2, 3, 3]])
     assert routing_blocks(Routed(None), metadata, (1, 8, 3)) == {}
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_packed_offsets_come_from_the_batchs_document_firsts(seed):
+    """A packed batch's `cu_seqlens` (`dew.nn.inputs.cu_seqlens`) are each sequence's first token over the
+    flattened tokens in order, every row's first token one, the sequences past them empty at the end: the
+    same from the batch's `Coordinates.firsts`, built by one builder for a traced step's coordinates and a
+    host batch's alike (`document_firsts`, row 1923), from the starts alone, and as the tokens marked in
+    order would give them (row 1897: a scan over the flattened tokens ran a token a loop iteration on a
+    mesh); and a request's sliced coordinates hold the firsts of their own slots."""
+    import jax.numpy as jnp
+
+    from dew.batch import coordinates
+    from dew.nn.inputs import ModelInputs, cu_seqlens
+
+    rng = np.random.default_rng(seed)
+    rows, length, documents = 3, 17, 4
+    segments = np.zeros((rows, length), np.int32)
+    for row in range(rows):
+        cuts = np.sort(rng.choice(np.arange(1, length), rng.integers(0, documents), replace=False))
+        segments[row] = np.searchsorted(cuts, np.arange(length), side="right") + 1
+    tokens = coordinates(segments=segments, max_segments=documents)
+    marked = np.asarray(tokens.starts).copy()
+    marked[:, 0] = True
+    flat = np.flatnonzero(marked.reshape(-1))
+    sequences = rows * (documents + 1)
+    want = np.concatenate([flat, np.full(sequences + 1 - flat.size, rows * length)]).astype(np.int32)
+    np.testing.assert_array_equal(cu_seqlens(tokens.starts, sequences, tokens.firsts), want)
+    np.testing.assert_array_equal(cu_seqlens(tokens.starts, sequences), want)
+    host = coordinates(segments=segments, max_segments=documents, xp=np)
+    assert isinstance(host.firsts, np.ndarray)
+    np.testing.assert_array_equal(host.firsts, tokens.firsts)
+
+    request = ModelInputs(tokens=jnp.zeros((rows, length), jnp.int32), token_fields={"coordinates": tokens})
+    sliced = request.slice_tokens(0, length - 3).token_fields["coordinates"]
+    np.testing.assert_array_equal(
+        sliced.firsts, coordinates(segments=segments[:, :length - 3], max_segments=documents).firsts)
+
+
+def test_a_traced_packed_batch_holds_its_documents_apart_from_its_tokens():
+    """A packed batch whose coordinates a traced step built holds its documents' firsts `[B, D]` beside its
+    token-aligned fields `[B, S]` (`Coordinates.TOKEN_ALIGNED`), fewer documents than slots: it validates,
+    and a slice or a rotation of its slots moves the token-aligned fields and builds the firsts again from
+    the moved starts, each row's slot 0 a first."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.batch import coordinates
+    from dew.nn.inputs import ModelInputs
+
+    segments = np.asarray([[1, 1, 1, 2, 2, 2, 2, 2], [1, 1, 1, 1, 1, 2, 2, 2]], np.int32)
+
+    def checked(segments):
+        tokens = coordinates(segments=segments, max_segments=2)
+        inputs = ModelInputs(tokens=jnp.zeros(segments.shape, jnp.int32),
+                             token_fields={"coordinates": tokens})
+        inputs.validate()
+        sliced = inputs.slice_tokens(0, 6).token_fields["coordinates"]
+        rotated = inputs.align_left(jnp.asarray([1, 0])).token_fields["coordinates"]
+        return tokens.firsts, sliced.starts, sliced.firsts, rotated.starts, rotated.firsts
+
+    firsts, sliced, sliced_firsts, rotated, rotated_firsts = jax.jit(checked)(segments)
+    assert firsts.shape == (2, 3) and sliced.shape == (2, 6) and rotated.shape == (2, 8)
+    np.testing.assert_array_equal(firsts, [[0, 3, 8], [0, 5, 8]])
+    np.testing.assert_array_equal(sliced_firsts, [[0, 3, 6], [0, 5, 6]])
+    # The first row rotated left a slot: its second document from slot 2.
+    np.testing.assert_array_equal(rotated_firsts, [[0, 2, 8], [0, 5, 8]])
+
+
+def test_a_field_dict_refuses_anything_but_coordinates_under_their_key():
+    """The reserved `coordinates` token field holds `Coordinates` alone: an array there is refused where
+    the layout is read, never dropped for the flat fields beside it (review of ledger 1122)."""
+    from dew.batch import COORDINATES_FIELD, field_coordinates, laid_coordinates
+
+    held = {COORDINATES_FIELD: np.zeros((1, 4), np.int32), "attention_mask": np.ones((1, 4), bool)}
+    with pytest.raises(TypeError):
+        laid_coordinates(held)
+    with pytest.raises(TypeError):
+        field_coordinates(held, (1, 4))
+
+
+def test_a_prompt_padded_as_document_zero_extends_as_one_its_validity_pads():
+    """A response continues its prompt's last document whether the prompt's padding is marked as
+    document 0 or by its validity (`ModelInputs.extended`, review of ledger 1122): the two extended
+    layouts hold the same validity and starts, the padding neither a start nor real, so a recurrence
+    neither resets at it nor reads it before the response."""
+    import jax.numpy as jnp
+
+    from dew.batch import COORDINATES_FIELD
+    from dew.nn.inputs import ModelInputs
+
+    tokens = jnp.asarray([[3, 5, 0, 0]], jnp.int32)
+    segments = jnp.asarray([[1, 1, 0, 0]], jnp.int32)
+    by_documents = ModelInputs.from_value(ModelInputs(tokens, {"segment_ids": segments}))
+    by_validity = ModelInputs.from_value(ModelInputs(tokens, {"segment_ids": segments,
+                                                              "attention_mask": segments != 0}))
+    response = jnp.asarray([[7]], jnp.int32)
+    laid = [inputs.extended(response).token_fields[COORDINATES_FIELD]
+            for inputs in (by_documents, by_validity)]
+    np.testing.assert_array_equal(laid[0].valid, laid[1].valid)
+    np.testing.assert_array_equal(laid[0].starts, laid[1].starts)
+    np.testing.assert_array_equal(laid[0].valid, [[True, True, False, False, True]])

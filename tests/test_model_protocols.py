@@ -47,113 +47,40 @@ every registered model built tiny by tests/tiny_models.py's `build_model`
 and `tiny_inputs`, which that file's registry-wide parametrization needs.
 """
 
+import contextlib
 import dataclasses
 import functools
 import json
-from pathlib import Path
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
+from architecture_cases import CASES as ARCHITECTURES
+from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
-from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
+from jepa_cases import MASK
+from model_support import float64_twin, moved
+from reference_error import as_given, assert_as_exact, widened
 from tiny_models import build_model, tiny_inputs
 
-from dew.interop import Pretrained, hf_decoders
+from dew.batch import coordinates
+from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.dit import TextContext
 from dew.nn.inputs import ModelInputs
 from dew.nn.precision import FP32_SUMS
-from dew.nn.protocols import IntervalModel, OutputTable, Recomputing, RequiresText, TimeScaled
+from dew.nn.protocols import IntervalModel, OutputTable, RequiresText, TimeScaled
 from dew.registry import models
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
 
-FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 DTYPES = ("float32", "bfloat16")
-ROWS, LENGTH = 2, 9
-
-
-def _config(name: str) -> dict:
-    return json.loads((FIXTURES / name / "config.json").read_text())
-
-
-def _checkpoint(directory: Path) -> bool:
-    """Whether `directory` is a tiny source of a registered decoder family: a
-    decoder's config, or a wrapper's whose text_config names its decoder. A
-    tower fixture's text_config states the width its projector reads and no
-    decoder (mimo-vision-tiny, under MiMo-V2's own model_type)."""
-    if not (directory / "config.json").is_file() or not (directory / "model.safetensors").is_file():
-        return False
-    config, families = _config(directory.name), hf_decoders.families()
-    text = config.get("text_config") or {}
-    return ("architectures" in config or "model_type" in text) and (
-        config.get("model_type") in families or text.get("model_type") in families)
-
-
-CHECKPOINTS = sorted(directory.name for directory in FIXTURES.iterdir() if _checkpoint(directory))
-OWN = [name for name in CHECKPOINTS if _config(name)["model_type"] in models]
-"""The checkpoints of a Dew model of their own, DiffusionGemma's."""
-DECODERS = [name for name in CHECKPOINTS if name not in OWN]
-
-
-def _layers(value, found: set[str], under: bool = False) -> set[str]:
-    """The mixer classes a translated record names, by the `class` of each
-    record under `mixer` or `kinds` (KDA beside MLA is not a delta net beside
-    attention), and its layer types."""
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if under and key == "class" and isinstance(item, str):
-                found.add(item)
-            _layers(item, found, under or key in ("mixer", "kinds"))
-            if key == "layer_types" and isinstance(item, (list, tuple)):
-                found.update(map(str, item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _layers(item, found, under)
-    return found
-
-
-@functools.cache
-def _paths(name: str) -> tuple:
-    """The code paths a checkpoint takes: the model it loads into, its token
-    mixers and layer types, and its routing, head and attention direction.
-    A family whose fields only its own translator reads is its own path."""
-    config = _config(name)
-    wrapper = config["model_type"] if name in OWN or config.get("text_config") else "decoder"
-    try:
-        record = dict(hf_decoders.translate_config(config.get("text_config") or config))
-    except ValueError:
-        return wrapper, name
-    return (wrapper, frozenset(_layers(record, set())),
-            (record.get("mixture") is not None, bool(record.get("tie_embeddings", True)),
-             record.get("head_transform") is not None, bool(record.get("head_bias")),
-             bool(record.get("causal", True))))
-
-
-def _smallest_of_each(names) -> list[str]:
-    """The smallest checkpoint of each code path (`_paths`), in name order."""
-    chosen: dict[object, str] = {}
-    for name in sorted(names, key=lambda name: (FIXTURES / name / "model.safetensors").stat().st_size):
-        chosen.setdefault(_paths(name), name)
-    return sorted(chosen.values())
-
-
-PATHS = _smallest_of_each(CHECKPOINTS)
-"""One checkpoint per wrapper, mixer and layer set, routing, head and direction."""
-
-
-@functools.cache
-def loaded(name: str, dtype: str = "float32") -> Pretrained:
-    return Pretrained.load(FIXTURES / name, dtype=dtype, attention_impl="reference")
 
 
 def same(actual, expected) -> None:
@@ -161,23 +88,6 @@ def same(actual, expected) -> None:
     assert jax.tree.structure(actual) == jax.tree.structure(expected)
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want), strict=True)
-
-
-class Reads(NamedTuple):
-    tokens: jax.Array
-    logits: jax.Array
-    hidden: jax.Array
-    table: OutputTable | None
-
-
-@functools.cache
-def reads(name: str, dtype: str) -> Reads:
-    source = loaded(name, dtype)
-    model, variables = source.model, source.variables
-    tokens = jnp.asarray(np.random.RandomState(0).randint(0, model.vocab_size, (ROWS, LENGTH)), jnp.int32)
-    return Reads(tokens, model.apply(variables, tokens, method="logits"),
-                 model.apply(variables, tokens, method="hidden_states"),
-                 model.apply(variables, method="output_table"))
 
 
 def contracted(hidden: jax.Array, table: OutputTable, variables) -> jax.Array:
@@ -285,9 +195,10 @@ def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name
     same(read.logits, model.text.apply(text, read.tokens))
     same(read.hidden, model.text.apply(text, read.tokens, method="hidden_states"))
     boundary, places = LENGTH // 2, jnp.arange(LENGTH)
-    packing = {"segment_ids": jnp.broadcast_to((places >= boundary).astype(jnp.int32), read.tokens.shape),
-               "positions": jnp.broadcast_to(jnp.where(places >= boundary, places - boundary, places),
-                                             read.tokens.shape)}
+    shape = read.tokens.shape
+    packing = {"coordinates": coordinates(
+        segments=jnp.broadcast_to((places >= boundary).astype(jnp.int32), shape),
+        positions=jnp.broadcast_to(jnp.where(places >= boundary, places - boundary, places), shape))}
     packed = model.apply(variables, read.tokens, method="hidden_states", **packing)
     same(packed, model.text.apply(text, read.tokens, method="hidden_states", **packing))
     assert not np.array_equal(np.asarray(packed[:, boundary:]), np.asarray(read.hidden[:, boundary:]))
@@ -326,7 +237,7 @@ def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name)
     assert all(after[path] is leaf for path, leaf in expected.items())
     same(trainable.apply(moved, read.tokens, method="logits"), read.logits)
     with jax.enable_x64(new_val=True):
-        learned = gradient(_float64(trainable), widened(moved), read.tokens,
+        learned = gradient(float64_twin(trainable), widened(moved), read.tokens,
                            np.asarray(_cotangent(read.logits), np.float64), method="logits")
     assert all(np.any(np.asarray(learned[path[1:]])) for path in scalars)
     assert trainable.trainable_variables(moved) is moved
@@ -472,25 +383,97 @@ CAPACITY = LENGTH + STEPS
 """Room for the prompt and the greedy steps, below every checkpoint's own capacity."""
 
 
-def _greedy(model, variables, tokens, forced=None, **call):
-    """The cache `init_cache` allocates, the `STEPS` greedy draws after
-    `tokens` (or the `forced` ones) and the logits of every call, through
-    `call` (the decode mode, or DiffusionGemma's `encode`, the clean commits
-    a canvas reads)."""
-    cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
-    logits, held = model.apply({**variables, "cache": cache}, tokens, mutable=["cache"], **call)
+class _Served(NamedTuple):
+    """A model's cache allocation and call, compiled once as a server compiles its prefill and its step:
+    each a jitted program of the variables it reads, so a packed variables tree is its own trace."""
+
+    allocated: Callable
+    applied: Callable
+
+
+def _served(model, call: dict) -> _Served:
+    return _Served(jax.jit(lambda variables: model.apply(variables, ROWS, method="init_cache",
+                                                         mutable=["cache"])[1]["cache"]),
+                   jax.jit(lambda variables, cache, tokens: model.apply(
+                       {**variables, "cache": cache}, tokens, mutable=["cache"], **call)))
+
+
+@functools.cache
+def _programs(name: str, kind: str, call: tuple) -> _Served:
+    """`name`'s compiled call (`_served`) by `kind`: the model, the model `sized` to `CAPACITY`, or its
+    float64 twin (`wide`), each compiled once a process for every test that runs it."""
+    model = loaded(name).model
+    model = {"model": model, "sized": model.with_cache_capacity(CAPACITY),
+             "wide": float64_twin(model)}[kind]
+    return _served(model, dict(call))
+
+
+def _greedy(programs: _Served, variables, tokens, forced=None):
+    """The cache the programs allocate, the `STEPS` greedy draws after `tokens` (or the `forced` ones)
+    and the logits of every call, through their call (the decode mode, or DiffusionGemma's `encode`, the
+    clean commits a canvas reads)."""
+    cache = programs.allocated(variables)
+    logits, held = programs.applied(variables, cache, jnp.asarray(tokens))
     drawn, scores = [], [logits]
     for step in range(STEPS):
         drawn.append(jnp.argmax(logits[:, -1], axis=-1).astype(jnp.int32) if forced is None
-                     else forced[:, step])
-        logits, held = model.apply({**variables, "cache": held["cache"]}, drawn[-1][:, None],
-                                   mutable=["cache"], **call)
+                     else jnp.asarray(forced)[:, step])
+        logits, held = programs.applied(variables, held["cache"], drawn[-1][:, None])
         scores.append(logits)
     return cache, jnp.stack(drawn, axis=1), scores
 
 
 def _decoding(name: str) -> dict:
     return {"method": "encode"} if name in OWN else {"decode": True}
+
+
+CACHED_SEEDS = 8
+"""Check 1's declared seeds for a decoder's cached scores against another program's (a cache capacity, packed
+projections), sized by `seeds_for` on armada."""
+
+
+def _continued(model):
+    """Check 1's draw for a decoder's cached scores: `ROWS` prompts of `LENGTH` tokens and the `STEPS`
+    tokens each continues by, drawn uniformly from its vocabulary, so no step's scores rest on an argmax."""
+    def draw(seed):
+        rng = np.random.default_rng([0x2B, seed])
+        return (rng.integers(0, model.vocab_size, (ROWS, LENGTH)).astype(np.int32),
+                rng.integers(0, model.vocab_size, (ROWS, STEPS)).astype(np.int32))
+    return draw
+
+
+def _scored(programs: _Served, variables, *, wide: bool = False):
+    """A drawn prompt's logits and each forced step's through the cache, as `_greedy` takes them: a host
+    loop over the programs, which the gate runs as given; with `wide`, under x64, the float64 twin's
+    truth."""
+    @as_given
+    def run(tokens, forced):
+        with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
+            _, _, scores = _greedy(programs, variables, tokens, forced)
+            return [np.asarray(score, np.float64 if wide else score.dtype) for score in scores]
+    return run
+
+
+@functools.cache
+def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
+    """`name`'s reference arm and its float64 truth over `_continued` draws (`_scored`), each draw's
+    scores kept once a process: the cache-capacity and packed-projection tests judge their programs
+    against the same two."""
+    variables = loaded(name).variables
+
+    def kept(run):
+        results: dict[tuple[bytes, bytes], object] = {}
+
+        @as_given
+        def held(tokens, forced):
+            key = (np.asarray(tokens).tobytes(), np.asarray(forced).tobytes())
+            if key not in results:
+                results[key] = run(tokens, forced)
+            return results[key]
+        return held
+
+    return (kept(_scored(_programs(name, "model", call), variables)),
+            kept(_scored(_programs(name, "wide", call), widened(variables), wide=True)))
 
 
 @pytest.mark.parametrize("name", PATHS)
@@ -505,220 +488,17 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     same(sized.apply(variables, read.tokens, method="logits"), read.logits)
     if not model.causal:
         return
-    cache, drawn, scores = _greedy(model, variables, read.tokens, **_decoding(name))
-    sized_cache, sized_drawn, sized_scores = _greedy(sized, variables, read.tokens, **_decoding(name))
+    call = tuple(_decoding(name).items())
+    own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
+    cache, drawn, _ = _greedy(own, variables, read.tokens)
+    sized_cache, sized_drawn, _ = _greedy(at_capacity, variables, read.tokens)
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
-    as_exact(sized_scores, scores, lambda: _greedy(_float64(model), widened(variables), read.tokens,
-                                                   forced=drawn, **_decoding(name))[2], "cached logits")
-
-
-def _float64(model):
-    """`model` computing in float64, its own `dtype` and every module it
-    holds: the truth a float32 run's rounding is measured from."""
-    fields = [field.name for field in dataclasses.fields(model) if field.name not in ("parent", "name")]
-    held = {name: _float64(getattr(model, name)) for name in fields
-            if isinstance(getattr(model, name), nn.Module)}
-    return model.clone(**held, **({"dtype": jnp.float64} if "dtype" in fields else {}))
-
-
-def _flat(tree) -> np.ndarray:
-    return np.concatenate([np.ravel(np.asarray(leaf, np.float64)) for leaf in jax.tree.leaves(tree)])
-
-
-def as_exact(dew, reference, truth, label: str) -> None:
-    """`dew` the reference's bits, or where they differ as exact as the
-    reference (tests/reference_error.py) from `truth()`, the float64 twin."""
-    if all(np.array_equal(np.asarray(mine), np.asarray(theirs))
-           for mine, theirs in zip(jax.tree.leaves(dew), jax.tree.leaves(reference), strict=True)):
-        return
-    with jax.enable_x64(new_val=True):
-        wanted = truth()
-    assert_as_exact_as_the_reference(_flat(dew), _flat(reference), _flat(wanted), label)
-
-
-def _call(model, variables, inputs, **apply) -> jax.Array:
-    """A forward without dropout, whose float64 twin would draw other masks:
-    a token model's logits, a denoiser's output."""
-    return model.apply(variables, *inputs, **apply)
-
-
-def _stepped(model, variables, inputs, **apply) -> tuple[jax.Array, dict]:
-    """A step's forward and its gradient in every floating parameter."""
-    output = _call(model, variables, inputs, **apply)
-    cotangent = jax.random.normal(jax.random.key(1), output.shape, jnp.float32).astype(output.dtype)
-    flat = flatten_dict(variables["params"])
-    floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
-    held = {path: leaf for path, leaf in flat.items() if path not in floats}
-
-    def loss(trained):
-        params = unflatten_dict({**held, **trained})
-        return jnp.sum(_call(model, {**variables, "params": params}, inputs, **apply) * cotangent)
-
-    return output, jax.grad(loss)(floats)
-
-
-def _rungs(model) -> list:
-    """The model, then every rung `recompute_more` climbs to."""
-    rungs = [model]
-    while (stronger := rungs[-1].recompute_more()) is not None:
-        rungs.append(stronger)
-        assert len(rungs) <= 16, "the ladder does not end"
-    return rungs
-
-
-RUNG_SEEDS = 8
-"""Check 1's declared seeds for a rung's forward against the model's, sized paired by `seeds_for` on
-an A100, where a rung's checkpoint barriers change the forward program."""
-
-
-def _redrawn(inputs, seed: int):
-    """`inputs` drawn afresh at `seed` with their shapes and kinds: integer ids below the largest given
-    (a token model's ids stay in its vocabulary), floats from a normal, the rest as given."""
-    rng = np.random.default_rng([0x2A, seed])
-
-    def leaf(value):
-        value = np.asarray(value)
-        if np.issubdtype(value.dtype, np.integer):
-            return rng.integers(0, int(value.max()) + 1, value.shape).astype(value.dtype)
-        if np.issubdtype(value.dtype, np.floating):
-            return rng.standard_normal(value.shape).astype(value.dtype)
-        return value
-    return jax.tree.map(leaf, inputs)
-
-
-def _climbs_and_restores(model, variables, inputs, **apply) -> None:
-    """Each rung holds less than the one below it, and its top rung steps the
-    forward the model does: the top rung's checkpoint makes its forward another
-    program, which check 1 holds against the model's from the model's float64
-    twin over drawn inputs. Its backward recomputes, which can round apart
-    (gemma2-tiny's gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8;
-    test_decoder_remat.py found the same), so the gradients are the model's
-    bits or as exact as them. A rung's record restores it from any rung below
-    it and moves no rung above it, and the top rung runs over the model's
-    variables, every collection where it was.
-
-    Of testing.md's memory settings, no remat and a rung of the planner's, a
-    model meets each once here: its top rung, which recomputes every name its
-    layers mark, so every checkpoint site the architecture has runs under
-    remat. Each named policy below it steps on its own in
-    test_decoder_remat.py (`test_named_policies_train_the_same_model_as_full`),
-    which no architecture here repeats."""
-    rungs = _rungs(model)
-    records = [rung.recompute_record() for rung in rungs]
-    assert len(rungs) > 1
-    assert all(records[index] not in records[:index] for index in range(len(records)))
-    for low, rung in enumerate(rungs):
-        for high in range(len(rungs)):
-            restored = rung.restore_recompute(records[high]).recompute_record()
-            assert restored == records[max(low, high)], (records[low], records[high], restored)
-    assert all(rung.restore_recompute("no rung").recompute_record() == record
-               for rung, record in zip(rungs, records, strict=True))
-    _, gradient_tree = _stepped(model, variables, inputs, **apply)
-    truth = functools.cache(
-        lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
-    written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
-    # Applied as the step applies them: some models read their ids on the host.
-    def forward_truth(*inputs):
-        with jax.enable_x64(new_val=True):
-            wide = _call(_float64(model), widened(variables), widened(inputs), **apply)
-            return np.asarray(wide, np.float64)
-
-    top = rungs[-1]
-    stepped = _stepped(top, variables, inputs, **apply)
-    assert_as_exact(lambda *inputs: _call(top, variables, inputs, **apply),
-                    lambda *inputs: _call(model, variables, inputs, **apply),
-                    lambda seed: _redrawn(inputs, seed), f"forward at {top.recompute_record()}",
-                    seeds=RUNG_SEEDS, truth_fn=forward_truth)
-    as_exact(stepped[1], gradient_tree, truth, f"gradient at {top.recompute_record()}")
-    assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
-
-
-@pytest.mark.parametrize("name", PATHS)
-def test_a_checkpoints_remat_rungs_step_as_it_does(name):
-    source, read = loaded(name), reads(name, "float32")
-    _climbs_and_restores(source.model, source.variables, (read.tokens,), method="logits")
-
-
-CONTINUUM_SEEDS = 8
-"""Check 1's declared seeds for a continuum decoder scanned at its top remat rung, and decoding, against
-its plain forward (`seeds_for`)."""
-
-
-def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
-    """A decoder with a continuum level (`dew.nn.continuum`) scanned at its top remat rung computes the
-    logits and gradients the same decoder does unscanned and unrematerialized, and its cached decode
-    the logits its own full forward gives each prefix, both on par (check 1) from its float64 twin over
-    drawn variables and tokens: the level stands after the stack, so a scan, a rung's checkpoints and a
-    cache leave it as the head reads it."""
-    from dew.nn.continuum import ContinuumLevel
-
-    plain = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=32, attention_impl="xla",
-                              continuum=ContinuumLevel(hidden=4))
-    scanned = _rungs(plain.clone(scan_layers=True))[-1]
-    tokens = jnp.zeros((ROWS, LENGTH), jnp.int32)
-    shapes = jax.eval_shape(lambda: plain.init(jax.random.key(0), tokens))
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        variables = jax.tree.map(lambda leaf: (0.3 * rng.standard_normal(leaf.shape)).astype(np.float32),
-                                 shapes)
-        drawn = rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32)
-        return variables, drawn, rng.standard_normal((ROWS, LENGTH, VOCAB)).astype(np.float32)
-
-    def stepped(model):
-        def run(variables, drawn, cotangent):
-            output, pull = jax.vjp(lambda params: model.apply({"params": params}, drawn), variables["params"])
-            return output, pull(cotangent)[0]
-        return run
-
-    assert_as_exact(jax.jit(stepped(scanned)), jax.jit(stepped(plain)), draw,
-                    "a scanned, rematerialized continuum decoder", seeds=CONTINUUM_SEEDS,
-                    truth_fn=stepped(_float64(plain)))
-
-    def decoded(model):
-        def run(variables, drawn, _):
-            cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
-            steps = []
-            for position in range(LENGTH):
-                logits, held = model.apply({**variables, "cache": cache}, drawn[:, position:position + 1],
-                                           decode=True, mutable=["cache"])
-                cache = held["cache"]
-                steps.append(logits[:, 0])
-            return jnp.stack(steps, axis=1)
-        return run
-
-    def whole(model):
-        return lambda variables, drawn, _: model.apply(variables, drawn)
-
-    assert_as_exact(jax.jit(decoded(plain)), jax.jit(whole(plain)), draw,
-                    "a continuum decoder's cached decode", seeds=CONTINUUM_SEEDS,
-                    truth_fn=whole(_float64(plain)))
-
-
-RECOMPUTED = [case for case in ARCHITECTURES
-              if not case.is_jepa and isinstance(models.build(case.architecture, **case.config), Recomputing)]
-
-
-def _inputs(case) -> tuple:
-    """A batch of what the case's model takes, at test_architectures.py's sizes."""
-    if case.is_lm:
-        return (jnp.asarray(np.random.RandomState(0).randint(0, VOCAB, (ROWS, case.seq_len)), jnp.int32),)
-    sample = jax.random.normal(jax.random.key(0), (ROWS, *case.sample_shape))
-    text = jax.random.normal(jax.random.key(3), (ROWS, TEXT_TOKENS, TEXT_FEATURES))
-    return sample, jnp.asarray([0.3, 0.7]), TextContext(text, jnp.ones((ROWS, TEXT_TOKENS), bool))
-
-
-@pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
-def test_an_architectures_remat_rungs_step_as_it_does(case):
-    """Every architecture test_architectures.py trains that climbs a remat
-    ladder, decoders and DiT stacks, at its size there."""
-    model = models.build(case.architecture, **case.config)
-    inputs = _inputs(case)
-    _climbs_and_restores(model, model.init(jax.random.key(0), *inputs), inputs)
+    reference, truth = _reference(name, call)
+    assert_as_exact(_scored(at_capacity, variables), reference, _continued(model),
+                    f"{name} cached logits at a capacity", seeds=CACHED_SEEDS, truth_fn=truth)
 
 
 def _packed(variables, groups) -> dict:
@@ -752,24 +532,22 @@ def test_packed_projections_serve_the_models_numbers(name):
                    for member, width in zip(group.members, group.widths, strict=True))
     packed = _packed(variables, groups)
     assert model.inference_projection_groups(packed) == groups
+    label = f"{name} packed"
     if not model.causal:
-        def logits_truth():
-            return [_float64(model).apply(widened(variables), read.tokens, method="logits")]
+        def logits(model, variables):
+            return lambda tokens, forced: model.apply(variables, tokens, method="logits")
 
-        as_exact([model.apply(packed, read.tokens, method="logits")], [read.logits], logits_truth,
-                 f"{name} packed")
+        assert_as_exact(logits(model, packed), logits(model, variables), _continued(model), label,
+                        seeds=CACHED_SEEDS, truth_fn=logits(float64_twin(model), widened(variables)))
         return
-    _, drawn, scores = _greedy(model, variables, read.tokens, decode=True)
-    _, packed_drawn, packed_scores = _greedy(model, packed, read.tokens, decode=True)
+    call = (("decode", True),)
+    own = _programs(name, "model", call)
+    _, drawn, _ = _greedy(own, variables, read.tokens)
+    _, packed_drawn, _ = _greedy(own, packed, read.tokens)
     same(packed_drawn, drawn)
-
-    def truth():
-        wide, wide_variables = _float64(model), widened(variables)
-        return [wide.apply(wide_variables, read.tokens, method="logits"),
-                *_greedy(wide, wide_variables, read.tokens, forced=drawn, decode=True)[2]]
-
-    as_exact([model.apply(packed, read.tokens, method="logits"), *packed_scores], [read.logits, *scores],
-             truth, f"{name} packed")
+    reference, truth = _reference(name, call)
+    assert_as_exact(_scored(own, packed), reference, _continued(model), label, seeds=CACHED_SEEDS,
+                    truth_fn=truth)
 
 
 def _request() -> ModelInputs:
@@ -914,15 +692,6 @@ def denoiser(architecture: str, rng):
     return build_model(architecture, "float32"), sample, args[0], tuple(args[1:]), conditions
 
 
-def perturbed(variables, rng):
-    """`variables` with noise on every parameter, so a zero-initialized head
-    hides nothing a change of input does."""
-    leaves, tree = jax.tree.flatten(variables["params"])
-    noisy = [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-             for leaf, key in zip(leaves, jax.random.split(rng, len(leaves)), strict=True)]
-    return {**variables, "params": jax.tree.unflatten(tree, noisy)}
-
-
 @pytest.mark.parametrize("architecture", [architecture for architecture in sorted(models)
                                           if denoiser(architecture, jax.random.PRNGKey(0))])
 def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, rng):
@@ -952,7 +721,9 @@ def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, r
 
     def built(model, scale=None):
         model = model if scale is None else model.clone(time_scale=scale)
-        variables = perturbed(model.init(rng, sample, time, *rest, **conditions), rng)
+        # Noise on every parameter, so a zero-initialized head hides nothing a change of input does.
+        initialized = model.init(rng, sample, time, *rest, **conditions)
+        variables = {**initialized, "params": moved(initialized["params"], rng, 0.1)}
         return lambda at, **duration: model.apply(variables, sample, at, *rest, **duration, **conditions)
 
     duration = jnp.full_like(time, 0.25)

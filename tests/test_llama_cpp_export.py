@@ -15,7 +15,7 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "llama_cpp" / "reference.npz"
 

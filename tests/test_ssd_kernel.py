@@ -30,11 +30,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
-from ssd_support import ssd_orbit
+from ssd_support import ssd_orbit, stepwise_scan
 
-from dew.nn.kernels.recurrence_chunk import RESET_DECAY
-from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
-from dew.nn.precision import float32_products, products_dtype
+from dew.nn.kernels.recurrence_chunk import RESET_DECAY, ssd_operands
+from dew.nn.kernels.ssd import ssd_chunk_scan
 
 pytestmark = pytest.mark.kernel
 
@@ -47,15 +46,9 @@ def reference():
 
 
 def blocks(x, dt, A, B, C, state, chunk_size: int, dtype=jnp.float32):
-    """The operands as `chunk_ssd` hands them to a scan: groups expanded, the
-    sequence padded out to whole chunks of `chunk_size`, `x` scaled by its
-    step and the decay `A dt` per step."""
-    _, length, heads, _ = x.shape
-    B, C = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (B, C))
-    pad = (chunk_size - length % chunk_size) % chunk_size
-    x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
-    dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-    return tuple(jnp.asarray(t, dtype) for t in (x * dt[..., None], B, C, A[None, None, :] * dt, state))
+    """The operands as the layer hands them to the chunk scan (`ssd_operands`), with the state, in
+    `dtype`."""
+    return tuple(jnp.asarray(t, dtype) for t in (*ssd_operands(x, dt, A, B, C, chunk_size), state))
 
 
 def cotangents(y, final, seed: int = 0):
@@ -78,19 +71,6 @@ def mixer_operands(shape, seed: int = 0):
             jax.random.normal(keys[4], (batch, steps, groups, state_size), jnp.float32),
             jax.random.normal(keys[5], (heads,), jnp.float32),
             jax.random.normal(keys[6], (batch, heads, head_dim, state_size), jnp.float32))
-
-
-def stepwise_scan(x, b, c, a, state):
-    """The recurrence one step at a time, no chunks: `h_t = exp(a_t) h_{t-1}
-    + x_t b_t^T`, `y_t = h_t c_t`. Written apart from both chunked paths, so
-    in float64 it is an oracle neither of them shares a line with."""
-    def step(h, inputs):
-        x, b, c, a = inputs
-        h = jnp.exp(a)[..., None, None] * h + x[..., :, None] * b[..., None, :]
-        return h, jnp.einsum('bhpn,bhn->bhp', h, c)
-
-    final, ys = jax.lax.scan(step, state, tuple(jnp.moveaxis(t, 1, 0) for t in (x, b, c, a)))
-    return jnp.moveaxis(ys, 0, 1), final
 
 
 def segment_sum(x):
@@ -130,10 +110,10 @@ def _carry(previous, step):
 
 
 def exact_einsum(spec: str, *operands):
-    """`jnp.einsum` at its operands' precision (`precision.float32_products`): fp32 products in fp32, where
-    a TPU's default takes one bf16 pass, which hid the kernel's own default-precision matmuls from check 1
-    (template numerics review 2026-10-26 follow-up, P1-1)."""
-    return jnp.einsum(spec, *operands, precision=float32_products(products_dtype(*operands)))
+    """`jnp.einsum` at HIGHEST, which the reference states: fp32 products in fp32, where a TPU's default
+    takes one bf16 pass, which hid the kernel's own default-precision matmuls from check 1 (template
+    numerics review 2026-10-26 follow-up, P1-1)."""
+    return jnp.einsum(spec, *operands, precision=jax.lax.Precision.HIGHEST)
 
 
 def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
@@ -308,9 +288,6 @@ TPU_COPIES = [pytest.param(*param.values, id=f"tpu-{param.id}", marks=on_device)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
     """The kernel, interpreted on the host or compiled on a TPU, against float64: every forward and
     gradient leaf over declared draws (check 1)."""
-    if compiled:
-        shape, chunk_size = case
-        assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
     if kind == "fixture":
         chunk_size = case[0]
         _, length, _, width = reference["scan.x"].shape

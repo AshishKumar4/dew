@@ -61,7 +61,7 @@ def run():
     if sys.argv[1] == "prepare":
         from dew.training import prepare_process
         prepare_process(multi_host=False)
-    from affine_run import fit_one_step
+    from affine_training import fit_one_step
     fit_one_step()
 
 

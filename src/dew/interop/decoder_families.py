@@ -1,7 +1,5 @@
 """Decoder families, ordered from the most specific layout to the plain decoder."""
 
-from dew.interop import mamba2
-from dew.interop.decoder_parts import DecoderFamily
 from dew.interop.families.bloom import BLOOM
 from dew.interop.families.deepseek import (
     DEEPSEEK_V2,
@@ -23,17 +21,19 @@ from dew.interop.families.gemma import (
     GEMMA4_UNIFIED_TEXT,
 )
 from dew.interop.families.glm import GLM4_MOE, GLM5_NEXT_TEXT, GLM_MOE_DSA
-from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ
+from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ, OPENAI_GPT
 from dew.interop.families.gpt_bigcode import GPT_BIGCODE
 from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
 from dew.interop.families.k2_horizon import K2_HORIZON
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
-from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
+from dew.interop.families.lfm3 import LFM3
+from dew.interop.families.llama import GRANITEMOE, LLAMA, MINISTRAL, MISTRAL, MIXTRAL
 from dew.interop.families.llama4 import LLAMA4_TEXT
-from dew.interop.families.mamba import MAMBA
+from dew.interop.families.mamba import MAMBA, MAMBA2
 from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA, LLADA2_MOE, LLADA_MOE_V2
 from dew.interop.families.mimo import MIMO_V2, MIMO_V2_FLASH
+from dew.interop.families.minimax import MINIMAX
 from dew.interop.families.modernbert import MODERNBERT
 from dew.interop.families.muse import MUSE_GLIMMER_TEXT
 from dew.interop.families.nemotron_h import NEMOTRON_H
@@ -51,10 +51,13 @@ from dew.interop.families.qwen import (
     QWEN3_MOE,
     QWEN3_NEXT,
 )
+from dew.interop.families.qwen4_exp import QWEN4_EXP_TEXT
 from dew.interop.families.starcoder2 import STARCODER2
-from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
+    # Its convolution kind first: its gated attention and sliding layers are matched broadly below
+    # (Qwen 3.5's output gate, Ministral's sliding layers).
+    LFM3,
     DORY,
     OURO,
     BLOOM,
@@ -64,12 +67,16 @@ ENTRIES = (
     FALCON,
     PHI3,
     MINIMAX_M2,
+    # Its lightning kinds and normed residual are its own; its routed experts would read as Mixtral's.
+    MINIMAX,
     MIMO_V2_FLASH,
     MIMO_V2,
     MODERNBERT,
     NEMOTRON_H,
     STARCODER2,
     GPT_NEOX,
+    # Its post-LN blocks over GPT-2's layers, with no final norm and no position offset (OPT-350m's has two).
+    OPENAI_GPT,
     OPT,
     GPT_BIGCODE,
     GPT2,
@@ -92,6 +99,10 @@ ENTRIES = (
     KIMI_K3,
     DEEPSEEK_V3,
     MUSE_GLIMMER_TEXT,
+    # Its gated delta nets and gated attention would read as Qwen3-Next's or Qwen3.5's.
+    QWEN4_EXP_TEXT,
+    # Its grouped norms and value experts are its own; its gated, routed layers would read as Qwen3.5's.
+    K2_HORIZON,
     QWEN3_NEXT,
     QWEN3_5_MOE_TEXT,
     QWEN3_5_TEXT,
@@ -110,42 +121,7 @@ ENTRIES = (
     MIXTRAL,
     MISTRAL,
     MAMBA,
-    DecoderFamily(
-        ("mamba2",),
-        mamba2.config_from_hf,
-        lambda fields: isinstance(fields.mixer, Mamba2Mixer),
-        "mamba2",
-        "Mamba2ForCausalLM",
-        lambda model: {},
-        weight_path=mamba2.weight_path,
-        export_path=mamba2.export_path,
-        preserve_source_layout=True,
-        tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
-    ),
-    K2_HORIZON,
-    DecoderFamily(
-        ("ministral",),
-        ministral_config,
-        lambda fields: "sliding_attention" in (fields.layer_types or ()),
-        "ministral",
-        "MinistralForCausalLM",
-        lambda model: {},
-        preserve_source_layout=False,
-        # MinistralConfig's defaults for the fields its decoder reads.
-        defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
-        padding_idx=True,
-    ),
-    DecoderFamily(
-        ("llama",),
-        llama_config,
-        lambda fields: True,
-        "llama",
-        "LlamaForCausalLM",
-        # LlamaMLP's projections carry biases where mlp_bias says so.
-        lambda model: {"mlp_bias": True} if model.mlp_bias else {},
-        preserve_source_layout=False,
-        # LlamaConfig's context (configuration_llama.py:71), which a YaRN record's omitted lengths read.
-        defaults={"max_position_embeddings": 2048},
-        padding_idx=True,
-    ),
+    MAMBA2,
+    MINISTRAL,
+    LLAMA,
 )

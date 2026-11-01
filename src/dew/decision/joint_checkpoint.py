@@ -126,14 +126,15 @@ def head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
     """`JointSchemaHead`'s parameters under the release's tensor names and shapes."""
     from flax.traverse_util import flatten_dict, unflatten_dict
 
-    from dew.interop.decoder_parts import joined_packed
+    from dew.interop.decoder_parts import packed_layouts
     from dew.interop.weights import in_params, native_layouts
 
     stored = unflatten_dict({path: _stored(path, np.asarray(jax.device_get(leaf)))
                              for path, leaf in flatten_dict(dict(params)).items()})
     variables = {"params": stored}
-    layouts = native_layouts(variables, lambda path: _name(path[1:]), in_params(_path))
-    return joined_packed({layout.name: layout.export(variables) for layout in layouts}, IN_PROJ)
+    layouts = packed_layouts({layout.name: layout for layout in native_layouts(
+        variables, lambda path: _name(path[1:]), in_params(_path))}, IN_PROJ)
+    return {name: layout.export(variables) for name, layout in layouts.items()}
 
 
 def export(bundle: "PretrainedDecision", variables: Mapping[str, object] | None = None

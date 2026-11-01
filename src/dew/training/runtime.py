@@ -21,9 +21,19 @@ from typing import TYPE_CHECKING
 import jax
 from jax.experimental import multihost_utils
 
+from dew import communicators
 from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.cache import enable_compilation_cache, persist_compilations
-from dew.devices import apply_xla_flags, cuda_plugin, preallocate_gpu_pool, refuse_cpu_only_jax, xla_flag
+from dew.devices import (
+    apply_xla_flags,
+    backend_open,
+    cuda_plugin,
+    flags_hold,
+    flags_set,
+    preallocate_gpu_pool,
+    refuse_cpu_only_jax,
+    xla_flag,
+)
 from dew.logging import configure as configure_logging
 from dew.pool import (
     PREEMPTED_EXIT,
@@ -38,6 +48,9 @@ from dew.pool import (
 )
 
 _log = logging.getLogger(__name__)
+
+_UNPROVEN: set[str] = set()
+"""The run flags a process was told are unproven (`prepare_process`), once each."""
 
 if TYPE_CHECKING:
     from dew.training.tracker import Wandb
@@ -75,19 +88,41 @@ def prepare_process(wandb: Wandb | None = None,
     where its pool shares it (`dew.cache.persist_compilations`), and
     JAX_ENABLE_COMPILATION_CACHE=false turns the cache off.
 
-    `xla_flags` reaches XLA through the environment, which XLA reads when it
-    opens a backend. So this call has to come before the first JAX call in
-    the process, and it is the first line of every recipe. If you use the
-    library without a recipe, set XLA_FLAGS in the environment yourself.
+    `xla_flags` reaches XLA through XLA_FLAGS, which XLA parses once per
+    runtime it loads, at the first use of its debug options. Flags set here
+    before the backend opens are written into XLA_FLAGS, as XLA may not have
+    parsed them yet; where `import dew` has loaded jaxlib, it may have, and
+    Dew warns that they are unproven (`dew.devices.flags_hold`). Setting
+    XLA_FLAGS before the process starts makes them certain, as Dew's command
+    line does for a run's `trainer.xla_flags`. Flags asked for after the
+    backend opened are refused.
     A state kept on the CPU (`Layout(host=("variables",))`) needs one CPU
     device per local accelerator, which the trainer checks on its own mesh
     (`dew.distributed.host.companion_mesh`).
     """
-    _set_environment(wandb, xla_flags, compilation_cache_dir)
+    _set_environment(wandb, xla_flags, compilation_cache_dir, multi_host)
     _raise_limits()
     _join_process_pool(multi_host)
     ready_process()
     _log.info("Number of devices: %s", jax.device_count())
+
+
+def unprepared(multi_host: bool | None, xla_flags: str | None,
+               compilation_cache_dir: str | None) -> list[str]:
+    """Which of `prepare_process`'s options a run states that this process does not carry: a flag of
+    `xla_flags` XLA_FLAGS did not carry while the backend was closed (`flags_set`), a compilation cache
+    JAX keeps elsewhere, a pool it has not joined (`multi_host=True`; False only says never to join one).
+    Each acts by the time JAX opens its backend, and `prepare_process` sets none after
+    (`_set_environment`), so a run trained in a process no `prepare_process` set up with them would run
+    without them."""
+    missed = []
+    if xla_flags and not flags_set(xla_flags):
+        missed.append("xla_flags")
+    if compilation_cache_dir and jax.config.jax_compilation_cache_dir != compilation_cache_dir:
+        missed.append("compilation_cache_dir")
+    if multi_host and not jax.distributed.is_initialized():
+        missed.append("multi_host")
+    return missed
 
 
 def ready_process() -> None:
@@ -105,16 +140,30 @@ def ready_process() -> None:
 
 
 def _set_environment(wandb: Wandb | None, xla_flags: str | None,
-                     compilation_cache_dir: str | None) -> None:
+                     compilation_cache_dir: str | None, multi_host: bool | None = None) -> None:
     """The env vars wandb and the tokenizers read, the run's XLA flags and
-    Dew's defaults beside them, and the compilation cache: everything read
-    before a backend opens."""
+    Dew's defaults beside them, the GPU pool's share sized to leave its
+    communicators room (`dew.communicators`, a process of one host
+    alone), and the compilation cache: everything read before a backend opens."""
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
-    # HF tokenizers fork a thread pool; grain's workers fork the process.
-    os.environ['TOKENIZERS_PARALLELISM'] = "false"
-    apply_xla_flags(xla_flags)
+    # HF tokenizers fork a thread pool, and grain's workers fork the process, which deadlocks a pool
+    # the parent started; a value the user set is theirs.
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', "false")
+    if xla_flags and not flags_set(xla_flags):
+        if backend_open():
+            raise ValueError(f"XLA parsed its flags before JAX's backend opened, and it has: {xla_flags!r} "
+                             "would not take effect. Call prepare_process before anything calls JAX, or "
+                             "set XLA_FLAGS before the process starts")
+        apply_xla_flags(xla_flags)
+    if xla_flags and not flags_hold(xla_flags) and xla_flags not in _UNPROVEN:
+        _UNPROVEN.add(xla_flags)
+        _log.warning("XLA_FLAGS %r cannot be shown to have been set before the process loaded jaxlib, "
+                     "whose XLA may have parsed its flags since: they are unproven. Set XLA_FLAGS before "
+                     "the process starts, as `dew train` does, to make them certain", xla_flags)
     preallocate_gpu_pool()
+    if not joins_pool(multi_host, pool_cluster(multi_host)):
+        communicators.hold(communicators.sized_pool())
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 
@@ -186,8 +235,8 @@ def _joined() -> None:
     # formed: jax.process_count() would open the backend.
     if pool_size() > 1:
         end_pool_on_failure()
-    # XLA reads its flags when the backend opens, which the first
-    # line below does. The watchdog is the CUDA plugin's, and a TPU
+    # XLA parses its flags by the time the backend opens, which the
+    # first line below does. The watchdog is the CUDA plugin's, and a TPU
     # host's libtpu need not know its flag.
     if cuda_plugin() and xla_flag("xla_gpu_execution_terminate_timeout") is None:
         apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
@@ -291,4 +340,4 @@ def run_timestamp() -> str:
     return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
 
 
-__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp"]
+__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp", "unprepared"]

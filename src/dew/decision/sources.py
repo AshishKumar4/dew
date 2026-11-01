@@ -19,6 +19,7 @@ from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, import_path
 
 from . import joint_checkpoint
@@ -35,7 +36,7 @@ from .task import Decide
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         held = _records.record(self.record, "head")
         fields = _records.record(held["fields"], "head.fields")
@@ -68,6 +69,9 @@ class PretrainedDecision(Pretrained):
     """The release format's writer, the source codec's own: `save` writes the format it was read from."""
     exporter: Callable[..., Mapping[str, np.ndarray]] = dataclasses.field(repr=False, compare=False)
     """The release format's tensors, `writer`'s own: `export` returns what `save` writes."""
+    assumed: frozenset[str] = frozenset()
+    """The question budgets its layout holds that its release states none of, Laya's own
+    (`LAYA_BUDGETS`), as a run reports where each came from."""
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         return dataclasses.replace(self, variables=transform(self.variables),
@@ -96,7 +100,8 @@ class PretrainedDecision(Pretrained):
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,
                         directory: Path, tokenizer_folder: str, *, layout: Layout,
                         calibration: Calibration, strict_specials: bool, writer: Callable[..., None],
-                        exporter: Callable[..., Mapping[str, np.ndarray]]) -> Self:
+                        exporter: Callable[..., Mapping[str, np.ndarray]],
+                        assumed: frozenset[str] = frozenset()) -> Self:
         tokenizer = HFTokenizer(str(directory / tokenizer_folder), local_files_only=True)
         if strict_specials:
             hf = tokenizer.tokenizer
@@ -109,7 +114,13 @@ class PretrainedDecision(Pretrained):
         inherited = {field.name: getattr(backbone, field.name) for field in dataclasses.fields(Pretrained)}
         inherited["source"] = directory
         return cls(**inherited, head=head, head_variables=head_variables, layout=layout, specials=specials,
-                   calibration=calibration, decision_tokenizer=tokenizer, writer=writer, exporter=exporter)
+                   calibration=calibration, decision_tokenizer=tokenizer, writer=writer, exporter=exporter,
+                   assumed=assumed)
+
+
+LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
+"""The question budgets Laya's release declares where its config states none: the tokens its question
+and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
 
 
 def _save_laya(bundle: PretrainedDecision, directory: str | Path, *,
@@ -117,7 +128,8 @@ def _save_laya(bundle: PretrainedDecision, directory: str | Path, *,
     Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
 
 
-def _export_laya(bundle: PretrainedDecision, variables: Mapping[str, object] | None) -> dict[str, np.ndarray]:
+def _export_laya(bundle: PretrainedDecision, variables: Mapping[str, object] | None
+                 ) -> Mapping[str, np.ndarray]:
     held = bundle if variables is None else dataclasses.replace(bundle, variables=dict(variables))
     task = Decide.of(held)
     return laya_tensors(task.model, task.variables)[0]
@@ -150,12 +162,15 @@ class DecisionSource(SourceKind):
                 {"class": import_path(DecisionHead), "fields": {
                     "layers": _records.integer(config.get("head_layers", 2), "head_layers")}},
                 _head_path, IN_PROJ)
-            layout = MarkerLayout(
-                max_len=_records.integer(config.get("max_len", 512), "max_len"),
-                head_max_len=_records.integer(config.get("head_max_len", 192), "head_max_len"),
-                option_tokens=_records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
-                                              "option_tokens"),
-                parallel=config.get("option_layout", "sequential") == "parallel")
+            # The release's own budgets, as its config states them, Laya's where it states none; a
+            # budget it states as null keeps that part of the question whole.
+            head_max_len, option_tokens = (
+                None if (value := config.get(name, default)) is None else _records.integer(value, name)
+                for name, default in LAYA_BUDGETS.items())
+            assumed = frozenset(name for name in LAYA_BUDGETS if name not in config)
+            layout = MarkerLayout(max_len=_records.integer(config.get("max_len", 512), "max_len"),
+                                  head_max_len=head_max_len, option_tokens=option_tokens,
+                                  parallel=config.get("option_layout", "sequential") == "parallel")
             values = config.get("temperature", [1.0, 1.0, 1.0])
             if not isinstance(values, list) or len(values) != 3:
                 raise ValueError("temperature lists choice, score and noul")
@@ -176,11 +191,11 @@ class DecisionSource(SourceKind):
                                                           "fields": fields}, "head"),
                                       _path, IN_PROJ, HEAD_WEIGHTS,
                                       partial(_shaped, fields["hidden_size"]))
-            layout, calibration = JointLayout(), Calibration()
+            layout, calibration, assumed = JointLayout(), Calibration(), frozenset()
             tokenizer_folder, strict_specials = "", False
             writer, exporter = joint_checkpoint.save, joint_checkpoint.export
         else:
             return None
         return CompositeSource(backbone, head, PretrainedDecision.from_components, tokenizer_folder,
-                               {"layout": layout, "calibration": calibration,
+                               {"layout": layout, "calibration": calibration, "assumed": assumed,
                                 "strict_specials": strict_specials, "writer": writer, "exporter": exporter})

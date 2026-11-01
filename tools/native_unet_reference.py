@@ -107,12 +107,11 @@ def widen(root):
 
 def bundle(root, destination):
     """Archive source-compatible checkpoint files and numerical oracle arrays."""
-    import tarfile
-    with tarfile.open(destination, "w:xz") as archive:
-        for case in ("sd1", "sd2", "sdxl-inpaint", "refiner"):
-            directory = Path(root) / case
-            convert(directory)
-            archive.add(directory, arcname=case)
+    from fixture_archive import write
+    cases = ("sd1", "sd2", "sdxl-inpaint", "refiner")
+    for case in cases:
+        convert(Path(root) / case)
+    write(destination, ((Path(root) / case, case) for case in cases))
 
 
 if __name__ == "__main__":

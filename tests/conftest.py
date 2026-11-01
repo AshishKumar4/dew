@@ -3,6 +3,7 @@ import http.server
 import json
 import logging
 import os
+import sys
 import threading
 import urllib.parse
 from pathlib import Path
@@ -14,6 +15,7 @@ os.environ.update(lane_environment.configured(os.environ))
 import jax
 import pytest
 import remote_cache
+from tool_support import load
 
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 
@@ -35,6 +37,13 @@ else:
         if os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("DEW_XLA_CACHE_URL"):
             _cache = os.path.join(_cache, os.environ["PYTEST_XDIST_WORKER"])
         enable_compilation_cache(_cache)
+        # The processes its tests start (a checker run as a script, a CLI) compile into the same cache under
+        # the same settings, so their programs reach the shared bundles below and their next run is warm
+        # (2026-10-29, row 2323: tools/check_native_diffusion.py compiled cold each run, 139.6 s
+        # against 43.3 s warm), as JAX's own switch reaches them under DEW_TEST_NO_CACHE.
+        for _name in ("jax_compilation_cache_dir", "jax_persistent_cache_min_compile_time_secs",
+                      "jax_persistent_cache_min_entry_size_bytes", "jax_persistent_cache_enable_xla_caches"):
+            os.environ[_name.upper()] = str(getattr(jax.config, _name))
         # On armada, where each task's container starts cold, a cache the tasks share.
         _remote = remote_cache.install_from_environment()
 
@@ -51,6 +60,26 @@ def bundle(node) -> str:
     """The shared cache's bundle of `node`'s test file in this execution partition (`remote_cache.bundle`)."""
     return remote_cache.bundle(node.nodeid, node.config.getoption("ci_group", None),
                                os.environ.get("PYTEST_XDIST_WORKER"))
+
+
+def _marks_named(config) -> bool:
+    """Whether the run names its marks (`-m EXPR` or `-mEXPR`, an empty expression among them), on its command
+    line, in PYTEST_ADDOPTS or in its configuration's addopts."""
+    import shlex
+
+    given = [*config.invocation_params.args, *shlex.split(os.environ.get("PYTEST_ADDOPTS", "")),
+             *config.getini("addopts")]
+    return any(arg.startswith("-m") and not arg.startswith("--") for arg in given)
+
+
+def pytest_configure(config):
+    """A run that names no marks selects as CI does (tools/armada/session.py's `SELECTION`): the
+    network-marked tests, which reach the Hub and a GPU node's memory and run on the network lane (`ci.py
+    gpu-lane --network`), set aside, counted as deselected. So a plain `pytest tests/test_x.py`, or an armada
+    map of it, grades what CI grades, never a real checkpoint's download on a container's disk (gpt-oss-20b's
+    filled one, 2026-10-31). A run that names its marks, an empty expression included, chooses."""
+    if not _marks_named(config):
+        config.option.markexpr = load("session", "tools/armada").SELECTION[1]
 
 
 def pytest_collectstart(collector):
@@ -75,17 +104,34 @@ def pytest_runtest_makereport(item, call):
     `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
-    if call.excinfo is not None:
-        from reference_error import GateFailure
-
-        if isinstance(call.excinfo.value, GateFailure):
-            found = ("gate_findings", json.dumps([{"leaf": finding.leaf, "rule": finding.rule,
-                                                   "measure": finding.measure, "phase": call.when}
-                                                  for finding in call.excinfo.value.findings]))
-            # This phase's report, and the item's, which its teardown's report copies and the JUnit
-            # report reads a test's properties from where only one phase fails.
-            outcome.get_result().user_properties.append(found)
-            item.user_properties.append(found)
+    # Only a test that loaded the gate can raise its GateFailure: a skip or another failure loads none, so
+    # the files whose tests skip are not keyed on the gate's every change in the test cache.
+    gate = sys.modules.get("reference_error")
+    if call.excinfo is not None and gate is not None and isinstance(call.excinfo.value, gate.GateFailure):
+        found = ("gate_findings", json.dumps([{"leaf": finding.leaf, "rule": finding.rule,
+                                               "measure": finding.measure, "phase": call.when}
+                                              for finding in call.excinfo.value.findings]))
+        # This phase's report, and the item's, which its teardown's report copies and the JUnit
+        # report reads a test's properties from where only one phase fails.
+        outcome.get_result().user_properties.append(found)
+        item.user_properties.append(found)
+    # A GPU flow's counts (`gpu_flow.REPORTED`), the JUnit property `cells`: a flow none of whose cells ran is
+    # unqualified on the GPU it ran for, never green.
+    flow = sys.modules.get("gpu_flow")
+    if call.when == "call" and flow is not None and flow.REPORTED:
+        counted = ("cells", json.dumps({key: sum(run[key] for run in flow.REPORTED)
+                                        for key in ("passed", "failed", "skipped")}
+                                       | {"device": flow.REPORTED[-1]["device"]}))
+        flow.REPORTED.clear()
+        outcome.get_result().user_properties.append(counted)
+        item.user_properties.append(counted)
+    # The gate's sites this test moved onto YNNPACK's fusions (`reference_error.SWITCHED`), the JUnit property
+    # `ynn_switched`, so CI counts them where it reads a test's rows.
+    if call.when == "call" and gate is not None and gate.SWITCHED:
+        switched = ("ynn_switched", json.dumps(gate.SWITCHED))
+        gate.SWITCHED.clear()
+        outcome.get_result().user_properties.append(switched)
+        item.user_properties.append(switched)
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -111,25 +157,11 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture(autouse=True)
-def own_rung_records(monkeypatch, tmp_path_factory):
-    """Each test keeps its own rung records (`dew.training.rungs`). The suite
-    shares one compilation cache, beside which a run records its step's
-    rung, and a rung one test forces would be another's floor."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
-
-
-@pytest.fixture(autouse=True)
-def own_data_cache(monkeypatch, tmp_path_factory):
-    """Each test keeps its own automatic data cache (`dew.data.cache.automatic_root`): records one
-    test's maps made are not another's to read back."""
-    monkeypatch.setenv("DEW_DATA_CACHE", str(tmp_path_factory.mktemp("data-cache")))
-
-
-@pytest.fixture(autouse=True)
-def own_hub_answers(monkeypatch, tmp_path_factory):
-    """Each test keeps its own recorded Hub answers (`dew.cache.hub_answer`): a commit one test's
-    stand-in answered is not another's offline record."""
-    monkeypatch.setenv("DEW_HUB_ANSWERS", str(tmp_path_factory.mktemp("hub-answers")))
+def own_settings(monkeypatch, tmp_path_factory, request):
+    """Each test's own rung records, data cache, Hub answers and, reaching no network, Hub cache
+    (`lane_environment.per_test_settings`)."""
+    lane_environment.per_test_settings(monkeypatch, tmp_path_factory.mktemp,
+                                       network=request.node.get_closest_marker("network") is not None)
 
 
 MAPPINGS = Path("/proc/self/maps")
@@ -186,6 +218,15 @@ def without_deterministic_ops(monkeypatch):
 
 
 @pytest.fixture
+def with_deterministic_ops(monkeypatch):
+    """--xla_gpu_deterministic_ops set for the test, whatever the lane's flags: a test of a kernel's
+    deterministic schedule, which Dew's kernels choose from the flag as they trace (on a CPU lane too,
+    which sets no flag of its own)."""
+    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
+    monkeypatch.setenv("XLA_FLAGS", f"{flags} {lane_environment.DETERMINISTIC_OPS}".strip())
+
+
+@pytest.fixture
 def caplog(caplog):
     """Capture Dew's logger as well as the application's root logger. Dew's records reach the
     capture once, through a handler of their own that does not pass them on to the root, whether
@@ -204,6 +245,13 @@ def caplog(caplog):
 @pytest.fixture
 def rng():
     return jax.random.PRNGKey(0)
+
+
+@pytest.fixture(scope="module")
+def lint():
+    """tools/lint_slop.py, as the lint tests read it."""
+
+    return load("lint_slop")
 
 
 @pytest.fixture

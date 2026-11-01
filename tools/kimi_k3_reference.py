@@ -13,8 +13,8 @@ reference computes with the library's own decompression of them, so the
 packed file and the logits describe one model. `calculate_qparams` clamps
 the scale exponents and substitutes a finite scale for an all-zero group.
 
-Environment (~/.cache/dew/reference-venvs/kimi-k3): torch 2.8.0+cu128,
-transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1.
+Environment: tools/kimi_k3_reference.requirements.txt (torch 2.8.0+cu128,
+transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1).
 
 Three things change how the reference runs, neither what it computes:
 
@@ -40,6 +40,17 @@ names them, the last layer MLA), attention-residual blocks of 3 so the last
 block is short, a dense first layer, 8 experts of which 2 route, latent
 experts, SiTU with the release's betas. Like the release, `A_log` is stored
 zero-padded from the KDA heads to the KDA head dim (96 heads to 128 there).
+
+`truth` writes numerics.npz beside reference.npz: the same released model
+built and run in float64 on the CPU under tools/torch_precision.py's
+`float64`, holding the fixture's weights, fla's kernels answered at their
+call boundaries by fla's own torch references (tools/fla_float64.py), which
+tests/test_kimi_k3.py measures Dew and the reference from: the logits, the
+loss, the logits after one SGD step at the stored learning rate, and the
+greedy decode's step logits teacher-forced. It runs on a CPU, in the same
+environment with torch 2.8.0's CPU build and triton 3.4.0 (fla imports it).
+`truth DIR` writes it for a residual order's directory that
+tools/rounding_orders.py drew, whose `symmetric` holds it to the fixture's.
 """
 
 import copy
@@ -62,6 +73,9 @@ ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 SOURCE = ROOT / "kimi-k3-source"
 DESTINATION = ROOT / "kimi-k3-tiny"
 LEARNING_RATE = 1e-2
+PICKS = "autotune.json"
+"""Where a fixture keeps the configuration each of fla's autotuned kernels took at each shape its run
+called it with, and its GPU's multiprocessor count (`record_picks`)."""
 
 
 def tiny_config() -> dict:
@@ -110,10 +124,26 @@ def fixture_batch() -> tuple[np.ndarray, np.ndarray]:
     return ids, mask
 
 
+def write_fixture(destination: Path, tensors: dict[str, torch.Tensor], config: dict) -> None:
+    """The fixture's weights, config and generation config written to `destination`."""
+    save_file(tensors, str(destination / "model.safetensors"))
+    (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    generation = {"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}
+    (destination / "generation_config.json").write_text(json.dumps(generation, indent=2) + "\n")
+
+
+def fixture_on_gpu(model: torch.nn.Module):
+    """`model` on the GPU in eval mode, with the fixture's batch (`fixture_batch`), as arrays and on the
+    GPU."""
+    ids, mask = fixture_batch()
+    on_gpu = model.cuda().eval()
+    return on_gpu, ids, mask, torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
+
+
 def sgd_step(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-             trained: Callable[[str], bool]):
+             trained: Callable[[str], bool], rate: float = LEARNING_RATE):
     """The logits, the mean next-token loss over targets whose input and
-    target are valid, and the logits after one SGD step at LEARNING_RATE on
+    target are valid, and the logits after one SGD step at `rate` on
     each parameter `trained` names that the loss reaches. The step stays in
     the model's parameters."""
     logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
@@ -127,7 +157,7 @@ def sgd_step(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: to
         moved = 0
         for name, parameter in model.named_parameters():
             if parameter.grad is not None and trained(name):
-                parameter.add_(parameter.grad, alpha=-LEARNING_RATE)
+                parameter.add_(parameter.grad, alpha=-rate)
                 moved += 1
         updated = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
     print("parameters moved", moved, "loss", float(loss),
@@ -163,15 +193,58 @@ def record_released_padding() -> None:
                    json.loads((DESTINATION / "config.json").read_text()), DESTINATION, ("text_config",))
 
 
+STEPPED_PREFILL = 40
+"""The prefill of tests/test_kimi_k3.py's cached decode, whose steps `record_stepped` records the reference
+at the shapes of."""
+
+
+def record_stepped() -> None:
+    """reference.npz's `stepped_logits` [1, tokens, vocab] for the committed fixture: the released model on
+    the CUDA device as `main` runs it (`released_modules`), holding the fixture's weights (`load_weights`),
+    over its batch's first row at the shapes tests/test_kimi_k3.py's cached decode computes them (ledger
+    1543): the first `STEPPED_PREFILL` positions from one forward over them, each later one from a forward
+    over the row up to it. Every other array of the file is kept as it is."""
+    from safetensors.torch import load_file
+
+    configuration, modeling, _ = released_modules()
+    config = json.loads((DESTINATION / "config.json").read_text())
+    model = modeling.KimiK3ForConditionalGeneration(
+        configuration.KimiK3Config(**copy.deepcopy(config))).float()
+    model.language_model.config._attn_implementation = "eager"
+    load_weights(model, load_file(str(DESTINATION / "model.safetensors")))
+    model = model.cuda().eval()
+    with np.load(DESTINATION / "reference.npz") as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    row = torch.tensor(arrays["input_ids"][:1], device="cuda")
+    with torch.no_grad():
+        def forward(length: int) -> np.ndarray:
+            return model(input_ids=row[:, :length], use_cache=False).logits.cpu().numpy()
+
+        stepped = np.concatenate([forward(STEPPED_PREFILL), *(forward(length)[:, -1:]
+                                                               for length in range(STEPPED_PREFILL + 1,
+                                                                                   row.shape[1] + 1))], 1)
+    arrays["stepped_logits"] = stepped
+    np.savez(DESTINATION / "reference.npz", **arrays)
+    print("wrote", DESTINATION / "reference.npz", "stepped_logits", stepped.shape)
+
+
+def remote_modules():
+    """The pinned configuration, modeling and linear modules as the release writes them, the routed experts
+    in the backward pass (the second of the changes above)."""
+    configuration, modeling, linear = hub_modules("kimi_k3_remote", REPO, REVISION, REMOTE)
+    moe = linear.KimiSparseMoeBlock
+    moe.moe_infer = moe.moe_infer.__wrapped__
+    return configuration, modeling, linear
+
+
 def released_modules():
-    """The pinned configuration, modeling and linear modules, with fla's
-    intra-chunk solve held to IEEE fp32."""
+    """The pinned modules (`remote_modules`), with fla's intra-chunk solve held to IEEE fp32."""
     if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
         raise SystemExit("run with TRITON_F32_DEFAULT=ieee so fla's kernels keep fp32")
     os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    configuration, modeling, linear = hub_modules("kimi_k3_remote", REPO, REVISION, REMOTE)
+    configuration, modeling, linear = remote_modules()
     from fla.ops.kda import chunk_intra
     from triton.language import constexpr
 
@@ -185,8 +258,8 @@ def matmul_precision() -> str:
     from fla.ops.kda import chunk_intra
     from torch_precision import recorded_matmuls
 
-    return recorded_matmuls(**{"the intra-chunk solve": str(getattr(chunk_intra.SOLVE_TRIL_DOT_PRECISION, "value",
-                                                                    chunk_intra.SOLVE_TRIL_DOT_PRECISION))})
+    solve = chunk_intra.SOLVE_TRIL_DOT_PRECISION
+    return recorded_matmuls(**{"the intra-chunk solve": str(getattr(solve, "value", solve))})
 
 
 def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
@@ -231,17 +304,8 @@ def main() -> None:
                     parameter.detach().cpu(), (0, width - parameter.numel()))
             else:
                 tensors[name] = parameter.detach().cpu().contiguous().clone()
-    save_file(tensors, str(DESTINATION / "model.safetensors"))
-    (DESTINATION / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    generation = {"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}
-    (DESTINATION / "generation_config.json").write_text(json.dumps(generation, indent=2) + "\n")
-
-    model = model.cuda().eval()
-    moe = linear.KimiSparseMoeBlock
-    moe.moe_infer = moe.moe_infer.__wrapped__
-    ids, mask = fixture_batch()
-    input_ids = torch.tensor(ids, device="cuda")
-    attention_mask = torch.tensor(mask, device="cuda")
+    write_fixture(DESTINATION, tensors, config)
+    model, ids, mask, input_ids, attention_mask = fixture_on_gpu(model)
     logits, loss, updated = sgd_step(
         model, input_ids, attention_mask, lambda name: name.startswith("language_model."))
     for name, parameter in model.named_parameters():
@@ -273,23 +337,147 @@ def main() -> None:
              generated=generated, step_logits=step_logits,
              situ_gate=gate.reshape(-1).numpy(), situ_up=up.reshape(-1).numpy(),
              situ=situ_out.reshape(-1).numpy(), precision=matmul_precision())
+    record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
+
+
+def truth(directory: Path) -> dict[str, np.ndarray]:
+    """The float64 truth of the K3 fixture at `directory` (`float64_truth`): the released model built and
+    run in float64 on the CPU (`torch_precision.float64`), fla's kernels answered by its own references at
+    their call boundaries (`fla_float64`), holding the fixture's weights."""
+    from fla_float64 import installed
+    from safetensors.torch import load_file
+    from torch_precision import float64
+
+    configuration, modeling, linear = remote_modules()
+    config = json.loads((directory / "config.json").read_text())
+    tensors = load_file(str(directory / "model.safetensors"))
+    # compressed-tensors decodes MXFP4 in bfloat16 (`reference_mxfp4`), exact while each scale byte is at
+    # most 252, a power of two up to 2^125, since every E2M1 code times one is a bfloat16.
+    assert max(int(value.max()) for name, value in tensors.items() if name.endswith(".weight_scale")) <= 252
+    with installed(linear), float64():
+        model = modeling.KimiK3ForConditionalGeneration(
+            configuration.KimiK3Config(**copy.deepcopy(config))).double()
+        model.language_model.config._attn_implementation = "eager"
+        load_weights(model, tensors)
+        return float64_truth(model.eval(), directory, lambda name: name.startswith("language_model."))
+
+
+def float64_truth(model: torch.nn.Module, directory: Path,
+                  trainable: Callable[[str], bool]) -> dict[str, np.ndarray]:
+    """numerics.npz's arrays for the fixture at `directory`, `model` its released model at float64 holding the
+    fixture's weights, inside `torch_precision.float64`: `step_logits_f64` [rows, steps, vocab], the logits
+    teacher-forced over `generated` at the positions its greedy decode scored; then `logits_f64` [rows,
+    tokens, vocab] over `input_ids`, NaN at the padded positions, `loss_f64`, the mean next-token cross
+    entropy over the targets whose input and target are both valid, and `updated_logits_f64`, the logits
+    after one SGD step at the fixture's stored learning rate (`sgd_step`), its gradient over every
+    `trainable` weight."""
+    with np.load(directory / "reference.npz") as stored:
+        fixture = {name: stored[name] for name in stored.files}
+    valid = fixture["attention_mask"].astype(bool)
+    steps = fixture["step_logits"].shape[1]
+    reached = np.concatenate([valid, np.ones((valid.shape[0], steps), bool)], 1)
+    with torch.no_grad():
+        step_logits = np.stack([
+            model(input_ids=torch.tensor(row[seen][:-1])[None], use_cache=False).logits[0, -steps:].numpy()
+            for row, seen in zip(fixture["generated"], reached, strict=True)])
+    logits, loss, updated = sgd_step(model, torch.tensor(fixture["input_ids"]),
+                                     torch.tensor(fixture["attention_mask"]), trainable,
+                                     rate=float(fixture["learning_rate"]))
+    assert all(value.dtype == torch.float64 for value in (logits, loss, updated)), "the truth runs in float64"
+
+    def grid(values: torch.Tensor) -> np.ndarray:
+        return np.where(valid[..., None], values.detach().numpy(), np.nan)
+
+    return {"logits_f64": grid(logits), "loss_f64": np.float64(loss.detach()),
+            "updated_logits_f64": grid(updated), "step_logits_f64": step_logits}
+
+
+def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]]) -> None:
+    """numerics.npz beside the fixture's reference.npz at `directory` (`truth`'s arrays, float64 throughout:
+    no matmul of it takes a reduced precision), each against the recorded reference said."""
+    arrays = truth(directory)
+    with np.load(directory / "reference.npz") as stored:
+        valid = stored["attention_mask"].astype(bool)
+        for key in ("logits", "updated_logits", "step_logits"):
+            exact, recorded = arrays[f"{key}_f64"], stored[key]
+            if key != "step_logits":
+                exact, recorded = exact[valid], recorded[valid]
+            print(f"{directory.name} {key}: the reference sits {np.max(np.abs(recorded - exact)):.3e} (max) "
+                  f"and {np.sqrt(np.mean(np.square(recorded - exact))):.3e} (rms) from float64")
+        print(f"{directory.name} loss: float64 {arrays['loss_f64']:.9f}, "
+              f"the reference {float(stored['loss']):.9f}")
+    np.savez(directory / "numerics.npz", **arrays, precision="ieee")
 
 
 def orders(drawn: Path) -> None:
     """The reference's own rounding draws over the residual orders
     tools/rounding_orders.py wrote under `drawn`, in MXFP4's groups of 32
     (`record_orders`)."""
-    configuration, modeling, linear = released_modules()
+    configuration, modeling, _ = released_modules()
     config = json.loads((DESTINATION / "config.json").read_text())
     model = modeling.KimiK3ForConditionalGeneration(
         configuration.KimiK3Config(**copy.deepcopy(config))).float()
     model.language_model.config._attn_implementation = "eager"
-    model = model.cuda().eval()
-    moe = linear.KimiSparseMoeBlock
-    moe.moe_infer = moe.moe_infer.__wrapped__
     record_orders(model, drawn, DESTINATION, load_weights, lambda name: name.startswith("language_model."),
                   matmul_precision())
+
+
+def autotuned() -> dict:
+    """Each autotuned Triton kernel of the fla modules this process has imported, by its function's
+    module and name, re-exports counted once."""
+    from triton.runtime.autotuner import Autotuner, Heuristics
+
+    kernels = {}
+    for module in [module for name, module in sys.modules.items() if name.startswith("fla.") and module]:
+        for kernel in vars(module).values():
+            while isinstance(kernel, Heuristics):
+                kernel = kernel.fn
+            if isinstance(kernel, Autotuner):
+                kernels[f"{kernel.base_fn.__module__}.{kernel.base_fn.__name__}"] = kernel
+    return kernels
+
+
+def picks() -> dict:
+    """What decides how this run's sums round beyond its inputs, as `PICKS` keeps it: the configuration
+    each of fla's autotuned kernels took at each shape it ran (its tiles, warps and stages, which a timing
+    chose), and the GPU's multiprocessor count, over which fla's gated norm backward splits its weight
+    gradient's partial sums (fused_norm_gate's `NS`)."""
+    from fla.utils import get_multiprocessor_count
+
+    kernels = {name: sorted([list(key), {"kwargs": config.kwargs, "num_warps": config.num_warps,
+                                         "num_stages": config.num_stages, "num_ctas": config.num_ctas}]
+                            for key, config in kernel.cache.items())
+               for name, kernel in sorted(autotuned().items()) if kernel.cache}
+    return {"multiprocessors": get_multiprocessor_count(0), "kernels": kernels}
+
+
+def record_picks(destination: Path) -> None:
+    """Write this run's `picks` beside the fixture in `destination`."""
+    (destination / PICKS).write_text(json.dumps(picks(), indent=1, sort_keys=True) + "\n")
+
+
+def restore_picks(destination: Path) -> None:
+    """Set each of fla's autotuned kernels to the configurations the fixture's run in `destination`
+    took (`record_picks`), so each shape it runs takes its recorded configuration without timing: a
+    later run on a GPU of as many multiprocessors reproduces the fixture's bits from a cold cache, where
+    timing could pick another tile (ledger 568: four A100 runs of the orders could not reproduce order
+    0). One of another count splits the norm's sums otherwise, and is refused."""
+    from fla.utils import get_multiprocessor_count
+    from triton import Config
+
+    recorded, kernels = json.loads((destination / PICKS).read_text()), autotuned()
+    here = get_multiprocessor_count(0)
+    if recorded["multiprocessors"] != here:
+        raise SystemExit(f"the fixture's run split its sums over {recorded['multiprocessors']} "
+                         f"multiprocessors, this GPU's {here}: record it again here")
+    if missing := sorted(set(recorded["kernels"]) - set(kernels)):
+        raise SystemExit(f"fla no longer autotunes {missing}, which the fixture's run did")
+    for name, taken in recorded["kernels"].items():
+        kernels[name].cache.update({tuple(key): Config(config["kwargs"], num_warps=config["num_warps"],
+                                                       num_stages=config["num_stages"],
+                                                       num_ctas=config["num_ctas"])
+                                    for key, config in taken})
 
 
 def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
@@ -299,11 +487,13 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
     order under `drawn`, each order's weights read in by `load`: its updated
     logits' RMS distance from float64 written to `destination`/orders.npz
     beside the orders (tests/reference_error.py's K-order rule). Order 0 is
-    the fixture's own run and must reproduce its updated logits bit for bit."""
+    the fixture's own run and must reproduce its updated logits bit for bit:
+    fla's kernels take the fixture's configurations (`restore_picks`), and no
+    shape is timed afresh."""
     from safetensors.torch import load_file
 
-    ids, mask = fixture_batch()
-    input_ids, attention_mask = torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
+    restore_picks(destination)
+    model, _, mask, input_ids, attention_mask = fixture_on_gpu(model)
     valid = mask.astype(bool)
     with np.load(destination / "numerics.npz") as exact, np.load(destination / "reference.npz") as stored:
         truth, recorded = exact["updated_logits_f64"][valid], stored["updated_logits"]
@@ -316,17 +506,21 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
         if k == 0:
             assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
         distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
+    assert picks() == json.loads((destination / PICKS).read_text()), \
+        "a kernel ran a shape the fixture's run did not"
     np.savez(destination / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
              updated_logits=np.asarray(distances), precision=precision)
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
 
 if __name__ == "__main__":
-    import sys
-
     if sys.argv[1:2] == ["orders"]:
         orders(Path(sys.argv[2]))
     elif sys.argv[1:] == ["padding"]:
         record_released_padding()
+    elif sys.argv[1:] == ["stepped"]:
+        record_stepped()
+    elif sys.argv[1:2] == ["truth"]:
+        write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:
         main()

@@ -19,6 +19,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import activation
 from dew.nn.dense import Dense
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 
@@ -51,10 +52,10 @@ class Continuum(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        down = Dense(self.level.hidden, use_bias=False, dtype=self.dtype, precision=self.precision,
-                     name="down")
-        up = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision, name="up",
-                   kernel_init=nn.initializers.zeros_init())
+        # The ungated feed-forward `down`, `up`, the latter zero at its start.
+        mlp = GatedMLP(self.level.hidden, x.shape[-1], activation(self.level.activation), output_init_std=0.0,
+                       linear=Dense, names=("down", "up"), dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, mlp)
         # The residual sums in at least fp32 and rounds once to the states' dtype, the head's input.
         wide = at_least_fp32(x.dtype)
-        return (x.astype(wide) + up(activation(self.level.activation)(down(x))).astype(wide)).astype(x.dtype)
+        return (x.astype(wide) + mlp(x).astype(wide)).astype(x.dtype)

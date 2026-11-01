@@ -30,7 +30,8 @@ from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.distributed.placement import parameter_axes
-from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+from dew.telemetry.trace import collective
 
 
 def split_axes(tree) -> set[str]:
@@ -112,7 +113,7 @@ def placed(tree, mesh: jax.sharding.Mesh, *spec):
 
 
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
-                          donate=(), arm=None) -> None:
+                          donate=(), arm=None, also=None) -> None:
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
@@ -127,7 +128,8 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     split is compared with in place of `fn` on one device: a call whose rounding depends on the shapes it
     runs at is compared with the shapes its shards run. A caller passing `arm` also asserts the split
     against the reference path (check 1 against float64), so the comparison with `arm` alone is not the
-    whole contract."""
+    whole contract: `also`, `(label, arm)`, is that second arm, compared with the same split runs (each
+    draw's split run once, `assert_as_exact`'s further references)."""
     run = without_ynn(fn, donate_argnums=donate)
 
     def put(args):
@@ -152,8 +154,9 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     def one_device(*args):
         return run(*kept(args))
 
+    # Each draw's split run once, against `also`'s arm too (`assert_as_exact`'s further references).
     assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, draw, label, seeds=seeds,
-                    truth_fn=truth_fn)
+                    truth_fn=truth_fn, also=None if also is None else dict([also]))
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})

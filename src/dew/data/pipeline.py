@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import integer
 from dew.batch import Batch
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
@@ -31,6 +32,104 @@ if TYPE_CHECKING:
 class Rejected:
     reason: str
     permanent: bool = True
+    consumed: int = 0
+    """The source examples a rejected row was the last of (`CONSUMED`), which the next row its corpus keeps
+    carries on (`dew.data.mixing.Accepted`)."""
+    cut: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    """The tokens the cuts of the refused rows removed, by what each cut, which its corpus counts beside
+    the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""
+
+
+CONSUMED = "_dew_consumed"
+"""A row's count of the source examples it is the last row of, set on each source example a run bounded in
+examples reads (`MarkConsumed`) and carried through every step to the batch: each example's count goes to the
+last row a step makes of it, the next row kept where a step rejects or makes none of it (`Owed`), and a packed
+window's is its rows' sum. A batch's sum is the source examples its dispatch consumes
+(`dew.batch.EXAMPLES_CONSUMED`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class MarkConsumed:
+    """The step that marks each source example a run bounded in examples reads as one consumed by the row it
+    is read in (`CONSUMED`), set where the bound is (`dew.data.compile`)."""
+
+    def __call__(self, element: Batch) -> Batch:
+        return {**element, CONSUMED: 1}
+
+
+@dataclasses.dataclass
+class Owed:
+    """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
+    owed to the next row kept: the one carrier the reading process's (`dew.data.mixing.Accepted`), a
+    batched step's (`dew.data.mixing.Carried`) and a loading worker's group (`dew.data.lowering`) use."""
+
+    examples: int = 0
+
+    def owe(self, consumed: int) -> None:
+        """Owe `consumed` more examples to the next row kept."""
+        self.examples += consumed
+
+    def paid(self, row: Batch) -> Batch:
+        """`row`, kept, taking the examples owed (`CONSUMED`), none owed after it."""
+        owed, self.examples = self.examples, 0
+        if not owed:
+            return row
+        return {**row, CONSUMED: owed + integer(row.get(CONSUMED, 0), "a row's consumed examples")}
+
+
+type Cuts = Mapping[str, tuple[int, int]]
+"""A record's cut record (`_dew_cut`): by what each cut, the rows it shortened and the tokens it removed;
+characters where the kind names them (`<kind>_characters`), as a cut of text encoded whole is measured."""
+
+
+def cut(element: Batch, removed: Mapping[str, int]) -> Batch:
+    """`element` cut short by a step that removed `removed` of it (by what it cut, the tokens), its cut
+    record composed with what earlier steps recorded (`composed`)."""
+    if not any(removed.values()):
+        return element
+    made = {kind: (1, tokens) for kind, tokens in removed.items() if tokens}
+    return {**element, "_dew_truncated": True, "_dew_cut": composed(element.get("_dew_cut", {}), made)}
+
+
+def composed(earlier: Cuts, later: Cuts) -> dict[str, tuple[int, int]]:
+    """Two cut records of the same rows, one step after another: a kind both cut counts its rows once,
+    the most either shortened, and adds what each removed; a 100-token text cut to 80, then to 60,
+    removed 40 of one row."""
+    kinds = {**earlier, **later}
+    return {kind: (max(earlier.get(kind, (0, 0))[0], later.get(kind, (0, 0))[0]),
+                   earlier.get(kind, (0, 0))[1] + later.get(kind, (0, 0))[1]) for kind in kinds}
+
+
+def cut_unit(kind: str) -> str | None:
+    """The unit a cut of `kind` removes: characters for a kind that names them (`<kind>_characters`,
+    a text encoded whole), none for an event that removes nothing (`options_alike`, a row whose cut
+    left two options alike), else tokens."""
+    if kind == "options_alike":
+        return None
+    return "characters" if kind.endswith("_characters") else "tokens"
+
+
+def cut_counts(cuts: Iterable[Mapping[str, int]]) -> dict[str, tuple[int, int]]:
+    """Several rows' cuts (each the tokens a cut removed of the row, by what it cut) as one record's
+    `_dew_cut`, which `dew.data.mixing.CorpusCounts.delivered` counts: by what each cut, the rows it
+    shortened and the tokens it removed; distinct rows add, where `composed` adds one row's successive
+    cuts."""
+    found: dict[str, tuple[int, int]] = {}
+    for row in cuts:
+        for kind, tokens in row.items():
+            shortened, removed = found.get(kind, (0, 0))
+            found[kind] = (shortened + 1, removed + tokens)
+    return found
+
+
+class Refused(ValueError):
+    """A request a served task refuses, under the reason its training would reject the same record
+    under (`Rejected`), which a server counts as a run's data counters count rejections
+    (`dew.data.mixing.CorpusCounts`)."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 type Record = Batch | bytes | Rejected | None
@@ -59,7 +158,11 @@ class Reasoned(Protocol):
 PACK_POLICY: Literal["first-fit", "best-fit", "concat"] = "first-fit"
 """How a pack fills its rows where none is asked for."""
 DROP_REMAINDER = True
-"""Whether a batch a training pass fills only in part is dropped, where none is asked for."""
+"""Whether a batch a training pass fills only in part is dropped, where none is asked for. Grain keeps it
+(`drop_remainder=False`); Dew drops it because the training step is compiled for one batch shape, and a
+short batch would compile a second program and take an update over fewer rows. A validation pass never
+drops one (`dew.data.lowering._Build.batch_order`), and a run bounded in examples keeps its last batch,
+filled and marked (`dew.data.compile._bounded`)."""
 TOKEN_FIELDS = ("text",)
 """The per-token fields a pack or a window lays out where none are named."""
 PACK_BINS = 32
@@ -103,8 +206,8 @@ class SingleReader(Protocol):
 
 @runtime_checkable
 class TokenGeometry(Protocol):
-    """A record step whose rows each hold `max_length` tokens, which a token
-    budget divides into rows (`TokenBudget`)."""
+    """A record step, or a stage that lays rows out (`Pack`, `Windows`), whose rows each hold
+    `max_length` tokens, which a token budget divides into rows (`TokenBudget`)."""
 
     @property
     def max_length(self) -> int: ...
@@ -171,7 +274,12 @@ class Configured:
     reads before it binds; binding it to a step that drops or expands records is refused.
     `measures` measures a fact it needs over each store it reads, in a memory read: the whole store,
     below any holdout, so the parts a run trains and scores on agree; a store's own statement of it
-    gives way to the measure, and a mixture's step binds the largest of its stores'."""
+    gives way to the measure, and a mixture's step binds the largest of its stores'. `random` and
+    `expands` state what the step it binds to is, before it binds: a random map's, and an expansion's
+    of a record into several (`Expansion`); binding to another is refused. An objective's step that
+    expands is marked as one that makes several rows of each source example (`examples`, set where the
+    objective places it): it runs after the chain's record order, a run's `examples=` bound stands
+    before it, and the expansion it binds to carries the mark (`FlatMap.examples`)."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
@@ -179,6 +287,8 @@ class Configured:
     random: bool = False
     one_to_one: bool = False
     measures: Measure | None = None
+    expands: bool = False
+    examples: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -225,6 +335,14 @@ class Map:
     configured: Bound | None = None
 
 
+def examples_bound(stages: Sequence[object]) -> int | None:
+    """Where a run bounded in examples marks the source examples it reads (`MarkConsumed`), the stage
+    after the bound's limit (`dew.data.compile._bounded`): its index in `stages`, None for a read the run
+    bounds otherwise. The one locator of the bound every compile and lowering step asks."""
+    return next((index for index, stage in enumerate(stages)
+                 if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), None)
+
+
 @dataclasses.dataclass(frozen=True)
 class RandomMap:
     step: RandomStep
@@ -252,6 +370,10 @@ class FlatMap:
     step: ExpandStep
     identity: str | None = None
     configured: Bound | None = None
+    examples: bool = False
+    """Whether this is an objective's step that makes several rows of each source example (a decision
+    layout's row a question): a corpus counts its source examples before it (`Accepted`), and a run's
+    `examples=` bound stands before it (`dew.data.compile._bounded`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -329,6 +451,12 @@ class Pack:
 
         return windowed(facts, self.seq_len - 1, self.fields, packed=True, along=self.along)
 
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, its last token their target, which a token budget divides
+        into rows (`TokenGeometry`)."""
+        return self.seq_len - 1
+
     def __post_init__(self) -> None:
         if self.policy == "concat" and (self.segments is not None or self.along):
             raise ValueError("concatenated packing cuts documents across windows; it takes no "
@@ -354,6 +482,11 @@ class Windows:
         from dew.data.facts import windowed
 
         return windowed(facts, self.seq_len, self.fields, packed=False)
+
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, which a token budget divides into rows (`TokenGeometry`)."""
+        return self.seq_len
 
     def __post_init__(self) -> None:
         if self.seq_len < 1 or (self.stride is not None and self.stride < 1) or not self.fields:
@@ -761,6 +894,12 @@ class Dataset:
     def shuffle(
         self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None
     ) -> Pipeline:
+        """The records in an order drawn from `seed`: whole, within a `window` of records, or by blocks of
+        `block_shards` physical shards. The seed is 0 where none is given, where Grain derives an unseeded
+        shuffle from its pipeline's seed (`ds.seed`), in Dew the run's (`compile(seed=)`): this stage's
+        order is the chain's own, the one every run of the chain reads and its saved plan names, so a run's
+        seed changes neither it nor what a resume reads by it. What the run's seed does draw are its random
+        steps and the order a streamed read deals its physical shards in (`dew.data.shards.streamed`)."""
         if window is not None and block_shards is not None:
             raise ValueError("shuffle uses a window or physical shard blocks, not both")
         if block_shards is not None and block_shards < 1:
@@ -946,6 +1085,19 @@ class Dataset:
         return self.loading(dataclasses.replace(loading, threads=count,
                                                 read_buffer=max(loading.read_buffer, count)))
 
+    def elastic(self) -> Pipeline:
+        """Read it for training so a run resumes on any number of readers that splits its batch, as
+        a global order does, where its own order is read per share (a stream, or steps that drop,
+        expand, pack or draw). Every reader reads the order one reader reads, through its last step
+        that is not a map of each record alone, and keeps every count-th row of each batch, its
+        share; the maps written after that step run on its own rows alone, on its read threads. So
+        its rows are a one-reader run's, and its position, the same on every reader, resumes on any
+        count, as HF's `split_dataset_by_node` reads a stream on every node; each reader reads the
+        steps before those maps over every record. Read by index, its loading workers read its
+        inputs in their order (`dew.data.lowering._InputOrder`), so their count is no part of its
+        position either; streamed, it reads without them (ledger row 1896)."""
+        return dataclasses.replace(self._chain(), _elastic=True)
+
     def loading(self, loading: Loading) -> Pipeline:
         """Read with these workers, threads and buffers (`Loading`), rather than the measured
         defaults, recorded with the chain; `threads` sets its read threads alone."""
@@ -1007,6 +1159,8 @@ class Pipeline(Dataset):
     name: str | None = None
     mode: Read | None = None
     _loading: Loading | None = None
+    _elastic: bool = False
+    """Whether a training run reads it elastically (`Dataset.elastic`)."""
     piped: tuple[Piped, ...] = dataclasses.field(default=(), compare=False, repr=False)
     """The calls of `pipe` that made its stages (`Piped`), outermost last; no plan reads them."""
 
@@ -1036,9 +1190,9 @@ def _token_places(batch: Batch) -> tuple[int, int]:
     tokens = batch.get("text")
     if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
         return 0, 0
-    from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
+    from dew.batch import COORDINATES_FIELD, SEGMENTS_FIELD, VALIDITY_FIELD, real_slots
 
-    fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids")
+    fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, SEGMENTS_FIELD)
               if f"text_{name}" in batch}
     real = real_slots(fields, tokens.shape, xp=np)
     return int(tokens.size), int(tokens.size - np.count_nonzero(real))
@@ -1100,6 +1254,10 @@ class ObjectiveData:
     packed: tuple[RecordStep, ...] = ()
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()
+    geometry: RecordStep | None = None
+    """The rows the objective reads where a chain lays out none of its own, after its other record
+    steps; rows a chain packs or cuts into windows (`Pack`, `Windows`) keep the length it gives them, as
+    a schedule's stages each give theirs (`dew.data.compile.objective_steps`)."""
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep

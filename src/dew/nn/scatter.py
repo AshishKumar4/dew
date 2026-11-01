@@ -1,4 +1,5 @@
-"""The index a scatter with `mode='drop'` gives the entries it must not write.
+"""Indexing along a sequence: a row's entries at its own positions (`gather_positions`), and the index a
+scatter with `mode='drop'` gives the entries it must not write (`DROPPED`).
 
 JAX drops an index at or past its axis. XLA's deterministic scatter on GPU
 (`--xla_gpu_deterministic_ops`, which the CUDA test lane sets) linearizes a
@@ -18,4 +19,19 @@ every backend. The paged pool's write into heads it leaves implicit is a second 
 which `DROPPED` alone does not cover: `KVStore.write_tokens` maps it over its group.
 """
 
+import jax
+import jax.numpy as jnp
+
+__all__ = [
+    "DROPPED",
+    "gather_positions",
+]
+
 DROPPED = 2**30
+
+
+def gather_positions(values: jax.Array, positions: jax.Array) -> jax.Array:
+    """`values` `[B, L, ...]` at each row's own `positions` `[B, K]`: `[B, K, ...]`, the entry at
+    `values[b, positions[b, k]]` (a token's state at its cue, the tokens a router keeps, a sequence in
+    another order)."""
+    return jnp.take_along_axis(values, positions.reshape(*positions.shape, *(1,) * (values.ndim - 2)), axis=1)

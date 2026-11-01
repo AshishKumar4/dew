@@ -1,15 +1,22 @@
 """The noise schedules, one module per family."""
 
 from .common import ContinuousNoiseScheduler, GeneralizedNoiseScheduler, NoiseScheduler, expand
-from .cosine import CosineNoiseScheduler, cosine_beta_schedule
+from .cosine import (
+    CosineContinuousNoiseScheduler,
+    CosineGeneralNoiseScheduler,
+    CosineNoiseScheduler,
+    cosine_beta_schedule,
+)
 from .discrete import DiscreteNoiseScheduler
+from .exp import ExpNoiseScheduler, exp_beta_schedule
 from .flow import FlowMatchingScheduler, RectifiedFlow
 from .karras import EDMNoiseScheduler, KarrasVENoiseScheduler
 from .linear import LinearNoiseScheduler, linear_beta_schedule
 from .sqrt import SqrtContinuousNoiseScheduler
 
-__all__ = ["ContinuousNoiseScheduler", "CosineNoiseScheduler", "DiscreteNoiseScheduler",
-           "EDMNoiseScheduler", "FlowMatchingScheduler", "GeneralizedNoiseScheduler",
+__all__ = ["ContinuousNoiseScheduler", "CosineContinuousNoiseScheduler", "CosineGeneralNoiseScheduler",
+           "CosineNoiseScheduler", "DiscreteNoiseScheduler", "EDMNoiseScheduler", "ExpNoiseScheduler",
+           "FlowMatchingScheduler", "GeneralizedNoiseScheduler",
            "KarrasVENoiseScheduler", "LinearNoiseScheduler", "NoiseScheduler", "RectifiedFlow",
-           "SqrtContinuousNoiseScheduler", "cosine_beta_schedule", "expand",
+           "SqrtContinuousNoiseScheduler", "cosine_beta_schedule", "exp_beta_schedule", "expand",
            "linear_beta_schedule"]

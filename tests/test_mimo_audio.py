@@ -19,14 +19,10 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import (
-    assert_as_exact_as_the_reference,
-    assert_rounds_where_the_reference_does,
-    float64_forward,
-    ieee_fixture,
-)
+from float64_terms import float64_forward
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_rounds_where_the_reference_does, ieee_fixture
 
-from dew.nn.attention import RMSNorm
 from dew.nn.mimo_audio import (
     AudioTokenizerEncoder,
     MiMoAudioCodeEncoder,
@@ -35,6 +31,7 @@ from dew.nn.mimo_audio import (
     translate_mimo_audio_config,
     translate_mimo_audio_weights,
 )
+from dew.nn.norms import RMSNorm
 from dew.nn.quantizers import residual_quantize
 from dew.registry import towers
 

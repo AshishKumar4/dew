@@ -23,13 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    torch_with_gradients,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -328,7 +323,7 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
 
     # The unconditional branch of a guided call carries each row's scalar, so
     # it is the plain call with the empty caption at that row's own guidance.
-    process, _ = loaded.task.grid(4)
+    process, _ = loaded.grid(4)
     empty = {"text": "", "negative": True}
     denoise = process.denoiser(loaded.model, variables, {"conditioning": given},
                               {"conditioning": encoder.encode(

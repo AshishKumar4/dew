@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
+from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -56,6 +56,13 @@ def decoded(model, params, ids, prompt=4):
     return jnp.concatenate(steps, axis=1), cache
 
 
+def passes(model, prompt=4):
+    """`model`'s full passes over a draw's ids at the shapes `decoded` computes them (`as_stepped`): the
+    prompt's from one pass over it, each later position's from one over the ids up to it."""
+    forward = jax.jit(model.apply)
+    return lambda params, ids: as_stepped(lambda held: forward(params, held), ids, prompt)
+
+
 def unrolled(params, steps):
     """The parameters of a stack `steps` times as deep whose layer i is layer i mod depth."""
     depth = TINY_DECODER["num_layers"]
@@ -82,10 +89,10 @@ def test_a_loop_without_its_norm_is_the_stack_repeated_cache_and_all(rng):
 
 @pytest.mark.parametrize("scan_layers", [False, True])
 def test_decoding_a_loop_matches_its_prefill(rng, scan_layers):
-    """A loop decoded a token at a time is on par with its prefill (check 1), and its cache holds
-    each pass's layers."""
+    """A loop decoded a token at a time is on par with its prefills, each step's at the width it reads
+    (check 1), and its cache holds each pass's layers."""
     model = tiny(scan_layers=scan_layers)
-    assert_as_exact(lambda params, ids: decoded(model, params, ids)[0], jax.jit(model.apply),
+    assert_as_exact(lambda params, ids: decoded(model, params, ids)[0], passes(model),
                     drawn(model), f'{scan_layers} loop decode', seeds=SEEDS['decode'], truth_fn=wide(model))
     ids = tokens(rng)
     _, cache = decoded(model, model.init(rng, ids), ids)
@@ -190,7 +197,7 @@ def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(
     for stored, deep_index in ((0, 0), (1, 1), (2, 2), (4, 3), (5, 4), (3, 5)):
         jax.tree.map(np.testing.assert_array_equal, cache[f'layers_{stored}'],
                      deep_cache[f'layers_{deep_index}'])
-    assert_as_exact(lambda params, ids: decoded(looped, params, ids)[0], jax.jit(looped.apply), drawn(looped),
+    assert_as_exact(lambda params, ids: decoded(looped, params, ids)[0], passes(looped), drawn(looped),
                     'block loop decode', seeds=SEEDS['block decode'], truth_fn=wide(looped))
     scanned = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)), scan_layers=True)
     assert_as_exact(jax.jit(scanned.apply), jax.jit(looped.apply), drawn(looped), 'scanned block loop',
@@ -207,3 +214,28 @@ def test_a_decoder_gains_a_loop_over_its_own_block_that_one_pass_leaves_as_it_wa
     assert not np.array_equal(twice.apply(params, ids), plain.apply(params, ids))
     assert plain.with_passes(2) is None and plain.with_passes(None, (1, 3)) is None
     assert twice.with_passes(4).loop == Loop(4, step_norm=False, layers=(1, 3))
+
+
+DELTA_NETS = {'linear_attention': {'mixer': {'class': 'gated_delta_net', 'fields': {
+    'linear_num_key_heads': 2, 'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
+    'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}}
+"""A stack of gated delta nets, whose decode state is a recurrent memory and a convolution tail."""
+
+
+def test_each_pass_of_a_shared_cache_step_starts_from_the_cache_the_step_found(rng):
+    """Every pass of a `Loop(shared_cache=True)` step starts from the cache as the step found it
+    (`SharedPassView`), its recurrent memory and convolution tail with its cursors: allocating the
+    cache leaves every entry zero, and a stack of gated delta nets prefills, bit for bit, what the same
+    loop with a cache of its own per pass prefills, where the second pass took the prompt again over
+    the state the first pass left (audit NN-A1)."""
+    models = [tiny(loop=Loop(2, shared_cache=shared), layer_types=('linear_attention',) * 2, kinds=DELTA_NETS)
+              for shared in (True, False)]
+    ids = tokens(rng)
+    params = models[0].init(rng, ids)
+    prefilled = []
+    for model in models:
+        made, step = decode_steps(model)
+        cache = made(params, ids.shape[0])
+        assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
+        prefilled.append(step(params, cache, ids)[0])
+    np.testing.assert_array_equal(*prefilled)

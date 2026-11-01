@@ -12,7 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
     BACKWARD_FORMS,
@@ -136,6 +137,28 @@ SPLIT_SEEDS = 8
 
 MERGE_SEEDS = 8
 """The merge site's declared draws (check 1)."""
+
+
+@pytest.mark.parametrize("form", ["full", "causal"])
+def test_a_padded_call_whose_rows_stay_in_reach_keeps_its_folded_launch(form):
+    """A folded call padded past its queries (`Forward.queries`), whose real rows' maxima are finite and
+    within the fold's reach, keeps its folded launch's outputs: a padded query reads nothing, its maximum
+    -inf, which `walked_launches` reads over the call's own rows alone (the batch-2 review: over every row
+    a full or causal call's -inf took the natural rewalk on every padded call). A real row's -inf still
+    walks again natural (its products past fp32 below zero)."""
+    spec = algebra.Forward(form, 64, ids=False, scale=0.5, queries=48)
+    assert spec.base2
+
+    def launched(maxima):
+        def launch(launched_form, live, again=False):
+            del live, again
+            return jnp.float32(launched_form.natural), maxima, jnp.zeros(maxima.shape, bool)
+
+        return algebra.walked_launches(spec, launch, lambda live, guarded, plain: plain)
+
+    rows = jnp.full((1, 1, 64), 3.0).at[..., 48:].set(-jnp.inf)
+    assert float(launched(rows)) == 0.0
+    assert float(launched(rows.at[..., 5].set(-jnp.inf))) == 1.0
 
 
 def test_two_states_merged_are_on_par_with_one_pass_over_their_keys():
@@ -833,8 +856,9 @@ def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at
 def test_power2_is_exact_under_jit_at_every_exponent():
     """`algebra.power2` scales by powers of two exactly wherever the result is a normal fp32, compiled
     (where XLA computes `exp2` as an inexact `exp` and fuses a product of them into one `exp`, past fp32's
-    range), at exponents from -380 to 380 against exact float64 scaling, and zero stays zero."""
-    exponents = jnp.arange(-380.0, 381.0, dtype=jnp.float32)
+    range), at every integral exponent from -400 to 400 against exact float64 scaling (its split takes thirds
+    by a product with fp32's 1/3, the clip at POWER2_REACH among them), and zero stays zero."""
+    exponents = jnp.arange(-400.0, 401.0, dtype=jnp.float32)
     mantissas = jnp.asarray([0.0, 0.5, 0.75, 1.0, -0.6], jnp.float32)
     found = np.asarray(jax.jit(lambda x, k: algebra.power2(x[:, None], k[None, :]))(mantissas, exponents))
     exact = np.ldexp(np.asarray(mantissas, np.float64)[:, None], np.asarray(exponents, np.int64)[None, :])

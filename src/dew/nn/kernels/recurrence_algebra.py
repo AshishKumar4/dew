@@ -20,8 +20,9 @@ families that need them. A token updates and reads, per head over a state `S` `[
   and the write `grown[-1] S + (k exp(gc[-1] - gc))^T v_new`;
 - `readout(q, entering, entered, k, pairs, v_new) -> o`: the memory entered read through the decayed
   queries, plus the chunk's own pairs;
-- `compose(first, second)`: two spans' transitions `S -> T S + W` as one, associatively, for a scan over
-  shards or chunks run in parallel.
+- `compose(first, second)`: two spans' transitions `S -> T S + W` (`Span`) as one, associatively, for a scan
+  over shards or chunks run in parallel; `entering(span, axis)` the memory each shard of a sequence enters its
+  span with, their exclusive prefix across the mesh axis.
 
 Each works over any leading dimensions: the portable math (`recurrence_chunk.chunk_delta_rule`) calls them on
 `[B, H, NC, ...]` arrays, and a kernel's body on one chunk's tiles. Packed `documents` restart the decays at
@@ -34,14 +35,15 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 import functools
 import math
 from collections.abc import Callable
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
 
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.templates.attention_algebra import power2
-from dew.nn.precision import compensated_add, float32_einsum, float32_matmul
+from dew.nn.kernels.templates.product import Exact, Transposed
+from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul
 
 from . import recurrence
 
@@ -69,6 +71,8 @@ PRODUCTS = {
     "memory_dq": "the output's gradient against the entered memory's transpose, `do S^T`",
     "memory_dk": "the corrected values against the leaving memory's gradient, `v dS^T`",
     "memory_dw": "the values' gradient against the entered memory's transpose, `dv S^T`",
+    "memory_trace": "the entered memory's transpose against the leaving one's gradient, `S^T dS`, whose "
+                    "diagonal sums `sum(S dS)` (a mainloop's `memory_gradients` launch)",
     "scores_dq": "the scores' gradient against the keys, `ds k`, and its transpose against the queries",
     "inverse_t": "the inverse's transpose against a gradient, `L^T dX` (`system_gradient`)",
     "inverse_dx": "a gradient against a weighted operand's transpose, `dw (k b exp(gc))^T`",
@@ -82,44 +86,23 @@ contractions (`paired`), which a mainloop issues as a product of the factored op
 decay's bound keeps exact, or as the weighed sum."""
 
 
-class Transposed:
-    """A register operand a product takes transposed, `value^T`: a mainloop stages it and reads the tile
-    transposed, where a transpose of registers would move every element between threads."""
-
-    def __init__(self, value: jax.Array):
-        self.value = value
-
-    @property
-    def shape(self) -> tuple:
-        return (*self.value.shape[:-2], self.value.shape[-1], self.value.shape[-2])
-
-
-class Exact:
-    """A register operand exact in a 16-bit dtype (a mask of zeros and ones): a mainloop stages it as one
-    part, where an fp32 operand takes three."""
-
-    def __init__(self, value: jax.Array):
-        self.value = value
-
-    @property
-    def shape(self) -> tuple:
-        return self.value.shape
-
-
 def portable(name: str, left, right):
-    """XLA's product, the portable math's issuer: `left @ right`, float32 products in float32 on a GPU, as
-    torch's are, not TF32, summed as Dew sums a CPU's float32 products (`dew.nn.precision.float32_matmul`,
-    which `accumulated`); the portable math takes its operands in at least float32
+    """XLA's product, the portable math's issuer: `left @ right` in IEEE float32 where nothing states a
+    precision (`dew.nn.precision.exact_float32`), since a chunk's products carry the recurrent state,
+    whose rounding every later chunk reads compounded, summed as Dew sums a CPU's float32 products
+    (`float32_matmul`, which `accumulated`); the portable math takes its operands in at least float32
     (`recurrence_chunk.chunked`), a `Transposed` one transposed."""
     del name
     left, right = (jnp.swapaxes(x.value, -1, -2) if isinstance(x, Transposed) else
                    x.value if isinstance(x, Exact) else x for x in (left, right))
-    return float32_matmul(left, right)
+    return float32_matmul(left, right, exact_float32(None))
 
 
+@jax.jit
 def _cumulated(g, documents=None):
     """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)` (`compensated_add`),
-    restarting at each of packed `documents`' first positions."""
+    restarting at each of packed `documents`' first positions: one program JAX traces once for their types,
+    whose exact sums the portable math's forward and gradient each traced afresh (row 3142)."""
     zeros = jnp.zeros_like(g)
     if documents is None:
         return jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)
@@ -189,9 +172,11 @@ def raised(whole, part):
     its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
     port's decay gradient under decays near zero 7 to 10 times the token-by-token recurrence's distance from
     float64; and exp2 of a whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2
-    the same way."""
+    the same way. Its power of two within twice 127 (`power2`'s two factors): the fraction's exp2 lies in
+    [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the two factors held an
+    A100's query_key launch spill-free where three spilled it (ledger 2519)."""
     n = _floor(whole)
-    return power2(jnp.exp2((whole - n) + part), n)
+    return power2(jnp.exp2((whole - n) + part), n, reach=2 * 127)
 
 
 def _floor(x):
@@ -204,31 +189,64 @@ def _floor(x):
 
 
 def decayed(rows, rows_lo, columns, columns_lo):
-    """`exp2(rows - columns)` `[R, C]` of a compensated prefix's halves (`apart`) to fp32's resolution, as
-    `raised` takes it, each side's integer part apart from its fraction on its vector: the tile takes the
-    integers' difference (exact), the fractions' in (-1, 1) and the low halves', and one exp2 of their sum
-    scaled by the integers' power of two (`_scaled`). The exponent rounds at the fractions' scale, at least as
-    finely as the whole difference's, and the tile takes no floor and one integer add for its scaling: a
-    mainloop holds a few of its working tiles, not `raised`'s many (wgmma's output and reverse launches
-    spilled 128 and 260 bytes on them, and none with no pair decay, SE regs-probe90b)."""
-    row_whole, column_whole = _floor(rows), _floor(columns)
-    fraction = (((rows - row_whole)[:, None] - (columns - column_whole)[None, :])
-                + (rows_lo[:, None] - columns_lo[None, :]))
-    return _scaled(jnp.exp2(fraction), row_whole[:, None] - column_whole[None, :])
+    """`exp2(rows - columns)` `[R, C]` of a compensated prefix's halves at the tile's rows and columns, each
+    side's vector separated (`separated`, `between`): the tile takes the wholes' difference, exact, the
+    fractions', and one exp2 scaled by a power of two."""
+    (row_whole, row_fraction), (column_whole, column_fraction) = (separated(rows, rows_lo),
+                                                                  separated(columns, columns_lo))
+    return between((row_whole[:, None], row_fraction[:, None]),
+                   (column_whole[None, :], column_fraction[None, :]))
+
+
+def range_decay(later, later_low, earlier, earlier_low):
+    """`exp2(later - earlier)` of a compensated prefix's halves at two positions (broadcasting): `raised` of
+    their difference, compensated (`compensated_add`), so no rounding of the halves' difference reaches
+    it: a range's decay, which from the difference rounded to one fp32 lost a fraction's last bits at the
+    prefix's size (1e-6 of the decay near -43). The template's ranges, on its halves' vectors; separating
+    both sides for `between` held more registers, one of sm80's training launches spilling 48 bytes (a
+    port's prefix, stored separated, takes `between`)."""
+    return raised(*compensated_add((later, later_low), (-earlier, -earlier_low)))
 
 
 PAIR_FLOOR = -124.0
 """The least power of two `_scaled` scales by, past which a pair's decay is zero: `x 2^k` of an `x` at least
 1/4 stays a normal fp32 down to it, and a decay under 2^-122 weighs nothing beside the chunk's own token."""
 
+PAIR_CEILING = 120.0
+"""The largest power of two `_scaled` scales by, where it holds: the pairs past a token (a decay's inverse,
+which every caller masks) stay finite, and a key gated up from its sub-chunk's start (`key_decayed_pairs`)
+reaches it at most (`factored_range`)."""
+
 
 def _scaled(x, k):
     """`x * 2^k` of `x` in [1/4, 4) (`exp2` of a pair's fraction) and an integral `k`, exactly, by adding `k`
-    to `x`'s exponent bits: zero where `k` is under `PAIR_FLOOR`, and `k` held at 120 above, where the pairs
-    past a token (a decay's inverse, which every caller masks) stay finite."""
-    held = jnp.clip(k, PAIR_FLOOR, 120.0).astype(jnp.int32)
+    to `x`'s exponent bits: zero where `k` is under `PAIR_FLOOR`, and `k` held at `PAIR_CEILING` above."""
+    held = jnp.clip(k, PAIR_FLOOR, PAIR_CEILING).astype(jnp.int32)
     bits = jax.lax.bitcast_convert_type(x, jnp.int32) + jax.lax.shift_left(held, jnp.full_like(held, 23))
     return jnp.where(k < PAIR_FLOOR, 0.0, jax.lax.bitcast_convert_type(bits, jnp.float32))
+
+
+def separated(hi, lo):
+    """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`: `n` the integer
+    `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo`, the
+    form whose differences are exact at any size (`between`). Once a call, where its prefix is cumulated."""
+    whole = _floor(hi)
+    return whole, (hi - whole) + lo
+
+
+def between(later, earlier):
+    """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution:
+    exp2 of the fractions' difference scaled by the wholes' difference (`_scaled`), zero below 2^-124. A
+    difference of the rounded sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay
+    near -43, which put a port's decay gradient under decays near zero 9 to 14 times the token-by-token
+    recurrence's error from float64 (ledger 2098). The fractions' difference stays within two, its exp2
+    within `_scaled`'s range, for exponents under 2^24, where a fraction's remainder `lo` is at most one: a
+    chunk's prefix (its 64 tokens' at most 2^18 each). Truncating the difference into the scale, for any
+    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-4934890e4). Every pair's
+    decay, the ports' of their separated prefix and the template's of its halves (`decayed`), and the ports'
+    ranges; the template's ranges (`range_decay`) and a decay from the prefix's start are `raised`'s."""
+    (whole, fraction), (other, its_fraction) = later, earlier
+    return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
@@ -320,10 +338,54 @@ def factor(a, issue: Issue = portable):
 
 def paired(name: str, left, right, decay, issue: Issue = portable):
     """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk, `[..., C, C]`: one decay channel
-    scales the product `name` after it, one per key dimension weighs each term of it."""
+    scales the product `name` after it (`_decayed_product`), one per key dimension weighs each term of it. A
+    pair whose decay is zero (above the diagonal, across a document's start: `decays` masks its exponent)
+    weighs nothing, its derivatives included: selected, not multiplied by zero, where its product's tangent
+    may overflow (ledger 2470). Its depth is summed in two halves, then added (`_halved`): the chunk form's
+    solve and readout cancel what these sums carry where keys align, and one fp32 sum over the key width
+    put the portable math's output 1.52 times the token recurrence's distance from float64 where fp32
+    products sum in fp32 (1.34 in halves; ledger 2467)."""
     if decay.shape[-1] == 1:
-        return issue(name, left, jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return float32_einsum('...sd,...td,...std->...st', left, right, decay)
+        return _decayed_product(name, issue, left, right, decay[..., 0])
+
+    def summed(depth):
+        return float32_einsum('...sd,...td,...std->...st', left[..., depth], right[..., depth],
+                              decay[..., depth], precision=exact_float32(None))
+
+    return jnp.where(jnp.any(decay != 0, axis=-1), _halved(summed, left.shape[-1]), 0.0)
+
+
+def _halved(summed: Callable[[slice], jax.Array], depth: int) -> jax.Array:
+    """`summed(slice(None))`, a product's sum over its `depth`, as its two halves' sums added (`paired`)."""
+    half = depth // 2
+    return summed(slice(None, half)) + summed(slice(half, None))
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
+def _decayed_product(name: str, issue: Issue, left, right, decay):
+    """`(left @ right^T) * decay` of the pairs whose decay is nonzero, zero elsewhere (`paired`), its depth in
+    two halves (`_halved`)."""
+    return jnp.where(decay != 0, _product(name, issue, left, right) * decay, 0.0)
+
+
+def _product(name: str, issue: Issue, left, right) -> jax.Array:
+    """`left @ right^T`, the product `name`, summed over the depth in two halves (`paired`)."""
+    return _halved(lambda depth: issue(name, left[..., depth], jnp.swapaxes(right[..., depth], -1, -2)),
+                   left.shape[-1])
+
+
+@_decayed_product.defjvp
+def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
+    """The product's tangent with each term weighed by its pair's decay before they are summed: the terms'
+    sum before the decay overflowed fp32 where the decayed tangent is finite (keys and queries near 2^63, the
+    two terms 2.6e38 and 8.5e37 past 3.4e38 against a decay of 0.6; ledger 2470)."""
+    left, right, decay = primals
+    d_left, d_right, d_decay = tangents
+    product = _product(name, issue, left, right)
+    weighed = (issue(name, d_left, jnp.swapaxes(right, -1, -2)) * decay
+               + issue(name, left, jnp.swapaxes(d_right, -1, -2)) * decay + product * d_decay)
+    kept = decay != 0
+    return jnp.where(kept, product * decay, 0.0), jnp.where(kept, weighed, 0.0)
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):
@@ -425,16 +487,67 @@ def _remembered_tangent(issue, name, primals, tangents):
     return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
 
 
-def compose(first, second, issue: Issue = portable):
-    """Two spans' transitions as one: each a pair `(T [..., Dk, Dk], W [..., Dk, Dv])` taking the memory
-    entering to `T S + W`; `second` after `first` is `(T2 T1, T2 W1 + W2)`, associative, so a scan over spans
-    may run as a tree."""
-    (t1, w1), (t2, w2) = first, second
-    return issue("compose", t2, t1), issue("compose", t2, w1) + w2
+class Span(NamedTuple):
+    """A span's affine map of the memory entering it, `S -> T S + W`: its `write` `W` `[..., Dk, Dv]` and its
+    `transfer` `T`, a dense one `[..., Dk, Dk]` (the delta rule's, `transition`, or a rule's final memory from
+    the identity, `recurrence_chunk.entering_memory`) or a head's decay as its log `[...]`, never expanded to
+    a matrix: it scales the whole memory, which then may be laid either way round (Mamba-2's `[..., P,
+    N]`)."""
+
+    transfer: jax.Array
+    write: jax.Array
+
+    @property
+    def dense(self) -> bool:
+        return self.transfer.ndim == self.write.ndim
+
+    def decayed(self, memory, issue: Issue = portable) -> jax.Array:
+        """`T S`."""
+        if self.dense:
+            return issue("compose", self.transfer, memory)
+        return jnp.exp(self.transfer)[..., None, None] * memory
+
+    def applied(self, memory, issue: Issue = portable) -> jax.Array:
+        """`T S + W`: the memory the span leaves from the memory `S` entering it."""
+        return self.decayed(memory, issue) + self.write
 
 
-def transition(key, w, u, grown, last, kept, issue: Issue = portable):
-    """A chunk's transition `(T, W)` (`compose`): with `carry`'s operands, `T = grown[-1] kept - (k last)^T W`
+def compose(first: Span, second: Span, issue: Issue = portable) -> Span:
+    """Two spans' transitions as one (`Span`, each of the same form): `second` after `first` is `(T2 T1, T2 W1
+    + W2)`, a decay's logs summed, associative, so a scan over spans may run as a tree."""
+    first, second = Span(*first), Span(*second)
+    transfer = (issue("compose", second.transfer, first.transfer) if second.dense
+                else first.transfer + second.transfer)
+    return Span(transfer, second.applied(first.write, issue))
+
+
+def entering(span: Span, axis: str, initial=None, issue: Issue = portable) -> jax.Array:
+    """The memory each shard of a sequence the mesh axis `axis` splits enters its `span` with, inside a
+    `shard_map` that holds `axis` manual: the shards' spans before it composed (`compose`) and applied to
+    `initial`, the memory the first shard enters (zero where None). A Kogge-Stone scan: shifts 1, 2, 4, ...
+    for `ceil(log2 n)` rounds, one span a shard a round, each shard composing the one it is handed where a
+    shard that far back exists, then one shift more to make the prefix exclusive; autodiff transposes each
+    `ppermute`. A dense span's prefix composes its transfers too (`T2 T1`), where gathering every shard's
+    summaries and applying them in turn (fla's context-parallel states) held n of them a shard."""
+    shards, index = jax.lax.axis_size(axis), jax.lax.axis_index(axis)
+
+    def shifted(value, shift: int):
+        return jax.lax.ppermute(value, axis, [(r, r + shift) for r in range(shards - shift)])
+
+    span, shift = Span(*span), 1
+    while shift < shards:
+        composed = compose(shifted(span, shift), span, issue)
+        span = jax.tree.map(functools.partial(jnp.where, index >= shift), composed, span)
+        shift *= 2
+    before = shifted(span, 1)
+    if initial is None:
+        return jnp.where(index > 0, before.write, 0.0)
+    return jnp.where(index > 0, before.applied(initial.astype(before.write.dtype), issue), initial)
+
+
+def transition(key, w, u, grown, last, kept, issue: Issue = portable) -> Span:
+    """A chunk's transition `(T, W)` (`Span`, `compose`): with `carry`'s operands, `T = grown[-1] kept - (k
+    last)^T W`
     and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`. Packed documents keep the memory
     entering only where `kept` because the operands are built so (`recurrence_chunk.chunked`): `W` is zero
     outside the document the memory entering belongs to and `last` outside the chunk's last document; `kept`
@@ -442,7 +555,7 @@ def transition(key, w, u, grown, last, kept, issue: Issue = portable):
     decayed = jnp.swapaxes(key * last, -1, -2)
     dk = key.shape[-1]
     diagonal = jnp.eye(dk, dtype=grown.dtype) * jnp.swapaxes(grown[..., -1:, :], -1, -2) * kept
-    return diagonal - issue("corrected", decayed, w), issue("write", decayed, u)
+    return Span(diagonal - issue("corrected", decayed, w), issue("write", decayed, u))
 
 
 def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue: Issue = portable):
@@ -451,7 +564,7 @@ def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue
     linear, written = transition(key, w, u, grown, last, kept, issue)
     k, _, g, beta, start = token
     no_write = k, jnp.zeros_like(k), g, beta, start
-    return _last_token(linear, no_write, delta), _last_token(written, token, delta)
+    return Span(_last_token(linear, no_write, delta), _last_token(written, token, delta))
 
 
 # A chunk's tiles. The functions below are the same algebra on one chunk of one head, as a mainloop's
@@ -522,30 +635,20 @@ def tril_inverse(diagonal, index):
     return inverse + (index[:, None] == index[None, :])
 
 
-def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
-    """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s . k_t)
-    exp2(g_s - g_t), -1)`, a decay a head: `system`'s blocks, inverted (`inverted`)."""
-    return inverted(system(keys, gates, lows, betas, columns, issue), issue)
-
-
-def system(keys: Load, gates, lows, betas, columns: int, issue: Issue, *,
-           laid: tuple | None = None) -> dict:
+def system(keys: Load, decay: Callable[[int, int], jax.Array], betas, count: int, columns: int,
+           issue: Issue) -> dict:
     """The blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s . k_t) exp2(g_s -
-    g_t), -1)`, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c` of `columns`, `gates`,
-    `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32, and `laid` the halves `(gates,
-    lows)` as a column's vectors, where a mainloop's layouts keep a column's vector apart from a row's (Mosaic
-    GPU's, whose vectors are one or the other of a tile's). Every block of `k k^T` sums its column blocks'
-    products ('intra')."""
-    count = len(gates)
-    column_gates, column_lows = (gates, lows) if laid is None else laid
+    g_t), -1)` over its `count` sub-chunks, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c`
+    of `columns`, `decay(i, j)` the pairs' decays from sub-chunk `j` to `i` and `betas` each sub-chunk's
+    write gates, fp32. Every block of `k k^T` sums its column blocks' products ('intra'): fla's kkt (the
+    GDN port's solve)."""
 
     def block(i, j):
         product = sum(issue("intra", keys(i, c), keys(j, c).T) for c in range(columns))
-        decay = decayed(gates[i], lows[i], column_gates[j], column_lows[j])
+        pairs = decay(i, j)
         if i == j:
-            lag = _lags(decay.shape)
-            decay = jnp.where(lag > 0, decay, 0.0)
-        return product * decay * betas[i][:, None]
+            pairs = jnp.where(_lags(pairs.shape) > 0, pairs, 0.0)
+        return product * pairs * betas[i][:, None]
 
     return {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
 
@@ -580,17 +683,30 @@ def doubled(a, issue: Issue):
     return inverse
 
 
-def inverted(blocks: dict, issue: Issue) -> dict:
+def solved(system, issue: Issue):
+    """`(I + A)^-1 - I` `[C, C]` of a chunk's strictly lower system `A`: `doubled`'s inverse of `-A`, its unit
+    diagonal taken off after the last level, as `weighted` takes it (it adds the diagonal outside its
+    product)."""
+    rows, cols = _grid(system.shape)
+    return doubled(-system, issue) - jnp.where(rows == cols, 1.0, 0.0)
+
+
+def inverted(blocks: dict, issue: Issue, *, neighbours_first: bool = False) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` from `A`'s strictly lower blocks `blocks`
     (the diagonal ones strictly lower themselves): forward substitution inverts each diagonal block
     (`tril_inverse`), and neighbouring inverses merge as `X_ij = -X_ii sum_m A_im X_mj` ('merge'), nearest the
-    diagonal first."""
+    diagonal first: fla's solve (chunk_fwd.py's for the gated delta rule). With `neighbours_first`, a pair of
+    neighbours merges as `-(X_ii A_ij) X_jj`, the product order fla's chunk_intra.py takes for Kimi delta
+    attention."""
     count = max(i for i, _ in blocks) + 1
     index = jnp.arange(blocks[0, 0].shape[0])
     inverse = {(i, i): tril_inverse(blocks[i, i], index) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
             j = i - distance
+            if distance == 1 and neighbours_first:
+                inverse[i, j] = -issue("merge", issue("merge", inverse[i, i], blocks[i, j]), inverse[j, j])
+                continue
             inner = functools.reduce(jnp.add, (issue("merge", blocks[i, m], inverse[m, j])
                                                for m in range(j, i)))
             inverse[i, j] = -issue("merge", inverse[i, i], inner)
@@ -623,39 +739,53 @@ def corrected(values, weights: Load | None, state, dtype, issue: Issue):
 def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple | None = None) -> list:
     """The memory leaving a chunk, slice by key slice: `state[i] decay[i] + keys(i)^T values` ('write'), the
     values cast to the keys' `dtype`; `decay[i]` scales each slice's rows `[K_i, 1]` or the whole. `last`,
-    `(key_rows, value_row)`, takes the chunk's last token's write out of the product, its key slice
-    `key_rows(i)` as a row's vector and its values `value_row` as a column's: the write that weighs most
-    under steep decays, added on its own where a tensor core's truncating sum (mma.sync's) would lose its
-    last bit."""
+    `(key_rows, value_row, row)`, takes the chunk's last real token's write, its row `row`, out of the
+    product, its key slice `key_rows(i)` as a row's vector and its values `value_row` as a column's: the
+    write that weighs most under steep decays, added on its own where a tensor core's truncating sum
+    (mma.sync's) would lose its last bit."""
     values = values.astype(dtype)
     if last is None:
         return [part * decay[i] + issue("write", keys(i).T, values) for i, part in enumerate(state)]
-    key_rows, value_row = last
+    key_rows, value_row, row = last
     rows, _ = _grid(values.shape)
-    earlier = jnp.where(rows < values.shape[0] - 1, values, jnp.zeros((), values.dtype))
+    earlier = jnp.where(rows != row, values, jnp.zeros((), values.dtype))
     return [part * decay[i] + (issue("write", keys(i).T, earlier) + key_rows(i)[:, None] * value_row[None, :])
             for i, part in enumerate(state)]
+
+
+def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue: Issue) -> list:
+    """`carried` with the write's gate on the keys' side: `state[i] decay[i] + (keys(i) gate)^T values`, each
+    key row scaled by its token's `gate` `[C]` (its write gate and its decay to the chunk's end) in fp32 and
+    rounded to `dtype` for the product, the values (`values`, a tile) as they are: mamba_ssm's state write,
+    `(B dt exp(dA_last - dA))^T x` (`_chunk_state_fwd`), whose rounding a 16-bit call's takes."""
+    return [part * decay[i] + issue("write", Transposed(
+        (keys(i).value().astype(jnp.float32) * gate[:, None]).astype(dtype)), values)
+        for i, part in enumerate(state)]
 
 
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
     memory's decay `exp2(g_last)`."""
-    gated = corrected_values * raised(last - gate, last_lo - gate_lo)[:, None]
+    gated = corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
     return gated, raised(last, last_lo)
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
-                 laid: tuple | None = None):
+                 laid: tuple | None = None, column_scale=None):
     """A chunk's own pairs' scores `[C, C]` under a decay a head, `tril((q k^T) exp2(g_s - g_t))`, the key
     column blocks `queries(c)` and `keys(c)` summed into fp32 ('scores'), in `dtype` for `chunk_output`'s
     'local', which every value block of the chunk takes. `laid` is the prefix's halves `(gate, low)` as a
     column's vectors where a mainloop's layouts keep them apart from a row's (`system`'s). The pairs' decays
-    come before the products, their exponents' working tiles done before the products' sum is live."""
+    come before the products, their exponents' working tiles done before the products' sum is live.
+    `column_scale` `[C]`, where given, scales each key token's column before the scores are rounded (the
+    write gate on the keys' side, mamba_ssm's `CB exp(dA_i - dA_j) dt_j`, `_chunk_scan_fwd`)."""
     decay = decayed(gate, low, *((gate, low) if laid is None else laid))
     scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
     for c in range(columns):
         scores += issue("scores", queries(c), keys(c).T)
     scores = scores * decay
+    if column_scale is not None:
+        scores = scores * column_scale[None, :]
     lag = _lags(scores.shape)
     return jnp.where(lag >= 0, scores, 0.0).astype(dtype)
 
@@ -676,15 +806,15 @@ def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, 
 def factored_range(floor: float, sub: int = SUB) -> bool:
     """Whether a decay a key dimension whose every token's log decay is at least `floor` (natural log, a
     layer's declared lower bound: Kimi delta attention's -5) factors over `sub`-token sub-chunks
-    (`key_decayed_pairs`): a sub-chunk's widest range in base 2, `-floor sub log2(e)`, under fp32's largest
-    power of two's exponent, so a key gated up from its sub-chunk's start stays finite."""
-    return -floor * sub * math.log2(math.e) < 126
+    (`key_decayed_pairs`): a sub-chunk's widest range in base 2, `-floor sub log2(e)`, under the largest power
+    of two a decay scales by (`PAIR_CEILING`), so a key gated up from its sub-chunk's start is exact."""
+    return -floor * sub * math.log2(math.e) < PAIR_CEILING
 
 
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
                       gates: Callable[[int], tuple],
-                      reference: Callable[[int, int], tuple], issue: Issue, *, chunk: int, strict: bool,
-                      sub: int = SUB):
+                      reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
+                      chunk: int, strict: bool, rolled: bool, sub: int = SUB):
     """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
     g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
     write-gated keys) and keys `keys(c)` of each key block `c` of `columns`, fp32, `gates(c)` its prefix
@@ -692,19 +822,48 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     `reference(s, c)` (a column's vectors) as its pairs' common point: its rows gated down to it,
     `r exp2(g - g_ref)`, against every key up to its end gated up from it, `k exp2(g_ref - g)`, one product a
     sub-chunk and key block ('pairs'): fla_kda's sub-chunk factoring, its diagonal sub-chunks' too, which a
-    declared floor bounds (`factored_range`). An exponent is its halves' difference summed, within a
-    sub-chunk's range of zero down the rows (and up the keys); past it every pair's true value underflows."""
+    declared floor bounds (`factored_range`). Each factor is of the separated prefix (`between`), its exponent
+    within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero.
+    The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
+    rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
+    attention's intra launch, 1170 registers a thread on an A100, 519 on an H100). The key blocks are a
+    rolled loop where `rolled`, else unrolled."""
+    def products(s, c, prefix, down):
+        place = s * sub
+        start_whole, start_fraction = separated(*reference(s, c))
+        start = start_whole[None, :], start_fraction[None, :]
+        index, _ = _grid(prefix[0].shape)
+        # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
+        yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
+               lambda: Transposed(jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)))
+
+    def block(c, total):
+        # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
+        # live within its own turn. Its rows gated down at once, each to its own sub-chunk's first token:
+        # gated a sub-chunk at a time, every row was gated for each, and the exponentials were two thirds of
+        # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
+        prefix = separated(*gates(c))
+        index, _ = _grid(prefix[0].shape)
+
+        def laid(s, below):
+            # Each sub-chunk's reference laid over its rows from its own on, read in a rolled turn: read at
+            # static rows, their addresses were hoisted to the kernel's start and held through it (260 of an
+            # H100's 475 registers at the peak).
+            halves = separated(*reference(s, c))
+            return tuple(jnp.where(index >= s * sub, half[None, :], under)
+                         for half, under in zip(halves, below, strict=True))
+
+        start = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
+        down = rows(c) * between(prefix, start)
+        return jax.lax.fori_loop(0, chunk // sub, lambda s, total: (
+            total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
+
     total = jnp.zeros((chunk, chunk), jnp.float32)
-    for place in range(0, chunk, sub):
+    if rolled:
+        total = jax.lax.fori_loop(0, columns, block, total)
+    else:
         for c in range(columns):
-            # Each tile read where it is used, a sub-chunk and key block at a time: few live at once.
-            gate, low = gates(c)
-            start_gate, start_low = reference(place // sub, c)
-            exponent = (gate - start_gate[None, :]) + (low - start_low[None, :])
-            index, _ = _grid(exponent.shape)
-            down = jnp.where((index >= place) & (index < place + sub), rows(c) * jnp.exp2(exponent), 0.0)
-            up = jnp.where(index < place + sub, keys(c) * jnp.exp2(-exponent), 0.0)
-            total = total + issue("pairs", down, Transposed(up))
+            total = block(c, total)
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
 
@@ -712,24 +871,26 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
 def key_decayed_write(key, gate, low, last, last_low):
     """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` over both prefix
     halves, in the keys' arithmetic: the write the memory takes (`carried`)."""
-    return key * raised(last - gate, last_low - low)
+    return key * range_decay(last, last_low, gate, low)
 
 
-def key_decayed_output(queries: Callable[..., jax.Array], gates: Callable[..., tuple], entered: Load,
-                       columns: int, scores, value, scale: float, issue: Issue):
-    """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S + tril(Aqk) v`,
-    each key block's gated queries `queries(c) exp2(gates(c))` (`gates(c)` the prefix's halves, `raised`)
-    rounded to their dtype against the memory entered `entered(c)` ('memory'), the scores `scores` (`Aqk`,
-    scaled) rounded to the values' dtype ('local')."""
-    out = jnp.zeros((scores.shape[0], value.shape[-1]), jnp.float32)
-    for c in range(columns):
-        query = queries(c)
-        gated = (query * raised(*gates(c))).astype(query.dtype)
-        out = out + issue("memory", gated, entered(c).astype(gated.dtype))
-    out = out * scale
+def key_gated(query, gates: tuple, scale: float):
+    """A key block's queries gated by their decays to the chunk's start and scaled, `scale q exp2(g)`
+    (`gates` the prefix's halves, `raised`), rounded to the queries' dtype: `key_decayed_output`'s left
+    operand, as fla's chunk_gla output kernel scales its gated queries."""
+    return (query * raised(*gates) * scale).astype(query.dtype)
+
+
+def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value,
+                       summed: Callable[[list], jax.Array]):
+    """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `(scale q exp2(g))_narrow S + tril(Aqk) v`,
+    each key block's gated and scaled queries `gated(c)` (`key_gated`'s) against the memory entered
+    `entered(c)` ('memory') and the scores `scores` (`Aqk`, scaled) rounded to the values' dtype ('local'),
+    every product into one accumulator (`summed`, the mainloop's: a list of `(name, left, right)`), as fla's
+    chunk_kda sums its key blocks' into one."""
     lag = _lags(scores.shape)
     local = jnp.where(lag >= 0, scores, 0.0).astype(value.dtype)
-    return out + issue("local", local, value)
+    return summed([("memory", gated(c), entered(c)) for c in range(columns)] + [("local", local, value)])
 
 
 # The fast backward of a decay a head under the delta rule, fla's arithmetic on a chunk's tiles (the port's
@@ -756,34 +917,45 @@ def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, o
     return issue("local_dv", product.astype(out_grad.dtype), out_grad)
 
 
-def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: TileLoad, out_grad, local, gate,
-                    low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
+def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, queries: TileLoad, out_grad, local,
+                    gate, low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
     """One chunk of the memory's reverse recurrence (fla's dhu) under a decay a head: from the gradient of
     the memory leaving the chunk `grad`, its key slices `[K_i, BV]` fp32, the corrected values' gradient
     `dv = (k grad) exp2(g_last - g) + local` ('values_dv', the gradient cast to `dtype`) and the gradient of
     the memory the chunk entered, `grad exp2(g_last) + scale q^T (do exp2(g)) - w^T dv` ('reads', the
     decayed `do` fp32; 'weights_dv', `dv` cast to `dtype`). `last` and `last_low` are the chunk's last prefix
-    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles."""
+    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles. Without the delta rule
+    (`weights` None) nothing was corrected, and the memory entered takes no `w^T dv`."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
-    dv = dv * raised(last - gate, last_low - low)[:, None] + local
+    dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
     kept = raised(last, last_low)[:, None]
-    entered = [part * kept + issue("reads", queries(i).T, read) * scale
-               - issue("weights_dv", weights(i).T, dv.astype(dtype)) for i, part in enumerate(grad)]
-    return entered, dv
+    def slice_entered(i, part):
+        # A slice's terms in one expression, so each slice's products are live alone (formed slice by slice
+        # into a list first, every slice's partial sum stayed live past the products: 128 bytes spilled in
+        # an H100's reverse walk of Qwen3.5-27B's gated delta net).
+        entered = part * kept + issue("reads", queries(i).T, read) * scale
+        return entered if weights is None else entered - issue("weights_dv", weights(i).T, dv.astype(dtype))
+
+    return [slice_entered(i, part) for i, part in enumerate(grad)], dv
 
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
                     blocks: int, gate, low, scale: float, dtype, issue: Issue, *,
-                    laid: tuple | None = None) -> tuple[jax.Array, jax.Array]:
+                    laid: tuple | None = None, column_scale=None) -> tuple[jax.Array, jax.Array]:
     """A chunk and value head's scores' gradient under a decay a head, `ds = do v^T` over the value blocks
     `j` gated by its pairs' decays, causal and scaled, in `dtype` (which `memory_gradients`' `dq += ds k`
     and `dk += ds^T q` take), and the decay's pair terms `ds (q k^T)` (strictly lower, fp32,
-    `summed_pairs`'): the part of fla's dqkwg the memory's products do not take, a launch of its own."""
+    `summed_pairs`'): the part of fla's dqkwg the memory's products do not take, a launch of its own.
+    `column_scale` `[C]`, where given, scales each value token's column in fp32 after the products: the
+    write gate on the keys' side (`chunk_scores`'), mamba_ssm's `dCB = (dout x^T) dt`
+    (`_chunk_scan_bwd_dcb`)."""
     column_gate, column_low = (gate, low) if laid is None else laid
     pair_decay = decayed(gate, low, column_gate, column_low)
     ds = functools.reduce(jnp.add, (issue("values_ds", out_grads(j), values(j).T) for j in range(blocks)))
+    if column_scale is not None:
+        ds = ds * column_scale[None, :]
     lag = _lags(ds.shape)
     ds = jnp.where(lag >= 0, ds * pair_decay, 0.0) * scale
     scores = functools.reduce(jnp.add, (issue("local_t", queries(c), keys(c).T) for c in range(columns)))
@@ -791,32 +963,38 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
 
 
 def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
-                     value_grads: TileLoad, entered: TileLoad, leaving: TileLoad, blocks: int, ds, gate, low,
-                     last, last_low, memory_decay, scale: float, issue: Issue,
-                     emit: Callable[[str, int, jax.Array], None]) -> tuple[jax.Array, jax.Array]:
+                     value_grads: TileLoad | None, entered: TileLoad, leaving: TileLoad, blocks: int, ds,
+                     gate, low, last, last_low, memory_decay, scale: float, issue: Issue,
+                     emit: Callable[[str, int, jax.Array], None],
+                     row_scale=None) -> tuple[jax.Array, jax.Array]:
     """The queries', keys' and weights' gradients of a chunk and value head (fla's dqkwg's memory products)
     under a decay a head, given its scores' gradient `ds` (`scores_gradient`'s, a tile its products read as
     they are, in the operands' dtype): over the value blocks `j`, `dq = do S^T`, `dk = v dS^T` and
     `dw = -dv S^T` for the corrected values `values(j)`, the output's gradient `out_grads(j)`, the corrected
     values' own `value_grads(j)` and the memories the chunk entered and left `entered(c, j)`, `leaving(c, j)`
-    (key block `c`), then the gates and `dq += ds k`, `dk += ds^T q`, each key block's to `emit('dq' | 'dk'
-    | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
+    (key block `c`), then the gates and `dq += ds k`, `dk += ds^T q` (none where `ds` is None: a caller
+    summing the scores' gradient over value heads first takes them once), each key block's to `emit('dq' |
+    'dk' | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
     `leaving` `[C]` each token's write into the memory the chunk leaves. `memory_decay` is the decay's
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
-    summing key blocks apart adds it once)."""
+    summing key blocks apart adds it once). Without the delta rule (`value_grads` None) there are no weights
+    and no `dw`. `row_scale` `[C]`, where given, scales each token's row of `dk`'s memory products in fp32:
+    the write gate on the keys' side (`keys_gated_carried`), mamba_ssm's `dB = (x dstates^T) dt`."""
     row_decay = raised(gate, low)[:, None]
-    leaving_decay = raised(last - gate, last_low - low)[:, None]
+    leaving_decay = range_decay(last, last_low, gate, low)[:, None]
     leaving_terms, after = [], []
     for c in range(columns):
         dq = _summed(issue("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks))
         dq = dq * row_decay * scale
         after.append(jnp.sum(dq * queries(c).value().astype(jnp.float32), axis=1))
-        emit("dq", c, dq + issue("scores_dq", ds, keys(c)))
+        emit("dq", c, dq if ds is None else dq + issue("scores_dq", ds, keys(c)))
         dk = _summed(issue("memory_dk", values(j), leaving(c, j).T) for j in range(blocks))
-        dk = dk * leaving_decay
+        dk = dk * leaving_decay if row_scale is None else dk * (leaving_decay * row_scale[:, None])
         leaving_terms.append(jnp.sum(dk * keys(c).value().astype(jnp.float32), axis=1))
-        emit("dk", c, dk + issue("scores_dq", Transposed(ds), queries(c)))
-        emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T) for j in range(blocks)))
+        emit("dk", c, dk if ds is None else dk + issue("scores_dq", Transposed(ds), queries(c)))
+        if value_grads is not None:
+            emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T)
+                                   for j in range(blocks)))
     after = _summed(after)
     if memory_decay is not None:
         lag = _lags((after.shape[0],) * 2)
@@ -855,6 +1033,12 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
+    """The write gate's gradient on a tile of values gated, `u = v beta`, from `u_grad`, fp32: the values'
+    own, `du beta`, and beta's, `sum(v du)` over the tile's columns."""
+    return u_grad * beta[:, None], jnp.sum(u_grad * values, axis=1)
+
+
 def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, beta, dtype, issue: Issue, *,
                     emit: Callable[[str, int, jax.Array], None]) -> jax.Array:
     """The WY representation's backward under a decay a head, its values' part: each value block's gradient
@@ -864,8 +1048,9 @@ def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, bet
     for j in range(blocks):
         u_grad = u_grads(j).value().astype(jnp.float32)
         d_scaled = u_grad + issue("inverse_t", lower.T, u_grad.astype(dtype))
-        emit("values", j, d_scaled * beta[:, None])
-        d_betas.append(jnp.sum(d_scaled * values(j).value().astype(jnp.float32), axis=1))
+        d_values, d_beta = gated_values_back(d_scaled, values(j).value().astype(jnp.float32), beta)
+        emit("values", j, d_values)
+        d_betas.append(d_beta)
     return _summed(d_betas)
 
 

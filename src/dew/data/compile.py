@@ -18,6 +18,7 @@ import functools
 import itertools
 import os
 import threading
+import typing
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
@@ -60,6 +61,8 @@ from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
+    FilledBatch,
+    Forwarding,
     GlobalReader,
     GlobalStream,
     Loader,
@@ -67,8 +70,11 @@ from dew.data.dataset import (
     PhasedStream,
     Reader,
     Records,
+    rows_of,
+    take_batch,
 )
 from dew.data.facts import merge_facts
+from dew.data.holdout import selecting
 from dew.data.lowering import (
     _as_iter,
     _Build,
@@ -99,6 +105,7 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
+    MarkConsumed,
     Mixture,
     Native,
     ObjectiveData,
@@ -118,7 +125,9 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     children,
+    examples_bound,
     record_stage,
+    runs,
     with_children,
     with_stores,
 )
@@ -134,6 +143,8 @@ from dew.data.sources.base import (
     materialized,
     tokenizer_contract,
 )
+from dew.data.sources.concatenate import Concatenate
+from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 
 _DEFAULT_LOADING = Loading()
@@ -233,7 +244,7 @@ class _Facts(View[Source]):
     facts and the rows a run materializes are one read's."""
     stated_label: str = ""
     """The source's name as it was written, before a read put another in its place (a Hub split's
-    Parquet files, `Consumed`), which the run's metrics go by."""
+    Parquet files, `dew.data.sources.base.Consumed`), which the run's metrics go by."""
 
     def label(self) -> str:
         return self.stated_label
@@ -283,15 +294,16 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     for branch in pipelines:
         for key, measuring in _measured(branch).items():
             measured.setdefault(key, {}).update({each.measure.fact: each for each in measuring})
-    stores: dict[int, Records] = {}
+    # Each store held beside its records, so no store made later takes a freed one's address and records.
+    stores: dict[int, tuple[Source, Records]] = {}
     reading = threading.Lock()
 
     def whole(store: Source) -> Records:
         # A store several holdout parts measure over is read once for them all.
         with reading:
             if id(store) not in stores:
-                stores[id(store)] = store.records(read)
-            return stores[id(store)]
+                stores[id(store)] = (store, store.records(read))
+            return stores[id(store)][1]
 
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
@@ -327,19 +339,48 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
+def _stores(source: Source) -> Iterator[Source]:
+    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
+    selects from."""
+    for _, selected in selecting(source):
+        if isinstance(selected, Concatenate):
+            for part in selected.sources:
+                yield from _stores(part)
+        else:
+            yield selected
+
+
+def _token_stores(source: Source) -> Iterator[TokenFiles]:
+    """The token stores `source` reads, through every view and a concatenation's parts."""
+    for each in beneath(source, typing.get_args(Rows.__value__)):
+        if isinstance(each, Concatenate):
+            for part in each.sources:
+                yield from _token_stores(part)
+        elif isinstance(each, TokenFiles):
+            yield each
+
+
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     tokenizer_contract((f"corpus {_name(leaf)}", source.metadata())
                        for pipeline in pipelines for leaf, source in _leaves(pipeline))
 
 
+def _laid_out(pipeline: Pipeline) -> TokenGeometry | None:
+    """The rows `pipeline`'s source reads laid out, a token store's windows or a planned pack's
+    (`TokenGeometry`), through the views that keep its rows as they are (a compile's pinned read, a
+    holdout's selection), or None."""
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        return None
+    laid = beneath(pipeline.source, ("read", "selected"))
+    return next((source for source in laid if isinstance(source, TokenGeometry)), None)
+
+
 def _row_tokens(pipeline: Pipeline) -> int | None:
-    """The tokens each row of `pipeline` holds, as its last record step
-    declaring them states (`TokenGeometry`), or its corpora alike."""
-    declared = [
-        stage.step
-        for stage in pipeline.stages
-        if isinstance(stage, (Map, RandomMap)) and isinstance(stage.step, TokenGeometry)
-    ]
+    """The tokens each row of `pipeline` holds, as its last record step or layout declaring them
+    states (`TokenGeometry`), a source that reads them laid out first (`_laid_out`), or its corpora
+    alike."""
+    steps = (stage.step if isinstance(stage, (Map, RandomMap)) else stage for stage in pipeline.stages)
+    declared = [step for step in (_laid_out(pipeline), *steps) if isinstance(step, TokenGeometry)]
     if declared:
         return declared[-1].max_length
     if nested := children(pipeline):
@@ -379,15 +420,38 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
+def _native_after_bound(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`) and runs a native Grain step
+    after the bound that marks them."""
+    stages = pipeline.stages
+    at = examples_bound(stages)
+    return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
+
+
+def _shuffles_windows(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples) and
+    shuffles in a window after a stage that packs or windows its rows."""
+    stages = pipeline.stages
+    if examples_bound(stages) is None:
+        return False
+    packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
+    return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
+                                      for stage in stages[packed:])
+
+
 def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
-    """`pipeline`'s training read bounded to its first `examples` records as they reach the first
-    stage that packs or windows them, or its batch where none does: the records the objective's
-    steps make, not the windows a pack lays them in. A repeat without end goes before the bound
+    """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
+    reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
+    run after the chain's own record order, `_objective_branch`), or where none does, the first stage that
+    packs or windows them, or its batch: never the rows an objective makes of an example or the windows
+    a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
-    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
-    Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
-    batch's included, a mixed corpus that packs on its own, and phases, which end by steps. A chain
-    without a batch is left for `compile` to refuse."""
+    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`); in a
+    pool, a read in one order takes the bound before it cuts its shares, and a read whose shares each
+    read records of their own takes on each its part of the pool's first `examples`
+    (`dew.data.lowering._Build.bounded`). Refuses a bound it cannot place: a repeat with a count before
+    it, or any repeat after it, the batch's included, a mixed corpus that packs on its own, and phases,
+    which end by steps. A chain without a batch is left for `compile` to refuse."""
     if examples < 1:
         raise ValueError(f"examples must be at least 1, got {examples}")
     if isinstance(pipeline.source, Phases):
@@ -398,16 +462,24 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     batched = _until(pipeline.stages, (BatchStage, TokenBudget))
     if batched == len(pipeline.stages):
         return pipeline
-    at = _until(pipeline.stages[:batched], (Pack, Windows))
+    at = next((index for index, stage in enumerate(pipeline.stages[:batched])
+               if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
     repeats = [stage for stage in pipeline.stages[:at] if isinstance(stage, Repeat)]
     if any(stage.epochs is not None for stage in repeats) or any(
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
         raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
                          f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
-    bound = (Limit(examples),) if repeats else (Repeat(None), Limit(examples))
+    # Each example the bound reads is consumed by the last row a step makes of it (`MarkConsumed`).
+    bound = (*(() if repeats else (Repeat(None),)), Limit(examples), Map(MarkConsumed()))
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))
+
+
+def _expands(stage: Stage) -> bool:
+    """Whether `stage` is an objective's step that makes, or once it binds will make, several rows of a
+    source example (`FlatMap.examples`, `Configured.examples`)."""
+    return isinstance(stage, (FlatMap, Configured)) and stage.examples
 
 
 def _lays_out(pipeline: Pipeline) -> bool:
@@ -423,7 +495,8 @@ members may be restored by key beneath them: a shuffle's window, a packer's rema
 expansion's tail holds rows of the mix that saved them."""
 
 
-def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, str]:
+def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
+                      ) -> dict[str, tuple[JSON, tuple[TokenFiles, ...]]]:
     """What each member of a streamed mix reads and makes, as one digest under its key
     (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
     order rests on and its caches; and under the empty key the same of the mixture's own stages
@@ -435,7 +508,8 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     Each member is read in `train`, the tree the plan's lowering describes (`build`), which a
     memory read made of the written pipeline and which holds no member that accepted no row; its
     caches are those of each of its corpora's stages as its pipeline wrote them (`_written`), the
-    ones a memory read already ran among them."""
+    ones a memory read already ran among them. Each member's manifest comes with the token stores it
+    reads (`Plan.earlier_members`)."""
     source = train.source
     if (not isinstance(source, Mixture) or build.global_order
             or not all(isinstance(stage, _KEYED_ABOVE) for stage in train.stages)):
@@ -452,22 +526,22 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in written(train.stages)
-                                                  if not isinstance(stage, (Workers, Prefetch))),
-                                                *(StepIdentity.of(step) for step in host)])})}
+    members: dict[str, tuple[JSON, tuple[TokenFiles, ...]]] = {"": ({"steps": steps([
+        *(_identity(stage) for stage in written(train.stages) if not isinstance(stage, (Workers, Prefetch))),
+        *(StepIdentity.of(step) for step in host)])}, ())}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
                                              strict=True)):
         sources = [read for _, read in _leaves(child)]
         identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
                       *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
-        members[key] = fingerprint({
+        members[key] = (json_value({
             "order": unplaced(json_value(corpora[index], "member order")),
             "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
             "cache": list(_cache_references(child, build.read)),
-        })
+        }, "member manifest"), tuple(store for read in sources for store in _token_stores(read)))
     return members
 
 
@@ -507,8 +581,11 @@ def _prepared(
     provision: bool,
     training: bool = False,
     objective: ObjectiveData | None = None,
+    widths: Mapping[str, object] | None = None,
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
     automatic: str | None = None,
+    examples: int | None = None,
+    measured: _Measured | None = None,
 ) -> tuple[Pipeline, ...]:
     """The one preparation compile, iterate, validation and publish lower from.
 
@@ -520,8 +597,57 @@ def _prepared(
     source-scoped steps run and materialize first, so run-scoped steps bind
     to measured facts; publication passes no counts and reads nothing before
     its fill. The caller materializes what remains. A training read caches
-    each corpus's leading deterministic steps under `automatic` (`_automatic`).
+    each corpus's leading deterministic steps under `automatic` (`_automatic`). A training read bounded
+    to `examples` source examples takes its bound as the objective's steps are placed, before any step
+    runs, so no eager pass expands an example the bound counts (`_bounded`). Branches a run's widths
+    already measured this way (`measured`, `_measure`) are bound and laid out as they stand.
     """
+    if measured is None:
+        measured = _measure(branches, read, provision=provision, training=training, objective=objective,
+                            counts=counts, automatic=automatic, examples=examples)
+    branches, metadata = measured.branches, measured.metadata
+    held = [not training or index > 0 for index in range(len(branches))]
+    if metadata is not None:
+        # A run's static widths, measured over every branch it reads, bind this one's run-scoped steps
+        # (`run_widths`): a validation split takes training's shapes, not its own.
+        branches = tuple(_configured(branch, {**metadata, **(widths or {})}, read) for branch in branches)
+    if objective is not None:
+        branches = tuple(_windowed(branch, objective) for branch in branches)
+    if any(isinstance(stage, TokenBudget) for branch in branches for stage in branch.stages):
+        # A token budget's rows are the training rows' fixed length (`_budgeted`).
+        trained = _row_tokens(branches[0])
+        branches = tuple(_budgeted(branch, trained) for branch in branches)
+    for branch, scored in zip(branches, held, strict=True):
+        _analyzed(branch, read, validation=scored)
+    return branches
+
+
+@dataclasses.dataclass(frozen=True)
+class _Measured:
+    """Branches prepared through their source's own steps (`_measure`), materialized where a memory read
+    runs them: the facts they state then (`metadata`, None where no step binds to facts), which a run's
+    widths merge (`run_widths`) and its preparation binds (`_prepared`), and the counts that read filled."""
+
+    branches: tuple[Pipeline, ...]
+    metadata: Mapping[str, object] | None
+    counts: tuple[dict[str, CorpusCounts], ...]
+
+
+def _measure(
+    branches: Sequence[Pipeline],
+    read: Read,
+    *,
+    provision: bool,
+    training: bool = False,
+    objective: ObjectiveData | None = None,
+    counts: Sequence[dict[str, CorpusCounts]] | None = None,
+    automatic: str | None = None,
+    examples: int | None = None,
+) -> _Measured:
+    """`_prepared`'s first part: each branch checked, its generations promoted and checked again, its
+    sources provisioned and pinned, the objective's steps placed, a training read's bound taken, and with
+    read='memory' and `counts` its source-scoped steps run and materialized, so the facts the branches
+    state are measured ones; publication passes no counts and reads nothing before its fill."""
     if read not in ("memory", "indexed", "streamed"):
         raise ValueError(f"unknown read mode {read!r}")
     held = [not training or index > 0 for index in range(len(branches))]
@@ -539,6 +665,8 @@ def _prepared(
             _objective_branch(branch, objective, train=not scored, read=read)
             for branch, scored in zip(branches, held, strict=True)
         )
+    if examples is not None and training:
+        branches = (_bounded(branches[0], examples), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
@@ -554,16 +682,8 @@ def _prepared(
             if training and not stored(branches[0]):
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
-        branches = tuple(_configured(branch, metadata, read) for branch in branches)
-    if objective is not None:
-        branches = tuple(_windowed(branch, objective) for branch in branches)
-    if any(isinstance(stage, TokenBudget) for branch in branches for stage in branch.stages):
-        # A token budget's rows are the training rows' fixed length (`_budgeted`).
-        trained = _row_tokens(branches[0])
-        branches = tuple(_budgeted(branch, trained) for branch in branches)
-    for branch, scored in zip(branches, held, strict=True):
-        _analyzed(branch, read, validation=scored)
-    return branches
+        return _Measured(tuple(branches), metadata, tuple(counts or ()))
+    return _Measured(tuple(branches), None, tuple(counts or ()))
 
 
 def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
@@ -584,7 +704,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
-    return _Build(read, loading, seed, batch, lowered, training=training)
+    return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic)
 
 
 @compiling
@@ -601,10 +721,15 @@ def compile(
     rejections: Literal["drop", "mask"] = "drop",
     resume: Literal["exact", "non-exact"] = "exact",
     examples: int | None = None,
+    widths: Mapping[str, object] | None = None,
+    measured: _Measured | None = None,
 ) -> Loader:
-    """Check every leaf before opening readers, then build both branches.
+    """Check every leaf before opening readers, then build both branches; `widths` are the run's
+    static widths its steps bind to (`run_widths`), and `measured` its training branch as their
+    measurement prepared it (`_training_measure`), which it binds as it stands.
     With no `read`, the sources choose it (`_preferred_read`). `examples` bounds the training read to
-    its first that many records before they are packed (`_bounded`), a run's `examples=` budget."""
+    its first that many source examples, before they are packed and before the objective makes rows
+    of them (`_bounded`), a run's `examples=` budget."""
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
@@ -622,9 +747,44 @@ def compile(
             resume=resume,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
-                     seed=seed, rejections=rejections, examples=examples)
+                     seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
-    return loader if examples is None else dataclasses.replace(loader, examples=examples)
+    if examples is None:
+        return loader
+    return dataclasses.replace(loader, examples=examples, bound_ends=_bound_ends(staged.original))
+
+
+def _bound_ends(pipeline: Pipeline) -> bool:
+    """Whether `pipeline`'s read, bounded in examples (`_bounded`), ends where its bound does: no limit or
+    slice after the bound ends it first (`Loader.bound_ends`)."""
+    at = examples_bound(pipeline.stages)
+    after = () if at is None else pipeline.stages[at + 1:]
+    return not any(isinstance(stage, (Limit, Slice)) for stage in after)
+
+
+def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
+                      read: Read, provision: bool, loading: Loading, examples: int | None) -> _Measured:
+    """A compile's training branch, and its `validation`, prepared through their source's own steps as
+    the compile reads them (`_measure`): bounded to `examples`, a chain's own layout as written, before
+    preparation could plan it into its source, and the objective's with its preparation; each corpus's
+    leading deterministic steps cached where the read is no stream; their counts filled."""
+    from dew.data.cache import automatic_root
+
+    written = None if examples is None or not _lays_out(train) else examples
+    if written is not None:
+        train = _bounded(train, written)
+    counts: dict[str, CorpusCounts] = {}
+    validation_counts: dict[str, CorpusCounts] = {}
+    return _measure(
+        (train,) if validation is None else (train, validation),
+        read,
+        provision=provision,
+        training=True,
+        objective=objective,
+        counts=(counts,) if validation is None else (counts, validation_counts),
+        automatic=automatic_root(loading) if read != "streamed" else None,
+        examples=examples if written is None else None,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -653,35 +813,23 @@ def _staged(
     seed: int,
     rejections: Literal["drop", "mask"],
     examples: int | None = None,
+    widths: Mapping[str, object] | None = None,
+    measured: _Measured | None = None,
 ) -> _Staged:
-    from dew.data.cache import automatic_root
-
     if rejections == "mask":
         raise ValueError(
             "rejections='mask' needs an objective proven mask-safe; no objective currently declares it"
         )
     stated = next((stage for stage in train.stages if isinstance(stage, TokenBudget)), None)
     batch_tokens = None if stated is None else stated.tokens
-    counts: dict[str, CorpusCounts] = {}
-    validation_counts: dict[str, CorpusCounts] = {}
-    # A chain's own layout is bounded as written, before preparation could plan it into its source; the
-    # objective's goes in with its preparation, so the bound follows that.
-    written = None if examples is None or not _lays_out(train) else examples
-    if written is not None:
-        train = _bounded(train, written)
-    branches = _prepared(
-        (train,) if validation is None else (train, validation),
-        read,
-        provision=provision,
-        training=True,
-        objective=objective,
-        counts=(counts,) if validation is None else (counts, validation_counts),
-        automatic=automatic_root(loading) if read != "streamed" else None,
-    )
+    if measured is None:
+        measured = _training_measure(train, validation, objective=objective, read=read, provision=provision,
+                                     loading=loading, examples=examples)
+    counts, validation_counts = (*measured.counts, {})[:2]
+    branches = _prepared(measured.branches, read, provision=provision, training=True, objective=objective,
+                         widths=widths, measured=measured)
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    if examples is not None and written is None:
-        branches = (_bounded(branches[0], examples), *branches[1:])
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
     validation = scored[0] if scored else None
@@ -726,15 +874,18 @@ def _compiled(
             *(StepIdentity.of(step) for step in host),
         ),
     )
+    members = _member_manifests(train, build, host)
     plan = Plan(
         "global" if global_order else "per-share",
         manifest,
         {"read": read, "seed": seed, **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read),
-        members=_member_manifests(train, build, host),
+        members={key: fingerprint(manifest) for key, (manifest, _) in members.items()},
+        earlier_members=members,
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
+        stores=tuple(store for source in sources for store in _token_stores(source)),
     )
     tuned = build.tuned(train)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
@@ -767,6 +918,19 @@ def _compiled(
     records = _epoch_records(train, build)
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
+    order_records = _order_records(train, build)
+    if order_records is None and _native_after_bound(train):
+        # A native Grain step rebuilds or reorders rows as it likes, so the examples each row consumes
+        # (`CONSUMED`), which a run no plan counts ahead reads its progress off, are kept by no contract.
+        raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
+                         "keeps no count of the examples its rows consume: run it before the bound, as a "
+                         "step Dew names, or read the data in a global order")
+    if order_records is None and _shuffles_windows(train):
+        # A run no plan counts ahead reads its progress off the windows that end its examples
+        # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.
+        raise ValueError(f"{_name(train)} shuffles the windows it packs, which a run bounded in examples "
+                         "and read in its own order reads in the order they end their examples; shuffle "
+                         "the records before the pack, or read it in a global order")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,
@@ -780,9 +944,17 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
+        widths=_bound_widths(original),
         tail=_tail(train, build),
-        order_records=_order_records(train, build),
+        order_records=order_records,
     )
+
+
+def _bound_widths(pipeline: Pipeline) -> Mapping[str, object]:
+    """The run's static widths `pipeline`'s run-scoped configured steps bound (`Bound`, `run_widths`)."""
+    bound = (ran.configured for ran in map(runs, _steps(pipeline))
+             if ran is not None and ran.configured is not None and ran.configured.step.scope == "run")
+    return {name: value for binding in bound for name, value in binding.values.items()}
 
 
 def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[DeviceStep, ...]]:
@@ -948,7 +1120,8 @@ def _compile_phases(
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
     return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
-                               token_ends=source.ends if tokens else None)
+                               token_ends=source.ends if tokens else None,
+                               widths=merge_facts(loaded.widths for loaded, _ in built))
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
@@ -995,6 +1168,12 @@ def _training_reader(
     partition.rows(build.batch)
     if plan.volatile and partition.readers > 1:
         raise ValueError("volatile pipeline requires one reader per share until its bytes are persisted")
+    if plan.volatile and build.elastic and partition.count > 1:
+        # Every share reads an elastic order's prefix whole on its own (`_elastic_cut`), so a source
+        # whose rows can differ between reads (a fetch that drops failed records) orders them apart.
+        raise ValueError(f"an elastic read's {partition.count} shares each read its whole order, which this "
+                         "pipeline's volatile source can read differently on each; persist its bytes first "
+                         "(`Pipeline.cache`), or read it without `.elastic()`")
     _one_shape(host, partition)
     opened: Iterator[Batch]
     if build.global_order:
@@ -1007,9 +1186,12 @@ def _training_reader(
             endless=build.lowering.endless,
         )
     else:
+        if build.elastic:
+            _refuse_inelastic(pipeline, build)
         own_plan = dataclasses.replace(
             plan,
-            topology={
+            # An elastic read's order is one reader's at any count, its position every reader's.
+            topology={"elastic": True} if build.elastic else {
                 "shares": partition.count,
                 "share": partition.index,
                 "workers": _workers(pipeline, build.loading),
@@ -1028,9 +1210,27 @@ def _training_reader(
             resume,
             stop_seconds=build.loading.stop_seconds,
             endless=build.lowering.endless,
+            replicated=build.elastic,
         )
         statistics.observe(opened)
     return _Host(opened, host) if host else opened
+
+
+def _refuse_inelastic(pipeline: Pipeline, build: _Build) -> None:
+    """Refuse an elastic read (`Pipeline.elastic`) streamed in loading workers, which read a stream's
+    shards each its own, so its order and position would hold only at their count; or whose batch
+    is a token budget's, which takes no fixed share of rows. Indexed, its workers read its inputs
+    in their order (`dew.data.lowering._InputOrder`)."""
+    written = any(isinstance(stage, Workers) for stage in _steps(pipeline))
+    if (_workers(pipeline, build.loading) or written) and build.read == "streamed":
+        raise ValueError(
+            f"{pipeline.name or 'this chain'} is read elastically and streamed, and loading workers read a "
+            "stream's shards each their own, so its order would change with their count: read it by "
+            "index (`.read(\"indexed\")`), or with Loading(workers=0) (elastic streams in workers are "
+            "ledger row 1896)")
+    if any(isinstance(stage, TokenBudget) for stage in pipeline.stages):
+        raise ValueError("an elastic read keeps a share of each batch's rows, and a token budget's batch "
+                         "holds no fixed count of them; batch it by rows")
 
 
 def _validation_reader(
@@ -1080,24 +1280,37 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     laid = max(layouts, default=0)
     at = laid + _until(pipeline.stages[laid:], boundary)
     suffix = pipeline.stages[at:]
+    # Rows the chain lays out hold the length it gives them, which the objective's geometry gives way to:
+    # a pack's or windows', or a source's that reads them laid out (a planned pack, a store's windows).
+    laid_out = layouts or _laid_out(pipeline) is not None
+    geometry = () if laid_out or objective.geometry is None else (objective.geometry,)
     pipeline = _objective_records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]),
-                                  objective.train if train else objective.evaluate)
+                                  (*(objective.train if train else objective.evaluate), *geometry))
     return dataclasses.replace(pipeline, stages=(*pipeline.stages, *suffix))
 
 
 def _objective_records(
     pipeline: Pipeline, steps: Sequence[RecordStep | pygrain.RandomMapTransform | Expansion | Configured]
 ) -> Pipeline:
-    """Append objective record steps at the caller's preparation boundary."""
-    return pipeline._then(*(step if isinstance(step, Configured) else record_stage(step) for step in steps))
+    """Append objective record steps at the caller's preparation boundary, each step that makes several
+    rows of a source example marked as one (`FlatMap.examples`)."""
+    def staged(step) -> Stage:
+        if isinstance(step, Configured):
+            # One stated to expand records binds to an expansion that carries the mark (`_bind`).
+            return dataclasses.replace(step, examples=True) if step.expands else step
+        stage = record_stage(step)
+        return dataclasses.replace(stage, examples=True) if isinstance(stage, FlatMap) else stage
+    return pipeline._then(*(staged(step) for step in steps))
 
 
 def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
-    """Prepare each corpus, then attach objective randomness after the user's record order."""
+    """Prepare each corpus, then attach objective randomness, and the steps from the first that makes
+    several rows of a record on, after the user's record order: the user's order (its shuffle and
+    mixture) is of source examples, and a run's `examples=` bound counts them there (`_bounded`)."""
     steps = objective.train if train else objective.evaluate
     random = next((index for index, step in enumerate(steps)
-                   if isinstance(step, pygrain.RandomMapTransform)
-                   or (isinstance(step, Configured) and step.random)), len(steps))
+                   if isinstance(step, (pygrain.RandomMapTransform, Expansion))
+                   or (isinstance(step, Configured) and (step.random or step.expands))), len(steps))
     prefix = dataclasses.replace(objective, train=objective.train[:random],
                                  evaluate=objective.evaluate[:random])
     branch = objective_steps(pipeline, prefix, train=train, read=read)
@@ -1106,6 +1319,15 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     branch = dataclasses.replace(branch, stages=branch.stages[:at])
     branch = _objective_records(branch, steps[random:])
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
+    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in branch.stages):
+        # A held chain measured before its run's batch is known takes the objective's batch steps where
+        # it is batched (`_batch_steps_after`, `held`).
+        return branch
+    return _batch_steps_after(branch, objective, train=train)
+
+
+def _batch_steps_after(branch: Pipeline, objective: ObjectiveData, *, train: bool) -> Pipeline:
+    """`branch` with the objective's batch steps after its batch."""
     steps = objective.train_batch if train else objective.evaluate_batch
     # A string or object field stays in the batch for the host code and metrics that read it; the
     # prefetcher places the rest (`dew.distributed.batches.split_fields`).
@@ -1185,8 +1407,134 @@ def iterate(
     return _as_iter(rows, loading)
 
 
+type Handed = pygrain.MapDataset | pygrain.IterDataset | Mapping[str, np.ndarray]
+"""Data handed to `fit` as it is, which a run steps on as given (`native`): a Grain dataset's
+elements, or arrays whole."""
+
+
+class _Whole:
+    """The same batch every step, the arrays a run was handed whole; its position the steps read. It
+    never runs out (`Identified.endless`), and names what it reads as a stream Dew names no further does:
+    by its type (`stream_identity`)."""
+
+    endless = True
+
+    def __init__(self, batch: Batch):
+        self.batch, self.read = batch, 0
+
+    def identity(self) -> str:
+        return type(self).__name__
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        self.read += 1
+        return self.batch
+
+    def get_state(self) -> bytes:
+        return str(self.read).encode()
+
+    def set_state(self, state: bytes) -> None:
+        self.read = int(state)
+
+
+def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
+    """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`); `held`, a validation
+    share, filled out to every share's rows, a whole number of its row shards, its repeats marked
+    (`DataPartition.held`, `FilledBatch`), so every share reads a batch its devices split where any
+    does and every real row scores once."""
+    rows = rows_of(batch)
+    if not held:
+        return batch if partition.count == 1 else take_batch(batch, np.arange(rows)[partition.cut()])
+    mine, real = partition.held(rows) if partition.count > 1 else (slice(None), True)
+    shards = partition.count * partition.row_multiple
+    filled = -(-rows // shards) * partition.row_multiple
+    return FilledBatch(filled, real=real).map(take_batch(batch, np.arange(rows)[mine]))
+
+
+class _Shared(Forwarding):
+    """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
+    the stream's; `endless` where it reads a map dataset repeated without end (`native`), which says
+    so of nothing it reads."""
+
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool,
+                 endless: bool = False):
+        self._source, self.partition, self.held, self._endless = batches, partition, held, endless
+
+    @property
+    def endless(self) -> bool:
+        return self._endless or super().endless
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        return _share(next(self._source), self.partition, held=self.held)
+
+    def get_state(self):
+        return self._source.get_state()
+
+    def set_state(self, state) -> None:
+        self._source.set_state(state)
+
+
+def native(handed: Handed, *, training: bool) -> Reader:
+    """A reader of the data handed to `fit` as it is, each element a batch the run steps on, never
+    batched again: a Grain dataset's elements (batched by Grain, `MapDataset.batch`), a map dataset's
+    read endlessly where it trains, or a mapping of arrays read whole, every step the same batch (a
+    full-batch run; a run of minibatches states them, `Memory(arrays).batch(size)`)."""
+    if isinstance(handed, Mapping):
+        batch = {name: np.asarray(column) for name, column in handed.items()}
+        if training:
+            return lambda partition: _Shared(_Whole(batch), partition, held=False)
+        return lambda partition: iter([_share(batch, partition, held=True)])
+    repeated = training and isinstance(handed, pygrain.MapDataset)
+    stream: pygrain.IterDataset = (
+        (handed.repeat() if training else handed).to_iter_dataset() if isinstance(handed, pygrain.MapDataset)
+        else handed)
+    return lambda partition: _Shared(iter(stream), partition, held=not training, endless=repeated)
+
+
+def native_loader(handed: Handed) -> Loader:
+    """The data handed to `fit` as it is (`native`) as the loader the run reads, its global batch
+    its first element's rows."""
+    if isinstance(handed, pygrain.IterDataset):
+        probe = iter(handed)
+        try:
+            first = next(probe)
+        finally:
+            if isinstance(probe, Closeable):
+                probe.close()
+    else:
+        first = handed[0] if isinstance(handed, pygrain.MapDataset) else {
+            name: np.asarray(column) for name, column in handed.items()}
+    if first is None:
+        raise ValueError("a Grain dataset handed to fit gives its batches, and its first is missing (None)")
+    batch = rows_of(first)
+    records = (len(handed) * batch if isinstance(handed, pygrain.MapDataset)
+               else batch if isinstance(handed, Mapping) else None)
+    return Loader(train=native(handed, training=True), val=None, records=records, batch=batch)
+
+
+def run_widths(measured: Sequence[_Measured], objective: ObjectiveData) -> Mapping[str, object]:
+    """A run's static widths: the facts its objective's run-scoped steps read (`Configured.scope`,
+    such as a decision's `slots`), measured over its training chain and every held one, each prepared
+    in its own role with the objective's steps in their places and its source's own steps run where a
+    memory read runs them (`_measure`), and merged as a run reads them together (`merge_facts`: slots
+    as their maxima). Training and every validation split bind them alike (`fitted`), so every split
+    reads in training's shapes, one program for them all, where a split once took its own. None are
+    measured where the objective's steps read none."""
+    needs = {need for step in (*objective.train, *objective.evaluate)
+             if isinstance(step, Configured) and step.scope == "run" for need in step.needs}
+    if not needs:
+        return {}
+    merged = merge_facts([each.metadata for each in measured if each.metadata is not None])
+    return {name: merged[name] for name in sorted(needs) if name in merged}
+
+
 def fitted[Entry](
-    dataset: Dataset | Loader,
+    dataset: Dataset | Loader | Handed,
     validation: Dataset | Mapping[str, Dataset | Entry] | None,
     *,
     objective: ObjectiveData,
@@ -1195,24 +1543,51 @@ def fitted[Entry](
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
-    their stores provisioned. A training dataset without a repeat repeats
-    before its batch, so a run's length is its steps, epochs or tokens, or
-    with `examples` reads that many records before they are packed and ends
-    (`compile`'s `examples`); a validation dataset without a batch takes the
+    their stores provisioned, or training data handed as it is read as
+    handed (`native`; `dew.training._fit.handed_splits` reads validation so).
+    A training dataset without a repeat repeats before its batch, so a run's
+    length is its steps, epochs or tokens, or with `examples` reads that many
+    records before they are packed and ends (`compile`'s `examples`); a
+    validation dataset without a batch takes the
     training batch, and is read and loaded as it asks. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
     is passed on as it is."""
+    if not isinstance(dataset, (Dataset, Loader)):
+        if examples is not None:
+            raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
+                             "is has none: read it as a chain (dew.data.Grain, dew.data.Memory), or set "
+                             "steps=")
+        dataset = native_loader(dataset)
+    named = {"val": validation} if isinstance(validation, Dataset) else validation
+    # Every chain the run reads binds the widths measured over them all (`run_widths`), each measured
+    # once, as its read prepares it, and read on from there.
+    # Each held chain is measured in the batches it is read in: its own, else training's (`held`), where
+    # training states its batch ahead; a token budget's rows are counted as it compiles.
+    trained = (next((stage.size for stage in dataset._chain().stages if isinstance(stage, BatchStage)), None)
+               if isinstance(dataset, Dataset) else dataset.batch)
+    held_chains = {name: _held_batched(entry._chain(), trained, unbatched=trained is None)
+                   for name, entry in (named or {}).items() if isinstance(entry, Dataset)}
+    scored = {name: _held_measure(chain, objective) for name, chain in held_chains.items()}
     if isinstance(dataset, Dataset):
         chain = dataset._chain()
-        loader = compile(chain if examples is not None else _endless(chain), objective=objective,
-                         provision=True, seed=seed, examples=examples)
+        trained = chain if examples is not None else _endless(chain)
+        read = trained.mode or _preferred_read((trained,), provision=True)
+        # A run of phases compiles each phase on its own (`_compile_phases`), so its measure is its own.
+        measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
+                    _training_measure(trained, None, objective=objective, read=read, provision=True,
+                                      loading=trained._loading or _DEFAULT_LOADING, examples=examples))
+        widths = (run_widths([*([measured] if measured else []), *scored.values()], objective)
+                  if scored else {})
+        loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
+                         widths=widths, read=read, measured=measured)
     else:
+        widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset
-    named = {"val": validation} if isinstance(validation, Dataset) else validation
     if named is None:
         return loader, None
-    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed)
-                    if isinstance(entry, Dataset) else entry for name, entry in named.items()}
+    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths,
+                               measured=scored[name]) if isinstance(entry, Dataset) else entry
+                    for name, entry in named.items()}
 
 
 def _endless(chain: Pipeline) -> Pipeline:
@@ -1245,23 +1620,55 @@ def _reads_on(chain: Pipeline) -> bool:
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
-         seed: int = 0) -> Reader:
+         seed: int = 0, widths: Mapping[str, object] | None = None, measured: _Measured | None = None
+         ) -> Reader:
     """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
     read and loaded as it asks, its random steps drawing from `seed`; one that states neither batch is
     refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
-    filled out with copies its `VALID_ROWS` marks, where a training read would drop them."""
-    chain = dataset._chain()
+    filled out with copies its `VALID_ROWS` marks, where a training read would drop them. `measured`
+    is the chain as its run's widths measured it (`_held_measure`), which it reads as it stands."""
+    chain = _held_batched(dataset._chain(), batch)
+    if measured is None:
+        measured = _held_measure(chain, objective)
+    elif not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in measured.branches[0].stages):
+        # Measured before its run's batch was known (`fitted`): batched now, the objective's batch steps
+        # after its batch.
+        def batched(branch: Pipeline) -> Pipeline:
+            branch = _held_batched(branch, batch)
+            return branch if objective is None else _batch_steps_after(branch, objective, train=False)
+
+        measured = dataclasses.replace(measured, branches=tuple(map(batched, measured.branches)))
+    # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
+    return validation(measured.branches[0], batch=1, objective=objective, read=_held_read(chain),
+                      loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths,
+                      measured=measured)
+
+
+def _held_batched(chain: Pipeline, batch: int | None, *, unbatched: bool = False) -> Pipeline:
+    """A held `chain` in its own batches, else in batches of `batch`, each keeping a short last one; one
+    that states neither is refused, or left as it is where it may be (`unbatched`, a batch not yet
+    known). It is batched before it is measured (`_held_measure`), so an objective's batch steps follow
+    its batch as they do in training."""
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
+        if batch is None and unbatched:
+            return chain
         if batch is None:
             raise ValueError(f"{_name(chain)} states no batch; batch it (`.batch(n)`) or give batch=")
         chain = chain.batch(batch, drop_remainder=False)
-    batched = (BatchStage, TokenBudget)
-    chain = dataclasses.replace(chain, stages=tuple(
-        dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, batched) else stage
-        for stage in chain.stages))
-    # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
-    return validation(chain, batch=1, objective=objective, read=chain.mode,
-                      loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)
+    return dataclasses.replace(chain, stages=tuple(
+        dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, (BatchStage, TokenBudget))
+        else stage for stage in chain.stages))
+
+
+def _held_read(chain: Pipeline) -> Read:
+    """The read a held chain asks, else the one its sources choose (`_preferred_read`)."""
+    return chain.mode or _preferred_read((chain,), provision=True)
+
+
+def _held_measure(chain: Pipeline, objective: ObjectiveData | None) -> _Measured:
+    """A held chain prepared through its source's own steps as its pass reads them (`_measure`), its
+    counts filled where a memory read runs them."""
+    return _measure((chain,), _held_read(chain), provision=True, objective=objective, counts=({},))
 
 
 @compiling
@@ -1275,13 +1682,21 @@ def validation(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
     seed: int = 0,
+    widths: Mapping[str, object] | None = None,
+    measured: _Measured | None = None,
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
-    stream. With no `read`, the sources choose it (`_preferred_read`)."""
+    stream. With no `read`, the sources choose it (`_preferred_read`); `widths` are the run's static
+    widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched."""
     read = read or _preferred_read((pipeline,), provision=provision)
-    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
-        pipeline = pipeline.batch(batch, drop_remainder=False)
-    prepared = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
+
+    # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).
+    pipeline = _held_batched(pipeline, batch)
+    if measured is not None:
+        measured = dataclasses.replace(measured, branches=tuple(
+            _held_batched(branch, batch) for branch in measured.branches))
+    prepared = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},),
+                         widths=widths, measured=measured)
     (pipeline,) = _made(prepared, read, ({},), training=False)
     packed = _coordinated(pipeline)
     # A token budget is fixed-length rows by now (`_budgeted`).

@@ -7,8 +7,10 @@ from collections.abc import Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from reference_error import as_given, assert_as_exact, seeds_for, widened
 
+from dew.batch import Variables
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import ModelInputs
@@ -36,33 +38,64 @@ def served_inputs(row: np.ndarray, request: Served, vocab: int) -> ModelInputs:
                        {name: jnp.asarray([held], jnp.int32) for name, held in request.groups.items()})
 
 
+def drawn_scores(forward, weights: Variables, prompt: np.ndarray, tokens: np.ndarray,
+                 held: dict[str, np.ndarray], *, per_step: bool) -> np.ndarray:
+    """Each drawn token's log probability under `forward` (`[B, S, V]` log probabilities over `weights`,
+    tokens and their `held` fields) after `prompt` `[1, P]` and the tokens drawn before it: with
+    `per_step`, from a forward of its own over the prompt and those tokens, at the width the step that
+    drew it reads (ledger 1543: a step's reference at the shapes the step computes); else from one
+    forward over the whole row, as a float64 truth, whose products round alike at every shape."""
+    def at(step: int) -> jax.Array:
+        tail = np.full((1, step), -1, np.int32)
+        logits = forward(weights, jnp.asarray(np.concatenate([prompt, tokens[None, :step]], 1)),
+                         {name: jnp.asarray(np.concatenate([value, tail], 1))
+                          for name, value in held.items()})
+        return logits[0, prompt.shape[1] - 1:]
+
+    steps = len(tokens)
+    read = jnp.stack([at(step)[step] for step in range(steps)]) if per_step else at(steps - 1)
+    return np.asarray(jnp.take_along_axis(read, jnp.asarray(tokens)[:, None], -1)[:, 0])
+
+
 def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], label: str, *, serving: dict,
                            hits: Sequence[int] | None = None, rounds: Sequence[int] | None = None,
-                           budget: int = SERVED_BUDGET) -> None:
+                           budget: int = SERVED_BUDGET, alone: bool = True,
+                           truth: tuple[nn.Module, Variables] | None = None,
+                           seeds: tuple[int, int] | None = None) -> None:
     """Check 1 of a server's draws: greedy requests through a server over `task` with `serving`, queued in
     `rounds` (how many go in together before the server runs them; all at once where None, one a round
     where `hits` is given), with `hits` the shared prefix tokens after each round (`prefix_hits`), draw
     what the lone task draws, and score each drawn token's raw log probability on par with a full forward
     of the decoder over the prompt, its groups (the prefix run's where it carries none) and the tokens
-    drawn before it, from the float64 twin's. `task` draws greedily and stops at its `budget` alone."""
+    drawn before it, from the float64 twin's. `task` draws greedily and stops at its `budget` alone.
+
+    Without `alone`, the tokens scored are the server's own draws, each draw one run of it, and the lone
+    task's own draws are held to the same full forward after it, so served and alone are each on par with
+    it: a model whose products round at boundaries (a quantized memory's moving weights, ledger 2032)
+    draws, from one program of its arithmetic and another, tokens that need not agree, a lone task
+    batched with itself among them. `truth` is the decoder and float variables whose float64 twin is the
+    truth where the task's own do not widen to one (a served quantization's stored codes); the task's by
+    default. `seeds` are the served site's and the lone one's declared seeds, sized paired by `seeds_for`
+    on armada; None sizes them here, each run."""
     if rounds is None:
         rounds = (len(requests),) if hits is None else (1,) * len(requests)
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    held_model, held_variables = (decoder, variables) if truth is None else truth
+    wide = held_model.clone(dtype=jnp.float64, attention_impl="reference")
     width = max(request.length for request in requests)
-
-    def draw(seed):
-        row = np.random.default_rng([0x1536, seed]).integers(1, vocab, width).astype(np.int32)
-        drawn = tuple(np.asarray(task(served_inputs(row, request, vocab), budget, key=index).host()
-                                 .tokens)[0, -budget:] for index, request in enumerate(requests))
-        return row, drawn
 
     # One server for every draw, as a deployment serves request after request: its programs compile
     # once, and a draw's prompts share no page with another's, their tokens drawn apart.
     server = Server.from_task(task, **serving)
+    services: dict[bytes, list] = {}
 
-    @as_given
-    def served(row, drawn):
+    def serve(row) -> list:
+        """The server's generations of `row`'s requests, queued in `rounds`, its prefix hits checked: each row
+        served once, as a deployment serves a prompt, and asked again (the gate's check that a draw and an
+        arm are functions of their inputs) the generations of that one service, as a second would read the
+        pages and states the first left, which no other draw's prompt shares."""
+        if (key := np.asarray(row).tobytes()) in services:
+            return services[key]
         tickets, shared, before = [], [], server.prefix_hits
         for end in itertools.accumulate(rounds):
             tickets.extend(server.submit(served_inputs(row, requests[index], vocab), budget, key=index)
@@ -70,32 +103,52 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
             server.run()
             shared.append(server.prefix_hits - before)
         assert hits is None or shared == list(hits), shared
-        generations = [ticket.result().host() for ticket in tickets]
+        services[key] = [ticket.result().host() for ticket in tickets]
+        return services[key]
+
+    def likelihoods(generations) -> tuple:
+        return tuple(np.asarray(generation.raw_log_probs[0], np.float32) for generation in generations)
+
+    def draw(seed):
+        row = np.random.default_rng([0x1536, seed]).integers(1, vocab, width).astype(np.int32)
+        if not alone:
+            # The server's draws and their likelihoods as it scored them, from one run of it.
+            generations = serve(row)
+            drawn = tuple(np.asarray(generation.tokens)[0, -budget:] for generation in generations)
+            return row, drawn, likelihoods(generations)
+        drawn = tuple(np.asarray(task(served_inputs(row, request, vocab), budget, key=index).host()
+                                 .tokens)[0, -budget:] for index, request in enumerate(requests))
+        return row, drawn
+
+    @as_given
+    def served(row, drawn, scored=None):
+        if scored is not None:
+            return scored
+        generations = serve(row)
         for generation, tokens in zip(generations, drawn, strict=True):
             np.testing.assert_array_equal(generation.tokens[0, -budget:], tokens)
-        return tuple(np.asarray(generation.raw_log_probs[0], np.float32) for generation in generations)
+        return likelihoods(generations)
 
     def explicit(model, wide_weights: bool = False):
         """The full forward's scores of each request's draws, a host loop over the requests whose
-        forward compiles as Dew's users compile it, as the server's programs do."""
+        forward compiles as Dew's users compile it, as the server's programs do. The reference arm
+        (`wide_weights` False) scores each drawn token from a forward of its own over the prompt and the
+        tokens drawn before it, at the width the server's step reads (ledger 1543, the gate's ruling: a
+        step's reference at the shapes the step computes); the float64 truth, whose products round
+        alike at every shape, scores them all from one forward over the whole row."""
         forward = jax.jit(lambda weights, tokens, groups: jax.nn.log_softmax(
             model.apply(weights, tokens, **groups)))
 
         @as_given
-        def scored(row, drawn):
-            weights = widened(variables) if wide_weights else variables
+        def scored(row, drawn, _served=None):
+            weights = widened(held_variables) if wide_weights else variables
             scores = []
             for request, tokens in zip(requests, drawn, strict=True):
                 inputs = served_inputs(np.asarray(row), request, vocab)
                 prompt, tokens = np.asarray(inputs.tokens), np.asarray(tokens)
                 carried = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
                 held = with_served_blocks(carried, np.ones(prompt.shape, bool), task.prefix)
-                tail = np.full((1, budget - 1), -1, np.int32)
-                logits = forward(weights, jnp.asarray(np.concatenate([prompt, tokens[None, :-1]], 1)),
-                                 {name: jnp.asarray(np.concatenate([value, tail], 1))
-                                  for name, value in held.items()})
-                read = logits[0, prompt.shape[1] - 1:]
-                scores.append(np.asarray(jnp.take_along_axis(read, jnp.asarray(tokens)[:, None], -1)[:, 0]))
+                scores.append(drawn_scores(forward, weights, prompt, tokens, held, per_step=not wide_weights))
             return tuple(scores)
         return scored
 
@@ -103,5 +156,21 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     # their errors moving together across draws, which a hybrid stack's recurrence spreads too widely for
     # the reference compared with itself to resolve (`seeds_for`).
     reference, truth = explicit(decoder), explicit(wide, wide_weights=True)
-    seeds = seeds_for(reference, draw, label, truth_fn=truth, dew_fn=served)
-    assert_as_exact(served, reference, draw, label, seeds=seeds, truth_fn=truth)
+    count = seeds_for(reference, draw, label, truth_fn=truth, dew_fn=served) if seeds is None else seeds[0]
+    assert_as_exact(served, reference, draw, label, seeds=count, truth_fn=truth)
+    if alone:
+        return
+
+    def drawn_alone(seed):
+        """The lone task's draws of the seed's requests and their likelihoods as it scored them."""
+        row = np.random.default_rng([0x1536, seed]).integers(1, vocab, width).astype(np.int32)
+        generations = [task(served_inputs(row, request, vocab), budget, key=index).host()
+                       for index, request in enumerate(requests)]
+        return row, tuple(np.asarray(generation.tokens)[0, -budget:] for generation in generations), \
+            likelihoods(generations)
+
+    # The lone task held to the same full forward: served and alone each on par with it, so with each other.
+    lone = as_given(lambda row, drawn, scored: scored)
+    alone_seeds = (seeds_for(reference, drawn_alone, f"{label} alone", truth_fn=truth, dew_fn=lone)
+                   if seeds is None else seeds[1])
+    assert_as_exact(lone, reference, drawn_alone, f"{label} alone", seeds=alone_seeds, truth_fn=truth)

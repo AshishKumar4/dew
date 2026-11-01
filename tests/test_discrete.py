@@ -13,6 +13,7 @@ from reference_error import assert_as_exact
 from sampling_gate import assert_draws_as_declared
 from scipy import stats
 
+from dew.batch import token_coordinates
 from dew.data.dataset import Loader
 from dew.diffusion import EpsilonPredictionTransform, Process
 from dew.diffusion.discrete import MDLM, DiscreteProcess, LogLinear, Unmask
@@ -423,12 +424,15 @@ class FieldReader(nn.Module):
     def setup(self):
         self.scale = self.param("scale", nn.initializers.constant(30.0), ())
 
-    def __call__(self, tokens, **fields):
-        return self.logits(tokens, **fields)
+    def __call__(self, tokens, positions=None, coordinates=None, **fields):
+        # The call's flat positions laid out once, as a model's call converts them (`token_coordinates`).
+        laid = token_coordinates(tokens.shape, coordinates, positions=positions)
+        return self.logits(tokens, coordinates=laid, **fields)
 
-    def logits(self, tokens, *, train=False, positions=None, image_indices=None, conditioning=None,
+    def logits(self, tokens, *, train=False, coordinates=None, image_indices=None, conditioning=None,
                **fields):
-        text = (positions + (conditioning is not None)) % 14
+        # The rows' places, as their layout's coordinates give them (`ModelInputs.kwargs`).
+        text = (coordinates.positions + (conditioning is not None)) % 14
         target = text if image_indices is None else jnp.where(image_indices < 0, text, 14)
         return self.scale * jax.nn.one_hot(target, self.vocab_size)
 
@@ -453,6 +457,29 @@ def test_a_masked_response_continues_the_prompts_fields_and_keeps_its_media():
     unruled = ModelInputs(inputs.tokens, {"token_type_ids": jnp.zeros((2, 3), jnp.int32)})
     with pytest.raises(ValueError):
         DiscreteProcess(LogLinear(), mask_id=15).generate(model, variables, unruled, 3, key=0)
+
+
+def test_a_prompt_laid_out_by_its_coordinates_generates_as_its_fields_do(rng):
+    """A request's `Coordinates` continue into its masked response as every other
+    extension continues them (`ModelInputs.extended`): a left-padded prompt at
+    given positions generates, token for token, what the same prompt as a
+    validity and a positions field does, its response's positions read from and
+    written to its `Coordinates` (audit AT-04)."""
+    from dew.batch import COORDINATES_FIELD, coordinates
+    from dew.nn.inputs import ModelInputs
+
+    model = transformer(causal=False)
+    tokens = jnp.array([[0, 1, 3], [2, 4, 5]])
+    valid = jnp.array([[False, True, True], [True, True, True]])
+    positions = jnp.array([[0, 2, 3], [0, 1, 2]])
+    fields = ModelInputs(tokens, {"attention_mask": valid, "positions": positions})
+    laid = ModelInputs(tokens, {COORDINATES_FIELD: coordinates((2, 3), valid=valid, positions=positions)})
+    variables = model.init(rng, tokens)
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    expected = process.generate(model, variables, fields, 3, key=0, steps=4)
+    generated = process.generate(model, variables, laid, 3, key=0, steps=4)
+    np.testing.assert_array_equal(generated.tokens, expected.tokens)
+    np.testing.assert_array_equal(generated.lengths, expected.lengths)
 
 
 def test_a_packed_prompt_continues_its_last_document_as_if_alone():
@@ -557,7 +584,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     corpus at over 80% accuracy where a random byte would be right 1 in 257
     times, and rows unmasked from nothing match a corpus sentence at a rate
     above the 0.19 that rows of random corpus characters reach (measured,
-    tests/test_discrete.py at c0f4156). The loss reports the masked accuracy
+    tests/test_discrete.py at ac8809c). The loss reports the masked accuracy
     and the masked fraction beside the NELBO."""
     process = MDLM(mask_id=BYTE_MASK)()
     model = CausalTransformer(vocab_size=257, emb_features=64, num_layers=2, num_heads=4,

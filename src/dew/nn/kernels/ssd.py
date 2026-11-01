@@ -27,19 +27,14 @@ holds the kernel to `chunk_ssd` and its `jax.grad`.
 
 from __future__ import annotations
 
-import functools
-import logging
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
-from ..precision import float32_products, products_dtype
+from ..precision import exact_float32
 from . import generation
-
-_log = logging.getLogger(__name__)
 
 MIN_WIDTH = 8
 """The narrowest chunk, head width or state width the kernel is chosen for.
@@ -90,29 +85,14 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     return chunk_size >= MIN_CHUNK and _program_words(*widths) <= TPU_PROGRAM_WORDS
 
 
-@functools.cache
-def _announce(backend: str, chunk_size: int, head_dim: int, state_size: int,
-              platform: str | None) -> None:
-    """One line per geometry a process traces, from the trace that chose."""
-    geometry = f"chunk {chunk_size}, head width {head_dim}, state {state_size}"
-    if platform is None:
-        _log.info("mamba2 ssd scan on %s: the xla path (%s, %d fp32 words a program)",
-                  backend, geometry, _program_words(chunk_size, head_dim, state_size))
-    else:
-        _log.info("mamba2 ssd scan on %s: the pallas kernel (%s)", platform, geometry)
-
-
 def ssd_kernel_platform(chunk_size: int, head_dim: int, state_size: int, *,
                         dtype: DTypeLike) -> str | None:
     """Return the backend to build this `dtype` scan's kernel for, or None for the XLA path.
 
-    The choice is logged once per geometry.
-    """
+    The scan's route is the selector's to report (`recurrence_chunk.SCAN`, `generation`'s Route
+    collection), where the kernel report reads it (row 971)."""
     backend = generation.backend()
-    platform = backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend,
-                                          dtype=dtype) else None
-    _announce(backend, chunk_size, head_dim, state_size, platform)
-    return platform
+    return backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend, dtype=dtype) else None
 
 
 def _triangles(size: int):
@@ -152,10 +132,11 @@ def _last_row(matrix):
 
 
 def _mm(lhs, rhs):
-    """`lhs @ rhs` at the precision its operands' dtype states (`precision.float32_products`): the chunk's
-    fp32 operands multiplied in fp32, where a TPU's Pallas matmul at its default precision takes one bf16
-    pass (template numerics review 2026-10-26 follow-up, P1-1: every Mamba-2 layer's scan on a TPU)."""
-    return jnp.matmul(lhs, rhs, precision=float32_products(products_dtype(lhs, rhs)))
+    """`lhs @ rhs`, the chunk's fp32 operands multiplied in fp32 where nothing states a precision
+    (`precision.exact_float32`), where a TPU's Pallas matmul at JAX's default takes one bf16 pass, since a
+    chunk's products carry the recurrent state, whose rounding every later chunk reads compounded
+    (template numerics review 2026-10-26 follow-up, P1-1: every Mamba-2 layer's scan on a TPU)."""
+    return jnp.matmul(lhs, rhs, precision=exact_float32(None))
 
 
 def _chunk_forward(x, b, c, a, state):

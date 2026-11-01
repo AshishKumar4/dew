@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.progress import END
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.sessions import (
@@ -30,7 +31,8 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
     SESSION_WEIGHTS_KEY,
 )
-from dew.telemetry.instrumentation import collective, hlo_instructions
+from dew.telemetry.instrumentation import hlo_instructions
+from dew.telemetry.trace import collective
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "agentic.npz"
 CHAIN = 7
@@ -82,7 +84,8 @@ def _batch(reference, rollouts, proximal=True):
 class Fixed(GRPOObjective):
     """GRPO whose policy log-probabilities are its parameters."""
 
-    def packed_log_probs(self, params, batch):
+    def packed_log_probs(self, params, batch, *, progress=END):
+        del progress
         return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, params["current"], 0.0)
 
 

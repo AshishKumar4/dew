@@ -21,6 +21,7 @@ from dew.interop.decoder_parts import (
     ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.rope import YarnScaling
 
 
 def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -55,17 +56,18 @@ _PHI_NAMES: Renames = (
 
 
 def _phi_export(model: CausalTransformer) -> Mapping[str, object]:
+    yarn = model.rope_scaling if isinstance(model.rope_scaling, YarnScaling) else None
     return {
         'hidden_act': hf_ungated(model.mlp, 'Phi'),
         'layer_norm_eps': model.norm_eps, 'qk_layernorm': False,
         'resid_pdrop': model.dropout_rate, 'embd_pdrop': model.embedding_dropout_rate,
         'attention_dropout': model.attention_dropout_rate,
         # One record holds the rotated fraction beside the ramp, as PhiConfig reads it.
-        'rope_parameters': {**({'rope_type': 'default'} if model.yarn is None else {
-            key: value for key, value in dataclasses.asdict(model.yarn).items() if value is not None}),
+        'rope_parameters': {**({'rope_type': 'default'} if yarn is None else {
+            key: value for key, value in dataclasses.asdict(yarn).items() if value is not None}),
                             'rope_theta': model.rope_theta,
                             'partial_rotary_factor': model.partial_rotary_factor or 1.},
-        **({} if model.yarn is None else {'rope_scaling': None}),
+        **({} if yarn is None else {'rope_scaling': None}),
         'attention_bias': None, 'rms_norm_eps': None, 'head_dim': None,
     }
 

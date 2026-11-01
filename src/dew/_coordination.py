@@ -11,6 +11,8 @@ coordinate through these, so they live apart from any one of them.
 from __future__ import annotations
 
 import atexit
+import contextlib
+import contextvars
 import hashlib
 import itertools
 import json
@@ -26,6 +28,8 @@ import jax
 import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec
+
+from dew._records import JSON
 
 if TYPE_CHECKING:
     from jax._src.distributed import State
@@ -166,6 +170,51 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
     return materialized if held else None
 
 
+_READS_HOME: contextvars.ContextVar[str | None] = contextvars.ContextVar("reads_home", default=None)
+"""The phase of the scope `read_home` reads a pool's arrays home in (`reading_home`), None outside one."""
+
+_WRITES_WEIGHTS: contextvars.ContextVar[bool] = contextvars.ContextVar("writes_weights", default=True)
+"""Whether a weights writer in this scope writes what it reads (`reading_home`, `writes_weights`)."""
+
+
+@contextlib.contextmanager
+def reading_home(phase: str, *, writes: bool = True) -> Iterator[None]:
+    """A scope in which `read_home` reads an array spanning the pool's processes home by a collective
+    (`collective_host`), every process of the pool reading the same arrays in the same order: each
+    process running the same writer over the same tree (`dew.interop.saved_sources.export_run`), a
+    writer that reads one tensor at a time then holds one on every host, not the whole tree. Without
+    `writes`, a weights writer reads every tensor as it would and writes none of them
+    (`writes_weights`), as a pool's processes beside the one that publishes do.
+
+    A process that fails inside the scope publishes its failure (`publish_failure`), which ends the
+    pool within `FAILURE_GRACE_SECONDS`: the others may be waiting on it in a read it will not join."""
+    token, writing = _READS_HOME.set(phase), _WRITES_WEIGHTS.set(writes)
+    try:
+        yield
+    except BaseException as failure:
+        if jax.process_count() > 1:
+            publish_failure(failure, f"phase {phase}")
+        raise
+    finally:
+        _READS_HOME.reset(token)
+        _WRITES_WEIGHTS.reset(writing)
+
+
+def writes_weights() -> bool:
+    """Whether a weights writer writes the tensors it reads here (`reading_home`), as it does outside one."""
+    return _WRITES_WEIGHTS.get()
+
+
+def read_home(value) -> np.ndarray:
+    """`value` on this host: an array spanning other processes' devices read home by the pool together
+    inside `reading_home`, and any other as it is (`np.asarray`), which refuses such an array outside
+    one rather than wait on processes that are not reading it."""
+    phase = _READS_HOME.get()
+    if phase is not None and isinstance(value, jax.Array) and not value.is_fully_addressable:
+        return np.asarray(collective_host(value, phase=phase))
+    return np.asarray(value)
+
+
 def from_every_process(value) -> list:
     """Every rank's JSON-encodable `value`, in rank order, in one round of the
     coordination service (`_round`). For the small host values a pool
@@ -215,6 +264,34 @@ def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
         raise ValueError(f"{phase}: the stream ended on {ended} of {jax.process_count()} processes and the "
                          "others read on: each process's stream must hold as many items")
     return read
+
+
+def agreed_reads[T](phase: str, stream: Iterator[T],
+                    said: Callable[[T], JSON]) -> tuple[T | None, list[JSON]]:
+    """`stream`'s next item on this rank, or None where it has run out, with what `said` gives of each rank's
+    item (None for a rank whose stream has run out), in rank order, learned in one round: a pool's shares
+    that end apart, each reading on until every one has (a run on the examples clock). A rank that fails
+    stops every rank, as `agreed` does."""
+    held: tuple[T | None] | None = None
+    error: BaseException | None = None
+    try:
+        held = (next(stream, None),)
+    except BaseException as failure:
+        error = failure
+    word = json.dumps(None if held is None or held[0] is None else said(held[0]))
+    if jax.process_count() == 1:
+        if error is not None:
+            raise error
+        words = [word]
+    else:
+        try:
+            words = _agree(phase, error, word)
+        except BaseException as failure:
+            if error is None:
+                raise PeerFailure(str(failure)) from failure
+            raise
+    assert held is not None
+    return held[0], [json.loads(spoken) for spoken in words]
 
 
 def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:

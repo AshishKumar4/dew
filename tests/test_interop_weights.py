@@ -106,3 +106,65 @@ def test_a_numeric_token_joins_the_indexed_token_before_it(name, indexed, path):
 
 def test_no_tokens_fold_to_no_path():
     assert indexed_path(()) == ()
+
+
+def test_a_host_leafs_export_transposes_on_the_host():
+    """A host leaf's transposed export (an export gathered home, a NumPy bfloat16 kernel) transposes
+    where it is, moving nothing to a device and back, which would need it to fit there (ledger 1875);
+    a device leaf's transposes on its device, as before, the same values either way."""
+    import jax
+    import ml_dtypes
+    import numpy as np
+
+    from dew.interop.streaming import WeightLayout
+
+    layout = WeightLayout("proj.weight", (("params", "kernel"),), (3, 2), transpose=(1, 0))
+    kernel = np.arange(6, dtype=np.float32).reshape(2, 3).astype(ml_dtypes.bfloat16)
+    with jax.transfer_guard("disallow_explicit"):
+        exported = layout.export({"params": {"kernel": kernel}})
+    np.testing.assert_array_equal(exported, kernel.T)
+    on_device = layout.export({"params": {"kernel": jax.device_put(kernel)}})
+    np.testing.assert_array_equal(on_device, kernel.T)
+
+
+PACKS = {
+    "a transposed qkv (GPT-2's c_attn)": ("gpt2", ".attn.c_attn.weight", (8, 24), {}),
+    "one part under its own name, transposed (GPT-2's mlp.c_proj)": (
+        "gpt2", ".mlp.c_proj.weight", (8, 6), {}),
+    "unequal widths (Phi-3's qkv)": ("phi3", ".self_attn.qkv_proj.weight", (24, 5),
+                                     {"num_heads": 4, "num_kv_heads": 2, "head_dim": 3}),
+    "runs a key head (MiMo-V2's grouped qkv)": ("mimo_v2", ".self_attn.qkv_proj.weight", (24, 5),
+                                                {"num_heads": 4, "num_kv_heads": 2, "head_dim": 3}),
+    "transposed experts (Qwen 3.5 MoE's gate_up_proj)": (
+        "qwen3_5_moe_text", ".experts.gate_up_proj", (2, 6, 4), {}),
+}
+"""Packed source tensors of each kind the export joins: one transposed after its parts are joined, a part
+alone under the pack's own name, transposed, one of unequal parts, one interleaved in runs, and stacked
+experts transposed on their last two axes; each by its family, a stored shape and the translated geometry
+its parts' widths and runs read."""
+
+
+@pytest.mark.parametrize("kind", PACKS)
+def test_a_packed_tensor_split_into_its_parts_and_joined_by_its_layout_is_the_stored_tensor(kind):
+    """A source tensor a family packs, split into its parts as a load reads them (`packed_readings`) and
+    joined again from them held in memory by the layout an export writes it by (`packed_layouts`), is the
+    stored tensor bit for bit: the one plan reads a pack and writes it back, whether its parts are a
+    decoder's leaves or tensors in memory (ledger 1027)."""
+    import numpy as np
+
+    from dew.interop.decoder_parts import packed_layouts, packed_readings, packing_of
+    from dew.interop.hf_decoders import family_entry
+    from dew.interop.streaming import WeightLayout
+
+    family, suffix, shape, config = PACKS[kind]
+    packed = family_entry(family).packed
+    name = f"model.layers.0{suffix}"
+    assert packing_of(packed, name) is not None, (family, suffix)
+    stored = np.random.default_rng(1027).normal(size=shape).astype(np.float32)
+    (reading,) = packed_readings({name: stored}, packed, config)
+    parts = {part.name: np.asarray(part.tensor) for part in reading.parts}
+    assert reading.packing is not None and len(parts) == len(reading.packing.parts)
+    held = {part: WeightLayout(part, ((part,),), value.shape) for part, value in parts.items()}
+    layouts = packed_layouts(held, packed, config)
+    assert list(layouts) == [name]
+    np.testing.assert_array_equal(layouts[name].export(parts), stored)

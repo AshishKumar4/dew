@@ -118,12 +118,9 @@ def bundle(directory: str, destination: str) -> None:
     """Pack every entry of `directory`, the saved models and the recorded
     arrays, into the xz tarball `destination` for the suite. The diffusers
     reference tools that bundle a whole directory share it."""
-    import tarfile
+    from fixture_archive import write
 
-    root = Path(directory)
-    with tarfile.open(destination, "w:xz") as archive:
-        for path in sorted(root.iterdir()):
-            archive.add(path, arcname=path.name)
+    write(destination, ((path, path.name) for path in sorted(Path(directory).iterdir())))
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 

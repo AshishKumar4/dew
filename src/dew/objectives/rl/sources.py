@@ -47,14 +47,11 @@ from uuid import uuid4
 import jax
 
 from dew.inference.engine import settled
-from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
+from dew.inference.rollouts import INFRASTRUCTURE, Draw, RolloutServer
 
 from .episodes import Environment, Episode, EpisodeId, EpisodeProgress, EpisodeStatus, session_of, step_action
 from .rollout import PromptTask, Reward, scored_draw
 from .sessions import Call, Session, Status, Task
-
-_INFRASTRUCTURE = (InfrastructureError, OSError)
-"""What a draw or a callback fails with when its external boundary, not its code, failed."""
 
 
 def _failure(error: BaseException) -> str:
@@ -72,7 +69,7 @@ def _draw_failure(drawn: Future[Draw]) -> str | None:
     failure = drawn.exception()
     if failure is None:
         return None
-    if isinstance(failure, _INFRASTRUCTURE):
+    if isinstance(failure, INFRASTRUCTURE):
         return f"draw: {_failure(failure)}"
     raise failure
 
@@ -200,14 +197,14 @@ class EnvironmentSource:
             with self.environment(task, identity) as environment:
                 try:
                     self._play(episode, environment, key, handle)
-                except _INFRASTRUCTURE:
+                except INFRASTRUCTURE:
                     raise
                 except BaseException:
                     broken = True
                     raise
             if episode.status not in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
                 episode.score(lambda finished: self.verifier(task, finished), version, binding)
-        except _INFRASTRUCTURE as error:
+        except INFRASTRUCTURE as error:
             if broken:
                 # The environment's exit failed while broken code was raising: the failure carries
                 # that error as its context and is raised, not retried.
@@ -271,13 +268,14 @@ class PromptSource:
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _rollout(self, task: Task, prompt: PromptTask, version: int, drawn: Future[Draw]) -> Session:
+        source = prompt.record.data_source
         failed = _draw_failure(drawn)
         if failed is not None:
-            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed)
+            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed, source)
         draw = drawn.result().checked(self.server.sampling)
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
-                           f"draw: served by version {draw.version}, submitted under {version}")
+                           f"draw: served by version {draw.version}, submitted under {version}", source)
         return scored_draw(task.id, 0, Call.of(draw), self.decode(draw.response(self.server.sampling)),
                            prompt.record, self.reward)
 

@@ -9,13 +9,21 @@ packs them once at its load (`packed_owned`); a generation over weights it
 borrows, a live objective's, packs them inside its compiled call (`pending`,
 `packed_in_call`). A server serves the weights its task holds, and a reload
 packs what those hold packed (`packed_layout`).
+
+A tree split for training (`dew.batch.freeze`) packs and splits as its whole
+tree does, its collections kept: a group whose members are all frozen packs
+into a frozen kernel and splits back into frozen members, so a frozen trunk
+serves in its export's layout and trains as it was stored. A group some of
+whose members train packs into a trained kernel, the one the export's layout
+holds, beside which the pack flags its frozen members (`PACKED_FROZEN`), and
+splits back into its members each in the collection it was in.
 """
 
 
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TypeGuard
 
 import jax
@@ -23,9 +31,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import SingleDeviceSharding
 
-from dew.batch import Variables
+from dew.batch import FROZEN, PACKED_FROZEN, Variables, merge, select, thaw, under
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.quantization import QUANTIZATION, Quantization, QuantizedClass
 
@@ -91,6 +100,14 @@ def projection_groups(model: nn.Module, variables: Variables) -> tuple[Projectio
     only where the packed projection is selected as each member is, so a
     quantized member is not served unquantized, nor the reverse."""
     return _projection_groups(model, unfreeze(dict(variables)))
+
+
+def declared_groups(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
+    """The groups `model` reads packed (`Serving`) for a tree of `variables`' structure, its leaves
+    concrete or abstract (`jax.ShapeDtypeStruct`): what a tree of its shape may hold packed, whatever
+    it holds now (`projection_groups` asks which its arrays serve). A model that names none, or is
+    adapted, declares none."""
+    return _declared(model, unfreeze(dict(variables))) if _declares(model) else ()
 
 
 def _declares(model: nn.Module) -> TypeGuard[Serving]:
@@ -255,8 +272,12 @@ def packed_owned(model: nn.Module, variables: Variables) -> Variables:
     """`variables`, a tree its caller owns and gives up (a source's or a saved run's placed
     weights), with its groups packed one at a time through the host (`_handed_over`): each packed
     kernel and bias placed where its members were (`_placed_alike`), the members' buffers freed
-    first, so the devices hold one copy of the weights throughout. A host tree packs on the host."""
-    return _joined(variables, pending(model, variables), _handed_over)
+    first, so the devices hold one copy of the weights throughout. A host tree packs on the host,
+    and a tree split for training packs as its whole tree does (`_frozen_packed`)."""
+    whole = thaw(variables)
+    groups = pending(model, whole)
+    frozen, flags = _frozen_packed(_frozen_leaves(variables), whole, groups)
+    return _held_apart(_joined(whole, groups, _handed_over), frozen, {**_flags(variables), **flags})
 
 
 def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
@@ -317,20 +338,118 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     from dew.quantization import split_columns
 
     spec = _quantization(model)
+    whole = thaw(variables)
 
     def splits(group: ProjectionGroup) -> bool:
-        stored = _node(variables, "params", group.path)[group.packed].values()
+        stored = _node(whole, "params", group.path)[group.packed].values()
         plain = all(isinstance(leaf, (jax.Array, np.ndarray)) for leaf in stored)
         return plain or spec is None or spec.weight_only or _selected_alike(spec, group)
 
-    groups = tuple(group for group in _held_packed(model, variables) if splits(group))
+    groups = tuple(group for group in _held_packed(model, whole) if splits(group))
     if not groups:
         return variables
-    split = _split(variables, groups, split_columns)
+    split = _held_apart(_split(whole, groups, split_columns), _frozen_split(variables, groups),
+                        _flags(variables, groups))
     return freeze(split) if isinstance(variables, FrozenDict) else split
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
     """`variables` with the groups `model` reads packed packed, as a new tree that leaves
     `variables` whole: what `packed_owned` holds of a tree it is given up."""
-    return pack_projections(variables, projection_groups(model, variables))
+    whole = thaw(variables)
+    groups = projection_groups(model, whole)
+    frozen, flags = _frozen_packed(_frozen_leaves(variables), whole, groups)
+    return _held_apart(pack_projections(whole, groups), frozen, {**_flags(variables), **flags})
+
+
+type _Path = tuple[str, ...]
+
+
+def _paths(variables: Variables, collection: str) -> frozenset[_Path]:
+    """The paths of the leaves of `variables`' `collection` (`flatten_dict`), as `dew.batch.select`
+    takes them."""
+    return frozenset((collection, *path) for path in flatten_dict(variables.get(collection, {})))
+
+
+def _flagged(variables: Variables) -> dict[_Path, np.ndarray]:
+    """The flags `variables` hold (`PACKED_FROZEN`) by their paths."""
+    return {(PACKED_FROZEN, *path): np.asarray(flags)
+            for path, flags in flatten_dict(variables.get(PACKED_FROZEN, {})).items()
+            if isinstance(flags, (np.ndarray, jax.Array))}
+
+
+def _frozen_leaves(variables: Variables) -> frozenset[_Path]:
+    """The leaves `variables` hold frozen (`dew.batch.freeze`), each at the path `thaw` moves it to,
+    `("params", ...)`."""
+    return frozenset(("params", *path[1:]) for path in _paths(variables, FROZEN))
+
+
+def _frozen_packed(frozen: frozenset[_Path], whole: Variables, groups: Sequence[ProjectionGroup]
+                   ) -> tuple[frozenset[_Path], dict[_Path, np.ndarray]]:
+    """The leaves of `whole` (`thaw`n) held frozen once `groups` pack, `frozen` before, and the flags of
+    the groups packed trained over frozen members (`PACKED_FROZEN`): a group whose members' leaves are
+    all frozen packs into frozen leaves, and one some of whose members train into trained ones, its
+    frozen members flagged."""
+    flags: dict[_Path, np.ndarray] = {}
+    if not frozen:
+        return frozen, flags
+    leaves = _paths(whole, "params")
+    for group in groups:
+        base = ("params", *group.path)
+        members = [under(*base, member) for member in group.members]
+        held = {path for path in frozen if any(member(path) for member in members)}
+        if not held:
+            continue
+        frozen -= held
+        within = {path for path in leaves if any(member(path) for member in members)}
+        if held == within:
+            frozen |= {(*base, group.packed, *path[len(base) + 1:]) for path in held}
+            continue
+        for rest in {path[len(base) + 1:] for path in within}:
+            flags[(PACKED_FROZEN, *group.path, group.packed, *rest)] = np.asarray(
+                [(*base, member, *rest) in held for member in group.members])
+    return frozen, flags
+
+
+def _frozen_split(variables: Variables, groups: Sequence[ProjectionGroup]) -> frozenset[_Path]:
+    """The leaves held frozen once `groups` of `variables` split (`_split`): a frozen packed leaf's
+    members are frozen, and a trained one's are those its flags name (`PACKED_FROZEN`), the rest
+    trained."""
+    frozen = _frozen_leaves(variables)
+    flagged = _flagged(variables)
+    for group in groups:
+        base = ("params", *group.path)
+        packed = (*base, group.packed)
+        held = {path for path in frozen if under(*packed)(path)}
+        frozen = (frozen - held) | {(*base, member, *path[len(packed):])
+                                    for path in held for member in group.members}
+        marks = (PACKED_FROZEN, *group.path, group.packed)
+        for path, flags in flagged.items():
+            if under(*marks)(path):
+                frozen |= {(*base, member, *path[len(marks):])
+                           for member, was in zip(group.members, flags, strict=True) if was}
+    return frozen
+
+
+def _flags(variables: Variables, groups: Sequence[ProjectionGroup] = ()) -> dict[_Path, np.ndarray]:
+    """The flags `variables` hold (`PACKED_FROZEN`) but those of `groups`, which split."""
+    marks = [under(PACKED_FROZEN, *group.path, group.packed) for group in groups]
+    return {path: flags for path, flags in _flagged(variables).items()
+            if not any(mark(path) for mark in marks)}
+
+
+def _held_apart(variables: Variables, frozen: frozenset[_Path],
+                flags: Mapping[_Path, np.ndarray] | None = None) -> Variables:
+    """`variables`, one `params` collection (`thaw`), with the leaves at `frozen` in `FROZEN` again and
+    `flags` beside (`PACKED_FROZEN`): the split `dew.batch.freeze` made, over a tree whose groups packed
+    or split since."""
+    if flags:
+        variables = merge(variables, unflatten_dict(flags))
+    if not frozen:
+        return variables
+    rest = {name: tree for name, tree in variables.items() if name != "params"}
+    params = {"params": variables["params"]}
+    held = {FROZEN: select(params, lambda path: path in frozen)["params"]}
+    if frozen >= _paths(variables, "params"):
+        return {**rest, **held}
+    return {**rest, "params": select(params, lambda path: path not in frozen)["params"], **held}

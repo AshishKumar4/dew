@@ -18,18 +18,23 @@ wrote, which decide the vocabulary.
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar, NamedTuple
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Annotated, ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import tyro
 
 from dew._records import integer, text
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.lm.objective import Samples
 from dew.optim import OptimConfig
-from dew.registry import DtypeName, ModelConfig, objectives, resolve_dtype
+from dew.registry import ModelConfig, objectives
 from dew.sampling.text import Sampling
+
+if TYPE_CHECKING:
+    from dew.objectives.rl.methods import RolloutSettings
 
 
 class Tokens(NamedTuple):
@@ -41,9 +46,110 @@ class Tokens(NamedTuple):
 
 
 @dataclasses.dataclass(frozen=True)
+class PromptRollout:
+    """GRPO's synchronous rollout over a run's prompts (`RolloutScheduler.sampled`): `groups`
+    completions of each prompt the policy draws under `sampling`, each at most `max_new_tokens`, each
+    scored by `reward` against its prompt's record, their advantages by `estimator` (`group` by
+    default), a completion that runs out of its budget trained as `truncation` says, and `admit` of a
+    batch's prompts' groups trained on (every one by default). A step short of its groups after dynamic
+    sampling (dapo's) draws the run's next prompt batches too, `generation_batches` in all at most
+    (`RolloutScheduler.generation_batches`).
+
+    `method` names a composition (`dew.objectives.rl.methods`: grpo, dapo, dr_grpo, gspo, cispo, gmpo,
+    reinforce_pp, rloo), which fixes the objective's settings it names, stated `--objective.*`
+    arguments refused, and the rollout's estimator, dynamic sampling and overlong punishment over
+    `max_new_tokens`, ramping over its last `overlong_cache` tokens (a quarter of it where None);
+    `estimator` is then the method's.
+
+    `reward` names it by its import path: a function of a completion's text and its prompt's record
+    (`dew.objectives.rl.Reward`), or a class whose instance at its defaults is one
+    (`dew.rl.sandbox:MathReward`). A reward outside Dew is imported before the run loads, as any
+    class a run names is (`dew.registry.imported`)."""
+
+    reward: str
+    groups: int = 4
+    max_new_tokens: int = 32
+    estimator: str | None = None
+    truncation: str = "score"
+    sampling: Sampling = dataclasses.field(default_factory=lambda: Sampling(temperature=1.0))
+    method: str | None = None
+    admit: int | None = None
+    overlong_cache: int | None = None
+    generation_batches: int = 1
+
+    def __post_init__(self) -> None:
+        from dew.objectives.rl.methods import method
+        from dew.objectives.rl.sessions import check_estimator, check_truncation
+
+        if ":" not in self.reward:
+            raise ValueError(f"reward names a reward by its import path, `module:name`, not {self.reward!r}")
+        if type(self.groups) is not int or self.groups < 2:
+            raise ValueError("groups is the completions drawn of each prompt, at least two for an advantage")
+        if type(self.max_new_tokens) is not int or self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens is a positive budget of completion tokens")
+        if self.method is not None:
+            method(self.method)
+            if self.estimator is not None:
+                raise ValueError(f"the method {self.method} fixes the estimator; leave "
+                                 "--rollout.estimator out")
+        if self.estimator is not None:
+            check_estimator(self.estimator)
+        check_truncation(self.truncation)
+        if self.admit is not None and (type(self.admit) is not int or self.admit < 1):
+            raise ValueError("admit is a positive number of each batch's prompts' groups, or None for all")
+        if type(self.generation_batches) is not int or self.generation_batches < 1:
+            raise ValueError("generation_batches is the most prompt batches a step draws, at least its own")
+        if self.overlong_cache is not None and (
+                self.method is None or not method(self.method).overlong
+                or type(self.overlong_cache) is not int
+                or not 0 < self.overlong_cache <= self.max_new_tokens):
+            raise ValueError("overlong_cache is the last tokens of the budget a method's overlong punishment "
+                             "ramps over (dapo's): positive, within max_new_tokens")
+
+    def objective_settings(self) -> Mapping[str, object]:
+        """The objective settings `method` fixes, which the run derives (`ObjectiveConfig.build`)."""
+        from dew.objectives.rl.methods import method
+
+        return {} if self.method is None else method(self.method).settings(self.max_new_tokens)
+
+    def scheduler_settings(self) -> RolloutSettings:
+        """The scheduler's settings: `method`'s (`Method.rollout`, its overlong window `overlong_cache`'s),
+        else the estimator's, `group` by default."""
+        from dew.objectives.rl.methods import RolloutSettings, method
+
+        if self.method is None:
+            return RolloutSettings(estimator=self.estimator or "group")
+        return method(self.method).rollout(self.max_new_tokens, self.overlong_cache)
+
+    def build(self, objective, decode):
+        """The scheduler drawing over `objective`'s policy, decoding completions with `decode`."""
+        from numbers import Real
+
+        from dew.data.prompts import PromptRecord
+        from dew.objectives.rl import RolloutScheduler
+        from dew.registry import imported
+
+        # An import path names a function or a class, which an instance of at its defaults is a reward.
+        named = imported(self.reward)
+        scorer = named() if isinstance(named, type) else named
+
+        def reward(text: str, record: PromptRecord) -> float:
+            score = scorer(text, record)
+            if not isinstance(score, Real):
+                raise ValueError(f"the reward {self.reward} scored {type(score).__name__}, not a number")
+            return float(score)
+        return RolloutScheduler.sampled(objective, reward,
+                                        decode=decode, groups=self.groups, max_new_tokens=self.max_new_tokens,
+                                        truncation=self.truncation, sampling=self.sampling, admit=self.admit,
+                                        generation_batches=self.generation_batches,
+                                        **self.scheduler_settings())
+
+
+@dataclasses.dataclass(frozen=True)
 class LMRunConfig(DecoderRunConfig):
     """A decoder's run (`DecoderRunConfig`) plus the settings specific to language models."""
 
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**DecoderRunConfig._FLAG_SELECTED, "rollout": "rollout"}
     RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "prompt", "max_new_tokens",
                                             "sampling")
 
@@ -55,8 +161,10 @@ class LMRunConfig(DecoderRunConfig):
     `processor`. A step whose optimizer clips by the attention logit maxima
     (`muonclip`) asks the objective for them (`Step.qk_stats`), whichever
     objective it is."""
-    model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
+    # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
+    model: ModelConfig = dataclasses.field(default_factory=lambda: ModelConfig("causal_transformer", {}))
+    # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
+    # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
             learning_rate=6e-4,
@@ -76,21 +184,23 @@ class LMRunConfig(DecoderRunConfig):
     layout. A run records a hub repo as `repo@commit`, with the commit it
     resolved to. The checkpoint sets the architecture, so of its fields
     --model.max-seq-len alone may be set."""
-    pretrained_param_dtype: DtypeName = "float32"
-    """The dtype `pretrained`'s parameters are stored and trained in."""
+    rollout: Annotated[PromptRollout, tyro.conf.subcommand("rollout")] | None = None
+    """The rollout a GRPO run trains on (`--rollout.reward`), over its chain's prompts
+    (`dew.data.presets.prompts`): GRPO needs one, and another objective takes none. The model's
+    context is a prompt and its completion."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.pretrained is None and self.pretrained_param_dtype != "float32":
-            raise ValueError("--pretrained-param-dtype stores a --pretrained checkpoint's parameters; "
-                             "this run loads none")
         if self.pretrained is None and self.loops:
             raise ValueError("--loop-* run a --pretrained checkpoint's block in passes; a fresh decoder "
                              "states its loop in --model")
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
+        if (self.rollout is None) == (self.objective.name == objectives.paths["grpo"]):
+            raise ValueError("a GRPO run trains on the completions its rollout draws (--rollout.reward), "
+                             "and another objective on its data alone, with no rollout")
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective this run names over its token files.
 
         The files decide the vocabulary; training and sampling decide the
@@ -115,19 +225,24 @@ class LMRunConfig(DecoderRunConfig):
                              f"written with {written}")
         kind = objectives.label(self.objective.name)
         samples = None if kind == "block_diffusion" else self.samples()
-        context = (tokens.seq_len + 1 if samples is None else
-                   max(tokens.seq_len, len(samples.prompt) + samples.max_new_tokens))
+        # The model reaches as far as its longest generation: a preview's, and a rollout's whole budget past
+        # a full-width prompt, one token past the windows it learns on.
+        generated = max(0 if samples is None else len(samples.prompt) + samples.max_new_tokens,
+                        0 if self.rollout is None else tokens.seq_len + 1)
+        context = tokens.seq_len + 1 if samples is None else max(tokens.seq_len, generated)
         run, source = self, None
         if self.pretrained is None:
+            self.built_fresh()
             # A fresh masked-diffusion model may corrupt to the id past the
             # tokenizer's, as MDLM does, so the table covers its mask id too.
             mask = self.model.arguments.get("mask_token_id")
             table = max(vocab_size, mask + 1) if isinstance(mask, int) else vocab_size
             fields = {**self.model.fields, "max_seq_len": context, "vocab_size": table}
-            model = self.model.build(max_seq_len=context, vocab_size=table)
+            model = self.model.build(max_seq_len=context, vocab_size=table, **self.numerics_fields())
         else:
-            source, run = self.pretrained_source(written, vocab_size, context)
+            source = self.pretrained_source(written, vocab_size, context)
             source = self.looped(source)
+            # Its fields name the mask id a masked objective reads, which a loop leaves as loaded.
             model, fields = source.model, dict(source.model_config)
         if source is None:
             run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
@@ -146,15 +261,18 @@ class LMRunConfig(DecoderRunConfig):
         elif kind == "block_diffusion":
             objective = self.block_objective(model, variables, source)
         else:
+            # A rollout's method fixes the objective settings it names (`PromptRollout.method`).
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
-                samples=samples, processor=self.processor())
+                samples=samples, processor=self.processor(),
+                **({} if self.rollout is None else self.rollout.objective_settings()))
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
         loaded, held = self.compiled(objective.data(), self.chain(), self.validation)
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)
         validation = run.validation_metrics(validates=scored)
-        return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation,
-                                                     validation=held))
+        decode = tokenizer_for(written).decode
+        rollout = None if self.rollout is None else self.rollout.build(objective, decode)
+        return Prepared(run, objective, loaded, metrics=validation, validation=held, rollout=rollout)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """Perplexity, where the run evaluates a validation split it holds."""
@@ -165,12 +283,30 @@ class LMRunConfig(DecoderRunConfig):
         tokenizer, vocabulary and length. Raises ValueError for a chain that states none, which an LM
         run cannot size its model for."""
         facts = self.chain().facts()
+        if self.rollout is not None:
+            return self._prompted(facts, self.rollout)
         missing = [name for name in ("tokenizer", "vocab_size", "seq_len") if facts.get(name) is None]
         if missing:
             raise ValueError(f"an LM run trains on token windows (dew.data.presets.lm, sft or "
                              f"token_windows); this chain states no {', '.join(missing)}")
         return Tokens(text(facts["tokenizer"], "tokenizer"), integer(facts["vocab_size"], "vocab_size"),
                       integer(facts["seq_len"], "seq_len"), bool(facts.get("packed", False)))
+
+    @staticmethod
+    def _prompted(facts, rollout: PromptRollout) -> Tokens:
+        """A rollout run's tokens: its prompts' tokenizer and vocabulary, and a context of a prompt
+        (`dew.data.presets.prompts`'s width) and its completion, less the last token, which no
+        position predicts from."""
+        from dew.data.prompts import PROMPT_KEY
+
+        shape = facts.get("fields", {}).get(PROMPT_KEY) if isinstance(facts.get("fields"), dict) else None
+        if facts.get("tokenizer") is None or not shape:
+            raise ValueError("a rollout run trains on rendered prompts (dew.data.presets.prompts); this "
+                             "chain states no prompt width or tokenizer")
+        tokenizer = text(facts["tokenizer"], "tokenizer")
+        width = integer(shape[-1], "prompt width")
+        return Tokens(tokenizer, tokenizer_for(tokenizer).vocab_size, width + rollout.max_new_tokens - 1,
+                      packed=False)
 
     def processor(self):
         """The run's tokenizer as its checkpoints record it for every loader."""
@@ -188,8 +324,19 @@ class LMRunConfig(DecoderRunConfig):
         return Samples(prompt=tokenizer.encode(self.prompt or "\n"), max_new_tokens=self.max_new_tokens,
                        sampling=self.sampling, decode=tokenizer.decode)
 
+    def pinned(self) -> LMRunConfig:
+        """This run with its Hub sources at their commits (`RunConfig.pinned`), `pretrained` among them
+        (`SourceReference.pinned`)."""
+        from dew.interop.sources import pinned_source
+
+        run = super().pinned().with_pinned_run(self.pretrained)
+        if self.pretrained is None:
+            return run
+        pretrained = pinned_source(self.pretrained)
+        return run if pretrained == self.pretrained else dataclasses.replace(run, pretrained=pretrained)
+
     def pretrained_source(self, written: str, vocab_size: int, context: int):
-        """The bundle `pretrained` names, and this run with it pinned to the commit it was read at.
+        """The bundle `pretrained` names, at the commit the run pinned it to (`pinned`).
 
         The checkpoint decides every architecture field, so the model flags
         may say only how far the KV cache reaches, the compute dtype and the
@@ -201,6 +348,7 @@ class LMRunConfig(DecoderRunConfig):
         from dew.interop.sources import SourceReference
 
         assert self.pretrained is not None
+        self.sourced_model()
         choices = ("max_seq_len", "dtype", "attention_impl")
         overridden = sorted(set(self.model.fields) - set(choices))
         if overridden:
@@ -211,10 +359,10 @@ class LMRunConfig(DecoderRunConfig):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
         reference = SourceReference.parse(self.pretrained)
-        dtype = resolve_dtype(self.model.fields.get("dtype"))
-        loaded = Pretrained.load(reference.name, dtype=jnp.bfloat16 if dtype is None else dtype,
-                                 param_dtype=self.pretrained_param_dtype,
-                                 attention_impl=str(self.model.fields.get("attention_impl", "auto")),
+        # The checkpoint computes in the run's compute dtype and stores its parameters as its source
+        # keywords say, by whether the run trains it.
+        loaded = Pretrained.load(reference.name, dtype=jnp.dtype(self.compute_dtype()),
+                                 attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.source_keywords(frozen=self.lora is not None))
@@ -228,8 +376,7 @@ class LMRunConfig(DecoderRunConfig):
         if loaded.model.vocab_size < vocab_size:
             raise ValueError(f"{self.pretrained} has room for {loaded.model.vocab_size} ids and the token "
                              f"files use {vocab_size}")
-        pinned = reference.name if loaded.revision is None else f"{reference.name}@{loaded.revision}"
-        return loaded, dataclasses.replace(self, pretrained=pinned)
+        return loaded
 
     def masked_objective(self, model, fields, variables, source=None):
         """MDLM over a bidirectional model, its mask id from the model's fields.

@@ -12,28 +12,22 @@ registry's `{"class": ..., "fields": ...}` whose fields `recorded_fields` wrote.
 
 from __future__ import annotations
 
-import dataclasses
-from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Generic, Self
+from typing import TYPE_CHECKING, ClassVar
 
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
-from typing_extensions import TypeVar
 
-from dew import _records
 from dew.batch import FROZEN, Variables
+from dew.inputs.condition import ConditionEncoder, ConditionWork
 from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
-from dew.nn.flops import counted_flops
-from dew.nn.protocols import Counted
+from dew.nn.text_checkpoints import DEFAULT_MODEL, DEFAULT_T5_MODEL
 from dew.nn.text_encoders import (
-    DEFAULT_MODEL,
-    DEFAULT_T5_MODEL,
     CLIPTextTransformer,
     CLIPTowerOutput,
     T5EncoderTransformer,
@@ -44,7 +38,7 @@ from dew.nn.text_encoders import (
     translate_config,
     translate_t5_config,
 )
-from dew.registry import component, dtype_name, resolve_dtype, to_record
+from dew.registry import dtype_name, resolve_dtype
 
 if TYPE_CHECKING:
     from torchax.interop import JittableModule
@@ -52,122 +46,6 @@ if TYPE_CHECKING:
 
     from dew.data.processors import FeatureExtractor
     from dew.data.text import PinnedTokenizer
-
-Raw = TypeVar("Raw")
-"""One item of a modality's raw data: a prompt, a waveform."""
-
-Encoded = TypeVar("Encoded", default=object)
-"""The conditioning value a modality's encoder produces: a `TextContext`, a
-`DenoisingCondition`, an array. An encoder that leaves it unstated promises
-its callers nothing about the value beyond what it hands the model."""
-
-
-@dataclass(frozen=True)
-class ConditionWork:
-    """A condition encoder's forward FLOPs and the sequence its denoiser reads.
-
-    The output lengths may differ from encoded input (system prompts
-    cropped, CLIP and T5 concatenated, or visible zero tokens retained).
-    Keeping both under the encoder makes its geometry the encode contract.
-    """
-
-    flops: float
-    lengths: np.ndarray
-    spans: np.ndarray
-    features: int
-    pooled_features: int | None = None
-    time_ids: int | None = None
-
-    @classmethod
-    def of_tokens(cls, tower: Counted, tokens: Mapping[str, np.ndarray], features: int) -> Self:
-        """The work of a `tower` that reads each row's unmasked `tokens` and hands its denoiser the
-        whole fixed-length sequence, `features` wide: its FLOPs over the real tokens, their lengths,
-        and spans of the token budget."""
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return cls(counted_flops(tower, lengths), lengths, spans, features)
-
-
-class ConditionEncoder(ABC, Generic[Raw, Encoded]):
-    """Turns one modality's raw data into a conditioning value.
-
-    Subclasses implement `from_pretrained`, `tokenize`, `encode` and
-    `recorded_fields`, the record a run keeps of them (`dew.registry.Recorded`).
-    """
-
-    if TYPE_CHECKING:
-        # Each encoder is a dataclass, whose fields hold its towers (`dew.nn.kernels.options.quantizations`).
-        __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[object]]]
-
-    params: Variables
-    parameter_collections: ClassVar[tuple[str, ...] | None] = None
-    """The collections that hold learned weights, frozen ones included, or None
-    for a bare parameter tree. Collections not named here keep their dtype."""
-    reads_captions: ClassVar[bool] = True
-    """Whether a dataset's captions are this encoder's raw data. An encoder
-    that does not read captions reads a batch field its dataset writes
-    itself, such as audio, and `InputSpec.tokenize` leaves that field alone."""
-    keyword: ClassVar[str] = "textcontext"
-    """The model keyword this encoder's value is passed under. Each value
-    type goes to the models written for it: a `TextContext` to the native
-    architectures' `textcontext`, and a `DenoisingCondition` to the
-    published families' `conditioning`."""
-
-    @classmethod
-    @abstractmethod
-    def from_pretrained(cls, checkpoint: str, *, params: Variables | None = None) -> Self:
-        """Load the tower named `checkpoint`. This is the one call that opens files.
-
-        Anything else a checkpoint needs is a keyword field with a default;
-        `recorded_fields` records those fields, and `bound` rebuilds the
-        encoder from them. When you pass `params`, the load uses them as they are. It
-        reads the checkpoint's metadata but none of its weights, and keeps
-        the values, dtypes and placement of `params`.
-        """
-
-    @abstractmethod
-    def tokenize(self, texts: Sequence[Raw]) -> Mapping[str, np.ndarray]:
-        """Turn raw data into the host arrays `encode` reads, one row per item."""
-
-    @abstractmethod
-    def encode(self, params: Variables, tokens) -> Encoded:
-        """Encode tokens into the conditioning value on device, under `params`."""
-
-    def captions(self, tokens) -> tuple[str, ...]:
-        """Return the text the tokens stand for, to show in a rendered artifact.
-
-        A modality that is not text returns an empty tuple.
-        """
-        return ()
-
-    @abstractmethod
-    def recorded_fields(self) -> Mapping[str, object]:
-        """Return the keyword fields that `from_pretrained` rebuilds this encoder from, its checkpoint
-        among them: the record a run keeps (`dew.registry.Recorded`)."""
-
-    def dependencies(self) -> Mapping[str, object]:
-        """What `tokenize` makes of raw data depends on: the encoder and the fields it is
-        rebuilt from, which hold its context length and its checkpoint's revision."""
-        return _records.record(to_record(self, ConditionEncoder), "encoder")
-
-    @staticmethod
-    def bound(record: Mapping[str, object], *, params: Variables | None = None) -> ConditionEncoder:
-        """Rebuild the encoder a record names, `{"class": alias or import path, "fields": ...}`
-        (`dew.registry.component`), around `params` where given.
-
-        The fields are the keywords `recorded_fields` wrote, scalars and dtype names its
-        `from_pretrained` reads itself, passed back to it, so each encoder keeps its own concrete
-        signature. `checkpoint` is the one field every encoder takes; a record without one raises
-        ValueError. With `params` the load reads the checkpoint's metadata and tokenizer, never its
-        weights (`from_pretrained`).
-        """
-        encoder, fields = component(ConditionEncoder, record)
-        checkpoint = fields.get("checkpoint")
-        if not isinstance(checkpoint, str):
-            raise ValueError(f"the {record['class']} record names no checkpoint to rebuild from")
-        rest = {name: value for name, value in fields.items() if name != "checkpoint"}
-        return encoder.from_pretrained(checkpoint, **rest, params=params)
-
 
 def _pinned_tokenizer(checkpoint: str, revision: str | None) -> PinnedTokenizer:
     """A text tower's tokenizer files resolved once (`pin_tokenizer`): a local directory as it is,
@@ -418,6 +296,13 @@ def _last_hidden_state(model, features, *, key: str):
     return model(**{key: features}).last_hidden_state
 
 
+_AUDIO_FILES = ("config.json", "config.*.json", "preprocessor_config.json", "processor_config.json")
+"""The files an audio tower's configuration and feature extractor are read from (transformers'
+`CONFIG_NAME` and the versioned configurations it names, of which `PreTrainedConfig.get_config_dict`
+reads one; `FEATURE_EXTRACTOR_NAME`; and `PROCESSOR_NAME`, whose nested extractor settings
+`FeatureExtractionMixin.get_feature_extractor_dict` reads first)."""
+
+
 @dataclass(frozen=True, eq=False)
 class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     """Encodes audio as a transformers model's last hidden state, using the checkpoint's feature extractor.
@@ -448,15 +333,21 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     module: JittableModule
     params: Variables
     extractor: FeatureExtractor
+    files: Mapping[str, object]
+    """The checkpoint's configuration and feature-extractor files the tower and `extractor` were read from,
+    hashed (`dew.data.text.pin_files`), which its identity holds (`dependencies`)."""
     dtype: Dtype | None = None
     param_dtype: str = "float32"
+    revision: str | None = None
+    """The checkpoint's git revision, recorded so a rebuild reads the same weights and extractor."""
     parameter_collections: ClassVar[tuple[str, ...] | None] = ("params",)
     reads_captions: ClassVar[bool] = False
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *, seconds: float = 1.0,
-                        dtype=None, param_dtype: str = "float32",
+                        dtype=None, param_dtype: str = "float32", revision: str | None = None,
                         params: Variables | None = None) -> HFAudio:
+        from dew.data.text import pin_files
         from dew.interop.pickles import host_view
         from dew.interop.torchax_fallback import INSTALL
 
@@ -469,13 +360,18 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
             raise ImportError(
                 f"hf_audio runs transformers' audio model through torchax: {INSTALL}"
             ) from error
+        # The configuration and extractor read from one commit's files, whose hashes the identity holds,
+        # and the weights from that commit.
+        hub = revision is not None and not Path(checkpoint).is_dir()
+        files, directory = pin_files(f"{checkpoint}@{revision}" if hub else checkpoint, _AUDIO_FILES)
         if params is None:
-            model = AutoModel.from_pretrained(checkpoint, dtype=getattr(torch, param_dtype))
+            model = AutoModel.from_pretrained(checkpoint, revision=files["revision"],
+                                              dtype=getattr(torch, param_dtype))
         else:
             # Supplied weights replace every tensor, so the tower is built
             # without storage.
             with torch.device("meta"):
-                model = AutoModel.from_config(AutoConfig.from_pretrained(checkpoint))
+                model = AutoModel.from_config(AutoConfig.from_pretrained(directory))
         if model.config.is_encoder_decoder:
             model = model.get_encoder()
         model.eval()
@@ -491,8 +387,8 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         # Torch's copies are no longer read: the forward runs on the arrays above.
         torch.nn.Module.to(model, "meta")
         return cls(checkpoint=checkpoint, seconds=seconds, module=module, params=params,
-                   extractor=AutoFeatureExtractor.from_pretrained(checkpoint), dtype=resolve_dtype(dtype),
-                   param_dtype=param_dtype)
+                   extractor=AutoFeatureExtractor.from_pretrained(directory), files=files,
+                   dtype=resolve_dtype(dtype), param_dtype=param_dtype, revision=revision)
 
     @property
     def input_name(self) -> str:
@@ -552,7 +448,12 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
 
     def recorded_fields(self) -> dict:
         return {"checkpoint": self.checkpoint, "seconds": self.seconds,
-                "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
+                "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype, "revision": self.revision}
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and the hashes of the configuration and extractor files it reads, so an
+        extractor that moved under an unpinned checkpoint name changes the identity too."""
+        return {**super().dependencies(), "files": self.files}
 
 
 __all__ = ["CLIPText", "CharTable", "ConditionEncoder", "HFAudio", "T5Text"]

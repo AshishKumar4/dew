@@ -17,13 +17,16 @@ import jax
 import numpy as np
 import optax
 import pytest
-from affine_run import TimingRegression as Regression, batches
+from affine_run import FEATURES, TimingRegression as Regression, batches
 from PIL import Image
+from recording import RecordingTracker
 
 from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
+from dew.data import Memory
 from dew.data.dataset import Loader
+from dew.data.pipeline import Pipeline
 from dew.pool import PREEMPTED_EXIT
-from dew.telemetry.records import FitEnded
+from dew.telemetry.records import FitEnded, FitStarted
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
 
 
@@ -98,6 +101,9 @@ def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_pat
     memory = entries[1]['value']['memory']
     assert memory['analysis']['temp'] >= 0 and memory['analysis']['argument'] > 0
     assert [device['id'] for device in memory['devices']] == [device.id for device in jax.local_devices()]
+    # The step's kernel report (row 1895) is in its plan: a CPU's regression step launches no kernel.
+    kernels = entries[1]['value']['plan']['kernels']
+    assert (kernels['launches'], kernels['unsized']) == ([], 0)
     assert entries[-1]['value']['status'] == 'completed'
 
 
@@ -372,6 +378,48 @@ def test_the_panel_shows_the_metrics_its_last_interval_reported():
         ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
 
 
+def test_a_run_on_the_examples_clock_shows_its_progress_in_examples_and_estimates_its_steps():
+    """A run bounded in examples that counts no steps ahead shows none until it has consumed some, then
+    the steps its examples so far took, carried over its bound (`≈`), an estimate the run never reads;
+    its bar is the examples it consumed of its bound, exactly. A run counted ahead shows its own."""
+    from rich.console import Console
+
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=None, examples=1000)
+    assert display.steps_total() == (None, "")
+    display.current = 10
+    display.interval(10, {"train/loss": 1.0, "train/examples_consumed": 250.0})
+    assert display.steps_total() == (40, "≈40")
+    console = Console(width=100, record=True, force_terminal=False)
+    console.print(display)
+    shown = console.export_text()
+    assert "10/≈40" in shown and "25%" in shown
+    counted = TrainingDisplay(total=40)
+    assert counted.steps_total() == (40, "40")
+
+
+def test_a_clocked_fit_starts_its_display_on_its_bound_and_estimates_its_steps():
+    """A clocked fit's start record carries its bound and no step or token count, and the display it
+    starts reads its length as that bound, its steps estimated from the examples the run consumed, where
+    it once read a token count it had none of (row 2528)."""
+
+    from dew.training.display import TrainingDisplay
+
+    x = np.random.default_rng(0).normal(size=(24, FEATURES)).astype(np.float32)
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=tracker).fit(
+        Pipeline(Memory({"x": x, "y": 2 * x[:, :2]})).read("streamed").batch(8), examples=24, log_every=1)
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert (started.examples, started.tokens, started.target_steps) == (24, None, None)
+    display = TrainingDisplay()
+    display.start(started, model="affine", batch=8, precision="float32", shown={}, averaged=False)
+    assert (display.examples, display.total) == (24, None)
+    display.current = 1
+    display.interval(1, {"train/loss": 1.0, "train/examples_consumed": 8.0})
+    assert display.steps_total() == (3, "≈3")
+
+
 def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_within_its_name_column():
     """A step some of whose launches' work XLA's cost analysis cannot count reports its utilizations
     as lower bounds beside how many launches went uncounted: the panel shows them as `hfu ≥` and
@@ -420,8 +468,22 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/chunks_per_record/tiny-shakespeare": 1.0})
     assert [row.name for _, row in display.rows()] == ["loss"]
     data_line = shown.data_line
+
+    def words(line):
+        # The line's words, its spacing and separators aside: what it says, not how it is laid out.
+        return [word for word in line.plain.split() if word != "·"]
+
     line = data_line(display.corpus_counts)
-    assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
+    assert line is not None
+    # One label: its count, unnamed, and the rejected total, with no reason and no truncation.
+    said = words(line)
+
+    def follows(said, value, label):
+        return any(said[at:at + 2] == [value, label] for at in range(len(said) - 1))
+
+    assert "tiny-shakespeare" not in line.plain
+    assert follows(said, "4,824", "rows") and follows(said, "0", "rejected")
+    assert "(" not in line.plain and "%" not in line.plain
     # mix(web, code).filter(f): the corpora count the rows they fed the mix, the mixture the rows
     # f kept, and f's drops are the mixture's.
     mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0, "data/rows/mixture": 4700.0,
@@ -429,8 +491,17 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/rejected/code/empty": 0.0, "data/rejected/mixture/filtered": 124.0,
                          "data/truncated/web": 0.25, "data/truncated/code": 0.0})
     assert mixture is not None
-    assert mixture.plain == ("data web 3,000  code 1,824  mixture 4,700 rows  ·  127 rejected (too_long 3, "
-                             "filtered 124)  ·  15.5% truncated")
+    said = words(mixture)
+    # Each label named before its count, in the order the counters came; the rejected total over every
+    # label (2 + 1 + 124) with each reason's count; the truncated share over the truncating labels' rows.
+    named = [said[said.index(label) + 1] for label in ("web", "code", "mixture")]
+    assert named == ["3,000", "1,824", "4,700"]
+    assert said.index("web") < said.index("code") < said.index("mixture")
+    assert follows(said, "4,700", "rows") and follows(said, "127", "rejected")
+    assert follows(said, "15.5%", "truncated")
+    reasons = mixture.plain[mixture.plain.index("(") + 1:mixture.plain.index(")")]
+    assert {tuple(reason.split()) for reason in reasons.split(",")} == {("too_long", "3"),
+                                                                        ("filtered", "124")}
     assert data_line({"train/loss": 1.0}) is None
 
 

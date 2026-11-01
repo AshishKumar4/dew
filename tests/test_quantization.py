@@ -22,13 +22,8 @@ import optax
 import pytest
 from flax import linen as nn
 from flax.core import FrozenDict
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_fp32_reduction_bound,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
 
 from dew.config import ObjectiveConfig
@@ -96,6 +91,17 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     assert not np.array_equal(wrapped, plain)
 
 
+def test_a_model_qwix_quantized_directly_is_not_quantized_again():
+    """Qwix holds one provider a model, so quantizing a model a direct `qwix.quantize_model` call already
+    quantized would replace that quantization: `Quantization.apply` refuses it (`qwix.is_quantized`)."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.dense import Dense
+
+    provider = qwix.QtProvider([qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)])
+    with pytest.raises(ValueError):
+        Quantization().apply(qwix.quantize_model(Dense(8), provider))
+
+
 def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
     """A Dew Dense Qwix quantizes directly (`qwix.quantize_model`, outside `quantize_with`'s trace)
     differentiates on a CPU: its product calls a backward of its own (a custom_vjp), so the float64
@@ -141,6 +147,22 @@ def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_p
     np.testing.assert_array_equal(np.asarray(model.apply(variables, first)), plain(first))
     np.testing.assert_array_equal(np.asarray(model.apply(variables, then)), plain(then))
     assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain(then))
+
+
+def test_a_dense_quantized_after_its_plain_call_quantizes():
+    """A Dew Dense (`precision.accumulated`'s product, its trace kept a contraction's types) called plain,
+    then quantized directly at the same shapes (`qwix.quantize_model`, which intercepts JAX's product in
+    place): the quantized call quantizes, its output not the plain one's."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.dense import Dense
+
+    layer = Dense(8)
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
+    variables = layer.init(jax.random.key(0), x)
+    plain = np.asarray(jax.jit(layer.apply)(variables, x))
+    quantized = qwix.quantize_model(layer, qwix.QtProvider(
+        [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+    assert not np.array_equal(np.asarray(jax.jit(quantized.apply)(variables, x)), plain)
 
 
 def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight():
@@ -284,10 +306,9 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
                     seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
-@pytest.mark.skipif(jax.default_backend() == "gpu",
-                    reason="Dew refuses a grouped quantized convolution on a GPU; "
-                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
-@pytest.mark.parametrize("groups", [1, 16])
+@pytest.mark.parametrize("groups", [1, pytest.param(16, marks=pytest.mark.skipif(
+    jax.default_backend() == "gpu", reason="Dew refuses a grouped quantized convolution on a GPU; "
+                                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it"))])
 def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision_it_pins(groups):
     """A quantized convolution keeps its call's contract, as a quantized matmul does: one that asks
     for a float32 result from bf16 operands returns float32, where before it returned the bf16
@@ -342,8 +363,15 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
         return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", feature_group_count=groups,
                                             dimension_numbers=("NHWC", "HWIO", "NHWC"))
 
-    assert_as_exact(jax.jit(lambda x, kernel: widened.apply({"params": {"kernel": kernel}}, x)),
-                    jax.jit(lambda x, kernel: reference(kernel, x, peaks_of(x))), draw,
+    # Qwix's own quantized training convolves its integers into int32, which XLA:GPU cannot run, so
+    # the reference runs on the CPU whatever the platform.
+    cpu, qwix_own = jax.devices("cpu")[0], jax.jit(lambda x, kernel: reference(kernel, x, peaks_of(x)))
+
+    @as_given
+    def on_cpu(x, kernel):
+        return qwix_own(*jax.device_put((x, kernel), cpu))
+
+    assert_as_exact(jax.jit(lambda x, kernel: widened.apply({"params": {"kernel": kernel}}, x)), on_cpu, draw,
                     f"float32 result of {groups} groups", seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
@@ -397,8 +425,7 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
         return grouped.apply({"params": {"kernel": kernel}}, x)
 
     def value_and_gradients(function):
-        out, transpose = jax.vjp(jax.jit(function), kernel, x)
-        return (out, *transpose(cotangent))
+        return with_gradients(jax.jit(function))(kernel, x, cotangent)
 
     def dequantized(array, for_lhs):
         how = conv_general.get_how_to_quantize(
@@ -522,8 +549,7 @@ def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does()
         module_path=".*", weight_qtype=jnp.int8, op_names=("dot_general", "einsum", "dot"))]))
 
     def value_and_gradients(module):
-        out, transpose = jax.vjp(jax.jit(module.apply), variables, x)
-        return out, *transpose(cotangent)
+        return with_gradients(jax.jit(module.apply))(variables, x, cotangent)
 
     got = value_and_gradients(Quantization(weight_only=True).apply(conv))
     assert got[0].dtype == jnp.bfloat16
@@ -567,8 +593,7 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
         [qwix.QtRule(module_path=pattern, weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
 
     def value_and_gradients(module, variables):
-        out, transpose = jax.vjp(jax.jit(module.apply), variables, x)
-        return out, *transpose(cotangent)
+        return with_gradients(jax.jit(module.apply))(variables, x, cotangent)
 
     plain = value_and_gradients(block, variables)
     jax.tree.map(np.testing.assert_array_equal, value_and_gradients(spec.apply(block), variables), plain)
@@ -781,6 +806,7 @@ PACKED_SEEDS = 256
 on armada."""
 
 
+@pytest.mark.whole_suite
 def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_model():
     """`dew.pipeline` packs a decoder's projections before quantizing them; served packed, its logits
     and its draws' log-likelihoods, a task's and a server's, are on par (check 1) with the canonical
@@ -1315,8 +1341,8 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
 @pytest.mark.parametrize("precision", [None, "highest"])
 def test_a_matmul_quantizes_whatever_precision_it_pins(precision, dtype):
     """A quantized product has no precision to honour, so a matmul a rule matches quantizes
-    whatever precision it pins: a float32 model's layers pin float32 products
-    (`float32_products`) and quantize as a bfloat16 model's do."""
+    whatever precision it pins: a float32 model's layers pinned at "highest" quantize as a bfloat16
+    model's do."""
     x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(dtype)
     model = nn.Dense(16, dtype=dtype, param_dtype=dtype, precision=precision)
     variables = model.init(jax.random.key(0), x)

@@ -83,6 +83,7 @@ from dew.interop.decoder_parts import (
     refuse_encoder_fields,
     renamed_path,
 )
+from dew.interop.unread import Stored, held, valued
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -371,14 +372,14 @@ def _kimi_k3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     return _decoder_path(name.removeprefix('language_model.model.'), config)
 
 
-def _kimi_linear_prepare(tensors: Mapping[str, np.ndarray],
-                          _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _kimi_linear_prepare(tensors: Mapping[str, Stored],
+                          _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     """Read each KDA layer's `A_log` `[1, 1, heads, 1]` as the `[heads]` the
     layer holds (modeling_kimi.py:487-488)."""
     prepared = dict(tensors)
     for name, value in tensors.items():
         if name.endswith('.self_attn.A_log'):
-            log = np.asarray(value)
+            log = held(value)
             if log.ndim != 4 or log.shape[:2] != (1, 1) or log.shape[3] != 1:
                 raise ValueError(
                     f"{name} holds {log.shape}, not the [1, 1, heads, 1] the gate broadcasts over"
@@ -391,8 +392,8 @@ _KDA_ZERO_PADDED = ('.self_attn.A_log',)
 """The tensors K3's release stores past their heads as zeros (`DecoderFamily.zero_padded`)."""
 
 
-def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray],
-                      _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _kimi_k3_prepare(tensors: Mapping[str, Stored],
+                      _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     """Trim each KDA layer's zero-padded `A_log` to its heads.
 
     The release stores `A_log` `[128]` beside `dt_bias` `[96 * 128]`: 96
@@ -412,10 +413,10 @@ def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray],
         if rank is None or bias is None or bias.shape[0] % rank.shape[0]:
             raise ValueError(f"{name} has no dt_bias and f_a_proj to count its heads by")
         heads = bias.shape[0] // rank.shape[0]
-        log = np.asarray(value)
+        log = held(value)
         if log.ndim != 1 or log.shape[0] < heads:
             raise ValueError(f"{name} holds {log.shape}, fewer than its {heads} heads")
-        if np.any(log[heads:]):
+        if valued(log) and np.any(log[heads:]):
             raise ValueError(f"{name} pads its {heads} heads with nonzero values")
         prepared[name] = log[:heads]
     return prepared

@@ -79,14 +79,12 @@ def _fits(width: int, head: int | None) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class ConvCase:
-    """A conv as the conv selector reads it (`CONV`): whether the kernels run here (`placed`), whether
-    the call is reverse mode's (`reverse`: a caller differentiating forward sets `FORWARD_MODE`, and the
-    kernels implement a VJP), whether no mesh axis splits its operand (`whole`), the operand's `shape`
+    """A conv as the conv selector reads it (`CONV`): whether the kernels run here (`placed`), whether no
+    mesh axis splits its operand (`whole`), the operand's `shape`
     and `dtype`, the dtype it is written in (`out`), its `taps` and its pieces (`parts`, `(width, head)`
     each)."""
 
     placed: bool
-    reverse: bool
     whole: bool
     shape: tuple[int, ...]
     dtype: np.dtype
@@ -98,8 +96,6 @@ class ConvCase:
 SUPPORTS: tuple[Requirement[ConvCase], ...] = (
     Requirement('capability', lambda case: case.placed, "the kernels need a GPU of sm80 or later",
                 row=INHERENT),
-    Requirement('forward_mode', lambda case: case.reverse,
-                "a JVP trace needs forward-mode derivatives; the kernels implement a VJP", row=INHERENT),
     Requirement('placement', lambda case: case.whole,
                 "a mesh axis splits the conv's operands, and the kernels see whole arrays",
                 row='ledger 1306'),
@@ -120,8 +116,7 @@ SUPPORTS: tuple[Requirement[ConvCase], ...] = (
 and the shapes and dtypes they take."""
 
 CONV: Op[ConvCase] = Op('short_conv', (Kernel('pallas', SUPPORTS), Kernel('xla', (), generic=True)),
-                        lambda case: generation.measured_kernel(
-                            'short_conv', 'pallas' if generation.backend() == 'gpu' else 'xla'))
+                        lambda case: 'pallas' if generation.backend() == 'gpu' else 'xla')
 """The conv selector: the kernels on a GPU where their requirements hold, else XLA's conv
 (`dew.nn.linear.xla_conv1d`)."""
 
@@ -200,8 +195,10 @@ def _sqrt(x, *, interpret: bool):
     return jnp.sqrt(x) if interpret else _inline("sqrt.rn.f32 $0, $1;", x)
 
 
-def _preactivation(window, taps, bias):
-    """The conv's sum in fp32, tap by tap from the oldest token, then the bias."""
+def preactivation(window, taps, bias):
+    """The conv's sum, tap by tap from the oldest token, then the bias: `window` and `taps` each tap's
+    inputs `[..., C]` and weights `[C]`, oldest first, in the sum's dtype (fp32 in the kernels; the portable
+    conv's and the decode reference's at least fp32), the one order every conv path adds in."""
     total = window[0] * taps[0][None, :]
     for inputs, tap in zip(window[1:], taps[1:], strict=True):
         total = total + inputs * tap[None, :]
@@ -252,7 +249,7 @@ def _forward_kernel(*refs, pieces: tuple[tuple[int, int, int, bool], ...], rows:
             columns = first + local
             taps, bias = _taps(w_ref, b_ref, columns, count)
             window = tuple(_rows(x_ref, tokens - count + 1 + tap, columns, length) for tap in range(count))
-            y = _preactivation(_alone(window, documents, documents[-1]), taps, bias)
+            y = preactivation(_alone(window, documents, documents[-1]), taps, bias)
             if activation:
                 y = _divide(y, 1.0 + jnp.exp(-y), interpret=interpret)
             if normalised:
@@ -295,7 +292,7 @@ def _backward_kernel(*refs, first: int, normalised: bool, block: int, segments: 
         ahead = load(tokens + 1)
         stream, documents = (*history, current), (*owners, document)
         window = _alone(stream, documents, document)
-        pre = _preactivation(window, taps, bias)
+        pre = preactivation(window, taps, bias)
         gate = _sigmoid(pre, interpret=interpret) if activation else None
         out = pre if gate is None else pre * gate
         if normalised:
@@ -350,12 +347,13 @@ class Walk:
 TILE = Tile(rows=16, warps=4)
 """The forward's launch: 16 tokens a tile, each window loaded at once."""
 
-WALK = Walk(segments=8, steps=64, warps=4)
+WALK = Walk(segments=8, steps=32, warps=4)
 """The backward's launch, its runs no longer than a row's share: eight runs a tile, with a 128-channel
-block 1024 elements, eight an fp32 register of each of four warps' threads, and 64 tokens a run, whose
-K-1 extra tokens are 5% of it at the K of 4 every mixer uses. A run sums its taps' products token by
+block 1024 elements, eight an fp32 register of each of four warps' threads, and 32 tokens a run, whose
+K-1 extra tokens are 9% of it at the K of 4 every mixer uses. A run sums its taps' products token by
 token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap gradients 2.06 times
-as far from float64 as XLA's on an A100, past the gate."""
+as far from float64 as XLA's on an A100, and runs of 64 1.57 times at the 0.8B's and 9B's training
+shapes on an H100 (row 2411), past the gate."""
 
 
 def _inputs(x, w, bias, valid, documents):
@@ -410,24 +408,8 @@ class ConvForward(_ConvLaunch):
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
              documents: jax.Array | None, *, parts: tuple[tuple[int, int | None], ...], activation: bool,
              eps: float, dtype: str, interpret: bool, config: Tile, return_residuals: bool = False):
-        batch, length, _ = x.shape
-        pieces, programs = [], 0
-        for first, width, head in _pieces(parts):
-            block = block_width(width, head)
-            pieces.append((programs, first, block, head is not None))
-            programs += width // block
-        specs, operands = _inputs(x, taps, bias, valid, documents)
-        kernel = functools.partial(
-            _forward_kernel, pieces=tuple(pieces), rows=config.rows, count=taps.shape[1], length=length,
-            has_bias=bias is not None, has_valid=valid is not None, has_documents=documents is not None,
-            activation=activation, eps=eps, interpret=interpret)
-        widths = [width for width, _ in parts]
-        return tuple(pl.pallas_call(
-            kernel, grid=(programs, pl.cdiv(length, config.rows), batch), in_specs=specs,
-            out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width in widths],
-            out_shape=[jax.ShapeDtypeStruct((batch, length, width), jnp.dtype(dtype)) for width in widths],
-            compiler_params=_params(config.warps), interpret=interpret, name="short_conv_forward",
-        )(*operands)), None
+        return _forward_launch(x, taps, bias, valid, documents, parts=parts, activation=activation, eps=eps,
+                               dtype=dtype, interpret=interpret, config=config), None
 
     def _get_heuristics_config(self, ba) -> Tile:
         return TILE
@@ -447,33 +429,8 @@ class ConvBackward(_ConvLaunch):
              documents: jax.Array | None, before: jax.Array | None, dy: jax.Array, *, first: int,
              head: int | None, activation: bool, eps: float, interpret: bool, config: Walk,
              return_residuals: bool = False):
-        batch, length, channels = x.shape
-        count, width = taps.shape[1], dy.shape[-1]
-        block = block_width(width, head)
-        grid = (width // block, pl.cdiv(length, config.segments * config.steps), batch)
-        specs, operands = _inputs(x, taps, bias, valid, documents)
-        tiles = grid[1]
-        kernel = functools.partial(
-            _backward_kernel, first=first, normalised=head is not None, block=block, segments=config.segments,
-            steps=config.steps, count=count, length=length, has_bias=bias is not None,
-            has_valid=valid is not None, has_documents=documents is not None, aliased=before is not None,
-            activation=activation, eps=eps, interpret=interpret)
-        whole = pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0))
-        out_specs = [whole, pl.BlockSpec((None, None, width, count), lambda c, t, b: (b, t, 0, 0))]
-        out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
-                     jax.ShapeDtypeStruct((batch, tiles, width, count), jnp.float32)]
-        if bias is not None:
-            out_specs.append(pl.BlockSpec((None, None, width), lambda c, t, b: (b, t, 0)))
-            out_shape.append(jax.ShapeDtypeStruct((batch, tiles, width), jnp.float32))
-        held = [] if before is None else [before]
-        return tuple(pl.pallas_call(
-            kernel, grid=grid,
-            in_specs=[*specs, *([whole] if held else []),
-                      pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))],
-            out_specs=out_specs, out_shape=out_shape,
-            input_output_aliases={len(operands): 0} if held else {},
-            compiler_params=_params(config.warps), interpret=interpret, name="short_conv_backward",
-        )(*operands, *held, dy)), None
+        return _backward_launch(x, taps, bias, valid, documents, before, dy, first=first, head=head,
+                                activation=activation, eps=eps, interpret=interpret, config=config), None
 
     def _get_heuristics_config(self, ba) -> Walk:
         return self._walk(ba, WALK)
@@ -483,6 +440,64 @@ class ConvBackward(_ConvLaunch):
         """`walk` with its runs no longer than a row's tokens shared among its segments."""
         length = ba.arguments['x'].shape[1]
         return dataclasses.replace(walk, steps=min(walk.steps, pl.cdiv(length, walk.segments)))
+
+
+@tuning.lowered_once(('parts', 'activation', 'eps', 'dtype', 'interpret', 'config'))
+def _forward_launch(x, taps, bias, valid, documents, *, parts: tuple[tuple[int, int | None], ...],
+                    activation: bool, eps: float, dtype: str, interpret: bool, config: Tile
+                    ) -> tuple[jax.Array, ...]:
+    """`ConvForward`'s launch, lowered once a configuration (`tuning.lowered_once`)."""
+    batch, length, _ = x.shape
+    pieces, programs = [], 0
+    for first, width, head in _pieces(parts):
+        block = block_width(width, head)
+        pieces.append((programs, first, block, head is not None))
+        programs += width // block
+    specs, operands = _inputs(x, taps, bias, valid, documents)
+    kernel = functools.partial(
+        _forward_kernel, pieces=tuple(pieces), rows=config.rows, count=taps.shape[1], length=length,
+        has_bias=bias is not None, has_valid=valid is not None, has_documents=documents is not None,
+        activation=activation, eps=eps, interpret=interpret)
+    widths = [width for width, _ in parts]
+    return tuple(pl.pallas_call(
+        kernel, grid=(programs, pl.cdiv(length, config.rows), batch), in_specs=specs,
+        out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width in widths],
+        out_shape=[jax.ShapeDtypeStruct((batch, length, width), jnp.dtype(dtype)) for width in widths],
+        compiler_params=_params(config.warps), interpret=interpret, name="short_conv_forward",
+    )(*operands))
+
+
+@tuning.lowered_once(('first', 'head', 'activation', 'eps', 'interpret', 'config'))
+def _backward_launch(x, taps, bias, valid, documents, before, dy, *, first: int, head: int | None,
+                     activation: bool, eps: float, interpret: bool, config: Walk) -> tuple[jax.Array, ...]:
+    """`ConvBackward`'s launch, lowered once a configuration (`tuning.lowered_once`)."""
+    batch, length, channels = x.shape
+    count, width = taps.shape[1], dy.shape[-1]
+    block = block_width(width, head)
+    grid = (width // block, pl.cdiv(length, config.segments * config.steps), batch)
+    specs, operands = _inputs(x, taps, bias, valid, documents)
+    tiles = grid[1]
+    kernel = functools.partial(
+        _backward_kernel, first=first, normalised=head is not None, block=block, segments=config.segments,
+        steps=config.steps, count=count, length=length, has_bias=bias is not None,
+        has_valid=valid is not None, has_documents=documents is not None, aliased=before is not None,
+        activation=activation, eps=eps, interpret=interpret)
+    whole = pl.BlockSpec((None, length, channels), lambda c, t, b: (b, 0, 0))
+    out_specs = [whole, pl.BlockSpec((None, None, width, count), lambda c, t, b: (b, t, 0, 0))]
+    out_shape = [jax.ShapeDtypeStruct(x.shape, x.dtype),
+                 jax.ShapeDtypeStruct((batch, tiles, width, count), jnp.float32)]
+    if bias is not None:
+        out_specs.append(pl.BlockSpec((None, None, width), lambda c, t, b: (b, t, 0)))
+        out_shape.append(jax.ShapeDtypeStruct((batch, tiles, width), jnp.float32))
+    held = [] if before is None else [before]
+    return tuple(pl.pallas_call(
+        kernel, grid=grid,
+        in_specs=[*specs, *([whole] if held else []),
+                  pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))],
+        out_specs=out_specs, out_shape=out_shape,
+        input_output_aliases={len(operands): 0} if held else {},
+        compiler_params=_params(config.warps), interpret=interpret, name="short_conv_backward",
+    )(*operands, *held, dy))
 
 
 def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: float, dtype, interpret: bool):
@@ -506,22 +521,32 @@ def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bo
     return dx, dw, None if bias is None else jnp.concatenate(db).astype(bias.dtype)
 
 
-def _conv_fwd(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
-    out = _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
-    return out, (x, taps, bias, valid, documents)
+def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float, dtype, interpret: bool):
+    """`linear.causal_conv1d` on the kernels: `x` `[B, T, C]` convolved causally by `taps` `[C, K]` behind
+    K-1 zero tokens, plus `bias` `[C]` or None, silu'd where `activation`, as the `parts` pieces
+    `((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`
+    l2-normalised (`eps`) over each `head` channels. `valid` `[B, T]` int8 or None zeroes padding tokens'
+    outputs; `documents` `[B, T]` int32 or None numbers packed documents, a tap reading a token only in
+    its output token's. Differentiated at every order through XLA's conv (`linear.xla_conv1d`, the same
+    arithmetic; `generation.linear_tangent`): reverse mode runs the backward kernels, and forward mode takes
+    XLA's tangent however a jit, a scan or a remat staged the call (row 2395)."""
+    from dew.nn.linear import xla_conv1d
 
+    def forward(x, taps, bias, valid, documents):
+        return _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret), ()
 
-def _conv_bwd(parts, activation, eps, dtype, interpret, residual, cotangents):
-    x, taps, bias, valid, documents = residual
-    dx, dw, db = _backward(x, taps, bias, valid, documents, cotangents, parts, activation, eps, interpret)
-    return dx, dw, db, None, None
+    def backward(saved, operands, cotangents):
+        del saved
+        x, taps, bias, valid, documents = operands
+        dx, dw, db = _backward(x, taps, bias, valid, documents, cotangents, parts, activation, eps, interpret)
+        # The masks have no tangent space: float0's zero, as JAX takes it of them.
+        masks = (None if mask is None else jax.custom_derivatives.zero_from_primal(mask)
+                 for mask in (valid, documents))
+        return dx, dw, db, *masks
 
+    def portable(x, taps, bias, valid, documents):
+        return xla_conv1d(x, taps, activation, bias, valid=valid, segments=documents, parts=parts,
+                          dtype=dtype)
 
-conv = jax.custom_vjp(_forward, nondiff_argnums=(5, 6, 7, 8, 9))
-"""`linear.causal_conv1d` on the kernels: `x` `[B, T, C]` convolved causally by `taps` `[C, K]` behind
-K-1 zero tokens, plus `bias` `[C]` or None, silu'd where `activation`, as the `parts` pieces
-`((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`
-l2-normalised (`eps`) over each `head` channels. `valid` `[B, T]` int8 or None zeroes padding tokens'
-outputs; `documents` `[B, T]` int32 or None numbers packed documents, a tap reading a token only in
-its output token's. Gradients for `x`, `taps` and `bias`."""
-conv.defvjp(_conv_fwd, _conv_bwd)
+    return generation.linear_tangent(forward, backward, portable)(x, taps, bias, valid, documents)
+

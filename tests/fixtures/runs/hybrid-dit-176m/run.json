@@ -36,6 +36,12 @@
       "wrappers": []
     },
     "data_seed": 0,
+    "source": {
+      "text_only": false,
+      "prediction_depths": null,
+      "attention": null,
+      "dex": null
+    },
     "optim": {
       "optimizer": "adamw",
       "optimizer_opts": {},
@@ -53,20 +59,36 @@
       "name": "text-to-image-176m",
       "checkpoint_dir": "run",
       "keep": 1,
+      "resume": "auto",
       "best": null,
       "update_tokens": null,
       "key": 0,
       "steps": 1350000,
       "epochs": null,
       "tokens": null,
+      "examples": null,
+      "stop": null,
+      "restore_best": false,
+      "cooldowns": null,
       "log_every": 100,
       "eval_every": "epoch",
       "checkpoint_every": "epoch",
       "checkpoint_final": true,
+      "local_directory": null,
+      "local_every": null,
+      "scored_to": null,
       "accumulation": 1,
       "split": null,
       "batch_ramp": null,
-      "dynamic_scale": false,
+      "precision": {
+        "dtypes": {
+          "params": "float32",
+          "compute": "float32",
+          "output": "float32"
+        },
+        "matmul": "default",
+        "forms": "fast"
+      },
       "mesh": {
         "fsdp": 1,
         "expert": 1,
@@ -234,6 +256,8 @@
       "xla_flags": null,
       "quantization": null,
       "lower_for": null,
+      "compile_ahead": null,
+      "ahead": null,
       "tune_kernels": false
     },
     "objective": {
@@ -273,6 +297,9 @@
       }
     },
     "lora": null,
+    "val_metrics": [],
+    "val_every": {},
+    "val_summaries": [],
     "preset": {
       "class": "dew.diffusion.presets:EDM",
       "fields": {
@@ -305,10 +332,8 @@
       "latent_scale": null
     },
     "pretrained": null,
-    "pretrained_param_dtype": "float32",
     "teacher_run": null,
     "rollout": null,
-    "val_metrics": [],
     "data": {
       "version": 1,
       "source": {
@@ -344,7 +369,8 @@
         "read_buffer": 128,
         "worker_buffer": 2,
         "ram_budget_mb": null,
-        "max_workers": null
+        "max_workers": null,
+        "cache": true
       },
       "stages": [
         {
@@ -432,7 +458,8 @@
         "read_buffer": 128,
         "worker_buffer": 2,
         "ram_budget_mb": null,
-        "max_workers": null
+        "max_workers": null,
+        "cache": true
       },
       "stages": [
         {

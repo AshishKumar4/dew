@@ -9,17 +9,16 @@ its data rather than at a user's first step.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import jax
-import pytest
 from decision_support import decision_rows
+from objective_data import IMAGES, SEQ_LEN, first
+from rl_cases import packed
 
 from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
-from dew.data import TFDS, Loading, Memory, images as image_steps, presets
-from dew.data.compile import compile
+from dew.data import TFDS, Memory, images as image_steps, presets
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
@@ -41,37 +40,14 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
-from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.objectives.supervised import CrossEntropy, Supervised
 from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
-
-IMAGES = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
-SEQ_LEN = 15
-
-
-def first(chain, objective=None):
-    """The first training batch `chain` makes, compiled with `objective`'s own stages as a run's is."""
-    compiled = compile(chain.read("memory").loading(Loading(workers=0)),
-                       objective=None if objective is None else objective.data())
-    return next(compiled.train(DataPartition()))
 
 
 def decoder(**fields):
     return CausalTransformer(vocab_size=260, emb_features=16, num_layers=1, num_heads=2,
                              mlp_features=32, max_seq_len=32, **fields)
-
-
-def corpus_windows(corpus: Path):
-    """Windows of SEQ_LEN byte tokens over a short text, each document ended by the tokenizer's EOS and
-    the stream cut into windows, in pairs (`presets.lm`), what the LM recipe trains on."""
-    documents = [{"text": "the quick brown fox jumps over the lazy dog " * 8} for _ in range(4)]
-    return Memory(documents).pipe(presets.lm, "byte", seq_len=SEQ_LEN, batch=2, eos=True, pack=None)
-
-
-@pytest.fixture(scope="module")
-def windows(tmp_path_factory):
-    return corpus_windows(tmp_path_factory.mktemp("corpus"))
 
 
 def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfig:
@@ -106,16 +82,6 @@ def with_teacher(kind):
             *shared, variables={TEACHER: drawn}, steps=2),
     }[kind]()
     return built, first(config.data, built)
-
-
-def packed(objective_for):
-    """Rows `sessions.pack` writes, what every GRPO rollout and the RLVR
-    example's scheduler train on, at the width the objective names."""
-    width = SEQ_LEN + 1
-    sessions = [Session("t", str(sample // 2), sample, 0,
-                        (Call((1, 2, 3), (4, 5), (-0.1, -0.2), "stop", 0),),
-                        Status.COMPLETED, float(sample % 2)) for sample in range(4)]
-    return objective_for(width - 1), pack(sessions, width)
 
 
 def preference_pairs():

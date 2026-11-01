@@ -1,0 +1,10 @@
+{
+ "bytes": 22332,
+ "kind": "release",
+ "license": "apache-2.0",
+ "path": "releases/7f8ad01484898946b3c9c9d5ebc85e5ac726061d0fa7b4a522c4b8110c13a921/generation_utils.py",
+ "reference": "Dream-org/Dream-v0-Base-7B@6572adb5535263e4d1a337b56942ba48b6dee2a9/generation_utils.py",
+ "repo": "dewml/fixtures",
+ "revision": "a5de72f71f4b55b7662a1f90730c84b149a2e749",
+ "sha256": "7f8ad01484898946b3c9c9d5ebc85e5ac726061d0fa7b4a522c4b8110c13a921"
+}

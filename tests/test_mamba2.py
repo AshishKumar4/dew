@@ -20,21 +20,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decode_through
-from reference_error import (
-    FACTOR,
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    indexed_recording,
-    recording,
-    widened,
-)
+from model_support import as_stepped, decode_through
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import FACTOR, assert_as_exact, declared_seeds, indexed_recording, recording, widened
+from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 from ssd_support import mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
-from dew.batch import coordinates
+from dew.batch import coordinates, field_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
@@ -225,16 +218,38 @@ def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(reference, geom
 
 def test_the_layer_decodes_as_it_prefills(reference, geometry):
     """A prefill against the cache and single-token steps after it reproduce
-    the parallel forward: the conv tail and the SSM state both cross the
-    step boundary."""
+    the parallel forwards, each step's at the width it reads (`as_stepped`):
+    the conv tail and the SSM state both cross the step boundary."""
     module = layer(geometry)
     variables = layer_params(reference)
     hidden = jnp.asarray(reference["layer.hidden"])
-    parallel = module.apply(variables, hidden)
+    parallel = as_stepped(jax.jit(lambda held: module.apply(variables, held)), hidden, 5)
 
     decoded, cache, _ = decode_through(module, variables, hidden, prefill=5)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
     as_exact(decoded, parallel, wide_apply(module, variables, hidden), "decoded")
+
+
+def test_the_layer_takes_forward_mode(reference, geometry):
+    """`jax.jvp` through the layer, as MeanFlow and consistency training trace a model: its tangent along a
+    seeded direction of the reference's input on par from float64 with the same product its reverse mode
+    gives (the Jacobian `jax.jacrev` builds, contracted with the direction). The D skip's custom VJP refused
+    forward mode on every target (row 1933), so a hybrid with Mamba-2 layers trained on neither."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])
+    direction = jnp.asarray(np.random.default_rng(1933).standard_normal(hidden.shape, np.float32))
+
+    def tangent(x, d):
+        return jax.jvp(lambda x: module.apply(variables, x), (x,), (d,))[1]
+
+    def reverse(x, d):
+        jacobian = jax.jacrev(lambda x: module.apply(variables, x))(x)
+        return jnp.tensordot(jacobian, d, axes=d.ndim)
+
+    as_exact(jax.jit(tangent)(hidden, direction), jax.jit(reverse)(hidden, direction),
+             in_float64(lambda x, d: jax.jvp(lambda x: module.clone(dtype=jnp.float64).apply(
+                 widened(variables), x), (x,), (d,))[1], hidden, direction), "the layer's tangent")
 
 
 def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
@@ -257,32 +272,6 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     assert not jnp.any(padded[1][~valid[1]])
 
 
-SPLIT_ROWS = {
-    # Every slot real, as a pool of processes fills validity where no producer padded.
-    "all_valid": (np.ones(32, bool), None),
-    # Right-padded: real tokens first, the tail padding inside the last two shards.
-    "right_padded": (np.arange(32) < 21, None),
-    # Left-padded: a prompt's padding in front, across the first shard and into the second.
-    "left_padded": (np.arange(32) >= 11, None),
-    # Gaps inside a document, one at a shard's cut, and a shard holding a single real token, fewer
-    # than the conv's three-token history: its next shard reads the ones before it too.
-    "gaps": (~np.isin(np.arange(32), [2, 7, 8, 13, 16, 17, 18, 19, 20, 21, 22, 25]), None),
-    # Packed documents with gaps between and inside them, one starting on a shard's first real token.
-    "packed": (~np.isin(np.arange(32), [5, 6, 14, 15, 30, 31]),
-               np.repeat([1, 1, 2, 3], [5, 11, 8, 8])),
-    # A whole interior shard of padding with real tokens on both sides: the history and the state
-    # cross it unchanged.
-    "empty_shard": (~((np.arange(32) >= 8) & (np.arange(32) < 16)), None),
-    # The same with one document continuing across the empty shard and another starting after it.
-    "empty_shard_packed": (~((np.arange(32) >= 8) & (np.arange(32) < 16)),
-                           np.repeat([1, 2], [20, 12])),
-}
-"""Each row of the sequence split's check: its real tokens and its documents (None for one)."""
-
-SPLIT_BATCH = 8
-"""The rows a sequence-split draw holds: every parameter's gradient, the heads' `D` and `A_log` too,
-sums over all of them."""
-
 SPLIT_SEEDS = {"all_valid": 64, "right_padded": 128, "left_padded": 128, "gaps": 128, "packed": 256,
                "empty_shard": 256, "empty_shard_packed": 64}
 """Each row's declared draws, sized by `seeds_for` on armada paired with the unsplit layer: the two arms
@@ -295,47 +284,10 @@ that the unsplit layer against itself resolves none of them within 512 draws."""
 @pytest.mark.parametrize("row", sorted(SPLIT_ROWS))
 def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones(reference, geometry, row):
     """Under a sequence axis of 4, the layer runs rows with padding as `held_scan` runs them on one
-    device: a padded slot neither reads nor advances the conv or the state, each real token's conv
-    reading the real tokens before it in its document across gaps and shards, and padded slots emit
-    zero. Output and input gradient are check 1's against the unsplit layer, from float64, over drawn
-    hidden states, and so are the parameters' gradients. A pool of processes always carries
-    validity, so this is every multi-host run."""
-    module = layer(geometry)
-    variables = layer_params(reference)
-    valid, segments = SPLIT_ROWS[row]
-    fields = {"valid": jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32)))}
-    if segments is not None:
-        fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
-    call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
-    width = geometry["hidden_size"]
-
-    def draw(seed):
-        rng = np.random.default_rng([0x5E9, seed])
-        return (rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32),
-                rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32))
-
-    def run(model, params, mesh=None):
-        def pulled(hidden, cotangent):
-            out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
-            return out, *pull(cotangent)
-        if mesh is None:
-            return jax.jit(pulled)
-        @as_given
-        def split(hidden, cotangent):
-            with jax.set_mesh(mesh):
-                return jax.jit(pulled)(hidden, cotangent)
-        return split
-
-    @as_given
-    def truth(hidden, cotangent):
-        with jax.enable_x64(new_val=True):
-            return run(module.clone(dtype=jnp.float64), widened(variables))(*widened((hidden, cotangent)))
-
-    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
-    assert_as_exact(run(module, variables, mesh), run(module, variables), draw,
-                    f"mamba2 split over the sequence, {row}", seeds=SPLIT_SEEDS[row], truth_fn=truth)
-    split = run(module, variables, mesh)(*draw(0))[0]
-    assert not np.any(np.asarray(split)[:, ~valid])
+    device (`assert_split_as_whole`). A pool of processes always carries validity, so this is every
+    multi-host run."""
+    assert_split_as_whole(layer(geometry), layer_params(reference), row, SPLIT_SEEDS[row],
+                          f"mamba2 split over the sequence, {row}", width=geometry["hidden_size"])
 
 
 @pytest.mark.mesh
@@ -437,7 +389,9 @@ def test_padded_packed_rows_reset_at_each_document():
     params = model.init(jax.random.key(0), ids)
 
     def hidden(tokens, model=model, params=params, **fields):
-        return model.apply(params, tokens, method=CausalTransformer.hidden_and_mtp_inputs, **fields)[0]
+        # The flat fields laid out once (`field_coordinates`), the layout the trunk reads.
+        return model.apply(params, tokens, method=CausalTransformer.hidden_and_mtp_inputs,
+                           coordinates=field_coordinates(fields, tokens.shape))[0]
 
     closed = hidden(closed_ids, segment_ids=closed_segments)[0]
     padded = hidden(ids, attention_mask=valid, segment_ids=segments)[0]
@@ -473,12 +427,13 @@ def tiny_lm(**overrides) -> CausalTransformer:
 def test_the_model_decodes_as_it_scores_in_parallel():
     """A prefill of four tokens and eight single-token steps, every layer's
     state riding the flax cache collection, against the same twelve tokens
-    scored at once."""
+    scored by full passes, each step's at the width it reads (`as_stepped`),
+    from the twelve scored at once in float64."""
     model = tiny_lm()
     rng = jax.random.key(0)
     ids = jax.random.randint(rng, (2, 12), 0, 32)
     params = model.init(rng, ids)
-    full = jnp.asarray(model.apply(params, ids))
+    full = as_stepped(jax.jit(lambda held: model.apply(params, held)), ids, 4)
 
     cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
@@ -492,3 +447,104 @@ def test_the_model_decodes_as_it_scores_in_parallel():
     with jax.enable_x64(new_val=True):
         truth = np.asarray(model.clone(dtype=jnp.float64).apply(widened(params), ids))
     as_exact(jnp.stack(steps, axis=1), full[:, 3:], truth[:, 3:], "the decoded logits")
+
+
+def ssd_lm() -> CausalTransformer:
+    """Two SSD layers at widths the TPU's Pallas scan takes (`ssd_kernel_runs`): 4 heads of 64
+    channels, a state of 64, chunks of 64 over 128 tokens, a residual of 128 apart from every inner
+    width, in bf16 as a hybrid's step runs them."""
+    config = {"vocab_size": 64, "emb_features": 128, "num_layers": 2, "num_heads": 4, "mlp_features": 0,
+              "max_seq_len": 128, "tie_embeddings": False, "qk_norm": False, "dtype": jnp.bfloat16,
+              "mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 64, "state_size": 64,
+                        "n_groups": 1, "chunk_size": 64}}}
+    return CausalTransformer(**config)
+
+
+def stepped(model):
+    """`model`'s training step: the next-token loss's gradient over every parameter and the logits,
+    from the parameters and a row of 129 ids, compiled once."""
+    def loss(params, ids):
+        logits = model.apply({"params": params}, ids[:, :-1])
+        wide = jax.nn.log_softmax(logits.astype(jnp.promote_types(logits.dtype, jnp.float32)))
+        return -jnp.mean(jnp.take_along_axis(wide, ids[:, 1:, None], axis=-1)), logits
+    return jax.jit(jax.grad(loss, has_aux=True))
+
+
+def rowed(value) -> np.ndarray:
+    """`value` as rows over its last axis, float64; a vector one row."""
+    value = np.asarray(value, np.float64)
+    return value.reshape(-1, value.shape[-1]) if value.ndim > 1 else value[None]
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu",
+                    reason="needs a tpu, the one backend the ssd kernel runs on")
+def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_the_xla_scan():
+    """A Mamba-2 model's training step compiled on the TPU, its rows split over a mesh of every device
+    the process holds (each shard's scan its own Pallas call, `manual_map`): the logits and every
+    parameter's gradient against the same step on the XLA scan, its kernels chosen as on a CPU
+    (`generation.assumed`), both from the float64 step on the host. Over ORDERS orders of the
+    residual stream (tests/residual_orders.py), an exact symmetry, so only the rounding moves: each
+    output's RMS within FACTOR of the reference's and its worst row within ROW_FACTOR
+    (tests/reference_error.py's over-orders rules); the float64 step under an order first held to
+    the identity's within float64 rounding."""
+    from reference_error import (
+        ORDERS,
+        assert_as_exact_over_orders,
+        assert_computes_the_oracle,
+        assert_rows_as_exact_over_orders,
+        chain_roundings,
+    )
+    from residual_orders import orders, permuted, residual_width
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.ssd import ssd_kernel_runs
+
+    assert ssd_kernel_runs(64, 64, 64, "tpu", dtype=jnp.float32)
+    model, devices = ssd_lm(), jax.devices()
+    ids = np.asarray(jax.random.randint(jax.random.key(0), (2 * len(devices), 129), 0, 64))
+    variables = jax.device_get(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1])))
+    units = residual_width(variables)
+
+    def ordered(result, order):
+        """The step's gradients with the residual's units in `order`, and its logits, which no order
+        moves."""
+        gradients, logits = result
+        return permuted({"params": gradients}, order)["params"], logits
+
+    # The float64 oracle runs on the host: a TPU emulates float64.
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        wide = stepped(model.clone(dtype=jnp.float64))
+        exact = jax.device_get(wide(widened(variables["params"]), ids))
+        last = orders(units, 2, seed=0)[-1]
+        found = jax.device_get(wide(permuted(widened(variables), last)["params"], ids))
+        roundings = chain_roundings(jax.make_jaxpr(wide)(widened(variables["params"]), ids))
+        for (path, leaf), true in zip(jax.tree_util.tree_leaves_with_path(found),
+                                      jax.tree.leaves(ordered(exact, last)), strict=True):
+            assert_computes_the_oracle(np.asarray(leaf), np.asarray(true),
+                                       f"the residual order {jax.tree_util.keystr(path)}",
+                                       roundings=roundings)
+
+    mesh = jax.sharding.Mesh(np.array(devices), ("data",))
+    placed = jax.device_put(ids, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+    whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    kernel, xla = stepped(model), stepped(model)
+    distances: dict = {}
+    with jax.set_mesh(mesh):
+        for order in orders(units, ORDERS, seed=1):
+            params = jax.device_put(permuted(variables, order)["params"], whole)
+            truth = jax.tree_util.tree_leaves_with_path(ordered(exact, order))
+            found = {"dew": jax.device_get(kernel(params, placed))}
+            with generation.assumed("cpu"):
+                found["reference"] = jax.device_get(xla(params, placed))
+            for side, result in found.items():
+                for (path, held), leaf in zip(truth, jax.tree.leaves(result), strict=True):
+                    name = jax.tree_util.keystr(path)
+                    distances.setdefault((name, side), []).append(
+                        np.sqrt(np.mean(np.square(rowed(leaf) - rowed(held)), axis=1)))
+                    distances[name, "size"] = np.sqrt(np.mean(np.square(rowed(held)), axis=1))
+    for name in sorted({name for name, side in distances if side == "dew"}):
+        mine, theirs = np.stack(distances[name, "dew"]), np.stack(distances[name, "reference"])
+        assert_as_exact_over_orders(np.sqrt(np.mean(np.square(mine), axis=1)),
+                                    np.sqrt(np.mean(np.square(theirs), axis=1)), f"the step's {name}")
+        assert_rows_as_exact_over_orders(mine, theirs, f"the step's {name} row by row",
+                                         sizes=distances[name, "size"])

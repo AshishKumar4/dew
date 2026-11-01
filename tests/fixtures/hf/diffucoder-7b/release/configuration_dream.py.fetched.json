@@ -1,0 +1,11 @@
+{
+ "bytes": 3197,
+ "kind": "release",
+ "license": "apple-amlr",
+ "origin": "release",
+ "path": "configuration_dream.py",
+ "reference": "apple/DiffuCoder-7B-Base@a2c33054cbe99b9ab7af074f09b1d13943157ff1/configuration_dream.py",
+ "repo": "apple/DiffuCoder-7B-Base",
+ "revision": "a2c33054cbe99b9ab7af074f09b1d13943157ff1",
+ "sha256": "24d038962ccf16361595494461000ec0c1b043653c7494d7fc835c96f121f0b9"
+}

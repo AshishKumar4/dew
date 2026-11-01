@@ -12,19 +12,28 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import ClassVar
 
+import grain.python as pygrain
 import numpy as np
 
-from dew._records import record
+from dew._records import integer, record
 from dew.batch import Batch
 from dew.data.dataset import Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
-from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
+from dew.data.tokens import (
+    FirstFit,
+    PackedWindows,
+    chunk_lengths,
+    chunk_table,
+    entries,
+    first_fit,
+    packed_window,
+)
 
 
 def plan_name(pack: Pack, field: str) -> str:
@@ -92,6 +101,150 @@ def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int = 0) -> Mapping[s
     kept = np.flatnonzero(targets > 0)
     placed = dict(zip(_FIELDS, (documents, offsets, chunk_sizes, order, starts, targets, kept), strict=True))
     return {**placed, "totals": np.asarray([targets[kept].sum(), np.count_nonzero(targets == 0)], np.int64)}
+
+
+class FirstFitPacked(pygrain.IterDataset[Batch]):
+    """`documents`, each as `pack` reads one (`Pack.document`), packed first-fit into windows as a
+    stream of them arrives: `pack.bins` windows
+    open at a time, placed as the plan of lengths places them (`FirstFit`) and laid out as it lays
+    them (`packed_window`), the windows of grain's `FirstFitPackIterDataset` with the stage's
+    fields, so a stream and an indexed read of one corpus pack one way. Its position is grain's
+    packer's: where the documents of the windows it emits now began, how many of those windows it
+    emitted and how many in all, so a position either saved resumes on the other."""
+
+    def __init__(self, documents: pygrain.IterDataset[Batch], pack: Pack):
+        super().__init__(documents)
+        self._documents, self._pack = documents, pack
+
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        return _FirstFitPacking(self._documents.__iter__(), self._pack)
+
+
+def window_fields(pack: Pack) -> tuple[dict[str, int], tuple[str, ...]]:
+    """Each field a window of `pack` holds and its length, and the fields a document's sizes are counted
+    along, each with its segment ids and positions: the first token field, and each along an axis of
+    its own (`PackedWindows`)."""
+    return (dict.fromkeys(pack.fields, pack.seq_len) | dict(pack.along),
+            (pack.fields[0], *(name for name, _ in pack.along)))
+
+
+class _FirstFitLaying:
+    """Documents, each as `pack` reads one (`Pack.document`), laid first-fit into windows as they come:
+    `pack.bins` windows open at a time, a document that fits none emitting every one that holds a
+    document and starting afresh. Each window it emits is its fields by name, as grain hands a window
+    on, with the places of the documents it holds among those laid, in the order it laid them, which
+    its segment ids number from 1."""
+
+    def __init__(self, pack: Pack):
+        self._pack = pack
+        self._lengths, self._paired = window_fields(pack)
+        self._placement = FirstFit([self._lengths[name] for name in self._paired], pack.bins, pack.segments)
+        self._count = 0
+        self.restart()
+
+    def restart(self) -> None:
+        """No window open."""
+        self._placement.restart()
+        self._laid: PackedWindows | None = None
+        self._held: list[list[int]] = [[] for _ in range(self._pack.bins)]
+
+    def holding(self) -> bool:
+        """Whether an open window holds a document."""
+        return self._placement.holding() > 0
+
+    def lay(self, document: Batch) -> list[tuple[Batch, tuple[int, ...]]]:
+        """`document` laid first-fit: the windows it emitted, where it fit no open one, else none. The
+        first of a set lays out the set's windows at its fields' dtypes and shapes, as grain lays them."""
+        sizes = [entries(document[name]) for name in self._paired]
+        chosen = self._placement.place(sizes)
+        emitted: list[tuple[Batch, tuple[int, ...]]] = []
+        if chosen is None:
+            emitted = self.emitted()
+            chosen = self._placement.place(sizes)
+            assert chosen == 0
+        if self._laid is None:
+            self._laid = PackedWindows(document, self._lengths, self._paired, self._pack.bins)
+        self._laid.add(chosen, document)
+        self._held[chosen].append(self._count)
+        self._count += 1
+        return emitted
+
+    def emitted(self) -> list[tuple[Batch, tuple[int, ...]]]:
+        """Every window that holds a document, in order, none open after."""
+        assert self._laid is not None
+        windows: list[tuple[Batch, tuple[int, ...]]] = [
+            (dict(sorted(window.items())), tuple(self._held[index]))
+            for index, window in enumerate(self._laid.windows())]
+        self.restart()
+        return windows
+
+
+def first_fit_windows(documents: Sequence[Batch], pack: Pack) -> list[tuple[Batch, tuple[int, ...]]]:
+    """`documents`, each as `pack` reads one (`Pack.document`), packed first-fit into windows in the
+    order given, as the stream's packer packs them (`FirstFitPacked`, `_FirstFitLaying`). Each window,
+    its fields by name, with the indices of the documents it holds in the order it laid them, which its
+    segment ids number from 1."""
+    laying = _FirstFitLaying(pack)
+    windows = [window for document in documents for window in laying.lay(document)]
+    return windows + laying.emitted() if laying.holding() else windows
+
+
+class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
+    def __init__(self, documents: pygrain.DatasetIterator[Batch], pack: Pack):
+        super().__init__(documents)
+        self._documents = documents
+        self._laying = _FirstFitLaying(pack)
+        self._restart(documents.get_state())
+        self._counter = 0
+
+    def _restart(self, began: Mapping[str, object]) -> None:
+        """No window open or emitted, the next document read where `began` stands."""
+        self._began, self._ending = began, None
+        self._laying.restart()
+        self._emitting: list[Batch] | None = None
+        self._next = 0
+
+    def _emitted(self, windows: list[tuple[Batch, tuple[int, ...]]],
+                 ending: Mapping[str, object]) -> list[Batch]:
+        """`windows`, to emit in order, the windows after them beginning where `ending` stands."""
+        self._ending = ending
+        self._emitting = [window for window, _ in windows]
+        return self._emitting
+
+    def __next__(self) -> Batch:
+        emitting = self._emitting
+        while emitting is None:
+            before = self._documents.get_state()
+            try:
+                document = next(self._documents)
+            except StopIteration:
+                if not self._laying.holding():
+                    raise
+                emitting = self._emitted(self._laying.emitted(), before)
+                break
+            emitted = self._laying.lay(document)
+            if emitted:
+                emitting = self._emitted(emitted, before)
+        window = emitting[self._next]
+        self._next += 1
+        self._counter += 1
+        if self._next == len(emitting):
+            # The windows after these begin with the document that did not fit them.
+            self._began, self._emitting, self._next = self._ending, None, 0
+        return window
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parent": self._began, "next_row": self._next, "counter": self._counter}
+
+    def set_state(self, state) -> None:
+        saved = record(state, "first-fit packer position")
+        self._documents.set_state(record(saved["parent"], "first-fit packer's documents"))
+        self._restart(self._documents.get_state())
+        self._next = integer(saved["next_row"], "first-fit packer's next window")
+        self._counter = integer(saved["counter"], "first-fit packer's windows emitted")
+
+    def close(self) -> None:
+        self._documents.close()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -258,6 +411,12 @@ class PackedSource(View[Source]):
 
     def describe(self) -> str:
         return f"{self.source.describe()} {self.plan.kind} packing={self.plan.pack!r}"
+
+    @property
+    def max_length(self) -> int:
+        """The inputs each window of the pack holds (`Pack.max_length`), which a token budget divides
+        into rows (`dew.data.pipeline.TokenGeometry`)."""
+        return self.plan.pack.max_length
 
     def consumed(self, read: Read) -> PackedSource:
         documents = _consumed(self.source, "indexed" if read == "streamed" else read)

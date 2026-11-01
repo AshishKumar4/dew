@@ -9,7 +9,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, widened
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import widened
 from reference_trees import evaluated, tree_contract, tree_sum
 
 from dew.interop import Pretrained

@@ -1,16 +1,18 @@
-"""The tiny decoder and the parameter-tree view several model tests share."""
+"""The tiny decoder, the parameter-tree view and the weight draws several model tests share."""
 
+import dataclasses
 import functools
 import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from lane_environment import outside_suite
 from flax import linen as nn
 
 from dew.inference import RunProcessor, TextGeneration
@@ -94,6 +96,40 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
     return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
 
 
+def called_outputs(forward: Callable[[int], jax.Array], calls: Sequence[tuple[int, int]]) -> jax.Array:
+    """A sequence's outputs at the shapes a cached rollout's `calls` compute them, each `(lo, hi)` a call
+    over positions `lo` to `hi`, `forward(n)` a forward over the sequence's first `n` positions: each
+    call's positions from a forward of its own over the sequence up to the call's last, at the width
+    the call reads (ledger 1543, the gate's ruling: a call's reference at the shapes the call computes,
+    where one forward over the whole sequence would compute every call's products at one row count,
+    which a GPU's kernel rounds apart by row count). Joined along the sequence, as one forward over it
+    would be; a float64 truth, whose products round alike at every shape, reads that one forward."""
+    return jnp.concatenate([forward(hi)[:, lo:hi] for lo, hi in calls], axis=1)
+
+
+def stepped_outputs(forward: Callable[[int], jax.Array], length: int, prefill: int) -> jax.Array:
+    """A sequence's outputs `[B, length, ...]` at the shapes a cached decode computes them (`called_outputs`),
+    `forward(n)` a forward over its first `n` positions: a prefill of its first `prefill` positions, then
+    one position a step."""
+    return called_outputs(forward, [(0, prefill), *((position, position + 1)
+                                                     for position in range(prefill, length))])
+
+
+def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, prefill: int) -> jax.Array:
+    """`forward`'s outputs over `sequence` `[B, S, ...]` at the shapes a cached decode computes them
+    (`stepped_outputs`)."""
+    return stepped_outputs(lambda length: forward(sequence[:, :length]), sequence.shape[1], prefill)
+
+
+def float64_twin(model: nn.Module) -> nn.Module:
+    """`model` computing in float64, its own `dtype` and every module it
+    holds: the truth a float32 run's rounding is measured from."""
+    fields = [field.name for field in dataclasses.fields(model) if field.name not in ("parent", "name")]
+    held = {name: float64_twin(getattr(model, name)) for name in fields
+            if isinstance(getattr(model, name), nn.Module)}
+    return model.clone(**held, **({"dtype": jnp.float64} if "dtype" in fields else {}))
+
+
 def largest_difference(left, right) -> float:
     """The largest absolute difference between two trees of the same structure, over every leaf; trees
     of another structure raise, as `jax.tree.map` pairs them."""
@@ -163,8 +199,7 @@ def streamed_export(writer: str, argument: Path, directory: Path, shard_size: st
     CPU device, as a user's has (the suite's simulated mesh would place every leaf eight times over),
     so no heap the writer freed is there for the save to reuse."""
     root = Path(__file__).resolve().parents[1]
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    env = {**outside_suite(os.environ), "PYTHONPATH": str(root / "src")}
     written = subprocess.run([sys.executable, "-c", writer, str(argument), str(directory / "source")],
                              capture_output=True, text=True, env=env)
     assert written.returncode == 0, written.stderr[-2000:]
@@ -226,9 +261,102 @@ def cached_round_trips(round_trip, cases, workspace) -> Callable[[str], object]:
 
 def parameter_loss(objective, variables, batch, step) -> Callable:
     """`objective`'s reduced loss of `batch` at `step` as a function of the parameters alone, the rest
-    of `variables` held: the function a reference's SGD step differentiates."""
+    of `variables` held: the function a reference's SGD step differentiates. Its statistics are read as
+    the trainer reads them (`Objective._loss`), whether or not the loss returns an `Aux` beside them."""
     def loss(params):
-        statistics, _ = objective.loss({**variables, "params": params}, batch, step)
+        statistics, _ = objective._loss({**variables, "params": params}, batch, step)
         return objective.reduce_loss(statistics)[0]
 
     return loss
+
+
+def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict], dict[str, jax.Array]]:
+    """Dew's forward of `source` (a loaded remote-code release, `Pretrained`) at a recorded `site`
+    (tests/remote_code_draws.py), in float64 with `wide`, the truth its recording is held to: a seed's
+    inputs to its outputs by leaf. `logits` over plain rows; `packed` over a packed row, each document's
+    positions from 0; `decode` through the decode cache in `CHUNKS`; `gradients`, the parameters'
+    gradient of the logits' product with the cotangent, by each parameter's dotted path; `update`, the
+    logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
+    rows, each row's real slots alone (`row0`, `row1`)."""
+    import optax
+    from reference_error import widened
+    from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, RATE, positions
+
+    from dew.batch import coordinates
+
+    model = source.model.clone(dtype=jnp.float64) if wide else source.model
+    variables = widened(source.variables) if wide else source.variables
+    if site == "packed":
+        segments = np.concatenate([np.full(length, index + 1) for index, length in enumerate(DOCUMENTS)])
+        placed = coordinates(segments=segments[None].astype(np.int32), positions=positions(),
+                             max_segments=len(DOCUMENTS) + 1)
+        return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"], coordinates=placed)})
+    if site == "decode":
+        made, step = decode_steps(model)
+
+        def decoded(inputs):
+            cache, steps, start = made(variables, inputs["ids"].shape[0]), [], 0
+            for chunk in CHUNKS:
+                logits, cache = step(variables, cache, inputs["ids"][:, start:start + chunk])
+                steps.append(logits)
+                start += chunk
+            return {"logits": jnp.concatenate(steps, axis=1)}
+        return decoded
+    if site == "gradients":
+        def gradients(inputs):
+            def loss(params):
+                logits = model.apply({**variables, "params": params}, inputs["ids"])
+                return jnp.sum(logits * inputs["cotangent"].astype(logits.dtype))
+            return dict(flat_tree(jax.grad(loss)(variables["params"])))
+        return jax.jit(gradients)
+    if site == "update":
+        def updated(inputs):
+            def loss(params):
+                logits = model.apply({**variables, "params": params}, inputs["ids"])
+                return optax.softmax_cross_entropy_with_integer_labels(
+                    logits[:, :-1], inputs["ids"][:, 1:]).mean()
+            params, optimizer = variables["params"], optax.sgd(RATE)
+            steps, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
+            return {"logits": model.apply({**variables, "params": optax.apply_updates(params, steps)},
+                                          inputs["ids"])}
+        return jax.jit(updated)
+    if site == "biased":
+        def biased(inputs):
+            mask = inputs["attention_mask"].astype(bool)
+            logits = model.apply(variables, inputs["ids"], attention_mask=mask)
+            return {"row0": logits[0], "row1": logits[1, PADDED:]}
+        return jax.jit(biased)
+    return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"])})
+
+
+def prediction_logits(model, variables, tokens):
+    """A causal transformer's multi-token prediction logits for `tokens`: its prediction depth's first, read
+    from its hidden states (`CausalTransformer.mtp_logits`)."""
+    hidden = model.apply(variables, tokens, method=CausalTransformer.hidden_states)
+    return model.apply(variables, hidden, tokens, method=CausalTransformer.mtp_logits)[0]
+
+
+def stepped_decode(model, variables, ids):
+    """`ids` decoded a token a call through the cache one token's call allocates, the calls one program
+    under a scan: the steps' logits `[B, S, V]` and the cache they leave."""
+    def step(cache, column):
+        logits, state = model.apply({**variables, "cache": cache}, column[:, None], decode=True,
+                                    mutable=["cache"])
+        return state["cache"], logits[:, 0]
+
+    cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
+    return jnp.moveaxis(steps, 0, 1), cache
+
+
+@jax.jit
+def moved(tree, key: jax.Array, scale: float):
+    """`tree` with each floating leaf moved by `scale` times its own normal draw from `key`, its dtype
+    kept, so no zero-initialized layer answers every input alike or takes no gradient; other leaves as
+    they are. One program draws and moves every leaf, compiled once a tree's structure and shapes."""
+    leaves, structure = jax.tree.flatten(tree)
+    keys = jax.random.split(key, len(leaves))
+    return jax.tree.unflatten(structure, [
+        (leaf + scale * jax.random.normal(each, leaf.shape)).astype(leaf.dtype)
+        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+        for leaf, each in zip(leaves, keys, strict=True)])

@@ -125,10 +125,16 @@ class FitStarted:
     seed: int | None = None
     """None: no integer seed recorded (a JAX key was supplied, or the record predates the field)."""
     tokens: int | None = None
+    examples: int | None = None
+    """The source examples a run on the examples clock is bounded to, its length where it counts no
+    steps ahead (`target_steps` None); None for a run counted otherwise."""
     cadences: Mapping[str, JSON] = dataclasses.field(default_factory=dict)
     """The run's cadences and schedule warmups as it resolved them, a share of the run among them
     (`dew.training.budget.every_step`, `dew.optim.OptimConfig.warmups`): steps, committed tokens or a
     duration by name."""
+    groups: Mapping[str, str] | None = None
+    """Where the optimizer's split sent each parameter and why, by its path (`dew.optim.OptimConfig.groups`:
+    Muon's matrices beside AdamW's vectors, lookups and filters); None for an optimizer that splits none."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -148,8 +154,10 @@ class StepCompiled:
     because the step did not fit, the links of the tensor and sequence axes
     the mesh splits, by axis name, the arithmetic of the check that it
     fits this process's devices (`dew.training.memory.memory_record`), and
-    its plan: the microbatches it reads each batch in, their rows, and every
-    compile the search made (`dew.training.memory.Probe`)."""
+    its plan: the microbatches it reads each batch in, their rows, every
+    compile the search made (`dew.training.memory.Probe`), its kernels
+    (`dew.training._lowering.KernelReport.record`), and the kernels those compiles found spilling and
+    the launch configs they refused (`dew.training.planning.FitSearch.kernels`)."""
     seconds: float
     remat: JSON
     links: Mapping[str, AxisLink]
@@ -165,7 +173,8 @@ class CheckpointRequested:
 
 
 @dataclasses.dataclass(frozen=True)
-class ProfileWindow:
+class ProfileTraced:
+    """The directory a fit's profile window (`dew.training.ProfileWindow`) wrote and the steps it traced."""
     directory: str
     steps: int
 
@@ -215,7 +224,7 @@ class TrialFinished:
     value: float
 
 
-type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | ProfileWindow | FitEnded
+type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | ProfileTraced | FitEnded
                | TrialFinished)
 # A PEP 695 alias holds its union in `__value__`; `get_args` of the alias
 # itself is empty, and these are the classes `isinstance` is given.

@@ -132,15 +132,13 @@ def bundle(root, destination):
     tasks with diffusers_extended_reference.py, then call bundle(ROOT,
     "tests/fixtures/tiny_diffusers.tar.xz"). No model downloads.
     """
-    import tarfile
-    from tools.native_diffusion_reference_files import convert
-    def native_files(info):
-        return None if info.name.endswith(".bin") else info
-    with tarfile.open(destination, "w:xz") as archive:
-        for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"):
-            directory = (Path(root) / task).resolve()
-            convert(directory)
-            archive.add(directory, arcname=task, filter=native_files)
+    from fixture_archive import write
+    from native_diffusion_reference_files import convert
+    tasks = ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety")
+    for task in tasks:
+        convert((Path(root) / task).resolve())
+    write(destination, (((Path(root) / task).resolve(), task) for task in tasks),
+          kept=lambda name: not name.endswith(".bin"))
 
 
 class Float64Numpy:

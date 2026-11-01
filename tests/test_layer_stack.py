@@ -13,15 +13,25 @@ import functools
 import json
 from pathlib import Path
 
+import interop_support
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from model_support import largest_difference
-from reference_error import FEWEST_SEEDS, GateFailure, as_given, assert_as_exact, widened, without_ynn
+from model_support import largest_difference, stepped_decode
+from reference_error import (
+    FEWEST_SEEDS,
+    GateFailure,
+    as_given,
+    assert_as_exact,
+    equations,
+    widened,
+    without_ynn,
+)
 from sharded import assert_sharded
 from token_support import token_rows
+from whole_suite import timed
 
 from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
@@ -275,7 +285,12 @@ class ScanCase:
         return arm("scanned"), arm("plain"), truth
 
 
-@pytest.mark.parametrize("shape", sorted(SHAPES))
+PAST_TARGET = {"scan": {"gemma3n": 151}}
+"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (66a222273, ledger 2137):
+Gemma 3n's scanned stack; every train scans the other shapes, the sparse gate's fault among them."""
+
+
+@pytest.mark.parametrize("shape", timed(PAST_TARGET, "scan", sorted(SHAPES)))
 def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
     run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
@@ -372,6 +387,101 @@ TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 4, "num_heads": 4
 
 def tiny(**overrides):
     return models.build("causal_transformer", **{**TINY, **overrides})
+
+
+PERIODIC_SEEDS = 8
+"""The periodic decode's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def hybrid(periods: int, **overrides):
+    """A stack of `periods` repeats of three windowed layers and one full one, Qwen3.5's pattern."""
+    return tiny(num_layers=4 * periods, max_seq_len=16,
+                layer_types=(("sliding_attention",) * 3 + ("full_attention",)) * periods,
+                kinds={"sliding_attention": {"window": 4}}, attention_impl="reference", **overrides)
+
+
+def decoded(model, variables, ids):
+    """Single-token steps through the cache (`stepped_decode`): the steps' logits, and the cache's paths."""
+    steps, cache = stepped_decode(model, variables, ids)
+    return steps, paths(cache)
+
+
+def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
+    """Under `scan_layers` a decode step over resident weights scans a stack whose layers repeat one
+    period as one body of the period's layers (`scan_groups(periodic=True)`): the step is one scan
+    over the period's repeats, its body the same for two periods as for six, its cache in the plain
+    loop's layout, and its steps decode as exactly as the plain loop's, both from the loop's own
+    float64 steps (check 1)."""
+    ids = jax.random.randint(jax.random.key(1), (2, 10), 0, VOCAB)
+
+    def program(model, variables):
+        """The step's one scan: its length and its body's operations."""
+        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+        graph = jax.make_jaxpr(lambda variables, cache: model.apply(
+            {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(variables, cache)
+        (scan,) = (equation for equation in graph.jaxpr.eqns if equation.primitive.name == "scan")
+        body = sorted(str(equation.primitive) for equation in equations(scan.params["jaxpr"]))
+        return scan.params["length"], body
+
+    short, deep = hybrid(2, scan_layers=True), hybrid(6, scan_layers=True)
+    (two, shallow), (six, body) = (program(model, model.init(jax.random.key(0), ids))
+                                   for model in (short, deep))
+    assert (two, six) == (2, 6) and shallow == body
+    plain = hybrid(6)
+    variables = plain.init(jax.random.key(0), ids)
+    assert decoded(deep, variables, ids)[1] == decoded(plain, variables, ids)[1]
+
+    def draw(seed):
+        return (np.random.default_rng([0x9E, seed]).integers(0, VOCAB, (2, 10)).astype(np.int32),)
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(decoded(hybrid(6, dtype=jnp.float64), widened(variables), ids)[0])
+
+    def steps(model):
+        return lambda ids: decoded(model, variables, ids)[0]
+
+    assert_as_exact(steps(deep), steps(plain), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
+                    truth_fn=truth)
+
+
+SOURCE_SCAN_SEEDS = 8
+"""A loaded source's scanned decode's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
+    """`Pretrained.load(..., scan_layers=True)`, a run's and a pipeline's `--source.scan-layers`
+    (`SourceOptions`), scans a loaded source's periodic stack in its decode step (ledger 642): qwen35-tiny's
+    period of three delta nets and an attention layer, twice in its transformers checkpoint, decodes as
+    one scan of the period's two repeats, its steps as exactly as the plain load's, both from its own
+    float64 steps (check 1)."""
+    import torch
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    config = json.loads((FIXTURES / "qwen35-tiny" / "config.json").read_text())
+    config.update(num_hidden_layers=8, layer_types=config["layer_types"] * 2)
+    torch.manual_seed(0)
+    Qwen3_5ForCausalLM(Qwen3_5TextConfig(**config)).to(torch.float32).save_pretrained(tmp_path)
+    plain, scanned = (Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", scan_layers=scan)
+                      for scan in (False, True))
+    ids = np.zeros((2, 1), np.int32)
+    cache = scanned.model.init(jax.random.key(0), ids, decode=True)["cache"]
+    graph = jax.make_jaxpr(lambda variables, cache: scanned.model.apply(
+        {**variables, "cache": cache}, ids, decode=True, mutable=["cache"]))(scanned.variables, cache)
+    assert [equation.params["length"] for equation in graph.jaxpr.eqns
+            if equation.primitive.name == "scan"] == [2]
+
+    draw = interop_support.token_draw(0x642, config["vocab_size"], (2, 10))
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(decoded(plain.model.clone(dtype=jnp.float64), widened(plain.variables), ids)[0])
+
+    def steps(source):
+        return lambda ids: decoded(source.model, source.variables, ids)[0]
+
+    assert_as_exact(steps(scanned), steps(plain), draw, "a loaded source's scanned decode",
+                    seeds=SOURCE_SCAN_SEEDS, truth_fn=truth)
 
 
 def bf16(**overrides):
@@ -510,9 +620,9 @@ def token_draw(rows):
 
 
 PIPELINED_STATES_SEEDS = 8
-"""The pipelined layer states' check-1 seeds, sized by `seeds_for` on armada (f913cd36a)."""
+"""The pipelined layer states' check-1 seeds, sized by `seeds_for` on armada (b11e684df)."""
 FETCHED_STATES_SEEDS = 8
-"""The host-fetched layer states' check-1 seeds, sized by `seeds_for` on armada (f913cd36a)."""
+"""The host-fetched layer states' check-1 seeds, sized by `seeds_for` on armada (b11e684df)."""
 
 
 def pipelined_layer_states():

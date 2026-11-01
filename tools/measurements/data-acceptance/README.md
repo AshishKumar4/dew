@@ -1,6 +1,6 @@
 # Data acceptance receipts
 
-The data loader's acceptance checks, measured at Dew `5e4698ff5` (main `54cf2697d` with this
+The data loader's acceptance checks, measured at Dew `0af730f70` (main `2c9999da5` with this
 tool) by `tools/benchmark_data.py`. Each arm runs in a fresh interpreter over the same produced
 files: Dew's reader (`ImageData` or `TextData` through `loader`) and plain Grain over the same
 record steps, two loading workers each.

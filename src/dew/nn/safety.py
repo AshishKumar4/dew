@@ -3,8 +3,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
-from dew.nn.attention import l2_normalized
 from dew.nn.dense import Dense
+from dew.nn.norms import l2_normalized
 from dew.nn.precision import float32_dot_general, float32_matmul
 from dew.nn.text_encoders import CLIPVisionTransformer
 

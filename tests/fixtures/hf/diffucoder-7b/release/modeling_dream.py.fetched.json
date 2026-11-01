@@ -1,0 +1,11 @@
+{
+ "bytes": 36763,
+ "kind": "release",
+ "license": "apple-amlr",
+ "origin": "release",
+ "path": "modeling_dream.py",
+ "reference": "apple/DiffuCoder-7B-Base@a2c33054cbe99b9ab7af074f09b1d13943157ff1/modeling_dream.py",
+ "repo": "apple/DiffuCoder-7B-Base",
+ "revision": "a2c33054cbe99b9ab7af074f09b1d13943157ff1",
+ "sha256": "3166e789f0d69beb1f4fbdee2317953d1c1c3b9bc21479b109afc5dd059de5b3"
+}

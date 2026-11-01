@@ -38,7 +38,8 @@ PER_SHARE = ("a per-share read resumes only on the shares, workers and cycle len
              "`dew data publish` or `publish(chain, Cache(url))`, and read it by index with "
              "`.cache(generation)`; provisioning a source's index (`dew data provision`) lets it be read by "
              "index, which is global only where every later step keeps a global order (no filter, flat "
-             "map, windows, online packing or workers before the batch)")
+             "map, windows, online packing or workers before the batch); or read the chain elastically "
+             "(`.elastic()`), which every reader reads whole and keeps its share of")
 """What a refusal of a per-share position on another topology tells its reader (docs/design/data.md §10,
 the provisioned lowering)."""
 
@@ -62,11 +63,19 @@ class Global:
     `records` counts every record of the run, the completed phases' too."""
 
     plan: Mapping[str, object] | None = None
+    tokens: tuple[int, ...] | None = ()
+    """The committed tokens each phase of `completed` ended at, for a run on the committed-token clock
+    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock,
+    None in a position written before positions held them."""
 
 
 def encode(place: Global) -> bytes:
     """`place` as the bytes a checkpoint stores for it."""
-    return json.dumps({ENVELOPE: dataclasses.asdict(place)}).encode()
+    held = dataclasses.asdict(place)
+    if place.tokens is None:
+        # A position read from before positions held stage tokens records none, as it was written.
+        del held["tokens"]
+    return json.dumps({ENVELOPE: held}).encode()
 
 
 def decode(position: bytes) -> Global | None:
@@ -76,14 +85,8 @@ def decode(position: bytes) -> Global | None:
     that are not JSON at all: a stream may report its state as any bytes it
     likes, and only this envelope carries the promise that no shard is in it.
     """
-    try:
-        stored = json.loads(position)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        # Bytes that are not JSON take the same path as JSON that is not this
-        # envelope, which is the one the docstring promises.
-        stored = None
-    envelope = stored.get(ENVELOPE) if isinstance(stored, dict) else None
-    if not isinstance(envelope, dict):
+    envelope = _enveloped(position, ENVELOPE)
+    if envelope is None:
         return None
     fields = {"records", "order", "completed"}
     if fields - set(envelope):
@@ -93,7 +96,8 @@ def decode(position: bytes) -> Global | None:
     completed = tuple((str(order), int(end)) for order, end in envelope["completed"])
     plan = envelope.get("plan")
     return Global(records=int(envelope["records"]), order=str(envelope["order"]),
-                  completed=completed, plan=None if plan is None else record(plan, "data plan"))
+                  completed=completed, plan=None if plan is None else record(plan, "data plan"),
+                  tokens=None if "tokens" not in envelope else tuple(int(end) for end in envelope["tokens"]))
 
 
 def read(position: bytes) -> Global:
@@ -109,7 +113,32 @@ def read(position: bytes) -> Global:
     return place
 
 
+REPLICATED = "dew_replicated_position"
+"""The key an elastic read's position is written under (`dew.data.Pipeline.elastic`): where the order
+one reader reads stopped, which every reader reads whole and keeps its share of, so every process
+writes the same one and any process count reads it back."""
+
+
+def replicated(position: bytes) -> Mapping[str, object] | None:
+    """The elastic read's position `position` holds (`REPLICATED`), or None for any other kind."""
+    return _enveloped(position, REPLICATED)
+
+
+def _enveloped(position: bytes, key: str) -> dict | None:
+    """The object `position` holds under dew's `key`, None where it is not JSON or holds no object
+    there."""
+    try:
+        stored = json.loads(position)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Bytes that are not JSON take the same path as JSON that is not this
+        # envelope, which is the one `decode` promises.
+        stored = None
+    held = stored.get(key) if isinstance(stored, dict) else None
+    return held if isinstance(held, dict) else None
+
+
 def translates(position: bytes) -> bool:
     """Whether a process count other than the one that wrote `position` can
-    read it: true for a global position, false for one shard's own offset."""
-    return decode(position) is not None
+    read it: true for a global position and an elastic read's, false for one
+    shard's own offset."""
+    return decode(position) is not None or replicated(position) is not None

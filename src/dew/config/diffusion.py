@@ -10,7 +10,6 @@ returns for the same file.
 from __future__ import annotations
 
 import dataclasses
-import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
 
@@ -20,8 +19,8 @@ import tyro
 
 from dew._records import number, record
 from dew.batch import Variables, merge
-from dew.checkpoints import Checkpoints
-from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
+from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
+from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
@@ -57,8 +56,10 @@ from dew.sampling.solvers import EulerAncestral, Solver
 
 if TYPE_CHECKING:
 
+    from dew.data.pipeline import Dataset
     from dew.diffusion.presets import Preset
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
+    from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
     # A kind's `union` imports every aliased class, so the run builds it at
     # the end of the module, where the annotations, read when a command line
@@ -66,26 +67,29 @@ if TYPE_CHECKING:
     # classes, which a reader and a checker need.
     PresetSpec = Preset
 
-# Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
+# Every other dial of a stage is `dew.nn.attention_blocks.Stage`'s own default, and
 # a stage that names one restates it.
 ATTENTION = {"heads": 8}
 
 # The default unet has attention everywhere but the full-resolution stage,
-# where it costs the most. Every other architecture takes its own kwargs as
-# JSON.
+# where it costs the most, and computes in bf16 over float32 parameters: half
+# the activations' memory and the convolutions on the tensor cores, as
+# mixed-precision training keeps it. Every other architecture takes its own
+# kwargs as JSON.
 DEFAULT_MODEL_CONFIG = {
     "attention_configs": [None, ATTENTION, ATTENTION, ATTENTION],
     "precision": "default",
-    "dtype": "bfloat16",
 }
 
 
 @dataclasses.dataclass(frozen=True)
 class FlowRolloutConfig:
-    """A run's Flow-GRPO rollout: `groups` samples of each prompt over `steps` time points, the first
-    `train_steps` transitions trained (all of them when None), each scored by the image metric
-    `reward` names, an alias or an import path, against its own prompt, higher being better
-    (`clip_score`). `build` makes the `FlowRollout` over an objective."""
+    """A run's flow RL rollout: `groups` samples of each prompt over `steps` time points, each scored by
+    the image metric `reward` names, an alias or an import path, against its own prompt, higher being
+    better (`clip_score`). Flow-GRPO trains the first `train_steps` transitions of each trajectory (all
+    of them when None) and DiffusionNFT each clean sample at the first `train_steps` times of its
+    sampler's grid (the released 9 when None). `build` makes the objective's rollout, a `FlowRollout`
+    or an `NFTRollout`."""
 
     reward: str = "clip_score"
     groups: int = 4
@@ -97,11 +101,12 @@ class FlowRolloutConfig:
             raise ValueError(f"reward names {self.reward!r}, which no metric alias names; the aliases are "
                              f"{sorted(metrics)}, or name a metric by its import path")
 
-    def build(self, objective: FlowGRPOObjective) -> FlowRollout:
+    def build(self, objective: FlowGRPOObjective | DiffusionNFTObjective) -> FlowRollout | NFTRollout:
         """The rollout over `objective`, scoring each sample with the metric's per-sample measure."""
         from dew.artifacts import ImageGrid
         from dew.eval.common import ImageMetric
         from dew.objectives.rl.flow import FlowRollout
+        from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
         metric = metrics[self.reward]()
         if not isinstance(metric, ImageMetric):
@@ -111,6 +116,9 @@ class FlowRolloutConfig:
         def reward(images, batch):
             return np.asarray(metric.fn(ImageGrid(images), batch))
 
+        if isinstance(objective, DiffusionNFTObjective):
+            trained = {} if self.train_steps is None else {"train_steps": self.train_steps}
+            return NFTRollout(objective, reward, groups=self.groups, steps=self.steps, **trained)
         return FlowRollout(objective, reward, groups=self.groups, steps=self.steps,
                            train_steps=self.train_steps)
 
@@ -161,15 +169,14 @@ class DiffusionRunConfig(RunConfig):
     autoencoder: PretrainedAutoencoder | None = None
     """The autoencoder for latent diffusion; None trains in pixel space."""
     pretrained: str | None = None
-    """A published diffusion pipeline to fine-tune.
+    """A published diffusion pipeline to fine-tune, or a saved diffusion run to start from.
 
-    It is a Hub repo, `repo@revision` or a local directory in the diffusers layout.
-    The checkpoint decides the model, its text conditioning and its autoencoder, so
-    `--model` holds only the precision settings and `text` and `autoencoder` stay
-    unset.
+    It is a Hub repo, `repo@revision` or a local directory in the diffusers layout,
+    or a saved Dew run's directory, which loads as its own sampling task at the step
+    `--source.step` selects (`load_diffusion_source`). The checkpoint decides the
+    model, its text conditioning and its autoencoder, so `--model` holds only the
+    precision settings and `text` and `autoencoder` stay unset.
     """
-    pretrained_param_dtype: DtypeName = "float32"
-    """The dtype `pretrained`'s parameters are stored and trained in."""
     teacher_run: str | None = None
     """The run directory a distillation's teacher trained in. Its published weights are the frozen
     teacher's (`teacher_variables=`), unless the starting tree holds the teacher; guidance distillation
@@ -185,16 +192,14 @@ class DiffusionRunConfig(RunConfig):
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
-        flow = issubclass(objectives[self.objective.name], FlowGRPOObjective)
+        flow = issubclass(objectives[self.objective.name], (FlowGRPOObjective, DiffusionNFTObjective))
         if flow and self.rollout is None:
             object.__setattr__(self, "rollout", FlowRolloutConfig())
         if not flow and self.rollout is not None:
-            raise ValueError(f"--rollout configures a Flow-GRPO run's rollout, and --objective "
+            raise ValueError(f"--rollout configures a flow RL run's rollout, and --objective "
                              f"{self.objective.name} trains on its data")
-        if self.pretrained is None and self.pretrained_param_dtype != "float32":
-            raise ValueError("--pretrained-param-dtype stores a --pretrained pipeline's parameters; "
-                             "this run loads none")
 
         if self.pretrained is not None:
             # The pipeline's own denoiser trains; the model flags it reads are
@@ -216,19 +221,6 @@ class DiffusionRunConfig(RunConfig):
         elif self.preset is None:
             raise ValueError("preset None trains on the convention a pretrained pipeline's "
                              "scheduler reads; name a preset or --pretrained")
-        # EDM's sigma draw is the space's: pixels without an autoencoder,
-        # latents with one. A regime or sigmas the preset states win.
-        if (isinstance(self.preset, EDM) and self.preset.regime is None
-                and (self.preset.P_mean is None or self.preset.P_std is None)):
-            latent = self.autoencoder is not None or self.pretrained is not None
-            object.__setattr__(self, "preset", dataclasses.replace(
-                self.preset, regime="latent" if latent else "pixel"))
-        # A resolution shift is the data's: the token count of its images.
-        if (isinstance(self.preset, Flow) and self.preset.resolution_shift is not None
-                and self.preset.resolution_shift.tokens is None and self.data is not None):
-            height, width = self.sample_field().shape[-3:-1]
-            object.__setattr__(self, "preset", dataclasses.replace(
-                self.preset, resolution_shift=self.preset.resolution_shift.at(height, width)))
         if self.audio is not None and self.text is not None:
             raise ValueError(
                 "the models take one context under textcontext, and this run names both "
@@ -238,11 +230,53 @@ class DiffusionRunConfig(RunConfig):
             raise ValueError("audio conditioning reads its clips' audio, and this chain's clips carry none "
                              "(dew.data.presets.clips(sample_rate=))")
 
+    def derived_preset(self) -> Preset | None:
+        """The run's preset as it builds its process, what it leaves to the run derived from the run as it
+        stands, so an override of what it derives from (the images' size, `data.images.size`, or the
+        autoencoder) derives it afresh, where the run records the preset as given: EDM's sigma draw the
+        space's, pixels without an autoencoder and latents with one, and a Flow resolution shift's token
+        count the data's images' (`ResolutionShift.at`). A regime, sigmas or token count the preset states
+        wins, a model whose grid is not the 16-pixel one stating its own."""
+        preset = self.preset
+        # A regime or sigmas the preset states win.
+        if isinstance(preset, EDM) and preset.regime is None and (
+                preset.P_mean is None or preset.P_std is None):
+            latent = self.autoencoder is not None or self.pretrained is not None
+            return dataclasses.replace(preset, regime="latent" if latent else "pixel")
+        shift = preset.resolution_shift if isinstance(preset, Flow) else None
+        if isinstance(preset, Flow) and shift is not None and shift.tokens is None and self.data is not None:
+            height, width = self.sample_field().shape[-3:-1]
+            return dataclasses.replace(preset, resolution_shift=shift.at(height, width))
+        return preset
+
     def sample_field(self) -> Field:
         """Return the batch field the model generates, at the resolution the data comes in
         (`Dataset.facts`): a clip's video, else an image. Raises ValueError for a chain of neither, or
         one whose size varies."""
         return media_field(self.chain(), "diffusion")
+
+    def mask_field(self, sample: Field, wanted: Field, chain: Dataset | None = None,
+                   name: str = "the chain") -> Field:
+        """The batch field an inpainting pipeline reads its mask from (`wanted`, the pipeline's own): the
+        chain's `wanted.key` (the run's data, or `chain`, a validation split `name`) at the samples' height
+        and width, one channel, as `dew.data.images.RandomMask` draws one or a dataset's own column decodes
+        one. A chain that carries none is refused, naming RandomMask: an inpainting pipeline paints the
+        region its mask marks, and a plain image chain marks none."""
+        fields = record((self.chain() if chain is None else chain).facts()["fields"], f"{name}'s fields")
+        shape = fields.get(wanted.key)
+        expected = (*sample.shape[:-1], 1)
+        if shape is None:
+            recipe = ("images(..., augment=RandomMask())" if chain is None else
+                      "images(..., augment=RandomMask(), rejects=False), whose random steps draw by each "
+                      "record's own index, which a dropped record would shift")
+            raise ValueError(f"{self.pretrained} is an inpainting pipeline, which paints the region a mask "
+                             f"marks in each image; {name} carries no {wanted.key!r} field: draw one per "
+                             f"image with dew.data.images.RandomMask() ({recipe}), or decode a dataset's "
+                             f"own into {wanted.key!r}")
+        if not isinstance(shape, list | tuple) or tuple(shape) != expected:
+            raise ValueError(f"{name}'s {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
+                             f"over {sample.key} of {sample.shape} reads a mask of {list(expected)}")
+        return Field(wanted.key, expected)
 
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict[str, Configured]:
         """Return the fields the run derives for the model, which `ModelConfig.build`
@@ -255,13 +289,13 @@ class DiffusionRunConfig(RunConfig):
         differentiates in time, turns a `TimeScaled` model's time features at
         `SMOOTH_TIME_SCALE` unless `model.fields` names a scale.
         """
-        fields: dict[str, Configured] = {}
+        fields: dict[str, Configured] = dict(self.numerics_fields())
         if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.name])}:
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
         model = self.model.build(**fields)
-        if isinstance(model, IntervalModel) and self.preset is not None:
-            built = self.preset()
+        if isinstance(model, IntervalModel) and (preset := self.derived_preset()) is not None:
+            built = preset()
             fields["interval"] = isinstance(built, Process) and built.interval
         if (issubclass(objectives[self.objective.name], MeanFlowObjective) and isinstance(model, TimeScaled)
                 and "time_scale" not in self.model.fields):
@@ -307,7 +341,9 @@ class DiffusionRunConfig(RunConfig):
 
     def _objective(self, variables: Variables | None) -> DiffusionObjective:
         """The configured objective over `variables`."""
+        mask = None
         if self.pretrained is None:
+            self.built_fresh()
             model, conditions, autoencoder = self._scratch(variables)
             sample, convention = self.sample_field(), None
         else:
@@ -322,9 +358,6 @@ class DiffusionRunConfig(RunConfig):
                 source = source.adapt(self.lora, key=self.trainer.key)
             if source.inputs is None:
                 raise ValueError(f"{self.pretrained} loads no diffusion inputs to train on")
-            if source.inputs.mask is not None:
-                raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
-                                 "on masks an image dataset does not carry")
             # The objective is built over the pipeline itself, which brings the sampling policy it
             # samples by (`DiffusionObjective`'s `model`); the run's own process, inputs and tree
             # stand over the pipeline's.
@@ -333,7 +366,8 @@ class DiffusionRunConfig(RunConfig):
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
-        inputs = InputSpec(sample=sample, conditions=conditions)
+            mask = None if source.inputs.mask is None else self.mask_field(sample, source.inputs.mask)
+        inputs = InputSpec(sample=sample, conditions=conditions, mask=mask)
         objective = self.objective.build(model=model, process=self._process(convention), inputs=inputs,
                                          autoencoder=autoencoder, variables=variables,
                                          **self._teacher(variables))
@@ -341,69 +375,76 @@ class DiffusionRunConfig(RunConfig):
         return objective
 
     def _teacher(self, variables: Variables | None) -> TeacherArguments:
-        """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
-        starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
-        objective rebuilt from the run's record over the tree the student holds frozen
-        (`teacher_weights`)."""
+        """The teacher a distillation reads from `teacher_run`, its step the one its task loads by
+        default (`SavedRun.pinned`): the model its run publishes (`SavedRun.variables`: the trained
+        policy, not a reference its average holds), unless the starting tree holds the teacher
+        (`TEACHER`), and for guidance distillation the teacher's objective over the run's own sampling
+        task (`TextToImage.from_saved`: its model, adapters included, its process and its inputs) bound
+        to the tree the student holds frozen (`teacher_weights`)."""
+        from dew.inference.images import TextToImage
+        from dew.inference.tasks import SavedRun
+
         if self.teacher_run is None:
             return {}
         kind = objectives[self.objective.name]
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
-        published: Variables | None = None
-        if variables is None or TEACHER not in variables:
-            # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
-            with Checkpoints(self.teacher_run) as checkpoints:
-                published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
-                                                  param_dtype=None)
+        # A student that holds its teacher reads its run for guidance distillation's components alone.
+        fresh = variables is None or TEACHER not in variables
+        if not fresh and not issubclass(kind, GuidanceDistillationObjective):
+            return {}
+        run = SavedRun.pinned(self.teacher_run)
+        published = run.variables(ema=None) if fresh else None
         given: TeacherArguments = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
-            held = teacher_weights(variables, published, whole=True)
-            given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
+            task = TextToImage.from_saved(run, variables=teacher_weights(variables, published, whole=True))
+            given["teacher"] = DiffusionObjective(task.model, task.process, task.inputs,
+                                                  autoencoder=task.autoencoder, ema_decay=None)
         return given
 
-    def prepare(self) -> Prepared:
+    def build_run(self) -> Prepared:
         """The objective `build` makes, with the run's Hub sources pinned
         (`pinned`), on its data, whose captions the objective's conditions
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
         the batches it trains on (`rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
-        run = self.pinned()
+        run = self
         objective = run.build()
+        mask = objective.inputs.mask
+        if mask is not None and run.validation is not None:
+            # Each evaluation scores its splits through their masks, as the run trains through its own.
+            splits = run.validation if isinstance(run.validation, Mapping) else {"validation": run.validation}
+            for name, split in splits.items():
+                run.mask_field(objective.inputs.sample, mask, split, f"the {name!r} split")
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.validation_metrics(validates=bool(held))
         rollout = None
-        if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
+        if isinstance(objective, (FlowGRPOObjective, DiffusionNFTObjective)) and run.rollout is not None:
             rollout = run.rollout.build(objective)
-        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
-                                                    rollout=rollout, validation=held))
+        return Prepared(run, objective, dataset, metrics=metrics, rollout=rollout, validation=held)
 
     def pinned(self) -> DiffusionRunConfig:
-        """Return this run with its Hub sources pinned to the commits they resolve to now.
-
-        The sources are `pretrained` and the alignment's encoder, so the record names
+        """Return this run with its Hub sources pinned to the commits they resolve to now: an imported
+        adapter's (`RunConfig.pinned`), `pretrained` and the alignment's encoder, so the record names
         the weights the run started from.
         """
-        from dew.interop import sources
-
-        def pin(source: str) -> str:
-            if os.path.isdir(source):
-                return source
-            reference = sources.SourceReference.parse(source)
-            return f"{reference.name}@{reference.metadata().name}"
+        from dew.interop.sources import pinned_source
 
         objective = self.objective
         stated = objective.fields.get("alignment")
         if isinstance(stated, Mapping):
             alignment = from_record(Alignment, stated)
             if alignment.source is not None:
-                objective = dataclasses.replace(objective, fields={**objective.fields, "alignment": to_record(
-                    dataclasses.replace(alignment, source=pin(alignment.source)), Alignment)})
-        return dataclasses.replace(self, pretrained=None if self.pretrained is None else pin(self.pretrained),
-                                   objective=objective)
+                pinned = dataclasses.replace(alignment, source=pinned_source(alignment.source))
+                objective = dataclasses.replace(
+                    objective, fields={**objective.fields, "alignment": to_record(pinned, Alignment)})
+        pretrained = None if self.pretrained is None else pinned_source(self.pretrained)
+        return dataclasses.replace(super().pinned().with_pinned_run(self.pretrained), objective=objective,
+                                   pretrained=pretrained)
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
@@ -432,13 +473,14 @@ class DiffusionRunConfig(RunConfig):
 
     @property
     def _compute(self) -> DtypeName | None:
-        """The compute dtype the model's record names, which the text and audio
-        encoders and a pretrained pipeline compute in too."""
+        """The compute dtype the model's record names, which the text and audio encoders compute in
+        too; None where it names none, each encoder its own, as its data plan records it (its
+        tokenizer's identity holds its dtype)."""
         held = self.model.fields.get("dtype")
         return None if held is None else dtype_name(resolve_dtype(str(held)))
 
     def _source(self, variables: Variables | None):
-        """The `pretrained` pipeline at the data's resolution: its own
+        """The `pretrained` pipeline, or saved run's task, at the data's resolution: its own
         weights, or `variables` bound over its metadata."""
         from dew.interop.pretrained import load_diffusion_source
         from dew.interop.sources import SourceReference
@@ -449,13 +491,14 @@ class DiffusionRunConfig(RunConfig):
         # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
         placement = self.source_keywords(frozen=self.lora is not None)
         return load_diffusion_source(
-            reference.name, revision=reference.revision, dtype=self._compute or "bfloat16",
-            param_dtype=self.pretrained_param_dtype,
-            attention_impl=str(self.model.fields.get("attention_impl", "auto")),
+            reference.name, revision=reference.revision,
+            dtype=dtype_name(jax.numpy.dtype(self.compute_dtype())),
+            param_dtype=placement["param_dtype"], attention_impl=self.source_attention(),
             size=self.sample_field().shape[:-1],
             variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
             text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
-            modeling_overrides=placement.get("modeling_overrides"))
+            modeling_overrides=placement.get("modeling_overrides"), step=placement.get("step"),
+            ema=placement.get("ema"))
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained
@@ -464,7 +507,9 @@ class DiffusionRunConfig(RunConfig):
         if self.preset is None:
             assert convention is not None
             return convention
-        process = build_process(self.preset)
+        preset = self.derived_preset()
+        assert preset is not None
+        process = build_process(preset)
         if convention is not None and (
                 type(process.schedule) is not type(convention.schedule)
                 or type(process.prediction) is not type(convention.prediction)):

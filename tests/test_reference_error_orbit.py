@@ -77,6 +77,19 @@ def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
     np.testing.assert_array_equal(over.theirs, at[0].theirs)
 
 
+def test_a_paired_sizing_sizes_an_orbit_over_its_orders():
+    """`seeds_for` takes the site's orders: paired, an orbit site is sized over the evidence its verdict
+    reads, each seed's draw over every order, and the verdict at that count passes."""
+    seeds = seeds_for(_outer_first, _cancelling_draw, "cancelling sums", dew_fn=_left_to_right,
+                      orders=_swapped)
+    assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
+                    orders=_swapped)
+    # The orders reach the sizing's draws: an orbit of the draw's own order alone is refused there.
+    with pytest.raises(ValueError):
+        seeds_for(_outer_first, _cancelling_draw, "one order", dew_fn=_left_to_right,
+                  orders=lambda inputs: [inputs])
+
+
 def test_an_orbit_fails_a_dew_wrong_only_at_another_order():
     """A reference exact on the cancelling row at every order holds a Dew exact at the draw's own order
     and all error at the other: one order passes it, the orbit fails it."""
@@ -137,14 +150,16 @@ def test_an_orbit_still_fails_a_sum_that_differs():
 
 
 def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
-    """A recorded reference (`indexed_recording`'s, which it marks `recorded`) holds its recorded draws
-    alone, and an orbit holds the draw's own order and another."""
+    """A recorded reference (`indexed_recording`'s, which it marks `recorded`), the site's or a further one,
+    holds its recorded draws alone, and an orbit holds the draw's own order and another."""
     def recorded(terms):
         return _outer_first(terms)
     recorded.recorded = True
 
     with pytest.raises(ValueError):
         _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)
+    with pytest.raises(ValueError):
+        _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=_swapped, also=[recorded])
     with pytest.raises(ValueError):
         _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
 
@@ -158,7 +173,7 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
     for width in (1, 2, 3, 8):
         factor = NARROW_FACTORS.get(width, ROW_FACTOR)
         for worst, fails in ((0.99 * factor, False), (1.01 * factor, True)):
-            # The draws hold each worst row by its log (`_log_over`).
+            # The draws hold each worst row by its log (`log_over`).
             draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)),
                            np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
                            np.ones((8, 1), bool), (width,))

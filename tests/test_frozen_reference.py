@@ -17,7 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from affine_run import Counting, frozen_trainer
+from affine_run import Counting
+from affine_training import frozen_trainer
 
 from dew.data.dataset import Loader
 

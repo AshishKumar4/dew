@@ -52,7 +52,8 @@ from decision_support import decision_rows
 from flax.nnx import bridge
 from recording import RecordingTracker
 from steady_state import steady_state
-from tiny_models import PER_ARCH, TINY
+from test_text_rollout_contract import assert_generation_scores_as_full_forwards
+from tiny_configs import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Loader, replayed
@@ -86,6 +87,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import PPOObjective, ValueHead
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 from dew.objectives.rl.grpo import GRPOObjective
+from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
 from dew.objectives.rl.preference import DPOObjective
 from dew.objectives.rl.sessions import (
@@ -459,12 +461,12 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     or variable, does not. The trainer builds the tree, and its step on the batch logs a finite
     loss and leaves every trained leaf finite, some of them moved: Adam's
     first update moves a leaf exactly where its gradient is nonzero, and a
-    gradient that is not finite would leave the leaf so. The run checkpoints
-    its step, and evaluation scores `evaluated` (the batch by default) to
+    gradient that is not finite would leave the leaf so. The run trains two
+    steps, checkpointing each, and evaluation scores `evaluated` (the batch by default) to
     finite artifacts, or, for an objective that scores no tokens (`scores`
     False), to none; a second evaluation runs the programs the first
-    compiled, tracing nothing. The run resumes from its checkpoint onto the
-    run that never stopped (`assert_resumes`). `data` replaces the batch stream
+    compiled, tracing nothing. A run resumed from its first checkpoint ends on
+    this run, which never stopped (`assert_resumes`). `data` replaces the batch stream
     with the method's own; a method that trains on what its `rollout` samples
     from the batch, not on the batch (`sampled` False), has no sample field to
     check.
@@ -481,44 +483,44 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
                       rollout=rollout)
-    # The state fit places, which a run that never stopped starts from too.
-    initial, _, _ = trainer.place()
-    started = jax.device_get(initial.variables["params"])
     if data is None:
         data = Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=ROWS, records=None)
-    state = trainer.fit(data, steps=1, log_every=1, state=initial)
+    # A fresh fit, its own batch-aware startup the one a run that never stopped takes.
+    state = trainer.fit(data, steps=2, log_every=1, checkpoint_every=1)
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
-    assert len(losses) == 1 and np.isfinite(losses[0]), losses
+    assert len(losses) == 2 and np.all(np.isfinite(losses)), losses
     variables = jax.device_get(state.variables)
     assert finite(variables), "a trained leaf is not finite"
+    # The second step's update, from the first's checkpoint: Adam moves a leaf where its gradient is nonzero.
+    started = Checkpoints(str(directory)).variables(step=1)["params"]
     moved = [not np.array_equal(before, after) for before, after in
              zip(jax.tree.leaves(started), jax.tree.leaves(variables["params"]), strict=True)]
     assert any(moved), "the step moved no trained leaf: no gradient reached them"
-    assert Checkpoints(str(directory)).latest == 1
+    assert Checkpoints(str(directory)).latest == 2
     trained = Trained(directory, state, variables)
     artifact = objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
     # An objective that scores no tokens evaluates to nothing (`Objective.evaluate`).
     assert (artifact is not None and finite(artifact)) if scores else artifact is None, artifact
     with steady_state(allow=("host_to_device", "device_to_host")):
         objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
-    assert_resumes(objective, data, directory, rollout)
+    assert_resumes(objective, data, directory, rollout, trainer, state)
     return trained
 
 
-def assert_resumes(objective, data, directory: Path, rollout) -> None:
+def assert_resumes(objective, data, directory: Path, rollout, whole: Trainer, uninterrupted) -> None:
     """A new trainer resumed from the run's first checkpoint ends its second step on every leaf of
-    a run of two steps that never stopped, bit for bit, keys as their raw bits, and its step reads
-    the restored state as that run's read its fresh one: the same avals, shardings and formats, so
-    it runs the program the persistent cache holds for the step. It resumes from a copy of the
-    checkpoint's directory, so the checkpoint the cell reloads stays the first step's."""
+    the run's own two steps (`whole`'s, ending at `uninterrupted`), which never stopped, bit for bit,
+    keys as their raw bits, and its step reads the restored state as that run's read its fresh one:
+    the same avals, shardings and formats, so it runs the program the persistent cache holds for the
+    step. It resumes from a copy of the run's directory holding its first step alone, so the
+    checkpoint the cell reloads stays the run's last."""
     copied = directory.with_name(f"{directory.name}-resumed")
     shutil.copytree(directory, copied)
+    shutil.rmtree(Checkpoints(str(copied)).path(2))
     resumed = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(copied)),
                       rollout=rollout)
     after = resumed.fit(data, steps=2, log_every=1, checkpoint_final=False)
-    whole = Trainer(objective, optax.adam(1e-3), key=0, rollout=rollout)
-    uninterrupted = whole.fit(data, steps=2, log_every=1)
     assert int(after.step) == int(uninterrupted.step) == 2
 
     def bits(tree):
@@ -677,7 +679,10 @@ def decision(family: Family, directory: Path) -> None:
     tokenizer, specials = vocabulary(held)
     layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
         max_len=48, head_max_len=32, option_tokens=4)
-    objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout)
+    # A backbone that reads one document a row (no packing) holds one row a window (`segments`).
+    windows = {} if PACKING in family.facts else {"segments": 1}
+    objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout,
+                                  **windows)
     data = decision_rows(EXAMPLES, ROWS, EXAMPLES, objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
     trained = assert_trains(objective, batch, directory, data=data)
@@ -735,18 +740,28 @@ def mask_id(family: Family) -> int:
     return model.mask_token_id if MASK_TOKEN in family.facts else TOKENS[1]
 
 
+GENERATION_SEEDS: Mapping[str, int] = {f"{family} generation {leaf}": 8 for family in ALL
+                                       for leaf in ("raw", "policy")} | {
+    "causal_transformer+gated_delta_hybrid generation raw": 32,
+    "causal_transformer+gated_delta_hybrid generation policy": 64,
+    "multimodal_transformer+gemma3 generation policy": 32}
+"""Check 1's declared seeds for each family's cached generation, raw and under its policy, sized by
+`seeds_for` paired with the cached arm on armada: 8, but where named."""
+
+
 def generation(family: Family, directory: Path) -> None:
-    """Cached greedy decoding continues a prompt with the tokens the full
-    forward pass ranks first at every position it decoded."""
+    """The task continues each prompt after its own tokens, and cached decoding of left-padded prompts
+    scores each drawn token on par with a fresh full forward over the row's unpadded tokens, raw and
+    under the top-k policy that drew it, from the family's float64 twin (check 1,
+    test_text_rollout_contract.py's `assert_generation_scores_as_full_forwards`)."""
     held = loaded(family)
     variables = held.variables or held.model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     task = TextGeneration(held.model, variables, sampling=Sampling(temperature=0.0))
     prompt = token_batch(SEQ // 2, seed=8)[:2]
-    generated = task(prompt.tolist(), SEQ // 2, key=0)
-    tokens = np.asarray(generated.tokens)
+    tokens = np.asarray(task(prompt.tolist(), SEQ // 2, key=0).tokens)
     assert tokens.shape == (2, SEQ) and (tokens[:, :SEQ // 2] == prompt).all()
-    logits = np.asarray(held.model.apply(variables, jnp.asarray(tokens)))
-    np.testing.assert_array_equal(logits[:, SEQ // 2 - 1:-1].argmax(-1), tokens[:, SEQ // 2:])
+    assert_generation_scores_as_full_forwards(held.model, f"{family} generation", params=variables,
+                                              seeds=GENERATION_SEEDS)
 
 
 # --- denoising methods -------------------------------------------------------
@@ -890,6 +905,19 @@ def flow_grpo(family: Family, directory: Path) -> None:
                                   variables=held.variables)
     rollout = FlowRollout(objective, reward=lambda samples, batch: np.mean(samples, axis=tuple(
         range(1, np.ndim(samples)))), groups=2, steps=3)
+    assert_trains(objective, denoised_batch(inputs), directory, sampled=False, rollout=rollout)
+
+
+def diffusion_nft(family: Family, directory: Path) -> None:
+    """DiffusionNFT's implicit positive and negative policies over the clean samples its rollout draws
+    with the old policy, each scored against its group by a reward, its velocity held near the base
+    model's where the family starts from one (a loaded tree; a fresh one has no base to stay near)."""
+    held = loaded(family)
+    inputs = family.inputs()
+    objective = DiffusionNFTObjective(held.model, presets.Flow(), inputs, steps=2, variables=held.variables,
+                                      kl=0.0 if held.variables is None else 1e-4)
+    rollout = NFTRollout(objective, reward=lambda samples, batch: np.mean(samples, axis=tuple(
+        range(1, np.ndim(samples)))), groups=2, steps=3, train_steps=2)
     assert_trains(objective, denoised_batch(inputs), directory, sampled=False, rollout=rollout)
 
 
@@ -1041,6 +1069,8 @@ METHODS: tuple[Method, ...] = (
     Method("rcm", frozenset({DENOISES}), frozenset(), rcm, trains=("rcm",),
            within=lambda family: family.name in DISTILLED),
     Method("flow_grpo", frozenset({DENOISES}), frozenset(), flow_grpo, trains=("flow_grpo",),
+           within=lambda family: family.name in DISTILLED),
+    Method("diffusion_nft", frozenset({DENOISES}), frozenset(), diffusion_nft, trains=("diffusion_nft",),
            within=lambda family: family.name in DISTILLED),
     Method("ladd", frozenset({DENOISES}), frozenset({FEATURES}), ladd, refuse_ladd, trains=("ladd",),
            within=lambda family: family.name in DISTILLED | {"hybrid_dit"}),

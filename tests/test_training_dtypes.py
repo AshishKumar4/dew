@@ -49,6 +49,38 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
     np.testing.assert_array_equal(gradient, expected)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_token_lookup_takes_forward_mode_and_nested_derivatives(dtype):
+    """The lookup under `jax.jvp` and `jax.linearize` with respect to its table takes the gather's own
+    tangent, bit for bit, where its custom VJP alone refused forward mode (row 1869, audit NN-06), and forward
+    over reverse is the gather's own; its gradient still accumulates in the table's dtype (the test above)."""
+    model = TokenEmbedding(5, 3, dtype=dtype)
+    ids = jnp.asarray([[0, 4, 4, 2]], jnp.int32)
+    table = model.init(jax.random.key(6), ids)["params"]["embedding"]
+    direction = jax.random.normal(jax.random.key(7), table.shape, table.dtype)
+
+    def lookup(table):
+        return model.apply({"params": {"embedding": table}}, ids)
+
+    def gathered(table):
+        return table[ids].astype(dtype)
+
+    found = jax.jit(lambda t: jax.jvp(lookup, (t,), (direction,)))(table)
+    want = jax.jit(lambda t: jax.jvp(gathered, (t,), (direction,)))(table)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+    linearized = jax.jit(lambda t: jax.linearize(lookup, t)[1](direction))(table)
+    np.testing.assert_array_equal(linearized, want[1])
+
+    def nested(fn):
+        def loss(table):
+            return jnp.sum(fn(table).astype(jnp.float32) ** 2)
+
+        return jax.jit(lambda t: jax.jvp(jax.grad(loss), (t,), (direction,))[1])(table)
+
+    # Both scatter-add the rows in the table's dtype, in the ids' order.
+    np.testing.assert_array_equal(nested(lookup), nested(gathered))
+
+
 @pytest.mark.parametrize("vocab, padding_idx", [(5, 0), (5, 4), (5, -1), (5, -5), (1, 0), (1, -1)])
 def test_a_padding_rows_lookups_train_it_no_more_than_torchs(vocab, padding_idx):
     """`padding_idx` leaves the row its id names untrained by every lookup of it, as torch's
@@ -356,7 +388,7 @@ def test_optimizer_dtype_overflow_backs_off_and_drops_its_window():
 def test_an_ema_leaf_the_step_left_alone_keeps_its_average_bit_for_bit(dtype, decay):
     """`ema_update` of a leaf whose live value is its average returns that average bit for bit, at any
     decay, however its program fuses the update: a parameter no gradient moved keeps its EMA as it was."""
-    from dew.training.transaction import ema_update
+    from dew.averaging import ema_update
 
     average = jnp.asarray(np.random.default_rng(0).standard_normal(4096), dtype)
     kept = jax.jit(ema_update)({"w": average}, {"w": average}, decay)["w"]
@@ -367,7 +399,7 @@ def test_an_ema_of_finite_leaves_of_opposite_signs_stays_their_finite_average():
     """`ema_update` between finite leaves returns their weighted average wherever it is finite, at the ends
     of fp32's range too: an average of 2**127 and a live value of -(2**127) at decay 0.5 average to exactly 0,
     where their difference alone overflows."""
-    from dew.training.transaction import ema_update
+    from dew.averaging import ema_update
 
     average = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 3e38], jnp.float32)
     live = jnp.asarray([-(2.0 ** 127), 2.0 ** 127, -3e38], jnp.float32)
@@ -379,7 +411,7 @@ def test_an_ema_of_a_leaf_the_step_left_alone_is_nan_at_a_nan_decay():
     """`ema_update` at a NaN decay returns NaN, a leaf the step left as it was among them, as the weighted
     sum does: the resulting state's finiteness check sees the bad decay, rather than a select that keeps the
     leaf hiding it."""
-    from dew.training.transaction import ema_update
+    from dew.averaging import ema_update
 
     leaf = jnp.asarray([1.0, -2.0], jnp.float32)
     updated = jax.jit(ema_update)({"w": leaf}, {"w": leaf}, jnp.float32(np.nan))["w"]

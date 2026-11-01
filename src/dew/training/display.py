@@ -45,6 +45,7 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
+from dew.data.pipeline import cut_unit
 from dew.logging import display_console
 from dew.mesh import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
@@ -68,6 +69,10 @@ WORSE = Style(color="#d9534f")
 PLAIN = Shown()
 # The panel's width on a wide terminal; a narrower one gets all of its own.
 WIDEST = 120
+
+EXAMPLES_CONSUMED_SCALAR = "train/examples_consumed"
+"""The scalar a run on the examples clock logs its consumed examples under (`dew.training.interval.
+Interval.consumption`), which the display reads."""
 
 
 def redraws(console: Console) -> bool:
@@ -284,9 +289,11 @@ def data_line(counters: Mapping[str, float]) -> Text | None:
     (`data/rows/<label>`), as they are, since a chain's labels count different stages (a mixture's
     corpora the rows they fed it, the mixture those a later step kept) and no sum of them is the
     run's; the records rejected, summed over the labels, with each reason only where something was
-    rejected for it (`data/rejected/<label>/<reason>`); and the share of the rows truncated where
-    any was (`data/truncated/<label>`, each label's share of its own rows). None where the run
-    reports no rows."""
+    rejected for it (`data/rejected/<label>/<reason>`); the share of the rows truncated where
+    any was (`data/truncated/<label>`, each label's share of its own rows); and each cut by what it
+    cut, the rows it shortened and the tokens it removed, summed over the labels, where any was
+    (`data/cut/<label>/<kind>`, `data/cut_removed/<label>/<kind>`). None where the run reports no
+    rows."""
     rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
             if name.startswith("data/rows/")}
     if not rows:
@@ -307,6 +314,19 @@ def data_line(counters: Mapping[str, float]) -> Text | None:
     weight = sum(rows[label] for label in shares)
     if weight and (truncated := sum(share * rows[label] for label, share in shares.items())):
         line.append("  ·  ", LABEL).append(f"{truncated / weight:.1%}", "bold").append(" truncated", LABEL)
+    cut: collections.Counter[str] = collections.Counter()
+    removed: collections.Counter[str] = collections.Counter()
+    for name, value in counters.items():
+        if name.startswith("data/cut/"):
+            cut[name.rpartition("/")[2]] += int(value)
+        elif name.startswith("data/cut_removed/"):
+            removed[name.rpartition("/")[2]] += int(value)
+    for kind, count in cut.items():
+        if count:
+            line.append("  ·  ", LABEL).append(f"{count:,}", "bold").append(f" {kind} cut", LABEL)
+            unit = cut_unit(kind)
+            if unit is not None:
+                line.append(f" ({removed[kind]:,} {unit})", LABEL)
     return line
 
 
@@ -325,6 +345,11 @@ class TrainingDisplay:
     header: list[tuple[str, str]] = dataclasses.field(default_factory=list)
     shown: Mapping[str, Shown] = dataclasses.field(default_factory=dict)
     total: int | None = 0
+    examples: int | None = None
+    """The examples a run on the examples clock is bounded to (`FitStarted.examples`), whose progress the
+    bar shows and whose steps it estimates; None for a run of steps or tokens."""
+    consumed: float = 0.0
+    """The examples the run has consumed, as its last logged interval read them."""
     first: int | None = None
     current: int = 0
     started: float = 0.0
@@ -366,7 +391,7 @@ class TrainingDisplay:
         `averaged` says evaluation scores the EMA rather than the live
         weights."""
         self.first = self.current = started.start_step
-        self.total = started.target_steps
+        self.total, self.examples = started.target_steps, started.examples
         self.started = time.perf_counter()
         self.shown = shown
         self.averaged = averaged
@@ -387,7 +412,8 @@ class TrainingDisplay:
         console = Console()
         if not redraws(console):
             target = (f"to {started.target_steps}" if started.target_steps is not None
-                      else f"for {started.tokens} real tokens")
+                      else f"for {started.tokens} real tokens" if started.tokens is not None
+                      else f"for {started.examples} examples" if started.examples is not None else "")
             self.note(f"Training {model} from step {started.start_step} {target}: "
                       + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return
@@ -425,6 +451,7 @@ class TrainingDisplay:
         if not self.shown_here:
             return
         self.corpus_counts = {name: value for name, value in scalars.items() if name.startswith("data/")}
+        self.consumed = scalars.get(EXAMPLES_CONSUMED_SCALAR, self.consumed)
         for name, value in scalars.items():
             if name in self.corpus_counts:
                 continue
@@ -436,13 +463,14 @@ class TrainingDisplay:
             rows[name].values.append(value)
         self.reported = frozenset(scalars) - self.corpus_counts.keys()
         if self.live is None:
-            target = "" if self.total is None else f"/{self.total}"
+            total, shown = self.steps_total()
+            target = "" if total is None else f"/{shown}"
             line = f"step {step}{target}  " + "  ".join(
                 f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
             if (counted := data_line(self.corpus_counts)) is not None:
                 line += f"  {counted.plain}"
-            if (rate := self.rate()) and self.total is not None and step < self.total:
-                line += f"  {duration((self.total - step) / rate)} left"
+            if (rate := self.rate()) and total is not None and step < total:
+                line += f"  {duration((total - step) / rate)} left"
             self.note(line)
 
     def evaluation(self, evaluation: Evaluation) -> None:
@@ -577,6 +605,17 @@ class TrainingDisplay:
                 rows.append((heading, Row(self.named(bare), shown, values)))
         return rows
 
+    def steps_total(self) -> tuple[int | None, str]:
+        """The run's steps, as shown: its own where it counts them ahead, else, on the examples clock,
+        estimated from the examples its steps have consumed (`≈`), shown and never used; None before
+        a run of no count has consumed any."""
+        if self.total is not None:
+            return self.total, str(self.total)
+        if self.examples is None or not self.consumed:
+            return None, ""
+        estimated = max(self.current, round(self.current * self.examples / self.consumed))
+        return estimated, f"≈{estimated}"
+
     def rate(self) -> float | None:
         """Steps a second over the last few seconds of steps."""
         if len(self.pace) < 2:
@@ -602,17 +641,20 @@ class TrainingDisplay:
         # The bar, with the step, the percentage, the rate and the times.
         rate = self.rate()
         elapsed = time.perf_counter() - self.started
-        fraction = None if self.total is None else self.current / max(self.total, 1)
+        total, shown = self.steps_total()
+        # A run on the examples clock shows its progress exactly, in the examples it has consumed.
+        fraction = (None if total is None else self.current / max(total, 1) if self.total is not None
+                    else min(self.consumed / max(self.examples or 1, 1), 1.0))
         stats = Text()
         stats.append(str(self.current), "bold")
         if fraction is not None:
-            stats.append(f"/{self.total}", LABEL).append(f"  {fraction:>4.0%}")
+            stats.append(f"/{shown}", LABEL).append(f"  {fraction:>4.0%}")
         if rate:
             stats.append(f"  {rate:.1f}" if rate >= 1 else f"  {1 / rate:.1f}")
             stats.append(" step/s" if rate >= 1 else " s/step", LABEL)
         stats.append(f"  {duration(elapsed)}")
-        if rate and self.total is not None and self.current < self.total:
-            stats.append(" + ", LABEL).append(duration((self.total - self.current) / rate))
+        if rate and total is not None and self.current < total:
+            stats.append(" + ", LABEL).append(duration((total - self.current) / rate))
             stats.append(" left", LABEL)
         room = inner - len(stats) - 2
         if fraction is None:

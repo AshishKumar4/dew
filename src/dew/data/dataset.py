@@ -33,7 +33,8 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
-from dew.batch import VALID_ROWS, Batch, padded_rows
+from dew._records import record
+from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
 from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
@@ -108,6 +109,19 @@ class DataPartition:
         such a mesh is refused.
         """
         return dataclasses.replace(_partition(mesh, batch_axes(mesh)), window=window)
+
+    def bounded(self, examples: int, records: int | None = None) -> int:
+        """This share's examples of the pool's first `examples`, where each share reads records of its own
+        dealt `index :: count` (`cut`) from a root of `records` a pass, each pass over its own: its records
+        in every whole pass the bound spans, and its records among those the last pass reaches. Where no
+        pass's count is known ahead (a step before the bound drops records), the examples themselves are
+        dealt so, every count-th from its index."""
+        if records is None:
+            return len(range(self.index, examples, self.count))
+        if not records:
+            return 0
+        passes, rest = divmod(examples, records)
+        return passes * len(range(self.index, records, self.count)) + len(range(self.index, rest, self.count))
 
     def held(self, rows: int, offset: int = 0) -> tuple[slice, bool]:
         """Which of `rows` rows a validation read of this share holds, and whether they are real:
@@ -234,7 +248,8 @@ class Budgeted(Protocol):
 
 
 class Forwarding:
-    """Forwards a stream wrapper's stop signal, stop budget, close, identity and endlessness to its source.
+    """Forwards a stream wrapper's stop signal, stop budget, close, identity, endlessness and whether its
+    shares run out together to its source.
 
     Subclasses keep the source at `_source` and override `close` for their own
     cleanup around `super().close()`.
@@ -274,6 +289,10 @@ class Forwarding:
     def endless(self) -> bool:
         return stream_endless(self._forwarded())
 
+    @property
+    def together(self) -> bool:
+        return stream_together(self._forwarded())
+
 
 _QUIET_STOP_SECONDS = 5.0
 """How long a stop of grain's workers runs before it says what it waits for
@@ -285,8 +304,12 @@ GRAIN_KILL_SECONDS = 25
 no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
 
 
-WORKER_BUFFER = 2
-"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`)."""
+WORKER_BUFFER = 1
+"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`):
+Grain's own (`per_worker_buffer_size`). Two read no faster on a CPU and hold a second batch in each worker
+(row 2508: two workers over a record step of a few milliseconds, eight draws each, two against one at
+1.03 times the samples a second, 0.66 to 1.35, with the consumer waiting on none; 0.98 times with it
+taking 5 ms a batch; 1.00 times at 20 ms)."""
 
 
 WORKER_PROCESS_BYTES = 219 * 2**20
@@ -311,22 +334,42 @@ class Host:
     memory: int
 
     @classmethod
-    def current(cls) -> Host:
+    def current(cls, cgroup: Path | None = None, root: Path = Path("/sys/fs/cgroup")) -> Host:
+        """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
+        /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
+        a container's limit on a parent binds an unlimited child, so each level's CPU quota and
+        the memory its limit leaves bound the host's. Under a memory limit the page cache the
+        kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
+        working set: a run that has read its corpus once holds it in cache, charged to its
+        cgroup, and counting that as taken left room for no worker beside it."""
         import psutil
 
-        cpus = len(os.sched_getaffinity(0))
-        quota = Path("/sys/fs/cgroup/cpu.max")
-        if quota.is_file():
-            limit, period = quota.read_text().split()
-            if limit != "max":
-                cpus = min(cpus, math.ceil(int(limit) / int(period)))
-        memory = psutil.virtual_memory().available
-        maximum, current = Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")
-        if maximum.is_file() and current.is_file():
-            limit = maximum.read_text().strip()
-            if limit != "max":
-                memory = min(memory, max(0, int(limit) - int(current.read_text())))
+        group = _own_cgroup() if cgroup is None else cgroup
+        cpus, memory = len(os.sched_getaffinity(0)), psutil.virtual_memory().available
+        for level in (group, *group.parents):
+            quota = level / "cpu.max"
+            if quota.is_file():
+                limit, period = quota.read_text().split()
+                if limit != "max":
+                    cpus = min(cpus, math.ceil(int(limit) / int(period)))
+            maximum, current, stat = level / "memory.max", level / "memory.current", level / "memory.stat"
+            if maximum.is_file() and current.is_file() and (limit := maximum.read_text().strip()) != "max":
+                stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
+                reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
+                memory = min(memory, max(0, int(limit) - (int(current.read_text()) - reclaimed)))
+            if level == root:
+                break
         return cls(cpus, memory)
+
+
+def _own_cgroup() -> Path:
+    """This process's cgroup (v2) directory: the path /proc/self/cgroup names (`0::/path`) under
+    /sys/fs/cgroup, which is the root itself inside a container's own cgroup namespace."""
+    root, membership = Path("/sys/fs/cgroup"), Path("/proc/self/cgroup")
+    lines = membership.read_text().splitlines() if membership.is_file() else []
+    named = next((line[3:] for line in lines if line.startswith("0::")), None)
+    own = root / named.strip().lstrip("/") if named else root
+    return own if own.is_dir() else root
 
 
 def batch_bytes(batch: Batch) -> int:
@@ -680,6 +723,10 @@ class Loader:
     device: tuple[DeviceStep, ...] = ()
     """The training batch's steps the compiled training step runs, on the
     accelerator, after the reader delivers it (`DeviceStep`)."""
+    widths: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    """The run's static widths its steps bound (`run_widths`): the facts its objective's run-scoped
+    steps read (`Configured.scope`), such as a decision's `slots`, which a saved run of the objective
+    records (`Objective.bind_widths`); empty where they read none."""
     tail: Tail = "dropped"
     """What becomes of the records an epoch leaves short of a whole batch: read, carried into the
     next epoch by an order that reads on or kept and filled by one that keeps them, so an epoch's
@@ -692,6 +739,10 @@ class Loader:
     """The records the training read is bounded to before they are packed (`compile`'s
     `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
     not bounded."""
+    bound_ends: bool = True
+    """Whether a read bounded in `examples` ends where its bound does, having read every one: no take or
+    slice after the bound ends it first, which a run on the examples clock refuses
+    (`dew.training._fit.clocked`), whose last batch consumes the examples no batch counted (`drained`)."""
     token_ends: tuple[int | None, ...] | None = None
     """The committed tokens each phase of a schedule ends at (`dew.data.pipeline.schedule`), the last
     where the data ends or None where it runs on, which the trainer reads its commits against and ends
@@ -731,32 +782,27 @@ class Loader:
                              "steps")
         return steps
 
-    def example_steps(self, examples: int, window: int = 1) -> int:
-        """The steps that read the `examples` records this loader's training read is bounded to
-        (`examples`), its last batch short where they end inside one, in whole updates of `window`
-        steps. A global order's plan counts them ahead (`order_records`); one read in its own
-        order, as a pack that runs as rows arrive makes, is counted by reading it once to its end, on
-        the host. Refused where the read is bounded to another count, in a pool, whose processes
-        split the short batch the examples end in unevenly, so each would end at a step of its own,
-        and where the last steps would make no whole update, so some examples would train nothing."""
+    def example_steps(self, examples: int, window: int = 1) -> int | None:
+        """The steps that read the `examples` source examples this loader's training read is bounded to
+        (`examples`), with every row the objective makes of each, its last batch short where they end
+        inside one, in whole updates of `window` steps, where a global order's plan counts them ahead
+        (`order_records`); None for one read in its own order, as a pack that runs as rows arrive makes,
+        or one an objective expands after the bound, which no pass reads ahead to count, such as a pool's
+        read whose shares each read records of their own and so end steps apart: its run keeps its
+        progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`), a pool's every share
+        reading on until each has run out (`dew.training._fit.pooled_read`). A pool's read in one global
+        order plans as one process's does, every share ending at its steps, a share the order's last batch
+        ends before stepping batches of no real row (`dew.data.lowering._evened`). Refused where the read is
+        bounded to another count, and where the last steps would make no whole update, so some examples
+        would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
                              f"before packing, and this loader's is {held}; give fit the Dataset chain, "
                              "which it bounds and compiles")
-        if jax.process_count() > 1:
-            raise ValueError("examples end in a short batch, which a pool's processes would split unevenly "
-                             "and end at steps of their own; train them on one process or count the run "
-                             "in steps")
-        if self.order_records is not None:
-            steps = self._steps(self.order_records, window)
-        else:
-            stream = self.train(DataPartition())
-            try:
-                steps = sum(1 for _ in stream)
-            finally:
-                if isinstance(stream, Closeable):
-                    stream.close()
+        if self.order_records is None:
+            return None
+        steps = self._steps(self.order_records, window)
         if steps % window:
             raise ValueError(f"{examples} examples fill {steps} batches, which are not whole updates of "
                              f"{window} steps: the last {steps % window} would update nothing; change the "
@@ -792,6 +838,13 @@ class Checkpointable(Protocol):
     def set_state(self, state: Position) -> None: ...
 
 
+def restore_parent(parent: pygrain.DatasetIterator, state: Mapping[str, object], key: str,
+                   what: str) -> None:
+    """Set `parent`, the stream a wrapper reads, to the position the wrapper's own `state` saved for it
+    under `key`, `what` naming it where the record is no position."""
+    parent.set_state(record(state[key], what))
+
+
 @runtime_checkable
 class Identified(Protocol):
     """A training stream that names the records it reads and says whether it
@@ -800,13 +853,25 @@ class Identified(Protocol):
     Each process of a pool opens its own stream, over its own copy of the
     corpus, and `Trainer.fit` refuses a pool whose streams name different
     records before any process reads one. It agrees every read of a stream
-    that may run out, so a process whose stream ran out stops its peers
-    before they step without it; an endless one is agreed at its first read.
+    that may run out on some processes and not others, so a process whose
+    stream ran out stops its peers before they step without it; an endless
+    one, or one whose shares run out together (`Together`), is agreed at its
+    first read.
     """
 
     endless: bool
 
     def identity(self) -> str: ...
+
+
+@runtime_checkable
+class Together(Protocol):
+    """A training stream whose every share runs out at the same read, by construction: one global
+    order cut into shares, each stepping as many batches of it (`GlobalStream`). No read of it after
+    its first can run out on some processes and not others, so a pool agrees none
+    (`dew.training._fit.FitRun.agrees`)."""
+
+    together: bool
 
 
 def batch_digest(batch: Batch) -> str:
@@ -895,6 +960,12 @@ def stream_endless(stream: Iterator[Batch] | None) -> bool:
     """Whether `stream` says it never runs out (`Identified`), as Dew's
     global streams do."""
     return isinstance(stream, Identified) and stream.endless
+
+
+def stream_together(stream: Iterator[Batch] | None) -> bool:
+    """Whether `stream` says its every share runs out at the same read (`Together`), as one global
+    order does."""
+    return isinstance(stream, Together) and stream.together
 
 
 def tapped(stream: Reader, on_batch: Callable[[Batch], None]) -> Reader:
@@ -1012,20 +1083,26 @@ class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
     own rows (`dew.batch.padded_rows`), and `VALID_ROWS` marking the real ones: those of
     its own a batch that marks them already marks real. Without `real` every
-    row is a repeat."""
+    row is a repeat. A whole batch is as it was, or where `marked`, marks its
+    rows too, so every batch of a read holds one tree whether or not it is
+    filled (`dew.data.lowering._evened`)."""
 
-    def __init__(self, rows: int, *, real: bool = True):
-        self._rows, self._real = rows, real
+    def __init__(self, rows: int, *, real: bool = True, marked: bool = False):
+        self._rows, self._real, self._marked = rows, real, marked
 
     def map(self, element: Batch) -> Batch:
         held = rows_of(element)
         if held == self._rows and self._real:
-            return element
+            return {VALID_ROWS: np.ones(held, bool), **element} if self._marked else element
         indices, repeats = padded_rows(held, self._rows)
         valid = ~repeats & self._real
         if VALID_ROWS in element:
             valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
-        return {**take_batch(element, indices), VALID_ROWS: valid}
+        filled = {**take_batch(element, indices), VALID_ROWS: valid}
+        if EXAMPLES_CONSUMED in element:
+            # A repeat consumes nothing: its row's examples are the real row's.
+            filled[EXAMPLES_CONSUMED] = np.where(valid, filled[EXAMPLES_CONSUMED], 0).astype(np.int32)
+        return filled
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -1167,9 +1244,15 @@ class GlobalStream:
     it and a restore whose plan disagrees is refused (`Plan.check`).
     `dew.position` defines the format that both this class and
     `dew.checkpoints` read.
+
+    Every share steps as many batches of the order, its whole batches where
+    it drops a remainder, and else a share past the order's last batch
+    reading on with batches of no real row (`dew.data.lowering._evened`), so
+    where it ends, the shares run out at the same read (`together`).
     """
 
     endless = True
+    together = True
 
     def __init__(
         self,
@@ -1233,7 +1316,11 @@ class GlobalStream:
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
         if saved.plan is not None:
-            self.manifest_changes = self._plan.check(saved.plan, resume=self._resume)
+            from dew.data.plan import earlier_plan
+
+            # The saved position's one translation (`earlier_plan`), then its check.
+            translated = earlier_plan(saved.plan, self._plan)
+            self.manifest_changes = self._plan.check(translated, resume=self._resume)
         if saved.completed:
             raise ValueError(
                 f"the saved data position is {saved.records} records into a phased run "
@@ -1461,6 +1548,8 @@ class PhasedStream:
                 order=self._stream(phase).order,
                 completed=completed,
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
+                tokens=() if self._tokens is None else tuple(int(end) for end in self._tokens[:phase]
+                                                             if end is not None),
             )
         )
 
@@ -1472,6 +1561,18 @@ class PhasedStream:
             if len(saved.completed) > len(self._ends):
                 raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
                                  f"{len(self._ends) + 1}")
+            finished = self._tokens[:len(saved.completed)]
+            if saved.tokens is None and saved.completed:
+                raise ValueError(f"the saved run finished {len(saved.completed)} phases in a position "
+                                 "written before positions held the committed tokens each ended at, so "
+                                 "nothing says where they ended on this run's clock; resume it with the Dew "
+                                 "that wrote it")
+            if saved.tokens is not None and saved.tokens != finished:
+                # Its records end where the saved run's commits reached the phases' tokens, which a phase
+                # ending at other tokens would read on from as though the run had reached them.
+                raise ValueError(f"the saved run finished its phases at {list(saved.tokens)} committed "
+                                 f"tokens, and this run's end at {list(finished)}; a phase the run has read "
+                                 "cannot change under it")
             # The ends the saved run reached, and none past them, which this run reaches as it reads.
             for index in range(len(self._ends)):
                 self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)
@@ -1684,7 +1785,8 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     Only a stream whose position is a global record count can ramp. The ramp
     cuts that order into other steps, and the count it saves has to be the
     records it handed over. A stream that batches its own records reports a
-    shard offset and is refused, by name.
+    shard offset and is refused, by name, as is an elastic read, whose
+    position is its order's, not a record count the ramp's steps cut.
     """
     # An impossible schedule fails here, not mid-run. Moving its stages to update boundaries
     # (`Ramp.stages`' window) cannot make one impossible, so this checks the schedule as given.
@@ -1700,7 +1802,9 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
             )
         if isinstance(stream, Resumable):
             state = stream.get_state()
-            if isinstance(state, bytes) and position.translates(state):
+            # A global record count alone: an elastic read's position is the order's, which the
+            # ramp's steps, cut from a global order, do not save or restore (`RampedStream`).
+            if isinstance(state, bytes) and position.decode(state) is not None:
                 return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
                                     tail=dataset.tail, order_records=dataset.order_records)
         if isinstance(stream, Closeable):

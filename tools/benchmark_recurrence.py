@@ -45,6 +45,8 @@ from pathlib import Path
 
 import numpy as np
 
+from dew.nn.kernels.options import program
+
 
 @dataclasses.dataclass(frozen=True)
 class Shape:
@@ -166,12 +168,12 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
             # What the kernels take, whatever this GPU's row prefers.
             case = scan_case(x, B, shape.chunk)
-            refusals['hand'] = '; '.join(requirement.refusal(case).detail
-                                         for requirement in SCAN.kernel('pallas').failed(case))
+            refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').failed(case))
             cotangents = (given['dy'], given['dfinal'])
         else:
+            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                                     scale=shape.key_width ** -0.5)
+                                     scale=shape.key_width ** -0.5, write_bound=1.0)
             inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
                       given['beta'].astype(bf16))
 
@@ -189,8 +191,10 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
         arms = {'template': template, 'hand': hand, 'xla': xla}
 
+    # The cotangents are an argument: `program` keeps each function it compiled, and a closure over them
+    # would keep every shape's until the sweep ended.
     def forward_backward(fn):
-        def run(*args):
+        def run(cotangents, *args):
             outputs, pull = jax.vjp(fn, *args)
             return outputs, pull(jax.tree.map(lambda c, o: c.astype(o.dtype), cotangents, outputs))
         return run
@@ -202,9 +206,11 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
         if refusals.get(arm):
             row.update(fwd_ms=None, fwd_bwd_ms=None, error=f"refuses: {refusals[arm]}")
             continue
-        for part, compiled in (('fwd_ms', jax.jit(fn)), ('fwd_bwd_ms', jax.jit(forward_backward(fn)))):
+        parts = (('fwd_ms', program(fn), inputs),
+                 ('fwd_bwd_ms', program(forward_backward(fn)), (cotangents, *inputs)))
+        for part, compiled, given_args in parts:
             try:
-                measured = samples(compiled, *inputs, warmup=warmup, repeats=repeats)
+                measured = samples(compiled, *given_args, warmup=warmup, repeats=repeats)
                 row[part] = 1e3 * statistics.median(measured)
             except jax.errors.JaxRuntimeError as error:
                 row[part], row['error'] = None, _failure(error)

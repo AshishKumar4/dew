@@ -1,8 +1,10 @@
 """What several interop tests read off a reference: a checkpoint's stored
 bytes, a source autoencoder's vector-Jacobian products, the audio features
-a checkpoint's own extractor makes and the pad row of its token lookup; and a
+a checkpoint's own extractor makes and the pad row of its token lookup; a tiny
+checkpoint's transformers reference run in the test over check 1's draws; and a
 Hub cache an offline process resolves a repo from."""
 
+import contextlib
 import functools
 import json
 import shutil
@@ -80,6 +82,120 @@ def float64_logits(loaded):
     return lambda inputs: {"logits": model.apply(variables, jnp.asarray(inputs["input_ids"]))}
 
 
+def fixture_ids(directory: Path, mask=None, shape=None):
+    """Check 1's draw over the tiny checkpoint at `directory`: a seed's ids uniform over its config's
+    vocabulary in the shape of its `input_ids.npy` (or `shape`), 0 where `mask` is false (the pad its
+    recorder wrote into padded rows), the same on every run."""
+    shape = np.load(directory / "input_ids.npy").shape if shape is None else shape
+    vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
+
+    def draw(seed):
+        ids = np.random.default_rng(seed).integers(0, vocabulary, shape).astype(np.int32)
+        return (ids if mask is None else np.where(mask, ids, 0).astype(np.int32),)
+
+    return draw
+
+
+def transformers_model(directory: Path, *, masked: bool = False, dtype: str = "float32", **options):
+    """transformers' own class for the checkpoint at `directory`, as its config names it, the masked LM
+    where `masked` and else the causal LM, in `dtype` (float32 unless a narrower run is the reference)
+    on eager attention and eager experts, in eval mode, `options` given to `from_pretrained` too: the
+    reference a tiny checkpoint's recorder ran (tools/hf_reference.py), run in the test."""
+    import torch
+    import transformers
+
+    auto = transformers.AutoModelForMaskedLM if masked else transformers.AutoModelForCausalLM
+    return auto.from_pretrained(directory, dtype=getattr(torch, dtype), attn_implementation="eager",
+                                experts_implementation="eager", **options).eval()
+
+
+def assert_exported_decoder_follows_transformers(loaded, directory: Path, draw, label: str, run,
+                                                  generating=6):
+    """A decoder `loaded` from the checkpoint at `directory / "source"` against transformers' own class
+    for it: its logits (`run(model, ids)`) on par from the float64 twin over `draw` (check 1, the draw's
+    seeds sized by `seeds_for`), its export at `directory / "export"` reloading in transformers to the
+    same logits bit for bit (both read by the same class on the same attention, so the export's weights
+    and config alone differ), and a greedy continuation of `generating` tokens from the first draw's
+    first four ids drawing the tokens transformers' generate draws, prompt and continuation both."""
+    import torch
+    from reference_error import seeds_for
+
+    from dew.sampling import Sampling, generate
+
+    reference, truth = transformers_arms(transformers_model(directory / "source"), run)
+    seeds = seeds_for(reference, draw, label, truth_fn=truth)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw, label,
+                    seeds=seeds, truth_fn=truth)
+    loaded.save(directory / "export")
+    exported, source = (transformers_model(directory / name) for name in ("export", "source"))
+    ids = torch.as_tensor(np.asarray(draw(0)[0]), dtype=torch.long)
+    with torch.no_grad():
+        np.testing.assert_array_equal(run(exported, ids).numpy(), run(source, ids).numpy())
+        drawn = source.generate(ids[:1, :4], max_new_tokens=generating, min_new_tokens=generating,
+                                do_sample=False)
+    generated = generate(loaded.model, loaded.variables, np.asarray(ids[:1, :4]), generating, key=0,
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
+
+
+def transformers_arms(model, run, *, source=None, twin=None):
+    """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
+    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by the float64
+    twin (`tools.torch_precision.float64_twin`) of `source`, by default `model`, inside `float64`, each
+    run `as_given`, its tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly.
+    A narrower `model` (bfloat16) is measured from its stored weights' truth: `source`, the float32
+    load. `twin` is the twin itself where the reference builds its own (a PEFT model's)."""
+    import torch
+
+    from tools.torch_precision import float64, float64_twin
+
+    def tensor(value):
+        value = np.asarray(value)
+        return torch.from_numpy(value.astype(np.int64) if np.issubdtype(value.dtype, np.integer) else value)
+
+    def arm(network, precision):
+        @as_given
+        def given(*inputs):
+            with precision(), torch.no_grad():
+                return jax.tree.map(lambda out: (out.float() if out.dtype == torch.bfloat16 else out).numpy(),
+                                    run(network, *map(tensor, inputs)))
+        return given
+
+    if twin is None:
+        twin = float64_twin(model if source is None else source)
+    return arm(model, contextlib.nullcontext), arm(twin, float64)
+
+
+def peft_twin(model):
+    """A PEFT model's float64 twin (`tools.torch_precision.float64_twin`): the same base and adapter
+    built inside `float64` by transformers' and PEFT's own builders, so every value their constructors
+    compute is float64's (the rotary tables' among them), loaded with `model`'s weights, to run inside
+    `float64` (`transformers_arms`' `twin`)."""
+    import copy
+
+    import torch
+    from peft import get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    from tools.torch_precision import float64_twin
+
+    def build():
+        config = copy.deepcopy(model.get_base_model().config)
+        base = AutoModelForCausalLM.from_config(config, dtype=torch.float64)
+        return get_peft_model(base, copy.deepcopy(model.peft_config["default"]))
+
+    return float64_twin(model, build)
+
+
+def next_token_losses(model, ids):
+    """The torch causal LM `model`'s cross entropy at each next token of `ids` in its logits' precision,
+    the per-token losses `LMObjective.token_scores` returns (a `run` of `transformers_arms`)."""
+    import torch
+
+    logits = model(ids, use_cache=False).logits
+    return torch.nn.functional.cross_entropy(logits[:, :-1].transpose(1, 2), ids[:, 1:], reduction="none")
+
+
 def extract_fixture(archive: Path, directory: Path) -> Path:
     with tarfile.open(archive) as source:
         source.extractall(directory, filter="data")
@@ -108,17 +224,23 @@ def hub_cache(cache: Path, repo_id: str, source: Path,
     return commit
 
 
+def respelled(source: Path, directory: Path, edit) -> Path:
+    """`source`'s checkpoint copied to `directory` under the config `edit` returns from its own."""
+    shutil.copytree(source, directory)
+    (directory / "config.json").write_text(json.dumps(edit(json.loads((source / "config.json").read_text()))))
+    return directory
+
+
 def without_config_field(source: Path, directory: Path, *path: str) -> Path:
     """`source`'s checkpoint copied to `directory` with the config field at `path` (a key, nested
-    keys after it) left out, as a config that leaves it to its default writes it."""
-    shutil.copytree(source, directory)
-    config = json.loads((directory / "config.json").read_text())
-    section = config
-    for key in path[:-1]:
-        section = section[key]
-    del section[path[-1]]
-    (directory / "config.json").write_text(json.dumps(config))
-    return directory
+    keys after it) left out, as a config that leaves it to its default writes it (`respelled`)."""
+    def dropped(config):
+        section = config
+        for key in path[:-1]:
+            section = section[key]
+        del section[path[-1]]
+        return config
+    return respelled(source, directory, dropped)
 
 
 def fixture_with_meta(path: Path) -> tuple[dict[str, np.ndarray], dict]:
@@ -162,7 +284,7 @@ def assert_published_checkpoint(measured, name: str) -> None:
     reference logit clears the next by the gate's selection margin (`selection_margins.MARGIN`), so that
     float32 rounding cannot pick another token. A continuation with a step nearer a tie decides
     nothing, and is not compared."""
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
     from selection_margins import MARGIN, top_margin
 
     for row in measured:
@@ -452,3 +574,14 @@ def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
     def draw(seed):
         return (np.random.default_rng([salt, seed]).integers(0, vocab, shape).astype(np.int32),)
     return draw
+
+
+def reference_read(case, directory, *, wide: bool):
+    """transformers' read of an export (`decoder_export_reference.reference_forward`) in fp32 or, `wide`, in
+    float64, run as given on a draw's ids."""
+    from reference_error import as_given
+
+    from tools.decoder_export_reference import reference_forward
+
+    forward = reference_forward(case, directory, wide=wide)
+    return as_given(lambda ids: forward(np.asarray(ids)))

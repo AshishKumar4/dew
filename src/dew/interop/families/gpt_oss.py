@@ -24,6 +24,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.rope import YarnScaling
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -65,8 +66,9 @@ def _gpt_oss_export(model: CausalTransformer) -> Mapping[str, object]:
     if mixture is None:
         refuse('mixture', 'GPT OSS needs routed experts')
     # A plain rotary is written as a plain record: an omitted one reads as the class's YaRN.
-    rope = ({'rope_type': 'default', 'rope_theta': model.rope_theta} if model.yarn is None
-            else {**asdict(model.yarn), 'rope_type': 'yarn', 'rope_theta': model.rope_theta})
+    yarn = model.rope_scaling if isinstance(model.rope_scaling, YarnScaling) else None
+    rope = ({'rope_type': 'default', 'rope_theta': model.rope_theta} if yarn is None
+            else {**asdict(yarn), 'rope_type': 'yarn', 'rope_theta': model.rope_theta})
     return {'hidden_act': 'silu', 'num_local_experts': mixture.experts,
             'num_experts_per_tok': mixture.top_k, 'swiglu_limit': 7.0, 'rope_parameters': rope}
 

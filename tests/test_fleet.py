@@ -18,6 +18,7 @@ import sys
 import time
 
 import pytest
+from process_support import running
 from tool_support import load
 
 from dew.data.prompts import PromptRecord
@@ -85,16 +86,10 @@ def test_the_wall_clock_kills_a_sleeping_program_and_its_children():
     child = int(outcome.stdout.split()[0])
     # The group kill reaches the grandchild; allow the kernel a moment to reap it.
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            with open(f"/proc/{child}/stat") as stat:
-                if stat.read().split(")")[-1].split()[0] == "Z":
-                    break
-        except FileNotFoundError:
-            break
+    while running(child):
+        if time.monotonic() > deadline:
+            pytest.fail("the forked child outlived the timeout")
         time.sleep(.05)
-    else:
-        pytest.fail("the forked child outlived the timeout")
 
 
 def test_cpu_time_is_a_timeout_before_the_wall_clock():

@@ -1,6 +1,6 @@
 # JAX and Flax features for Dew
 
-Research date: 2026-09-06. Dew source: `65fd2f4`.
+Research date: 2026-09-06. Dew source: `cb9ce8f`.
 
 This extends [google-jax-stack.md](google-jax-stack.md). The [MaxText inventory](maxtext-parity.md) names the missing training capabilities. This note identifies the upstream primitives that can implement them. Fit entries are recommendations, not approved designs.
 
@@ -9,7 +9,7 @@ This extends [google-jax-stack.md](google-jax-stack.md). The [MaxText inventory]
 The requested command printed JAX `0.11.1` and Flax `0.12.9`:
 
 ```sh
-/home/mrwhite0racle/Desktop/dew/.venv/bin/python -c 'import jax, flax; print(jax.__version__, flax.__version__)'
+.venv/bin/python -c 'import jax, flax; print(jax.__version__, flax.__version__)'
 ```
 
 Installed distribution metadata also reports jaxlib `0.11.1`, Optax `0.2.8`, Grain `0.2.18`, Orbax Checkpoint `0.12.4` and Qwix `0.1.8`. JAX source links below use tag `jax-v0.11.1`; Flax links use `v0.12.9`. MaxText links use the 0.2.4 commit `538fe7a3f3376d94cf3f04e77741aa6d7e8efa45`. Its base file matches the release tag byte for byte.
@@ -22,7 +22,7 @@ No cloud run, model download or GPU/TPU benchmark was performed. Expected wins a
 
 ## Correction, 2026-09-22
 
-Dew changed after this survey. Line numbers elsewhere in this note refer to `65fd2f4`. Checked against the current source, these statements are out of date:
+Dew changed after this survey. Line numbers elsewhere in this note refer to `cb9ce8f`. Checked against the current source, these statements are out of date:
 
 - The decoder has named-residual remat. `RematPolicy` and `REMAT_POLICIES` (`src/dew/nn/backbones/causal_transformer.py:433-520`) carry MaxText's recipes, `save_dot_except_mlp` among them, and can offload residuals to `pinned_host` through `save_and_offload_only_these_names` (`src/dew/nn/backbones/causal_transformer.py:474-481`). The "No decoder policy" gaps in the activation-memory table and item 1 under "What Dew needs" describe the older source.
 - A layout can keep `params`, `opt_state` or `ema` in pinned host memory between steps (`HOST_RESIDENT`, `src/dew/training/distributed.py:271-276`; `Trainer.shardings`, `src/dew/training/trainer.py:342-356`). The state-residency rows that say every field inherits device memory describe the older source.
@@ -163,7 +163,7 @@ All 17 flag assignments in the two tables were accepted by the installed jaxlib 
 ```sh
 ulimit -c 0
 JAX_PLATFORMS=cpu XLA_FLAGS='--xla_gpu_pipeline_all_gather=on' \
-  /home/mrwhite0racle/Desktop/dew/.venv/bin/python -c 'import jax; print(jax.devices()[0].platform)'
+  .venv/bin/python -c 'import jax; print(jax.devices()[0].platform)'
 ```
 
 This checks spelling and parser availability. It does not exercise GPU lowering, collectives, kernels or performance. The note does not recommend enabling the flags without a target-topology run. Copying the command-buffer setting as a default would hurt most, because Dew already measured slower single-card execution with command buffers disabled (`docs/performance.md:219-247`).

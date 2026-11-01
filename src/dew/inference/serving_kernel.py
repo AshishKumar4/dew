@@ -11,7 +11,7 @@ scheduler in `serving` only feeds and reads them.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -20,22 +20,33 @@ from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
-from dew.batch import Variables
+from dew.batch import VALIDITY_FIELD, Variables, coordinates, real_slots
 from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
-from dew.nn.attention import CROSS_KEY, CROSS_VALUE
+from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
-from dew.nn.kernels.options import Option, compiler_options
+from dew.nn.kernels.options import Option, OuterProgram, compiler_options
 from dew.nn.kernels.tuning import tune
-from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
+from dew.nn.kv_cache import (
+    POOLED,
+    ROW_CURSORS,
+    TABLE,
+    as_words,
+    from_words,
+    grouped,
+    is_paged,
+    leaf_name,
+    with_rounding_keys,
+)
+from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, row_step
-from dew.sampling.text import decode_ops, prefill_state
+from dew.sampling.text import decode_ops, prefill_state, rounding_keys
 
 
 @struct.dataclass
@@ -105,7 +116,7 @@ def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacit
     prompt, which leave the cursors at zero and the validity false."""
     ops = decode_ops(model, params, pad_id, None)
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
-                        {"attention_mask": jnp.zeros((slots, 1), bool)})
+                        {VALIDITY_FIELD: jnp.zeros((slots, 1), bool)})
     _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
                                                   errors=checkify.user_checks))
     keys = jax.random.key_data(jax.random.key(0))
@@ -184,8 +195,9 @@ class Dense:
     continuing: bool = False
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
-                  admission: Admission) -> tuple[DecoderState, jax.Array]:
-        """The resident carry with the admitted prompts prefilled into their rows.
+                  admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
+        """The resident carry with the admitted prompts prefilled into their rows, at the run's
+        `progress` (`Server.progress`).
 
         The prompts run over a fresh cache at their own bucket width, so the
         prefill's attention reads only the prompt's keys, not the resident
@@ -194,7 +206,9 @@ class Dense:
         """
         narrow = cache_sized(model, admission.prompts.tokens.shape[1])
         fresh, real = prefill_state(narrow, params, admission.prompts,
-                               decode_ops(narrow, params, pad_id, None))
+                                    decode_ops(narrow, params, pad_id, None, progress),
+                                    rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)),
+                                    progress=progress)
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
@@ -215,8 +229,9 @@ class Paged:
     continuing: bool = False
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
-                  admission: Admission) -> tuple[DecoderState, jax.Array]:
-        """The resident carry with each admitted row's next prompt piece in the pool.
+                  admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
+        """The resident carry with each admitted row's next prompt piece in the pool, at the run's
+        `progress`.
 
         The piece runs over the shared pool with the page table and cursor the
         host supplies per row, so it reads earlier pieces and shared prefix
@@ -227,7 +242,9 @@ class Paged:
         scattered back to the rows' slots.
         """
         rows = admission.cursors.shape[0]
-        allocated = model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+        allocated = with_rounding_keys(
+            model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"],
+            rounding_keys(jax.random.wrap_key_data(admission.keys)))
         continues = admission.cursors > 0
 
         def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
@@ -243,8 +260,9 @@ class Paged:
             return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - 1)), held, fresh)
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
-        fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
-                                    cache=cache)
+        fresh, real = prefill_state(model, params, admission.prompts,
+                                    decode_ops(model, params, pad_id, None, progress), cache=cache,
+                                    progress=progress)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
@@ -261,8 +279,10 @@ Placement = Dense | Paged
 
 def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
               admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-              stopping: decoding.Finishing, grammar: Grammar | None) -> tuple[Slots, Draws]:
-    """One iteration: admit, feed every drawing row its last draw, then every active row draws.
+              stopping: decoding.Finishing, grammar: Grammar | None,
+              progress: Progress = END) -> tuple[Slots, Draws]:
+    """One iteration: admit, feed every drawing row its last draw, then every active row draws, every
+    forward at the run's `progress` (`Server.progress`).
 
     This is `strategies._sample_rows`'s step over rows that carry their own
     budget, so a row that stops or spends its budget goes inactive while the
@@ -277,19 +297,19 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     mixed = admission is not None and placement.mixed
     if mixed:
         assert admission is not None
-        real = jnp.any(admission.prompts.token_fields["attention_mask"], axis=1)
+        real = jnp.any(real_slots(admission.prompts.token_fields, admission.prompts.tokens.shape), axis=1)
         state = _seated(state, state.decoder, real, admission, placement.groups)
     elif admission is not None:
-        state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission), admission,
-                        placement.groups)
+        state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission, progress),
+                        admission, placement.groups)
     capacity = state.tokens.shape[1] // 2
     fed = state.active & (state.step > 0)
     last = jnp.take_along_axis(state.tokens, (capacity + state.step - 1)[:, None], axis=1)[:, 0]
     if mixed:
         assert admission is not None
-        decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission)
+        decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission, progress)
     else:
-        ops = decode_ops(model, params, pad_id, None)
+        ops = decode_ops(model, params, pad_id, None, progress)
         decoder = ops.advance(state.decoder, last, fed)
     if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
@@ -312,7 +332,8 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
 
 
 def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Placement, decoder: DecoderState,
-                last: jax.Array, fed: jax.Array, admission: Admission) -> DecoderState:
+                last: jax.Array, fed: jax.Array, admission: Admission, progress: Progress = END
+                ) -> DecoderState:
     """The admitting step's forward over every token it runs: each slot's
     last draw where it feeds, then the admitted prompt pieces, left-padded,
     in one row (`dew.nn.inputs.Admitted`). The projections read their
@@ -321,18 +342,20 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     step takes its last piece's. A piece continuing its row (a paged cache's
     shared prefix, a chunked prompt) reads the row's earlier keys."""
     rows = last.shape[0]
-    tokens, valid = admission.prompts.tokens, admission.prompts.token_fields["attention_mask"]
+    tokens = admission.prompts.tokens
+    valid = real_slots(admission.prompts.token_fields, tokens.shape)
     pieces, width = tokens.shape
     flat = jnp.concatenate([jnp.where(fed, last, pad_id), jnp.where(valid, tokens, pad_id).reshape(-1)])
     real = jnp.concatenate([fed, valid.reshape(-1)])
     scored = jnp.concatenate([jnp.arange(rows), rows + jnp.arange(pieces) * width + width - 1])
     (_, logits), updated = model.apply(
-        {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True, attention_mask=real[None],
+        {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True,
+        coordinates=coordinates(flat[None].shape, valid=real[None]),
         admitted=Admitted(slots=admission.slots, cursors=admission.cursors,
                           tables=admission.tables if isinstance(placement, Paged) else None,
                           continuing=placement.continuing),
         mutable=["cache"],
-        method="states_and_logits_at")
+        method="states_and_logits_at", **progressed(model, progress))
     held = jnp.where(fed[:, None], logits[0, :rows], decoder.logits)
     seated = jnp.where(admission.final, admission.slots, rows)
     return dataclasses.replace(decoder, cache=updated["cache"],
@@ -382,9 +405,11 @@ def joined(resident: Slots, carried: Slots) -> Slots:
 def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
              resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-             stopping: decoding.Finishing, grammar: Grammar | None
+             stopping: decoding.Finishing, grammar: Grammar | None, progress: Progress
              ) -> tuple[checkify.Error, tuple[Slots, Slots, Draws]]:
-    """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value.
+    """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value,
+    at the run's `progress`, an input like the weights, so a server serves each version it loads at its
+    own without a compile of its own.
 
     The first iteration takes the admission, the draws come back stacked
     `[steps, slots]`, and the host throws the error when it reads them, one
@@ -400,7 +425,7 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
     def advanced(state: Slots, admission: Admission | None) -> tuple[checkify.Error, tuple[Slots, Draws]]:
         return checkify.checkify(
             lambda state, admission: _advanced(model, params, pad_id, placement, state, admission, transforms,
-                                               stopping, grammar),
+                                               stopping, grammar, progress),
             errors=checkify.user_checks)(state, admission)
 
     error, (state, draws) = advanced(joined(resident, carried), admission)
@@ -464,7 +489,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
-              options: Mapping[str, Option] | None = None) -> jax.stages.Wrapped:
+              options: Mapping[str, Option] | None = None) -> OuterProgram:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
@@ -475,8 +500,8 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     change the backend's defaults. See docs/performance.md for
     the measurements.
     """
-    return jax.jit(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
-                   in_shardings=(None, resident, carried, rows, None, None, None),
+    return OuterProgram(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
+                   in_shardings=(None, resident, carried, rows, None, None, None, None),
                    out_shardings=(None, (resident, carried, None)),
                    compiler_options=None if options is None else dict(options))
 
@@ -484,7 +509,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
 def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
                       state: Slots, shardings: Slots, rows: NamedSharding | None,
                       transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-                      grammar: Grammar | None) -> tuple[Formats, Step | None]:
+                      grammar: Grammar | None, progress: Progress) -> tuple[Formats, Step | None]:
     """Choose the memory layout the resident state keeps, by asking XLA for it, and the decode-only
     step that chose it where it takes the state in that layout.
 
@@ -507,9 +532,9 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
 
     program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
     arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
-                 grammar)
+                 grammar, progress)
     tune(lambda: program.lower(*arguments))
-    compiled = program.lower(*arguments).compile()
+    compiled = program.compiled(*arguments)
     formats = joined(*compiled.output_formats[1][:2])
     return formats, _reusable(compiled, formats)
 
@@ -541,8 +566,8 @@ def _reusable(compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
         return None
 
     def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
-             grammar):
-        return compiled(params, resident, carried, admission, transforms, stopping, grammar)
+             grammar, progress):
+        return compiled(params, resident, carried, admission, transforms, stopping, grammar, progress)
     return step
 
 
@@ -577,25 +602,52 @@ def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Arr
     return jax.tree.map(captured, states, cache, is_leaf=lambda x: x is None)
 
 
-def state_programs(formats: Formats, states: Variables) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+def _layout_key(tree) -> tuple[tuple, str]:
+    """A tree of formats or placements as a key: its leaves and its structure's text, as the tree holds the
+    cache mapping and is not hashable itself."""
+    leaves, structure = jax.tree_util.tree_flatten(tree)
+    return tuple(leaves), str(structure)
+
+
+_STATE_PROGRAMS: dict[Hashable, tuple[OuterProgram, OuterProgram]] = {}
+"""One pair of row-state programs per resident layout and store placement; see `state_programs`."""
+
+
+def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, OuterProgram]:
     """The programs that move row states between the resident state, kept in `formats`, and a store of
     them placed as `states` is: restoring a store's entries into slots, the resident matrices donated, and
-    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`)."""
-    resident, carried = split_donated(formats)
+    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`). Each compiles
+    through Dew's one compile point (`OuterProgram`), once per layout and placement, as the step programs
+    are (`decode_programs`)."""
     placed = jax.tree.map(lambda leaf: leaf.sharding, states)
-    return (jax.jit(_restored, donate_argnums=(0,), in_shardings=(resident, carried, placed, None, None),
-                    out_shardings=(resident, carried)),
-            jax.jit(_captured, donate_argnums=(0,), in_shardings=(placed, resident, carried, None, None),
-                    out_shardings=placed))
+    key = (_layout_key(formats), _layout_key(placed))
+    programs = _STATE_PROGRAMS.get(key)
+    if programs is None:
+        resident, carried = split_donated(formats)
+        programs = _STATE_PROGRAMS[key] = (
+            OuterProgram(_restored, donate_argnums=(0,), in_shardings=(resident, carried, placed, None, None),
+                         out_shardings=(resident, carried)),
+            OuterProgram(_captured, donate_argnums=(0,), in_shardings=(placed, resident, carried, None, None),
+                         out_shardings=placed))
+    return programs
 
 
-def opened_in(formats: Formats) -> jax.stages.Wrapped:
-    """`opened`, allocating its state in `formats`."""
-    return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+_OPENED: dict[Hashable, OuterProgram] = {}
+"""One state-opening program per resident layout; see `opened_in`."""
+
+
+def opened_in(formats: Formats) -> OuterProgram:
+    """`opened`, allocating its state in `formats`, compiled through Dew's one compile point
+    (`OuterProgram`), once per layout."""
+    key = _layout_key(formats)
+    program = _OPENED.get(key)
+    if program is None:
+        program = _OPENED[key] = OuterProgram(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+    return program
 
 
 _PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, Option], ...]],
-                tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
+                tuple[OuterProgram, OuterProgram]] = {}
 """One pair of step programs per resident layout; see `decode_programs`."""
 
 ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
@@ -606,8 +658,27 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
 
 
+def dispatched(program: OuterProgram) -> Step:
+    """`program`, a server's step, as a `Step` that runs its executables (`OuterProgram.executable`), one
+    for each size of admission its bucketing pads to, called with the dynamic arguments alone: a server's
+    weights, cache and policies keep their shapes and placements from call to call, so no step's Python
+    walks them to build jit's dispatch key."""
+    executables: dict[Hashable, jax.stages.Compiled] = {}
+
+    def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
+             grammar, progress):
+        size = None if admission is None else tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(admission))
+        executable = executables.get(size)
+        if executable is None:
+            executable = executables[size] = program.executable(
+                model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
+                grammar, progress)
+        return executable(params, resident, carried, admission, transforms, stopping, grammar, progress)
+    return step
+
+
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
-                    ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+                    ) -> tuple[OuterProgram, OuterProgram]:
     """`_compiled` over `formats`, once per layout and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
@@ -616,12 +687,12 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     it leaves it runs that compile as its decoding step instead
     (`resident_formats`). The formats tree holds the cache mapping and is
     not hashable itself, so its leaves and its structure's text key the
-    programs. They stay apart from `dew.nn.kernels.options.program`, the
-    seam every other outer program shares: they donate the cache they step
-    and take its formats as placements, neither of which that seam's
+    programs (`_layout_key`). Each compiles through the kernel templates' reports as every
+    outer program does (`dew.nn.kernels.options.OuterProgram`), but they stay
+    apart from `dew.nn.kernels.options.program`: they donate the cache they
+    step and take its formats as placements, neither of which that seam's
     arguments carry."""
-    leaves, structure = jax.tree_util.tree_flatten(formats)
-    key = (tuple(leaves), str(structure), rows, tuple(sorted(options.items())))
+    key = (*_layout_key(formats), rows, tuple(sorted(options.items())))
     programs = _PROGRAMS.get(key)
     if programs is None:
         halves = split_donated(formats)

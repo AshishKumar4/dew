@@ -16,7 +16,8 @@ import pytest
 from data_support import record_batches
 from diffusion_stubs import batch_for
 from diffusion_support import images_of
-from objective_cases import cases, corpus_windows
+from objective_cases import cases
+from objective_data import corpus_windows
 from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 
@@ -43,7 +44,7 @@ TOKEN_ACCURACY = FIXTURES / "token_accuracy"
 RECORDS = 9
 """The split: a batch and one record, so on two processes one share runs out
 a batch before the other's and covers it with a copy of its last."""
-ROLLOUT = {"grpo", "ppo", "flow_grpo"}
+ROLLOUT = {"grpo", "ppo", "flow_grpo", "diffusion_nft"}
 """Trained on rollouts: a validation split holds prompts, which their loss does not read."""
 
 
@@ -103,7 +104,7 @@ def moved(tree, seed: int):
 
 @pytest.mark.parametrize("held", [7, 1])
 def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
-    """Main's repro: eight training records in batches of four, and seven or
+    """The maintainer's repro: eight training records in batches of four, and seven or
     one to validate. The pass reads each record once, on one process or two,
     and the repeats that fill the last batch out are marked; with one record,
     process 1's share is empty and reads one batch of repeats alone."""
@@ -133,6 +134,16 @@ def test_a_batch_fills_out_with_its_own_rows_in_turn_and_never_from_none():
 
 EVALUATED = sorted(set(objectives) - ROLLOUT)
 """Every registered objective with an evaluation loss."""
+
+POOLED = (("block_diffusion", "distillation", "lm", "mean_flow", "masked_diffusion", "supervised"),
+          ("guidance_distillation",), ("ladd",), ("decision", "shortcut"), ("jepa", "dpo"),
+          ("diffusion", "rcm"))
+"""`EVALUATED` in the parts `tests/test_multiprocess.py` runs its passes on a pool in, so no part passes
+CI's group target on a pool's own seconds, which its two processes' start and compiles dominate: split
+four ways (the second part guidance distillation's Flux alone, about 119 s on one process), the parts
+took 95, 117, 127 and 124 s (verdict 10-29), and LADD's 47 s on one process, JEPA's 40 and the decision
+objective's 36 each now share a pool with one lighter objective at most. The first, the lightest, also
+scores `Perplexity`."""
 
 
 def evaluated(name: str, windows, tmp_path) -> dict:

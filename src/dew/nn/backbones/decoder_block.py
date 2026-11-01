@@ -15,34 +15,37 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew._records import JSON
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
 from ..activations import GatedActivation, gated_product
-from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
-from ..cross_attention import NAME as CROSS_ATTENTION
+from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
     Carried,
+    GatedResidual,
     HyperConnection,
     HyperConnections,
     HyperHead,
     collapse_by,
     collapse_streams,
+    gated_write,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
+from ..inputs import AttentionMetadata, LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
 from ..ngpt import NGPT, stepped
+from ..norms import LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
-from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
+from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
@@ -74,7 +77,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there. 'layer' keeps torch's exact variance, the
     reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
-    (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
+    (`dew.nn.norms.LayerNorm`), whose mean and square reduce in one pass,
     which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
@@ -84,12 +87,16 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
             return RMSNorm(epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
                            scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups,
                            dtype=dtype, name=name)
-        if spec.groups != 1 or spec.offset:
-            raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis under an "
-                             f"unshifted weight, not {spec}")
+        offset = scale_offset if spec.offset is None else spec.offset
+        if spec.groups != 1 or (offset and (kind != 'layer' or not spec.scale)):
+            raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis and a "
+                             f"weight offset from one only as a scaled 'layer' norm, not {spec}")
+        if kind == 'layer' and offset:
+            return OffsetLayerNorm(epsilon=eps, use_bias=bias, dtype=dtype, name=name)
         if kind == 'layer':
-            return nn.LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
-                                dtype=dtype, name=name)
+            # Torch's exact variance, rematerialized as every Dew LayerNorm is (ledger 3010).
+            return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
+                             dtype=dtype, name=name)
         return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, dtype=dtype, name=name)
 
     return build
@@ -97,20 +104,12 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
 
 @runtime_checkable
 class SeamNorm(Protocol):
-    """A pre-norm that owns a block's residual seam (`dew.nn.attention.RMSNorm`):
+    """A pre-norm that owns a block's residual seam (`dew.nn.norms.RMSNorm`):
     it adds a sublayer's branch to the stream it reads and hands that stream
     back beside the norm, `(x + branch, normed)`, so one fused pass takes the
     add, the norm and, in reverse, the stream's own cotangent."""
 
     def seam(self, x, branch=None, *, axes=None) -> tuple[jax.Array, jax.Array]: ...
-
-
-@runtime_checkable
-class ReadsTrain(Protocol):
-    """A token mixer or feed-forward whose call takes `train`, for a dropout of its own."""
-
-    @property
-    def reads_train(self) -> bool: ...
 
 
 @runtime_checkable
@@ -147,6 +146,10 @@ class Mixture:
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
     `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
     `routing_block` with `block_experts` is LLaDA2.2's block routing.
+    `weight_sum_epsilon` is the term a renormalization of non-softmax weights
+    adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6),
+    and `weight_sum_min` the least it divides by (ERNIE 4.5's `moe_norm_min`,
+    `Router.weight_sum_min`).
     """
 
     experts: int
@@ -160,6 +163,8 @@ class Mixture:
     group_score: str = 'top2'
     bias: bool = False
     bias_in_weights: bool = False
+    weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
+    weight_sum_min: float = 0.0
     routing_block: int | None = None
     block_experts: int | None = None
     scale_inputs: bool = False
@@ -219,11 +224,12 @@ class Mixture:
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
                 or self.bias_in_weights or self.routing_block is not None
-                or self.scale_inputs or self.shared_features or self.latent_features is not None):
+                or self.scale_inputs or self.shared_features or self.latent_features is not None
+                or self.weight_sum_epsilon != WEIGHT_SUM_EPSILON or self.weight_sum_min):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, routing blocks, input scaling "
-                "or shared branch to set")
+                "score function, scaling, groups, balancing bias, routing blocks, input scaling, "
+                "shared branch or renormalization bounds to set")
 
     @property
     def beside_dense(self) -> bool:
@@ -271,7 +277,8 @@ class Mixture:
                                          'groups_per_token', 'group_score', 'bias', 'bias_in_weights',
                                          'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
-                                         'latent_features', 'latent_norm', 'media_bias')
+                                         'latent_features', 'latent_norm', 'media_bias',
+                                         'weight_sum_epsilon', 'weight_sum_min')
                        if getattr(self, name) != getattr(plain, name)]
             ignored += ['swiglu_limit'] if swiglu_limit is not None else []
             if ignored:
@@ -298,6 +305,7 @@ class Mixture:
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
             group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
+            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
             media_bias=self.media_bias, routing_block=self.routing_block,
             block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
@@ -308,11 +316,6 @@ class Mixture:
                 RMSNorm, epsilon=norm_eps, scale_offset=scale_offset, scale_after_cast=scale_after_cast,
                 dtype=dtype) if self.latent_norm else None,
             dtype=dtype, precision=precision)
-
-
-LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
-"""The collection a block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`): Google's
-release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""
 
 
 def layer_scalar_mode(variables: Mapping[str, object], path: tuple[str, ...]) -> str | None:
@@ -334,9 +337,17 @@ class BlockWiring:
     `pre_norms` norms each sublayer's input and `output_norms` norms its
     output. The input norms alone give the plain pre-norm block, both give
     Gemma's sandwich block, and the output norms alone give OLMo 3's post-norm
-    block. `ngpt` gives the normalized transformer's block, which has neither:
-    each sublayer reads the unit residual and joins it by a learned step along
+    block. `residual_norms` norms the stream itself after each sublayer joins it,
+    the original Transformer's post-LN block (OPT-350m's), through the same two
+    norms the pre-norm block reads its sublayers' inputs with. `ngpt` gives the
+    normalized transformer's block, which has neither: each sublayer reads the
+    unit residual and joins it by a learned step along
     the sphere (`dew.nn.ngpt.stepped`), `attn_alpha` and `mlp_alpha` its rates.
+    `normed_residual` makes each sublayer's normed input the stream its output
+    joins, and `stream_multiplier` scales that stream as it does, the branch
+    scaled by the model's `residual_multiplier`: MiniMax-Text-01's `postnorm`
+    block and its alpha factors (modeling_minimax_text_01.py at a7351bf2,
+    :1024-1058), `x <- alpha norm(x) + beta f(norm(x))` a sublayer.
     The output norms are separate modules named for the sublayer outputs, so
     the input norms keep their names, and a checkpoint without
     output norms loads with two fewer leaves per layer. `layer_scalar` selects
@@ -348,11 +359,14 @@ class BlockWiring:
     # OLMo 3's post-norm block: modeling_olmo3.py:249-266.
     pre_norms: bool = True
     output_norms: bool = False
+    residual_norms: bool = False
     parallel_residual: bool = False
     shared_parallel_norm: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
     branch_scale: float | None = None
     """Initial value of learned per-feature attention and feed-forward residual scales."""
+    normed_residual: bool = False
+    stream_multiplier: float = 1.0
     ngpt: NGPT | None = None
 
     def __post_init__(self):
@@ -364,6 +378,17 @@ class BlockWiring:
                              "norms, parallel residual or layer scalar")
         if self.layer_scalar not in (None, "frozen", "trainable"):
             raise ValueError("layer_scalar must be None, frozen or trainable")
+        if self.residual_norms and (self.pre_norms or self.output_norms or self.parallel_residual
+                                    or self.ngpt is not None):
+            raise ValueError("a post-LN block norms its stream after each sublayer joins it: it takes no "
+                             "pre- or output norms, parallel residual or nGPT step")
+        if self.normed_residual and (not self.pre_norms or self.parallel_residual or self.ngpt is not None):
+            raise ValueError("normed_residual joins each sublayer's output to its normed input: it needs pre "
+                             "norms, and takes no parallel residual or nGPT step")
+        if self.stream_multiplier != 1.0 and (self.residual_norms or self.parallel_residual
+                                              or self.ngpt is not None):
+            raise ValueError("stream_multiplier scales the stream each sublayer joins: a post-LN block's, a "
+                             "parallel residual's and an nGPT step's joins take no factor")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -628,7 +653,7 @@ class DecoderBlock(nn.Module):
         count = self._submodule_flops(lengths, counted_flops)
         if self.altup is not None:
             count += AltUpLayer(self.altup, self.emb_features, parent=None).mixing_flops(lengths)
-        if self.hyper_connections is not None:
+        if self.hyper_connections is not None and not self.hyper_connections.gated:
             site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
             count += (1 + (self.feedforward is not None)) * site.mixing_flops(lengths)
         if self.residual_site is not None:
@@ -670,12 +695,34 @@ class DecoderBlock(nn.Module):
         if self.altup is not None:
             count += AltUpLayer(self.altup, self.emb_features, parent=None).parameter_flops(lengths)
         if self.hyper_connections is not None:
-            site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
+            site = (GatedResidual if self.hyper_connections.gated else HyperConnection)(
+                self.hyper_connections, self.emb_features, parent=None)
             count += (1 + (self.feedforward is not None)) * site.parameter_flops(lengths)
         if self.residual_site is not None:
             count += DepthAttention(self.emb_features, parent=None).depth_parameter_flops(
                 lengths, self.residual_sources)
         return count
+
+    @nn.nowrap
+    def _stream_sites(self, spec: HyperConnections):
+        """The attention's and the MLP's sites over the streams, set up under `attn_hc` and `ffn_hc`:
+        mHC's (`HyperConnection`), or Qwen4-Exp's gated ones (`GatedResidual`)."""
+        if (self.wiring.pre_norms == spec.gated or self.wiring.output_norms or self.wiring.layer_scalar
+                or self.parallel is not None or self.altup is not None
+                or self.laurel_rank is not None or self.per_layer_input_dim
+                or self.residual_multiplier != 1.0):
+            raise ValueError(
+                "hyper_connections runs the mHC block, a plain pre-norm block whose "
+                "residual is the stream stack, or Qwen4-Exp's gated one, which norms in its read "
+                "and takes no pre norms: no output norms, layer scalar, parallel branch, altup, "
+                "laurel, per-layer inputs or residual multiplier")
+        sites = {'spec': spec, 'emb_features': self.emb_features, 'norm_eps': self.norm_eps}
+        if spec.gated:
+            gated = functools.partial(GatedResidual, **sites, dtype=self.dtype, precision=self.precision)
+            self.attn_gated, self.ffn_gated = gated(name='attn_hc'), gated(name='ffn_hc')
+        else:
+            self.attn_hc = HyperConnection(**sites, name='attn_hc')
+            self.ffn_hc = HyperConnection(**sites, name='ffn_hc')
 
     def setup(self):
         projections = self.projections()
@@ -689,11 +736,24 @@ class DecoderBlock(nn.Module):
                 or self.altup is not None or self.residual_site is not None
                 or self.laurel_rank is not None or self.parallel is not None):
             raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
-        if self.wiring.pre_norms and self.attention_norm:
+        normed = self.wiring.pre_norms or self.wiring.residual_norms
+        if normed and self.attention_norm:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if self.wiring.pre_norms and self.feedforward is not None and not self.wiring.shared_parallel_norm:
+        if normed and self.feedforward is not None and not self.wiring.shared_parallel_norm:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
+        if self.wiring.residual_norms and (self.hyper_connections is not None or self.altup is not None
+                                           or self.residual_site is not None or self.laurel_rank is not None
+                                           or self.parallel is not None or not self.attention_norm):
+            raise ValueError("a post-LN block norms the plain stream: it takes no hyper-connections, AltUp, "
+                             "depth residuals, LAuReL or parallel experts")
+        if ((self.wiring.normed_residual or self.wiring.stream_multiplier != 1.0)
+                and (self.hyper_connections is not None or self.altup is not None
+                     or self.residual_site is not None or self.laurel_rank is not None
+                     or self.parallel is not None or not self.attention_norm or self.cross is not None)):
+            raise ValueError("normed_residual and stream_multiplier join the plain stream: they take no "
+                             "hyper-connections, AltUp, depth residuals, LAuReL, parallel experts, "
+                             "cross-attention or an unnormed attention")
         if self.wiring.output_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             if self.feedforward is not None:
@@ -737,18 +797,7 @@ class DecoderBlock(nn.Module):
                 norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
                 name='laurel')
         if self.hyper_connections is not None:
-            if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
-                    or self.parallel is not None or self.altup is not None
-                    or self.laurel_rank is not None or self.per_layer_input_dim
-                    or self.residual_multiplier != 1.0):
-                raise ValueError(
-                    "hyper_connections runs the mHC block, a plain pre-norm block whose "
-                    "residual is the stream stack: no output norms, layer scalar, parallel "
-                    "branch, altup, laurel, per-layer inputs or residual multiplier")
-            site = functools.partial(HyperConnection, spec=self.hyper_connections,
-                                     emb_features=self.emb_features, norm_eps=self.norm_eps)
-            self.attn_hc = site(name='attn_hc')
-            self.ffn_hc = site(name='ffn_hc')
+            self._stream_sites(self.hyper_connections)
         if self.residual_site is not None:
             if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
                     or self.parallel is not None or self.altup is not None
@@ -834,10 +883,10 @@ class DecoderBlock(nn.Module):
         next block its residual; the sublayers, norms and branches are the same for
         every form.
         """
-        state = self._enter(x, train, attention_metadata)
+        state = self._enter(x, train, attention_metadata, decode)
         if self.cross is not None:
-            state = self._crossed(state, None if attention_metadata is None else attention_metadata.context,
-                                  decode, train)
+            held = AttentionMetadata() if attention_metadata is None else attention_metadata
+            state = self._crossed(state, held.context, decode, train, held.progress)
         state, read, site = self._read(state, "attention")
         if not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -845,10 +894,12 @@ class DecoderBlock(nn.Module):
             state, normed = self._stream_normed(self.input_layernorm, state, None)
         else:
             normed = self.input_layernorm(read)
+        if self.wiring.normed_residual:
+            state = state._replace(x=normed)
         routes = self._routes(per_layer_input)
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
-            routes if self._mixer_routes else {})
+            routes if self._mixer_routes else {}, None if per_layer_input is None else per_layer_input.depth)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         attention_branch = self._branch(mixed, train, "attention")
@@ -870,6 +921,8 @@ class DecoderBlock(nn.Module):
                 state, read, site = self._read(state, "mlp")
                 mlp_input = (normed if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
+                if self.wiring.normed_residual:
+                    state = state._replace(x=mlp_input)
             hidden = self.mlp(mlp_input,
                               **self._feedforward_inputs(attention_metadata, mlp_input.shape),
                               **({} if self.parallel is not None else routes),
@@ -887,11 +940,20 @@ class DecoderBlock(nn.Module):
             state = self._write(state, "mlp", mlp_branch, site)
         return self._leave(state, train, per_layer_input)
 
-    def _crossed(self, state: _BlockState, context, decode: bool, train: bool) -> _BlockState:
+    def _crossed(self, state: _BlockState, context, decode: bool, train: bool,
+                 progress: jax.Array | None) -> _BlockState:
         """The state after the cross-attention block joins it: the plain stream (AltUp's active
         copy among them, nGPT's unit one), mHC's streams through their mean, or the depth
         state's partial block through the mixture the attention reads."""
-        cross = functools.partial(self.cross_attention, decode=decode, train=train)
+        # A block that reads through the layer's own attention is handed it, with the layer's attention
+        # input from the states a sublayer reads (`LayerReads`).
+        layer = {}
+        if self.cross_attention.reads_layer:
+            if not isinstance(self.self_attn, AttendsContext):
+                raise ValueError(f"this layer's mixer ({type(self.self_attn).__name__}) has no attention of "
+                                 "its own for its cross-attention block to read a context through")
+            layer = {"layer": LayerReads(self._attention_input, self.self_attn, progress)}
+        cross = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
         if isinstance(state, _Plain):
             return state._replace(x=constrain(cross(state.x, context), RESIDUAL))
         if isinstance(state, _Streams):
@@ -904,12 +966,18 @@ class DecoderBlock(nn.Module):
             return self.attention_res(sources(state.blocks, state.finished, partial))
         return state._replace(partial=cross(state.partial, context, read=mixture))
 
+    def _attention_input(self, read: jax.Array) -> jax.Array:
+        """The states a sublayer reads, `read`, as the layer's attention reads them: through its
+        input norm where it pre-norms its attention, else as they are."""
+        return self.input_layernorm(read) if self.wiring.pre_norms and self.attention_norm else read
+
     def _joined(self, state: _BlockState) -> tuple[SeamNorm, _Plain] | None:
         """The MLP's pre-norm and the plain stream, where that norm adds the
         attention branch to the stream itself (`_stream_normed`): no other
         sublayer reads the stream between the attention and the MLP."""
         if (self.feedforward is None or not self.wiring.pre_norms or self.laurel_rank is not None
-                or self.wiring.parallel_residual or self.wiring.shared_parallel_norm):
+                or self.wiring.parallel_residual or self.wiring.shared_parallel_norm
+                or self.wiring.normed_residual or self.wiring.stream_multiplier != 1.0):
             return None
         norm = self.post_attention_layernorm
         return (norm, state) if isinstance(norm, SeamNorm) and isinstance(state, _Plain) else None
@@ -944,7 +1012,7 @@ class DecoderBlock(nn.Module):
             output = output * (self.attention_scale if site == "attention" else self.mlp_scale)
         return self.dropout(scaled(output, self.residual_multiplier), deterministic=not train)
 
-    def _enter(self, residual, train: bool, attention_metadata) -> _BlockState:
+    def _enter(self, residual, train: bool, attention_metadata, decode: bool = False) -> _BlockState:
         """The residual the block received, as the state its sublayers read."""
         if self.hyper_connections is not None:
             streams, pre = residual if self.hyper_connections.single_pass else (residual, None)
@@ -952,11 +1020,10 @@ class DecoderBlock(nn.Module):
                 if attention_metadata is None or attention_metadata.engram_ids is None:
                     raise ValueError("an engram layer reads the bucket ids the model hashes into "
                                      "attention_metadata.engram_ids")
-                # A media position takes no engram contribution (V4.1 model.py:351-365), and
-                # the lookup lands before anything reads the streams (:1261-1263).
-                streams = self.engram_layer(
-                    streams, attention_metadata.engram_ids[:, :, self.engram_index],
-                    None if attention_metadata.media is None else ~attention_metadata.media)
+                # The lookup lands before anything reads the streams (V4.1 model.py:1261-1263), each
+                # layer reading the call's rows as it masks them (`EngramLayer`, `PLELayer`).
+                streams = self.engram_layer(streams, attention_metadata.engram_ids[:, :, self.engram_index],
+                                            MixerCall(attention_metadata, decode))
             if self.prediction_site == 'input':
                 # V4.1's DSpark reads each target layer's attention input,
                 # after its engram (V4.1 inference/model.py:1264-1266).
@@ -979,6 +1046,9 @@ class DecoderBlock(nn.Module):
         if isinstance(state, _Streams):
             spec = self.hyper_connections
             assert spec is not None
+            if spec.gated:
+                read, injection = (self.attn_gated if site == "attention" else self.ffn_gated)(state.streams)
+                return state, read, injection
             pre, post, comb = (self.attn_hc if site == "attention" else self.ffn_hc).mapping(state.streams)
             # Under Single-Pass, a site collapses by the `pre` the site before
             # it computed and hands its own on (V4.1 inference/model.py:968-994).
@@ -1031,9 +1101,16 @@ class DecoderBlock(nn.Module):
             # 556 of a 72-layer Dory prefill's 664 s compile on an A100 (ledger 635).
             stepped_x = jax.lax.optimization_barrier(stepped(state.x, output, alpha, self.wiring.ngpt.step))
             return state._replace(x=constrain(stepped_x, RESIDUAL))
+        if isinstance(state, _Plain) and self.wiring.residual_norms:
+            norm = self.input_layernorm if site == "attention" else self.post_attention_layernorm
+            return state._replace(x=constrain(norm(state.x + output), RESIDUAL))
         if isinstance(state, _Plain):
-            return state._replace(x=constrain(state.x + output, RESIDUAL))
+            stream = scaled(state.x, self.wiring.stream_multiplier)
+            return state._replace(x=constrain(stream + output, RESIDUAL))
         if isinstance(state, _Streams):
+            assert self.hyper_connections is not None
+            if self.hyper_connections.gated:
+                return state._replace(streams=constrain(gated_write(state.streams, mapping, output), STREAMS))
             post, comb = mapping
             return state._replace(streams=constrain(mix_streams(post, comb, output, state.streams), STREAMS))
         site_spec = self.residual_site
@@ -1084,14 +1161,14 @@ class DecoderBlock(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
-             train: bool, routes: dict):
+             train: bool, routes: dict, depth=None):
         """The token mixer over `x`, called with one `MixerCall`. It is never
         called with a `MIXING` field set that it does not read (`ReadsMixing`),
         which it would compute as if unset. The train flag, a prediction phase
         other than ordinary and the layer's replayed experts reach it only
         when the call carries them, since a mixer with no use for one does not
         take it."""
-        call = MixerCall(attention_metadata, decode, kv_store)
+        call = MixerCall(attention_metadata, decode, kv_store, depth)
         unread = call.unread(self.self_attn.reads if isinstance(self.self_attn, ReadsMixing) else frozenset())
         if unread:
             raise ValueError(f"{type(self.self_attn).__name__} does not read the call's {', '.join(unread)}, "

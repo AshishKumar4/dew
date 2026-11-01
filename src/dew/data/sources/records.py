@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-import io
+import itertools
 import threading
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
+from typing import Protocol
 
 import grain.python as grain
 
 from dew.batch import Batch
 from dew.data.dataset import Loading, Ranges
+from dew.data.declared import Declared, Unmirrored, mirrored
 from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode
@@ -20,28 +23,65 @@ from .codec import decode
 _MAX_OPEN_SHARDS = Loading().threads
 
 
+class ShardReader[P, V](Protocol):
+    """A reader of one shard's records, by their place in it (`P`), that `ShardReaders` holds open and
+    closes."""
+
+    def __getitem__(self, place: P, /) -> V: ...
+
+    def close(self) -> None: ...
+
+
 @dataclass
-class _OpenedShard:
-    reader: ArrayRecords
+class _OpenedShard[P, V]:
+    reader: ShardReader[P, V]
     reads: int = 0
+    used: int = 0
+    """When a read last asked for it, on the process's clock of reads (`ShardReaders._clock`)."""
 
 
-class ShardReaders[K]:
+class ShardReaders[K, P, V]:
     """At most `limit` shards' readers open at once, each opened by `open` for its key as a read
     first asks for it and closed as the least recent idle one makes room: the bound every physical
     shard's mirror is sized by (`_MAX_OPEN_SHARDS`, Loading's default read threads). Busy readers stay
     open until their reads drain; with as many readers as read threads, a thread asking for a new
     shard holds none, so at least one retained reader is idle and can release its mirror before the
     new open. More read threads than retained readers queue on missing shard opens until a reader
-    drains. Readers retired by close still occupy that bound until their reads drain."""
+    drains. Readers retired by close still occupy that bound until their reads drain.
 
-    def __init__(self, open: Callable[[K], ArrayRecords], limit: int = _MAX_OPEN_SHARDS):
+    The idle readers of every source a process reads are bounded together by the same count
+    (`_trim`): a mixture of hundreds of sources keeps the files one source keeps, the least recently
+    read closed as others are read, while each source's own reads never wait on another's."""
+
+    _live: weakref.WeakSet[ShardReaders] = weakref.WeakSet()
+    # Guards `_live`'s membership, held for no more than an add or a copy.
+    _registry = threading.Lock()
+    _clock = itertools.count()
+    _trimming = threading.Lock()
+    # Whether a read asked for a trim no pass has made since (`_trim`), under `_registry`.
+    _requested = False
+    # The idle readers every source holds open together, which `_trim` brings back to the bound:
+    # counted as each falls idle, is read again or closes, so a read that leaves the process within
+    # it scans nothing.
+    _idle = 0
+
+    def __init__(self, open: Callable[[K], ShardReader[P, V]], limit: int = _MAX_OPEN_SHARDS):
         self.open, self.limit = open, limit
-        self._opened: OrderedDict[K, _OpenedShard] = OrderedDict()
-        self._retired: list[_OpenedShard] = []
+        self._opened: OrderedDict[K, _OpenedShard[P, V]] = OrderedDict()
+        self._retired: list[_OpenedShard[P, V]] = []
         self._lock = threading.Condition(threading.Lock())
+        with ShardReaders._registry:
+            ShardReaders._live.add(self)
 
-    def read(self, key: K, row: int) -> Batch | bytes | None:
+    @classmethod
+    def _idled(cls, change: int) -> bool:
+        """Count `change` readers fallen idle (read again or closed where negative) in the process;
+        whether it then holds more idle than the bound."""
+        with cls._registry:
+            cls._idle += change
+            return cls._idle > _MAX_OPEN_SHARDS
+
+    def read(self, key: K, row: P) -> V:
         """Row `row` of shard `key`'s reader, opened for it where none is."""
         with self._lock:
             while (
@@ -50,25 +90,99 @@ class ShardReaders[K]:
                 and all(opened.reads for opened in self._opened.values())
             ):
                 self._lock.wait()
-            if key not in self._opened:
+            opening = key not in self._opened
+            if opening:
                 if len(self._opened) + len(self._retired) >= self.limit:
                     idle = next(held for held, opened in self._opened.items() if not opened.reads)
                     self._opened.pop(idle).reader.close()
-                self._opened[key] = _OpenedShard(self.open(key))
+                    ShardReaders._idled(-1)
+                self._opened[key] = _OpenedShard(self._admitted(key))
             self._opened.move_to_end(key)
             opened_shard = self._opened[key]
+            if not opening and not opened_shard.reads:
+                ShardReaders._idled(-1)
             opened_shard.reads += 1
+            opened_shard.used = next(ShardReaders._clock)
         try:
             return opened_shard.reader[row]
         finally:
             with self._lock:
                 opened_shard.reads -= 1
                 # A reopened shard owns a different reader from an evicted in-flight read.
+                over = False
                 if not opened_shard.reads:
                     if self._opened.get(key) is not opened_shard:
                         self._retired.remove(opened_shard)
                         opened_shard.reader.close()
+                    else:
+                        over = ShardReaders._idled(1)
                     self._lock.notify_all()
+            if over:
+                ShardReaders._trim()
+
+    def _admitted(self, key: K) -> ShardReader[P, V]:
+        """Shard `key`'s reader, opened under the lock: where Dew's mirror has no room for the copy it
+        reads (`Unmirrored`), this source's idle readers let go of theirs and it opens again; its busy
+        readers keep theirs, and a mirror without room beside them refuses."""
+        try:
+            return self.open(key)
+        except Unmirrored:
+            for idle in [held for held, opened in self._opened.items() if not opened.reads]:
+                self._opened.pop(idle).reader.close()
+                ShardReaders._idled(-1)
+            return self.open(key)
+
+    @classmethod
+    def _trim(cls) -> None:
+        """Close the least recently read idle readers of every source in the process past the bound
+        one source keeps (`_MAX_OPEN_SHARDS`), as a read leaves more idle than that. It waits on no
+        lock: where another read is trimming, it asks that one to trim again (`_requested`), which
+        it does before it lets go, and a source whose lock is held, a read opening one of its shards
+        say, is passed over, its idle readers trimmed as one of its reads drains. So no read waits on
+        a source it does not read, and no request is lost to a trim already past it."""
+        with cls._registry:
+            cls._requested = True
+        while cls._trimming.acquire(blocking=False):
+            try:
+                while True:
+                    with cls._registry:
+                        if not cls._requested:
+                            break
+                        cls._requested = False
+                        live = list(cls._live)
+                    cls._closed_past_bound(live)
+            finally:
+                cls._trimming.release()
+            # A request made between the last look and the release is this read's to serve.
+            with cls._registry:
+                if not cls._requested:
+                    return
+
+    @classmethod
+    def _closed_past_bound(cls, live: Sequence[ShardReaders]) -> None:
+        """The trim's pass over `live`'s sources (`_trim`): their idle readers past the bound closed,
+        the least recently read first, each source's lock taken only where it is free."""
+        idle = []
+        for readers in live:
+            if not readers._lock.acquire(blocking=False):
+                continue
+            try:
+                idle.extend((opened.used, id(readers), key, readers)
+                            for key, opened in readers._opened.items() if not opened.reads)
+            finally:
+                readers._lock.release()
+        idle.sort(key=lambda entry: entry[:2])
+        for _, _, key, readers in idle[:max(0, len(idle) - _MAX_OPEN_SHARDS)]:
+            if not readers._lock.acquire(blocking=False):
+                continue
+            try:
+                opened = readers._opened.get(key)
+                if opened is not None and not opened.reads:
+                    readers._opened.pop(key).reader.close()
+                    cls._idled(-1)
+                    readers._lock.notify_all()
+            finally:
+                readers._lock.release()
 
     def close(self) -> None:
         """Close every idle reader, retiring busy ones until their reads drain."""
@@ -78,12 +192,14 @@ class ShardReaders[K]:
                     self._retired.append(opened)
                 else:
                     opened.reader.close()
+                    ShardReaders._idled(-1)
             self._opened.clear()
             self._lock.notify_all()
 
 
 class ArrayRecords:
-    """Read shards concurrently, retaining as many readers as default read threads (`ShardReaders`).
+    """Read shards concurrently, retaining as many readers as default read threads (`ShardReaders`),
+    and as many idle readers as that with every other source the process reads.
 
     Shuffled indexed reads reuse the LRU across Loading's in-flight read width.
     Non-native shards need a mirror with room for that many physical shards.
@@ -96,10 +212,13 @@ class ArrayRecords:
         *,
         record_codec: bool = False,
         counts: Sequence[int] | None = None,
+        declared: Sequence[Declared | None] | None = None,
     ):
         self.urls = tuple(urls)
         self.storage_options = storage_options
         self.record_codec = record_codec
+        # Each shard as its producer declared it (`Declared`), read from a checked file on this host.
+        self.declared = (None,) * len(self.urls) if declared is None else tuple(declared)
         self.counts = None if counts is None else tuple(counts)
         if self.counts is not None and (
             len(self.counts) != len(self.urls) or any(count < 0 for count in self.counts)
@@ -111,7 +230,8 @@ class ArrayRecords:
     def _shard(self, shard: int) -> ArrayRecords:
         """Physical shard `shard`'s own reader, checked against its producer's row count."""
         assert self.counts is not None
-        opened = ArrayRecords((self.urls[shard],), self.storage_options, record_codec=self.record_codec)
+        opened = ArrayRecords((self.urls[shard],), self.storage_options, record_codec=self.record_codec,
+                              declared=(self.declared[shard],))
         if len(opened) != self.counts[shard]:
             opened.close()
             raise ValueError(f"ArrayRecord {self.urls[shard]} differs from its producer's row count")
@@ -124,21 +244,21 @@ class ArrayRecords:
     @cached_property
     def reader(self):
         paths = []
-        for url in self.urls:
+        for url, declared in zip(self.urls, self.declared, strict=True):
+            if declared is not None:
+                # ArrayRecord's reader opens paths alone, so a declared shard is read from a checked file
+                # on this host: its own, or its copy in Dew's mirror, a GCS one's too, held while it reads.
+                path, held = declared.leased()
+                self._pins.append(held)
+                paths.append(path)
+                continue
             fs, path = Store(url, self.storage_options).resolve()
             if local(fs):
                 paths.append(path)
             elif on_gcs(fs):
                 paths.append("gs://" + path)
             else:
-                fs, path = Store(url, self.storage_options).cached().resolve()
-                pin = fs.open(path, "rb")
-                if not isinstance(pin, io.BufferedReader) or not isinstance(pin.name, str):
-                    pin.close()
-                    raise ValueError(
-                        f"ArrayRecord {url} needs mirror room for {_MAX_OPEN_SHARDS} physical shards "
-                        "(Loading's default read threads)"
-                    )
+                pin = mirrored(Store(url, self.storage_options))
                 self._pins.append(pin)
                 paths.append(pin.name)
         return grain.ArrayRecordDataSource(paths)
@@ -168,6 +288,7 @@ class ArrayRecords:
             "storage_options": self.storage_options,
             "record_codec": self.record_codec,
             "counts": self.counts,
+            "declared": self.declared,
         }
 
     def __setstate__(self, state: Mapping[str, object]) -> None:

@@ -1,4 +1,5 @@
-"""GPT-2's learned positions, biased LayerNorm and Conv1D checkpoint layout."""
+"""GPT-2's learned positions, biased LayerNorm and Conv1D checkpoint layout, and GPT-1's post-LN blocks over
+them."""
 
 from collections.abc import Mapping
 from functools import partial
@@ -23,6 +24,7 @@ from dew.interop.decoder_parts import (
     ungated_mlp,
 )
 from dew.interop.safetensors_io import LazyTensors
+from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 
@@ -127,8 +129,8 @@ def _gptj_order(head_dim: int, rotated: int) -> np.ndarray:
                            np.arange(rotated, head_dim)))
 
 
-def _gptj_prepare(tensors: Mapping[str, np.ndarray],
-                  config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _gptj_prepare(tensors: Mapping[str, Stored],
+                  config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     if config is None:
         raise ValueError('GPT-J rotary storage requires translated head geometry')
     head_dim = _records.integer(config['head_dim'], 'head_dim')
@@ -216,8 +218,8 @@ def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     )
 
 
-def _gpt2_prepare(tensors: Mapping[str, np.ndarray],
-                   _config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _gpt2_prepare(tensors: Mapping[str, Stored],
+                   _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     """Check and drop the fixed attention buffers, and nest the bare model's names."""
     prepared = {}
     for name, tensor in tensors.items():
@@ -287,6 +289,83 @@ GPTJ = DecoderFamily(
     weight_path=_gptj_path, export_path=partial(renamed_name, _GPTJ_NAMES),
     prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+)
+
+def _openai_gpt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """GPT-1's decoder (modeling_openai.py): GPT-2's attention, MLP and Conv1D layers, each block norming its
+    stream after each sublayer joins it (`n = ln_1(x + a)`, `h = ln_2(n + m)`) and the trunk ending in no
+    norm. Its `afn` 'gelu' is OpenAI's tanh GELU (`ACT_FNS`, gelu_new)."""
+    afn = _records.text(hf.get('afn', 'gelu'), 'afn')
+    spelled = {'gelu': 'gelu_new', 'relu': 'relu'}
+    if afn not in spelled:
+        refuse(f'afn={afn!r}', "GPT-1's MLP reads a tanh GELU ('gelu') or ReLU here")
+    # GPT-1's blocks always scale by the head width and read none of GPT-2's other attention switches
+    # (modeling_openai.py builds each Block with scale=True), whatever a config carries.
+    config = gpt2_config({**hf, 'activation_function': spelled[afn], 'n_inner': None,
+                          'vocab_size': hf.get('vocab_size', 40478),
+                          'n_positions': hf.get('n_positions', 512), 'scale_attn_weights': True,
+                          'scale_attn_by_inverse_layer_idx': False, 'reorder_and_upcast_attn': False,
+                          'add_cross_attention': False}, used)
+    # The original release's `n_special`, which transformers' OpenAI GPT reads nowhere: its vocabulary
+    # counts the special tokens.
+    used.update(('afn', 'predict_special_tokens', 'n_special'))
+    config.update({'pre_norms': False, 'post_residual_norms': True, 'final_norm': False})
+    return config
+
+
+def _openai_gpt_export(model: CausalTransformer) -> Mapping[str, object]:
+    fields = dict(gpt2_export(model))
+    activation = fields.pop('activation_function')
+    fields['afn'] = {'gelu_new': 'gelu', 'relu': 'relu'}[str(activation)]
+    fields.update(dict.fromkeys(('n_inner', 'scale_attn_weights', 'activation_function')))
+    return fields
+
+
+def _openai_nested(name: str) -> str:
+    """A bare OpenAIGPTModel's names nested under the causal LM's `transformer`, as the original release
+    stores them."""
+    return 'transformer.' + name if name.startswith(('h.', 'tokens_embed.', 'positions_embed.')) else name
+
+
+def _openai_gpt_prepare(tensors: Mapping[str, Stored],
+                        _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
+    """Check and drop the fixed causal masks, and nest the bare model's names."""
+    return {_openai_nested(name): tensor for name, tensor in tensors.items()
+            if not fixed_attention_buffer(name, tensor, 'attn', ())}
+
+
+OPENAI_GPT_NAMES: Renames = (
+    ('transformer.tokens_embed', 'model.embed_tokens'),
+    ('transformer.positions_embed', 'model.embed_positions'),
+    ('transformer.h', 'model.layers'), ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'),
+    ('attn.c_proj', 'self_attn.o_proj'), *GPT_MLP)
+"""GPT-1's trunk and blocks: GPT-2's but for its embeddings' names; `ln_1` norms the stream after the
+attention joins it and `ln_2` after the MLP (`post_residual_norms`), as OPT-350m's norms do."""
+
+
+def _openai_gpt_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    name = _openai_nested(name)
+    # Alias inspection sees raw names before preparation, which validates and drops the masks.
+    if name.endswith('.attn.bias'):
+        return None
+    return renamed_path(OPENAI_GPT_NAMES, name, config)
+
+
+OPENAI_GPT = DecoderFamily(
+    ('openai-gpt',),
+    _openai_gpt_config,
+    lambda fields: (fields.position_embedding == 'learned' and fields.post_residual_norms
+                    and not fields.final_norm and fields.position_embedding_offset == 0),
+    'openai-gpt',
+    'OpenAIGPTLMHeadModel',
+    _openai_gpt_export,
+    weight_path=_openai_gpt_path,
+    export_path=partial(renamed_name, OPENAI_GPT_NAMES),
+    prepare=_openai_gpt_prepare,
+    spelling=_openai_nested,
+    packed=_GPT2_PACKED,
+    preserve_source_layout=False,
+    tied_head_names=('lm_head.weight', 'transformer.tokens_embed.weight'),
 )
 
 GPT2 = DecoderFamily(

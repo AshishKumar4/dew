@@ -26,24 +26,28 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
-from dew.nn.attention import (
-    LayerNorm,
-    RMSNorm,
-    causal_attention_mask,
-    kernel_for_materialized_mask,
-    max_attention_logits,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
+from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits
+from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
-from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of
+from dew.nn.flops import MissingFlopsCount, attention_flops, cross_attention_flops, projection_flops
+from dew.nn.inputs import (
+    PLAIN_CALL,
+    MixerCall,
+    PredictionPhase,
+    coordinates_of,
+    counted_places,
+    document_reach,
+)
 from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
+from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import (
     at_least_fp32,
     compensated_add,
@@ -51,7 +55,15 @@ from dew.nn.precision import (
     float32_dot_general,
     float32_einsum,
 )
-from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
+from dew.nn.rope import (
+    LongRopeScaling,
+    Scaling,
+    YarnScaling,
+    deinterleaved,
+    rotary_freqs,
+    rotate,
+    yarn_query_scale,
+)
 from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import (
     index_agreements,
@@ -63,13 +75,17 @@ from dew.nn.sparse_selection import (
 from dew.quantization import quantized_products
 
 
-def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None):
+def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None,
+                      layout: KVCache):
     """Open a sparse latent attention's decode cache: its expanded keys and values, as DeepSeek V3.2
-    stores them, through the attention cache (`open_kv_cache`), and the sparse indexer's keys beside
-    them where `index_keys` is given (None on a layer that owns no indexer and reads another layer's
-    selection). Returns the [B, S] slots and an `append` that writes the new rows and returns the
-    whole cache, the index keys last or None."""
-    positions, written = open_kv_cache(module, key, max_seq_len, valid=valid, value_dim=value_dim)
+    stores them, through the attention cache (`open_kv_cache`) in `layout`, and the sparse indexer's
+    keys beside them where `index_keys` is given (None on a layer that owns no indexer and reads
+    another layer's selection), one compact row each, which a paged server keeps as a row's state.
+    Returns the [B, S] slots, an `append` that writes the new rows and returns the whole cache, the
+    index keys last or None, and the attention cache's own append, whose `query` puts a query in the
+    basis the stored keys are in."""
+    positions, written = open_kv_cache(module, key, max_seq_len, valid=valid, value_dim=value_dim,
+                                       layout=layout)
     cached_index = None if index_keys is None else module.variable(
         "cache", "cached_index", jnp.zeros, (key.shape[0], max_seq_len, index_keys.shape[-1]),
         index_keys.dtype)
@@ -80,7 +96,7 @@ def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_se
             cached_index.value = write_cache(cached_index.value, new_index_keys, written.positions)
         return full_key, full_value, None if cached_index is None else cached_index.value
 
-    return positions, append
+    return positions, append, written
 
 
 INDEXER = 'indexer'
@@ -287,9 +303,10 @@ class MultiHeadLatentAttention(nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
     decode=True runs against the cache like the standard mixer; `positions` and
-    `segment_ids` behave as there. `yarn`, the layer's YaRN ramp, transforms
-    `rope_theta`, the layer's base, and its mscale pre-scales the query; the
-    mixer resolves both through `MixerContext`. The two latent norms are the model's RMSNorm, as the
+    `segment_ids` behave as there. `rope_scaling`, the layer's one rope scaling
+    (`MixerContext.rope_scaling`: YaRN, Llama 3.1's ramp or LongRoPE),
+    transforms `rope_theta`, the layer's base, at every rotation it makes, and
+    a YaRN ramp's mscale pre-scales the query. The two latent norms are the model's RMSNorm, as the
     reference builds them from the layer's one norm class.
 
     `index_n_heads` and `index_head_dim` put the indexer beside the attention
@@ -306,9 +323,12 @@ class MultiHeadLatentAttention(nn.Module):
     documents, row validity, the selection) takes 'auto' and 'cudnn' to xla.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): it narrows its keys by the
-    documents, the rows' validity and its own selection, no mask, bias or mixed step."""
+    reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
+                                                 "position_bias"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask or key
+    runs, the key positions they are read at and a position bias, on an uncached call, as the standard
+    attention reads them; an indexed layer narrows its keys by the documents, the rows' validity and
+    its own selection alone, and refuses them (`_check_call`)."""
 
     emb_features: int
     num_heads: int
@@ -321,7 +341,7 @@ class MultiHeadLatentAttention(nn.Module):
     causal: bool = True
     rope_theta: float = 10000.0
     rope_interleave: bool = True
-    yarn: YarnScaling | None = None
+    rope_scaling: Scaling | None = None
     # DeepSeek and GLM norm the latents at RMSNorm's 1e-6 default whatever
     # the trunk's rms_norm_eps says (modeling_deepseek_v3.py:392,404,
     # modeling_glm_moe_dsa.py:349,361).
@@ -334,10 +354,28 @@ class MultiHeadLatentAttention(nn.Module):
     index_head_dim: int | None = None
     index_rope_interleave: bool = False
     index_shared: bool = False
+    sliding_window: int | None = None
+    """A dense layer's window: each query sees the keys within this many of its place, itself included,
+    counting its document's real tokens (`dew.nn.attention.visibility_mask`); a non-causal layer windows
+    only under `bidirectional_window`. An indexed layer's candidates take no window."""
+    bidirectional_window: bool = False
+    """Whether a non-causal layer keeps its window on both sides of a query (the layer context's flag of
+    the name); otherwise it reads its whole row."""
+    attention_chunk: int | None = None
+    """A dense layer's chunk: each query sees the keys in its own chunk of this many places
+    (`dew.nn.attention.chunk_mask`), as Llama 4's chunked layers do."""
+    bidirectional_blocks: bool = False
+    """A causal dense layer reads each block of its call's `block_groups` whole, as the standard
+    attention's flag of the name does, on an uncached call."""
+    bidirectional_images: bool = False
+    """A causal dense layer reads each image of its call's `image_groups` whole, on an uncached call."""
     kv_store_key: str | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
+    kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
+    """The decode cache's storage layout (`dew.nn.kv_cache`), paged or quantized, over the latents
+    or, under the sparse layout, the expanded keys."""
     rotary: bool = True
     """False is Kimi K3's MLA (`mla_use_nope`, modeling_kimi_linear.py:396-437
     of moonshotai/Kimi-K3 at f831ab6): the decoupled rope head is kept as
@@ -437,21 +475,10 @@ class MultiHeadLatentAttention(nn.Module):
         """The latent and expanded projections plus training's QK and AV."""
         if self.indexed or self.index_shared:
             raise MissingFlopsCount("MultiHeadLatentAttention needs indexer selection geometry for train/mfu")
-        query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
-        if self.q_lora_rank is None:
-            count = projection_flops(lengths, self.emb_features, query)
-        else:
-            count = (projection_flops(lengths, self.emb_features, self.q_lora_rank)
-                     + projection_flops(lengths, self.q_lora_rank, query))
-        count += projection_flops(lengths, self.emb_features, self.kv_lora_rank + self.qk_rope_head_dim)
-        count += projection_flops(lengths, self.kv_lora_rank,
-                                   self.num_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        count += projection_flops(lengths, self.num_heads * self.v_head_dim, self.emb_features)
-        if self.output_gate:
-            count += projection_flops(lengths, self.emb_features, self.num_heads * self.v_head_dim)
-        return count + attention_flops(lengths, self.num_heads,
-                                       self.qk_nope_head_dim + self.qk_rope_head_dim,
-                                       self.v_head_dim, causal=self.causal)
+        # Its projections are its read of a context's, over its own sequence (`context_projection_flops`).
+        return self.context_projection_flops(lengths, lengths) + attention_flops(
+            lengths, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim,
+            causal=self.causal)
 
     def _select(self, index_scores, keep, kv_store):
         """The keys each query attends among `keep`, as `top_k_selection`
@@ -477,11 +504,11 @@ class MultiHeadLatentAttention(nn.Module):
         """The softmax-scale ratio the query carries into the kernel.
 
         The kernel scales by `1 / sqrt(qk_head_dim)` itself; YaRN's mscale
-        rides on the query, so a plain rope carries exactly 1.0.
+        rides on the query, so any other rope carries exactly 1.0.
         """
-        if self.yarn is None:
+        if not isinstance(self.rope_scaling, YarnScaling):
             return 1.0
-        return yarn_query_scale(self.yarn)
+        return yarn_query_scale(self.rope_scaling)
 
     def _queries(self, x, place: LogicalAxes):
         """`[B, S, H, nope+rope]` queries and the residual the indexer reads,
@@ -512,7 +539,7 @@ class MultiHeadLatentAttention(nn.Module):
         latent, rot = jnp.split(compressed, [self.kv_lora_rank], axis=-1)
         return constrain(self.kv_a_layernorm(latent), RESIDUAL), constrain(rot, RESIDUAL)
 
-    def _rotated(self, q_rot, rot, positions):
+    def _rotated(self, q_rot, rot, positions, reach=None):
         """Rotate the query's and the latent's rope heads at `positions`.
 
         Returns the rotated pair and the angles, which the indexer rotates
@@ -523,8 +550,8 @@ class MultiHeadLatentAttention(nn.Module):
         if not self.rotary:
             return q_rot, rot, None, None
         freqs_cos, freqs_sin = rotary_freqs(
-            positions, self.qk_rope_head_dim, self.rope_theta, rope_scaling=self.yarn,
-            dtype=at_least_fp32(q_rot.dtype))
+            positions, self.qk_rope_head_dim, self.rope_theta, rope_scaling=self.rope_scaling,
+            dtype=at_least_fp32(q_rot.dtype), reach=reach)
         return (_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin),
                 _rotate(self.rope_interleave, rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
                 freqs_cos, freqs_sin)
@@ -539,6 +566,73 @@ class MultiHeadLatentAttention(nn.Module):
         rot = jnp.broadcast_to(
             rot[:, :, None, :], (batch, length, self.num_heads, self.qk_rope_head_dim))
         return jnp.concatenate([nope, rot], axis=-1), values
+
+    @property
+    def reads_context(self) -> bool:
+        """Whether it projects keys and values of its own to read a context with (`context_keys`): a
+        latent attention always does (`dew.nn.cross_attention.AttendsContext`)."""
+        return True
+
+    @nn.nowrap
+    def context_heads(self) -> tuple[int, int, int]:
+        """Its key heads' count and the widths of a key and a value head, as `context_keys` gives them:
+        a key head for each query head, its no-position part and its rope head together."""
+        return self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim
+
+    def context_query(self, x):
+        """Its query heads over `x` `[B, S, E]` as it reads another sequence (`attend_context`): through
+        its query latent as its own call projects them, YaRN's scale on them, their rope parts
+        unrotated, a context having no positions to rotate by. With the output gate, `x`, which the
+        gate reads (`_output`), else None."""
+        queries, _ = self._queries(x, RESIDUAL)
+        q_pass, q_rot = jnp.split(queries, [self.qk_nope_head_dim], axis=-1)
+        return self._scaled_query(q_pass, q_rot), x if self.output_gate else None
+
+    def context_keys(self, context):
+        """Its key and value heads over a context `[B, C, E]`: the context's normed latent expanded by
+        its own projection, beside its decoupled rope head unrotated (`_expand`)."""
+        return self._expand(*self._latents(context, RESIDUAL))
+
+    def attend_context(self, query, gate, key, value, *, lengths, queries=None, segments=None,
+                       max_segments=None, progress=None):
+        """Its attention of `query` heads (`context_query`) over a context's `key` and `value` heads
+        (`context_keys`), each row's first `lengths` keys real (none for a row without context, whose
+        read its block leaves out) and, where given, each query reading its own document's keys alone
+        (`queries` `[B, S]`, `segments` `[B, C]`), unmasked by causality, then its output gate and
+        projection (`_output`); a latent attention anneals nothing over a run (`progress`)."""
+        sow_context_logits(self, query, key, lengths, queries, segments)
+        # A row without context reads its first slot, so its softmax stays finite (`CausalSelfAttention`).
+        attention = checkpoint_name(scaled_dot_product_attention(
+            query, key, value, dtype=self.dtype, precision=self.precision,
+            force_fp32_for_softmax=self.force_fp32_for_softmax, implementation=self.attention_impl,
+            key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
+            max_segments=max_segments), 'context')
+        return self._output(attention, gate)
+
+    @nn.nowrap
+    def context_flops(self, lengths, context_lengths) -> float:
+        """Its read of a context's work over rows of `lengths` tokens reading `context_lengths`
+        (`attend_context`): its projections' (`context_projection_flops`) and the attention between them."""
+        return self.context_projection_flops(lengths, context_lengths) + cross_attention_flops(
+            lengths, context_lengths, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim,
+            self.v_head_dim)
+
+    @nn.nowrap
+    def context_projection_flops(self, lengths, context_lengths) -> float:
+        """The part of its read of a context done by its own matrices: the query latent's, the output
+        gate's and the output projection's over the rows of `lengths` tokens, the key latent's and its
+        expansion's over the context's `context_lengths`; its own call's over its sequence alike
+        (`model_flops`)."""
+        query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+        rows = (projection_flops(lengths, self.emb_features, query) if self.q_lora_rank is None else
+                projection_flops(lengths, self.emb_features, self.q_lora_rank)
+                + projection_flops(lengths, self.q_lora_rank, query))
+        rows += projection_flops(lengths, self.num_heads * self.v_head_dim, self.emb_features)
+        if self.output_gate:
+            rows += projection_flops(lengths, self.emb_features, self.num_heads * self.v_head_dim)
+        return rows + projection_flops(context_lengths, self.emb_features,
+                                       self.kv_lora_rank + self.qk_rope_head_dim) + projection_flops(
+            context_lengths, self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
@@ -562,16 +656,29 @@ class MultiHeadLatentAttention(nn.Module):
         # since the widths add up exactly.
         q_pass, q_rot = jnp.split(
             queries, [self.qk_nope_head_dim], axis=-1)
+        query_basis, own = None, False
         if decode:
-            q_rot, key, value, mask = self._decode_step(
+            q_rot, key, value, mask, query_basis = self._decode_step(
                 x, q_rot, rot, latent, q_resid, logical_positions, valid, call, prediction_phase)
             if self.sparse:
                 unselected = self._empty_selection(mask[:, 0], row_valid)
             causal = False
         else:
             positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
-            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions)
-            if segment_ids is not None:
+            # Under LongRoPE a packed document picks its factors by its own furthest place
+            # (`document_reach`), so it rotates as it does alone.
+            reach = (document_reach(segment_ids, valid, positions)
+                     if isinstance(self.rope_scaling, LongRopeScaling) and segment_ids is not None else None)
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions, reach)
+            # Windows, chunks and groups count each document's real tokens from its first place
+            # (`counted_places`); rotation reads the places as given.
+            counted = (jnp.broadcast_to(positions, (batch, length)) if logical_positions is None
+                       else counted_places(segment_ids, valid, logical_positions))
+            visible, own = self._dense_visibility(attention_metadata, positions, counted, segment_ids, valid,
+                                                  causal, batch, length)
+            if visible is not None:
+                mask, causal = visible, False
+            elif segment_ids is not None:
                 inside = document_mask(segment_ids)[:, None]
                 mask = inside
                 if causal:
@@ -610,12 +717,15 @@ class MultiHeadLatentAttention(nn.Module):
                         and self.is_mutable_collection(INDEXER_COLLECTION)):
                     objective = (index_scores, keep)
             key, value = self._expand(latent, rot)
-        if valid is not None:
+        if valid is not None and not own:
+            # A call's own pairwise mask or key runs replace its validity, as the shared core's do.
             queries_valid = jnp.asarray(valid, bool)[:, None, :, None]
             mask = queries_valid if mask is None else mask & queries_valid
             if not decode:
                 mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         query = self._scaled_query(q_pass, q_rot)
+        if query_basis is not None:
+            query = query_basis(query)
         if mask is not None and not decode:
             # Packed documents, row validity and the indexer's selection all
             # materialize a mask on the training path, so they take the xla
@@ -626,12 +736,68 @@ class MultiHeadLatentAttention(nn.Module):
                 force_fp32_for_softmax=self.force_fp32_for_softmax)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
-        return self._attend(query, key, value, x, mask, implementation, causal=causal,
+        bias = None if decode or attention_metadata is None else attention_metadata.position_bias
+        if bias is not None:
+            implementation = kernel_for_materialized_mask(
+                implementation, query, key, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax)
+        return self._attend(query, key, value, x, mask, implementation, causal=causal, bias=bias,
                             unselected=unselected, force_fp32_for_softmax=self.force_fp32_for_softmax)
 
+    def _dense_visibility(self, metadata, positions, places, segment_ids, valid, causal: bool, batch: int,
+                          length: int) -> tuple[jax.Array | None, bool]:
+        """An uncached dense call's visibility `[B, 1, Q, K]` as the shared attention core resolves it
+        (`call_visibility`, `dense_visibility`), None where its causality and documents alone give it, and
+        whether the call's own pairwise mask or key runs replaced its causality, documents, groups and
+        validity. `positions` are its tokens' rotary places, which a call's own visibility reads, and
+        `places` their places counted over their documents' real tokens, which the window, the chunk and
+        the groups read."""
+        own = None if metadata is None else call_visibility(
+            metadata, positions, batch=batch, queries=length, keys=length, key_places=places,
+            sliding_window=self.sliding_window)
+        groups = {name: jnp.asarray(getattr(metadata, name), jnp.int32) for name in self._group_fields()
+                  if metadata is not None and getattr(metadata, name) is not None}
+        window = self.sliding_window if causal or self.bidirectional_window else None
+        if own is None and not (groups or window is not None or self.attention_chunk is not None):
+            return None, False
+        if own is not None:
+            mask, runs, window, key_places = own
+            causal, segment_ids, groups, valid = False, None, {}, None
+        else:
+            mask = runs = None
+            key_places = places
+        return dense_visibility(mask, segment_ids, causal, window, valid, runs, places, key_places, length,
+                                length, self.attention_chunk, **groups), own is not None
+
     def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
-        if call.metadata is not None and call.metadata.rotary_positions is not None:
+        metadata = call.metadata
+        if metadata is not None and metadata.rotary_positions is not None:
             raise ValueError("MLA does not implement multi-axis rotary positions")
+        selecting = self.indexed or self.index_shared
+        if selecting and (self.sliding_window is not None or self.attention_chunk is not None):
+            raise ValueError("an indexed mla layer selects its candidates among every key before it; "
+                             "a window or chunk narrows a dense layer's keys")
+        own = None if metadata is None else [
+            name for name, given in (("pairwise_mask", metadata.pairwise_mask),
+                                     ("key_runs", metadata.key_runs),
+                                     ("key_positions", metadata.key_positions),
+                                     ("position_bias", metadata.position_bias)) if given is not None]
+        if own and (selecting or call.decode):
+            raise ValueError(f"an mla layer reads {', '.join(own)} on a dense layer's uncached call, its "
+                             "keys the call's own")
+        grouped = [name for name in self._group_fields()
+                   if metadata is not None and getattr(metadata, name) is not None]
+        if grouped and (selecting or call.decode):
+            raise ValueError(f"an mla layer reads {', '.join(grouped)} whole on a dense layer's uncached "
+                             "call")
+        if call.decode and self.attention_chunk is not None and metadata is not None and (
+                coordinates_of(metadata, batch, length).positions is not None):
+            raise ValueError("a chunked mla layer decodes at its cache's slots, so it takes no places of "
+                             "the call's own")
+
+    def _group_fields(self) -> tuple[str, ...]:
+        """The `AttentionMetadata` group fields the layer reads whole (`group_fields`)."""
+        return group_fields(self.causal, images=self.bidirectional_images, blocks=self.bidirectional_blocks)
 
     def _index_keys(self, x, valid):
         return self.indexer.keys(x)
@@ -653,9 +819,11 @@ class MultiHeadLatentAttention(nn.Module):
     def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, call,
                       prediction_phase: PredictionPhase):
         """One decode step's rotated query heads, its keys and values with the
-        cache's joined, and the mask over them: the expanded keys and the
+        cache's joined, the mask over them, and what puts the scaled query in the
+        basis the cached keys are in (None for none): the expanded keys and the
         indexer's selection under the sparse layout, or the latents expanded
-        after the append under the dense one."""
+        after the append under the dense one. `kv_cache`, the cache's layout,
+        stores either form paged or quantized."""
         # The cache hands out the slots first, because the rope heads
         # rotate at absolute positions: the queries at this step's slots
         # and the appended latents at theirs, while the cached ones keep
@@ -668,8 +836,8 @@ class MultiHeadLatentAttention(nn.Module):
             # draw. Only the decoupled rope channels change once the cache supplies their slots.
             key, value = self._expand(latent, rot)
             index_keys = self._index_keys(x, row_valid) if self.indexed else None
-            positions, append = open_latent_cache(self, key, self.v_head_dim, index_keys,
-                                                  self.max_seq_len, valid=valid)
+            positions, append, basis = open_latent_cache(self, key, self.v_head_dim, index_keys,
+                                                         self.max_seq_len, valid=valid, layout=self.kv_cache)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
@@ -683,24 +851,35 @@ class MultiHeadLatentAttention(nn.Module):
                 x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
                 allocated=allocated, committed=committed, prediction_phase=prediction_phase)
             mask = selection_mask(selection, key.shape[1])[:, None]
+            query_basis = basis.query
         else:
-            # The latent and its rotary part, one head each, as the attention cache's keys and values.
+            # The latent and its rotary part, one head each, as the attention cache's keys and values,
+            # the latents read back in their own basis, which the expansion reads.
             positions, append = open_kv_cache(self, latent[:, :, None], self.max_seq_len, valid=valid,
-                                              value_dim=self.qk_rope_head_dim)
+                                              value_dim=self.qk_rope_head_dim, layout=self.kv_cache)
             q_rot, rot, _, _ = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
-            latent, rot = (part[:, :, 0] for part in append(latent[:, :, None], rot[:, :, None]))
+            latent, rot = append(latent[:, :, None], rot[:, :, None])
+            latent, rot = append.store.plain(latent)[:, :, 0], rot[:, :, 0]
             key, value = self._expand(latent, rot)
             mask = self._visible(positions, key.shape[1])
-        return q_rot, key, value, mask
+            query_basis = None
+        return q_rot, key, value, mask, query_basis
 
     def _visible(self, slots, total: int):
         """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
-        to its own slot that hold a token."""
-        return causal_attention_mask(slots, total, key_valid=cached_validity(self, total))
+        to its own slot that hold a token, within its window and chunk counted over the cache's
+        slots, which hold each row's real tokens in order."""
+        seen = causal_attention_mask(slots, total, self.sliding_window,
+                                     key_valid=cached_validity(self, total))
+        if self.attention_chunk is None:
+            return seen
+        slots = jnp.asarray(slots)
+        return seen & chunk_mask(slots, jnp.broadcast_to(jnp.arange(total), (slots.shape[0], total)),
+                                 self.attention_chunk)
 
-    def _attend(self, query, key, value, x, mask, implementation, *, causal: bool = False,
+    def _attend(self, query, key, value, x, mask, implementation, *, causal: bool = False, bias=None,
                 unselected=None, force_fp32_for_softmax: bool = True):
         """The attention over `key` and `value` and its output projection, sowing the per-head
         maxima QK-Clip reads where a caller opened the collection. A query `unselected` marks reads
@@ -712,13 +891,15 @@ class MultiHeadLatentAttention(nn.Module):
         # caller opened the collection. Under a sparse selection the mask
         # holds the selected keys, so the maximum is over those.
         if self._qk_open():
-            self.sow("qk", "max_logits", max_attention_logits(
-                query, key, causal=causal, mask=mask))
+            # Beside a context this call read through the same projections first (`attend_context`).
+            found = with_context_logits(self, max_attention_logits(query, key, causal=causal, mask=mask,
+                                                                   bias=bias))
+            self.sow("qk", "max_logits", found)
             self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=force_fp32_for_softmax,
-            implementation=implementation, causal=causal, mask=mask)
+            implementation=implementation, causal=causal, mask=mask, bias=bias)
         if unselected is not None:
             wide = value.astype(at_least_fp32(value.dtype))
             uniform = jnp.mean(wide, axis=1, keepdims=True).astype(attention.dtype)
@@ -805,17 +986,15 @@ class MultiHeadLatentAttention(nn.Module):
 def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:
     """What a latent attention does not run of its layer's context: the
     attention policies it is asked (`MixerContext.policies`), the standard
-    attention's value norm, keys as values, window, chunk, score scale and
-    partial rotation, and a cache other than its latents."""
+    attention's value norm, keys as values, score scale and partial rotation;
+    a dense layer takes its window and chunk. Its cache takes the layer's layout (`kv_cache`), paged or
+    quantized, over its latents or its expanded keys."""
     return {
         **ctx.policies(),
         "v_norm": ctx.v_norm,
         "k_eq_v": ctx.k_eq_v,
-        "sliding_window": ctx.sliding_window,
-        "attention_chunk": ctx.attention_chunk,
         "attention_scale": ctx.attention_scale,
         "partial_rotary_factor": ctx.partial_rotary_factor,
-        "kv_cache": ctx.kv_cache != KVCache(),
     }
 
 
@@ -824,8 +1003,8 @@ class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
 
     `mixer={"name": "mla", "fields": {...}}` takes a DeepSeek config.json's fields, so
-    translation renames nothing. The rope base and its YaRN ramp are the layer's
-    (`MixerContext.rope_theta` and `yarn`, the model's or its kind's). The context's GQA
+    translation renames nothing. The rope base and its scaling are the layer's
+    (`MixerContext.rope_theta` and `rope_scaling`, the model's or its kind's). The context's GQA
     geometry and `qk_norm` are not read (the latent norms are always present).
     A `kv_shared` layer is GLM's IndexShare layer, which shares its provider's
     selection and so needs the kind to select. Dials this cannot honour (a
@@ -846,11 +1025,19 @@ class MLAMixer(MixerBase):
     index_rope_interleave: bool = False
     mla_use_nope: bool = False
     mla_use_output_gate: bool = False
+    bidirectional_blocks: bool = False
+    """A causal dense layer reads each block of a call's `block_groups` whole (the standard kind's flag)."""
+    bidirectional_images: bool = False
+    """A causal dense layer reads each image of a call's `image_groups` whole."""
 
     @property
     def indexed(self) -> bool:
         """Whether the layer carries the indexer, selecting or not."""
         return self.index_n_heads is not None
+
+    @property
+    def reads_blocks(self) -> bool:
+        return self.bidirectional_blocks
 
     @property
     def sparse(self) -> bool:
@@ -880,7 +1067,7 @@ class MLAMixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
-            yarn=ctx.yarn,
+            rope_scaling=ctx.rope_scaling,
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,
@@ -889,9 +1076,15 @@ class MLAMixer(MixerBase):
             index_head_dim=None if ctx.kv_shared else self.index_head_dim,
             index_rope_interleave=self.index_rope_interleave,
             index_shared=ctx.kv_shared,
+            sliding_window=ctx.sliding_window,
+            bidirectional_window=ctx.bidirectional_window,
+            attention_chunk=ctx.attention_chunk,
+            bidirectional_blocks=self.bidirectional_blocks,
+            bidirectional_images=self.bidirectional_images,
             kv_store_key=ctx.kv_store_key,
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
             rotary=not self.mla_use_nope,
-            output_gate=self.mla_use_output_gate)
+            output_gate=self.mla_use_output_gate,
+            kv_cache=ctx.kv_cache)

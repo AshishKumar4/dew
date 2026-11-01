@@ -18,14 +18,17 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew._coordination import read_home
+from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.distributed.host import evict
+from dew.interop.unread import Stored, valued
 from dew.interop.weights import swapped
-from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
 
 
 @dataclass(frozen=True, eq=False)
@@ -34,10 +37,11 @@ class SourceLeaf:
 
     `members` holds one tensor, or with `stacked` one per expert in expert
     order. `transposed` swaps each member's last two axes. `dtype` is the
-    storage the leaf is read into, which casts only the read part.
+    storage the leaf is read into, which casts only the read part. A load
+    without its weights holds `Unread` members, whose shapes it reads alone.
     """
 
-    members: tuple[np.ndarray, ...]
+    members: tuple[Stored, ...]
     dtype: np.dtype
     transposed: bool = False
     stacked: bool = False
@@ -83,7 +87,7 @@ class SourceLeaf:
                                    member_shape, copy=False) for member in self.members)
         return SourceLeaf(members, self.dtype, stacked=self.stacked)
 
-    def _member(self, member: np.ndarray, index: tuple[slice, ...]) -> np.ndarray:
+    def _member(self, member: Stored, index: tuple[slice, ...]) -> np.ndarray:
         """One member's values at `index` of its view, C-ordered in `dtype`:
         read and cast in the stored layout, which is contiguous, then
         swapped in tiles (`swapped`) where the leaf is transposed."""
@@ -109,10 +113,12 @@ class SourceLeaf:
     def release(self) -> None:
         """Give back the mapped pages the reads faulted in."""
         for member in self.members:
-            evict(member)
+            # An `Unread` member maps no pages.
+            if valued(member):
+                evict(member)
 
 
-type LazyTree = dict[str, np.ndarray | SourceLeaf | LazyTree]
+type LazyTree = dict[str, Stored | SourceLeaf | LazyTree]
 """A variables collection whose leaves are stored arrays or `SourceLeaf` recipes."""
 
 
@@ -121,6 +127,20 @@ def materialize(tree: LazyTree) -> LazyTree:
     return {name: (materialize(value) if isinstance(value, dict)
                    else value.read() if isinstance(value, SourceLeaf) else value)
             for name, value in tree.items()}
+
+
+@runtime_checkable
+class HostArray(Protocol):
+    """A leaf built on the host as it is read (`np.asarray`), its shape and dtype known before: a DEX
+    layer's folded output projection (`dew.nn.dex.FoldedKernel`), which an export folds as it writes it."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> np.dtype: ...
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray: ...
 
 
 @dataclass(frozen=True)
@@ -160,7 +180,7 @@ class WeightLayout:
     chunks: int | None = None
 
     def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
-              scalar_mode: str | None) -> np.ndarray | jax.Array:
+              scalar_mode: str | None) -> np.ndarray | jax.Array | HostArray:
         if path[-1] == "layer_scalar":
             if scalar_mode not in LAYER_SCALAR_COLLECTIONS:
                 raise ValueError("layer_scalar export requires an explicit model mode")
@@ -170,7 +190,7 @@ class WeightLayout:
             if not isinstance(node, Mapping):
                 raise ValueError(f"parameter path {path} does not traverse a mapping")
             node = node[part]
-        if not isinstance(node, (np.ndarray, jax.Array)):
+        if not isinstance(node, (np.ndarray, jax.Array, HostArray)):
             raise ValueError(
                 f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array"
             )
@@ -190,6 +210,8 @@ class WeightLayout:
                 # Slice the expert where the leaf lives. One stacked leaf
                 # answers for E source tensors, so copying it to the host
                 # per tensor would move the whole stack E times.
+                if not isinstance(node, (np.ndarray, jax.Array)):
+                    node = np.asarray(node)  # a leaf built as it is read, sliced once built
                 if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
                     raise ValueError(
                         f"{self.name} is expert {self.expert_index} of {path}, which "
@@ -200,7 +222,8 @@ class WeightLayout:
 
     def _source(self, leaves, *, on_host: bool):
         xp = np if on_host else jnp
-        arrays = [xp.asarray(leaf) for leaf in leaves]
+        # A leaf spanning a pool's processes is read home by the pool together where it reads them so.
+        arrays = [read_home(leaf) if on_host else jnp.asarray(leaf) for leaf in leaves]
         if self.concatenate is None:
             value = arrays[0]
         elif self.chunks is None:
@@ -233,10 +256,14 @@ class WeightLayout:
         """The source tensor, built from its leaves and brought to contiguous host storage."""
         leaves = self._leaves(variables, scalar_mode)
         # A single transposed bfloat16 kernel copies at 0.15 GiB/s on the RTX 3090 box's CPU;
-        # transposing on its device before the contiguous host copy reaches several GiB/s.
+        # transposing on its device before the contiguous host copy reaches several GiB/s. Only a leaf
+        # already on a device: a host leaf (an export gathered home) transposes where it is, never copied
+        # to the accelerator and back, which would need it to fit there.
         device_transpose = (len(leaves) == 1 and self.transpose is not None
+                            and isinstance(leaves[0], jax.Array)
                             and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype)
-        value = np.ascontiguousarray(self._source(leaves, on_host=not device_transpose)).reshape(self.shape)
+        value = np.ascontiguousarray(read_home(self._source(leaves, on_host=not device_transpose)))
+        value = value.reshape(self.shape)
         return value if self.dtype is None else value.astype(self.dtype)
 
     def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:

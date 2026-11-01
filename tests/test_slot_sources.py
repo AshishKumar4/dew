@@ -4,11 +4,13 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import numpy as np
 import pytest
 from sharded import assert_sharded
+from tool_support import run_from
 
 from dew.decision import Choice, Decide
 from dew.distributed.placement import Layout, MeshSpec
@@ -92,6 +94,23 @@ bundle = Pretrained.load("dew/tiny-slot", dtype="float32", attention_impl="xla")
 np.savez(sys.argv[1], revision=np.asarray(bundle.revision),
          **{name: np.asarray(value) for name, value in bundle.head_variables["params"].items()})
 """
+
+
+def test_the_runtime_qualifications_native_phase_serves_its_pool_through_a_scoring_server(tmp_path):
+    """The runtime qualification's native phase (tools/slot_runtime_qualification.py) serves a slot
+    release's pool through `ScoringServer.from_task`, its observer of the release's scoring task
+    compiling as the task does, and records each question's option logits from batched passes (ledger
+    2056: the observer had no `compile`, so the phase raised before serving)."""
+    source, _ = slot_release(tmp_path, "slot_lm")
+    with run_from("slot_runtime_qualification", "tools") as tool:
+        requests = {str(seed): tool.request(seed, questions=4, short_words=2, long_words=6)
+                    for seed in range(2)}
+        values, metadata = tool.native(SimpleNamespace(source=source, dtype="float32"),
+                                       {"pilot": [0], "verdict": [1], "requests": requests})
+    asked = {name: question for body in requests.values() for name, question in body["questions"].items()}
+    assert {name: len(value) for name, value in values.items()} == {
+        name: len(question["criteria"]) for name, question in asked.items()}
+    assert max(metadata["batch_rows"]) >= 2
 
 
 def test_a_cached_slot_release_reopens_with_the_hub_offline(tmp_path):
@@ -269,7 +288,12 @@ def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_r
     exported = Decide.from_pretrained(tmp_path / "updated", dtype="float32", attention_impl="xla")
     question = {"team": Choice("Which team?", ["billing", "technical"])}
     rows = loaded.layout.rows(loaded.tokenizer, loaded.specials, request["state"], question)
-    np.testing.assert_array_equal(loaded.scored(rows), exported.scored(rows))
+    # Both loads hold one layout of the weights, the run's packed and the export's apart packed alike
+    # (ledger 2299), so under the run's layout and widths, whose window and budget declare the pass's
+    # shape (`Decide.pass_shapes`), they run one program.
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(exported.variables)
+    np.testing.assert_array_equal(loaded.scored(rows),
+                                  replace(exported, layout=loaded.layout, budget=loaded.budget).scored(rows))
     server = ScoringServer.from_task(*exported.scoring())
     first, second = server.submit(request), server.submit(request)
     server.step()
@@ -345,7 +369,7 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
 
         def observed(params, hidden):
             ids = head.tied_labels()
-            tied = None if ids is None else task.model.label_logits(task.variables, hidden, inputs, ids)
+            tied = None if ids is None else task.model.readout_logits(task.variables, hidden, inputs, ids)
             scores = head.apply({"params": params}, hidden, inputs, table, tied=tied)[:, 0]
             return jnp.sum(scores * probe)
 

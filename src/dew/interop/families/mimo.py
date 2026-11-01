@@ -42,7 +42,6 @@ from dew.interop.decoder_parts import (
     nested_ramp,
     partial_rope_entry,
     plain_partial_rope,
-    ramp_field,
     refuse,
     renamed_name,
     renamed_path,
@@ -147,7 +146,7 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
                                           partial_rotary_factor=local_factor)
     for kind, ramp in zip(_KINDS, (full_ramp, local_ramp), strict=True):
         if ramp is not None and kind in layers:
-            kinds.setdefault(kind, native_fields(LayerKind)())[ramp_field(ramp)] = ramp
+            kinds.setdefault(kind, native_fields(LayerKind)())['rope_scaling'] = ramp
     return _attention_and_experts(
         config, hf, used, kinds, value_dim=_records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
         scale=0.707, factor=full_factor, count=count, sparse=sparse)

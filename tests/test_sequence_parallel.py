@@ -27,14 +27,10 @@ from model_support import two_documents
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
 from token_support import token_rows
 
-from dew.nn.attention import (
-    NormalAttention,
-    attention_kernel,
-    causal_attention_mask,
-    exchanged_heads_attention,
-    gathered_keys_attention,
-    scaled_dot_product_attention,
-)
+from dew.nn.attention import attention_kernel, scaled_dot_product_attention
+from dew.nn.attention_blocks import NormalAttention
+from dew.nn.attention_masks import causal_attention_mask
+from dew.nn.attention_parallel import exchanged_heads_attention, gathered_keys_attention
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels.templates import attention as template
 from dew.nn.rope import rotary_freqs
@@ -292,11 +288,7 @@ def test_splash_runs_inside_the_exchange():
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
-@pytest.mark.gpu(reason="cuDNN's fused attention, split over two GPUs")
-@pytest.mark.skipif(jax.device_count() < 2, reason="cuDNN's fused attention, split over two GPUs")
-@pytest.mark.parametrize("exchange", sorted(EXCHANGES))
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_cudnn_runs_inside_either_exchange(exchange, causal, without_deterministic_ops):
+def cudnn_runs_inside_either_exchange(exchange, causal, without_deterministic_ops):
     """cuDNN's partitioning rule refuses queries split unlike their keys
     (`_check_qkv_bias_mask_spec` in jax/_src/cudnn/fused_attention_stablehlo.py),
     which is what the gather hands a kernel it leaves to GSPMD: every call

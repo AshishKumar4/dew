@@ -15,8 +15,9 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from float64_terms import float64_forward
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference, float64_forward
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_weights

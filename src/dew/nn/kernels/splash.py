@@ -16,7 +16,7 @@
 
 The body of `jax/experimental/pallas/ops/tpu/splash_attention/splash_attention_kernel.py` in JAX's source
 tree as of jax-v0.12.0 (license header above), carried for the one call Dew makes of it
-(`dew.nn.attention.splash_attention`): multi-head attention over grouped key heads, the head dimension
+(`dew.nn.attention_tpu.splash_attention`): multi-head attention over grouped key heads, the head dimension
 minor, a static mask (`splash_attention_mask`, processed by JAX's public `splash_attention_mask_info`),
 segment ids, sinks and a logit softcap, its backward in separate dQ and dK/dV kernels. Upstream's
 references, its multi-query and sequence-minor layouts, its dynamic masks, its fused backward kernel,

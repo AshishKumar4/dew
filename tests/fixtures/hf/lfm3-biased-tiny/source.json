@@ -1,0 +1,17 @@
+{
+ "released": {
+  "repo": "LiquidAI/LFM3-1.7B",
+  "revision": "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd",
+  "code": [
+   "configuration_lfm3.py",
+   "modeling_lfm3.py",
+   "lfm3_conv.py"
+  ]
+ },
+ "transformers": {
+  "version": "5.18.0",
+  "why": "the release's code imports use_kernel_func_from_hub_with_fallback, first in 5.15.0, where PreTrainedConfig remaps a custom-code config's 'conv' layer type to 'linear_attention' and the code's own mask lookup fails (KeyError 'conv' through 5.17.0); 5.18.0 is the first release its code runs under"
+ },
+ "torch": "2.14.1",
+ "command": "tools/remote_code_reference.py lfm3-biased-tiny --draw; PYTHONPATH=src python tools/remote_code_reference.py lfm3-biased-tiny --record --release-python <a Python with transformers 5.18.0>"
+}

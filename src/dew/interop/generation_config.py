@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -159,6 +159,10 @@ _CONTROLS = {
     "force_words_ids": _Control("unsupported", refusal="constrained beam search is not implemented"),
     "forced_bos_token_id": _Control("transform"),
     "forced_eos_token_id": _Control("transform"),
+    # Dream's `diffusion_generate` (generation_utils.py at Dream-org/Dream-v0-Base-7B 6572adb): the keyword
+    # arguments it hands its model, and whether it returns each step's canvas (`output_history`).
+    "generation_kwargs": _Control("unsupported", neutral=({},),
+                                  refusal="no native walk hands its model extra keyword arguments"),
     "guidance_scale": _Control(
         "transform",
         neutral=(1.0,),
@@ -199,6 +203,8 @@ _CONTROLS = {
     "output_hidden_states": _Control(
         "unsupported", neutral=(False,), refusal="generation does not return hidden states"
     ),
+    "output_history": _Control("unsupported", neutral=(False,),
+                               refusal="a native walk returns its final canvas, not each step's"),
     "output_logits": _Control(
         "unsupported", neutral=(False,), refusal="generation does not return per-step logits"
     ),
@@ -270,14 +276,20 @@ def _active(config: Mapping[str, object], generation_config: Mapping[str, object
     return None if _neutral(value, neutral) else value
 
 
-def audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object]) -> None:
+def audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object],
+                 walked: Collection[str] = (), mask_id: int | None = None) -> None:
     """Refuse the active source controls a masked model cannot honour.
 
     Native MDLM has no AR policy chain and no KV cache, so only the controls a
-    task owns are left standing.
+    task owns are left standing, and those the release's own walk reads
+    (`walked`, its family's `masked_walk`, as Dream's `alg`, `steps` and `eps`).
+    A `mask_token_id` naming the id the task unmasks (`mask_id`) is the task's own.
     """
     refused = []
     for name in sorted(_CONTROLS.keys() | generation_config.keys()):
+        if name in walked or (name == "mask_token_id"
+                              and _generation_value(config, generation_config, name) in (None, mask_id)):
+            continue
         rule = _CONTROLS.get(name)
         if rule is not None and rule.owner in ("task", "metadata", "inapplicable"):
             continue
@@ -556,8 +568,9 @@ def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: in
     """The generation_config.json a masked-diffusion export writes: no KV cache,
     the response budget, the pad id and the end-of-sequence ids, which
     `audit_masked` accepts and `PretrainedMaskedDecoder.text_generation` reads
-    back. Dew's solver and step count have no field there, so the reader's MDLM
-    defaults stand."""
+    back. Dew's solver and step count have no field there, so the reader's
+    defaults stand: its family's walk where it declares one (LLaDA2.0's), else
+    MDLM's."""
     values: dict[str, JSON] = {"use_cache": False, **eos_field(eos_token_ids)}
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens

@@ -73,7 +73,7 @@ if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew.diffusion.presets import Preset
-    from dew.inputs.encoders import ConditionEncoder
+    from dew.inputs.condition import ConditionEncoder
     from dew.interop.composite import SourceKind
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
@@ -164,13 +164,14 @@ _FILES: dict[str, Path] = {}
 """The modules `module_from_file` imported, by name, each its file."""
 
 
-def module_from_file(path: str | os.PathLike[str], name: str) -> types.ModuleType:
+def module_from_file(path: str | os.PathLike[str], name: str, *, beside: bool = False) -> types.ModuleType:
     """The Python file at `path` imported as the module `name`, which `sys.modules` holds before it runs,
     so what it defines is named by `name` (`import_path`) and a record of it reads back here
     (`imported`). Each call runs the file again; a file this imported before under `name` gives way
     to this one. A name that is another module's, imported or importable (the standard library's
     `json` for a `json.py`), or a package's module (a dotted name), is refused rather than shadowed
-    or read in its place."""
+    or read in its place, the process as it was. `beside` puts the file's directory first on the path
+    once the file is accepted, as `python -m` runs one beside its siblings, so it imports them."""
     location = Path(path).resolve()
     if "." in name:
         raise ValueError(f"{location} would import as {name}, a module of the package "
@@ -188,6 +189,8 @@ def module_from_file(path: str | os.PathLike[str], name: str) -> types.ModuleTyp
     if spec is None or spec.loader is None:
         raise ValueError(f"{location} is not a Python file")
     module = importlib.util.module_from_spec(spec)
+    if beside and str(location.parent) not in sys.path:
+        sys.path.insert(0, str(location.parent))
     sys.modules[name], _FILES[name] = module, location
     try:
         spec.loader.exec_module(module)
@@ -1384,6 +1387,7 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "tcd": "dew.sampling.solvers.gaussian:TCD",
     "unipc": "dew.sampling.solvers.unipc:UniPC",
     "unmask": "dew.diffusion.discrete:Unmask",
+    "confident": "dew.diffusion.discrete:Confident",
 })
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
@@ -1394,7 +1398,7 @@ encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases(
     "qwen_image_text": "dew.inputs.diffusion:QwenImageConditioner",
     "t5": "dew.inputs.encoders:T5Text",
     "wan_text": "dew.inputs.diffusion:WanConditioner",
-}, base="dew.inputs.encoders:ConditionEncoder")
+}, base="dew.inputs.condition:ConditionEncoder")
 metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
     "accuracy": "dew.decision.metrics:Accuracy",
     "aurc": "dew.decision.metrics:AURC",
@@ -1419,6 +1423,7 @@ objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
     "diffusion": "dew.objectives.diffusion.objective:DiffusionObjective",
     "distillation": "dew.objectives.distillation:DistillationObjective",
     "dpo": "dew.objectives.rl.preference:DPOObjective",
+    "diffusion_nft": "dew.objectives.rl.nft:DiffusionNFTObjective",
     "flow_grpo": "dew.objectives.rl.flow:FlowGRPOObjective",
     "grpo": "dew.objectives.rl.grpo:GRPOObjective",
     "guidance_distillation": "dew.objectives.diffusion.guidance_distillation:GuidanceDistillationObjective",
@@ -1438,11 +1443,14 @@ mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "gated_delta_net": "dew.nn.mixers.gated_delta_net:GatedDeltaNetMixer",
     "kimi_delta_attention": "dew.nn.kda:KimiDeltaAttentionMixer",
     "kpool_sparse_attention": "dew.nn.dsa_kpool:KPoolSparseAttentionMixer",
+    "lightning_attention": "dew.nn.mixers.lightning:LightningAttentionMixer",
     "mamba": "dew.nn.mixers.mamba:MambaMixer",
     "mamba2": "dew.nn.mixers.mamba2:Mamba2Mixer",
     "memory": "dew.nn.mixers.memory:InContextMemoryMixer",
     "mla": "dew.nn.mla:MLAMixer",
     "mlp": "dew.nn.mixers.mlp:MLPMixer",
+    "qsa_attention": "dew.nn.mixers.attention:QSAAttentionMixer",
+    "short_conv": "dew.nn.mixers.short_conv:ShortConvMixer",
 }, base="dew.nn.mixer_base:MixerBase")
 towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "deepseek_v41": "dew.nn.vision.deepseek_v41:DeepseekV41Vision",

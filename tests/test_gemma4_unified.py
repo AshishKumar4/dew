@@ -158,8 +158,29 @@ def audio_rich(config, pair: dict[str, np.ndarray], seed: int) -> dict[str, np.n
                                                   np.float32)}
 
 
-def gradient_functions(source):
-    """Every trainable source parameter and every floating media input, in the native input layout."""
+BACKWARD_GROUPS = {
+    "logits": ("logits",),
+    "layer3": ("parameter.model.language_model.norm.", "parameter.model.language_model.layers.3."),
+    "layer2": ("parameter.model.language_model.layers.2.",),
+    "layer1": ("parameter.model.language_model.layers.1.",),
+    "layer0": ("parameter.model.language_model.layers.0.",),
+    "embeddings": ("input.", "parameter.model.embed_", "parameter.model.language_model.embed_tokens."),
+    "vision": ("parameter.model.vision_embedder.",),
+}
+"""The recorded backward's leaves in groups, each a test of its own, by the prefixes of their names: every
+leaf in exactly one (`test_the_backward_groups_hold_every_recorded_leaf_once`). A group's program keeps
+its own gradients, so the backward stops where none of them reaches further, and its truth sketches its
+own leaves: each group's test computes and checks a part, the groups together every leaf."""
+
+
+def in_group(name: str, group: str) -> bool:
+    """Whether the observation `name` is one of `group`'s (`BACKWARD_GROUPS`)."""
+    return name.startswith(BACKWARD_GROUPS[group])
+
+
+def gradient_functions(source, group: str | None = None):
+    """Every trainable source parameter and every floating media input, in the native input layout; a
+    `group`'s alone where one is named (`BACKWARD_GROUPS`)."""
     native, reference, truth = source
     parameters = dict(reference.named_parameters())
     conversions = get_checkpoint_conversion_mapping(reference.config.model_type)
@@ -184,6 +205,8 @@ def gradient_functions(source):
 
     @jax.jit
     def native_observations(batch, probe):
+        """One row's observations, the program a user's step on that row runs: its logits, every
+        parameter's gradient in its source layout and every floating media input's gradient."""
         floating = {name: value for name, value in batch.conditioning.items()
                     if jnp.issubdtype(value.dtype, jnp.floating)}
 
@@ -195,24 +218,25 @@ def gradient_functions(source):
 
         (_, logits), (gradient, media) = jax.value_and_grad(loss, (0, 1), has_aux=True)(
             native.variables["params"], floating)
-        return logits, gradient, media
+        values = {f"parameter.{name}": layout.source_array({"params": gradient})
+                  for name, layout in bindings.values()}
+        # Real token rows are the forward contract; parameter Jacobians retain each independent
+        # example as an axis instead of judging each tiny example as a separate stochastic site.
+        values["logits"] = logits[0]
+        values.update({f"input.{name}": value for name, value in media.items()})
+        return {name: value for name, value in values.items() if group is None or in_group(name, group)}
 
-    @jax.jit
+    @as_given
     def ours(inputs):
+        """Each row's program over its own length (`native_observations`), compiled once a length
+        rather than once a window's lengths, and the rows' observations collected on the device, every
+        row dispatched before any is read."""
         observed = []
         for row in range(inputs["input/input_ids"].shape[0]):
             prefix = f"native/{row}/"
             fields = unflatten_dict({name.removeprefix(prefix): value for name, value in inputs.items()
                                      if name.startswith(prefix)}, sep="/")
-            single = ModelInputs(**fields)
-            logits, gradient, media = native_observations(single, inputs[f"probe/{row}"])
-            values = {f"parameter.{name}": layout.source_array({"params": gradient})
-                       for name, layout in bindings.values()}
-            # Real token rows are the forward contract; parameter Jacobians retain each independent
-            # example as an axis instead of judging each tiny example as a separate stochastic site.
-            values["logits"] = logits[0]
-            values.update({f"input.{name}": value for name, value in media.items()})
-            observed.append(values)
+            observed.append(native_observations(ModelInputs(**fields), inputs[f"probe/{row}"]))
         return collect(observed, jnp)
 
     def theirs(model, given, *, wide=False):
@@ -260,10 +284,11 @@ def gradient_functions(source):
         inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
         probe = np.random.default_rng([0xBACC, seed]).standard_normal(
             (*inputs["input_ids"].shape, reference.config.text_config.vocab_size), np.float32)
-        batch = native.processor.from_hf(inputs)
+        # Host arrays, which the rows are sliced from on the host.
+        batch = jax.tree.map(np.asarray, native.processor.from_hf(inputs))
         given = {f"input/{name}": value for name, value in inputs.items()}
         for row, mask in enumerate(inputs["attention_mask"]):
-            single = batch.take_rows(jnp.asarray([row])).slice_tokens(0, int(mask.sum()))
+            single = batch.take_rows(np.asarray([row])).slice_tokens(0, int(mask.sum()))
             fields = {"tokens": single.tokens, "token_fields": dict(single.token_fields),
                       "conditioning": dict(single.conditioning)}
             given.update({f"native/{row}/{name}": np.asarray(value)
@@ -365,23 +390,41 @@ def cached_functions(source):
     return ours, lambda *args: theirs(reference, *args), oracle, draw
 
 
-@pytest.mark.parametrize(("site", "functions"), [("backward", gradient_functions),
-                                                 ("cached", cached_functions)])
+def recorded_leaves(stored) -> set[str]:
+    """The recorded backward's leaves, by the shapes it records of them."""
+    return {name.removeprefix("backward.shape.") for name in stored if name.startswith("backward.shape.")}
+
+
+def test_the_backward_groups_hold_every_recorded_leaf_once():
+    """Every recorded backward leaf is in exactly one group, so the groups' tests check every leaf."""
+    leaves = recorded_leaves(recording(FIXTURE / "backward.npz"))
+    held = {leaf: [group for group in BACKWARD_GROUPS if in_group(leaf, group)] for leaf in leaves}
+    assert all(len(groups) == 1 for groups in held.values()), {
+        leaf: groups for leaf, groups in held.items() if len(groups) != 1}
+
+
+@pytest.mark.parametrize("group", BACKWARD_GROUPS)
+def test_unified_backward_follows_the_recorded_reference(source, group):
+    """The recorded backward's `group` of leaves: Dew's gradients against transformers' recorded float32
+    evidence from its recorded float64 truth over the recorded seeds (check 1), Dew's own float64 path
+    held to the recorded truth's sketch."""
+    ours, _, _, draw = gradient_functions(source, group)
+    stored = recording(FIXTURE / "backward.npz")
+    with jax.enable_x64(new_val=True):
+        native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64", attention_impl="reference")
+        native_truth = gradient_functions((native, source[1], source[2]), group)[0]
+    seeds = int(stored["backward.seeds"])
+    recorded_draw, reference, truth = indexed_recording(
+        stored, "backward", seeds, inputs_of=windows(lambda seed: draw(seed)[0], BACKWARD_WINDOW),
+        truth_fn=over_windows(native_truth),
+        leaves=tuple(sorted(leaf for leaf in recorded_leaves(stored) if in_group(leaf, group))))
+    assert_as_exact(as_given(lambda index, inputs: over_windows(ours)(inputs)), reference, recorded_draw,
+                    f"Gemma4 Unified recorded backward, {group}", seeds=seeds, truth_fn=truth)
+
+
+@pytest.mark.parametrize(("site", "functions"), [("cached", cached_functions)])
 def test_unified_runtime_observations_follow_the_reference(source, site, functions):
     ours, reference, truth, draw = functions(source)
-    if site == "backward":
-        stored = recording(FIXTURE / "backward.npz")
-        with jax.enable_x64(new_val=True):
-            native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64",
-                                      attention_impl="reference")
-            native_truth = gradient_functions((native, source[1], source[2]))[0]
-        seeds = int(stored["backward.seeds"])
-        recorded_draw, reference, truth = indexed_recording(
-            stored, "backward", seeds, inputs_of=windows(lambda seed: draw(seed)[0], BACKWARD_WINDOW),
-            truth_fn=over_windows(native_truth))
-        assert_as_exact(as_given(lambda index, inputs: over_windows(ours)(inputs)), reference, recorded_draw,
-                        "Gemma4 Unified recorded backward", seeds=seeds, truth_fn=truth)
-        return
 
     def inputs_of(seed):
         inputs, continuation = draw(seed)

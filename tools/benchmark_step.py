@@ -71,9 +71,10 @@ from dew.nn.flops import MissingFlopsCount
 from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
-from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
-from dew.telemetry.profile import capture_options
+from dew.telemetry.profile import Profiler
+from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
+from dew.training.interval import throughput
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
 
@@ -89,7 +90,7 @@ from benchmark_cases import (
     small_cases,
 )
 from benchmark_models import build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
-from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
+from trace_window import kernel_category, kernel_totals
 
 Row = dict[str, object]
 
@@ -299,14 +300,14 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
 
 
 def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
-    """Each device's traced window split by `trace_window.window_split` into
+    """Each device's traced window split by `dew.telemetry.trace.window_split` into
     compute, every collective, the communication no compute kernel
     overlapped, and idle time ended by a host-to-device copy (input) or by
     anything else (host), averaged over the devices.
 
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
-    HLO collective (`instrumentation.COLLECTIVES`) gets its own time and exposed time,
+    HLO collective (`dew.telemetry.trace.COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
@@ -316,7 +317,7 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
-    totals = communication_totals(devices, COLLECTIVES)
+    totals = communication_totals(devices)
     totals.pop("busy")  # device_timeline's, over every device
     per_step = 1e-6 / steps / len(devices)
     window = totals.pop("window")
@@ -328,14 +329,27 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     }
 
 
-def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float | None, float | None]:
-    """The objective's training FLOPs on the case's batch, train/mfu's numerator, and that MFU over the
-    mesh's peak; both None where the model has no count."""
+def training_work(trainer: Trainer, case: Case) -> tuple[float | None, str | None]:
+    """The objective's training FLOPs on the case's batch, train/mfu's numerator; None and the model's
+    reason where it has no count (`MissingFlopsCount`)."""
     try:
-        flops = trainer.objective.training_flops(None, global_batch(case))
-    except MissingFlopsCount:
-        return None, None
-    return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
+        return trainer.objective.training_flops(None, global_batch(case)), None
+    except MissingFlopsCount as missing:
+        return None, str(missing)
+
+
+def rates(trainer: Trainer, rows: int, steps: int, elapsed: float,
+          work: float | None) -> tuple[float | None, float | None]:
+    """`steps` steps of `rows` rows over `elapsed` seconds, each `work` training FLOPs, rated as the
+    trainer's interval rates them (`dew.training.interval.throughput`): the step's HLO utilization, a
+    lower bound where it runs launches whose work went uncounted (`StepFlops.unsized`), and its MFU, the
+    work over the mesh's peak; each None where nothing counts it."""
+    flops = trainer.step_flops
+    scalars = throughput(elapsed, steps, rows * steps, None if flops is None else steps * flops,
+                         trainer.device_mesh.devices.size,
+                         training_flops=None if work is None else steps * work)
+    bound = "_lower_bound" if flops is not None and flops.unsized else ""
+    return scalars.get(f"train/hfu{bound}"), scalars.get("train/mfu")
 
 
 def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
@@ -379,32 +393,24 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         timeline = {}
         if config.profile_dir:
             # After the timed windows, so the trace's own overhead is not in
-            # them. Each process traces its own devices into its own
-            # directory, since the trace file is named after the host.
-            directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"),
-                                     f"process{jax.process_index()}")
-            jax.profiler.start_trace(directory, profiler_options=capture_options())
-            try:
+            # them. Each process of a pool traces its own devices into a
+            # directory of its own (`Profiler`). The timeline reads the trace
+            # alone, which XProf opens as it is, so no reports are written.
+            with Profiler(os.path.join(config.profile_dir, case.label.replace(" ", "_")),
+                          reports=False) as capture:
                 for _ in range(config.profile_steps):
                     state, loss, is_finite = step(state)
                 loss.block_until_ready()
-            finally:
-                primary = sys.exception()
-                try:
-                    jax.profiler.stop_trace()
-                except BaseException as error:
-                    if primary is None:
-                        raise
-                    primary.add_note(f"Profiler stop failed: {error!r}")
             # A peak process traces the steps for their memory; their timeline is the case process's.
             if not config.peak_run:
+                (directory,) = (str(captured) for captured in capture.captures)
                 planes = device_events(directory)[0]
                 timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
                             **communication(directory, config.profile_steps, planes=planes)}
-        flops = trainer.step_flops and trainer.step_flops.hardware
+        flops = trainer.step_flops
         step_time = elapsed / config.steps
-        utilization = model_flops_utilization(flops, step_time)
-        training_flops, mfu = training_work(trainer, case, step_time)
+        training_flops, uncounted = training_work(trainer, case)
+        utilization, mfu = rates(trainer, case.batch_size, config.steps, elapsed, training_flops)
         planned = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
@@ -440,9 +446,14 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             "p90_ms": round(float(p90), 3),
             "samples_per_sec": round(case.batch_size / step_time, 2),
             "tokens_per_sec": round(case.batch_size * case.seq_len / step_time, 1) if case.is_lm else None,
-            "flops_per_step": flops,
+            "flops_per_step": None if flops is None else flops.hardware,
             "utilization": utilization,
+            # The launches a step runs whose work no count holds; where any runs, `utilization` and
+            # `flops_per_step` are lower bounds, as the trainer's train/hfu_lower_bound is.
+            "unsized_kernels": None if flops is None else flops.unsized,
             "training_flops": training_flops,
+            # Why the model counts no training work, where it counts none, so no MFU is reported.
+            "training_flops_missing": uncounted,
             "mfu": mfu,
             "planned_device_bytes": planned,
             "loss": float(loss),
@@ -490,6 +501,9 @@ def format_table(rows: list[Row]) -> str:
                 text = mesh_label(value)
             elif isinstance(value, (int, float)):
                 text = fmt.format(value * TABLE_SCALE.get(key, 1))
+                # A count some launch's work is missing from is a lower bound.
+                if key in ("flops_per_step", "utilization") and row.get("unsized_kernels"):
+                    text = ">=" + text
             else:
                 text = fmt.format(value)
             cells.append(text.ljust(width) if key == "architecture" else text.rjust(width))
@@ -544,8 +558,10 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
-    if not config.peak_run:
-        # A step's compile seconds are a cold compile's, which no cached executable stands in for.
+    if not config.peak_run and not jax.config.jax_compilation_cache_dir:
+        # Run alone, a step's compile seconds are a cold compile's, which no cached executable stands in for.
+        # A caller that names its cache (JAX_COMPILATION_CACHE_DIR: perf_gate's per-tree cache, whose later
+        # rounds load what its first compiled) keeps it, and its own switch (JAX_ENABLE_COMPILATION_CACHE).
         jax.config.update("jax_enable_compilation_cache", val=False)
     # Before this process opens a backend, which would hold the device each case's peak process needs.
     measuring = not (joins_pool(None, pool_cluster(None)) or config.peak_run)

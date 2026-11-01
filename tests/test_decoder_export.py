@@ -83,22 +83,25 @@ not established by the tiny untied-cutoff fixtures.
 import dataclasses
 import functools
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
 from model_support import cached_round_trips, flat_tree, streamed_export
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     ORDERS,
-    assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
-    float64_forward,
     within,
 )
 from residual_orders import orders, permuted, residual_width
@@ -133,6 +136,9 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
+# Every case runs each train since the export checks compile Dew's forward (ledgers 2182, 2278): GLM-5's
+# released standalone export, 173 s in train 279's CI before, is 99 s on armada at 7f18417b3 after; the
+# gradients and the cases reading GLM-5 Next's round trip 41-55 s.
 
 
 @pytest.fixture(scope="module")
@@ -534,6 +540,21 @@ def test_a_sharded_export_holds_a_few_shards_on_the_host(tmp_path):
     measured = streamed_export(SYNTHETIC_CHECKPOINT, FIXTURES / "qwen3-tiny", tmp_path, "50MB")
     assert measured["shards"] > 4
     assert measured["rise_gb"] < 4 * 50e6 / 2**30, measured
+
+
+def test_a_failed_export_ends_with_its_own_error(tmp_path):
+    """tools/benchmark_streaming_export.py samples the host's memory from a thread while it saves: a save
+    that fails (its directory here a file) ends the process with the save's error, the sampler stopped with
+    it, where the sampler, stopped only after a save that succeeded, kept the process from exiting (row
+    1579). The deadline is the test's own, past the tiny checkpoint's seconds."""
+    out = tmp_path / "out"
+    out.write_text("a file where the export's directory goes\n")
+    environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
+    run = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "benchmark_streaming_export.py"),
+                          str(FIXTURES / "qwen3-tiny"), "main", str(out)], capture_output=True, text=True,
+                         env=environment | {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")},
+                         timeout=300)
+    assert run.returncode == 1, run.stderr[-2000:]
 
 
 def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):
@@ -948,6 +969,11 @@ def test_a_quantized_packed_tensor_and_its_part_stored_apart_must_be_one_tensor(
     assert jax.tree.structure(apart.variables) == jax.tree.structure(alone.variables)
     for ours, theirs in zip(jax.tree.leaves(apart.variables), jax.tree.leaves(alone.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    # Without its weights the copy is checked by its shape, and the load holds what a load with them does.
+    shapes = Pretrained.load(tmp_path / "apart", dtype="float32", param_dtype=storage, attention_impl="xla",
+                             weights=False)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), apart.variables)
 
 
 def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path):
@@ -1200,11 +1226,12 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
     written = json.loads((tmp_path / "config.json").read_text())
     assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
     if model.num_nextn_predict_layers:
-        states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
-        prediction = model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
-        reloaded_states = restored.model.apply(restored.variables, jnp.asarray(ids), method="hidden_states")
-        reloaded_prediction = restored.model.apply(
-            restored.variables, reloaded_states, jnp.asarray(ids), method="mtp_logits")[0]
+        # Each forward compiled once, as a user runs it, not op by op.
+        def depths(model, variables):
+            states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
+            return model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
+        prediction = jax.jit(functools.partial(depths, model))(variables)
+        reloaded_prediction = jax.jit(functools.partial(depths, restored.model))(restored.variables)
         np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
         np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
                                    prediction, atol=LOGITS, rtol=0)
@@ -1228,15 +1255,30 @@ def assert_same_tensors(written: dict, expected: dict) -> None:
         assert written[tensor].dtype == value.dtype and np.array_equal(written[tensor], value), tensor
 
 
-@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny"])
+@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny", "glm5-next-tiny"])
 def test_a_moe_decoder_saves_every_tensor_its_source_holds(name, tmp_path):
     """A causal MoE decoder saved in its source's layout writes every tensor the source checkpoint
     holds, each expert's projections split from their stacked kernel and DeepSeek V3's balancing
-    bias from the `moe` collection, bit for bit, and its config keeps `use_cache`."""
+    bias from the `moe` collection, bit for bit, and its config keeps `use_cache`. GLM-5 Next's is the
+    source-layout route its trained round trip exports by, every train while that runs in the whole
+    suite alone (`WHOLE_SUITE`)."""
     loaded = Pretrained.load(FIXTURES / name, dtype="float32", param_dtype="auto", attention_impl="xla")
     loaded.save(tmp_path)
     assert_same_tensors(written_tensors(tmp_path), written_tensors(FIXTURES / name))
     assert json.loads((tmp_path / "config.json").read_text())["use_cache"] is True
+
+
+def test_a_moe_decoder_written_from_its_model_holds_its_sources_tensors(tmp_path):
+    """A mixture-of-experts decoder written from its model and variables alone
+    (`PretrainedDecoder.from_model`, the native export its family writes by, `decoder_tensors`) writes
+    every tensor its source checkpoint holds, bit for bit: LLaDA2's experts' projections sliced from
+    their stacked kernels by the plan the load stacked them by (`decoder_parts.expert_path`), its query,
+    key and value joined into their unequal-width pack, each oriented as the load read it
+    (`decoder_parts.stored_order`)."""
+    loaded = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", param_dtype="auto",
+                             attention_impl="xla")
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
+    assert_same_tensors(written_tensors(tmp_path), written_tensors(FIXTURES / "llada2-tiny"))
 
 
 def test_a_dense_decoder_written_from_its_model_holds_its_sources_tensors(tmp_path):

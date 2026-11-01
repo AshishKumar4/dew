@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import hashlib
 import logging
+import os
 import threading
 import time
 import urllib.request
@@ -24,6 +25,25 @@ _log = logging.getLogger(__name__)
 _HEADERS = {"User-Agent": "dew-data/1", "Accept-Encoding": "identity"}
 # As urllib's redirect handler: a redirect's status and the hops followed before giving up.
 _REDIRECTS, _HOPS = (301, 302, 303, 307, 308), 10
+
+_FILESYSTEMS: dict[tuple[int, int], tuple[asyncio.AbstractEventLoop, HTTPFileSystem]] = {}
+"""Each process's HTTP filesystem for each of fsspec's IO loops it fetches on, by the process and the loop,
+the loop held beside it. A process can run two such loops: two threads taking fsspec's lazily made lock at
+once each start one, as a process's first fetches on a fetch's own threads can. fsspec's instance cache
+tells running loops apart by nothing (its token reads a loop's repr), so it would hand a fetch on one the
+filesystem whose aiohttp session lives on the other, whose futures that loop never runs (row 1942)."""
+
+
+def _filesystem(loop: asyncio.AbstractEventLoop) -> HTTPFileSystem:
+    """The HTTP filesystem whose session lives on `loop`, in this process (`_FILESYSTEMS`)."""
+    key = (os.getpid(), id(loop))
+    held = _FILESYSTEMS.get(key)
+    if held is None:
+        options = {"auto_decompress": False, "timeout": aiohttp.ClientTimeout()}
+        made = HTTPFileSystem(loop=loop, client_kwargs=options, skip_instance_cache=True)
+        # Two threads making one at once keep whichever lands first; the other opened no session.
+        held = _FILESYSTEMS.setdefault(key, (loop, made))
+    return held[1]
 
 
 def _proxy(url: str) -> str | None:
@@ -142,11 +162,11 @@ class Fetch:
         reads (a file's) has no status but 200."""
         limit, deadline = self.max_bytes + 1, time.monotonic() + self.timeout
         if urlsplit(url).scheme in ("http", "https"):
-            # fsspec's own IO loop, where the filesystem keeps its session for every fetch in this process;
-            # the fetch's deadline is the only one (aiohttp's defaults bound each hop otherwise).
+            # fsspec's own IO loop, where the loop's filesystem keeps its session for every fetch on it
+            # (`_filesystem`); the fetch's deadline is the only one (aiohttp's defaults bound each hop
+            # otherwise).
             loop = get_loop()
-            options = {"auto_decompress": False, "timeout": aiohttp.ClientTimeout()}
-            http = HTTPFileSystem(loop=loop, client_kwargs=options)
+            http = _filesystem(loop)
             status, payload, ftp = sync(loop, _get, sync(loop, http.set_session), url, limit, self.timeout)
             if ftp is None:
                 return status, payload

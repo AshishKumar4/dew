@@ -21,6 +21,7 @@ from .common import (
     _multistep,
     _tapered_order,
     _tapered_orders,
+    _unit_noise,
 )
 
 Algorithm = Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver"]
@@ -117,7 +118,7 @@ class DPMSolverMultistep:
         spans = [(i, i + 1) for i, divided in enumerate(divides)
                  if divided and sigma[i + 1] > 0 and alpha[i] != 0]
         _check_gaps(levels, _history_gaps(orders) + spans, reason="DPM-Solver's higher orders divide by")
-        return _multistep(x, times, self.order)
+        return _multistep(x, times, self.order, process)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         alpha_s0, sigma_s0 = process.rates(t, like=x)
@@ -131,7 +132,7 @@ class DPMSolverMultistep:
         base = a * x + b * m0
         target_limit = alpha_t * denoised
         if self.algorithm.startswith("sde"):
-            noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+            noise = _unit_noise(key, x)
             base = base + n * noise
             source_limit = alpha_t * denoised + sigma_t * noise
             if self.algorithm == "sde-dpmsolver":
@@ -237,7 +238,7 @@ class DPMSolverSinglestep:
                                    reason="third-order SDE Heun differences diverge at an alpha=0 anchor")
         alpha, _, levels = _grid_levels(process, times)
         _check_gaps(levels, self._gaps(orders, alpha), reason="DPM-Solver's higher orders divide by")
-        return Singlestep(_multistep(x, times, self.order), x, jnp.asarray(orders, jnp.int32))
+        return Singlestep(_multistep(x, times, self.order, process), x, jnp.asarray(orders, jnp.int32))
 
     def _gaps(self, orders: list[int], alpha: np.ndarray) -> list[tuple[int, int]]:
         """The pairs of points whose gap each step's update divides by (`_check_gaps`).
@@ -267,7 +268,7 @@ class DPMSolverSinglestep:
         anchor = jnp.where(order == 1, x, state.anchor)
         lambdas, outputs = history.lambdas, history.outputs
         m0 = outputs[-1]
-        noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
+        noise = _unit_noise(key, x)
 
         def update(back: int):
             """The update's coefficients from the group's anchor, `back`
@@ -396,7 +397,7 @@ class DEIS:
         orders = _tapered_orders(self.order, times.shape[0] - 1, self.lower_order_final, euler_at_final=False)
         _check_gaps(_grid_levels(process, times)[2], _history_gaps(orders),
                     reason="DEIS's higher orders divide by")
-        return _multistep(x, times, self.order)
+        return _multistep(x, times, self.order, process)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         alpha_s0, sigma_s0 = process.rates(t, like=x)

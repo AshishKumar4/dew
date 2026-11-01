@@ -369,7 +369,7 @@ Reinforcement learning with verifiable rewards (RLVR) scores each completion by 
 
 `dew.inference.RolloutServer` is the interface for a server that samples continuations of token prompts under a versioned policy. `submit(prompt_ids, max_new_tokens, key=...)` returns a future `Draw` with the sampled IDs, their behavior log-probabilities, the raw-policy log-probabilities when the backend has them, its `finish_reason` (`stop` where it terminated, `length` where its budget cut it), and the policy `version` the request was submitted under. A draw terminates on one of the `Sampling`'s EOS IDs or on the ID that completes one of its `stop` strings, and keeps that ID; otherwise its budget, or a criterion that truncates it such as `MaxNewTokens`, cut it. vLLM and SGLang match the stop strings on the text they decode and return the IDs through the completing one, as Dew's own `Server` does; vLLM also keeps a speculative block's IDs past it, so `OpenAIRolloutServer` takes the policy's tokenizer (`decode=`) and cuts the draw at the first ID whose text completes the string. `load(variables, version)` pushes new weights. Generation continues across a push, so a draw's version is that of the oldest weights that may have produced any of its tokens.
 
-- `NativeRolloutServer(Server.from_task(task, slots=..., capacity=...))` drives Dew's continuous-batching `Server` on a background thread. `load` copies the trainer's tree onto the served device in place (`Server.reload`) between two steps, casting floating leaves to the served precision, so you can train in float32 and serve in bfloat16. Draws carry both raw and behavior likelihoods.
+- `NativeRolloutServer(Server.from_task(objective.policy(params, sampling, Progress(version)), slots=..., capacity=...), version=version)` drives Dew's continuous-batching `Server` on a background thread. `load` copies the trainer's tree onto the served device in place (`Server.reload`) between two steps, casting floating leaves to the served precision, so you can train in float32 and serve in bfloat16; each version draws at the run's progress at its updates (`dew.nn.progress`), as the trainer's loss reads it. A server built from a task at the run's end (`Progress` left at `END`) is refused for a model that reads the run's progress, which would draw from another policy than the one it trains. Draws carry both raw and behavior likelihoods.
 - `OpenAIRolloutServer(OpenAICompletion(name, client, provider="vllm" or "sglang"), sampling, weights)` posts token-ID prompts to a vLLM or SGLang completions endpoint. Each request has the `Sampling` controls, a seed, `logprobs=0` and the field that makes the engine return the sampled IDs: `return_tokens_as_token_ids` for vLLM, which puts them in the logprob tokens, and `return_token_ids` for SGLang, which lists them on the choice. So the draw holds the IDs the engine sampled, and no text has to be retokenized.
 
   The two engines report different distributions. vLLM reports raw model log-probabilities unless it runs with `--logprobs-mode processed_logprobs`, so for vLLM the server refuses a transforming `Sampling` (temperature other than one, top-k, top-p or min-p) unless you pass `processed_logprobs=True`. A filtering `Sampling` (top-k, top-p or min-p) also needs each draw's kept IDs, which only vLLM's token route returns, so `OpenAIRolloutServer` refuses one for vLLM.
@@ -472,7 +472,7 @@ Calls that recorded `routed_experts` add a `routed_experts` column, `[rows, widt
 - `"score"` trains them on their verifier reward, like a completed session. Use it for single-turn RLVR, where a completion cut off after a closed answer can still be graded, and where masking every budget-hit draw of a short budget would leave nothing to train on. `examples/train_rlvr.py` uses it, the behaviour of the rollout it replaced.
 - `"zero"` trains them on a verifier reward of 0 whatever the verifier said, keeping the step rewards their calls earned, which penalizes running long (SkyRL's `zero_reward_on_non_stop`).
 
-`rows_needed(chain_lengths(sessions, width, truncation=...), width)` counts the rows `pack` would fill. `advantages` are group-relative over `(task, group)`. `sessions.session_metrics(sessions, batch, latencies=..., version=..., truncation=...)` reports calls per chain, the masked share of sampled ids by status, mean reward and reward by component, the latency tail and version lag; the mismatch between trainer and engine is the loss's own metric.
+`rows_needed(chain_lengths(sessions, width, truncation=...), width)` counts the rows `pack` would fill. `advantages` are group-relative over `(task, group)`. `sessions.session_metrics(sessions, batch, latencies=..., version=..., truncation=...)` reports calls per chain, the masked share of sampled ids by status, mean reward and reward by component, the latency tail and version lag; the mismatch between trainer and engine is the loss's own metric. Where a batch's sessions come from two or more sources (`Session.source`, a prompt's `PromptRecord.data_source`), it reports each named source's status shares and mean trained reward beside the batch's, as `source/<source>/status/<name>` and `source/<source>/reward/mean`; a step whose sessions come from one source reports none.
 
 `GRPOObjective` trains a packed batch directly. `packed_log_probs(params, batch)` scores each ID against its own chain's prefix. A scheduler that rescores the proximal policy stores the result as `old_log_probs`; otherwise the behavior likelihoods are used in its place.
 
@@ -498,7 +498,7 @@ With Qwen3 (`Qwen/Qwen3-0.6B`), only a reasoning turn followed by a tool-role ob
 
 ## PPO
 
-`PPOObjective(model, seq_len, critic=..., value_coefficient=.5, value_clip=.2, beta=...)` trains the policy and critic as two subtrees of one variables tree, with the ordinary optimizer. `ValueHead(backbone)` adds a scalar Dense head on a decoder's hidden states. A custom critic can instead return one scalar per token position from packed token ids with their `segment_ids` and `positions`. The critic is initialized separately from the policy. The unit-decay reference covers only the policy subtree.
+`PPOObjective(model, seq_len, critic=..., value_coefficient=.5, value_clip=.2, beta=...)` trains the policy and critic as two subtrees of one variables tree, with the ordinary optimizer. `ValueHead(backbone)` adds a scalar Dense head on a decoder's hidden states. A custom critic can instead return one scalar per token position from packed token ids laid out by their `coordinates` (`dew.batch.Coordinates`, their documents and positions). The critic is initialized separately from the policy. The unit-decay reference covers only the policy subtree.
 
 `PPORollout(objective, episodes, groups=2, gamma=1., lam=.95)` collects `groups` episodes of each task through the rollout scheduler over the `EpisodeCollector` `episodes`, and adds critic evaluation and GAE. The collector's policy is `objective.policy(variables)`, which selects the policy subtree when it is bound to the Trainer snapshot. GAE runs over the sampled actions of a whole episode in draw order, across tool turns, chains and rows. GAE reads the packed `token_rewards`: each step reward the environment paid on the last action of the call it paid for, and the verifier's reward on the episode's last action. Advantages are whitened over the global set of actions before training. A cohort with exactly one trainable action token is refused, because its whitening is undefined. A cohort with none, such as one where every episode truncated, returns zero targets and makes no update. Completed episodes have zero tail bootstrap, following the pinned verl convention, and truncated ones are masked.
 
@@ -549,7 +549,7 @@ class ToolPolicy(nn.Module):
     def setup(self):
         self.table = self.param("table", lambda key: jnp.asarray(transitions()))
 
-    def hidden_states(self, tokens, train=False, attention_mask=None, positions=None, segment_ids=None):
+    def hidden_states(self, tokens, train=False, coordinates=None):
         return jax.nn.one_hot(tokens, self.vocab_size)
 
     def output_table(self):
@@ -559,11 +559,11 @@ class ToolPolicy(nn.Module):
     def init_cache(self, batch_size):
         self.variable("cache", "seen", lambda: jnp.zeros(batch_size, jnp.int32))
 
-    def __call__(self, tokens, train=False, decode=False, attention_mask=None, positions=None,
-                 segment_ids=None):
+    def __call__(self, tokens, train=False, decode=False, coordinates=None):
         if decode:
             seen = self.get_variable("cache", "seen")
-            valid = jnp.ones_like(tokens, bool) if attention_mask is None else attention_mask
+            valid = (jnp.ones_like(tokens, bool) if coordinates is None or coordinates.valid is None
+                     else coordinates.valid)
             self.put_variable("cache", "seen", seen + valid.sum(-1))
         return self.hidden_states(tokens) @ self.table
 
@@ -572,7 +572,7 @@ class TokenFeatures(nn.Module):
     """The critic's backbone: one trainable scale per token."""
 
     @nn.compact
-    def hidden_states(self, tokens, train=False, *, segment_ids=None, positions=None):
+    def hidden_states(self, tokens, train=False, *, coordinates=None):
         return jax.nn.one_hot(tokens, VOCAB) * self.param("scale", nn.initializers.ones, (VOCAB,))
 
 

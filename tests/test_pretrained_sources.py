@@ -88,8 +88,8 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     record = hf_decoders.translate_config(released)
     expected, attention_factor = ROPE_INIT_FUNCTIONS["yarn"](Qwen3Config.from_dict(released), None)
 
-    scaling = YarnScaling(**record["yarn"])
-    assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
+    scaling = YarnScaling(**record["rope_scaling"])
+    assert scaling.factor == 4.0 and scaling.original_max_position_embeddings == 32768
     assert (
         np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy()))
         < 1e-7
@@ -123,7 +123,7 @@ task = dew.pipeline(sys.argv[1], dtype="bfloat16", param_dtype="auto")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
@@ -172,7 +172,7 @@ else:
             return jnp.sum(variables["params"]["w"] ** 2), Aux({})
     trainer = Trainer(Probe(), optax.sgd(0.1), key=0)
     trainer.initial_state()
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512,64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512,64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
@@ -274,14 +274,13 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
 def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it():
     """Tier 3 observes, on the probe's model, whether every decoder layer asks transformers' attention
     interface for its attention with a mask Dew's visibility reproduces: StableLM's do, though its
-    class declares no attention backend, and run on Dew's; OpenAI GPT's and GPT-NeoX Japanese's compute
-    their own, and keep them, saying why."""
+    class declares no attention backend, and run on Dew's (a StableLM norming each head's queries and keys
+    by a layer norm of its own, which tier 2 does not assemble); GPT-NeoX Japanese's compute their own,
+    and keep it, saying why."""
     from dew.interop.pretrained import source_route
 
-    stablelm = source_route(tiny_config("stablelm").to_dict()).admitted
+    stablelm = source_route(tiny_config("stablelm", qk_layernorm=True).to_dict()).admitted
     assert stablelm.attends and not stablelm.why
-    openai = source_route(tiny_config("openai-gpt").to_dict()).admitted
-    assert not openai.attends and openai.why
     # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: the probe's mask is
     # transformers' eager one, so its attention stays causal and the type is admitted on its own.
     japanese = source_route(tiny_config("gpt_neox_japanese").to_dict()).admitted
@@ -290,7 +289,7 @@ def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for
 
 @pytest.mark.parametrize("spelled", ["its own names", "the standard names"])
 def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
-    """OpenAI-GPT's class reads its width, heads and depth as `n_embd`, `n_head` and `n_layer`, and the
+    """CTRL's class reads its width, heads and depth as `n_embd`, `n_head` and `n_layer`, and the
     standard names as aliases of them: a config spelled either way shrinks to a small model, the
     transformers config built from it as small, and is probed rather than refused for want of a name."""
     from transformers import AutoConfig
@@ -299,14 +298,58 @@ def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
 
     sizes = ({"n_embd": 256, "n_head": 4, "n_layer": 2} if spelled == "its own names"
              else {"hidden_size": 256, "num_attention_heads": 4, "num_hidden_layers": 2})
-    config = {**{key: value for key, value in tiny_config("openai-gpt").to_dict().items()
+    config = {**{key: value for key, value in tiny_config("ctrl").to_dict().items()
                  if key not in ("n_embd", "n_head", "n_layer", "hidden_size", "num_attention_heads",
                                 "num_hidden_layers", "num_key_value_heads", "head_dim")}, **sizes}
     shrunk = verify.shrink(config)
-    rebuilt = AutoConfig.for_model("openai-gpt", **{key: value for key, value in shrunk.items()
-                                                    if key != "model_type"})
+    rebuilt = AutoConfig.for_model("ctrl", **{key: value for key, value in shrunk.items()
+                                              if key != "model_type"})
     assert rebuilt.hidden_size < 256 and rebuilt.num_hidden_layers == 2
     assert isinstance(verify.verify_mapping(config), verify.Unmapped)
+
+
+def test_a_probe_whose_source_builds_no_model_is_unavailable():
+    """A type whose shrunken config builds no causal LM (CWM asking for an attention backend this host
+    does not install) is `ProbeUnavailable`, wherever the probe first builds it, its depth's cut
+    (`verify.shallow`) included."""
+    from dew.interop import verify
+
+    config = {**tiny_config("cwm", sliding_window=4).to_dict(), "attn_implementation": "flash_attention_2"}
+    with pytest.raises(verify.ProbeUnavailable):
+        verify.verify_mapping(config)
+
+
+HY_V3 = {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1, "moe_intermediate_size": 32}
+"""A small HY-3's routing, its first layer dense and the rest routed."""
+
+
+@pytest.mark.parametrize(("model_type", "fields", "depth"), [
+    ("hy_v3", {**HY_V3, "num_hidden_layers": 80}, 2),
+    ("smollm3", {"num_hidden_layers": 36}, 4),
+    ("smollm3", {"num_hidden_layers": 36, "no_rope_layers": [1, 1, 1, 0] * 9}, 4),
+    ("smollm3", {"num_hidden_layers": 12, "no_rope_layers": [1] * 11 + [0]}, 12),
+])
+def test_the_probe_runs_the_first_layers_that_hold_every_kind_its_depth_builds(model_type, fields, depth):
+    """The probe runs a stated depth's fewest first layers that hold every kind of layer it builds
+    (`verify.shallow`), each stated per-layer list cut alike, and the stated depth where the last layer is
+    a kind of its own: HY-3's 80 layers as its dense first and a routed second, SmolLM3's 36 as its
+    first four, the fourth without positions, whether its config states the per-layer list or its class
+    derives it."""
+    from dew.interop import verify
+
+    source = verify.ModelSource(model_type)
+    config = tiny_config(model_type, **fields).to_dict()
+    shrunk = verify.shrink(config, source)
+    cut = verify.shallow(source, shrunk)
+    assert cut["num_hidden_layers"] == depth
+    stated = fields.get("no_rope_layers")
+    assert stated is None or cut["no_rope_layers"] == stated[:depth]
+    built = source.configured(cut)
+    assert built.num_hidden_layers == depth
+    if model_type == "smollm3":
+        assert built.no_rope_layers[depth - 1] == 0 and all(built.no_rope_layers[:depth - 1])
+    else:
+        assert built.mlp_layer_types == ["dense", "sparse"]
 
 
 def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
@@ -365,3 +408,148 @@ def test_a_tensor_two_shards_both_hold_is_refused_by_both_readers(tmp_path):
     for read in (lambda: read_weights(tmp_path), lambda: stored.specs("")):
         with pytest.raises(ValueError):
             read()
+
+
+@pytest.mark.network
+def test_a_hub_decoder_loaded_without_its_weights_downloads_none(tmp_path):
+    """`Pretrained.load(weights=False)` of a Hub decoder reads its config and its weights' safetensors
+    headers over HTTP, none of its weight files downloaded, so a config-only check of a large base runs
+    on a small disk (ledger 1888): a fresh cache holds no weight file after it, and its variables are
+    the shapes of SmolLM2-135M's parameters, every leaf a shape alone (the census's load,
+    tools/hf_coverage.py's `loaded`)."""
+    from tool_support import load
+
+    repo, revision = "HuggingFaceTB/SmolLM2-135M", "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "cache"), "PYTHONPATH": src,
+           "DEW_HUB_ANSWERS": str(tmp_path / "answers")}
+    row = load("hf_coverage").loaded(repo, revision, env)
+    assert row.outcome == "loads", row.reason
+    assert row.parameters is not None and 130_000_000 < row.parameters < 140_000_000
+    assert not [path for path in (tmp_path / "cache").rglob("*") if path.suffix in (".safetensors", ".bin")]
+
+
+def test_a_runs_base_loads_without_its_weights_under_the_runs_source_options():
+    """A run's source options (`SourceOptions.keywords`) and `weights=False` load the base as the run
+    builds it, its variables the shapes and dtypes a load with its weights builds under the same
+    options: a wrapper's language model alone, its first prediction depth, its full attention reading
+    blocks (ledger 1888)."""
+    import jax
+
+    from dew.config import SourceOptions
+    from dew.interop import Pretrained
+
+    base = Path(__file__).resolve().parent / "fixtures" / "hf" / "qwen35-tiny-mm"
+    options = SourceOptions(text_only=True, prediction_depths=0,
+                            attention={"full_attention": "block_bidirectional"})
+    shapes = Pretrained.load(base, dtype="float32", weights=False, **options.keywords())
+    loaded = Pretrained.load(base, dtype="float32", **options.keywords())
+    assert shapes.model == loaded.model and shapes.config == loaded.config
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)
+    assert shapes.model.kind_of("full_attention").mixer.bidirectional_blocks
+
+
+WITHOUT_WEIGHTS = ("hf/gpt2-tiny", "hf/gpt-neox-tiny", "hf/bloom-tiny", "hf/falcon-tiny", "hf/phi3-tiny",
+                   "hf/mamba2-tiny", "hf/nemotron-h-tiny", "hf/kimi-linear-tiny", "hf/deepseek-v4-tiny",
+                   "hf/gpt-oss-tiny", "hf/minimax-m2-fp8-tiny", "hf/qwen35-tiny-mm",
+                   "hf/gemma4-unified-native-tiny", "codecs/modelopt/tiny", "codecs/modelopt/mixed",
+                   "codecs/nvfp4_qdq/e4m3", "codecs/storage/fp8", "codecs/storage/nvfp4")
+"""Sources whose readers each compute on stored values a load without its weights does not read: legacy
+buffers (GPT-2, GPT-NeoX), packed and split projections, a prepare hook (Kimi Linear, DeepSeek V4),
+media towers and projectors (Qwen 3.5, Gemma 4 Unified), and each decoded format: MXFP4 (GPT OSS), block
+FP8 (MiniMax-M2), ModelOpt NVFP4 and FP8 with input scales, compressed-tensors NVFP4 and storage."""
+
+
+def test_a_tensor_a_load_without_its_weights_holds_has_shapes_and_no_values():
+    """An `Unread` tensor goes through a reader's NumPy as its shape and dtype (a split, a transpose, a
+    cast, a lookup, a decode's arithmetic), and a value asked of it, a branch on one, a Python number,
+    an array, raises PayloadUnread, so no reader computes on a value it was not given (ledger 1904)."""
+    import numpy as np
+
+    from dew.interop.codecs import dequantize_fp8_blocks
+    from dew.interop.unread import PayloadUnread, Unread, lookup
+
+    codes = Unread((4, 8), np.uint8)
+    halves = np.split(codes.reshape(4, 2, 4).transpose(0, 2, 1), 2, axis=-1)
+    assert [half.shape for half in halves] == [(4, 4, 1), (4, 4, 1)]
+    decoded = lookup(np.arange(256, dtype=np.float32), codes) * np.float32(0.5)
+    assert (decoded.shape, decoded.dtype) == ((4, 8), np.float32)
+    assert np.shape(decoded) == (4, 8) and decoded.astype(np.float16).dtype == np.float16
+    # NumPy's own shapes and dtypes, operation by operation, as on arrays that hold values: its promotion (an
+    # int32 beside a float32 is float64, a weak Python scalar keeps the array's dtype, a NumPy scalar does
+    # not), its accumulation (an int32 sum is int64), a method as its function, and a byte view's geometry.
+    stored = {"codes": np.zeros((4, 8), np.uint8), "flags": np.zeros(2, np.bool_),
+              "ints": np.zeros((4, 8), np.int32), "wide": np.zeros(2, np.float64),
+              "halves": np.zeros((4, 8), np.float16)}
+    operations = (lambda arrays: arrays["ints"] + 1, lambda arrays: np.add(arrays["ints"], np.float32(1)),
+                  lambda arrays: arrays["flags"] | True, lambda arrays: arrays["wide"] * np.float64(2),
+                  lambda arrays: np.where(arrays["flags"], 0, 1),
+                  lambda arrays: np.where(arrays["ints"][0], np.ones(8, np.float32), np.zeros(8, np.float32)),
+                  lambda arrays: arrays["ints"].dot(np.ones((8, 2), np.float32)),
+                  lambda arrays: np.concatenate([arrays["ints"], np.ones((1, 8), np.float32)]),
+                  lambda arrays: arrays["ints"].sum(), lambda arrays: arrays["halves"].mean(axis=0),
+                  lambda arrays: -arrays["halves"], lambda arrays: arrays["codes"].view(np.uint32),
+                  lambda arrays: arrays["ints"].clip(0, 1.5))
+    for operation in operations:
+        given, shapes = operation(stored), operation({name: Unread(array.shape, array.dtype)
+                                                      for name, array in stored.items()})
+        assert (shapes.shape, shapes.dtype) == (np.shape(given), given.dtype)
+    # NumPy's elementwise `==` is `np.equal`; Python's `==` would answer one bool of the values.
+    assert np.equal(codes, 0).shape == (4, 8)
+    # A block-scaled FP8 weight decodes to its shape alone where either its codes or its scales are unread.
+    for weight, scale in ((np.ones((2, 2), np.float32), Unread((1, 1), np.float32)),
+                          (Unread((2, 2), np.float32), np.ones((1, 1), np.float32))):
+        blocks = dequantize_fp8_blocks(weight, scale, 2)
+        assert isinstance(blocks, Unread) and (blocks.shape, blocks.dtype) == ((2, 2), np.float32)
+    for asked in (lambda: bool(np.array_equal(codes, codes)), lambda: float(decoded[0, 0]),
+                  lambda: codes == 0, lambda: np.asarray(codes), lambda: np.isfinite(decoded).all() or None,
+                  lambda: np.zeros((4, 8)) + np.asarray(decoded)):
+        with pytest.raises(PayloadUnread):
+            asked()
+
+
+def test_a_gpt2_release_holding_its_legacy_buffers_loads_without_its_weights(tmp_path):
+    """The original GPT-2 release stores each block's causal mask and mask sentinel, which a load checks
+    and drops: without its weights the load holds their shapes alone, so it checks those, not values
+    it was not given (a mask of fabricated zeros is no causal mask), and builds what a load with them
+    builds (ledger 1918)."""
+    import shutil
+
+    import jax
+
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "gpt2"
+    shutil.copytree(Path(__file__).resolve().parent / "fixtures" / "hf" / "gpt2-tiny", directory)
+    stored = safetensors_numpy.load_file(directory / "model.safetensors")
+    positions = json.loads((directory / "config.json").read_text())["n_positions"]
+    for block in range(2):
+        stored[f"transformer.h.{block}.attn.bias"] = np.tril(np.ones((positions, positions), np.float32))[
+            None, None]
+        stored[f"transformer.h.{block}.attn.masked_bias"] = np.asarray(-1e4, np.float32)
+    safetensors_numpy.save_file(stored, directory / "model.safetensors", metadata={"format": "pt"})
+    shapes = Pretrained.load(directory, dtype="float32", weights=False)
+    loaded = Pretrained.load(directory, dtype="float32")
+    assert repr(shapes.model) == repr(loaded.model)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)
+
+
+@pytest.mark.parametrize("name", WITHOUT_WEIGHTS)
+def test_a_load_without_its_weights_builds_what_a_load_with_them_builds(name):
+    """A checkpoint loaded without its weights is the source a load with them reads, its config and
+    model the same, its variables the same shapes and dtypes, from the stored tensors' shapes alone:
+    no reader decodes a value it was not given (GPT-2's legacy causal buffers, a quantized release's
+    weights and scales), as none is read (ledger 1918, 1904)."""
+    import jax
+
+    from dew.interop import Pretrained
+
+    directory = Path(__file__).resolve().parent / "fixtures" / name
+    shapes = Pretrained.load(directory, dtype="float32", weights=False)
+    loaded = Pretrained.load(directory, dtype="float32")
+    # The model's printed fields, which hold a quantized release's scales as arrays that compare by value.
+    assert shapes.config == loaded.config and repr(shapes.model) == repr(loaded.model)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)

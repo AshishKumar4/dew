@@ -8,11 +8,11 @@ from flax.core import unfreeze
 from model_support import decoder
 
 from dew import Evaluation
-from dew.batch import VALID_ROWS, coordinates
+from dew.batch import TEXT_KEY, VALID_ROWS, coordinates
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance, RoutedStatistics
 
 

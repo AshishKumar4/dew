@@ -10,6 +10,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from interop_support import scaled_gap
+from model_support import moved
 from reference_error import as_given
 
 from dew.artifacts import Representations
@@ -17,7 +18,7 @@ from dew.diffusion.schedules import expand
 from dew.inputs import unit_range
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 
 class SourceOracle(nn.Module):
@@ -39,6 +40,20 @@ class ConditionalSourceOracle(nn.Module):
     def __call__(self, x, temb, label):
         return SourceOracle()(x, temb) + expand(label, x)
 
+
+
+FLAXDIFF_TIMES = 8192
+"""The times of one seed's draw at FlaxDiff's tangent grids (`flaxdiff_times`)."""
+
+
+def flaxdiff_times(seed: int) -> dict[str, np.ndarray]:
+    """A seed's times at which FlaxDiff's tangent grids are recorded over check 1's seeds
+    (tools/flaxdiff_schedules_reference.py seeds) and drawn again here: the 33 from 0 to 1 its
+    comparison read, both ends among them, and FLAXDIFF_TIMES uniform on [0, 1). A grid's rounding
+    grows with its sigma toward t = 1, where the tangent steepens, so a draw holds enough times for
+    each seed to reach that end."""
+    drawn = np.random.default_rng(seed).uniform(0, 1, FLAXDIFF_TIMES)
+    return {"t": np.concatenate([np.linspace(0, 1, 33), drawn]).astype(np.float32)}
 
 
 def apg_walked(case, label, x_T):
@@ -208,16 +223,10 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
 
 def moved_weights(variables):
     """Check 1's `draw(seed)` over a trainer's `variables`: each trained leaf moved by the seed's draw,
-    so zero-initialized layers take a gradient too."""
-    host = jax.tree.map(np.asarray, variables)
-
+    so zero-initialized layers take a gradient too. A draw's weights stay where `variables` are, so the
+    arms read them in place, not each from the host."""
     def draw(seed):
-        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(host["params"]))))
-
-        def moved_leaf(leaf):
-            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
-
-        return ({**host, "params": jax.tree.map(moved_leaf, host["params"])},)
+        return ({**variables, "params": moved(variables["params"], jax.random.key(seed), 0.02)},)
 
     return draw
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 from flax.traverse_util import flatten_dict
@@ -30,6 +31,7 @@ from dew.interop.hf_decoders import (
 )
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
+from dew.interop.unread import Stored
 from dew.interop.weights import nested
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
@@ -47,6 +49,9 @@ from dew.nn.vision.gemma4 import (
     translate_gemma4_vision_config,
 )
 from dew.registry import from_record, projectors, towers
+
+if TYPE_CHECKING:
+    from dew.nn.attention import AttentionImpl
 
 VISION_PREFIX = "model.encoder.vision_tower."
 PROJECTION_PREFIX = "model.encoder.embed_vision."
@@ -76,7 +81,7 @@ def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
-          attention_impl: str = "auto", max_seq_len: int | None = None) -> DiffusionGemma:
+          attention_impl: AttentionImpl = "auto", max_seq_len: int | None = None) -> DiffusionGemma:
     """Build the native `DiffusionGemma` module from a checkpoint's config, without allocating parameters.
 
     `config` is the `diffusion_gemma` wrapper config; any other config, or
@@ -104,7 +109,7 @@ def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
 
 
 def translate_weights(
-    tensors: Mapping[str, np.ndarray],
+    tensors: Mapping[str, Stored],
     config: Mapping[str, object],
     *,
     param_dtype: str = "float32",
@@ -119,9 +124,9 @@ def translate_weights(
     weights through their own. Each component casts its own leaves to
     `param_dtype` as it binds them, so no full FP32 tree is built and narrowed.
     """
-    text: dict[str, np.ndarray] = {}
-    vision: dict[str, np.ndarray] = {}
-    projection: dict[str, np.ndarray] = {}
+    text: dict[str, Stored] = {}
+    vision: dict[str, Stored] = {}
+    projection: dict[str, Stored] = {}
     for name, tensor in tensors.items():
         if name.startswith(VISION_PREFIX):
             vision[name.removeprefix(VISION_PREFIX)] = tensor

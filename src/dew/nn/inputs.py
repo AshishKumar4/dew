@@ -18,12 +18,22 @@ from jax.core import Tracer
 from dew._coordination import agreed
 from dew.batch import (
     COORDINATES_FIELD,
+    POSITIONS_FIELD,
+    SEGMENTS_FIELD,
+    TOKEN_LAYOUT_FIELDS,
     VALIDITY_FIELD,
     Coordinates,
     coordinates,
+    document_firsts,
     document_ranks,
     document_starts,
+    field_coordinates,
+    flat_field,
+    laid_coordinates,
     padded_rows,
+    prefix_max,
+    prefix_min,
+    prefix_sum,
     real_slots,
     token_ids,
     token_positions,
@@ -31,7 +41,9 @@ from dew.batch import (
     with_validity,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
-from dew.nn.sharding import rows_like
+from dew.nn.progress import Progress
+from dew.nn.scatter import gather_positions
+from dew.nn.sharding import explicit_spec, rows_like
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -48,10 +60,10 @@ type Media = np.ndarray | Image | Sequence[Media]
 type InputTree = (ModelInputs | jax.Array | np.ndarray
                   | Sequence[InputTree] | Mapping[str, object] | None)
 
-# A keyword a model call takes past its tokens: a token field or position
-# array, the conditioning mapping (`ModelInputs.kwargs`), a flag, or None for
-# an absent input.
-type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
+# A keyword a model call takes past its tokens: a token field array, the tokens'
+# layout (`Coordinates`), the conditioning mapping (`ModelInputs.kwargs`), a
+# flag, or None for an absent input.
+type ModelKwarg = jax.Array | Mapping[str, jax.Array] | Coordinates | Progress | bool | None
 
 # A token field's `[B, W, ...]` response values from its `[B, S, ...]` prompt
 # values, the prompt's `[B, S]` real slots and the width (`ModelInputs.extended`).
@@ -109,22 +121,22 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     for index, (row, slot) in enumerate(zip(arrays, slots, strict=True)):
         tokens[index, slot] = row
         valid[index, slot] = True
-    padded = {"attention_mask": valid}
+    padded = {VALIDITY_FIELD: valid}
     for name, values in (fields or {}).items():
         aligned = [np.asarray(row) for row in values]
         if len(aligned) != len(arrays) or any(
             value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)
         ):
             raise ValueError(f"token field {name!r} must align with the token rows")
-        if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
-            raise ValueError("attention_mask must contain only zero or one")
-        dtype = bool if name == "attention_mask" else np.result_type(*(row.dtype for row in aligned))
+        if name == VALIDITY_FIELD and any(np.any((row != 0) & (row != 1)) for row in aligned):
+            raise ValueError(f"{VALIDITY_FIELD} must contain only zero or one")
+        dtype = bool if name == VALIDITY_FIELD else np.result_type(*(row.dtype for row in aligned))
         value = np.zeros(tokens.shape, dtype=dtype)
         for index, (row, slot) in enumerate(zip(aligned, slots, strict=True)):
             value[index, slot] = row
         padded[name] = value
-    if padded["attention_mask"].all():
-        del padded["attention_mask"]
+    if padded[VALIDITY_FIELD].all():
+        del padded[VALIDITY_FIELD]
     return tokens, padded
 
 
@@ -169,7 +181,7 @@ class ModelInputs:
     """
 
     tokens: jax.Array
-    token_fields: Mapping[str, jax.Array] = struct.field(default_factory=dict)
+    token_fields: Mapping[str, jax.Array | Coordinates] = struct.field(default_factory=dict)
     conditioning: Mapping[str, jax.Array] = struct.field(default_factory=dict)
 
     @classmethod
@@ -181,6 +193,9 @@ class ModelInputs:
         array, and ids that int32 cannot represent raise ValueError. Rows given
         as a sequence are each read by `token_id`'s law first (`_token_row`), so
         a bool among them is refused rather than promoted into an id.
+
+        Its token layout is one `coordinates` field past here (`laid`): flat `segment_ids`,
+        `attention_mask` and `positions` fields are converted once.
 
         Distributed algorithms call this inside their agreed validation phase.
         It runs no collectives and no model.
@@ -194,7 +209,17 @@ class ModelInputs:
                     if isinstance(value, Sequence) and not isinstance(value, str | bytes) else value)
             prepared = cls(jnp.asarray(host_token_rows(np.asarray(rows))))
         prepared.validate()
-        return prepared
+        return prepared.laid()
+
+    def laid(self) -> ModelInputs:
+        """These inputs with their token layout as one `coordinates` field (`COORDINATES_FIELD`): their
+        `Coordinates` as they are, else built once from their flat `segment_ids`, `attention_mask` and
+        `positions` fields, which it replaces (`field_coordinates`); fields carrying both are refused.
+        Every model method past `__call__` reads a layout only as `Coordinates` (ledger 1122)."""
+        laid = field_coordinates(self.token_fields, self.tokens.shape)
+        rest = {name: value for name, value in self.token_fields.items()
+                if name not in (*TOKEN_LAYOUT_FIELDS, COORDINATES_FIELD)}
+        return replace(self, token_fields=rest if laid is None else {**rest, COORDINATES_FIELD: laid})
 
 
     def validate(self) -> None:
@@ -214,12 +239,20 @@ class ModelInputs:
                 f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
             )
         for name, value in self.token_fields.items():
-            # A field may be a tree of arrays, as `coordinates` is; each of its arrays is token-aligned.
-            for leaf in jax.tree.leaves(value):
+            # A field may be a tree of arrays; `coordinates` states which of its arrays run along the tokens
+            # (`Coordinates.TOKEN_ALIGNED`), its documents' firsts one entry a document.
+            aligned = value.tokens() if isinstance(value, Coordinates) else value
+            for leaf in jax.tree.leaves(aligned):
                 if leaf.ndim < 2 or leaf.shape[:2] != self.tokens.shape:
                     raise ValueError(
                         f"token field {name!r} must start with {self.tokens.shape}, got {leaf.shape}"
                     )
+            if isinstance(value, Coordinates) and value.firsts is not None and (
+                    value.firsts.shape[0] != self.tokens.shape[0]):
+                raise ValueError(f"token field {name!r}'s documents' firsts must have batch size "
+                                 f"{self.tokens.shape[0]}, got {value.firsts.shape}")
+        # The tokens' layout is their coordinates or their flat fields, one of them (`laid_coordinates`).
+        laid_coordinates(self.token_fields)
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -235,11 +268,15 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
-        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike.
-        return replace(self,
-            tokens=self.tokens[:, selection],
-            token_fields={name: jax.tree.map(lambda leaf: leaf[:, selection], value)
-                          for name, value in self.token_fields.items()})
+        # A field may be a tree of arrays, each sliced alike; `coordinates` slices its token-aligned ones
+        # (`Coordinates.along_tokens`).
+        def sliced(value):
+            if isinstance(value, Coordinates):
+                return value.along_tokens(lambda leaf: leaf[:, selection])
+            return jax.tree.map(lambda leaf: leaf[:, selection], value)
+
+        return replace(self, tokens=self.tokens[:, selection],
+                       token_fields={name: sliced(value) for name, value in self.token_fields.items()})
 
     def align_left(self, left_padding: jax.Array) -> ModelInputs:
         """Rotate each row so its real tokens start at slot 0 and its `left_padding` slots move to the end.
@@ -254,17 +291,23 @@ class ModelInputs:
         def shift(value: jax.Array) -> jax.Array:
             return rotate_rows(value, left_padding)
 
+        def shifted(value):
+            # `coordinates` rotates its token-aligned arrays (`Coordinates.along_tokens`).
+            if isinstance(value, Coordinates):
+                return value.along_tokens(shift)
+            return jax.tree.map(shift, value)
+
         return replace(self, tokens=shift(self.tokens),
-                            token_fields={name: jax.tree.map(shift, value)
-                                          for name, value in self.token_fields.items()})
+                            token_fields={name: shifted(value) for name, value in self.token_fields.items()})
 
-    def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
-        """Return the keyword arguments for a native model call, without the tokens.
+    def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array] | Coordinates]:
+        """Return the keyword arguments for a model call, without the tokens.
 
-        Each token field is its own keyword, and ``conditioning`` is included
-        only when it is not empty.
+        Each token field is its own keyword, the token layout one `coordinates` keyword (`laid`), and
+        ``conditioning`` is included only when it is not empty.
         """
-        prepared: dict[str, jax.Array | Mapping[str, jax.Array]] = dict(self.token_fields)
+        prepared: dict[str, jax.Array | Mapping[str, jax.Array] | Coordinates] = dict(
+            self.laid().token_fields)
         if self.conditioning:
             prepared["conditioning"] = self.conditioning
         return prepared
@@ -282,7 +325,7 @@ class ModelInputs:
         if tokens.ndim != 2 or tokens.shape[0] != self.tokens.shape[0]:
             raise ValueError(f"a response is [{self.tokens.shape[0]}, W] token ids, got {tokens.shape}")
         known = {**RESPONSE_FIELDS, **(rules or {})}
-        unruled = sorted(set(self.token_fields) - set(known) - {COORDINATES_FIELD})
+        unruled = unruled_fields(self.token_fields, rules)
         if unruled:
             raise ValueError(f"token fields {unruled} have no rule for a response's slots; "
                              "name one in `rules`")
@@ -291,7 +334,7 @@ class ModelInputs:
 
         def continued(name: str, value: jax.Array | Coordinates) -> jax.Array | Coordinates:
             if isinstance(value, Coordinates):
-                return _continued_layout(value, valid, width)
+                return _continued_layout(value, valid, width, known)
             return jnp.concatenate([value, known[name](value, valid, width).astype(value.dtype)], axis=1)
 
         return replace(
@@ -304,17 +347,29 @@ def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     reads slot `(i + shift) % S`, so a row's first `shift` slots move to its end, and a negative
     count rotates it back."""
     slots = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
-    return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
+    return gather_positions(values, slots)
 
 
-def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
+def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = None) -> jax.Array:
     """The cumulative offsets of the varlen sequences over the `[B * S]`
     tokens of `begins` `[B, S]`, which marks each sequence's first token: a
     kernel's `cu_seqlens` `[sequences + 1]`, the sequences past the marked
-    ones empty at the end. Every row's first token begins one."""
+    ones empty at the end. Every row's first token begins one. They come from
+    each row's documents' first slots, the batch's `firsts`
+    (`Coordinates.firsts`) where given, offset by their rows and sorted: no
+    scan over the flattened tokens, whose split over a mesh XLA runs a token
+    a loop iteration (row 1897)."""
     rows, length = begins.shape
-    first = begins.at[:, 0].set(True).reshape(-1)
-    starts = jnp.nonzero(first, size=sequences, fill_value=rows * length)[0]
+    given = document_firsts(begins, -(-sequences // rows)) if firsts is None else firsts
+    split = explicit_spec(given)
+    if split is not None:
+        # A batch's few documents, whole on each device, as the kernels read the offsets.
+        whole = jax.sharding.NamedSharding(split.mesh, jax.sharding.PartitionSpec())
+        given = jax.sharding.reshard(given, whole)
+    placed = jnp.where(given < length, given + jnp.arange(rows, dtype=jnp.int32)[:, None] * length,
+                       rows * length).reshape(-1)
+    starts = jnp.sort(placed)[:sequences]
+    starts = jnp.pad(starts, (0, sequences - starts.shape[0]), constant_values=rows * length)
     return jnp.concatenate([starts, jnp.full((1,), rows * length, starts.dtype)]).astype(jnp.int32)
 
 
@@ -349,7 +404,7 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     count = document_ranks(real, starts)
     if given is None:
         return count
-    firsts = starts | (real & (jnp.cumsum(real, axis=1) == 1))
+    firsts = starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1))
     slots = _last_marked(firsts)
     return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
@@ -365,7 +420,7 @@ def numbered_blocks(tokens: Coordinates, shape: tuple[int, int], block: int) -> 
     if tokens.segments is not None:
         real = jnp.ones(shape, bool) if tokens.valid is None else jnp.broadcast_to(tokens.valid, shape)
         opens = opens | document_starts(jnp.broadcast_to(jnp.asarray(tokens.segments), shape), real)
-    numbered = jnp.cumsum(opens, axis=1, dtype=jnp.int32) - 1
+    numbered = prefix_sum(opens, dtype=jnp.int32) - 1
     if tokens.valid is None:
         return numbered
     return jnp.where(jnp.broadcast_to(tokens.valid, shape), numbered, -1)
@@ -386,14 +441,14 @@ def document_reach(segments, valid, places) -> jax.Array:
     starts = document_starts(segments, real)
     # Each real token's document, numbered per row from its first real token, and that document's
     # largest place; a padding slot's number reaches no document.
-    numbered = jnp.cumsum(starts | (real & (jnp.cumsum(real, axis=1) == 1)), axis=1, dtype=jnp.int32)
+    numbered = prefix_sum(starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1)), dtype=jnp.int32)
     documents = jnp.where(real, numbered + jnp.arange(shape[0])[:, None] * (shape[1] + 1), -1)
     furthest = jax.ops.segment_max(jnp.where(real, places, jnp.iinfo(jnp.int32).min).ravel(),
                                    documents.ravel(), num_segments=shape[0] * (shape[1] + 1))
     held = jnp.take(furthest, jnp.maximum(documents, 0)).reshape(shape)
     # The slot of the next document's first real token after each slot, the row's length past the last.
     following = jnp.where(starts, index, shape[1])
-    following = jnp.flip(jax.lax.cummin(jnp.flip(following, axis=1), axis=1), axis=1)
+    following = prefix_min(following, reverse=True)
     following = jnp.pad(following[:, 1:], ((0, 0), (0, 1)), constant_values=shape[1])
     # The last real token before it, which ends the slot's document.
     ends = jnp.take_along_axis(_last_marked(real), following - 1, axis=1)
@@ -404,7 +459,7 @@ def _last_marked(marked: jax.Array) -> jax.Array:
     """Each slot's last `marked` slot at or before it `[B, S]`, 0 before any: a document's first
     slot where `marked` holds its starts (`counted_places`), its last real one where it holds the
     real tokens (`document_reach`)."""
-    return jax.lax.cummax(jnp.where(marked, jnp.arange(marked.shape[1]), 0), axis=1)
+    return jnp.asarray(prefix_max(jnp.where(marked, jnp.arange(marked.shape[1]), 0)))
 
 
 CONTEXT = "context"
@@ -413,15 +468,25 @@ CONTEXT = "context"
 CONTEXT_LENGTHS = "context_lengths"
 """The `ModelInputs.conditioning` entry counting each row's real context tokens, `[B]`
 integers; a row's padding comes after them. Without it every context token is real."""
+CONTEXT_SEGMENTS = "context_segments"
+"""The `ModelInputs.conditioning` entry naming each context token's document `[B, C]` integers, the
+packed row of the call it belongs to (0 for padding): a call's token reads the context of its own
+document alone, as several packed rows each read their own context. Without it every token of a row
+reads the row's whole context."""
 
 
 @struct.dataclass
 class CrossContext:
     """The sequence a call's cross-attention layers read: `embeddings` `[B, C, features]`
-    and each row's count of real tokens, `lengths` `[B]` int32, its padding after them."""
+    and each row's count of real tokens, `lengths` `[B]` int32, its padding after them, and where the
+    row packs several documents, each context token's document, `segments` `[B, C]` (0 for padding,
+    `CONTEXT_SEGMENTS`), whose tokens the call's tokens of that document alone read; and the call's own
+    tokens' documents, `queries` `[B, S]`, which the decoder sets from its coordinates."""
 
     embeddings: jax.Array
     lengths: jax.Array
+    segments: jax.Array | None = None
+    queries: jax.Array | None = None
 
     @staticmethod
     def parted(conditioning: Mapping[str, jax.Array] | None
@@ -430,34 +495,52 @@ class CrossContext:
         the rest, which a module around the decoder reads itself (a multimodal model's media); each
         None where it holds nothing."""
         context = {name: value for name, value in (conditioning or {}).items()
-                   if name in (CONTEXT, CONTEXT_LENGTHS)}
+                   if name in (CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS)}
         rest = {name: value for name, value in (conditioning or {}).items() if name not in context}
         return context or None, rest or None
 
     @classmethod
     def from_conditioning(cls, conditioning: Mapping[str, jax.Array]) -> CrossContext:
-        """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`.
+        """The context a call's `conditioning` carries under `CONTEXT`, `CONTEXT_LENGTHS` and
+        `CONTEXT_SEGMENTS`, as JAX arrays (`checked`)."""
+        embeddings, lengths, segments = cls.checked(conditioning, jnp)
+        return cls(jnp.asarray(embeddings), jnp.asarray(lengths, jnp.int32),
+                   None if segments is None else jnp.asarray(segments, jnp.int32))
+
+    @staticmethod
+    def checked(conditioning: Mapping[str, jax.typing.ArrayLike], xp=np
+                ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike, jax.typing.ArrayLike | None]:
+        """The context, its lengths and its tokens' documents a call's `conditioning` carries under
+        `CONTEXT`, `CONTEXT_LENGTHS` and `CONTEXT_SEGMENTS`, as arrays of `xp` (NumPy's on the host,
+        where a server admits a request; JAX's), each row's length its context's width where none is
+        given, the documents None where none are given, each in the dtype given.
 
         Raises ValueError for any other entry, for a context that is not
-        `[B, C, features]` floats, and for lengths that are not one integer
-        per row.
+        `[B, C, features]` floats, for lengths that are not one integer
+        per row, and for documents that are not one integer per context token.
         """
-        unknown = sorted(set(conditioning) - {CONTEXT, CONTEXT_LENGTHS})
+        unknown = sorted(set(conditioning) - {CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS})
         if unknown or CONTEXT not in conditioning:
-            raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r}, "
-                             f"got {sorted(conditioning)}")
-        embeddings = jnp.asarray(conditioning[CONTEXT])
+            raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r} "
+                             f"and {CONTEXT_SEGMENTS!r}, got {sorted(conditioning)}")
+        embeddings = xp.asarray(conditioning[CONTEXT])
         if embeddings.ndim != 3 or not jnp.issubdtype(embeddings.dtype, jnp.floating):
             raise ValueError(f"a context is [B, C, features] floats, got "
                              f"{embeddings.dtype}{embeddings.shape}")
         lengths = conditioning.get(CONTEXT_LENGTHS)
         if lengths is None:
-            lengths = jnp.full(embeddings.shape[:1], embeddings.shape[1], jnp.int32)
-        lengths = jnp.asarray(lengths)
+            lengths = xp.full(embeddings.shape[:1], embeddings.shape[1], np.int32)
+        lengths = xp.asarray(lengths)
         if lengths.shape != embeddings.shape[:1] or not jnp.issubdtype(lengths.dtype, jnp.integer):
             raise ValueError(f"context lengths are one integer per row, [{embeddings.shape[0]}], "
                              f"got {lengths.dtype}{lengths.shape}")
-        return cls(embeddings, lengths.astype(jnp.int32))
+        segments = conditioning.get(CONTEXT_SEGMENTS)
+        if segments is not None:
+            segments = xp.asarray(segments)
+            if segments.shape != embeddings.shape[:2] or not jnp.issubdtype(segments.dtype, jnp.integer):
+                raise ValueError(f"context segments are one integer per context token, "
+                                 f"{list(embeddings.shape[:2])}, got {segments.dtype}{segments.shape}")
+        return embeddings, lengths, segments
 
 
 @struct.dataclass
@@ -478,6 +561,9 @@ class AttentionMetadata:
     routing blocks of `routing_block` places for a block router
     (`numbered_blocks`), which the model computes once for its layers.
     `context` is the sequence its cross-attention layers read (`CrossContext`).
+    `progress` `[B]` is the updates the run committed before a training step, its declared input
+    (`dew.nn.progress`), one row's apiece, None at the run's end; a layer whose computation changes over
+    a run reads it.
     `pairwise_mask` `[B, S, keys]`, or `key_runs` `[B, S, R, 2]`, each query's
     key intervals whose union it reads, replaces a call's visibility, a
     windowed layer windowing it over `key_positions` `[B, keys]`.
@@ -516,7 +602,13 @@ class AttentionMetadata:
     position_bias: jax.Array | None = None
     blocks: jax.Array | None = None
     context: CrossContext | None = None
+    progress: jax.Array | None = None
     routing_block: int | None = struct.field(pytree_node=False, default=None)
+    whole_blocks: bool = struct.field(pytree_node=False, default=False)
+    """Whether each block of `block_groups` is its document's whole run of real tokens, as its producer
+    states it (a decision row read whole, `QuestionLayout.split` 'whole'): a layer that reads blocks
+    whole then reads each document both ways, which is non-causal attention by documents, and takes it so
+    (`CausalSelfAttention._masking`), its blocks unread."""
 
     @property
     def valid(self) -> jax.Array | None:
@@ -557,6 +649,9 @@ class MixerCall:
     kv_store: dict | None = None
     """Each name a layer publishes under to the run's later layers: attention's
     keys, values and positions, an index selection, a draft's context."""
+    depth: jax.Array | None = None
+    """The layer's index in its stack `[B, S]`, where its mixer reads it (`MixerBase.reads_depth`):
+    data a scan of like layers hands each one (`LayerInputs.depth`)."""
 
     def unread(self, reads: frozenset[str]) -> tuple[str, ...]:
         """The `MIXING` fields this call sets that a mixer reading `reads` does not read."""
@@ -602,11 +697,14 @@ class LayerInputs:
     is Gemma 3n/4's per-layer input signal. `experts` and `routed` are a
     routing replay's `[..., top_k]` expert ids and coverage
     (`dew.nn.protocols.Routes`), with `routed` broadcast over the layer axis.
+    `depth` is each layer's index in the stack, for a mixer that computes by
+    it (`MixerBase.reads_depth`, MiniMax's lightning rates).
     """
 
     embeddings: jax.Array | None = None
     experts: jax.Array | None = None
     routed: jax.Array | None = None
+    depth: jax.Array | None = None
 
     def span(self, first: int, count: int) -> LayerInputs:
         """Return layers `first` through `first + count - 1`, keeping the layer axis."""
@@ -668,27 +766,41 @@ def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
 
 
-def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coordinates:
-    """A request's `Coordinates` continued over its response's `width` slots: each field by its
-    own field's rule (`RESPONSE_FIELDS`), no document starting in the response, and its real
-    tokens no longer all first, since the response follows the prompt's padding."""
-    def continued(field, rule):
+LAID_FIELDS = {"valid": VALIDITY_FIELD, "positions": POSITIONS_FIELD, "segments": SEGMENTS_FIELD}
+"""Each `Coordinates` field a request's flat layout gives, by the flat field that gives it."""
+
+
+def _continued_layout(value: Coordinates, valid: jax.Array, width: int,
+                      rules: Mapping[str, FieldExtension]) -> Coordinates:
+    """A request's `Coordinates` continued over its response's `width` slots: each field by the rule
+    its flat field continues by (`rules`, `LAID_FIELDS`), no document starting in the response, and
+    its real tokens no longer all first, since the response follows the prompt's padding. A prompt
+    padded as document 0 holds that padding invalid first, its starts counted over its real tokens
+    alone (`document_starts`), so the padding neither starts nor feeds the document the response
+    continues, as a prompt whose validity marks it does."""
+    if value.segments is not None:
+        real = (jnp.ones(value.segments.shape, bool) if value.valid is None else value.valid) & (
+            value.segments != 0)
+        value = replace(value, valid=real, starts=document_starts(value.segments, real))
+
+    def continued(name: str):
+        field = getattr(value, name)
         return None if field is None else jnp.concatenate(
-            [field, rule(field, valid, width).astype(field.dtype)], axis=1)
+            [field, rules[LAID_FIELDS[name]](field, valid, width).astype(field.dtype)], axis=1)
 
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
-    return replace(value, valid=continued(value.valid, _response_validity),
-                   positions=continued(value.positions, _response_positions),
-                   segments=continued(value.segments, _response_document), starts=starts,
+    # No document starts in the response: its firsts built again over the longer rows (`document_firsts`).
+    firsts = None if starts is None else document_firsts(starts, value.max_segments + 1)
+    return replace(value, **{name: continued(name) for name in LAID_FIELDS}, starts=starts, firsts=firsts,
                    right_padded=False)
 
 
 RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     VALIDITY_FIELD: _response_validity,
-    "positions": _response_positions,
+    POSITIONS_FIELD: _response_positions,
     "rotary_positions": _response_coordinates,
-    "segment_ids": _response_document,
+    SEGMENTS_FIELD: _response_document,
     "image_indices": _response_text,
     "audio_indices": _response_text,
     "image_groups": _response_text,
@@ -697,16 +809,24 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
 """How each token field Dew's processors write continues into a response."""
 
 
-def next_position(fields: Mapping[str, jax.Array], valid: jax.Array) -> jax.Array | None:
+def unruled_fields(fields: Mapping[str, object],
+                   rules: Mapping[str, FieldExtension] | None = None) -> list[str]:
+    """The token fields with no rule for a response's slots, by name: neither in `RESPONSE_FIELDS` nor
+    in `rules`. A request's `Coordinates` continue by their own fields' rules (`_continued_layout`).
+    What every extension of a request (`ModelInputs.extended`, masked generation) admits."""
+    return sorted(set(fields) - set(RESPONSE_FIELDS) - set(rules or ()) - {COORDINATES_FIELD})
+
+
+def next_position(fields: Mapping[str, jax.Array | Coordinates], valid: jax.Array) -> jax.Array | None:
     """Each row's logical position after its last real token `[B]`, its
     response's first by `RESPONSE_FIELDS`: one past the largest coordinate a
     real token holds on any axis of its `rotary_positions`, else one past its
     last real token's position (`token_positions`), which a document reset may
     have lowered below an earlier one. None where the request gives neither,
     and a cache's cursor counts each row on. `valid` is its real slots (`real_slots`)."""
-    rotary = fields.get("rotary_positions")
+    rotary = flat_field(fields, "rotary_positions")
     if rotary is not None:
-        return _response_coordinates(rotary, valid, 1).reshape(rotary.shape[0], -1)[:, 0]
+        return _response_coordinates(jnp.asarray(rotary), valid, 1).reshape(rotary.shape[0], -1)[:, 0]
     positions = token_positions(fields)
     return None if positions is None else _response_positions(positions, valid, 1)[:, 0]
 
@@ -741,11 +861,13 @@ def assembly_signature(tree: InputTree, controls: tuple = ()) -> np.ndarray:
 
 
 def filled_validity[TreeT](tree: TreeT, wanted: bool | Sequence[bool] = True) -> TreeT:
-    """All-true validity at the sites that want it and do not carry it.
+    """All-true validity at the sites that want it and do not carry it, each wanted site's layout one
+    `Coordinates` (`with_validity`) whether it carried coordinates or flat fields, so every process
+    hands the same tree.
 
     `wanted` is one flag per site of `validity_sites`, or one flag for all of
-    them. Nothing is read from a resident array and no site that carries
-    validity is touched, so this is a schema operation and not a mask.
+    them. Nothing is read from a resident array and no site's validity is
+    changed, so this is a schema operation and not a mask.
     """
     sites = itertools.count()
 
@@ -754,12 +876,13 @@ def filled_validity[TreeT](tree: TreeT, wanted: bool | Sequence[bool] = True) ->
             return node
         index = next(sites)
         needed = wanted if isinstance(wanted, bool) else bool(wanted[index])
-        if not needed or token_validity(node.token_fields) is not None:
+        if not needed:
             return node
-        shape = np.shape(node.tokens)
-        ones = (np.ones(shape, bool) if isinstance(node.tokens, np.ndarray)
-                else jnp.ones(shape, bool))
-        return replace(node, token_fields=with_validity(node.token_fields, ones))
+        valid = token_validity(node.token_fields)
+        if valid is None:
+            shape = np.shape(node.tokens)
+            valid = np.ones(shape, bool) if isinstance(node.tokens, np.ndarray) else jnp.ones(shape, bool)
+        return replace(node, token_fields=with_validity(node.token_fields, valid))
 
     return jax.tree.map(fill, tree, is_leaf=lambda node: isinstance(node, ModelInputs))
 
@@ -840,6 +963,16 @@ def request_key(key: int | jax.Array | None) -> jax.Array:
     if typed.shape != ():
         raise ValueError("key must be a single JAX PRNG key")
     return typed
+
+
+def seed_of(key: int | jax.Array) -> int | None:
+    """`key` as an integer seed, None for a JAX PRNG key, refused as `request_key` refuses it, without
+    making a key: a seed's key opens JAX's backend."""
+    if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
+        return int(key)
+    if not isinstance(key, jax.Array):
+        raise ValueError("key must be an integer seed or a single JAX PRNG key")
+    return None
 
 
 def request_rows(keys: jax.Array) -> jax.Array:

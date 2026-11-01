@@ -1,14 +1,15 @@
 """Generate classic decoder fixtures and check small released checkpoints in fp32.
 
 Run with PYTHONPATH=src. --fixture writes a tiny same-weight reference;
---float64 writes a written fixture's float64 logits (`logits_f64.npy`), the
-truth the float64 rule reads, from its stored weights; --checkpoint compares
-the public loader and cached greedy decoding on real weights.
+--checkpoint compares the public loader and cached greedy decoding on real
+weights. The tests run transformers over the tiny fixtures themselves, its
+float64 twin their truth.
 """
 
 import argparse
 import dataclasses
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -19,13 +20,14 @@ import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GPT2Config, OPTConfig
 
 from dew.interop import Pretrained
-from dew.interop.verify import _ROUNDING
 from dew.sampling import Sampling, generate
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_source import torch_generated, torch_logits
 
 
 def write_fixture(family):
-    # The tests import this module as tools.classic_gpt_reference, where
-    # hf_reference is not on the path; the fixture runs as a script beside it.
+    # The fixture writer alone reads hf_reference, whose import loads transformers' models.
     from hf_reference import write_device_tiny
 
     config = (OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
@@ -41,20 +43,6 @@ def write_fixture(family):
                       f'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family {family}')
 
 
-FLOAT64_FIXTURES = ('gpt2-tiny', 'opt-tiny', 'gpt-neox-tiny')
-"""The classic fixtures whose float64 logits --float64 writes: GPT-2's and OPT's written here, and
-GPT-NeoX's (tools/gpt_neox_reference.py), read from their stored weights alike."""
-
-
-def write_float64(fixture):
-    """`fixture`'s float64 logits on its ids, from its stored weights (`write_float64_logits`)."""
-    from hf_reference import FIXTURES, write_float64_logits
-
-    model = AutoModelForCausalLM.from_pretrained(FIXTURES / fixture, dtype=torch.float32,
-                                                 attn_implementation='eager').eval()
-    print(write_float64_logits(fixture, model), flush=True)
-
-
 def check_checkpoint(checkpoint, output, revision):
     """`checkpoint`'s fp32 logits and greedy continuation at its pinned `revision` through the loader
     against transformers'. The reference runs on the CPU whatever JAX's platform, so a CPU-only Torch
@@ -64,20 +52,18 @@ def check_checkpoint(checkpoint, output, revision):
                                                     attn_implementation='eager', revision=revision).eval()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, revision=revision)
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
-    with torch.no_grad():
-        expected = reference(torch.from_numpy(ids).long(), use_cache=False).logits.numpy()
-        generated = reference.generate(torch.from_numpy(ids).long(), do_sample=False, max_new_tokens=6,
-                                       eos_token_id=None, pad_token_id=0).numpy()
+    expected, generated = torch_logits(reference, ids), torch_generated(reference, ids, 6)
     del reference
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
                              revision=revision)
     loaded = dataclasses.replace(loaded, model=loaded.model.clone(precision=jax.lax.Precision.HIGHEST))
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     error = float(np.max(np.abs(expected - actual)))
-    # Twice the largest tiny-family error per layer per logit, in fp32 ulps,
-    # matches Dew's existing verified-mapping bound (verify._ROUNDING).
+    # Twice the largest error per layer per logit in fp32 ulps that the thirteen dense and routed tier-1
+    # tiny fixtures (tests/fixtures/hf) measured, 6.46 (llama31-tiny: 9.89e-06 over two layers, logits up
+    # to 6.43).
     layers = config.num_hidden_layers
-    bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
+    bound = float(2 * 6.46 * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
     agreement = bool(np.array_equal(actual.argmax(-1), expected.argmax(-1)))
     ours = np.asarray(generate(loaded.model, loaded.variables, ids, 6, key=0,
                                sampling=Sampling(temperature=0)).tokens)
@@ -97,7 +83,6 @@ def check_checkpoint(checkpoint, output, revision):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', action='store_true')
-    parser.add_argument('--float64', choices=FLOAT64_FIXTURES, nargs='+')
     parser.add_argument('--family', choices=('gpt2', 'opt'), default='gpt2')
     parser.add_argument('--checkpoint')
     parser.add_argument('--revision', help='the commit --checkpoint is pinned at')
@@ -105,8 +90,6 @@ def main():
     args = parser.parse_args()
     if args.fixture:
         write_fixture(args.family)
-    for fixture in args.float64 or ():
-        write_float64(fixture)
     if args.checkpoint:
         if args.revision is None:
             parser.error('--checkpoint is checked at a pinned --revision')

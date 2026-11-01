@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from ..dex import HeadOutputs
 from ..mixers import AttentionMixer
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
@@ -75,8 +76,8 @@ def _classic(model: CausalTransformer):
         raise ValueError('first_attention_norm=False drops a pre-norm, so it requires pre_norms')
     if model.head_transform not in (None, 'gelu', 'gelu_exact'):
         raise ValueError("head_transform must be None, 'gelu' or 'gelu_exact'")
-    if model.norm_type == 'layer' and model.scale_offset:
-        raise ValueError('scale_offset describes RMSNorm weights')
+    if model.norm_type == 'fast_layer' and model.scale_offset:
+        raise ValueError("scale_offset describes an RMSNorm's or a 'layer' norm's weight")
     if model.position_embedding not in ('rotary', 'learned', 'alibi'):
         raise ValueError('position_embedding must be rotary, learned or alibi')
     if model.position_embedding_size is not None and (
@@ -87,7 +88,7 @@ def _classic(model: CausalTransformer):
             or model.position_embedding_size < model.max_seq_len + model.position_embedding_offset)):
         raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
     if model.position_embedding != "rotary" and (
-        model.partial_rotary_factor is not None or model.rope_scaling is not None or model.yarn is not None
+        model.partial_rotary_factor is not None or model.rope_scaling is not None
     ):
         raise ValueError('rotary scaling requires rotary positions')
     if model.mixture is not None and (model.mlp_bias or model.mlp in ('gelu', 'gelu_exact', 'relu')):
@@ -232,6 +233,8 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
             "copies through the layers, so a model has one or the other")
     _streams(model)
     _cross_attention(model)
+    _dex(model)
+    _gate_and_values(model)
     if model.swiglu_limit is not None and model.swiglu_limit <= 0:
         raise ValueError(
             f"swiglu_limit caps the gate and up projections, so it is positive, "
@@ -242,19 +245,56 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
             f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
             "model trained on plain next-token prediction")
 
+def softmax_attention_layers(model: CausalTransformer) -> frozenset[int]:
+    """`model`'s layers whose mixer's heads' outputs DEX extends (`dew.nn.dex.HeadOutputs`, softmax
+    attention), by index: those it extends and its recipe trains the projections of."""
+    return frozenset(index for index in range(model.num_layers)
+                     if isinstance(model.mixer_of(index), HeadOutputs))
+
+
+def _dex(model: CausalTransformer):
+    """Raise `ValueError` where DEX names a layer this model lacks or one whose mixer is no softmax
+    attention, which takes no differential (`softmax_attention_layers`)."""
+    if model.dex is None:
+        return
+    named = {layer for layer, _ in model.dex.layers}
+    outside = sorted(named - set(range(model.num_layers)))
+    if outside:
+        raise ValueError(f"DEX layers {outside} are outside the {model.num_layers} layers")
+    other = sorted(named - softmax_attention_layers(model))
+    if other:
+        raise ValueError(f"DEX names layers {other}, whose mixers are no softmax attention; it extends a "
+                         "softmax attention layer's heads")
+
+
+def _gate_and_values(model: CausalTransformer):
+    """Raise `ValueError` for an output gate activation the attention does not know, one set where no
+    output gate is, and value experts (`dew.nn.value_experts`) without the mixture whose routed layers
+    they sit on."""
+    from dew.nn.mixers.attention import GATE_ACTIVATIONS
+
+    if model.output_gate_activation not in GATE_ACTIVATIONS:
+        raise ValueError(f"output_gate_activation is one of {sorted(GATE_ACTIVATIONS)}, got "
+                         f"{model.output_gate_activation!r}")
+    if model.output_gate_activation != 'sigmoid' and not model.output_gate:
+        raise ValueError("output_gate_activation shapes the attention's output gate, which output_gate "
+                         "turns on")
+    if model.value_experts is not None and model.mixture is None:
+        raise ValueError("value_experts give the routed layers' values, and a model without a mixture "
+                         "routes none")
+
+
 def _cross_attention(model: CausalTransformer):
-    """Raise `ValueError` where `cross_attention` names a layer this model lacks, or a layer
-    with no feed-forward width to take."""
+    """Raise `ValueError` where `cross_attention` names a layer this model lacks, or one whose block
+    it cannot build (`CrossBlocks.block`)."""
     cross = model.cross_attention
     if cross is None:
         return
     outside = sorted(set(cross.layer_ids) - set(range(model.num_layers)))
     if outside:
         raise ValueError(f"cross-attention layers {outside} are outside the {model.num_layers} layers")
-    unsized = sorted(index for index in cross.layer_ids if not model.mlp_widths[index])
-    if cross.intermediate_size is None and unsized:
-        raise ValueError(f"layers {unsized} have no feed-forward whose width the cross-attention "
-                         "block takes; name its intermediate_size")
+    for index in cross.layer_ids:
+        cross.block(model, index)
 
 def _streams(model: CausalTransformer):
     """Raise `ValueError` for settings on mHC's residual streams that cannot be

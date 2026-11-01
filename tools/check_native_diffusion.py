@@ -7,11 +7,11 @@ component Dew wrote and its UNet recomputes the trained prediction
 (`diffusers_reads`).
 """
 import argparse
-from dataclasses import replace
 import json
-from pathlib import Path
 import sys
 import tempfile
+from dataclasses import replace
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling.guidance import CFG
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 
 def bundle(directory, streamed: bool = False):
@@ -43,7 +43,8 @@ and tools/diffusers_extended_reference.py)."""
 def held(errors, task, name, actual, reference, key):
     """`actual` as near float64 as the source's float32 `reference`, the truth
     the same saved pipeline computes in float64 (tests/reference_error.py)."""
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
 
     with np.load(TRUTH) as truth:
         wide = truth[f"{task}/{key}"]
@@ -85,16 +86,20 @@ def selection(source, meta):
     return given, null, process, times
 
 
-def trajectory(source, prepared, given, null, process, times, key):
-    """The single solver walk from the public `prepare`'s start, the one
-    path every caller starts from, and the conditions it walks under: the
-    text ones and the spatial ones `prepare` built. Its real rows: on a mesh
-    the rows pad to fill the devices."""
+def walked(prepared, given, null):
+    """The conditions a walk from the public `prepare`'s start walks under: the text ones and the
+    spatial ones `prepare` built, its real rows alone: on a mesh the rows pad to fill the devices."""
     spatial = {name: prepared.conditions[name][:prepared.rows] for name in ("mask", "masked_image")
                if name in prepared.conditions}
-    given, null = {**given, **spatial}, {**null, **spatial}
+    return {**given, **spatial}, {**null, **spatial}
+
+
+def trajectory(source, prepared, given, null, process, times, key):
+    """The single solver walk from the public `prepare`'s start, the one
+    path every caller starts from, and the conditions it walks under (`walked`)."""
+    given, null = walked(prepared, given, null)
     denoise = process.denoiser(source.model, source.variables, given, null)
-    latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.schedule.solver, guidance=CFG(3.0),
+    latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.solver, guidance=CFG(3.0),
                      key=key, times=times, final_denoise=False)
     images = jnp.clip(source.autoencoder.decode(source.variables["autoencoder"], latents), -1, 1)
     if source.finish is not None:
@@ -124,7 +129,7 @@ def public_start(task, source, reference, meta, key, given, null, process, times
         return source.autoencoder.encode(source.variables["autoencoder"], pixels_in_range, None)
 
     if kind == "xl-img2img":
-        from reference_error import assert_as_exact_as_the_reference
+        from one_draw import assert_as_exact_as_the_reference
 
         prepared = task.prepare(**shared, image=pixels, noise=noise)
         bypassed = task.prepare(**shared, image_latents=clean(), noise=noise)
@@ -158,7 +163,8 @@ def diffusers_reads(source, export, prediction, noise, given):
     same noise, timestep and conditions in float32 and float64, holds Dew's
     trained `prediction` to tests/reference_error.py's rule, and returns
     the rule's ratio."""
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
     from safetensors.numpy import load_file
 
     from tools import diffusers_consumer as consumer
@@ -217,31 +223,42 @@ def train_and_reload(source, reference, key, given, noise):
     return {"loss_before": float(value), "loss_after": float(after), "diffusers_ratio": ratio}
 
 
-def check_pipeline(directory, streamed: bool = False):
-    """The saved pipeline's trajectory, update, reload and export against the source. With
-    `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the same tree, placed on the
-    mesh, its trajectory's images are held to the source as the whole load's are, and it is the
-    pipeline the update, reload and export run on (`streamed_parity`)."""
+PARTS = ("walk", "update")
+"""What a pipeline's check holds (`check_pipeline`): the suite runs each part in a process of its own, and a
+call that names no `--part` runs both in one."""
+
+
+def check_pipeline(directory, part: str, streamed: bool = False):
+    """The saved pipeline against the source: its trajectory (`part` 'walk') or its update, reload and
+    export ('update'). With `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the
+    same tree, placed on the mesh, its trajectory's images are held to the source as the whole load's
+    are (`streamed_parity`), and it is the pipeline the update, reload and export run on, under the
+    conditions its public `prepare` builds."""
     directory = Path(directory)
-    source = bundle(directory)
     reference = np.load(directory / "reference.npz")
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
+    if part == "walk":
+        source = bundle(directory)
+        given, null, process, times = selection(source, meta)
+        qualified(errors, directory.name, source, reference, meta, key, given, null, process, times)
+        if streamed:
+            streamed_parity(errors, directory, source, reference, meta, key)
+        print(json.dumps({"directory": str(directory), "errors": errors}))
+        return
+    source = bundle(directory, streamed=streamed)
     given, null, process, times = selection(source, meta)
-    _, given = qualified(errors, directory.name, source, reference, meta, key, given, null, process, times)
-    if streamed:
-        source, given = streamed_parity(errors, directory, source, reference, meta, key)
+    prepared = public_start(source.text_to_image(), source, reference, meta, key, given, null, process, times)
+    given, _ = walked(prepared, given, null)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
-    errors["reload"] = 0.0
-    print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
+    print(json.dumps({"directory": str(directory), "reload": 0.0, "training": training}))
 
 
 def qualified(errors, name, source, reference, meta, key, given, null, process, times, label=""):
     """`source`'s components and walk held to the source, as one load or the other loads them: the
     conditioning (hidden, pooled), the autoencoder's encode and decode, the final latents, the
     trajectory's images, the safety checker's pixels and features, and the public task call walking
-    to the same images. `label` prefixes each measurement's name, so two loads report apart.
-    Returns the images and the walk's conditions."""
+    to the same images. `label` prefixes each measurement's name, so two loads report apart."""
     # The start the public `prepare` makes from what the reference pipeline was handed.
     task = source.text_to_image()
     prepared = public_start(task, source, reference, meta, key, given, null, process, times)
@@ -275,15 +292,12 @@ def qualified(errors, name, source, reference, meta, key, given, null, process, 
     # The same walk through the task facade: the same images.
     output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
     np.testing.assert_array_equal(output.host().images, images)
-    return images, given
 
 
 def streamed_parity(errors, directory, whole, reference, meta, key):
     """The pipeline streamed onto a mesh a leaf at a time: every leaf the whole load holds, bit for
     bit, each placed on the mesh, and every component and its walk held to the source as the whole
-    load's are (`qualified`): another program than the whole load's, which XLA need not round alike.
-    Returns the streamed pipeline and its walk's conditions, for the update, reload and export to
-    run on."""
+    load's are (`qualified`): another program than the whole load's, which XLA need not round alike."""
     streamed = bundle(directory, streamed=True)
     assert jax.tree.structure(streamed.variables) == jax.tree.structure(whole.variables)
     for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
@@ -292,13 +306,13 @@ def streamed_parity(errors, directory, whole, reference, meta, key):
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
     given, null, process, times = selection(streamed, meta)
-    _, given = qualified(errors, directory.name, streamed, reference, meta, key, given, null, process, times,
-                         label="streamed_")
-    return streamed, given
+    qualified(errors, directory.name, streamed, reference, meta, key, given, null, process, times,
+              label="streamed_")
 
 
 def check_grids(directory, grids, case=None):
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
 
     oracle = np.load(grids)
     source = bundle(directory)
@@ -335,7 +349,7 @@ def handoff(directory, source, task, key):
     latents (`initial=`) below it, as Diffusers' denoising_end and
     denoising_start split them. tools/diffusers_handoff_reference.py
     recorded Diffusers' own base and refiner pipelines doing so."""
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     recorded = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/diffusers_handoff.npz")
     refiner = bundle(Path(directory).parent / "refiner")
@@ -454,8 +468,8 @@ def regress(directory, case):
 
 
 def check_model(directory):
-    from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
     from dew.diffusion.process import DenoisingCondition
+    from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
     from dew.nn.backbones.unet_condition import UNet2DCondition
     directory = Path(directory)
     reference = np.load(directory / "reference.npz")
@@ -473,7 +487,8 @@ def check_model(directory):
     # --float64) by the float64 rule: a constant between two float32 implementations read one input's
     # VJP 1.1e-4 off on one CPU and within on another.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
 
     truth = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/native_unet_float64.npz")
     errors = {}
@@ -497,6 +512,7 @@ if __name__ == "__main__":
     parser.add_argument("--case")
     parser.add_argument("--model", action="store_true")
     parser.add_argument("--streamed", action="store_true", help="load the pipeline streamed onto a mesh")
+    parser.add_argument("--part", choices=PARTS, help="the pipeline check's part; both where none is named")
     args = parser.parse_args()
     if args.model:
         check_model(args.directory)
@@ -505,4 +521,5 @@ if __name__ == "__main__":
     elif args.case:
         regress(args.directory, args.case)
     else:
-        check_pipeline(args.directory, args.streamed)
+        for part in PARTS if args.part is None else (args.part,):
+            check_pipeline(args.directory, part, args.streamed)

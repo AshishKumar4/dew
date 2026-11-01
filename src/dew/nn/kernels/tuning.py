@@ -47,8 +47,10 @@ import contextlib
 import contextvars
 import dataclasses
 import enum
+import functools
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -72,6 +74,7 @@ from dew._records import JSON
 from dew.files import write_atomically
 
 from . import generation
+from .templates import report
 
 _log = logging.getLogger(__name__)
 
@@ -417,36 +420,48 @@ class KernelOp(tokamax.Op):
     revision: int = 1
 
     def __call__(self, *args, **kwargs):
+        # One path for every config (row 1866): bound once, the op's own config, a pin or a pick checked
+        # against the call itself (`pinnable`: a template's legality), the heuristic otherwise. The launch's
+        # key, which traces its hooks, is built only where a collector, a pin or a tuning read reads it.
+        ba = self.bind(*args, **kwargs)
         config = self.config
         if config is None:
-            ba = self.bind(*args, **kwargs)
-            keyed = self.keyed(ba)
             if (collected := cache.KERNEL_SEEN.value) is not None:
-                collected.found.append((self, keyed))
-            config = self._chosen(ba, keyed)
+                collected.found.append((self, self.keyed(ba)))
+            config = self._chosen(ba)
             if collected is not None:
                 collected.found.taken.append((config, ba))
-        if cache.KERNEL_LAUNCHES.value:
-            # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
-            # each traced array for its devices (`keyed`).
-            return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *args, **kwargs)
-        return self._fwd(*args, config=config, **kwargs)[0]
+        else:
+            config = self.completed(ba, config)
+            if not self.pinnable(ba, config):
+                raise Unpinnable(type(self).__name__, config, self.unpinnable(ba, config))
+        # The launch runs on its bound arguments, the facts its binding states from its operands (a
+        # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
+        # kernels carry it in their names, so a compile's reports name it (`report.launching`).
+        with report.launching(self, ba, config):
+            if cache.KERNEL_LAUNCHES.value:
+                # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
+                # each traced array for its devices (`keyed`).
+                return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
+                                           **ba.kwargs)
+            return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
     def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
         one, else a config pinned for its kernel (`pinned`, raising `Unpinnable` where its key's legal
         configs do not hold it), else in a tuning run its key's pick (`_pick`), else its own shapes'
         heuristic."""
-        return self.config if self.config is not None else self._chosen(ba, self.keyed(ba))
+        return self.config if self.config is not None else self._chosen(ba)
 
-    def _chosen(self, ba: tokamax.BoundArguments, keyed: tokamax.BoundArguments) -> Hashable:
+    def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
-            pin = pins[type(self)]
-            if not self.pinnable(keyed, pin):
-                raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
+            pin = self.completed(ba, pins[type(self)])
+            # A pin holds for the call's own shapes, as an explicit config does (`__call__`).
+            if not self.pinnable(ba, pin):
+                raise Unpinnable(type(self).__name__, pin, self.unpinnable(ba, pin))
             return pin
-        pick = _pick(keyed) if _READING.get() else None
+        pick = _pick(self.keyed(ba)) if _READING.get() else None
         # A pick measured at another shape of its key the launch's own shapes cannot take is not taken.
         if pick is None or not self.pinnable(ba, pick.fastest_config):
             return ba.heuristics_config
@@ -462,6 +477,13 @@ class KernelOp(tokamax.Op):
 
     def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Hashable]:
         return set(self.variants(ba))
+
+    def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
+        """A pinned or explicit `config` as the launch of `ba` takes it, the parts it leaves to the launch
+        derived once (a Mosaic forward's natural rewalk, `MosaicForward.completed`): itself, where the
+        launch derives nothing beside it."""
+        del ba
+        return config
 
     def pinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> bool:
         """Whether a pin (or a stored pick) may name `config` for the launch of `ba`: any config of its
@@ -516,11 +538,84 @@ class KernelOp(tokamax.Op):
         naming `HOOKS` defines it."""
         raise NotImplementedError(f"{type(self).__name__} names hooks {self.HOOKS} but no way to trace them")
 
+    def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
+        """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
+        call's arrays, making this launch's kernels alone, and their abstract values; compiled, not
+        interpreted, where the launch takes `interpret`."""
+        leaves, treedef = jax.tree.flatten((ba.args, ba.kwargs))
+        held = [hasattr(leaf, "shape") and hasattr(leaf, "dtype") for leaf in leaves]
+
+        def fn(*arrays):
+            given = iter(arrays)
+            args, kwargs = jax.tree.unflatten(treedef, [next(given) if array else leaf
+                                                        for leaf, array in zip(leaves, held, strict=True)])
+            if "interpret" in kwargs:
+                kwargs = {**kwargs, "interpret": False}
+            return self._fwd(*args, config=config, **kwargs)[0]
+
+        return fn, tuple(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                         for leaf, array in zip(leaves, held, strict=True) if array)
+
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Arrays at `specs` to time the launch on: normal floats, zero integers."""
         keys = jax.random.split(jax.random.key(seed), len(specs))
         return [jax.random.normal(key, spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.floating)
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
+
+
+def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda: False
+                 ) -> Callable[[Callable], Callable]:
+    """A kernel launch jitted with the arguments its signature names among `static` static: JAX keys its
+    program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
+    once however many layers, passes and recomputations call it, and no operand is held (a model's layers'
+    identical kernels were each lowered again: a 9B step lowered 880 RMS norm calls for 15 programs, row
+    2440). The launch tracing it is a static too (`report.launch_digest`): its kernels' names carry it, so
+    two launches whose statics meet (a GEMM's 4089 and 4096 rows, padded alike) trace apart, each kernel
+    named for its own, and a spill refuses the launch that compiled it (row 2941). A call whose static
+    arguments reach a function closing over values (`holdable`), or one `unless` names (a plan tracing
+    every call), runs the launch itself: jit's cache would keep the closure, and any array it reaches,
+    alive."""
+    def decorate(launch: Callable) -> Callable:
+        signature = inspect.signature(launch)
+        names = tuple(name for name in static if name in signature.parameters)
+
+        # One jitted launch a launch digest. JAX keys its trace cache on the function a jit wraps, not the
+        # jit, so each digest wraps a function object of its own.
+        @functools.cache
+        def jitted(digest: str | None) -> Callable:
+            del digest
+            return jax.jit(functools.partial(launch), static_argnames=names)
+
+        @functools.wraps(launch)
+        def called(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs).arguments
+            if unless() or not all(holdable(bound[name]) for name in names if name in bound):
+                return launch(*args, **kwargs)
+            return jitted(report.launch_digest())(*args, **kwargs)
+
+        return called
+
+    return decorate
+
+
+def holdable(value: Hashable | jax.Array) -> bool:
+    """Whether a cache may hold `value` without holding an array through it: no array, and no function of
+    a closure, bound method or callable object but a dataclass (a hook reading an operand's shape may reach
+    the array its call made), within a partial's arguments, a tuple or a dataclass's fields alike (a static
+    argument is hashable, so no list or dict)."""
+    if isinstance(value, (jax.Array, np.ndarray)) or inspect.ismethod(value):
+        return False
+    if isinstance(value, functools.partial):
+        return holdable(value.func) and all(map(holdable, (*value.args, *value.keywords.values())))
+    if inspect.isfunction(value):
+        return value.__closure__ is None and all(map(holdable, value.__defaults__ or ()))
+    if isinstance(value, tuple):
+        return all(map(holdable, value))
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return all(holdable(getattr(value, field.name)) for field in dataclasses.fields(value))
+    # Any other callable object (a hook class's instance) may hold an array its call reads, which no check
+    # sees; a class is a value.
+    return isinstance(value, type) or not callable(value)
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:

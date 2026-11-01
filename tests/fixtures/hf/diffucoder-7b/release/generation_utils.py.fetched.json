@@ -1,0 +1,11 @@
+{
+ "bytes": 22329,
+ "kind": "release",
+ "license": "apple-amlr",
+ "origin": "release",
+ "path": "generation_utils.py",
+ "reference": "apple/DiffuCoder-7B-Base@a2c33054cbe99b9ab7af074f09b1d13943157ff1/generation_utils.py",
+ "repo": "apple/DiffuCoder-7B-Base",
+ "revision": "a2c33054cbe99b9ab7af074f09b1d13943157ff1",
+ "sha256": "99318e7261e858be87e0aa5c7cccfbb2912d166c2b4218f0f81a07f922b5cf55"
+}

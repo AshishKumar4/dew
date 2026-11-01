@@ -1,10 +1,10 @@
 {
   "date": "2026-10-01",
   "commands": {
-    "pipeline": "python tools/benchmark_image_pipeline.py --flowers /home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1 --images 512 --repeats 3 --batch 32 --steps 60 --threads 4 --out image-pipeline.json",
-    "image_sft": "python examples/sft_diffusion_gemma_images.py --flowers /home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1 --smoke --out runs/flowers-caption-smoke",
-    "masked_lm": "python examples/train_masked_lm.py --tokens /mnt/scratch/dew/tmp/dataaug-wikitext --smoke --out runs/masked-lm-smoke",
-    "augmentation_parity": "JAX_PLATFORMS=cuda python tools/benchmark_image_pipeline.py --flowers /home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1 --images 3 --repeats 1 --decoder-only"
+    "pipeline": "python tools/benchmark_image_pipeline.py --flowers ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --images 512 --repeats 3 --batch 32 --steps 60 --threads 4 --out image-pipeline.json",
+    "image_sft": "python examples/sft_diffusion_gemma_images.py --flowers ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --smoke --out runs/flowers-caption-smoke",
+    "masked_lm": "python examples/train_masked_lm.py --tokens WIKITEXT_TOKENS --smoke --out runs/masked-lm-smoke",
+    "augmentation_parity": "JAX_PLATFORMS=cuda python tools/benchmark_image_pipeline.py --flowers ~/.cache/dew/datasets/oxford_flowers102/2.1.1 --images 3 --repeats 1 --decoder-only"
   },
   "augmentation_parity": {
     "device": "NVIDIA GeForce RTX 4080",
@@ -29,7 +29,7 @@
     "images": 512,
     "corpus_sha256": "e316cecae63e97ddc542ee047777dd092a53faf64737db12b053df7d20188106",
     "config": {
-      "flowers": "/home/mrwhite0racle/.cache/dew/datasets/oxford_flowers102/2.1.1",
+      "flowers": "~/.cache/dew/datasets/oxford_flowers102/2.1.1",
       "images": 512,
       "repeats": 3,
       "image_size": 128,
@@ -187,7 +187,7 @@
     "released_26b_qualified": false
   },
   "masked_lm": {
-    "corpus": "/mnt/scratch/dew/tmp/dataaug-wikitext",
+    "corpus": "WIKITEXT_TOKENS",
     "train_tokens": 1984069,
     "device": "NVIDIA GeForce RTX 4080",
     "steps": 8,

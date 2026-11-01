@@ -20,8 +20,8 @@ from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
 
 from dew.nn.activations import gated_product
-from dew.nn.attention import stream_rms_normalized
 from dew.nn.kernels import generation, norm_swiglu, tuning
+from dew.nn.norms import stream_rms_normalized
 
 
 def seam(x, branch, scale):
@@ -354,8 +354,7 @@ print(json.dumps([path, stamp, tuning.settled(launches), len(lowerings)]))
 """
 
 
-@pytest.mark.gpu
-def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_launch_once(tmp_path):
+def only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_launch_once(tmp_path):
     """A language model's step compiled by the Trainer measures nothing. An
     explicit pass (`tune(..., measure=True)`) on a GPU it has to itself
     measures each launch over every variant (`KernelOp.variants`), stores every time
@@ -399,8 +398,7 @@ class KernelBug(Exception):
     """A kernel's own failure, which no GPU limit explains."""
 
 
-@pytest.mark.gpu(reason="the tuner measures on CUDA")
-def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
+def a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
     """A launch one of whose configs raises as it lowers, a kernel's bug and not its GPU's shared
     memory: measuring the launch propagates the error, where the tuner had counted it one more
     failed config and kept the others' fastest."""
@@ -425,8 +423,7 @@ def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(
         tuning._measured(broken.op, broken)
 
 
-@pytest.mark.gpu(reason="the tuner measures on CUDA")
-def test_a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
+def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
     """A profile capture holds CUPTI, which takes one subscriber: measuring a launch beside it times
     no config, returns each as failed, so the launch keeps its heuristic, and leaves CUPTI to the
     capture without raising; once the capture ends, the same launch measures every config."""
@@ -514,3 +511,50 @@ def test_a_launch_is_chosen_for_the_gpu_its_operands_or_its_mesh_name():
     assert tuning._kind(keyed) == jax.devices()[0].device_kind
     concrete = tokamax.BoundArguments(norm_swiglu.RmsForward(), {"x": jnp.ones((8, 64), jnp.bfloat16)})
     assert tuning._kind(concrete) == jax.devices()[0].device_kind
+
+
+class _Holding:
+    """A hook object whose call reads an array it holds: a cache keyed on it would keep the array alive."""
+
+    def __init__(self, array):
+        self.array = array
+
+    def __call__(self, x):
+        return x * self.array.shape[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Scaled:
+    """A hook of a value alone: equal for equal factors, which a cache may hold."""
+
+    by: float
+
+    def __call__(self, x):
+        return x * self.by
+
+
+def _doubled(x):
+    return 2 * x
+
+
+@pytest.mark.parametrize(("made", "cached"), [(lambda: _doubled, True), (lambda: _Scaled(2.0), True),
+                                              (lambda: _Holding(jnp.ones(3)), False),
+                                              (lambda: jnp.tanh, False)],
+                         ids=["function", "dataclass", "array-holding-object", "jitted-callable"])
+def test_a_launch_lowered_once_traces_again_only_for_a_hook_that_may_hold_an_array(made, cached):
+    """`tuning.lowered_once` traces a launch once for a static hook it may hold (a function of no closure,
+    a dataclass of values), and again each call for one that may reach an array (a callable object's
+    attributes, which no check sees, a jitted function's among them): run uncached, it keeps nothing
+    alive. (Each hook made in the test: an array drawn as the module loads would start JAX's backend before
+    a worker process joins its pool, `tuning_worker`.)"""
+    hook = made()
+    traced = []
+
+    @tuning.lowered_once(("hook",))
+    def launch(x, *, hook):
+        traced.append(1)
+        return hook(x)
+
+    for _ in range(2):
+        jax.block_until_ready(launch(jnp.ones(4), hook=hook))
+    assert len(traced) == (1 if cached else 2)

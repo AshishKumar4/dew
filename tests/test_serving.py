@@ -15,7 +15,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from episode_support import ToolPolicy
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
@@ -23,6 +22,7 @@ from reference_error import as_given, assert_as_exact
 from serving_support import Served, assert_served_as_exact
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
+from tool_policy import ToolPolicy
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.loading import place
@@ -58,6 +58,38 @@ def assert_same_generation(served, alone):
     np.testing.assert_array_equal(served.terminated, alone.terminated)
     np.testing.assert_allclose(served.behavior_log_probs, alone.behavior_log_probs, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
+
+
+def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
+    """A server built from a task that draws at a run's progress (a DEX decoder half way through its
+    anneal, `TextGeneration.progress`) draws as the task does, and reloaded at another version's
+    (`Server.reload`, as `NativeRolloutServer.load` reloads it) as the task at that progress does; one
+    built at the run's end serves that end, refusing a run's progress, and a rollout server, which loads
+    each run version at its progress, refuses it (ledger 2695)."""
+    from dew.inference.rollouts import NativeRolloutServer
+    from dew.nn.dex import DifferentialExtension
+    from dew.nn.progress import END, Progress
+
+    model = decoder().clone(max_seq_len=128).with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+
+    def at(updates: int | None) -> TextGeneration:
+        progress = END if updates is None else Progress(jnp.asarray(updates, jnp.int32))
+        return TextGeneration(model, params, RunProcessor(Digits()), sampling=task().sampling,
+                              progress=progress)
+
+    server = Server.from_task(at(5), slots=2, capacity=128)
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, at(5)(prompt, 5, key=3))
+    server.reload(params, Progress(jnp.asarray(1, jnp.int32)))
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, at(1)(prompt, 5, key=3))
+    assert not np.array_equal(at(5)(PROMPTS[0], 5, key=3).host().raw_log_probs,
+                              at(1)(PROMPTS[0], 5, key=3).host().raw_log_probs)
+    with pytest.raises(ValueError):
+        Server.from_task(at(None), slots=2, capacity=128).reload(params, Progress(jnp.asarray(1, jnp.int32)))
+    with pytest.raises(ValueError):
+        NativeRolloutServer(Server.from_task(at(None), slots=2, capacity=128))
 
 
 @pytest.mark.mesh(devices=2)
@@ -511,6 +543,27 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
+def test_a_servers_step_runs_one_executable_for_each_admission_size():
+    """A server's step (`dew.inference.serving_kernel.dispatched`) asks its program for the executable a
+    call takes once for each size of admission, and runs it with the dynamic arguments alone after: no
+    later step builds the program's dispatch key over the weights and cache (train 329's review: about 1
+    ms a step)."""
+    from dew.inference.serving_kernel import dispatched
+
+    asked: list[int | None] = []
+
+    class Program:
+        def executable(self, model, params, pad_id, placement, steps, resident, carried, admission, *rest):
+            asked.append(None if admission is None else len(admission["slots"]))
+            return lambda *dynamic: dynamic[3]
+
+    step = dispatched(Program())
+    sizes = [None, {"slots": np.zeros(2)}, None, {"slots": np.zeros(2)}, {"slots": np.zeros(4)}, None]
+    ran = [step("model", {}, 0, "placement", 1, "resident", "carried", admission, (), (), None, "progress")
+           for admission in sizes]
+    assert asked == [None, 2, 4] and ran == sizes
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
     """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
@@ -677,12 +730,12 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
-def hybrid_model(vocab_size: int = VOCAB) -> CausalTransformer:
+def hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
     """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
     tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
     return CausalTransformer(
-        vocab_size=vocab_size, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
-        mlp_features=32, max_seq_len=128, dtype="float32",
+        vocab_size=vocab_size, emb_features=width, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=2 * width, max_seq_len=128, dtype="float32",
         layer_types=("linear_attention",) * 2 + ("full_attention",),
         kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
             "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
@@ -718,18 +771,37 @@ HYBRID_SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pa
 """A paged server sharing full pages of 4 prompt tokens, its rows' recurrent state beside them."""
 
 
-@pytest.mark.parametrize("requests, options, hits, rounds", [
+@dataclasses.dataclass(frozen=True)
+class HybridSite:
+    """A shared prefix site's model and draws: its vocabulary and width, the tokens each request draws,
+    and its declared seeds, sized paired by `seeds_for` on armada (None sizes them each run)."""
+
+    vocab: int = 256
+    width: int = 16
+    budget: int = 8
+    seeds: int | None = None
+
+
+WIDE_HYBRID = HybridSite(vocab=512, width=64, budget=16, seeds=256)
+"""The site of the requests whose repeats share the most: at 256 words, 16 wide and 8 draws, fp32 sums as
+users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 seeds, which 512 words, 64
+wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
+
+
+@pytest.mark.parametrize("requests, options, hits, rounds, site", [
     ((Served(12), Served(12), Served(12, flipped=(9,)), Served(12, flipped=(1,)), Served(12),
-      Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None),
-    ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None),
-    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None),
-    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), None),
+      Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
+    ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
+    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, HybridSite()),
+    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), None,
+     HybridSite()),
     ((Served(12), Served(12, flipped=(1,)), Served(12), Served(12, flipped=(1,))), {"prefix_states": 1},
-     (0, 8), (2, 2)),
-    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2))],
+     (0, 8), (2, 2), HybridSite()),
+    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), HybridSite())],
     ids=["by-default", "in-pieces", "every-page", "evicted", "one-entry-booked-twice",
          "restores-past-admission"])
-def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds):
+def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
+                                                                             site):
     """A shared prefix's pages hold its keys, and a hybrid stack's rows keep their recurrent memory and
     conv tail beside them: the server keeps the state a prompt leaves at its deepest shareable page
     boundary (and every `prefix_state_every` pages below it), a piece cut to end there, and a later prompt
@@ -743,12 +815,14 @@ def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(req
     next round's repeat of it reads; two repeats seated together each restore their state, past the
     one prompt piece a call admits. Each request draws what it draws alone and scores it as a full
     forward does (check 1)."""
-    # A vocabulary of 64 and eight draws a request, so each request's scores spread enough to measure.
-    model = hybrid_model(vocab_size=64)
+    # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
+    # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
+    model = hybrid_model(vocab_size=site.vocab, width=site.width)
     task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                           sampling=Sampling(temperature=0, pad_token_id=0))
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
-                           serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=8)
+                           serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=site.budget,
+                           seeds=None if site.seeds is None else (site.seeds, site.seeds))
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
@@ -1021,6 +1095,37 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
                         bound.sampling, bound.processor)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
         assert_same_generation(actual, retrained(prompt, 5, key=3))
+
+
+def test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it_was():
+    """A tree split for training (`dew.batch.freeze`), its first layer's keys and values frozen and its
+    queries trained and its second layer trained whole, packs as its whole tree does (ledger 2439): thawed,
+    it is the unsplit weights packed, the flags of its frozen members (`PACKED_FROZEN`) gone with the
+    split, so a model reads the same tree whatever its layers' membership; split, it is the tree it was,
+    each member in its own collection; and a server of it reloads its unsplit source weights."""
+    from dew.batch import PACKED_FROZEN, freeze, thaw
+    from dew.inference.projections import inference_projections, packed_owned, unpacked
+
+    model = decoder().clone(num_layers=2, max_seq_len=128)
+    whole = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    split = freeze(whole, lambda path: not ("layers_0" in path and {"k_proj", "v_proj"} & set(path)))
+    packed = packed_owned(model, jax.tree.map(jnp.array, split))
+    assert PACKED_FROZEN in packed and PACKED_FROZEN not in thaw(packed)
+
+    def assert_trees_equal(tree, expected):
+        assert jax.tree.structure(tree) == jax.tree.structure(expected)
+        for leaf, alike in zip(jax.tree.leaves(tree), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike), strict=True)
+
+    assert_trees_equal(thaw(packed), inference_projections(model, whole))
+    assert_trees_equal(unpacked(model, packed), split)
+    sampling = Sampling(temperature=0, eos_token_ids=None)
+    server = Server.from_task(TextGeneration(model, packed, RunProcessor(Digits()), sampling=sampling),
+                              slots=2, capacity=128)
+    server.reload(whole)
+    alone = TextGeneration(model, whole, RunProcessor(Digits()), sampling=sampling)
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, alone(prompt, 5, key=3))
 
 
 def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():

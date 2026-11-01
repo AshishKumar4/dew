@@ -32,7 +32,7 @@ from interop_support import (
     posterior_of,
     scaled_gap,
 )
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact
 
 from dew.interop.diffusion import component_tensors
 from dew.nn.autoencoders.wan import chunked_decode, chunked_moments, load_wan_vae
@@ -123,36 +123,40 @@ def widened(model, params):
     return model.clone(dtype=jnp.float64), jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), params)
 
 
+CHUNKED_SEEDS = 8
+"""The chunked walk's declared draws (check 1), sized by `seeds_for` paired with the chunked walk on
+armada."""
+
+
 @pytest.mark.parametrize("frames", [3, 5])
-def test_a_chunked_walk_is_the_whole_clip_as_exactly_as_float32_allows(loaded, reference, frames):
-    """The decode one latent frame at a time and the encode the first frame
-    then four at a time, each convolution's last frames carried in the cache,
-    against the one-pass walk: no further from the float64 one-pass walk
-    than the float32 one-pass walk is. Observed RMS ratios at 3 and 5 latent
-    frames: decode 1.017 and 0.978, encode 0.976 and 0.825; the chunked and
-    one-pass walks lie at most 1.5e-6 (decode) and 4.9e-7 (encode) apart."""
+def test_a_chunked_walk_is_the_whole_clip_as_exactly_as_float32_allows(loaded, frames):
+    """The decode one latent frame at a time and the encode the first frame then four at a time, each
+    convolution's last frames carried in the cache, against the one-pass walk: on par with it over drawn
+    latents and clips (check 1), truth the float64 one-pass walk."""
     autoencoder, params, _, _ = loaded
     model = autoencoder.model
-    rng = np.random.default_rng(frames)
-    latents = (channels_last(reference["latent"]) if frames == 3
-               else rng.standard_normal((1, frames, 4, 6, model.latent)).astype(np.float32))
-    video = (channels_last(reference["video"]) if frames == 3
-             else rng.uniform(-1, 1, (1, 4 * frames - 3, 32, 48, 3)).astype(np.float32))
-    whole = {"decode": model.apply({"params": params}, latents, method=model.decode),
-             "moments": model.apply({"params": params}, video, method=model.moments)}
-    chunked = {"decode": chunked_decode(model, {"params": params}, latents),
-               "moments": chunked_moments(model, {"params": params}, video)}
-    with jax.enable_x64(new_val=True):
+    variables = {"params": params}
+
+    def draw(seed):
+        rng = np.random.default_rng([frames, seed])
+        return (rng.standard_normal((1, frames, 4, 6, model.latent)).astype(np.float32),
+                rng.uniform(-1, 1, (1, 4 * frames - 3, 32, 48, 3)).astype(np.float32))
+
+    def chunked(latents, video):
+        return {"decode": chunked_decode(model, variables, latents),
+                "moments": chunked_moments(model, variables, video)}
+
+    def whole(latents, video):
+        return {"decode": model.apply(variables, latents, method=model.decode),
+                "moments": model.apply(variables, video, method=model.moments)}
+
+    def truth(latents, video):
         wide, wide_params = widened(model, params)
-        variables = {"params": wide_params}
-        truth = {"decode": wide.apply(variables, latents.astype(np.float64), method=wide.decode),
-                 "moments": wide.apply(variables, video.astype(np.float64), method=wide.moments)}
-        truth = {name: np.asarray(value) for name, value in truth.items()}
-    for name in whole:
-        assert chunked[name].shape == whole[name].shape
-        assert truth[name].dtype == np.float64
-        assert_as_exact_as_the_reference(np.asarray(chunked[name]), np.asarray(whole[name]), truth[name],
-                                         f"chunked {name}, {frames} latent frames")
+        return {"decode": wide.apply({"params": wide_params}, latents, method=wide.decode),
+                "moments": wide.apply({"params": wide_params}, video, method=wide.moments)}
+
+    assert_as_exact(chunked, whole, draw, f"chunked walk, {frames} latent frames", seeds=CHUNKED_SEEDS,
+                    truth_fn=truth)
 
 
 def test_the_autoencoder_walks_in_chunks_and_holds_one_chunk(loaded):

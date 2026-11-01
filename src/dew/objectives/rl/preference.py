@@ -16,13 +16,29 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.batch import VALID_ROWS, Variables
-from dew.data.preferences import IDS_KEY, MASK_KEY
+from dew.data.preferences import IDS_KEY, MASK_KEY, REAL_KEY
 from dew.inputs import Field, InputSpec
+from dew.nn.inspection import watched_positions
 from dew.objectives.base import Aux, EMASpec
 from dew.objectives.routing import ExpertBalance
 from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm.objective import TokenScorer
+
+
+def _stacked(halves: jax.Array) -> jax.Array:
+    """A pair's `[pairs, 2, ...]` values as the policy scores them, `[2 * pairs, ...]`: the chosen halves'
+    rows, then the rejected halves', TRL's order."""
+    return jnp.concatenate((halves[:, 0], halves[:, 1]))
+
+
+def _real_inputs(batch) -> jax.Array:
+    """Each half's real input tokens as its pair's layout marks them (`dew.data.preferences.REAL_KEY`),
+    chosen rows then rejected as the policy scores them."""
+    if REAL_KEY not in batch:
+        raise ValueError(f"a preference run that watches activations reads each half's real tokens from its "
+                         f"batch's {REAL_KEY!r}, which dew.data.preferences.PreferencePair lays out")
+    return _stacked(jnp.asarray(batch[REAL_KEY])[:, :, :-1] > 0)
 
 
 class DPOObjective(TokenScorer):
@@ -100,14 +116,17 @@ class DPOObjective(TokenScorer):
             raise ValueError(
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
                 "a DPO run always freezes one")
-        chosen_ids, rejected_ids, chosen_mask, rejected_mask = self._halves(batch)
+        _, _, chosen_mask, rejected_mask = self._halves(batch)
         # The policy and its reference score both halves in one forward each, through the same
         # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
-        pairs = jnp.concatenate((chosen_ids, rejected_ids))
-        policy = self.token_scores(variables, pairs, qk_stats=step.qk_stats, predict=predict,
-                                   routing=self.balance is not None)
+        pairs = _stacked(jnp.asarray(batch[IDS_KEY]))
+        with watched_positions(_real_inputs(batch) if step.watched is not None else None):
+            policy = self.token_scores(variables, pairs, qk_stats=step.qk_stats, predict=predict,
+                                       progress=self.progress(step), routing=self.balance is not None,
+                                       watched=step.watched is not None)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
-        ref_chosen, ref_rejected = jnp.split(-self.token_scores(step.ema, pairs).losses, 2)
+        ref_chosen, ref_rejected = jnp.split(
+            -self.token_scores(step.ema, pairs, progress=self.progress(step)).losses, 2)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
@@ -124,14 +143,15 @@ class DPOObjective(TokenScorer):
                 variables, statistics, policy.routing or {}, self._routed_batch(batch),
                 self._routed_queries(batch), {})
             reported.update(metrics)
-        return statistics, Aux[Variables](reported, qk_stats=policy.qk, effects=effects), policy
+        return statistics, Aux[Variables](reported, qk_stats=policy.qk, effects=effects,
+                                          inspected=policy.inspected), policy
 
     def _routed_queries(self, batch) -> jax.Array:
         """The router positions that count, `[2 * pairs, seq_len]`: each half's completion tokens among its
         inputs, the chosen halves first as `pairs` stacks them, and none in a repeat row (`VALID_ROWS`)."""
         mask = jnp.asarray(batch[MASK_KEY])
         rows = self.row_weights(batch, mask.shape[0]) > 0
-        completed = jnp.concatenate((mask[:, 0, :-1], mask[:, 1, :-1])) != 0
+        completed = _stacked(mask[:, :, :-1]) != 0
         return completed & jnp.concatenate((rows, rows))[:, None]
 
     def _routed_batch(self, batch):

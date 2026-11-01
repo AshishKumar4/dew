@@ -88,7 +88,7 @@ def _pair(max_length: int, directory=None, *, bos: str = "none", source: bool = 
     from transformers import LlamaForCausalLM
 
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.loading import RunProcessor
+    from dew.inference.tasks import RunProcessor
     from dew.interop.pretrained import Pretrained
     from dew.interop.processors import Processor
     from dew.sampling import Sampling
@@ -196,7 +196,7 @@ def test_a_task_that_names_no_eos_has_no_end_of_text_id_to_condition_on():
     """The id an empty context is conditioned on is the task's EOS; a task whose sampling names none
     is refused, rather than conditioned on id 0, some vocabulary's ordinary token."""
     from dew.data.text import ByteTokenizer
-    from dew.inference.loading import RunProcessor
+    from dew.inference.tasks import RunProcessor
     from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
 
@@ -216,6 +216,30 @@ def test_options_the_adapter_cannot_honour_are_refused(run, adapter):
         adapter.tok_encode("the", truncation=True)
     with pytest.raises(TypeError):
         adapter._loglikelihood_tokens([(None, [1], [2])], override_bs=1)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_harness_loads_a_run_sharded_and_stored_narrower(run):
+    """A harness loads a run over a mesh, by a layout, and stores its weights in the dtype `param_dtype`
+    names, as `TextGeneration.from_run` does (row 2244): `--model_args` names the mesh by its sizes,
+    `fsdp=2,param_dtype=bfloat16` placing bfloat16 weights on a mesh of two fsdp shards that scores a
+    request, and `DewLM.from_run`'s layout splits the largest of them over those shards."""
+    import math
+
+    import jax
+    import jax.numpy as jnp
+
+    from dew.training import Layout, MeshSpec
+
+    narrow = DewLM.create_from_arg_string(f"run={run},fsdp=2,param_dtype=bfloat16")
+    leaves = jax.tree.leaves(narrow.task.variables["params"])
+    assert {leaf.dtype for leaf in leaves} == {jnp.dtype(jnp.bfloat16)}
+    assert {leaf.sharding.mesh.shape["fsdp"] for leaf in leaves} == {2}
+    ((score, _),) = narrow.loglikelihood([instance("the ", "quick")])
+    assert math.isfinite(score)
+    split = DewLM.from_run(str(run), mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1))
+    largest = max(jax.tree.leaves(split.task.variables["params"]), key=lambda leaf: leaf.size)
+    assert not largest.sharding.is_fully_replicated
 
 
 def test_generation_controls_shape_the_draws_as_they_shape_lm_evals_own_model():
@@ -279,6 +303,26 @@ def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adap
     reordered = adapter.loglikelihood([instance(*pair) for pair in reversed(pairs)])
     assert [score for score, _ in reordered] == pytest.approx(
         [score for score, _ in reversed(together)], rel=RELATIVE)
+
+
+def test_harnesses_over_one_model_score_through_one_program(run):
+    """Two harnesses over one model, each with weights of its own (a run scored at each checkpoint, a
+    draw of weights per seed), score a request through the one program compiled for the model and the
+    request's width; the second compiles nothing, and each scores its own weights (a harness built its
+    scorer anew, a static argument of the program, so each recompiled it)."""
+    import dataclasses
+
+    import jax
+
+    from dew.telemetry.instrumentation import Compiles
+
+    first = TextGeneration.from_run(str(run))
+    second = dataclasses.replace(first, variables=jax.tree.map(lambda leaf: leaf * 2, first.variables))
+    request = [instance("the ", "quick")]
+    (score, _), = DewLM(first).loglikelihood(request)
+    with Compiles("_scored") as compiles:
+        (doubled, _), = DewLM(second).loglikelihood(request)
+    assert compiles.count == 0 and doubled != score
 
 
 @pytest.mark.network

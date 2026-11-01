@@ -10,6 +10,7 @@ move, and a weight-gradient GEMM traced at `up_proj/transpose` is a GEMM.
 import json
 
 import pytest
+from jax.profiler import ProfileData
 from tool_support import load
 
 attribute = load("attribute_step")
@@ -139,12 +140,43 @@ def captured(tmp_path, cells, peak: float, extra: tuple[str, ...] = ()):
     return reports
 
 
+def traced(tmp_path, kernels):
+    """The capture's trace beside its reports, as JAX writes it (plugins/profile/<run>/<host>.xplane.pb):
+    `kernels`, each (stream, name, start ms, end ms, program id or None for a transfer no program
+    launches), on one GPU's plane, its events carrying XLA's program_id stat."""
+    names = sorted({name for _, name, *_ in kernels})
+    lines = []
+    for number, stream in enumerate(sorted({stream for stream, *_ in kernels}), 1):
+        events = "".join(
+            f"events {{ metadata_id: {names.index(name) + 1} offset_ps: {round(start * 1e9)} "
+            f"duration_ps: {round((end - start) * 1e9)}"
+            + ("" if program is None else f" stats {{ metadata_id: 1 int64_value: {program} }}") + " } "
+            for each, name, start, end, program in kernels if each == stream)
+        lines.append(f'lines {{ id: {number} name: "{stream}" timestamp_ns: 0 {events}}}')
+    metadata = "".join(f'event_metadata {{ key: {index} value {{ id: {index} name: "{name}" }} }} '
+                       for index, name in enumerate(names, 1))
+    text = (f'planes {{ id: 1 name: "/device:GPU:0" {" ".join(lines)} {metadata}'
+            'stat_metadata { key: 1 value { id: 1 name: "program_id" } } }')
+    run = tmp_path / "profile" / "capture-a" / "plugins" / "profile" / "run"
+    run.mkdir(parents=True)
+    (run / "host.xplane.pb").write_bytes(ProfileData.text_proto_to_serialized_xspace(text))
+
+
 def dumped(tmp_path, name: str, text: str):
     """An XLA dump directory under `tmp_path` holding one optimized module `name`."""
     dump = tmp_path / "hlo"
     dump.mkdir()
     (dump / name).write_text(text)
     return dump
+
+
+def attributed(tmp_path, dump, *arguments: str) -> dict:
+    """The attribution's time section, the tool run as a person runs it on the capture and `dump`, with
+    `arguments`."""
+    out = tmp_path / "attribution.json"
+    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out),
+                           *arguments]) == 0
+    return json.loads(out.read_text())["time"]
 
 
 def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
@@ -154,10 +186,8 @@ def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
               "fusion(f32[8,3072,1024]{2,1,0} %p0)")
     captured(tmp_path, [("15", "input fusion", "input_reduce_fusion.4", fusion, "", "1", 2000.0, "")],
              311869.0)
-    dump = dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt", NAMELESS)
-    out = tmp_path / "attribution.json"
-    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
-    time = json.loads(out.read_text())["time"]
+    time = attributed(tmp_path, dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt",
+                                       NAMELESS))
     assert time["by_part_kind_ms"] == {"norm": {"reduce": 2.0}}
     assert time["by_part_ms"] == {"norm": {"backward": 2.0}}
 
@@ -198,10 +228,11 @@ def test_a_fusion_that_reads_optimizer_state_is_the_optimizers(tmp_path):
     captured(tmp_path, [("3", "loop fusion", "loop_convert_fusion.7", fusion,
                          "jit(step)/convert_element_type", "1", 3000.0, "src/dew/training/narrow.py:94")],
              311869.0)
-    dump = dumped(tmp_path, "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt", UPDATE)
-    out = tmp_path / "attribution.json"
-    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
-    assert json.loads(out.read_text())["time"]["by_part_kind_ms"] == {"optimizer": {"elementwise": 3.0}}
+    time = attributed(tmp_path, dumped(tmp_path, "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt",
+                                       UPDATE))
+    assert time["by_part_kind_ms"] == {"optimizer": {"elementwise": 3.0}}
+    # A capture with no accelerator timeline (no trace here) says so: its device time is unknown, not 0.
+    assert time["device_busy_ms_per_step"] is None and time["op_self_time_ms_per_step"] == 3.0
 
 
 def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
@@ -211,22 +242,25 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     cells = [("15", found["category"], found["hlo_op_name"], found["hlo_op_expression"], found["tf_op_name"],
               "2", time * 2, "", 1500.0) for case, time in times.items() for found in [ROWS[case][0]]]
     cells.append(("7", "custom-call", "other.1", "", "other program", "1", 15000.0, "", 0))
-    reports = captured(tmp_path, cells, 311869.0, extra=("hbm_bw",))
-    idle_columns = ["host_or_device", "type", "total_self_time"]
-    idle_rows = [("Device", "IDLE", 2000), ("Device", "IDLE", 1000),
-                 ("Host", "IDLE", 10000), ("Device", "compute", 50000)]
-    (reports / "framework_op_stats.json").write_text(json.dumps([{
-        "cols": [{"id": name} for name in idle_columns],
-        "rows": [{"c": [{"v": value} for value in values]} for values in idle_rows]}]))
-    dump = dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt", MODULE)
-    out = tmp_path / "attribution.json"
-    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump),
-                           "--out", str(out), "--steps", "2"]) == 0
-    time = json.loads(out.read_text())["time"]
+    captured(tmp_path, cells, 311869.0, extra=("hbm_bw",))
+    # Two steps on the device: the step program's kernels on two streams, overlapping from 4 to 6 ms,
+    # a batch's transfer, which no program launches, and another program's kernel in its gap.
+    compute, other, copies = "Stream #14(Compute)", "Stream #20(Compute)", "Stream #15(MemcpyH2D)"
+    traced(tmp_path, [(compute, "flash_bwd", 0, 6, 15), (compute, "gemm", 10, 12, 15),
+                      (other, "pallas_recurrence", 4, 8, 15), (compute, "other", 8, 9, 7),
+                      (copies, "MemcpyH2D", 9.5, 10, None)])
+    time = attributed(tmp_path, dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt",
+                                       MODULE), "--steps", "2")
     assert time["step_program"] == "15"
     assert time["programs_ms"] == {"15": 9.5, "7": 7.5}
-    assert (time["device_busy_ms_per_step"], time["device_idle_ms_per_step"],
-            time["device_window_ms_per_step"]) == (9.5, 1.5, 11.0)
+    # Its window is 12 ms over two steps; busy the union of its kernels and the transfer, 8 + 2.5 ms,
+    # though their self times sum to 19 ms, as concurrent kernels each count there; of the 1.5 ms gap,
+    # the other program ran 1 and the device was idle 0.5.
+    assert {key: time[f"device_{key}_ms_per_step"] for key in (
+        "window", "busy", "compute", "exposed_communication", "other_programs", "idle")} == {
+        "window": 6.0, "busy": 5.25, "compute": 5.25, "exposed_communication": 0.0, "other_programs": 0.5,
+        "idle": 0.25}
+    assert time["op_self_time_ms_per_step"] == 9.5
     assert time["by_kind_ms"] == {"attention": 6.0, "pallas": 2.0, "layout": 1.0, "gemm": 0.5}
     assert time["by_part_kind_ms"]["attention"] == {"attention": 6.0}
     assert time["by_part_kind_ms"]["mlp"] == {"gemm": 0.5}
@@ -241,6 +275,7 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     gemm = "%custom-call.1 = bf16[8,8]{1,0} custom-call()"
     captured(tmp_path, [("15", "custom-call", "custom-call.1", gemm, "jit(step)/dot_general", "1", 1000.0,
                          "")], 3742430.0)
+    traced(tmp_path, [("Stream #14(Compute)", "cublas_gemm", 0, 1, 15)])
     entry = tmp_path / "entry.json"
     entry.write_text(json.dumps({"model_flops_per_step": 2.5e11,
                                  "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition"}))
@@ -292,6 +327,8 @@ def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(
               'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
               "jit(step)/dot_general", "1", 1000.0, "", 4.0e5, 3.2e6)]
     captured(tmp_path, cells, 3742430.0, extra=("normalized_flop_rate", "model_flop_rate"))
+    traced(tmp_path, [("Stream #14(Compute)", "cublas_gemm", 0, 1, 15),
+                      ("Stream #14(Compute)", "cublasLt_f8_gemm", 1, 2, 15)])
     entry = tmp_path / "entry.json"
     entry.write_text(json.dumps({"model_flops_per_step": 1.05e12, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
     dump = dumped(tmp_path, "module_0015.jit_step.sm_12.0_gpu_after_optimizations.txt", GEMMS)

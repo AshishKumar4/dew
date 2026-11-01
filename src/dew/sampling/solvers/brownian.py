@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from .common import _sigma_integrator
+from .common import _sigma_integrator, given
 from .sigma import _ancestral
 
 
@@ -138,8 +138,8 @@ class DPMSolverSDE:
         if type(self.depth) is not int or not 1 <= self.depth <= MAX_BROWNIAN_DEPTH:
             raise ValueError(f"the Brownian bridge takes 1 to {MAX_BROWNIAN_DEPTH} levels, "
                              f"the mantissa of a float32 position, not {self.depth}")
-        # A seed is data a compiled walk takes (a traced int32 under jit), so it fits 31 bits.
-        if (self.seed is not None and not isinstance(self.seed, jax.Array)
+        # A seed is data a compiled walk takes, so a given one fits 31 bits.
+        if (self.seed is not None and given(self.seed)
                 and (type(self.seed) is not int or not 0 <= self.seed < 2 ** 31)):
             raise ValueError(f"the noise sampler's seed is an integer in [0, 2**31), not {self.seed}")
 
@@ -150,7 +150,7 @@ class DPMSolverSDE:
             if times.shape[0] > 1 and bool(jnp.any(sigmas[:-1] <= 0)):
                 raise ValueError("sigma=0 source has no finite update: DPMSolverSDE "
                                  "steps down from the interval's own sigma")
-        low, high = float(schedule.sigma_min), float(schedule.sigma_max)
+        low, high = (float(bound) for bound in schedule.sigma_range)
         if not 0 < low <= high:
             raise ValueError("the Brownian tree needs a positive sigma domain, and this "
                              f"schedule reports [{low}, {high}]")

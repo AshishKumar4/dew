@@ -41,7 +41,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
 import jax
 import numpy as np
@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition
     from dew.distributed.placement import Layout
+    from dew.nn.protocols import ProjectionGroup
     from dew.nn.sharding import Schedule
     from dew.state import TrainState
 
@@ -137,8 +138,16 @@ class StageLocal:
         _walked(variables, self.sites, lambda site, where, node: staged.append('stages' in node) or node)
         return any(staged)
 
+    @overload
     @staticmethod
-    def state(state, convert: Callable):
+    def state(state: TrainState, convert: Callable) -> TrainState: ...
+
+    @overload
+    @staticmethod
+    def state(state: Mapping[str, object], convert: Callable) -> dict[str, object]: ...
+
+    @staticmethod
+    def state(state: TrainState | Mapping[str, object], convert: Callable) -> TrainState | dict[str, object]:
         """`state` (a `TrainState`, its shapes, its placement, or a mapping of some of its fields) with
         `convert` applied to every field that holds or mirrors the variables: the variables, the
         optimizer state, the EMA, the narrow copies and the accumulated gradient."""
@@ -194,14 +203,15 @@ class StageLocal:
         bounds is what the layout replicates of a layer."""
         layout.check(self.row_shapes(variables), self.rows_placement(placement), mesh)
 
-    def placed(self, state, placement_of: Callable):
+    def placed(self, state: TrainState, placement_of: Callable[[TrainState], TrainState]) -> TrainState:
         """The placement of `state` (`Trainer.shardings`): `placement_of`'s of a state as it is, or of
         its stored layers' shapes, its stacked runs' placed on the stage axis (`placement`)."""
         if not self.holds(state.variables):
             return placement_of(state)
         return self.state(placement_of(self.state(state, self.row_shapes)), self.placement)
 
-    def supplied(self, state: TrainState, validated: Callable) -> tuple[TrainState, object]:
+    def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState]
+                 ) -> tuple[TrainState, TrainState]:
         """A state given whole, its runs stacked by stage onto the placement `validated` gives the
         stacked state's shapes, and that placement."""
         self.refused(state.opt_state)
@@ -210,11 +220,25 @@ class StageLocal:
         return (jax.jit(stack, out_shardings=placement)(state) if self.sites
                 else jax.device_put(state, placement)), placement
 
-    def restore(self, checkpoints: Checkpoints, template, step: int | str | None,
-                share: DataPartition | None = None):
+    @overload
+    def restore(self, checkpoints: Checkpoints, template: TrainState, step: int | str | None,
+                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()
+                ) -> tuple[TrainState, bytes | None]: ...
+
+    @overload
+    def restore(self, checkpoints: Checkpoints, template: Mapping[str, object], step: int | str | None,
+                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()
+                ) -> tuple[dict[str, object], bytes | None]: ...
+
+    def restore(self, checkpoints: Checkpoints, template: TrainState | Mapping[str, object],
+                step: int | str | None, share: DataPartition | None = None,
+                served: Sequence[ProjectionGroup] = ()
+                ) -> tuple[TrainState | dict[str, object], bytes | None]:
         """`checkpoints.restore` of `template`, a state or some of its fields, each stacked run's
-        layers read onto their own stage's devices (`checkpointed`) and stacked there (`restored`)."""
-        restored, position = checkpoints.restore(self.state(template, self.checkpointed), step, share=share)
+        layers read onto their own stage's devices (`checkpointed`) and stacked there (`restored`);
+        `served` as the checkpoints read it."""
+        restored, position = checkpoints.restore(self.state(template, self.checkpointed), step, share=share,
+                                                 served=served)
         return self.state(restored, self.restored), position
 
     def outside(self, state: TrainState) -> TrainState:
@@ -272,7 +296,8 @@ class StageLocal:
             for stage in range(self.stages):
                 held = rows[stage * count:(stage + 1) * count]
                 devices = held[0].sharding
-                assert isinstance(devices, NamedSharding)
+                assert isinstance(devices, NamedSharding) and isinstance(devices.mesh, Mesh), (
+                    "a stage's rows are read onto its own devices")
                 # A stage's rows are the restore's own arrays, no other leaf's: its piece takes them over.
                 piece = _sharded(row, devices.mesh, (None, *[None] * (len(shape) - 1), *row.spec))
                 pieces.append(jax.jit(_stacked_piece, static_argnames="within", donate_argnums=0,

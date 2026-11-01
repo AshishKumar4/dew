@@ -32,7 +32,7 @@ from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
-from dew.inputs.encoders import ConditionEncoder
+from dew.inputs.condition import ConditionEncoder
 from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
@@ -55,6 +55,7 @@ from dew.registry import models, projectors, read_arguments, resolve_dtype, towe
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
+from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 
@@ -270,13 +271,18 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     return objective
 
 
+OPTIMIZERS = {"adam": optax.adam, "adamw": optax.adamw}
+"""A case's optimizer by name (`Case.optimizer`), each at a learning rate."""
+
+
 def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
                   optimizer: optax.GradientTransformation | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
     checkpoints, on the case's device order. A case measures its own batch,
     so the step reads it whole and climbs the remat ladder where it must."""
     trainer = Trainer(
-        build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
+        build_objective(case, attention_impl), optimizer or OPTIMIZERS[case.optimizer](1e-4),
+        key=jax.random.key(0),
         **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, split=1, checkpoints=None, tracker=None)
     if case.device_order is not None:
@@ -316,9 +322,10 @@ def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> Model
                        {"pixel_values": pixels.astype(np.float32)})
 
 
-def global_batch(case: Case) -> Batch:
-    """The case's whole batch, drawn the same on every process."""
-    rng = np.random.default_rng(0)
+def global_batch(case: Case, seed: int = 0) -> Batch:
+    """The case's whole batch, drawn the same on every process: draw `seed` of it, seed 0 the one a
+    benchmark runs."""
+    rng = np.random.default_rng(seed)
     batch: Batch = {}
     if case.is_lm:
         vocab = case.config["vocab_size"]
@@ -423,8 +430,9 @@ class CompiledStep:
 
 @contextlib.contextmanager
 def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
-    """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch,
-    and yield it.
+    """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch
+    with the trials a run's compile takes (`Trials`), which profile only its admitted step where
+    JAX's AutoPGLE asks, on a copy of the state, and yield it.
 
     Each step reads the next placed batch, or with `fixed_batch` the first
     one again. The batches stay placed until the block ends.
@@ -434,8 +442,10 @@ def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) ->
         first = next(source)
         jax.block_until_ready((state, first))
         start = time.perf_counter()
-        compiled = trainer.compile(state, first)
+        trials = Trials(state, first)
+        compiled = trainer.compile(state, first, trials)
         compile_seconds = time.perf_counter() - start
+        state = trials.state
 
         def step(state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
             state, loss, _, finite, _, _ = compiled(state, first if fixed_batch else next(source))

@@ -13,11 +13,18 @@ import importlib.util
 
 import jax
 import pytest
+from flax.linen.dtypes import canonicalize_dtype
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates.gemm import template
 
 INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
                                 reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
+COMPILES_ON_CPU = pytest.mark.skipif(
+    jax.default_backend() != "cpu",
+    reason="reads ptxas's reports of kernels a CPU process compiles for a compile-only device; a GPU "
+           "process's read 0 registers (ET-A05A08-TEST6-h100)")
+"""A mark skipping a resource gate (`kernel_compile.mosaic_failures`) where the process has its own GPU."""
 SUMS_IN_IEEE = pytest.mark.skipif(
     jax.default_backend() != "cpu",
     reason="compares sums bit for bit as a CPU's IEEE fp32 dots give them, which a GPU's tensor cores, "
@@ -64,3 +71,12 @@ process cannot: a GPU host's process has no TPU toolchain."""
 def generations(*names: str) -> list:
     """`names` as parameters, each marked `runs`, for a test parametrized over assumed generations."""
     return [pytest.param(name, marks=runs(name)) for name in names]
+
+
+def interpreted_projection(x, kernel, group_sizes, dtype, precision=None):
+    """`moe.expert_projection` on the GEMM template's kernels, which a CPU process interprets as the GPU
+    `generation.assumed` names (the template's explicit interpreter, `interpret_on_cpu`; product code
+    never asks for it): the projection's law, its launches each selected as on that GPU."""
+    compute = canonicalize_dtype(x, kernel, dtype=dtype)
+    return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute,
+                         precision=precision, interpret_on_cpu=True)

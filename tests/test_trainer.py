@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import logging
 import math
 import os
 import subprocess
@@ -28,9 +29,20 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
+from affine_run import (
+    BATCH,
+    FEATURES,
+    Counting,
+    Features,
+    Regression,
+    Replaying,
+    Spread,
+    dataset,
+    raw_leaf,
+    val_batches,
+)
 from flax.core import FrozenDict, freeze as frozen_dict
-from recording import Preempting, RecordingTracker
+from recording import RecordingTracker, preempting
 from reference_error import as_given, assert_as_exact
 from steady_state import steady_state
 from token_support import write_token_corpus
@@ -39,9 +51,14 @@ from dew import position
 from dew.artifacts import Representations
 from dew.batch import merge, under
 from dew.checkpoints import Ranking
+from dew.data import Memory, presets, schedule
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
+from dew.data.pipeline import Pipeline
+from dew.data.sources.tokens import TokenFiles
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, EMASpec, Objective
+from dew.objectives.lm import LMObjective
 from dew.optim import Cosine, OptimConfig, Power
 from dew.state import CHECKPOINTED, TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
@@ -93,6 +110,49 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
     if log_every == 1:
         assert [scalars["train/tokens"] for _, scalars in tracker.scalars
                 if "train/tokens" in scalars] == logged
+
+
+def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
+    """A run whose optimizer splits by Muon's rule records, as it starts, where the split sent each
+    parameter and why (`FitStarted.groups`): the regression's kernel to Muon, its bias to AdamW. A run
+    of an optimizer it was handed built records none (row 2087)."""
+    from dew.telemetry.records import FitStarted
+
+    def started(optimizer):
+        tracker = RecordingTracker()
+        make_trainer(optimizer=optimizer, tracker=tracker).fit(dataset(), steps=1)
+        (record,) = [value for _, value in tracker.artifacts if isinstance(value, FitStarted)]
+        return record.groups
+
+    groups = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    assert groups is not None
+    assert sorted(groups.values()) == ["adamw: a bias or of rank below two", "muon"]
+    assert started(None) is None
+
+
+def test_a_runs_start_reports_each_phase_it_took_once(caplog):
+    """A run's start logs each phase as it starts and with the seconds it took when it ends (the data's
+    preparation, the step's compile, the evaluations' warming), and reports each phase's seconds once,
+    beside its first logged step's scalars, none after."""
+    import logging
+
+    tracker = RecordingTracker()
+    trainer = make_trainer(objective=Features(), tracker=tracker)
+    with caplog.at_level(logging.INFO, logger="dew.training.startup"):
+        trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
+    took = [record.getMessage() for record in caplog.records if " took " in record.getMessage()]
+    assert [message.split(" took ")[0] for message in took] == [
+        "preparing the data", "compiling the step", "warming the evaluations"]
+    reported = [{name: value for name, value in scalars.items() if name.startswith("startup/")}
+                for _, scalars in tracker.scalars]
+    [first] = [phases for phases in reported if phases]
+    assert set(first) == {"startup/data_seconds", "startup/compile_seconds", "startup/warm_seconds"}
+    assert all(seconds >= 0 for seconds in first.values()) and reported[0] == first
+    # A run that logs no step reports its start with its outcome, once.
+    quiet = RecordingTracker()
+    make_trainer(objective=Features(), tracker=quiet).fit(dataset(), steps=2, log_every=100)
+    started = [name for _, scalars in quiet.scalars for name in scalars if name.startswith("startup/")]
+    assert sorted(started) == ["startup/compile_seconds", "startup/data_seconds", "startup/warm_seconds"]
 
 
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
@@ -214,6 +274,106 @@ def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, ca
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
     state = resumed.fit(dataset(LargeTokenRows), tokens=65 * 262143 + 1, log_every=cadence)
     assert int(state.step) == 66
+
+
+LM_CONTEXT = 6
+LM_ROWS = 8
+
+
+def lm_data() -> Pipeline:
+    """Batches of eight rows of seven real ids, read again and again: each step commits its rows'
+    48 targets, the most they hold (`Objective.row_tokens`)."""
+    rows = (np.arange(2 * LM_ROWS * (LM_CONTEXT + 1), dtype=np.int32) % 13).reshape(-1, LM_CONTEXT + 1)
+    return Pipeline(Memory({"text": rows})).repeat().batch(LM_ROWS)
+
+
+def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32")
+    return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT), **kwargs)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
+def test_a_token_budget_reads_its_count_off_the_devices_as_often_in_a_longer_run(caplog, accumulation):
+    """An LM run's step commits at most its rows' targets (`Objective.row_tokens`), so a token budget
+    reads the committed count off the devices at its first step, whose window a checkpoint may have
+    begun, and at the steps whose rows could have brought it to the budget, never at those between, each
+    of which such a read waits on before the next step dispatches: a run of twenty steps reads it as
+    often as a run of four."""
+    def reads(steps: int) -> int:
+        caplog.clear()
+        with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
+            trainer = budget_lm_trainer(accumulation=accumulation)
+            state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
+        assert int(state.step) == steps
+        return sum("shape=(2,), dtype=uint32" in record.getMessage() for record in caplog.records)
+
+    assert reads(4) == reads(20)
+
+
+def varied_rows(position: int) -> dict[str, np.ndarray]:
+    """The batch read at `position`: eight rows of thirteen ids, twelve targets each, then rows of four
+    ids, three targets each, from there on."""
+    width = 13 if position == 0 else 4
+    return {"text": (np.arange(LM_ROWS * width, dtype=np.int32) % 13).reshape(LM_ROWS, width)}
+
+
+def test_a_token_budget_resumed_inside_an_update_ends_where_an_unbroken_run_does(tmp_path):
+    """A run of updates of three steps stopped after its first step resumes with that step's 96 targets
+    still to commit, more than any later step's 24: the update's commit at step 3 brings the run to the
+    budget of 144, so the resumed run ends there, as a run that never stopped does, where a bound of its
+    own steps alone would not reach the budget until step 6."""
+    def data():
+        return Loader(lambda partition: Replaying(varied_rows), None, batch=LM_ROWS, records=None)
+
+    budget = LM_ROWS * (12 + 3 + 3)
+    unbroken = budget_lm_trainer(tmp_path / "unbroken", accumulation=3).fit(data(), tokens=budget)
+    budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), steps=1)
+    resumed = budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), tokens=budget)
+    assert int(unbroken.step) == int(resumed.step) == 3
+
+
+def context_schedule(tmp_path, longer: int) -> Pipeline:
+    """A context-extension schedule over one token store: windows of LM_CONTEXT inputs until the run
+    commits two steps' targets, then windows of `longer`."""
+    corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(13), 64), tokenizer="symbols",
+                                vocab_size=13)
+
+    def stage(seq_len: int) -> Pipeline:
+        return TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=seq_len, batch=None)
+
+    return schedule([(stage(LM_CONTEXT), 2 * LM_ROWS * LM_CONTEXT), (stage(longer), None)]).batch(LM_ROWS)
+
+
+def test_a_schedule_trains_each_stage_at_the_row_length_it_lays_out(tmp_path):
+    """The second stage of a context-extension schedule lays out windows of ten inputs, past the
+    objective's own six and within the model's context (max_seq_len 12): the run trains it at that
+    length, compiled when its first batch arrives, and commits every target of both stages, two steps
+    of 8 x 6, then steps of 8 x 10."""
+    tracker = RecordingTracker()
+    budget_lm_trainer(tracker=tracker).fit(context_schedule(tmp_path, 10), steps=4, log_every=1)
+    committed = [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
+    assert committed == [LM_ROWS * LM_CONTEXT] * 2 + [LM_ROWS * 10] * 2
+
+
+def test_a_schedule_stage_past_the_models_context_is_refused(tmp_path):
+    """A stage whose windows hold thirteen inputs, past the model's max_seq_len of twelve, is refused
+    once its rows arrive, where a stage of twelve trains."""
+    budget_lm_trainer().fit(context_schedule(tmp_path / "held", 12), steps=4)
+    with pytest.raises(ValueError):
+        budget_lm_trainer().fit(context_schedule(tmp_path / "past", 13), steps=4)
+
+
+def test_an_objective_whose_rows_pass_a_learned_position_table_is_refused():
+    """A decoder whose positions are a learned table of twelve rows covers twelve places
+    (`PositionCapacity`), however long the rows its objective names: an objective of thirteen-token rows
+    is refused, whose rows, and the rows of any stage it reads up to them, would gather past the table,
+    and one of twelve is not."""
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, position_embedding="learned", dtype="float32")
+    assert LMObjective(model, seq_len=12).context == 12
+    with pytest.raises(ValueError):
+        LMObjective(model, seq_len=13)
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
@@ -393,6 +553,26 @@ class Keyed(Regression):
         return base * factor, aux
 
 
+def test_a_run_that_must_continue_refuses_to_start_afresh_and_one_that_must_not_refuses_to_continue(tmp_path):
+    """`fit(resume="require")` continues the latest checkpoint and refuses a directory with none, or a
+    run given its own state=, so a job that must continue never trains from scratch; `resume="never"`
+    trains a fresh directory and refuses one that holds a run, leaving that run's checkpoints as they
+    were, which the run that must continue then continues."""
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=2, resume="require")
+    assert int(make_trainer(tmp_path).fit(dataset(), steps=2, resume="never").step) == 2
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=4, resume="never")
+    given = make_trainer(tmp_path)
+    with pytest.raises(ValueError):
+        given.fit(dataset(), steps=4, resume="require", state=given.initial_state())
+    continued = make_trainer(tmp_path).fit(dataset(), steps=4, resume="require")
+    whole = make_trainer().fit(dataset(), steps=4)
+    for actual, expected in zip(jax.tree.leaves(continued.variables), jax.tree.leaves(whole.variables),
+                                strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 def test_a_resumed_run_continues_the_key_stream(tmp_path):
     """A resume continues fold_in(run_key, step) where it stopped.
 
@@ -435,7 +615,7 @@ def stream(reader):
 def preempted(tmp_path, data, at=3, steps=6):
     """`data` trained toward `steps` and preempted when step `at` is logged, its checkpoint written."""
     with pytest.raises(Preempted):
-        make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
+        make_trainer(tmp_path).fit(data, steps=steps, log_every=1, observe=preempting(at))
     assert Checkpoints(str(tmp_path / "run")).latest is not None
 
 
@@ -540,9 +720,6 @@ def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence
 def held_lm_trainer(container=dict, **settings):
     """A one-layer LM trainer over held weights, which the objective holds
     in `container` (Flax's FrozenDict, say)."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
-
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
@@ -624,9 +801,8 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
-    from dew.data import Loading, presets
+    from dew.data import Loading
     from dew.data.dataset import Forwarding
-    from dew.data.sources.tokens import TokenFiles
 
     corpus = write_token_corpus(tmp_path / "tokens", np.arange(29))
 
@@ -692,18 +868,14 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     assert position.read(resumed_place).records == 4 * BATCH
 
 
-@pytest.mark.gpu(reason="CUDA embedding-gradient reductions")
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
+def a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
     scatter-add order is not repeatable; conftest enables deterministic ops
     before the backend opens. Check every state leaf, not just parameters.
     bf16 at the default precision runs the head that rounds its logits and
     their gradient to bf16, and resumes bit-exactly too."""
-    from dew.data import Loading, presets
-    from dew.data.sources.tokens import TokenFiles
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
+    from dew.data import Loading
 
     corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(8), 256), tokenizer="symbols",
                                 vocab_size=8)
@@ -763,8 +935,7 @@ np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
 """
 
 
-@pytest.mark.gpu(reason="cuDNN and cuBLAS kernel choice")
-def test_a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache(tmp_path):
+def a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache(tmp_path):
     """XLA chooses a convolution's cuDNN algorithm and a GEMM's cuBLAS one per
     process, so only a second process shows whether it agrees. Two fresh
     processes train a DiT (a convolution embeds its patches) two Adam steps
@@ -1251,42 +1422,95 @@ def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
 
 
 def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None,
-                 directory=None) -> TrainState:
+                 directory=None, rollout=None) -> TrainState:
     """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
-    checkpointed in `directory` where one is given."""
-    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation,
+    checkpointed in `directory` where one is given, its batches through any `rollout`."""
+    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation, rollout=rollout,
                            optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
     return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
                        cooldowns=cooldowns)
 
 
+class NoisedTargets:
+    """A rollout whose batch is its state's and key's: the targets moved by noise its key draws, scaled
+    by its state's step, noting every step it is called at."""
+
+    def __init__(self):
+        self.steps: list[int] = []
+
+    def __call__(self, state, batch, key):
+        self.steps.append(int(state.step))
+        noise = np.asarray(jax.random.normal(key, np.shape(batch["y"])), np.float32)
+        return {**batch, "y": np.asarray(batch["y"]) + np.float32(0.01) * (1 + int(state.step)) * noise}
+
+
+@pytest.mark.parametrize("rollout", [False, True], ids=["batches", "rollout"])
 @pytest.mark.parametrize("accumulation", [1, 2])
-def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
+def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(
+        accumulation, rollout):
     """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
-    decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
+    decay begins there: the branch's `cooldown/val/loss`, recorded at the step it branched from, is that
     run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
-    it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
+    it branched from ends where a run with no cooldown ends, its parameters bit for bit. With a rollout
+    whose batches are its states' and keys' (`NoisedTargets`), the branch trains on what the rollout
+    draws from the branch's own states, as the decayed run trains on what it draws from its own, and
+    the run draws from its states again from the step it branched at."""
     from dew.optim import Linear
     from dew.telemetry.records import FitStarted
     from dew.training.cooldown import Cooldowns
 
     peak, at = 2.0 ** -4, 4 * accumulation
     stable = Linear(peak, decay_start=64, decay_steps=128)
-    tracker = RecordingTracker()
+    tracker, drawn = RecordingTracker(), NoisedTargets() if rollout else None
     branched = cooldown_run(stable, 3 * at, accumulation, tracker,
-                            Cooldowns(at=(at,), length=at, shape="linear"))
-    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-              if "cooldown_val/loss" in scalars}
+                            Cooldowns(at=(at,), length=at, shape="linear"), rollout=drawn)
+    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars}
     decayed = RecordingTracker()
-    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
+    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed,
+                 rollout=NoisedTargets() if rollout else None)
     finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
     assert cooled == {at: finals[-1]}
+    if drawn is not None:
+        assert drawn.steps == [*range(at), *range(at, 2 * at), *range(at, 3 * at)]
+        # The branch trains on the rollout's batches, not the stream's: the run with none scores otherwise.
+        unrolled = RecordingTracker()
+        cooldown_run(stable, 3 * at, accumulation, unrolled, Cooldowns(at=(at,), length=at, shape="linear"))
+        assert {step: scalars["cooldown/val/loss"] for step, scalars in unrolled.scalars
+                if "cooldown/val/loss" in scalars} != cooled
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["cooldowns.at"] == [at]
-    plain = cooldown_run(stable, 3 * at, accumulation)
+    plain = cooldown_run(stable, 3 * at, accumulation, rollout=NoisedTargets() if rollout else None)
     for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_cooldown_branchs_scoring_artifacts_keep_apart_from_the_runs_at_its_step(tmp_path):
+    """A run that keeps every evaluation's scoring artifacts (`scored_to`) keeps a cooldown branch's,
+    scored at the step it branched at, under `cooldown/` beside the run's own at that step
+    (`<scored_to>/step-<step>/cooldown/<split>-<batch>.npz`), neither written over the other."""
+    import grain.python as grain
+    from test_chain_compile import held_tokens
+
+    from dew.data import from_grain, from_iter
+    from dew.objectives.lm import Perplexity
+    from dew.training.cooldown import Cooldowns
+
+    train = from_grain(grain.MapDataset.source(list(held_tokens()) * 4), "indexed-tokens").batch(16)
+    held = from_iter(held_tokens, identity="streamed-tokens").batch(8).read("streamed").workers(0)
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, attention_impl="xla")
+    objective = LMObjective(model, seq_len=4)
+    Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), key=0).fit(
+        train.read("indexed").workers(0), validation=held, steps=4, eval_every=2, metrics=(Perplexity(),),
+        cooldowns=Cooldowns(at=(2,), length=1), scored_to=tmp_path)
+    run = {path.name: np.load(path) for path in (tmp_path / "step-2").glob("val-*.npz")}
+    branch = {path.name: np.load(path) for path in (tmp_path / "step-2" / "cooldown").glob("val-*.npz")}
+    assert run and branch.keys() == run.keys()
+    # The branch scored its own decayed state, the run its state at the step.
+    assert any(not np.array_equal(run[name][field], branch[name][field])
+               for name in run for field in run[name].files)
 
 
 @pytest.mark.parametrize("best", [False, True], ids=["unranked", "weights-best"])
@@ -1303,22 +1527,23 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best)
     stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(4,), length=4)
     uninterrupted = RecordingTracker()
     cooldown_run(stable, 12, 1, uninterrupted, cooldowns)
-    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
-                if "cooldown_val/loss" in scalars}
+    expected = {step: scalars["cooldown/val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown/val/loss" in scalars}
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
-    # The notice step 3's log sends reaches the run after step 4, as its branch begins.
-    stopped = Preempting(3)
+    # The notice sent after step 3 reaches the run after step 4, as its branch begins.
+    stopped = RecordingTracker()
     weights = Best(lambda scores: scores["val/loss"], weights_only=True)
     ranked = {"eval_every": 4, "best": weights} if best else {"eval_every": 12}
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
-            dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns, **ranked)
-    assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
+            dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns,
+            observe=preempting(3), **ranked)
+    assert not any("cooldown/val/loss" in scalars for _, scalars in stopped.scalars)
     assert Checkpoints(str(tmp_path / "run")).latest == 4
     resumed = RecordingTracker()
     state = cooldown_run(stable, 12, 1, resumed, cooldowns, tmp_path)
-    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
-            if "cooldown_val/loss" in scalars} == expected
+    assert {step: scalars["cooldown/val/loss"] for step, scalars in resumed.scalars
+            if "cooldown/val/loss" in scalars} == expected
     plain = cooldown_run(stable, 12, 1)
     for ours, theirs in zip(jax.tree.leaves(state.variables), jax.tree.leaves(plain.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
@@ -1338,24 +1563,24 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(8,), length=4)
     uninterrupted = RecordingTracker()
     cooldown_run(stable, 8, 1, uninterrupted, cooldowns)
-    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
-                if "cooldown_val/loss" in scalars}
+    expected = {step: scalars["cooldown/val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown/val/loss" in scalars}
     assert list(expected) == [8]
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
     best = Best(lambda scores: scores["val/loss"], weights_only=True) if saves == "weights-best" else None
     with pytest.raises(Preempted):
-        make_trainer(tmp_path, tracker=Preempting(7), optimizer=optimizer).fit(
+        make_trainer(tmp_path, optimizer=optimizer).fit(
             dataset(val=val_batches(2)), steps=8, log_every=1, eval_every=8, cooldowns=cooldowns,
-            checkpoint_final=saves == "final", best=best)
+            checkpoint_final=saves == "final", best=best, observe=preempting(7))
     assert Checkpoints(str(tmp_path / "run")).latest == 8
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is not None
     resumed, again = RecordingTracker(), RecordingTracker()
     cooldown_run(stable, 8, 1, resumed, cooldowns, tmp_path)
-    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
-            if "cooldown_val/loss" in scalars} == expected
+    assert {step: scalars["cooldown/val/loss"] for step, scalars in resumed.scalars
+            if "cooldown/val/loss" in scalars} == expected
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is None
     cooldown_run(stable, 8, 1, again, cooldowns, tmp_path)
-    assert not any("cooldown_val/loss" in scalars for _, scalars in again.scalars)
+    assert not any("cooldown/val/loss" in scalars for _, scalars in again.scalars)
 
 
 def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(monkeypatch):
@@ -1384,13 +1609,14 @@ def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_dev
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
     """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
     step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
-    from dew.training.cadence import Tokens
+    from dew.training.cadence import Counted
     from dew.training.cooldown import Cooldowns, resolved
 
     cooldowns = Cooldowns(at=("25%", 6), length="50%")
     assert [branch.at for branch in cooldowns.branches(16, None, 1)] == [4, 6]
     (shared,) = Cooldowns(at=("25%",)).branches(None, 96, 1)
-    assert shared.at == Tokens(24) and shared.due(3, 30, 20) and not shared.due(4, 50, 30)
+    assert shared.at == Counted(24, "tokens") and shared.due(3, {"tokens": (30, 20)})
+    assert not shared.due(4, {"tokens": (50, 30)})
     assert cooldowns.steps(4, 1) == 2 and cooldowns.steps(12, 2) == 6
     assert [cooldowns.factor(update, 4) for update in range(4)] == [1.0, 0.5, 1.0 - math.sqrt(0.5),
                                                                     1.0 - math.sqrt(0.75)]
@@ -1433,8 +1659,8 @@ def test_a_cooldown_of_an_injected_constant_rate_is_the_run_that_decays_there():
             (optax.inject_hyperparams(optax.sgd)(learning_rate=decaying), 8, decayed, None)):
         make_trainer(tracker=sink, optimizer=optimizer).fit(
             dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps, cooldowns=cooldowns)
-    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-              if "cooldown_val/loss" in scalars}
+    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars}
     assert cooled == {4: [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars][-1]}
 
 
@@ -1551,6 +1777,19 @@ def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput(
         assert np.isfinite(scalars["train/loss"])
         assert scalars["train/step_time_ms"] > 0
         assert scalars["train/samples_per_sec"] > 0
+
+
+def test_an_interval_read_no_later_than_the_last_reports_its_counts_and_no_rates():
+    """A log the writer reads no later than the one before it was done (`Taken.read`), an interval of
+    no seconds, still reports the tokens, work, compile and waits its steps counted, which a run's
+    committed tokens are summed from; only its rates, which need seconds, are left out."""
+    from dew.training.interval import throughput
+
+    counted = {"train/tokens": 15.0, "train/flops": 30.0, "train/compile_s": 0.5, "train/data_wait_ms": 2.0}
+    interval = {"waited": 0.004, "compiling": 0.5, "training_flops": 60.0, "tokens": 30}
+    assert throughput(0.5, 2, 16, None, 1, **interval) == counted
+    timed = throughput(1.5, 2, 16, None, 1, **interval)
+    assert timed.items() >= counted.items() and timed["train/tokens_per_s"] == 30.0
 
 
 # --------------------------------------------------------------------------
@@ -2053,7 +2292,7 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     time, into the persistent cache, before it holds them on devices; the
     trainer's own settings (the window, the scaler) stay values. The loss's
     shape once folded the step into the key eagerly, which a key known only
-    by its shape cannot do (74761deb)."""
+    by its shape cannot do (fd591eb1)."""
     trainer, _, _ = held_lm_trainer()
     state, shardings, _ = trainer.place()
 

@@ -42,16 +42,18 @@ import lint_scopes as scopes
 DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew", "dew.batch", "dew.mesh"]),
     ("Training", ["dew.training", "dew.training.budget", "dew.training.cooldown", "dew.state", "dew.optim",
-                  "dew.training.quantization", "dew.training.runtime", "dew.distributed.placement",
-                  "dew.distributed.batches", "dew.training.posthoc"]),
+                  "dew.laprop", "dew.newton_schulz", "dew.training.quantization", "dew.training.runtime",
+                  "dew.distributed.placement", "dew.distributed.batches", "dew.averaging"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
                     "dew.objectives.routing",
                     "dew.objectives.diffusion.adversarial",
                     "dew.objectives.diffusion.alignment", "dew.objectives.diffusion.consistency",
                     "dew.objectives.diffusion.end_to_end", "dew.objectives.diffusion.few_step",
                     "dew.objectives.diffusion.guidance_distillation",
-                    "dew.objectives.jepa", "dew.objectives.supervised", "dew.objectives.rl",
-                    "dew.objectives.rl.flow",
+                    "dew.objectives.jepa", "dew.objectives.supervised", "dew.objectives.residuals",
+                    "dew.objectives.perturbation", "dew.objectives.rl",
+                    "dew.objectives.rl.flow", "dew.objectives.rl.nft", "dew.objectives.rl.control",
+                    "dew.objectives.rl.dreamer", "dew.objectives.rl.tssm", "dew.objectives.world_model",
                     "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.gateway",
                     "dew.interop.harness", "dew.interop.harbor", "dew.interop.openenv"]),
     ("Data", ["dew.data", "dew.data.presets", "dew.data.pipeline", "dew.data.holdout", "dew.data.compile",
@@ -70,10 +72,12 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.backbones.edm2", "dew.nn.backbones.joint", "dew.nn.backbones.flux",
                 "dew.nn.backbones.flux2",
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.wan",
-                "dew.nn.backbones.z_image", "dew.nn.mp",
+                "dew.nn.backbones.z_image", "dew.nn.mp", "dew.nn.fourier",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal", "dew.nn.cross_attention",
-                "dew.nn.memory",
-                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.nn.dex", "dew.nn.progress", "dew.nn.memory", "dew.nn.ngpt", "dew.nn.hyper_connections",
+                "dew.nn.engram",
+                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.vision", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.nn.wrapping", "dew.nn.scatter", "dew.nn.precision",
                 "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
@@ -84,10 +88,14 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                               "dew.interop", "dew.interop.diffusion_gemma"]),
     ("Decision models", ["dew.decision", "dew.decision.config", "dew.decision.data", "dew.decision.objective",
                          "dew.decision.rows", "dew.decision.layout", "dew.decision.task"]),
-    ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
+    ("Conditions and evaluation", ["dew.inputs", "dew.inputs.condition", "dew.inputs.encoders",
+                                   "dew.eval", "dew.eval.calibration",
+                                   "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.distributed", "dew.telemetry.profile",
+    ("Utilities", ["dew.rl", "dew.rl.env", "dew.rl.simulator", "dew.rl.quadrotor", "dew.rl.flight", "dew.rl.hyperlux",
+                   "dew.rl.replay", "dew.rl.playground", "dew.rl.distributions",
+                   "dew.artifacts", "dew.distributed", "dew.cache", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
@@ -845,7 +853,7 @@ def main() -> None:
     for file, path in usage_files():
         try:
             commit = pinned(path)
-            shown[file] = (package, pages, home) if commit is None else at_commit(commit)
+            shown[file] = (package, pages, home) if commit is None else at_commit(held_by_history(commit))
         except Unresolved as error:
             problems.append(f"{file}: {error}")
     for file, module_path, name in usage_imports():
@@ -1006,6 +1014,18 @@ def groups_at(commit: str) -> list[tuple[str, list[str]]]:
                         for target in (node.targets if isinstance(node, ast.Assign) else [node.target]))):
             return ast.literal_eval(node.value)
     raise Unresolved(f"{P.declared} declares no DEW_GROUPS at {commit}")
+
+
+def held_by_history(commit: str) -> str:
+    """`commit`, where this checkout's history holds it; else refused: a pin to a commit outside it (one
+    from before a history rewrite, which an environment built before it still has as an object, or a branch's)
+    names nothing a fresh clone can install or archive (ledger 2783)."""
+    held = subprocess.run(["git", "-C", str(P.repo), "merge-base", "--is-ancestor", commit, "HEAD"],
+                          capture_output=True, check=False)
+    if held.returncode != 0:
+        raise Unresolved(f"its install pins {commit}, which this checkout's history does not hold: pin a "
+                         "commit of main")
+    return commit
 
 
 @functools.cache

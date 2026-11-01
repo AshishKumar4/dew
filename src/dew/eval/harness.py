@@ -23,6 +23,7 @@ slots that end one before the row's last token.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Sequence
 from typing import Any, Literal
@@ -30,6 +31,8 @@ from typing import Any, Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
+from jax.sharding import Mesh
 from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import TemplateLM
@@ -37,6 +40,7 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
 from dew.batch import BLOCKS_FIELD
+from dew.distributed.placement import Layout, MeshSpec
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.interop.generation_config import source_decoding
 from dew.nn.inputs import ModelInputs, pad_token_rows
@@ -54,16 +58,19 @@ TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
-def _scored(scorer: TokenScorer, variables, rows: ModelInputs) -> tuple[jax.Array, jax.Array]:
+def _scored(model: nn.Module, variables, rows: ModelInputs) -> tuple[jax.Array, jax.Array]:
     """Return the per-target log-probability and whether the target was the argmax, as the scorer
     the language-model losses share scores them (`TokenScorer.token_scores`), through its tiled
     head, which holds a tile of the vocabulary at a time rather than every row's whole logits;
-    compiled with the model's XLA options (`program`).
+    compiled with the model's XLA options (`program`), one program for each model and row width,
+    whichever harness asks: the model is its static argument, hashed by its fields, as a decode step
+    takes it (`dew.inference.serving_kernel`), so harnesses over a run's checkpoints share it.
 
     `rows` is `[B, T]` of token ids, with their fields (`_scoring_inputs`); both results are
     `[B, T - 1]`, entry `i` belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
     a causal model cannot read backwards, so a short row's own slots hold what they would hold alone.
     """
+    scorer: TokenScorer = LMObjective(model, rows.tokens.shape[1] - 1, head_tile="tiled")
     scores = scorer.token_scores(variables, rows, predict=True)
     return -scores.losses, scores.correct == 1
 
@@ -118,19 +125,22 @@ class DewLM(TemplateLM):
         self.task = task
         self._processor = processor
         self.batch_size = batch_size
-        self._scorers: dict[int, TokenScorer] = {}
 
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool | None = None,
-                 step: int | str | None = None, dtype: str | None = None,
+                 step: int | str | None = None, mesh: MeshSpec | Mesh | None = None,
+                 layout: Layout | None = None, dtype: str | None = None, param_dtype: str | None = None,
                  trust: Sequence[str] = ()) -> DewLM:
         """Load the run directory `run` as a harness model, the way `dew.pipeline` builds it.
 
         With `ema=None`, it uses the run's averaged weights when the run kept
-        them, and its live weights otherwise. `trust` is as `TextGeneration.from_run`
-        takes it.
+        them, and its live weights otherwise. `mesh`, `layout`, `dtype`, `param_dtype` and
+        `trust` are as `TextGeneration.from_run` takes them: a run sharded over a mesh, its
+        weights stored narrower. `--model_args` names the mesh by its axes' sizes,
+        `run=<directory>,fsdp=4,param_dtype=bfloat16` (`MeshSpec`'s fields).
         """
-        return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype, trust=trust),
+        return cls(TextGeneration.from_run(run, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype,
+                                           param_dtype=param_dtype, trust=trust),
                    batch_size=batch_size)
 
     @classmethod
@@ -167,7 +177,11 @@ class DewLM(TemplateLM):
                 "--model dew evaluates a run directory; name it with "
                 "--model_args run=<directory>")
         batch = arguments.pop("batch_size", 1)
-        return cls.from_run(str(run), batch_size=int(batch), **dict(arguments))
+        # A mesh's fields are each a key of their own, as one arguments string cannot hold a record.
+        mesh = {field.name: arguments.pop(field.name) for field in dataclasses.fields(MeshSpec)
+                if field.name in arguments}
+        return cls.from_run(str(run), batch_size=int(batch), mesh=MeshSpec(**mesh) if mesh else None,
+                            **dict(arguments))
 
     @property
     def eot_token_id(self) -> int:
@@ -284,7 +298,9 @@ class DewLM(TemplateLM):
                                      [len(rows[index]) - len(requests[index][2]) for index in batch],
                                      self.task.prefix)
             scoring = program(_scored, self.task.model, static_argnums=(0,))
-            probabilities, argmax = scoring(self._scorer(inputs.tokens.shape[1]), self.task.variables, inputs)
+            # Scored in the attention form the run trained in, as its generation is (`SavedRunTask.traced`).
+            with self.task.traced():
+                probabilities, argmax = scoring(self.task.model, self.task.variables, inputs)
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1
@@ -292,14 +308,6 @@ class DewLM(TemplateLM):
                 answers.append((float(values[offset, start:end].sum()),
                                 bool(matched[offset, start:end].all())))
         return answers
-
-    def _scorer(self, width: int) -> TokenScorer:
-        """The task's model scored over rows of `width` ids as a language model's loss scores them
-        (`LMObjective`), every target counted and its head tiled (`_scored`), one for each width a
-        batch pads to."""
-        if width not in self._scorers:
-            self._scorers[width] = LMObjective(self.task.model, width - 1, head_tile="tiled")
-        return self._scorers[width]
 
     def loglikelihood_rolling(self, requests: list[Instance],
                               disable_tqdm: bool = False) -> list[float]:

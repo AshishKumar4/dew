@@ -50,6 +50,7 @@ from jax.typing import ArrayLike
 import dew
 from dew.artifacts import uint8_pixels
 from dew.inference import TextToImage
+from dew.nn.kernels.options import program
 from dew.quantization import Quantization
 from dew.sampling import CFG, DPMSolverMultistep
 from dew.telemetry.benchmark import samples
@@ -79,7 +80,7 @@ class Config:
     """Names of modules to leave unquantized, matched anywhere in their path."""
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
-    revision: str | None = "8d891d967319e51cd0e73d3e5b7c29d68a238b52"
+    revision: str | None = "b282fd7d06d6bafca2739747423ef8049f6feada"
     """The Hub commit or tag to load; local run directories do not use it."""
     clip: bool = True
     """Sample every prompt at both seeds and score the images with CLIP."""
@@ -99,7 +100,10 @@ def nbytes(tree) -> int:
 
 def forward(pipe: TextToImage) -> dict:
     """Time the denoiser over one guided step's batch, the way sampling calls
-    it (`Denoiser.raw_both`), and read its compiled memory."""
+    it (`Denoiser.raw_both`) and compiles it (`program` over its model: the
+    model's compiler options, which keep XLA's int8 Triton GEMM off where it
+    computes wrongly, and the kernel templates' spill step-down), and read its
+    compiled memory."""
     prepared = pipe.prepare(list(PROMPTS), key=0, steps=STEPS)
     x, t = prepared.noise, jnp.full(prepared.noise.shape[:1], 0.5)
     variables = {name: value for name, value in pipe.variables.items() if name not in ("encoders", "autoencoder")}
@@ -108,7 +112,7 @@ def forward(pipe: TextToImage) -> dict:
         return pipe.process.denoiser(pipe.model, variables, prepared.conditions,
                                      prepared.unconditional).raw_both(x, t)
 
-    compiled = jax.jit(step).lower(variables, x, t).compile()
+    compiled = program(step, pipe.model).executable(variables, x, t)
     memory = compiled.memory_analysis()
     times = samples(compiled, variables, x, t, warmup=1, repeats=5)
     return {"weights_mib": round(nbytes(variables["params"]) / 2**20, 1),
@@ -136,7 +140,7 @@ def sample(pipe: TextToImage, key: int | jax.Array) -> tuple[np.ndarray, dict[st
 def quality(pipe: TextToImage) -> dict:
     from dew.data.text import load_tokenizer
     from dew.eval.images import clip_image_text_cosine
-    from dew.nn.text_encoders import DEFAULT_MODEL
+    from dew.nn.text_checkpoints import DEFAULT_MODEL
 
     tokenizer = load_tokenizer(DEFAULT_MODEL)
     tokens = tokenizer(list(PROMPTS), padding="max_length", max_length=tokenizer.model_max_length,

@@ -13,10 +13,12 @@ the same arrays step after step.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable
-from typing import Generic, overload
+from collections.abc import Callable, Iterator
+from typing import Generic
 
 import jax
 import jax.numpy as jnp
@@ -26,14 +28,28 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
+from dew.averaging import ema_update
+from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
+from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
+from dew.nn.inspection import (
+    PROBES,
+    Watched,
+    cotangent_summaries,
+    discovering,
+    flattened,
+    kept,
+    probes_of,
+    unscaled,
+)
+from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
     Aux,
     Evaluated,
+    Objective,
     Ratio,
     Recorded,
     Step,
@@ -42,11 +58,38 @@ from dew.objectives.base import (
 )
 from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
+from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class PassesProgress[L, E]:
+    """A custom training step (`Trainer(step=)`) that passes the run's progress to a model that reads
+    it (`dew.nn.progress`, `Progress(state.updates)`), as the objective's own loss does: `make`, its
+    factory, wrapped. A custom step not so declared refuses such a model, which it would otherwise
+    train at the run's end."""
+
+    make: Callable[[Objective[L, E], optax.GradientTransformation],
+                   Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]]
+
+    def __call__(self, objective: Objective[L, E], optimizer: optax.GradientTransformation
+                 ) -> Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]:
+        return self.make(objective, optimizer)
+
+
+def refuse_unpassed_progress[L, E](objective: Objective[L, E], *, passes: bool) -> None:
+    """Refuse a custom training step that does not say it passes the run's progress (`passes`,
+    `PassesProgress`) over a module of `objective`'s that reads it (`Objective.progress_readers`): it
+    would train the module at the run's end."""
+    for module in () if passes else objective.progress_readers()[:1]:
+        raise ValueError(f"a custom training step (Trainer(step=)) passes a {type(module).__name__}, which "
+                         "reads the run's progress (dew.nn.progress), none unless it says it does: pass "
+                         "Progress(state.updates) as the model's progress= and wrap the step's factory in "
+                         "dew.training.PassesProgress, or it trains at the run's end")
 
 
 @struct.dataclass
@@ -64,6 +107,9 @@ class Committed:
     norm: jax.Array
     count: jax.Array
     tokens: jax.Array
+    inspected: Summaries | None = None
+    """A sampled step's summaries as one vector (`dew.training.inspection.Summaries`), zero where it
+    committed nothing; None in a step that samples nothing."""
 
 
 def _chosen(take, taken, kept):
@@ -113,17 +159,59 @@ def _only_when(due, taken, kept, operand):
 
 
 def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array | None,
-            batch: Batch, stepped: jax.typing.ArrayLike) -> tuple:
+            batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
-    `batch`, wherever it ran: the advanced state, its step counting `stepped`, the loss, the metrics
-    with the batch's counts, and whether the loss is finite, the microbatch accepted and the window
-    committed."""
+    `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
+    examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
+    metrics with the batch's counts, and whether the loss is finite, the microbatch accepted and the
+    window committed."""
     metrics = {**aux.metrics, **step_counts(batch)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
-    return (dataclasses.replace(advanced, step=current.step + stepped), loss, metrics, jnp.isfinite(loss),
-            advanced.microstep > current.microstep, committed)
+    clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
+    return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
+            jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
+
+
+def probed_loss(objective: Objective, variables: Variables, batch: Batch, step: Step):
+    """The objective's loss statistics with its parameters and its watched outputs' cotangent probes
+    (`dew.nn.inspection.tapped`), their pullback giving the parameters' gradient and the probes', and the
+    loss's aux. The probes are laid out as the objective's model calls nest their modules, which a trace
+    of its loss that discovers them (`discovering`) sows, nothing computed; a probe no model call reads,
+    its collection dropped on the way, is refused."""
+    with discovering():
+        _, discovered = jax.eval_shape(lambda: objective._loss(variables, batch, step))
+    probes = probes_of(discovered.inspected or {})
+    if not probes:
+        raise ValueError("no watched module's output reaches the objective's loss for its cotangent to be "
+                         "summarized; name modules its model calls run (Inspection.modules)")
+
+    def loss(trainable, probes):
+        return objective._loss({**variables, "params": trainable, PROBES: probes}, batch, step)
+    stats, back, aux = jax.vjp(loss, variables["params"], probes, has_aux=True)
+    unread = sorted(set(leaves_by_path(probes)) - set(leaves_by_path(probes_of(aux.inspected or {}))))
+    if unread:
+        raise ValueError(f"the objective's model calls do not pass the step's cotangent probes "
+                         f"(variables[{PROBES!r}]) to the watched modules at {unread}; pass every "
+                         f"collection of the variables the objective is given through to its model")
+    return stats, back, aux
+
+
+def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
+    """The activation summaries a sampled step's latest microbatch sowed (`Aux.inspected`), by their
+    logged names (`dew.nn.inspection.flattened`). Refused where the objective's model call opened no
+    `inspected` collection (`Step.sown`), or where no module of a watched kind ran in it, either of which
+    would log nothing a run asked for."""
+    if aux.inspected is None:
+        raise ValueError("the run watches activations (Inspection.modules), which its objective's model "
+                         "calls do not return: they open Step.sown() and return what it sowed "
+                         "(Aux.inspected)")
+    found = flattened(aux.inspected, watched.modules)
+    if not found:
+        raise ValueError(f"no module the watched globs {list(watched.modules)} name runs in the objective's "
+                         f"model; name them by class (`*Attention`, `MLP`) or path (`layers_3/*`)")
+    return found
 
 
 def evaluation_of(aux: Aux) -> Evaluated | None:
@@ -148,49 +236,14 @@ def recorded(evaluations: list[tuple[Evaluated, jax.Array]], ran: jax.Array) -> 
                     evaluated=ran)
 
 
+COMMIT_FIELDS = ("opt_state", "ema")
+"""The state's fields a resident step reads only as it commits, past its gradient: the optimizer state, and
+the EMA but where the objective reads it in its forward (`Transaction.fetch`)."""
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
-
-
-def _project(tree: optax.Params, like: optax.Params) -> optax.Params:
-    """The leaves of tree at the key paths like holds, in like's containers."""
-    leaves = dict(jax.tree_util.tree_flatten_with_path(tree)[0])
-    return jax.tree_util.tree_map_with_path(lambda path, _: leaves[path], like)
-
-
-@overload
-def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables: ...
-
-
-@overload
-def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayLike) -> optax.Params: ...
-
-
-def ema_update(ema, params, decay):
-    """Update the EMA leaves toward `params`, keeping each leaf's storage dtype.
-
-    Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, and a
-    leaf the step left as it was keeps its average bit for bit wherever that
-    sum is finite, however a program fuses it (a select, not a difference
-    that finite leaves of opposite signs overflow; a NaN decay stays NaN);
-    the live value is the leaf of `params` at the same path; leaves that
-    `ema` does not hold are not averaged. The arithmetic runs in fp32 or
-    wider, so fp64 leaves keep fp64 precision. A decay of 1 or more returns
-    the average leaf as it was, even when it holds nonfinite values, as a
-    frozen reference can.
-    """
-    def step(average, live):
-        dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
-        if average.dtype != dtype or live.dtype != dtype:
-            average, live = jax.lax.optimization_barrier((average, live))
-        weight = jnp.asarray(decay, dtype)
-        wide, moved = average.astype(dtype), live.astype(dtype)
-        weighted = weight * wide + (1 - weight) * moved
-        updated = jnp.where((moved == wide) & jnp.isfinite(weighted), wide, weighted)
-        stored = updated.astype(average.dtype)
-        return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
-    return jax.tree.map(step, ema, _project(params, ema))
 
 
 def write_back(params: Variables, variables: Variables | None) -> Variables:
@@ -283,6 +336,9 @@ class Realization(Generic[Loss, Effects]):
     stats: Loss
     aux: Aux[Effects]
     pullback: Callable[[Loss], Variables]
+    probed: Callable[[Loss], tuple[Variables, Variables]] | None = None
+    """Where the step summarizes its watched outputs' cotangents (`Watched.cotangents`), the pullback
+    that also gives its probes' gradient (`dew.nn.inspection.tapped`), one backward for both."""
 
 
 @struct.dataclass
@@ -307,7 +363,24 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
 
 
-def example_places(slot, split: int, rows: int, column: jax.Array | None = None, part=None) -> jax.Array:
+_GROUPS: contextvars.ContextVar[tuple[int, jax.Array] | None] = contextvars.ContextVar("example_groups",
+                                                                                      default=None)
+
+
+@contextlib.contextmanager
+def example_groups(groups: int, group: jax.Array) -> Iterator[None]:
+    """Within the block, a step's microbatch is group `group`'s share of `groups` equal ones (DiLoCo's,
+    `dew.training.diloco`): its examples are placed and counted among the whole step's (`example_fields`),
+    each group's rows the `group`th share of them, as one run of every row places them."""
+    token = _GROUPS.set((groups, group))
+    try:
+        yield
+    finally:
+        _GROUPS.reset(token)
+
+
+def example_places(slot, split: int, rows: int, column: jax.Array | None = None, part=None,
+                   first: jax.typing.ArrayLike = 0, length: int | None = None) -> jax.Array:
     """The places among an update's examples of the `rows` rows of the microbatch in window slot `slot`,
     of steps read in `split` microbatches each: the step's place in the window times a step's rows, plus
     each row's place among its step's records, its `column` (`EXAMPLE_ROWS`) where the batch holds one,
@@ -322,24 +395,51 @@ def example_places(slot, split: int, rows: int, column: jax.Array | None = None,
     step = slot // split
     if column is None:
         part = slot % split if part is None else part
-        column = part + split * jnp.arange(rows, dtype=jnp.int32)
+        # A group's share (`example_groups`): its `length` rows from the step's row `first`.
+        column = part + split * (first + jnp.arange(rows if length is None else length, dtype=jnp.int32))
     return (step * rows * split + column).astype(jnp.int32)
 
 
-def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0) -> dict:
+def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0,
+                   microstep=None) -> dict:
     """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
     `slots` microbatches, its steps read in `split` microbatches each, this the `part`th, after the run
     rejected `rejected` attempts: the update's key (`Step.example_key`), which folds in the rejections,
     so a window that follows a dropped one draws afresh, each row's place among the update's
     examples (`example_places`), placed as the batch's rows are, so each device draws its own rows'
     examples alone, and how many examples the update pools. A batch with no rows has no examples."""
-    rows = rows_of(batch)
+    rows = local = rows_of(batch)
     if not rows:
         return {}
+    groups, group = _GROUPS.get() or (1, 0)
+    rows *= groups
     key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
                                                 state.updates), rejected)
-    index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
+    if holds_back(state.opt_state):
+        # Each input the optimizer takes, holds or skips draws apart: by the windows accepted before it,
+        # read off the microbatches accepted (`microstep`, the state's where none is given) over a
+        # window's (`slots`, its parts counted), so a window's slots and parts share its draw however
+        # its batch is split.
+        accepted = state.microstep if microstep is None else microstep
+        key = jax.random.fold_in(key, accepted // slots)
+    index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part, group * local, local)
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
+
+
+def attempt_step(state, variables, ema, batch, *, split: int, slots: int, attempt, part, slot,
+                 microstep=None, record: bool = False, watched: Watched | None = None) -> Step:
+    """The `Step` the loss of attempt `attempt` of the update `state` commits next reads: the step it
+    counts, its microbatches accepted (`microstep`, the state's where none is given) over the `split`
+    each step is read in; the attempt's own key; the averaged weights `ema` beside `variables`; the
+    updates committed, which a model whose computation moves over a run reads (`Objective.progress`);
+    and the microbatch's examples, its window `slot` of `slots`, its `part`, after the attempts the run
+    rejected (`example_fields`). An attempt and its replay read it, and so do the traces that shape and
+    narrow the step (`dew.training.footprint.traced_loss`, `dew.training.narrow.narrow_copies`), which
+    record nothing and watch nothing."""
+    accepted = state.microstep if microstep is None else microstep
+    return Step(accepted // split, jax.random.fold_in(state.key, attempt), with_ema(variables, ema),
+                committed=state.updates, record=record, qk_stats=clips_qk(state.opt_state), watched=watched,
+                **example_fields(state, slot, split, batch, slots, part, attempt - accepted, microstep))
 
 
 def placed_as_rows(index: jax.Array, batch) -> jax.Array:
@@ -358,7 +458,8 @@ class Transaction:
     run; only where each phase executes differs.
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
-                 record: bool = False):
+                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None,
+                 inspection: Inspection | None = None, examples: int | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -369,8 +470,24 @@ class Transaction:
         replay. `copies` names the parameters the forward reads through the
         state's narrow copies, which the commit rewrites (`dew.training.narrow`). `record` makes each
         evaluation return what its `Step.sample` and `Step.boundary` calls produced (`recorded`).
+        `fetch` brings the fields of `COMMIT_FIELDS` a resident step's state keeps in host memory to the
+        device (`Trainer._fetched`): the step reads them only once its gradient is ready, as the commit
+        does, so the device holds them through the update and not through the forward and backward, but
+        for an EMA the objective reads in its forward. Fetched at the step's start, an A100 held them
+        through both: a plain Adam step's peak rose from 2.483 GB to 3.020 GB with its state in host
+        memory, and fetched past the gradient it is 2.483 GB again (node receipt TL-a100-offload-1338-c,
+        hostmem.json). XLA:GPU still holds the whole state for the update, so keeping it on the host
+        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way. `examples`
+        is a run's bound in source examples, where it counts no updates ahead: each update hands its
+        optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
+        which a schedule over the run reads (`dew.optim.ScheduleBase.progressed`).
         """
+        self.fetch = fetch
         self.record = record
+        # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
+        self.inspection = inspection
+        self.watched = None if inspection is None else inspection.watched
+        self.bound = examples
         self.objective = objective
         self.optimizer = optimizer
         self.copies = copies or {}
@@ -381,6 +498,21 @@ class Transaction:
         self.stats_tree = jax.tree.structure(stats_shape)
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
 
+    def fetched(self, state: TrainState) -> TrainState:
+        """`state` with the fields `fetch` brings to the device there, `state` itself where nothing is."""
+        return state if self.fetch is None else self.fetch(state)
+
+    def past(self, state: TrainState, gradient) -> TrainState:
+        """`state` for the commit, its host-resident fields (`fetch`) brought to the device past `gradient`:
+        they pass an optimization barrier with it, so the device takes them only once it is ready. Where
+        nothing rests on the host the state is the commit's as it is: with the barrier there too, a step
+        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at ada6c5686)."""
+        if self.fetch is None:
+            return state
+        resting = {field: getattr(state, field) for field in COMMIT_FIELDS}
+        _, kept = jax.lax.optimization_barrier((gradient, resting))
+        return self.fetch(dataclasses.replace(state, **kept))
+
     def realize(self, variables: Variables, batch: Batch, step_info: Step) -> Realization:
         """Evaluate the objective's loss and keep the pullback of that trace.
 
@@ -388,10 +520,14 @@ class Transaction:
         parameter tree where the state lives. `HostExecution.realize` is the
         other one, and `step` takes either.
         """
-        def loss(trainable):
-            return self.objective._loss({**variables, "params": trainable}, batch, step_info)
-        stats, back, aux = jax.vjp(loss, variables["params"], has_aux=True)
-        return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
+        watched = step_info.watched
+        if watched is None or not watched.cotangents:
+            def loss(trainable):
+                return self.objective._loss({**variables, "params": trainable}, batch, step_info)
+            stats, back, aux = jax.vjp(loss, variables["params"], has_aux=True)
+            return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
+        stats, back, aux = probed_loss(self.objective, variables, batch, step_info)
+        return Realization(stats, aux, lambda cotangent: back(cotangent)[0], back)
 
     def local_reduction(self, stats, factor):
         """Reduce one microbatch's statistics to its loss and its cotangent.
@@ -402,14 +538,17 @@ class Transaction:
         loss, back = jax.vjp(lambda s: self.objective.reduce_loss(s)[0], stats)
         return loss, back(jnp.asarray(factor, loss.dtype))[0]
 
-    def prepare_attempt(self, state, stats, aux, loss, gradient):
+    def prepare_attempt(self, state, stats, aux, loss, gradient, closing=None):
         """Pool this microbatch into the window and weigh up the commit.
 
         Returns a `PendingAttempt`: the pooled statistics and gradient,
         whether this attempt closes the window, and whether the pooled loss
         needs a replay. A shared mean pools its gradient by mass here and
         never replays. A general statistics tree reduces only once pooled, so
-        its gradient has to be recomputed under the pooled cotangent.
+        its gradient has to be recomputed under the pooled cotangent. A
+        `closing` attempt, the last of a run whose stream ends inside the
+        window (`dew.batch.CLOSES_WINDOW`), closes it with the microbatches it
+        holds, its mean theirs.
         """
         if aux.qk_stats is None and clips_qk(state.opt_state):
             raise ValueError(
@@ -419,6 +558,8 @@ class Transaction:
         previous = state.accumulation
         fill = state.microstep % self.size
         due = (fill + 1) == self.size
+        if closing is not None:
+            due = due | closing
         local_finite = _all_finite((loss, stats, gradient, aux.variables, aux.effects))
         local_ok = jnp.asarray(a=True) if state.scale is None else local_finite
         qk = compact_qk(aux.qk_stats)
@@ -479,6 +620,15 @@ class Transaction:
             if jnp.issubdtype(leaf.dtype, jnp.inexact) else cot,
             back(jnp.asarray(factor, value.dtype))[0], current_stats)
 
+    def update_seed(self, pooled, current_stats, factor):
+        """The cotangent of the update's loss, the window's `pooled` statistics', on this microbatch's
+        `current_stats`, seeded with `factor`: `pooled_cotangent`'s, or, for a loss stated as one scalar,
+        which a shared window pools as the mean of its microbatches' (`prepare_attempt`), `factor` over
+        their count."""
+        if isinstance(pooled, Ratio) and not isinstance(current_stats, Ratio):
+            return jnp.asarray(factor / pooled.mass, jnp.result_type(current_stats))
+        return self.pooled_cotangent(pooled, current_stats, factor)
+
     def replay_input(self, state, fill, index):
         """Rebuild the inputs of the window's `index`-th microbatch.
 
@@ -493,15 +643,15 @@ class Transaction:
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
-        step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
-                         with_ema(variables, state.ema), committed=state.updates, record=self.record,
-                         qk_stats=clips_qk(state.opt_state),
-                         **self.examples(state, index, batch, part=attempt % self.split,
-                                         rejected=attempt - accepted))
+        step_info = self.attempt(state, variables, batch, attempt, attempt % self.split, index,
+                                 microstep=accepted)
         return self.read(variables, state.compute), batch, step_info
 
-    def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
-        return example_fields(state, slot, self.split, batch, self.size, part, rejected)
+    def attempt(self, state, variables, batch, attempt, part, slot, microstep=None) -> Step:
+        """`attempt_step` of this transaction's split, window, recording and watch."""
+        return attempt_step(state, variables, self.fetched(state).ema, batch, split=self.split,
+                            slots=self.size, attempt=attempt, part=part, slot=slot, microstep=microstep,
+                            record=self.record, watched=self.watched)
 
     def _places(self, slot, evaluated: Evaluated, part) -> jax.Array:
         """The places the window's slot `slot` and the column its loss saw give an evaluation's rows
@@ -528,6 +678,14 @@ class Transaction:
         """Add one replayed microbatch's unscaled gradient into the running sum."""
         return jax.tree.map(lambda a, b: a + _unscale(b, factor), accumulated, contribution)
 
+    def progress(self, current: TrainState) -> jax.Array:
+        """The share of the run's bound in examples `current` has consumed, float32: what its dispatched
+        batches consumed before this update (`TrainState.consumed`)."""
+        if self.bound is None or current.consumed is None:
+            raise ValueError("a schedule over the run's progress reads the examples it consumed, which only "
+                             "a run bounded in examples that no plan counts ahead keeps")
+        return jnp.asarray(current.consumed, jnp.float32) / self.bound
+
     def commit(self, current, gradient, effects, qk):
         """Apply the pooled native gradient and return its finiteness and global norm.
 
@@ -537,6 +695,18 @@ class Transaction:
         Admission is decided by finish_attempt after checking the updated
         parameters and optimizer state as well.
         """
+        # The clocks count the updates the optimizer applies (`update_applied`), which an optimizer that holds
+        # some back says by its state; one whose state does not, or a held update whose post-step
+        # effects no update would apply, is refused as the step is traced, before any runs.
+        refuse_untold(current.opt_state)
+        if holds_back(current.opt_state) and self.aux_shape.effects is not None:
+            raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
+                             "holds updates back, whose held calls' effects no update applies; accumulate "
+                             "gradients with Trainer(accumulation=k)")
+        if holds_back(current.opt_state) and current.deferred is None:
+            raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
+                             "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
+                             "through the trainer, which gives one written before them none waiting")
         native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)
@@ -547,13 +717,16 @@ class Transaction:
             # (`Objective.projected`), and the step stores them projected again.
             stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk)
+                clocked = {} if self.bound is None else {"progress": self.progress(current)}
+                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk,
+                                                          **clocked)
             else:
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored)
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
                 stepped(stored, update, current.opt_state, opt_state), updated=True)}
+            done = update_applied(current.opt_state, opt_state)
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
@@ -561,19 +734,38 @@ class Transaction:
             if self.objective.ema is not None:
                 if averaged is None:
                     raise ValueError("the objective declares EMA but the state carries none")
-                averaged = _chosen(self.objective.averages(current.updates),
-                                   ema_update(averaged, params, self.objective.ema.decay(current.updates)),
-                                   averaged)
+                # A decay over the run's progress reads it where the run keeps one (`EMASpec.progressed`).
+                at = self.progress(current) if self.objective.ema.progressed else current.updates
+                averaged = _chosen(self.objective.averages(current.updates) & done,
+                                   ema_update(averaged, params, self.objective.ema.decay(at)), averaged)
+            inspected = {} if self.inspection is None else summaries(
+                self.inspection, stored, native, update, params["params"])
+            updates = current.updates + done.astype(current.updates.dtype)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1)
+                                       updates=updates), inspected
 
         if current.scale is None:
-            return apply(current), native_finite, norm
+            return *apply(current), native_finite, norm
         if self.size == 1:
-            return _chosen(native_finite, apply(current), current), native_finite, norm
-        return _only_when(native_finite, apply, lambda x: x, current), native_finite, norm
+            applied, inspected = apply(current)
+            return _chosen(native_finite, applied, current), inspected, native_finite, norm
+        unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(apply, current)[1])
+        return *_only_when(native_finite, apply, lambda x: (x, unapplied), current), native_finite, norm
 
-    def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens):
+    def watched_summaries(self, aux, probed) -> dict[str, jax.Array]:
+        """A sampled step's watched modules' summaries: their outputs' (`watched_activations`), and with
+        their probes' gradient `probed`, the loss's cotangents there (`dew.nn.inspection.cotangent_summaries`,
+        unscaled as the probes read them, `unscaled`)."""
+        if self.watched is None:
+            return {}
+        found = watched_activations(self.watched, aux)
+        if probed is None:
+            return found
+        assert aux.inspected is not None
+        logged = kept(aux.inspected, self.watched.modules)
+        return {**found, **cotangent_summaries(probed, self.watched.histogram, logged)}
+
+    def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens, probed=None):
         """Commit the window when it is due, then advance the state's clocks.
 
         A rejected attempt costs the same trace as an accepted one. With a
@@ -610,10 +802,10 @@ class Transaction:
         def recopied(current):
             # A window of several microbatches reads one set of copies
             # throughout and rewrites them only as it commits.
-            committed, native_finite, norm = commit(current)
+            committed, inspected, native_finite, norm = commit(current)
             if committed.compute is not None:
                 committed = dataclasses.replace(committed, compute=narrowed(committed.variables, self.copies))
-            return committed, native_finite, norm
+            return committed, inspected, native_finite, norm
 
         due = pending.due & pending.active & accepted
         # The microbatch's real tokens (`tokens`, two uint32 words), which its window's commit trains on,
@@ -621,18 +813,20 @@ class Transaction:
         read = tokens
         held = read if previous is None or previous.tokens is None else _TokenCount.add(previous.tokens, read)
         if self.size == 1:
-            committed, native_finite, norm = commit(numerical)
+            committed, inspected, native_finite, norm = commit(numerical)
             numerical = _chosen(due, committed, numerical)
             native_finite = native_finite | ~due
         else:
             dtype = jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32)
             zero = jnp.real(jnp.zeros((), dtype))
+            uncommitted = jax.tree.map(jnp.zeros_like, jax.eval_shape(recopied, numerical)[1])
             # The window goes round the commit, which never reads it: a
             # conditional copies what it passes through.
-            numerical, native_finite, norm = _only_when(
-                due, recopied, lambda x: (x, jnp.asarray(a=True), zero),
+            numerical, inspected, native_finite, norm = _only_when(
+                due, recopied, lambda x: (x, uncommitted, jnp.asarray(a=True), zero),
                 dataclasses.replace(numerical, accumulation=None))
             numerical = dataclasses.replace(numerical, accumulation=previous)
+        inspected = {**inspected, **self.watched_summaries(aux, probed)}
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
@@ -676,9 +870,19 @@ class Transaction:
             advanced = dataclasses.replace(advanced, compute=narrowed(advanced.variables, self.copies))
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
-        counted = due & accepted
-        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-                                              jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)))
+        # An update the optimizer holds back commits nothing yet: its tokens wait in the state
+        # (`TrainState.deferred`) for the update that applies them (`update_applied`).
+        # An input the optimizer skipped trains no update, so its tokens wait for none (`input_taken`).
+        done = update_applied(state.opt_state, advanced.opt_state)
+        counted = due & accepted & done
+        if state.deferred is not None:
+            taken = input_taken(state.opt_state, advanced.opt_state)
+            held = _TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
+            waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
+            advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
+        return advanced, loss, aux, Committed(
+            jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
+            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.
@@ -689,7 +893,10 @@ class Transaction:
         inside `lax` control flow.
         """
         realize = self.realize if realize is None else realize
-        compile_phase = jax.jit if host else lambda f: f
+        # Each host phase is a program over the objective's modules, so it takes their options as the
+        # step's own compile does (`compiler_options`).
+        options = compiler_options(*self.objective.towers()) or None
+        compile_phase = functools.partial(jax.jit, compiler_options=options) if host else lambda f: f
         reduce = compile_phase(self.local_reduction)
         prepare = compile_phase(self.prepare_attempt)
         pooled = compile_phase(self.pooled_cotangent)
@@ -697,30 +904,40 @@ class Transaction:
         unscale = compile_phase(self.unscaled)
         add = compile_phase(self.add_contribution)
 
-        def run(state, batch, part, tokens):
+        def run(state, batch, part, tokens, closes=None):
             # The `part`th microbatch of the step's batch is attempt step *
             # split + part, with a draw of its own; the objective's schedules
             # count steps, however many microbatches each is read in. `tokens`
             # is its real tokens, which the trainer reads off the accounting
             # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
-            # Every attempt the run made and did not accept, so a rejected one's slot draws afresh.
-            rejected = attempt - state.microstep
-            step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, state.ema), committed=state.updates,
-                             record=self.record, qk_stats=clips_qk(state.opt_state),
-                             **self.examples(state, state.microstep % self.size, batch, part, rejected))
+            # Every attempt the run made and did not accept draws afresh (`attempt_step`'s rejections).
+            slot = state.microstep % self.size
+            step_info = self.attempt(state, state.variables, batch, attempt, part, slot)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-            realized = realize(self.read(state.variables, state.compute), batch, step_info)
+            # A watched cotangent is read unscaled by the factor its backward is seeded with.
+            with unscaled(factor):
+                realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
-            gradient = realized.pullback(cotangent)
+            # A step that summarizes its cotangents takes its probes' gradient from the same backward where
+            # the microbatch is its update's whole window; otherwise from the pooled loss's, below.
+            probing = realized.probed
+            whole = probing is not None and self.size == 1
+            gradient, probed = (realized.pullback(cotangent), None) if probing is None or not whole else (
+                probing(cotangent))
             if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
             # Otherwise no loss scale divides it (`Trainer._narrow_copies`),
             # and a copied parameter's gradient stays bf16 until the update
             # widens it as it reads it. A window of several microbatches
             # widens it as it pools it, so the window sums in fp32.
-            pending = prepare(state, realized.stats, realized.aux, loss, gradient)
+            # A run whose stream ends inside the window closes it at the step's last part (`closes`).
+            closing = None if closes is None else jnp.logical_and(closes, part == self.split - 1)
+            pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing)
+            if probing is not None and not whole:
+                # The probes summarize the cotangent of the update's loss, the window's pooled one, as replay
+                # differentiates it (`pooled_cotangent`), whatever microbatches the plan splits it into.
+                probed = probing(self.update_seed(pending.pooled, realized.stats, factor))[1]
 
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = evaluation_of(realized.aux)
@@ -742,12 +959,14 @@ class Transaction:
                         kept = [jax.tree.map(lambda held, new, slot=slot: jnp.where(slot == index, new, held),
                                              held, evaluated) for slot, held in enumerate(kept)]
                     return add(accumulated, realized.pullback(cot), factor), kept
+                # The window's other microbatches stand in its slots before this one's: all of them
+                # where the window is whole, those it holds where a closing attempt ends it early.
                 if host:
                     carried = (combined, unreplayed)
-                    for index in range(self.size - 1):
+                    for index in range(int(pending.fill)):
                         carried = one(index, carried)
                     return carried
-                return jax.lax.fori_loop(0, self.size - 1, one, (combined, unreplayed))
+                return jax.lax.fori_loop(0, pending.fill, one, (combined, unreplayed))
 
             replayed = jnp.zeros((), bool)
             if state.accumulation is not None and not self.shared:
@@ -762,7 +981,8 @@ class Transaction:
             if own is not None:
                 replays = replays or []
                 evaluations = [(own, self._places(state.microstep % self.size, own, part)), *replays]
-                ran = jnp.concatenate([jnp.ones((1,), bool), jnp.full((len(replays),), replayed)])
+                held = jnp.arange(len(replays)) < pending.fill
+                ran = jnp.concatenate([jnp.ones((1,), bool), jnp.logical_and(held, replayed)])
                 realized = dataclasses.replace(realized, aux=dataclasses.replace(
                     realized.aux, record=recorded(evaluations, ran)))
             if not host:
@@ -774,7 +994,8 @@ class Transaction:
                 # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(state, batch, aux, pending, gradient, attempt, tokens)
+                return finish(self.past(state, gradient), batch, aux, pending, gradient, attempt, tokens,
+                              probed)
             moving, held = apart(state)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)

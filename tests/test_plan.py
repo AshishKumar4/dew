@@ -5,13 +5,25 @@ the update pools the same rows, the clocks count the same steps, and a
 resumed run reads its batches as the run it continues did.
 """
 
-import re
+import contextlib
+import dataclasses
+import functools
+import gc
+import json
+import struct
+import weakref
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import FEATURES, Regression
+from export_support import Stalled
+from jax.extend.backend import get_backend
+from reference_error import as_given, assert_as_exact, seeds_for
+from sharded import collectives
 from token_support import write_token_corpus
 
 from dew import cache
@@ -20,7 +32,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
 from dew.diffusion.discrete import MDLM
-from dew.distributed.placement import Layout, MeshSpec
+from dew.distributed.placement import Layout, MeshSpec, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
@@ -29,10 +41,20 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
+from dew.state import TrainState, apart
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
-from dew.training.memory import climb_to, recompute_more, rung_record
-from dew.training.planning import TIMED_REPEATS, UNTIMED_FRONTIER, Timer, planned, splits
+from dew.training.memory import (
+    FirstRunFailed,
+    climb_to,
+    first_run,
+    local_devices,
+    memory_record,
+    recompute_more,
+    rung_record,
+)
+from dew.training.planning import Trials, planned, splits
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -185,8 +207,8 @@ def test_a_microbatch_moves_no_row_between_devices():
     batch = jax.device_put(jnp.arange(32).reshape(16, 2), rows)
     sliced = jax.jit(lambda batch, part: jax.lax.with_sharding_constraint(
         microbatch(batch, part, 2), rows), in_shardings=(rows, replicated))
-    text = sliced.lower(batch, jax.device_put(jnp.int32(1), replicated)).compile().as_text()
-    assert not re.search(r"all-gather|all-to-all|collective-permute|all-reduce", text), text
+    moved = collectives(sliced.lower(batch, jax.device_put(jnp.int32(1), replicated)).compile().as_text())
+    assert not moved, moved
 
 
 def one_device(trainer):
@@ -207,10 +229,23 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
     assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._split) == [1]
 
 
-def lm(split=None, accumulation=1, **fields):
+EXECUTED: list[int] = []
+"""One entry for each time a compiled program ran a `Counted` objective's loss."""
+
+
+class Counted(LMObjective):
+    """An `LMObjective` whose loss reports each run of a program over it (`jax.debug.callback`): a
+    step's microbatch, or a trial's, counts once, which a compile alone does not."""
+
+    def loss(self, variables, batch, step):
+        jax.debug.callback(lambda: EXECUTED.append(1))
+        return super().loss(variables, batch, step)
+
+
+def lm(split=None, accumulation=1, objective=LMObjective, **fields):
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=SEQ, **fields)
-    return one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+    return one_device(Trainer(objective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
 
 
@@ -305,8 +340,7 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     assert counted == [] and again.step_flops == first.step_flops
 
 
-@pytest.mark.gpu("a step's Pallas launches are read from a lowering of their own on a CUDA GPU alone")
-def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
+def a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
     """A step's lowering records its kernel launches as it traces them (`tune`), with its plan,
     so each run lowers its step once: the first again only where settling the launches changed
     a config its trace read, and a later run, which settles them from the record first, never."""
@@ -329,6 +363,262 @@ def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_f
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)
     assert counts[1] == 1
+
+
+@contextlib.contextmanager
+def autopgle(runs: int) -> Iterator[None]:
+    """JAX's AutoPGLE on for the block, profiling a program's first `runs` runs before compiling it
+    again guided by them (`jax_enable_pgle`, `jax_pgle_profiling_runs`)."""
+    before = jax.config.jax_enable_pgle, jax.config.jax_pgle_profiling_runs
+    jax.config.update("jax_enable_pgle", val=True)
+    jax.config.update("jax_pgle_profiling_runs", val=runs)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_pgle", val=before[0])
+        jax.config.update("jax_pgle_profiling_runs", val=before[1])
+
+
+@dataclasses.dataclass
+class Handed(Trials):
+    """Trials that profile the plan admitted, keep a weak reference to the executable it was admitted with
+    (`unguided`) and count the executables the backend holds then, it among them (`live`), and hand back
+    `profile` where given in place of the profile they measured."""
+    profile: bytes | None = None
+    unguided: weakref.ref | None = None
+    live: int = 0
+
+    def profiled(self, step, planned, mesh, runs):
+        measured = super().profiled(step, planned, mesh, runs)
+        self.unguided = weakref.ref(planned.executable)
+        self.live = live_executables()
+        return measured if self.profile is None else self.profile
+
+
+def live_executables() -> int:
+    """The executables the backend holds once the garbage they are part of is collected."""
+    gc.collect()
+    return len(get_backend().live_executables())
+
+
+COST = b"\x0a\x0c\x0a\x01x\x11" + struct.pack("<d", 1.0)
+"""A profile of one instruction, `x`, at a microsecond, as XLA's ProfiledInstructionsProto writes it: what
+an NVIDIA GPU's profile holds, which a CPU's compile takes and does not read."""
+
+
+def stepped(trainer, steps: int = 3, trials: Callable[[TrainState], Trials] | None = None):
+    """The state after `steps` steps of BATCH from the trainer's placed state, its step compiled on the
+    `trials` of that state, from which it steps on, or on none, stepping that state itself; and the
+    trials."""
+    state, _, _ = trainer.place()
+    held = None if trials is None else trials(state)
+    step = trainer.compile(state, BATCH, held)
+    state = state if held is None else held.state
+    for _ in range(steps):
+        state, *_ = step(state, BATCH)
+    return state, held
+
+
+@pytest.mark.parametrize("split", [1, 2], ids=["whole-batch", "two-microbatches"])
+def test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle(tmp_path, split):
+    """Under JAX's AutoPGLE the step a plan compiles ahead of its run, which no jit call profiles, runs as
+    many times as AutoPGLE profiles, each over the step's microbatches, on a trial: a copy of the state
+    beside it, where its compile is given no trials, which the caller then steps as a run without
+    AutoPGLE does; and under `fit`, whose admission keeps its first fitting plan
+    and profiles it all the same. XLA's profile of a CPU holds nothing, so each plan keeps the executable
+    it admitted."""
+    unguided, _ = stepped(lm(split=split))
+    with autopgle(2):
+        trainer, fitted = lm(split=split), windowed(tmp_path, split)
+        guided, _ = stepped(trainer)
+        fitted.fit(windows(token_files(tmp_path)), steps=1, checkpoint_every=None)
+    assert trainer.plan["pgle"] == fitted.plan["pgle"] == {"runs": 2, "bytes": 0}
+    assert int(guided.step) == 3
+    for guided_leaf, unguided_leaf in zip(jax.tree.leaves(guided.variables),
+                                          jax.tree.leaves(unguided.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(guided_leaf), np.asarray(unguided_leaf))
+
+
+def test_the_executable_a_profile_replaces_goes_with_its_program():
+    """Under AutoPGLE a profile of the admitted step's runs compiles its program again, and the run keeps
+    the guided executable alone: once the compile returns, the one the plan was admitted with is freed
+    and the backend holds as many executables as it did with that one alive, though JAX keeps every
+    executable it compiled of a program while the program's lowering lives. A handoff that kept the
+    admitted executable, or kept both, would hold one more."""
+    with autopgle(2):
+        trainer = lm()
+        state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
+    assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
+    assert trials.unguided is not None and trials.unguided() is None
+    assert live_executables() == trials.live and int(state.step) == 3
+
+
+def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
+                                                                                            monkeypatch):
+    """A fit's window opens once its warmup steps have run and its first step has compiled, so a window of
+    no warmup traces the three steps after the first, never the compile; its reports are exported in a
+    process of their own while the run trains on, a step after the window logging while the export waits
+    (`Stalled`, row 2017), and the run's end waits for them, whole. Under JAX's AutoPGLE, which
+    profiles each program's first runs in a profiling session of its own where a process holds one at a
+    time, a fit with a window is refused before it trains, naming JAX's way to capture guided programs
+    (`PGLE_CAPTURE`): JAX's sessions would fail inside the window, as the trainer's would."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    from affine_run import Replaying
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.training import ProfileWindow
+    from dew.training.profiling import traced_steps
+
+    stalled = Stalled.under(tmp_path / "stalled", monkeypatch)
+
+    class Releasing(RecordingTracker):
+        """The run's logs, the window's export released at the first log of a step after the window, once
+        the export waits: a log the run can make only while the export is held where it runs beside it."""
+
+        def __init__(self):
+            super().__init__()
+            self.stepped: list[int] = []
+
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if step > 4 and not self.stepped:
+                stalled.await_start()
+                self.stepped.append(step)
+                stalled.release()
+
+    tracker = Releasing()
+
+    def fit(directory):
+        model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                                  max_seq_len=SEQ)
+        window = ProfileWindow(str(directory), steps=3, warmup=0)
+        trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                     tracker=tracker, profile=window))
+        rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=5, log_every=1)
+
+    fit(tmp_path / "window")
+    # A step after the window logged while its export waited, which the run's end waited for in turn.
+    assert tracker.stepped == [5] and stalled.released
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
+    (capture,) = (tmp_path / "window").glob("capture-*")
+    assert window.steps == 3 and traced_steps(capture) == (1, 2, 3)
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
+    with autopgle(2), pytest.raises(ValueError):
+        fit(tmp_path / "pgle")
+    assert not (tmp_path / "pgle").exists()
+
+
+def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_path):
+    """A run whose window stopped and which fails steps later reports the window at its end, its reports
+    written (row 2824): the record says where the capture is whatever the run's outcome, as its manifest
+    says whether its export completed."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    from affine_run import Replaying
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.training import Observe, ProfileWindow
+
+    tracker = RecordingTracker()
+
+    class LaterStepFailed(RuntimeError):
+        """The run's failure, steps after its window stopped."""
+
+    def failing(state):
+        if int(state.step) >= 4:
+            raise LaterStepFailed
+        return 0
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                 tracker=tracker, profile=ProfileWindow(str(tmp_path), steps=2, warmup=0)))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    with pytest.raises(LaterStepFailed):
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
+                    observe=Observe(1, failing))
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
+    (capture,) = tmp_path.glob("capture-*")
+    assert window.steps == 2
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
+
+
+def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_the_devices_hold_both(
+        monkeypatch):
+    """Under AutoPGLE a compile given no trials profiles its step on a copy of the state beside the
+    caller's, which it never steps. With room for the step and its state alone, it is refused before it
+    copies anything, where trials that own the state (`fit`'s), which step it and restore it, profile at
+    that room; with room for the copy too, it profiles and leaves the devices holding the caller's state
+    alone, the copy freed."""
+    need = needs(monkeypatch, lm())
+    state, _, _ = lm().place()
+    copy = placed_bytes(apart(state)[0])
+
+    def copies(state) -> int:
+        """The arrays the backend holds shaped as the state's widest moving leaf, its own among them."""
+        widest = max(jax.tree.leaves(apart(state)[0]), key=lambda leaf: leaf.size)
+        return sum(live.shape == widest.shape and live.dtype == widest.dtype and not live.is_deleted()
+                   for live in jax.live_arrays())
+
+    free(monkeypatch, need + copy // 2)
+    with autopgle(2):
+        refused = lm()
+        state, _, _ = refused.place()
+        held = copies(state)
+        with pytest.raises(RuntimeError):
+            refused.compile(state, BATCH)
+        assert copies(state) == held
+        owned = lm()
+        stepped(owned, trials=functools.partial(Trials, batch=BATCH))
+        assert owned.plan["pgle"] == {"runs": 2, "bytes": 0}
+        free(monkeypatch, need + 2 * copy)
+        borrowed = lm()
+        state, _, _ = borrowed.place()
+        held = copies(state)
+        borrowed.compile(state, BATCH)
+        assert borrowed.plan["pgle"] == {"runs": 2, "bytes": 0}
+        assert copies(state) == held and not any(leaf.is_deleted() for leaf in jax.tree.leaves(state))
+
+
+def regression_steps(x, *, pgle: bool):
+    """The losses of four steps of SGD on `Regression` over `x`'s rows, eight a step, and its weights
+    after them, the step compiled ahead and, with `pgle`, guided by a profile of its first runs."""
+    trainer = one_device(Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0)))
+    rows = [{"x": x[start:start + 8], "y": 2 * x[start:start + 8, :2]} for start in range(0, len(x), 8)]
+    with autopgle(2) if pgle else contextlib.nullcontext():
+        state, _, _ = trainer.place()
+        trials = Trials(state, rows[0])
+        step = trainer.compile(state, rows[0], trials)
+    state, losses = trials.state, []
+    for batch in rows:
+        state, loss, *_ = step(state, batch)
+        losses.append(loss)
+    return {"loss": jnp.stack(losses), "params": state.variables["params"]}
+
+
+def regression_rows(seed: int) -> tuple[np.ndarray]:
+    """Four steps' rows of one draw: 32 rows of FEATURES coordinates from a unit normal."""
+    return (np.random.default_rng(seed).normal(size=(32, FEATURES)).astype(np.float32),)
+
+
+def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly():
+    """On an NVIDIA GPU the profile of the admitted step's runs holds its instructions' times, its
+    program compiles again guided by it, and the run steps the guided executable alone: the one the plan
+    was admitted with is freed and the backend holds no more executables than with it alive, as it would
+    not where the handoff is discarded. The guided steps' losses and weights are as exact as the unguided
+    step's (check 1)."""
+    with autopgle(2):
+        trainer = lm()
+        _, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH))
+    assert trainer.plan["pgle"]["runs"] == 2 and trainer.plan["pgle"]["bytes"] > 0
+    assert trials.unguided is not None and trials.unguided() is None and live_executables() == trials.live
+    guided = as_given(functools.partial(regression_steps, pgle=True))
+    unguided = as_given(functools.partial(regression_steps, pgle=False))
+    label = "a step guided by its profile"
+    assert_as_exact(guided, unguided, regression_rows, label,
+                    seeds=seeds_for(unguided, regression_rows, label, dew_fn=guided))
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():
@@ -383,10 +673,10 @@ def windows(corpus):
                    loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
-def windowed(directory, split):
+def windowed(directory, split, remat=None, objective=LMObjective):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
-                              max_seq_len=8)
-    return one_device(Trainer(LMObjective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
+                              max_seq_len=8, remat=remat)
+    return one_device(Trainer(objective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
                               split=split, layout=Layout(min_shard=1, tolerance=1.0),
                               checkpoints=Checkpoints(str(directory / "run"))))
 
@@ -409,12 +699,9 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path, monkeypatch):
-    """A run over two devices times its frontier, the batch whole as it fits and a rung up, and keeps one;
-    a run resumed from its checkpoint continues that plan without timing again, as the run it continues
-    compiled it, so the two train one program whatever a second timing would say."""
-    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
-    monkeypatch.delenv(UNTIMED_FRONTIER)
+def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monkeypatch):
+    """A run over two devices keeps its admitted plan, and a checkpoint resumed from it continues
+    that plan without compiling or timing optional alternatives."""
     corpus = token_files(tmp_path)
 
     def run(split):
@@ -424,73 +711,88 @@ def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path, m
 
     first = run(1)
     first.fit(windows(corpus), steps=2, checkpoint_every=2)
-    assert [timing["remat"] for timing in first.plan["timed"]] == [None, "minimal"]
+    assert first.plan["remat"] is None
     resumed = run(None)
     resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
-    assert resumed.plan["timed"] is None
     assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
 
 
-@pytest.mark.parametrize("seconds, split, remat", [
-    ([[0.2, 0.21], [0.1, 0.12]], 1, "minimal"), ([[0.1, 0.12], [0.2, 0.21]], 2, None),
-    ([[0.2, 0.3], [0.1, 0.25]], 2, None)], ids=["whole", "split", "within-spread"])
-def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_kept(
-        monkeypatch, seconds, split, remat):
-    """Where the devices hold a byte less than the batch whole needs at the
-    least recomputation, it fits split there, and whole one remat rung up with
-    the head tiled: both are compiled and timed, and the plan is the whole one
-    only where its every sample beats the split one's (`faster`), the split one
-    where their samples overlap, the objective at its rung, each plan's fastest
-    sample recorded."""
+def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkeypatch):
+    """A batch that needs two microbatches keeps the first fitting plan, without compiling a
+    different remat to ask whether it is faster. Even explicitly supplied timing trials are not run:
+    the compile runs no program, and a step then runs its two microbatches alone (row 2230)."""
     free(monkeypatch, needs(monkeypatch, lm(split=1)) - 1)
-    trainer = lm()
+    trainer = lm(objective=Counted)
     state, _, _ = trainer.place()
-    timed = []
-    step = trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), seconds)[1])
-    assert timed == [2]
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (split, remat)
-    assert trainer.objective.model.remat == (None if remat is None else REMAT_POLICIES[remat])
-    assert [(plan["split"], plan["remat"], plan["seconds"]) for plan in trainer.plan["timed"]] == [
-        (2, None, min(seconds[0])), (1, "minimal", min(seconds[1]))]
+    trials = Trials(state, BATCH)
+    EXECUTED.clear()
+    with Compiles("step") as compiles:
+        step = trainer.compile(state, BATCH, trials)
+    jax.effects_barrier()
+    assert (trainer.plan["split"], trainer.plan["remat"], len(EXECUTED)) == (2, None, 0)
+    assert compiles.count == len(trainer.plan["probes"])
+    assert all(probe["remat"] is None for probe in trainer.plan["probes"])
     state, loss, *_ = step(state, BATCH)
-    assert np.isfinite(float(loss))
+    jax.effects_barrier()
+    assert np.isfinite(float(loss)) and len(EXECUTED) == 2
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
-    """Over two devices a plan that fits the batch whole without recomputing is timed against the batch
-    whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the faster
-    is kept; on one device the plan is never timed."""
+@pytest.mark.parametrize("remat", [None, "minimal", "full"], ids=["default", "nonterminal", "terminal"])
+@pytest.mark.parametrize("trials_given", [False, True], ids=["without-trials", "with-trials"])
+def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, remat, trials_given):
+    """Over two devices, an admitted policy compiles once, whether default, explicitly nonterminal,
+    or explicitly terminal, and whether or not supplied Trials would time another plan faster."""
     free(monkeypatch, LIMIT)
-    trainer = lm()
+    policy = None if remat is None else REMAT_POLICIES[remat]
+    trainer = lm(remat=policy, objective=Counted)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
     state, _, _ = trainer.place()
-    timed = []
-    trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [[2.0], [1.0]])[1])
-    assert timed == [2]
-    timings = [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]]
-    assert timings == [(1, None), (1, "minimal")]
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
-    alone = lm()
-    state, _, _ = alone.place()
-    alone.compile(state, BATCH, lambda steps: pytest.fail("a single device's whole plan was timed"))
-    assert alone.plan["timed"] is None
+    trials = Trials(state, BATCH) if trials_given else None
+    EXECUTED.clear()
+    with Compiles("step") as compiles:
+        trainer.compile(state, BATCH, trials)
+    jax.effects_barrier()
+    assert compiles.count == 1 and not EXECUTED
+    assert trainer.plan["remat"] == remat
+    assert len(trainer.plan["probes"]) == 1
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("remat", sorted(REMAT_POLICIES))
+def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeypatch, remat):
+    """A real fit over two devices keeps each explicit policy it is given once admitted, whether the
+    policy has a further rung or is its ladder's last: its step compiles once and runs its one
+    microbatch alone, no optional compile or trial hidden in fit's internally created Trials (row 2153;
+    the compile-once gate, row 2286)."""
+    free(monkeypatch, LIMIT)
+    corpus = token_files(tmp_path)
+    trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat], objective=Counted)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+    EXECUTED.clear()
+    with Compiles("step") as compiles:
+        state = trainer.fit(windows(corpus), steps=1, checkpoint_every=None, checkpoint_final=False,
+                            eval_every=None)
+    jax.effects_barrier()
+    # The one step's one microbatch, and no trial beside it.
+    assert compiles.count == 1 and int(state.step) == 1 and len(EXECUTED) == 1
+    assert [probe["remat"] for probe in trainer.plan["probes"]] == [remat]
 
 
 @pytest.mark.parametrize("split", [1, 2])
 def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
-    """With room for the batch whole, or for two microbatches and not the
-    batch whole a rung up, there is one plan, and nothing is timed; the
-    frontier's compile that did not fit is in the plan's record."""
+    """With room for the batch whole or two microbatches, only the compiles needed to find the
+    admitted split appear in the plan. No optional remat candidate is compiled or timed."""
     free(monkeypatch, needs(monkeypatch, lm(split=split)))
     trainer = lm()
     state, _, _ = trainer.place()
-    trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
-    assert trainer.plan["timed"] is None
+    trials = Trials(state, BATCH)
+    with Compiles("step") as compiles:
+        trainer.compile(state, BATCH, trials)
+    assert compiles.count == len(trainer.plan["probes"])
     assert trainer.objective.model.remat is None
-    last = trainer.plan["probes"][-1]
-    assert (last["split"], last["remat"], last["fits"]) == ((1, None, True) if trainer.plan["split"] == 1
-                                                            else (1, "minimal", False))
+    assert (trainer.plan["split"], None, True) in asked(trainer)
+    assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 def asked(trainer) -> list[tuple[int, str | None, bool]]:
@@ -498,16 +800,17 @@ def asked(trainer) -> list[tuple[int, str | None, bool]]:
     return [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]]
 
 
-def assert_searched(probes, chosen, below, frontier, *, half=None):
+def assert_searched(probes, chosen, below, *, half=None):
     """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
     compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
     `below`, the largest split under the plan, asked and missed at each rung it may fit at, a plan at
-    the half rung missed at no recomputation before, and the `frontier` asked last. Which splits
+    the half rung missed at no recomputation before, and no optional frontier is asked. Which splits
     between are asked, and in what order, follows the memory each compile measured, which differs
     between devices (`Forecast`)."""
     assert probes[0][:2] == (1, None) and not probes[0][2]
     assert len({probe[:2] for probe in probes}) == len(probes)
-    assert (*chosen, True) in probes and probes[-1] == (*frontier, False)
+    assert (*chosen, True) in probes
+    assert all(remat in (None, half) for _, remat, _ in probes)
     for index, (split, remat, fits) in enumerate(probes[:-1]):
         if half is not None and remat is None and not fits:
             assert probes[index + 1] == (split, half, probes[index + 1][2])
@@ -523,9 +826,7 @@ DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear
 """A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
 
 
-@pytest.mark.gpu("the GPU kernel's delta rule recomputes its memory alone; on the CPU the half rung "
-                 "needs what no recomputation does")
-def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
+def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The
@@ -536,65 +837,97 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
         free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
         trainer = lm(**DELTA)
         state, _, _ = trainer.place()
-        trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
+        trials = Trials(state, BATCH)
+        trainer.compile(state, BATCH, trials)
+        assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_scan_and_conv"), half=half)
+    assert_searched(asked(trainer), (4, half), 2, half=half)
 
 
-def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
+def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
     """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
-    fits it in fewer, so the plan is four at no recomputation, and the frontier, the batch whole one
-    rung up, is asked at the first rung past the half rung, whose every split asked missed."""
+    fits it in fewer, so the plan is four at no recomputation. The half rung's failed fit probes
+    remain in the record, but no optional full-batch frontier is compiled."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
-    trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
+    trials = Trials(state, BATCH)
+    trainer.compile(state, BATCH, trials)
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_scan_and_conv"),
-                    half="all_but_delta_memory")
+    assert_searched(asked(trainer), (4, None), 2, half="all_but_delta_memory")
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
     """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits
-    that find the fewest microbatches that fit, each at no recomputation, and the frontier one rung
-    up."""
+    that find the fewest microbatches that fit, each at no recomputation, and stops there."""
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
     trainer = lm()
     state, _, _ = trainer.place()
-    trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
-    assert_searched(asked(trainer), (4, None), 2, (1, "minimal"))
-    assert all(remat is None for _, remat, _ in asked(trainer)[:-1])
+    trials = Trials(state, BATCH)
+    trainer.compile(state, BATCH, trials)
+    assert_searched(asked(trainer), (4, None), 2)
+    assert all(remat is None for _, remat, _ in asked(trainer))
 
 
-def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
-    """Timing a frontier steps the state it was given, deletes it, and hands
-    the run a copy of that state as it was, so the run trains on from where
-    it stood."""
+def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():
+    """A newly compiled step whose first run fails on its devices is raised as the step's, from the
+    devices' own error, with the record of the check that said it fits and what each device holds now,
+    each GPU's bytes free outside XLA's pool among it: a collective's communicators (NCCL) take their
+    buffers there, beside cuBLAS's workspaces and the kernels loaded (row 2901). A first run that
+    succeeds tells each GPU's free bytes there at the check and after it."""
+    class Refused:
+        """A step's loss whose run the devices refused, as a GPU reports it once it is awaited."""
+
+        def block_until_ready(self):
+            raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: the devices refused the step")
+
+    mesh = MeshSpec().build(jax.devices()[:1])
+    devices = local_devices(mesh)
+    gpus = [device.id for device in devices if device.platform == "gpu"]
+    compiled = jax.jit(lambda value: value * 2).lower(jnp.float32(0)).compile()
+    record = memory_record(compiled, devices, 0, fits=True)
+    assert [device["id"] for device in record["devices"] if device["outside"] is not None] == gpus
+    loss = compiled(jnp.float32(1))
+    observed = first_run(loss, 0, record, mesh)
+    assert observed["checked"] == {device["id"]: device["outside"] for device in record["devices"]
+                                   if device["outside"] is not None}
+    assert list(observed["now"]) == gpus and all(free >= 0 for free in observed["now"].values())
+    with pytest.raises(FirstRunFailed) as raised:
+        first_run(Refused(), 0, record, mesh)
+    assert isinstance(raised.value.__cause__, jax.errors.JaxRuntimeError)
+    assert raised.value.fitted == record
+    assert [(device["id"], device["outside"] is not None) for device in raised.value.now] == [
+        (device.id, device.id in gpus) for device in devices]
+
+
+@pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])
+def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
+    """An AutoPGLE trial runs a step on a copy of the state as it stood: trials that own the state
+    (`fit`'s) step it and delete it, handing back a copy as it was; trials that borrow it (a compile given
+    none) step a copy beside it and hand back the state itself, as it is. Either way the run trains on
+    from where it stood."""
     trainer = lm(split=1)
     state, _, _ = trainer.place()
     step = trainer.compile(state, BATCH)
     before = [raw(leaf).copy() for leaf in jax.tree.leaves(state)]
-    timer = Timer(state, BATCH)
-    seconds = timer([step, step])
-    assert len(seconds) == 2
-    assert all(len(samples) == TIMED_REPEATS and min(samples) > 0 for samples in seconds)
-    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(state))
+    trials = Trials(state, BATCH, owned=owned)
+    for _ in range(2):
+        advanced = trials.run(lambda current: jax.block_until_ready(step(current, BATCH)[0]))
+        assert int(advanced.step) == int(trials.state.step) + 1
+    assert all(leaf.is_deleted() == owned for leaf in jax.tree.leaves(state))
     assert all(np.array_equal(raw(left), right)
-               for left, right in zip(jax.tree.leaves(timer.state), before, strict=True))
+               for left, right in zip(jax.tree.leaves(trials.state), before, strict=True))
 
 
-def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
-    """Under `fit`, a frontier is timed on the run's own state, and the run
-    trains on from a fresh copy of it: the timed steps count for nothing."""
-    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
-    monkeypatch.delenv(UNTIMED_FRONTIER)
+def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeypatch, tmp_path):
+    """A fit trains its requested steps without spending extra updates on a speed comparison."""
     corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)
     trainer = windowed(tmp_path / "timed", None)
-    state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
-    assert [plan["seconds"] > 0 for plan in trainer.plan["timed"]] == [True, True]
+    with Compiles("step") as compiles:
+        state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
+    assert compiles.count == len(trainer.plan["probes"])
     assert int(state.step) == 3
 
 
@@ -627,17 +960,6 @@ def test_two_processes_name_one_run_alike():
     assert keys[0] == keys[1]
 
 
-def test_a_frontier_keeps_its_first_plan_unless_another_is_faster_beyond_the_spread():
-    """`faster` takes a later plan only where its slowest sample beats every sample of the plan it would
-    replace: timings that overlap are the clock's noise, and keep the first."""
-    from dew.training.planning import faster
-
-    assert faster([[2.0, 2.1], [1.0, 1.1]]) == 1
-    assert faster([[1.0, 1.1], [2.0, 2.1]]) == 0
-    assert faster([[1.0, 2.0], [0.9, 1.5]]) == 0
-    assert faster([[3.0], [2.0], [1.0]]) == 2
-
-
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
     """float8 e4m3fn and e4m3fnuz, and int4 and uint4, share one byte layout (`dtype.str` '<V1'): an
     array of each holding the same bytes fingerprints apart, as the same values of one dtype do not."""
@@ -652,3 +974,78 @@ def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
         assert fingerprint(raw.view(first)) != fingerprint(raw.view(second))
         assert fingerprint(raw.view(first)) == fingerprint(raw.copy().view(first))
 
+
+
+class Refused(jax.errors.JaxRuntimeError):
+    """An XLA refusal with its status code, as a GPU's compiler raises it."""
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+    @property
+    def error_code_string(self):
+        return self.code
+
+
+OUT_OF_MEMORY = ("EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 7.83GiB with "
+                 "allocator GPU_0_bfc on device 0. [tf-allocator-allocation-error='']")
+
+
+def autotuned(*failures: str) -> str:
+    """A GPU GEMM autotuner's NOT_FOUND message listing `failures`, as XLA's `PickBestConfig` writes it."""
+    return ("All configs failed during profiling or were excluded from selection.\n"
+            f"Failures ({len(failures)}):\n" + "\n".join(failures))
+
+
+@pytest.mark.parametrize(("code", "message", "refused"), [
+    ("RESOURCE_EXHAUSTED", "XLA:TPU's temporaries past HBM", True),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, OUT_OF_MEMORY), True),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "EXECUTION FAILED: INTERNAL: an illegal address"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "COMPILATION FAILED: INTERNAL: ptxas exited with 255"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "REDZONE CHECK FAILED: the kernel wrote past its output"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "WRONG RESULTS: Output disagrees with winning cluster"), False),
+    ("NOT_FOUND", autotuned(OUT_OF_MEMORY, "cublas_config: Backend excluded from selection (CUBLAS)"), False),
+    ("NOT_FOUND", "All configs failed during profiling or were excluded from selection.", False),
+    ("NOT_FOUND", "no config for this fusion", False),
+    ("INTERNAL", "a ptxas failure", False)],
+    ids=["exhausted", "autotuned-out-of-memory", "autotuned-executed-otherwise",
+         "autotuned-compilation-failed", "autotuned-redzone", "autotuned-wrong-results", "autotuned-excluded",
+         "autotuned-nothing-listed", "not-found", "internal"])
+def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, refused):
+    """XLA's refusal for memory, which the plan reads as the rung's miss and climbs past
+    (`compiled_if_it_fits`), is RESOURCE_EXHAUSTED, or a GPU GEMM autotuner's NOT_FOUND where every failure
+    it lists is a config's execution out of memory, as an A100's were at a whole head's GEMM (node receipt
+    TL-a100-offload-1338-d). One failure of another kind beside them, a config that failed to compile, its
+    redzone check or its results, or a backend excluded, and the error is raised as it came, as is any
+    other."""
+    from dew.training.memory import compiled_if_it_fits
+
+    error = Refused(code, message)
+    lowered = jax.jit(lambda: None).lower()
+
+    class Program:
+        def compiler_ir(self, dialect):
+            return lowered.compiler_ir(dialect)
+
+        def compile(self, options):
+            raise error
+
+    refusals = []
+    try:
+        outcome = compiled_if_it_fits(Program(), None, refusals, relower=Program)
+    except jax.errors.JaxRuntimeError as raised:
+        outcome = raised
+    assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
+
+
+def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path):
+    """An explicit full policy compiles one step, counted by the telemetry owner of JAX's public
+    monitoring events rather than a private log's spelling (rows 2111, 2154)."""
+    free(monkeypatch, LIMIT)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    trainer = lm(split=1, remat=REMAT_POLICIES["full"])
+    with Compiles("step") as compiles:
+        trained(trainer, steps=0)
+    assert compiles.count == 1
+    assert [probe["remat"] for probe in trainer.plan["probes"]] == ["full"]
+    assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]

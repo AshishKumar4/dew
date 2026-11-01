@@ -348,6 +348,33 @@ def run_child(script: str, *arguments: str) -> list[str]:
     return done.stdout.split()
 
 
+def test_a_recut_group_restores_what_its_overlapping_groups_held(cache_worker, tmp_path):
+    """A split file's group whose cut changed (CI's target moved, the record's durations moved) has no bundle
+    of its own yet: it seeds the programs of the old cut's groups whose share of the file overlaps its own,
+    never another's, and writes its own bundle under its own cut once its tests ran (debugger's measure: 565
+    of 1,182 recut groups restored nothing after the 240 to 120 s target)."""
+    url, stored, _ = cache_worker
+    # The old cut's groups, each in a task of its own.
+    for group, program in (("1/2", "jit_front-1"), ("2/2", "jit_back-1")):
+        old = tmp_path / f"old-{group[0]}"
+        old.mkdir()
+        cache = remote_cache.RemoteCache(old, url, "token", "jax/cpu")
+        cache.opened(remote_cache.bundle("tests/split.py::test_x", group, None))
+        compiled(old, program)
+        cache.closed(remote_cache.bundle("tests/split.py::test_x", group, None))
+        cache.drain()
+    new = tmp_path / "new"
+    new.mkdir()
+    recut = remote_cache.RemoteCache(new, url, "token", "jax/cpu")
+    group = remote_cache.bundle("tests/split.py::test_x", "1/3", None)
+    recut.opened(group)
+    assert set(programs(new)) == {"jit_front-1"}
+    recut.closed(group)
+    recut.drain()
+    assert [key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/split.py/1-of-3"])] == [
+        "jit_front-1"]
+
+
 def test_jaxs_own_cache_reset_works_under_the_shared_cache(cache_worker, tmp_path):
     """JAX's public `reset_cache` (jax.experimental.compilation_cache), which a run calls to point the
     cache elsewhere, works with the shared cache installed, and the program compiled before it is

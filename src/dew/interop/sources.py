@@ -16,15 +16,16 @@ import functools
 import json
 import logging
 import os
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 import jax
 import numpy as np
 
 from dew import _records
-from dew.cache import hub_answer, recorded_hub_answer
+from dew.cache import hub_answer, hub_commit, hub_storage, recorded_hub_answer
 from dew.interop import pickles
 from dew.interop.safetensors_io import (
     LazyTensors,
@@ -35,6 +36,13 @@ from dew.interop.safetensors_io import (
     stored_spec,
     weight_files,
 )
+from dew.interop.unread import Unread, unread
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+    from transformers.core_model_loading import WeightConverter
+
+    from dew.interop.decoder_parts import SourceCode
 
 
 def load_shards(directory: Path) -> dict[str, np.ndarray]:
@@ -86,6 +94,30 @@ class SourceReference:
 
     def metadata(self) -> Path:
         return snapshot(self.name, self.revision, weights=False) / (self.subfolder or "")
+
+    def pinned(self) -> SourceReference:
+        """This source at the commit its revision resolves to now, as a run records it (`hub_commit`). A
+        directory, local or on storage a URI names (a saved Dew run's on a bucket), or a source named at
+        a commit, is as it is: no Hub repository's id holds a scheme."""
+        from huggingface_hub.file_download import REGEX_COMMIT_HASH
+
+        from dew.checkpoints import is_uri
+
+        named = self.revision is not None and REGEX_COMMIT_HASH.fullmatch(self.revision)
+        if os.path.isdir(self.name) or is_uri(self.name) or named:
+            return self
+        return replace(self, revision=hub_commit(self.name, self.revision).value)
+
+    def cached(self) -> Path:
+        """The cache's snapshot folder of this source's commit (`pinned` first), where its files land as
+        they are fetched (`file`), with none fetched here."""
+        if os.path.isdir(self.name):
+            return Path(self.name)
+        return hub_storage(self.name) / "snapshots" / str(self.pinned().revision)
+
+    def spelled(self) -> str:
+        """The `repo@revision` spelling `parse` reads back, or the name alone."""
+        return self.name if self.revision is None else f"{self.name}@{self.revision}"
 
     def directory(self, root: Path) -> Path:
         return root / (self.subfolder or "")
@@ -183,6 +215,47 @@ def remote_code(name_or_dir: str | Path, directory: Path) -> Path:
     return directory
 
 
+def code_modules(code: SourceCode) -> dict[str, Path]:
+    """A source's own modules (`SourceCode`), by their path in the source: those its config's `auto_map`
+    names, and every module they import relatively, as transformers resolves a remote module's imports
+    (`dynamic_module_utils.get_relative_imports`), fetched through the hub's cache at the code's commit,
+    which a cached commit's file is read from without the network, or a directory's own (one it does
+    not hold it does not bring, as it would not open with it either). An entry naming another repo's
+    code (`repo--module.Class`) brings none: its loader fetches it there. What `Pretrained.save` writes
+    beside the weights, so the save opens through the source's own transformers loader as the source
+    does."""
+    from transformers.dynamic_module_utils import get_relative_imports
+
+    local = os.path.isdir(code.source)
+
+    def located(file: str) -> Path:
+        # A module named by a config or an import is a path inside the source, as a subfolder is.
+        if PurePosixPath(file).is_absolute() or {"", ".", ".."} & set(PurePosixPath(file).parts):
+            raise ValueError(f"{file!r} is no module inside the source: its code may not name a path "
+                             "outside it")
+        if local:
+            return Path(code.source) / file
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(str(code.source), f"{code.folder}/{file}" if code.folder else file,
+                                    revision=code.revision))
+
+    references = [reference for value in code.auto_map.values()
+                  for reference in (value if isinstance(value, list) else [value])
+                  if isinstance(reference, str) and "--" not in reference]
+    pending = [reference.rpartition(".")[0].replace(".", "/") + ".py" for reference in references]
+    modules: dict[str, Path] = {}
+    while pending:
+        file = pending.pop()
+        if file in modules or (local and not located(file).is_file()):
+            continue
+        modules[file] = located(file)
+        folder = file.rpartition("/")[0]
+        pending.extend(f"{folder}/{module}.py" if folder else f"{module}.py"
+                       for module in get_relative_imports(modules[file]))
+    return modules
+
+
 def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
     """The local path of `filename` in a directory, or `filename` downloaded
     from the repo at the snapshot's commit.
@@ -211,37 +284,29 @@ def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
                                 f"its {suffix} files are {present}") from error
 
 
+def pinned_source(source: str) -> str:
+    """`source` as a run records it, `repo@commit` (`SourceReference.pinned`); a local path, or one on
+    storage a URI names, as it is."""
+    from dew.checkpoints import is_uri
+
+    if os.path.exists(source) or is_uri(source):
+        return source
+    return SourceReference.parse(source).pinned().spelled()
+
+
 def repo_files(name: str, directory: Path) -> set[str]:
-    """Every file of the snapshot's commit, by repo-relative name.
-
-    A dry run lists the Hub tree the metadata fetch has just cached. Offline
-    it cannot: without a cached tree it raises DryRunError, and with one it
-    raises LocalEntryNotFoundError for the first listed file that was never
-    downloaded. The cache is then all a load can read anyway, so the
-    snapshot directory's own files are the listing.
+    """Every file of the snapshot's commit, by repo-relative name: as the Hub lists it
+    (`_hub_files`), recorded so an offline load reads the same listing (`hub_answer`);
+    offline where it was never listed online, the files the cached snapshot holds, all
+    such a load can read anyway.
     """
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import DryRunError, LocalEntryNotFoundError
-
-    try:
-        return {entry.filename for entry in snapshot_download(name, revision=directory.name, dry_run=True)}
-    except (DryRunError, LocalEntryNotFoundError):
-        return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
-
-
-def has_file(repo_id: str, filename: str, revision: str | None) -> bool:
-    """Whether the Hub repo `repo_id` holds `filename` at `revision`.
-
-    It asks the Hub; offline (`HF_HUB_OFFLINE`) it answers from the local
-    cache, where a file never fetched counts as absent.
-    """
-    from huggingface_hub import file_exists, try_to_load_from_cache
     from huggingface_hub.errors import OfflineModeIsEnabled
 
     try:
-        return file_exists(repo_id, filename, revision=revision)
+        return set(hub_answer(("repo files", name, directory.name),
+                              functools.partial(_hub_files, name, directory.name)).value)
     except OfflineModeIsEnabled:
-        return isinstance(try_to_load_from_cache(repo_id, filename, revision=revision), str)
+        return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
 
 def snapshot(name_or_dir: str, revision: str | None, *,
@@ -318,6 +383,24 @@ def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int
     return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
 
 
+def stored_tensors(source: SourceReference, root: Path) -> LazyTensors[Unread] | None:
+    """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and
+    dtypes alone, read from their safetensors headers (`StoredWeights.specs`, a Hub source's over HTTP
+    and cached), what a load without its weights translates: each tensor an `Unread` array, its shape
+    and dtype, no value fetched or read. None for a checkpoint of PyTorch pickles alone, whose shapes
+    no header states, which a load reads whole. Raises FileNotFoundError where a header cannot be read
+    (offline, never read online)."""
+    stored = StoredWeights(source.name, root, source.subfolder or "")
+    if not stored.files(""):
+        return None
+    held = stored.specs("")
+    if held is None:
+        raise FileNotFoundError(f"{source.name} at {root.name}: its weights' headers were never read "
+                                "online, and offline they are read from the files alone; load it online "
+                                "once, or with its weights")
+    return unread({name: spec for name, (_, spec) in held.items()})
+
+
 @dataclass(frozen=True)
 class StoredWeights:
     """A source's weight files, read by their headers and fetched by name: what a
@@ -332,20 +415,12 @@ class StoredWeights:
     def files(self, folder: str) -> tuple[str, ...]:
         """The repo-relative files that hold `folder`'s weights (`weight_files`): a directory's
         own, or the commit's, as the Hub lists them (`_hub_files`), recorded so an offline run
-        reads the same listing (`hub_answer`); offline where it was never listed online, those
-        the cached snapshot holds (`repo_files`)."""
-        from huggingface_hub.errors import OfflineModeIsEnabled
-
+        reads the same listing (`repo_files`)."""
         if os.path.isdir(self.name_or_dir):
             listing = {path.relative_to(self.directory).as_posix() for path in self.directory.rglob("*")
                        if path.is_file()}
         else:
-            try:
-                listing = set(hub_answer(("repo files", self.name_or_dir, self.directory.name),
-                                         functools.partial(_hub_files, self.name_or_dir,
-                                                           self.directory.name)).value)
-            except OfflineModeIsEnabled:
-                listing = repo_files(self.name_or_dir, self.directory)
+            listing = repo_files(self.name_or_dir, self.directory)
         selected = (Path(self.subfolder) / folder).as_posix()
         return weight_files(listing, "" if selected == "." else selected,
                             lambda name: json.loads((self.directory / name).read_text()))
@@ -389,3 +464,48 @@ class StoredWeights:
 
         return LazyTensors({name: spec for name, (_, spec) in held.items()},
                            lambda name: read(held[name][0])[name])
+
+
+@dataclass(frozen=True)
+class LoadName:
+    """A stored tensor's name as its model's transformers load names it (`load_names`): `name`; the name
+    its renamings alone give (`renamed`, an expert's own before the converter merges it); and its
+    `converter`, the `WeightConverter` that merges it into another tensor, which `pattern` of the
+    converter's sources matched, or None where it is renamed alone."""
+    name: str
+    renamed: str
+    converter: WeightConverter | None
+    pattern: str | None
+
+
+def load_names(model: PreTrainedModel) -> Callable[[str], LoadName] | None:
+    """The name `model`'s transformers load gives each stored key (`convert_and_load_state_dict_in_model`,
+    by the conversion mapping it keeps for the model, `get_model_conversion_mapping`): every renaming,
+    then at most one converter, the base model's prefix added or dropped as the model holds the name,
+    and the stored name itself where only it is held. None where a renaming renames a key by whether
+    another is stored (`GroupWeightRename`), which no read of one name tells: the caller leaves such a
+    checkpoint to transformers' own load."""
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import (
+        GroupWeightRename,
+        WeightConverter,
+        WeightRenaming,
+        rename_source_key,
+    )
+
+    transforms = get_model_conversion_mapping(model)
+    if any(isinstance(transform, GroupWeightRename) for transform in transforms):
+        return None
+    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    held, prefix = model.state_dict(), model.base_model_prefix
+
+    def loaded(stored: str) -> LoadName:
+        name, pattern = rename_source_key(stored, renamings, converters, prefix, held)
+        if name not in held and stored in held:
+            name, pattern = rename_source_key(stored, [], [], prefix, held)
+        converter = None if pattern is None else next(
+            converter for converter in converters if pattern in converter.source_patterns)
+        return LoadName(name, rename_source_key(stored, renamings, [])[0], converter, pattern)
+
+    return loaded

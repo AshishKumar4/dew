@@ -25,6 +25,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gelu_tanh
+from dew.nn.attention import AttentionImpl
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
@@ -75,7 +76,7 @@ class FluxSingleBlock(nn.Module):
     mlp_ratio: float = 4.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -144,7 +145,7 @@ class FluxTransformer(TextStream, nn.Module):
     axes_dims_rope: Sequence[int] = (16, 56, 56)
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:

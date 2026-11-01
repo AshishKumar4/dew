@@ -2,18 +2,23 @@
 
 import collections
 import copy
+import functools
 import itertools
 from dataclasses import replace
 from pathlib import Path
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from attention_oracle import attention_terms
 from decision_support import decision_rows
+from float64_terms import float64_terms
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
+from torch_layout import node
 
 from dew.batch import VALID_ROWS
 from dew.data.dataset import DataPartition
@@ -34,6 +39,7 @@ from dew.decision.layout import OPTION_TILE, QUESTION_FIELDS, DecisionInputs, La
 from dew.decision.rows import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
+from dew.nn.attention_blocks import NormalAttention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
 from dew.training.trainer import Trainer
@@ -65,10 +71,10 @@ def qwen35(length: int) -> Pretrained:
     return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
 
 
-def attending(length: int) -> CausalTransformer:
-    """A decoder of attention alone, which the parallel layout's pairwise mask needs."""
+def attending(length: int, implementation: str = "xla") -> CausalTransformer:
+    """A decoder of attention alone, which the parallel layout's key runs need, on `implementation`."""
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=length, attention_impl="xla")
+                             max_seq_len=length, attention_impl=implementation)
 
 
 ROWS = StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8)
@@ -78,12 +84,15 @@ ARMS = {
     "joint": (JointLayout(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
-    "parallel": (replace(ROWS, parallel=True), attending, lambda: DecisionHead(32, layers=1)),
+    # The parallel arm's decoder on the attention template, which reads the layout's key runs as its spans
+    # (`DecisionModel._read`, row 1835).
+    "parallel": (replace(ROWS, parallel=True), functools.partial(attending, implementation="template"),
+                 lambda: DecisionHead(32, layers=1)),
     "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS), qwen35,
                 lambda: LabelReadout(64, LABELS.ids(TOKENIZER, 3))),
 }
 """Joint rows under the joint schema head and rows of one question under the marker head,
-both over Qwen3.5; parallel options, whose pairwise mask Gated DeltaNet refuses, over attention;
+both over Qwen3.5; parallel options, whose key runs Gated DeltaNet refuses, over the attention template;
 options under labels read at each row's answer cue by the backbone's own logits, over Qwen3.5."""
 
 
@@ -153,7 +162,12 @@ def at_offset(batch, window: int, row: int) -> dict:
     if "positions" in batch:
         filler = np.cumsum(before) - 1
         one["positions"] = np.where(mine, batch["positions"][window], np.where(before, filler, 0))[None]
-    return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
+    # The row's document is 1 + whether a filler document stands before it, and its questions are its own:
+    # each question's row the row's new document, or its queries would read no document's tokens.
+    document = 1 + int(before.any())
+    if "question_rows" in batch:
+        one["question_rows"] = np.full((1, asked.size), document, np.int32)
+    return one | {"segments": (before + mine * document).astype(np.int32)[None]}
 
 
 def in_place(batch, placed: list[tuple[int, int]]) -> dict:
@@ -207,6 +221,114 @@ def gradient(objective, variables, batch):
     return jax.grad(total)(variables)
 
 
+def located(tree, path: tuple[str, ...], held) -> tuple[str, ...]:
+    """Where in a parameters tree a module whose scope is `path` holds `held`, its own parameters as its
+    apply read them: its model applies it at the tree's root or under one of its top-level modules, a
+    backbone's and a head's scopes alike (`layers_0/self_attn` in both), so the one place whose
+    parameters are `held`'s is its."""
+    found = []
+    for root in ((), *((name,) for name, child in tree.items() if isinstance(child, dict))):
+        reached = tree
+        for name in (*root, *path):
+            reached = reached.get(name) if isinstance(reached, dict) else None
+        if reached is not None and jax.tree.structure(reached) == jax.tree.structure(held) and all(
+                np.array_equal(np.asarray(mine), np.asarray(its))
+                for mine, its in zip(jax.tree.leaves(reached), jax.tree.leaves(held), strict=True)):
+            found.append((*root, *path))
+    assert len(found) == 1, f"{path} is at {len(found)} places of the parameters"
+    return found[0]
+
+
+READ = ("_heads", "__call__")
+"""The methods of an attention `AttentionTerms` reads: each projection to heads, and the call."""
+
+
+class AttentionTerms:
+    """Each attention's projections' gradients' float64 terms in `objective`'s float64 model at `batch`
+    (`NormalAttention`): its queries', keys' and values' terms (`attention_terms`, a logit's gradient
+    P (dP - delta) sized by its terms' rounding), carried through the projection that made them to its
+    bias, their root sum of squares over the batch's tokens, and to its kernel, the tokens' input times
+    them. A key's bias moves every logit of its query alike, so its gradient cancels to zero in float64
+    (softmax's shift invariance); its rounding is of those terms, behind the sums that cancel, where
+    `float64_terms` sizes a leaf by its final sum's terms alone. The attentions' inputs and outputs are
+    read through Flax's method interception, the outputs' cotangents as the gradient of a zero added to
+    each, in one program traced once."""
+
+    def __init__(self, objective, batch):
+        self.names: dict = {}
+        step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
+
+        def total(variables, added):
+            held: dict = {}
+
+            def read(call, args, kwargs, context):
+                module = context.module
+                if not isinstance(module, NormalAttention) or context.method_name not in READ:
+                    return call(*args, **kwargs)
+                path = module.scope.path
+                self.names[path] = module.names
+                record = held.setdefault(path, {})
+                out = call(*args, **kwargs)
+                if context.method_name == "_heads":
+                    record[args[0]] = (args[1], out)
+                    return out
+                record["documents"] = (kwargs["segment_ids"], kwargs.get("key_segment_ids"))
+                record["params"] = module.variables["params"]
+                record["out"] = out
+                return out + added[path] if path in added else out
+
+            with nn.intercept_methods(read):
+                loss, _ = objective.loss(variables, batch, step)
+            return loss.total, held
+
+        self.total = total
+        self.read = jax.jit(jax.grad(total, argnums=1, has_aux=True))
+        self.added: dict | None = None
+
+    def __call__(self, variables) -> dict:
+        """The terms carried to each attention's projections, by its place in the parameters (`located`):
+        each projection's input and its heads' terms."""
+        if self.added is None:
+            # Every draw's variables are of one tree, so its attentions' outputs of one shape.
+            _, shapes = jax.eval_shape(self.total, variables, {})
+            self.added = {path: jnp.zeros(record["out"].shape, record["out"].dtype)
+                          for path, record in shapes.items()}
+        cotangents, held = self.read(variables, self.added)
+        carried = {}
+        for path, record in held.items():
+            query_name, key_name, value_name, out_name = self.names[path]
+            (into_queries, queries), (into_keys, keys), (_, values) = (
+                record[name] for name in (query_name, key_name, value_name))
+            query_ids, key_ids = record["documents"]
+            key_ids = query_ids if key_ids is None else key_ids
+            queried = query_ids[:, None, :, None]
+            keep = (queried == key_ids[:, None, None, :]) & (queried != 0)
+            place = located(variables["params"], path, record["params"])
+            kernel = node(variables["params"], place)[out_name]["kernel"]
+            heads, width = queries.shape[2:]
+            dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
+            _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
+            carried[place] = {name: (np.asarray(into, np.float64), terms) for name, into, terms in (
+                (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
+                (value_name, into_keys, value_terms))}
+        return carried
+
+
+def with_attention_terms(sized, carried: dict):
+    """`sized`, a gradient's float64 terms (`float64_terms`), each attention projection's bias and kernel
+    sized by at least the attention's terms carried to it (`AttentionTerms`)."""
+    sized = jax.tree.map(np.array, sized)
+    for place, projections in carried.items():
+        placed = node(sized["params"], place)
+        for name, (into, terms) in projections.items():
+            leaf = placed[name]
+            squares = np.asarray(terms, np.float64) ** 2
+            leaf["bias"] = np.maximum(leaf["bias"], np.sqrt(squares.sum((0, 1))).reshape(leaf["bias"].shape))
+            leaf["kernel"] = np.maximum(leaf["kernel"], np.sqrt(np.einsum(
+                "bse,bshd->ehd", into ** 2, squares)).reshape(leaf["kernel"].shape))
+    return sized
+
+
 def decided(objective, variables, batch, segments: int):
     """The batch's logits and the gradient of its summed loss."""
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
@@ -214,22 +336,25 @@ def decided(objective, variables, batch, segments: int):
 
 # The joint arm's float64 truth over the seeds its gradients need is numeric work at model size, a GPU's
 # (BIBLE §8): on armada it took 705 s of CPU, the suite's whole critical path; the others take 187 s and 36 s.
-@pytest.mark.parametrize("arm", [pytest.param("joint", marks=pytest.mark.gpu(
-    reason="the joint arm's float64 truth at the seeds it needs")), "marker", "parallel"])
+# The joint arm runs in the models' GPU flow (tests/test_gpu_models.py).
+@pytest.mark.parametrize("arm", ["marker", "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives alone where its window packed it,
     through Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within
     the float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
-    truth is the rows in windows of their own in float64.
+    truth is the rows in windows of their own in float64, on the reference attention (the template takes
+    fp32, bf16 and fp16).
 
     The reference runs the same kernels at the same shapes as the window (`rows_alone`), so this
-    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm's
-    parity with fla is held at the layer, against fla's own packed sequences (test_fla_gdn,
-    test_fla_kda)."""
+    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm is held
+    at the layer: against the token recurrence in float64 on packed documents (test_fla_gdn), and trained
+    natively on a GPU (tests/test_gpu_recurrence.py's port cells)."""
     objective = objective_for(arm)
-    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
-                                          objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm])
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64,
+                                                                         attention_impl="reference"),
+                                          objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm],
+                              PACKING_WINDOWS.get(arm, 2))
 
 
 def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
@@ -247,8 +372,7 @@ def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
                                           objective.model.head), PACKING_SEEDS["readout"])
 
 
-@pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
-def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
+def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
     """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
     by documents, flash's packed sequences of the keys' own offsets, its padded questions and slots
     reading nothing. Each packed row's logits and the gradients are the row's alone within the
@@ -292,25 +416,34 @@ def rows_alone(decide, batch):
     return np.concatenate([logits[place] for place in every]), grads
 
 
-PACKING_SEEDS = {"joint": 256, "marker": 256, "parallel": 256, "flash": 8, "readout": 8}
+PACKING_SEEDS = {"joint": 256, "marker": 8, "parallel": 8, "flash": 8, "readout": 8}
 """Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
-packed window as `dew_fn`) gives on any platform the site runs on. An H100 took 256 for the joint arm
-and 128 for the marker and parallel arms (node receipts TL-h100-packing-size-*-3), an A100 128 for the
-joint arm and 256 for the marker and parallel arms (SF-a100-packing-seeds), armada 16, 8 and 8 (run-tests
-sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's, and the readout arm's 8 is an A100's
-(SF-readout-sizing), an H100's and armada's. The A100's are the head's gradients whose float64
-truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marker and parallel arms'
-scorer_out bias, shared by a question's options, and the joint arm's attention key biases (ledger
-1548). Twice the rows a draw took the same counts on an A100 (node receipts SF-packing-scale2-sizing),
-each draw twice the work."""
+packed window as `dew_fn`) gives on any platform the site runs on, each with its confirming block, the
+largest declared as docs/design/testing.md's check 1 rules (d28b1c318). The joint arm and the flash head
+run on GPUs alone, in the models' GPU flow (tests/test_gpu_models.py): an H100 took 256 for the joint arm
+(node receipts TL-h100-packing-size-*-3) and an A100 128 (SF-a100-packing-seeds); the flash arm's is an
+A100's. The marker and parallel arms run on armada's CPU alone (bible §7, no GPU unit tests), where
+both took 8 (run-tests sf-pack-sizing at 519299480, as sf-packing-cpu-sizing-898ec4ac6 and
+rows-memory-probe12-8ce8072b5 before it; on GPUs, where they no longer run, they took 64 to 256). The
+readout arm's 8 is an A100's (SF-readout-sizing), an H100's and armada's. The GPUs' larger counts are
+the head's gradients whose float64 truth is zero by symmetry, which both arms err at by 0 to 3 fp32
+ulps: the marker and parallel arms' scorer_out bias, shared by a question's options, and the joint arm's
+attention key biases (ledger 1548). Twice the rows a draw took the same counts on an A100 (node receipts
+SF-packing-scale2-sizing), each draw twice the work."""
 
 
-def assert_rows_decided_alone(objective, wide_modules, seeds: int) -> None:
-    """Two packed windows of the examples decide each row's questions as the row does alone where its
-    window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
+PACKING_WINDOWS = {"marker": 1}
+"""The packed windows a draw holds where an arm's site takes fewer than two: the marker arm's one window
+packs several rows, and its draw at two windows took 0.50 s on armada against 0.31 at one, where the
+256 draws two windows took on an A100 brought it past the suite's 240 s a test (ledger 1851)."""
+
+
+def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 2) -> None:
+    """`count` packed windows of the examples decide each row's questions as the row does alone where
+    its window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
-    in windows of their own."""
-    batch = windows(objective, 2)
+    in windows of their own, a leaf zero by algebra sized by the terms its sum adds."""
+    batch = windows(objective, count)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
     # more sequence (`dew.nn.attention.flash_attention`).
@@ -336,14 +469,26 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int) -> None:
         return wide.model.logits(variables, laid_out(rows, segments)), gradient(wide, variables, rows)
 
     def truth(variables):
+        # A leaf zero by algebra (a key's bias, the scorer's shared bias under the loss) cancels in its
+        # sum, which the check sizes by the terms it adds (`terms`).
         logits, grads = apart_in_float64(variables)
-        return np.asarray(logits)[rows["options"]], grads
+        return jnp.asarray(logits)[rows["options"]], grads
+
+    carried = AttentionTerms(wide, rows)
+
+    def terms(variables):
+        # Each leaf's terms as its sums add them (`float64_terms`), an attention's projections' at least
+        # the attention's own carried to them, where a key's bias cancels behind its final sum.
+        _, (logits, grads) = float64_terms(truth, variables)
+        return logits, with_attention_terms(grads, carried(variables))
 
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
     initialized = jax.jit(objective.init)
+    # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
+    # (`terms`), so each arm's rounding of them is on par, on every backend.
     assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
-                    seeds=seeds, truth_fn=truth)
+                    seeds=seeds, truth_fn=truth, terms=terms)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():

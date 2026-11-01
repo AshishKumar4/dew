@@ -28,14 +28,13 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import copy
-import fnmatch
 import functools
 import importlib.metadata
 import json
 import math
 import warnings
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import FunctionType
 from typing import TYPE_CHECKING, Self
@@ -48,18 +47,20 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
-from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, Variables, coordinates, real_slots
+from dew.batch import COORDINATES_FIELD, Coordinates, Variables, real_slots, token_coordinates
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
-from dew.interop.pretrained import PretrainedFallback, source_processor
-from dew.interop.weights import AUTO
+from dew.interop.pretrained import Placing, PretrainedFallback, source_processor
+from dew.interop.streaming import SourceLeaf
+from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
+from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
-from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
+from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -277,7 +278,7 @@ class _Attending:
     token's index where None) only where the call states its keys' positions (`key_places`), as Dew's
     own attention reads a stated visibility (`AttentionMetadata.key_positions`)."""
 
-    implementation: str
+    implementation: AttentionImpl
     documents: jax.Array | None
     valid: jax.Array | None
     max_segments: int
@@ -345,7 +346,8 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     key folded by the layer, and a training call that drops with no key is refused."""
     from torchax.interop import jax_view, torch_view
 
-    from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention_masks import causal_attention_mask
     from dew.nn.kv_cache import write_cache
     from dew.nn.local_attention import compacted
     from dew.nn.visibility import windowed
@@ -692,62 +694,71 @@ def refuse_quantized(config: Mapping[str, object]) -> None:
             f"release, or drop fallback for a registered family whose codec Dew reads")
 
 
-TORCH_AXES: tuple[tuple[str, LogicalAxes], ...] = (
-    # nn.Linear stores [out, in]; its bias is the output side alone.
-    ("*.q_proj.weight", ("heads", "embed")), ("*.q_proj.bias", ("heads",)),
-    ("*.k_proj.weight", ("kv", "embed")), ("*.k_proj.bias", ("kv",)),
-    ("*.v_proj.weight", ("kv", "embed")), ("*.v_proj.bias", ("kv",)),
-    ("*.o_proj.weight", ("embed", "heads")),
-    ("*.self_attn.out_proj.weight", ("embed", "heads")),
-    ("*.attention.query_key_value.weight", ("heads", "embed")),
-    ("*.attention.query_key_value.bias", ("heads",)),
-    ("*.attention.dense.weight", ("embed", "heads")),
-    ("*.gate_proj.weight", ("mlp", "embed")), ("*.up_proj.weight", ("mlp", "embed")),
-    ("*.down_proj.weight", ("embed", "mlp")),
-    ("*.fc1.weight", ("mlp", "embed")), ("*.fc1.bias", ("mlp",)),
-    ("*.fc2.weight", ("embed", "mlp")),
-    ("*.dense_h_to_4h.weight", ("mlp", "embed")), ("*.dense_h_to_4h.bias", ("mlp",)),
-    ("*.dense_4h_to_h.weight", ("embed", "mlp")),
-    # GPT-2's Conv1D stores [in, out].
-    ("*.attn.c_attn.weight", ("embed", "heads")), ("*.attn.c_attn.bias", ("heads",)),
-    ("*.attn.c_proj.weight", ("heads", "embed")),
-    ("*.mlp.c_fc.weight", ("embed", "mlp")), ("*.mlp.c_fc.bias", ("mlp",)),
-    ("*.mlp.c_proj.weight", ("mlp", "embed")),
-    # Token tables and output heads are [vocab, embed], positions [positions, embed].
-    ("*embed_tokens.weight", ("vocab", "embed")), ("*.wte.weight", ("vocab", "embed")),
-    ("*embed_in.weight", ("vocab", "embed")), ("*word_embeddings.weight", ("vocab", "embed")),
-    ("lm_head.weight", ("vocab", "embed")), ("embed_out.weight", ("vocab", "embed")),
-    ("*.wpe.weight", (None, "embed")), ("*embed_positions.weight", (None, "embed")),
-)
-"""The logical axes of the tensors the common transformers conventions name,
-in their torch orientation. A rule applies to a tensor its glob matches and
-whose rank equals the length of its axes; the first such rule wins."""
+def planned_axes(model: PreTrainedModel) -> tuple[tuple[str, LogicalAxes], ...]:
+    """The logical axes of `model`'s parameters by their torch names, from its tensor-parallel plan
+    (`model.tp_plan`: its config's `base_model_tp_plan` beside its head's), each parameter's style found
+    by its module's name with its layer indices read as `*` and named by transformers' registry
+    (`ALL_PARALLEL_STYLES`, which owns the styles' names): a column-split projection's
+    (`ColwiseParallel`, `PackedColwiseParallel`: an `nn.Linear` weight `[out, in]` split on its first
+    dimension, its bias with it) output width `mlp` over its input `embed`, a row-split one's
+    (`RowwiseParallel`, `PackedRowwiseParallel`: its second, its bias whole) the other way, and the input
+    and output tables `vocab` over `embed`. Dew's rules then place them as a native model's (`mlp` on the
+    tensor axis, `embed` on fsdp). A parameter no style splits so (the plan's expert, router and
+    replicated styles, a norm) takes `Layout`'s shape heuristic."""
+    import torch
+    from transformers.distributed.tensor_parallel import (
+        ALL_PARALLEL_STYLES,
+        ColwiseParallel,
+        PackedColwiseParallel,
+        PackedRowwiseParallel,
+        RowwiseParallel,
+    )
+
+    def split(style: str | None) -> str | None:
+        layer = None if style is None or style not in ALL_PARALLEL_STYLES else ALL_PARALLEL_STYLES[style]
+        if isinstance(layer, ColwiseParallel | PackedColwiseParallel):
+            return "column"
+        return "row" if isinstance(layer, RowwiseParallel | PackedRowwiseParallel) else None
+
+    plan = model.tp_plan
+    tables = [module.weight for module in (model.get_input_embeddings(), model.get_output_embeddings())
+              if isinstance(module, torch.nn.Module) and isinstance(module.weight, torch.Tensor)]
+    axes: list[tuple[str, LogicalAxes]] = []
+    for name, parameter in model.named_parameters():
+        module, _, kind = name.rpartition(".")
+        # A layer's index, a name of digits alone, reads as the plan's `*` (`dense_h_to_4h` keeps its 4).
+        style = split(plan.get(".".join("*" if part.isdigit() else part for part in module.split("."))))
+        if parameter.ndim == 2 and any(parameter is table for table in tables):
+            axes.append((name, ("vocab", "embed")))
+        elif style == "column" and parameter.ndim in (1, 2):
+            axes.append((name, ("mlp", "embed")[:parameter.ndim]))
+        elif style == "row" and kind == "weight" and parameter.ndim == 2:
+            axes.append((name, ("embed", "mlp")))
+    return tuple(axes)
 
 
 @dataclass(frozen=True)
 class TorchLayout(Layout):
-    """A `Layout` for a tree keyed by torch parameter names.
+    """A `Layout` for a tree keyed by torch parameter names, which a tier-3 model makes of the run's
+    (`TorchCausalLM.placement`).
 
-    `names` maps a glob over a tensor's torch name to its logical axes;
-    `rules` then map those onto the mesh exactly as they do for a native
-    model, so the tensor axis, fsdp, `min_shard` and `check` mean what they
-    mean there. A tensor no name matches takes `Layout`'s shape heuristic.
-    Optimizer moments and EMA copies end in their parameter's name, so they
-    take its placement.
+    `names` gives a tensor's logical axes by its torch name, the model's
+    tensor-parallel plan's (`planned_axes`); `rules` then map those onto the
+    mesh exactly as they do for a native model, so the tensor axis, fsdp,
+    `min_shard` and `check` mean what they mean there. A tensor it names none
+    for takes `Layout`'s shape heuristic. Optimizer moments and EMA copies end
+    in their parameter's name, so they take its placement.
 
     The placement decides where GSPMD keeps each tensor, not what the forward
     computes: a spec that suits the model badly costs collectives, never
     correctness.
     """
 
-    names: tuple[tuple[str, LogicalAxes], ...] = TORCH_AXES
+    names: tuple[tuple[str, LogicalAxes], ...] = ()
 
     def axes(self, name: str, ndim: int) -> LogicalAxes | None:
-        """The logical axes the first matching rule gives `name`, or None."""
-        for pattern, axes in self.names:
-            if len(axes) == ndim and fnmatch.fnmatchcase(name, pattern):
-                return axes
-        return None
+        """The logical axes `names` gives `name` at rank `ndim`, or None."""
+        return next((axes for held, axes in self.names if held == name and len(axes) == ndim), None)
 
     def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
         """The axes the name table gives the leaf's torch name, else `Layout`'s."""
@@ -771,10 +782,13 @@ class TorchGraph:
 
     module: JittableModule
     persistent: tuple[str, ...]
-    attention_impl: str | None = None
+    attention_impl: AttentionImpl | None = None
     shapes: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] = field(default_factory=dict)
     """The source's variables, `params` and `buffers`, as shapes and dtypes: what an initialization,
     which holds none of them, traces the forward over (`TorchCausalLM._run`)."""
+    axes: tuple[tuple[str, LogicalAxes], ...] = ()
+    """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
+    which its placement reads (`TorchCausalLM.placement`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -1027,23 +1041,10 @@ def _narrow_float(value) -> bool:
     return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 32
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2))
 def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
-    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype."""
-    return jax.lax.broadcast_in_dim(value, shape, dimensions)
-
-
-def _accumulated_forward(value, shape, dimensions):
-    return _accumulated(value, shape, dimensions), value
-
-
-def _accumulated_backward(shape, dimensions, value, cotangent):
-    _, transpose = jax.vjp(lambda wide: jax.lax.broadcast_in_dim(wide, shape, dimensions),
-                           value.astype(jnp.float32))
-    return (transpose(cotangent.astype(jnp.float32))[0].astype(value.dtype),)
-
-
-_accumulated.defvjp(_accumulated_forward, _accumulated_backward)
+    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype at every
+    order, as a Dew bias's does (`dew.nn.precision.broadcast_summed`, ledgers 2653 and 3038)."""
+    return broadcast_summed(value, shape, dimensions)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,
@@ -1121,6 +1122,20 @@ class TorchCausalLM(nn.Module):
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
         return ()
 
+    @nn.nowrap
+    def placement(self, layout: Layout) -> Layout:
+        """The run's `layout` for this model's torch-named tree (`dew.distributed.placement.RefinesLayout`):
+        its rules, fsdp and every other choice it makes, its tensors named by the model's tensor-parallel
+        plan (`TorchLayout`) beside those another tier-3 model of the run named (a distillation's
+        teacher), a name two models give different axes refused."""
+        names = dict(layout.names if isinstance(layout, TorchLayout) else ())
+        for name, axes in self.graph.axes:
+            if names.setdefault(name, axes) != axes:
+                raise ValueError(f"two tier-3 models of the run name {name} with different axes "
+                                 f"({names[name]} and {axes}), which one layout cannot place both by")
+        return TorchLayout(**{held.name: getattr(layout, held.name) for held in fields(Layout) if held.init},
+                           names=tuple(names.items()))
+
     @property
     def causal(self) -> bool:
         """True: `load` builds the model with `AutoModelForCausalLM`, whose
@@ -1134,23 +1149,26 @@ class TorchCausalLM(nn.Module):
 
     @nn.compact
     def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None,
-                 positions=None, **packing) -> jax.Array:
+                 positions=None, segment_ids=None, coordinates: Coordinates | None = None,
+                 **packing) -> jax.Array:
         """The logits of `tokens`, in at least float32: of whole rows laid as `logits` lays them, or
         with `decode` of a decoding call into the cache `init_cache` opened, `attention_mask` `[B, S]`
         the tokens that write and `positions` `[B, S]` their places in their rows (their slots where
-        None), or the rows' `coordinates` stating both; a decoding row holds one document."""
-        fields = {name: value for name, value in ((VALIDITY_FIELD, attention_mask), ("positions", positions))
-                  if value is not None}
+        None), or the rows' `coordinates` stating both, converted once (`token_coordinates`); a
+        decoding row holds one document."""
+        laid = token_coordinates(jnp.shape(tokens)[:2], coordinates, segments=segment_ids,
+                                 valid=attention_mask, positions=positions)
+        given = {} if laid is None else {COORDINATES_FIELD: laid}
         if not decode:
-            return self.logits(tokens, train=train, **fields, **packing)
+            return self.logits(tokens, train=train, **given, **packing)
         if self.graph.attention_impl is None:
             raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
                                  "Dew's attention writes")
-        laid = self._laid(tokens, {**fields, **packing})
+        laid = self._laid({**given, **packing})
         if laid is not None and laid.max_segments > 1:
             raise ValueError("a decoding row continues one document, and these rows hold several")
         # The tokens that write: those the validity marks less the padding a row numbers 0 in its documents.
-        real = real_slots({**fields, **packing}, jnp.shape(tokens)[:2])
+        real = real_slots(given, jnp.shape(tokens)[:2])
         return self._decoded(tokens, real, None if laid is None else laid.positions)
 
     @property
@@ -1219,27 +1237,36 @@ class TorchCausalLM(nn.Module):
 
     def _step(self, variables, tokens, held, slots, filled, places, reach=None):
         params, buffers, compute = self._operands(variables)
-        precision = float32_products(compute, self.precision)
+        precision = self._products(compute)
         return self.graph.step(params, buffers, tokens, cache=held, slots=slots, filled=filled,
                                positions=places, reach=reach, precision=precision)
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
         """The logits of the whole rows, as `__call__` returns them: in at least float32
         (`at_least_fp32`), so a float64 model's are float64, as its output table's are."""
-        logits, _ = self._run(tokens, train, self._laid(tokens, packing))
+        logits, _ = self._run(tokens, train, self._laid(packing))
         return logits.astype(at_least_fp32(logits.dtype))
 
     def hidden_states(self, tokens, train: bool = False, *, conditioning: Mapping[str, object] | None = None,
-                      attention_pairwise_mask=None, attention_key_positions=None, **packing) -> jax.Array:
+                      attention_pairwise_mask=None, attention_key_runs=None, attention_key_positions=None,
+                      **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`, for rows laid as `logits` lays them
-        (`_laid`). `attention_pairwise_mask` `[B, S, S]` states what each token sees, which then
+        (`_laid`). `attention_pairwise_mask` `[B, S, S]`, or `attention_key_runs` `[B, S, R, 2]` (the keys
+        each token sees as runs, `AttentionMetadata.key_runs`), states what each token sees, which then
         replaces documents and causality, and `attention_key_positions` `[B, S]` the keys' positions a
         window counts (on Dew's attention only), as Dew's own decoders read them; the tokens' rotary
         positions are the packing's (`positions`, `coordinates`).
         A tier-3 model reads no context: `conditioning` stays empty."""
         if conditioning:
             raise TypeError("a tier-3 model has no cross-attention to read a context with")
-        laid = self._laid(tokens, packing)
+        laid = self._laid(packing)
+        if attention_key_runs is not None:
+            from dew.nn.attention_masks import visibility_mask
+
+            # The runs as the mask they state, the stated visibility this path reads.
+            length = jnp.shape(tokens)[1]
+            attention_pairwise_mask = visibility_mask(length, length, causal=False, sliding_window=None,
+                                                      key_runs=attention_key_runs)[:, 0]
         if attention_pairwise_mask is None:
             return self._run(tokens, train, laid)[1]
         if self.graph.attention_impl is None:
@@ -1257,25 +1284,19 @@ class TorchCausalLM(nn.Module):
         logits, _ = self._run(tokens, train=False, head_input=hidden)
         return logits.astype(at_least_fp32(logits.dtype))
 
-    def _laid(self, tokens, packing: Mapping[str, object]) -> Coordinates | None:
-        """The rows' `Coordinates` from their packing fields, None for none: a model on Dew's attention
-        reads `coordinates`, else `segment_ids`, `positions` and the validity field; one on
-        transformers' own refuses them (`_refuse_packing`)."""
+    def _laid(self, packing: Mapping[str, object]) -> Coordinates | None:
+        """The rows' `Coordinates`, their layout past `__call__` (ledger 1122), None for none: a model on
+        Dew's attention reads them, one on transformers' own refuses them (`_refuse_packing`); any
+        other field is refused."""
         if self.graph.attention_impl is None:
             _refuse_packing(packing)
             return None
-        unknown = sorted(set(packing) - {COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids", "positions"})
-        if unknown:
-            raise Lacks("packing", f"a tier-3 model reads its rows' documents, positions and validity, "
-                                   f"not {unknown}")
-        if not packing:
-            return None
         laid = packing.get(COORDINATES_FIELD)
-        if isinstance(laid, Coordinates):
-            return laid
-        batch, length = jnp.shape(tokens)[:2]
-        return coordinates((batch, length), segments=packing.get("segment_ids"),
-                           valid=packing.get(VALIDITY_FIELD), positions=packing.get("positions"))
+        unknown = sorted(set(packing) - {COORDINATES_FIELD})
+        if unknown or (laid is not None and not isinstance(laid, Coordinates)):
+            raise Lacks("packing", f"a tier-3 model reads its rows' layout as their coordinates, not "
+                                   f"{unknown or [COORDINATES_FIELD]}")
+        return laid
 
     def _run(self, tokens, train: bool, laid: Coordinates | None = None, *, visible=None, key_places=None,
              head_input=None) -> tuple[jax.Array, jax.Array]:
@@ -1293,18 +1314,24 @@ class TorchCausalLM(nn.Module):
         params, buffers, compute = self._operands(held)
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
-                          precision=float32_products(compute, self.precision), laid=laid, visible=visible,
+                          precision=self._products(compute), laid=laid, visible=visible,
                           key_places=key_places, head_input=head_input)
 
     def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array], Dtype]:
-        """The forward's parameters at `dtype`, its buffers, and the dtype its products take: torch's
-        operators state no precision, so the products take the one its compute dtype does
-        (`float32_products`), `dtype` or the dtype its floating parameters hold."""
+        """The forward's parameters at `dtype`, its buffers, and the dtype its products take: `dtype`, or
+        the dtype its floating parameters hold."""
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
         compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
                                                   if jnp.issubdtype(leaf.dtype, jnp.floating)])
         return params, buffers, compute
+
+    def _products(self, compute: Dtype) -> jax.lax.PrecisionLike:
+        """The precision the forward's products take: the one stated, else, for float32 operands, IEEE
+        float32 (`exact_float32`), since this forward is transformers' torch code, whose float32 matmuls
+        torch multiplies in IEEE float32 (TF32 off by default), and its output table's head alike; other
+        operands' at JAX's configured precision."""
+        return exact_float32(self.precision) if jnp.dtype(compute) == jnp.float32 else self.precision
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
@@ -1344,8 +1371,9 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 
 def load(source: sources.SourceReference, root: Path, *, dtype: str,
-         param_dtype: str, attention_impl: str, max_seq_len: int | None,
-         admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
+         param_dtype: str, attention_impl: AttentionImpl, max_seq_len: int | None,
+         admission: TorchAdmission | None = None, weights: bool = True,
+         placed: Placing | None = None) -> PretrainedFallback:
     """Load the causal LM `source` selects through transformers and torchax.
 
     `root` is the metadata snapshot `Pretrained.load` resolved at `source`'s
@@ -1356,6 +1384,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     `fallback="torchax"`. Without `weights` the model is built from its
     config on torch's meta device, nothing but metadata fetched or read, and
     its variables are their shapes and dtypes alone (`jax.ShapeDtypeStruct`).
+    `placed` places them as the load asks, by the layout as the model refines it for its torch names
+    (`TorchCausalLM.placement`); they stay on the host where it is None.
     """
     name_or_dir, revision = source.name, source.revision
     directory = source.directory(root)
@@ -1374,24 +1404,13 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     try:
         import torch
         from torchax.interop import JittableModule, extract_all_buffers
-        from transformers import AutoModelForCausalLM
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
     if weights:
         directory = source.directory(source.weights(root))
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
-    storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
-    if weights:
-        model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
-                                                     experts_implementation=EXPERTS)
-    else:
-        from transformers import AutoConfig
-
-        stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(
-                stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
+    model, by_name = _built(directory, param_dtype, weights)
     model.eval()
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
@@ -1404,7 +1423,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # The head's structure, which a forward shows: the loaded model's, or without its weights the
     # same class at the probe's sizes (`verify.shrink`), since a forward on the meta device reads no
     # values, which some forwards do.
-    if head_name is not None and not (_plain_head(model, head) if weights else _shrunk_plain_head(config)):
+    if head_name is not None and not (_plain_head(model, head) if weights and by_name is None
+                                      else _shrunk_plain_head(config)):
         head_name = None
     # After the head's eager check: the functional parts and Dew's attention run only inside the traced
     # forward. The parts keep their parameters, which the jittable module holds already.
@@ -1415,19 +1435,28 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # Host views of torch's storage: nothing reaches a device before the
     # caller's placement. Without the weights, their shapes and dtypes.
     def held(leaf, name):
-        if weights:
-            return host_view(leaf, name)
-        return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+        if not weights:
+            return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+        if by_name is not None and name in by_name:
+            # Read a device shard at a time, cast to its storage as the placement reads it
+            # (`dew.interop.streaming.SourceLeaf`), as a native family's checkpoint streams.
+            tensor = by_name[name]
+            return SourceLeaf((tensor,), checkpoint_dtype(np.dtype(tensor.dtype), param_dtype))
+        return host_view(leaf, name)
+
+    if by_name is not None and (unread := sorted(set(jittable.params) - set(by_name))):
+        raise ValueError(_unread(name_or_dir, unread))
 
     params = {name: held(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: held(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
     stored = model.state_dict()
     persistent = tuple(name for name in buffers if name in stored)
     vocab = int(head_weight.shape[0])
+    axes = planned_axes(model)
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
-                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)})
+                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes)
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
     named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")
@@ -1448,28 +1477,131 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
         f"{versions['torch']}; "
         + ("its attention on Dew's, packed rows and Dew's decode cache included; " if attends
            else "its attention transformers' own, no packing or decode cache; ")
-        + "no sharding rules beyond TorchLayout's name table; the load holds the "
-        "torch model on the host, at least 2x the checkpoint", TransformersTierWarning, stacklevel=3)
+        + f"placed by its tensor-parallel plan (TorchLayout); {_host_cost(weights, by_name)}",
+        TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
-    return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
-                              built, generation_config, export_adapter=graph.export, revision=revision)
+    variables = {"params": params, "buffers": buffers}
+    landed = variables if placed is None else placed(variables, module)
+    # What no placement read (a load onto no mesh), read whole in its storage; torch's names are flat.
+    kept = {collection: {name: leaf.read() if isinstance(leaf, SourceLeaf) else leaf
+                         for name, leaf in tree.items()} for collection, tree in landed.items()}
+    return PretrainedFallback(module, kept, processor, config, directory, built, generation_config,
+                              export_adapter=graph.export, revision=revision)
 
 
-def _shapes(leaves: Mapping[str, np.ndarray | jax.ShapeDtypeStruct]) -> dict[str, jax.ShapeDtypeStruct]:
+def _unread(source: str | Path, names: Sequence[str]) -> str:
+    """The refusal of a source whose checkpoint lacks parameters its model's class names, which a load
+    would draw: the source is its checkpoint."""
+    return (f"{source}'s checkpoint holds no {', '.join(names[:4])}{' and more' if len(names) > 4 else ''}, "
+            "which its model's class names: a load would draw them, and the source is its checkpoint")
+
+
+def _shapes(leaves: Mapping[str, np.ndarray | SourceLeaf | jax.ShapeDtypeStruct]
+            ) -> dict[str, jax.ShapeDtypeStruct]:
     """Each leaf's shape and dtype."""
     return {name: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for name, leaf in leaves.items()}
 
 
 def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
-    """`_plain_head` of the class `config` builds, at the probe's sizes (`verify.shrink`) with
-    transformers' own initialization: the head's structure, which no size changes."""
+    """`_plain_head` of the class `config` builds, at the probe's sizes and depth (`verify.shrink`,
+    `verify.shallow`) with transformers' own initialization: the head's structure, which no size
+    changes."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    fields = {key: value for key, value in verify.shrink(config).items() if key != "model_type"}
-    stated = AutoConfig.for_model(str(config["model_type"]), **fields)
+    model_type = str(config["model_type"])
+    probed = verify.shallow(verify.ModelSource(model_type), verify.shrink(config))
+    fields = {key: value for key, value in probed.items() if key != "model_type"}
+    stated = AutoConfig.for_model(model_type, **fields)
     model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
     return _plain_head(model.eval(), model.get_output_embeddings())
+
+
+def _host_cost(weights: bool, by_name: Mapping[str, np.ndarray] | None) -> str:
+    """What a tier-3 load held on the host (`_built`): only transformers' own load, which converts its
+    checkpoint, holds the torch model (ledger 2781)."""
+    if not weights:
+        return "its weights unread"
+    if by_name is not None:
+        return "its tensors read from the checkpoint by name, no torch copy of the model held"
+    return "the load holds the torch model on the host, at least 2x the checkpoint"
+
+
+def _built(directory: Path, param_dtype: str, weights: bool
+           ) -> tuple[PreTrainedModel, dict[str, np.ndarray] | None]:
+    """The causal LM `directory`'s config describes, and with `weights` its tensors by name
+    (`_stored_tensors`): its parameters on torch's meta device, its buffers computed as its modules
+    compute them, each tensor read from the checkpoint memory-mapped, which the load's placement streams
+    onto the mesh a leaf at a time, no copy of the model held on the host. It is built in its config's
+    dtype, or under `AUTO` with none stated in its checkpoint's first floating tensor's, as transformers'
+    own load infers it, so its computed buffers are the ones that load computes. A checkpoint a tensor
+    operation of transformers' converts (a fused expert's merge) loads through transformers' own load,
+    which alone applies them, and its tensors are the model's (None), refused where the checkpoint
+    lacks a parameter its class names. Without `weights`, the model on the meta device alone."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    try:
+        from accelerate import init_empty_weights
+    except ImportError as error:
+        raise ImportError(f"fallback='torchax' builds its model's parameters on the meta device with "
+                          f"accelerate: {INSTALL}") from error
+    storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
+    stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
+    built_as = stated.dtype if storage == "auto" else storage
+    shards = sources.load_shards(directory) if weights else {}
+    if built_as is None:
+        floating = (tensor.dtype for tensor in shards.values() if jnp.issubdtype(tensor.dtype, jnp.floating))
+        built_as = next((getattr(torch, dtype.name) for dtype in floating), None)
+    if not weights:
+        with torch.device("meta"):
+            built = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+        return built, None
+    with init_empty_weights(include_buffers=False):
+        model = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+    # Its tied parameters one, as transformers' load ties them, which `_stored_tensors` reads by each name.
+    model.tie_weights()
+    stored = _stored_tensors(model, shards)
+    if stored is not None:
+        return model, stored
+    loaded = AutoModelForCausalLM.from_pretrained(
+        str(directory), dtype=storage, local_files_only=True, experts_implementation=EXPERTS,
+        output_loading_info=True)
+    # The model and what its load read and drew (`output_loading_info`).
+    assert isinstance(loaded, tuple)
+    converted, loading = loaded
+    if loading["missing_keys"]:
+        raise ValueError(_unread(directory, sorted(loading["missing_keys"])))
+    return converted, None
+
+
+def _stored_tensors(model: PreTrainedModel, shards: Mapping[str, np.ndarray]) -> dict[str, np.ndarray] | None:
+    """A checkpoint's `shards` (`sources.load_shards`, memory-mapped) by the names `model` holds them
+    under, as stored, which the load casts to their storage leaf by leaf where it places them
+    (`_in_storage`): each key named as transformers' load names it (`sources.load_names`), a key the model
+    holds nothing under left out, and a tied parameter (an output table that is its input table) under
+    each of its names from the one the checkpoint stores it under. None where a key takes one of the
+    mapping's tensor conversions (a fused expert's merge), or the mapping renames a key by whether
+    another is stored, which transformers' own load applies."""
+    names = sources.load_names(model)
+    if names is None:
+        return None
+    held = model.state_dict()
+    named: dict[str, np.ndarray] = {}
+    for key, tensor in shards.items():
+        read = names(key)
+        if read.converter is not None:
+            return None
+        if read.name in held:
+            named[read.name] = tensor
+    tied: dict[int, list[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        tied.setdefault(id(parameter), []).append(name)
+    for names in tied.values():
+        for stored in [name for name in names if name in named][:1]:
+            for name in names:
+                named.setdefault(name, named[stored])
+    return named
 
 
 def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:

@@ -3,16 +3,21 @@ shows what it and the validation metrics report."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import contextlib
+import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 import jax
+from jax.sharding import Mesh
 
 from dew.batch import Batch
 from dew.objectives.base import Metric, Shown
 
 if TYPE_CHECKING:
     from dew.state import TrainState
+    from dew.training._fit import FitRun
+    from dew.training.interval import Interval
 
 
 class Rollout(Protocol):
@@ -28,6 +33,19 @@ class Rollout(Protocol):
     call (rewards, lag, truncation); each logging interval sends them to the
     tracker and the display as `rollout/<name>`. It may declare how the display
     shows them in `shown`, as an objective does.
+
+    A rollout whose `draws_further` is true may read data batches past the
+    step's, as DAPO's dynamic sampling does until its training batch is full:
+    the trainer calls it with `further`, a read of the training stream's next
+    batch, None where it ran out (`FitRun.further`), every process reading
+    as many, whose position the step's checkpoint saves as any read's.
+
+    A rollout whose calls change more than the batch they return (its metrics,
+    a log, a journal, rollouts in flight) may have `branch(name)`, a context
+    manager a cooldown branch's calls run inside, on the branch's states, `name`
+    the branch's own (`cooldown-<step>`, the step it branches at), after which
+    the rollout stands as the run left it (`_branched`). One without it is
+    called alike there.
     """
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
@@ -37,6 +55,45 @@ def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
     """The rollout's report of its latest call. A rollout is any callable,
     and a plain function reports nothing, so the trainer reads `metrics` at this boundary."""
     return getattr(rollout, 'metrics', {})
+
+
+def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
+               marked: Callable[[Batch], Batch], interval: Interval, run: FitRun) -> Batch:
+    """`batch` sampled through `rollout`, its host preparation `marked` and placed on `mesh`
+    (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
+    (`FitRun.held`); without a rollout, the batch as it is.
+
+    Host-side and untraceable: sampling, scoring, advantages. The key folds the
+    step key once more, keeping the rollout's draws off the step's stream; both
+    are checkpointed, so a resumed run samples forward. Fixed shapes mean the
+    step still compiles once.
+    """
+    from dew.distributed.batches import shard_batch
+
+    if rollout is None:
+        return batch
+    began = time.perf_counter()
+    key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
+    further = {"further": run.further(interval)} if _draws_further(rollout) else {}
+    with run.held():
+        batch = shard_batch(mesh, marked(rollout(state, batch, key, **further)))
+    interval.rollout_seconds += time.perf_counter() - began
+    return batch
+
+
+def _draws_further(rollout: Rollout) -> bool:
+    """Whether the rollout reads data batches past its step's (`Rollout`'s `draws_further`), which a
+    rollout is any callable and a plain function declares none of, so the trainer reads it at this
+    boundary."""
+    return getattr(rollout, "draws_further", False)
+
+
+def _branched(rollout: Rollout | None, name: str) -> contextlib.AbstractContextManager:
+    """The context the cooldown branch `name`'s rollout calls run in: the rollout's `branch(name)`,
+    which a rollout is any callable and a plain function has none of, so the trainer reads it at this
+    boundary."""
+    branch = getattr(rollout, "branch", None)
+    return contextlib.nullcontext() if branch is None else branch(name)
 
 
 def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, Shown]:

@@ -12,6 +12,7 @@ here are the knobs a run has:
     python tools/benchmark_data.py --steps 100 --data run.py
     python tools/benchmark_data.py matrix --output data-matrix.json --work matrix-work
     python tools/benchmark_data.py caching --workload bpe --read indexed --output caching.json
+    python tools/benchmark_data.py declared --output declared.json
 
 The matrix runs each arm, Dew's reader and plain Grain over the same steps, in
 a fresh interpreter over the same produced files.
@@ -350,14 +351,17 @@ def _dropping(config: Worker):
     """The workload's corpus as a chain whose steps can drop records and keep every one here: an image
     decode that rejects what doesn't decode, or a target count before the pack."""
     measured = config.measurement
-    from dew.data import Files, presets
+    from dew.data import Files, images, presets
     from dew.data.pipeline import Pipeline
     from dew.data.sources import TokenFiles
     from dew.data.steps.text import CountTargets
 
     if config.workload == "image":
+        # The image arm's own chain but for the decode's rejects, its captions dropped on the host
+        # as that arm drops them, since a batch carries no text to the devices.
         rows = Pipeline(Files(str(config.source), format="array_record")).shuffle(measured.seed).repeat()
-        return rows.pipe(presets.images, measured.image_size, batch=measured.batch, rejects=True)
+        return rows.pipe(presets.images, measured.image_size, batch=measured.batch, draft=True, rejects=True,
+                         caption=images.caption(), host=(images.EncodeCaptions(),))
     documents = Pipeline(TokenFiles(str(config.source))).shuffle(measured.seed).repeat()
     documents = documents.filter_map(CountTargets())
     return documents.pipe(presets.lm, None, seq_len=measured.seq_len, batch=measured.batch, bins=32)
@@ -540,8 +544,8 @@ def training_measure(factory, objective, config: Worker) -> dict:
     import optax
 
     from dew.distributed.batches import DevicePrefetchIterator
-    from dew.telemetry.instrumentation import model_flops_utilization
-    from dew.telemetry.profile import capture_options
+    from dew.telemetry.instrumentation import NO_FLOPS
+    from dew.telemetry.profile import Profiler
     from dew.training import Trainer
 
     trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
@@ -566,9 +570,9 @@ def training_measure(factory, objective, config: Worker) -> dict:
                     segment_started = None
                 before = time.perf_counter()
                 compiled[key] = trainer.compile(state, batch)
-                flops[key] = None if trainer.step_flops is None else trainer.step_flops.hardware
+                flops[key] = trainer.step_flops
                 compiles.append({"signature": key, "seconds": time.perf_counter() - before,
-                                 "flops": flops[key]})
+                                 "flops": None if flops[key] is None else flops[key].hardware})
             before = time.perf_counter()
             # The step's commit telemetry (its sixth output) is not a signal this run reads.
             state, loss, _, finite, accepted = compiled[key](state, batch)[:5]
@@ -591,7 +595,8 @@ def training_measure(factory, objective, config: Worker) -> dict:
             # After the timed steps, so the trace's own overhead is not in them, as `benchmark_step`
             # traces. A shape first seen here compiles inside the window, and its idle counts.
             with tempfile.TemporaryDirectory() as directory:
-                with jax.profiler.trace(directory, profiler_options=capture_options()):
+                # The timeline reads the trace alone, so the capture writes no reports.
+                with Profiler(directory, reports=False) as capture:
                     for _ in range(timed.train_steps):
                         batch = next(reader)
                         counted.counts.get_nowait()
@@ -600,14 +605,15 @@ def training_measure(factory, objective, config: Worker) -> dict:
                             compiled[key] = trainer.compile(state, batch)
                         state = compiled[key](state, batch)[0]
                     jax.block_until_ready(state)
-                timeline = device_idle(directory)
+                (captured,) = capture.captures
+                timeline = device_idle(str(captured))
     resolved = jax.device_get(signals)
     if any(not bool(finite) or not bool(accepted) for _, finite, accepted in resolved):
         raise ValueError("the real small-model update was nonfinite or not accepted")
     seconds = completed_seconds
     padded = sum(row["padded_tokens"] for row in measured)
     hlo_flops = None if any(row["hlo_flops"] is None for row in measured) else sum(
-        row["hlo_flops"] for row in measured)
+        (row["hlo_flops"] for row in measured), NO_FLOPS)
     model_flops = None if any(row["model_flops"] is None for row in measured) else sum(
         row["model_flops"] for row in measured)
     return {"steps": len(measured), "data_wait_ms": statistics.mean(
@@ -621,19 +627,37 @@ def training_measure(factory, objective, config: Worker) -> dict:
             "compile_count": len(compiles), "compiles": compiles, "device_timeline": timeline,
             "losses": [float(resolved[row["signal_index"]][0]) for row in measured],
             "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
-            "model_mfu_bf16_peak": model_flops_utilization(model_flops, seconds),
-            "model_flops_scope": "objective.training_flops on real host lengths and layout; "
-                                 "custom image-mean model and frozen legacy API have no analytic count",
-            "hlo_utilization_bf16_peak": model_flops_utilization(hlo_flops, seconds),
+            **rated(seconds, len(measured), sum(row["rows"] for row in measured), hlo_flops, model_flops,
+                    trainer.device_mesh.devices.size)}
+
+
+def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float | None, devices: int, *,
+          peak: float | None = None) -> dict:
+    """A training window's `steps` steps of `rows` rows over `seconds`, their compiled work `hlo_flops`
+    (`StepFlops`, each device's) and the objective's `model_flops` (the whole mesh's), rated as the
+    trainer's interval rates its steps (`dew.training.interval.throughput`) on `devices` devices of dense
+    bf16 `peak` (the device's own by default): the objective's work over the whole mesh's peak, and the
+    compiled work a lower bound where a launch's went uncounted (`StepFlops.unsized`)."""
+    from dew.training.interval import throughput
+
+    rates = throughput(seconds, steps, rows, hlo_flops, devices, training_flops=model_flops, peak=peak)
+    bound = "_lower_bound" if hlo_flops is not None and hlo_flops.unsized else ""
+    return {"model_mfu_bf16_peak": rates.get("train/mfu"),
+            "model_flops_scope": "objective.training_flops on real host lengths and layout, over the mesh's "
+                                 "dense bf16 peak; custom image-mean model and frozen legacy API have no "
+                                 "analytic count",
+            "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
+            "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / steps,
             "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
+                                 "a lower bound where unsized_kernels_per_step is not zero; "
                                  "not an analytic real-token MFU"}
 
 
 def device_idle(directory: str) -> dict[str, float]:
     """The share of the traced steps' device window no kernel ran in, from the accelerator's own
-    timeline (`trace_window.window_split`, summed over its devices), and the part of it a batch's
+    timeline (`dew.telemetry.trace.window_split`, summed over its devices), and the part of it a batch's
     host-to-device copy ended, the device waiting for data."""
-    from trace_window import device_events, window_totals
+    from dew.telemetry.trace import device_events, window_totals
 
     planes, _ = device_events(directory)
     if not planes:
@@ -653,6 +677,22 @@ def stage_profile(factory, batches: int = 16) -> list[dict]:
     return [{"file": Path(key[0]).name, "line": key[1], "function": key[2],
              "self_seconds": value[2], "cumulative_seconds": value[3], "calls": value[1]}
             for key, value in sorted(profile.stats.items(), key=lambda pair: pair[1][3], reverse=True)[:20]]
+
+
+def host_facts() -> dict:
+    """What automatic loading sizes by on this host (`dew.data.dataset.Host`), beside the machine's own
+    counts and the cgroup files it reads, so an arm's record says why its workers were what they were."""
+    import psutil
+
+    from dew.data.dataset import Host, _own_cgroup
+
+    group = _own_cgroup()
+    read = ("cpu.max", "memory.max", "memory.current", "memory.stat")
+    files = {name: (group / name).read_text().strip()[:2000] for name in read if (group / name).is_file()}
+    host = Host.current()
+    return {"cpus": host.cpus, "memory_bytes": host.memory, "affinity": len(os.sched_getaffinity(0)),
+            "cpu_count": os.cpu_count(), "available_bytes": psutil.virtual_memory().available,
+            "cgroup": str(group), "cgroup_files": files}
 
 
 def matrix_worker(config: Worker) -> dict:
@@ -677,7 +717,7 @@ def matrix_worker(config: Worker) -> dict:
             config.engine](config, objective, loading)
         opened = time.perf_counter() - started
         loader = loader_measure(factory, config, objective)
-        result = {"engine": config.engine, "workload": config.workload, "config": asdict(config),
+        result = {"engine": config.engine, "workload": config.workload, "config": recorded(config),
             "policy": policy, "cold_open_seconds": opened, "loader": loader,
             "loading": asdict(loading),
             "device": jax.devices()[0].device_kind,
@@ -686,7 +726,8 @@ def matrix_worker(config: Worker) -> dict:
                            "fresh process and loader objects; shared OS page cache after input preparation"),
             "environment": {"python": platform.python_version(), "platform": platform.platform(),
                 "cpu": platform.processor(), "packages": {name: importlib.metadata.version(name)
-                    for name in ("jax", "jaxlib", "numpy", "grain", "transformers")}}}
+                    for name in ("jax", "jaxlib", "numpy", "grain", "transformers")}},
+            "host": host_facts()}
         result["first_batch_from_open_seconds"] = opened + result["loader"]["first_batch_seconds"]
         if measured.train_steps:
             result["training"] = training_measure(factory, objective, config)
@@ -743,6 +784,26 @@ def comparison(rows: list[dict]) -> list[dict]:
     return verdicts
 
 
+def named(path: Path) -> str:
+    """`path` as a receipt records it: relative to the checkout inside it, by its name outside it, so no
+    receipt names the directories of the host that ran it (bible §2)."""
+    root, whole = Path(__file__).resolve().parents[1], path.resolve()
+    return str(whole.relative_to(root)) if whole.is_relative_to(root) else path.name
+
+
+def recorded(config: object) -> dict:
+    """`config`'s fields as a receipt records them, each path `named`."""
+    return {name: named(value) if isinstance(value, Path) else value
+            for name, value in asdict(config).items()}
+
+
+def recorded_inputs(inputs: dict) -> dict:
+    """The matrix's inputs as its receipt records them, each file's path and each source `named`; the run
+    itself reads them where they are (`inputs.json`)."""
+    return {workload: {key: named(Path(value)) if key in ("path", "source") else value
+                       for key, value in facts.items()} for workload, facts in inputs.items()}
+
+
 def run_matrix(config: Matrix) -> None:
     config.work.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
@@ -786,8 +847,8 @@ def run_matrix(config: Matrix) -> None:
         rows.append({**row, "cold": cold})
         result = {"schema": 1, "commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
-            "inputs": inputs, "rows": rows,
-            "comparisons": comparison(rows), "config": asdict(config)}
+            "inputs": recorded_inputs(inputs), "rows": rows,
+            "comparisons": comparison(rows), "config": recorded(config)}
         config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
         arm = f"{workload}/{engine}{' cold' if cold else ''}"
         print(f"{arm}: " + (f"exit {done.returncode}" if done.returncode else
@@ -839,7 +900,7 @@ def run_scaling(config: Scaling) -> None:
         rows.append({"cycle": cycle, **measured})
         print(f"cycle {cycle}: {measured['records_per_second']:.1f} rows/s", flush=True)
     base = rows[0]["records_per_second"]
-    config.output.write_text(json.dumps({"schema": 1, "config": asdict(config), "rows": rows, "speedup": {
+    config.output.write_text(json.dumps({"schema": 1, "config": recorded(config), "rows": rows, "speedup": {
         str(row["cycle"]): row["records_per_second"] / base for row in rows}}, indent=2, default=str) + "\n")
 
 
@@ -971,10 +1032,161 @@ def run_caching(config: Caching) -> None:
         timed("replay", root)
         shutil.rmtree(root)
         timed("fill", root)
-    result = {"schema": 1, "config": asdict(config), "host": platform.processor() or platform.machine(),
+    result = {"schema": 1, "config": recorded(config), "host": platform.processor() or platform.machine(),
               "cpus": os.cpu_count(), "seconds": rows}
     config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
     print(json.dumps(result, default=str), flush=True)
+
+
+@dataclass(frozen=True)
+class DeclaredReads:
+    """A declared Parquet file on S3 or GCS (`url`, an object of a bucket Arrow's own client reads) read by
+    each route Dew can take for it (rows 2886, 2991): Arrow's own client, the file's version (an S3 ETag, a
+    GCS generation) read before and after (`native`, `Files._versioned`), and Dew's reads held to that
+    version, each Arrow read one request (`held`, `_DeclaredHandler`), alternating, each `repeats` times;
+    their medians and throughputs, beside the object's size and row groups, which the receipt names."""
+
+    url: str = ("s3://overturemaps-us-west-2/release/2026-10-21.0/theme=places/type=place/"
+                "part-00000-a0a9949b-7e8e-59fe-803b-6cc55b17f790-c000.zstd.parquet")
+    """Overture's places, 730 MB in 256 row groups, whose reads docs/design/data.md cites."""
+    region: str = "us-west-2"
+    anonymous: bool = True
+    columns: tuple[str, ...] = ("confidence",)
+    repeats: int = 5
+    output: Path = Path("data-declared-reads.json")
+
+
+def declared_object(url: str, anonymous: bool, region: str):
+    """The store of `url`, on S3 or GCS, its filesystem and path, and its declaration as its store states
+    it: its size and the version a read of it is held to."""
+    from dew.data.storage import STORED, Store
+
+    scheme = url.split("://", 1)[0]
+    options = ({"token": "anon" if anonymous else "google_default"} if scheme in ("gs", "gcs")
+               else {"anon": anonymous, "client_kwargs": {"region_name": region}})
+    store = Store(url, options)
+    fs, path = store.resolve()
+    info = fs.info(path)
+    version = STORED[scheme]
+    stated = info["ETag" if version == "etag" else version]
+    return store, fs, path, info, {"bytes": info["size"], "stored": {version: stated}}
+
+
+def run_declared_reads(config: DeclaredReads) -> None:
+    import pyarrow.fs as pafs
+    import pyarrow.parquet as pq
+
+    from dew.data.declared import Declared
+    from dew.data.sources.files import _arrow_filesystem, _DeclaredHandler
+
+    store, fs, path, info, stated = declared_object(config.url, config.anonymous, config.region)
+    declared = Declared(store, stated)
+    groups = pq.ParquetFile(fs.open(path)).metadata.num_row_groups
+    native = _arrow_filesystem(fs)
+    assert not isinstance(native, pafs.PyFileSystem), "Arrow's own client carries this store's settings"
+    held = pafs.PyFileSystem(_DeclaredHandler(fs, {path: declared}))
+
+    def read(filesystem, checked: bool) -> tuple[float, int]:
+        started = time.perf_counter()
+        if checked:
+            declared.still_held()
+        table = pq.read_table(path, columns=list(config.columns), filesystem=filesystem)
+        if checked:
+            declared.still_held()
+        return time.perf_counter() - started, table.nbytes
+
+    seconds: dict[str, list[float]] = {"native": [], "held": []}
+    decoded = 0
+    for _ in range(config.repeats):
+        for arm, filesystem, checked in (("native", native, True), ("held", held, False)):
+            took, decoded = read(filesystem, checked)
+            seconds[arm].append(took)
+    medians = {arm: statistics.median(times) for arm, times in seconds.items()}
+    result = {"schema": 1, "config": recorded(config), "object": config.url, "object_bytes": info["size"],
+              "row_groups": groups, "decoded_bytes": decoded, "seconds": seconds, "median_seconds": medians,
+              "native_speedup": medians["held"] / medians["native"]}
+    config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps({key: result[key] for key in ("object", "object_bytes", "row_groups", "median_seconds",
+                                                    "native_speedup", "decoded_bytes")}))
+
+
+@dataclass(frozen=True)
+class DeclaredShard:
+    """A declared ArrayRecord shard on GCS (`url`) read by the routes Dew could take for it (row 2991):
+    ArrayRecord's own GCS reader opening the path, the shard's generation read before and after
+    (`native`), and the shard read whole into a fresh mirror, checked against its digest, and read there
+    (`mirror`, `Declared.leased`), each reading `reads` records in a shuffled order, alternating, each
+    `repeats` times; their medians, with the time to each route's first record."""
+
+    url: str
+    """The shard, e.g. a synthetic 300 MB one of 3000 records of 100 KB (row 2991's, its bucket since
+    deleted)."""
+    anonymous: bool = False
+    reads: tuple[int, ...] = (64, 1024)
+    repeats: int = 3
+    output: Path = Path("data-declared-shard.json")
+
+
+def run_declared_shard(config: DeclaredShard) -> None:
+    import tempfile
+
+    import grain.python as grain
+    import numpy as np
+
+    from dew.data.declared import Declared
+    from dew.data.storage import Store
+
+    store, _, _, info, stated = declared_object(config.url, config.anonymous, "")
+    declared = Declared(store, stated)
+    # The digest the mirror checks its copy against, of the declared generation's bytes.
+    with declared.open() as opened:
+        digest = hashlib.sha256(opened.read()).hexdigest()
+
+    def native(count: int) -> tuple[float, float]:
+        started = time.perf_counter()
+        # Held to the declared generation as Arrow's own clients are (`Declared.still_held`, `Files`).
+        declared.still_held()
+        source = grain.ArrayRecordDataSource([config.url])
+        order = np.random.default_rng(count).permutation(len(source))[:count]
+        first = None
+        for index in order:
+            source[int(index)]
+            first = first or time.perf_counter() - started
+        declared.still_held()
+        return time.perf_counter() - started, first or 0.0
+
+    def mirror(count: int) -> tuple[float, float]:
+        with tempfile.TemporaryDirectory() as directory:
+            started = time.perf_counter()
+            options = {**(store.storage_options or {}), "dewcache": {"cache_storage": directory}}
+            held = Store(config.url, options)
+            local, pin = Declared(held, {**stated, "sha256": digest}).leased()
+            with pin:
+                source = grain.ArrayRecordDataSource([local])
+                order = np.random.default_rng(count).permutation(len(source))[:count]
+                first = None
+                for index in order:
+                    source[int(index)]
+                    first = first or time.perf_counter() - started
+            return time.perf_counter() - started, first or 0.0
+
+    results = {}
+    for count in config.reads:
+        times: dict[str, list[tuple[float, float]]] = {"native": [], "mirror": []}
+        for _ in range(config.repeats):
+            for arm, read in (("native", native), ("mirror", mirror)):
+                times[arm].append(read(count))
+        results[str(count)] = {
+            arm: {"seconds": [took for took, _ in runs],
+                  "median_seconds": statistics.median(took for took, _ in runs),
+                  "median_first_record_seconds": statistics.median(first for _, first in runs)}
+            for arm, runs in times.items()}
+    result = {"schema": 1, "config": recorded(config), "object": config.url, "object_bytes": info["size"],
+              "reads": results}
+    config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps({"object": config.url, "object_bytes": info["size"],
+                      **{count: {arm: entry["median_seconds"] for arm, entry in arms.items()}
+                         for count, arms in results.items()}}))
 
 
 if __name__ == "__main__":
@@ -986,5 +1198,9 @@ if __name__ == "__main__":
         run_scaling(tyro.cli(Scaling, args=sys.argv[2:]))
     elif sys.argv[1:2] == ["caching"]:
         run_caching(tyro.cli(Caching, args=sys.argv[2:]))
+    elif sys.argv[1:2] == ["declared"]:
+        run_declared_reads(tyro.cli(DeclaredReads, args=sys.argv[2:]))
+    elif sys.argv[1:2] == ["declared-shard"]:
+        run_declared_shard(tyro.cli(DeclaredShard, args=sys.argv[2:]))
     else:
         main(benchmark(sys.argv[1:]))

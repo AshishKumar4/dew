@@ -5,22 +5,44 @@ coordinates are whatever the caller's layout counts, slots, places in a document
 caller keeps its layout and builds no global mask to ask. An asymmetric window (Gemma's audio blocks)
 states its own sides."""
 
-from typing import Literal
+from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import BLOCKS_FIELD, coordinates, document_starts
+from dew.batch import BLOCKS_FIELD, coordinates, document_starts, prefix_max, prefix_min, prefix_sum
 
 
 def windowed(query, key, window: int, *, causal: bool):
-    """Whether each key coordinate lies within the window of each query coordinate (broadcast): a
-    causal window bounds the keys behind the query, keeping it and the w - 1 before it, and a two-sided
-    one those within w - 1 of it on either side (`window_sides`). It bounds distance alone; causality
-    is `visible`'s."""
-    distance = query - key
-    return (distance < window) if causal else (jnp.abs(distance) < window)
+    """Whether each key coordinate lies within the window of each query coordinate (broadcast), the keys
+    `window_sides` keeps before and after it: a causal window bounds the keys behind the query, keeping
+    it and the w - 1 before it, and a two-sided one those within w - 1 of it on either side. It bounds
+    distance alone; causality is `visible`'s. The scalar form of the template's spans' window
+    (`dew.nn.kernels.templates.attention.spans`), for coordinates no span holds: a stated mask's places,
+    which need not run in order, and a banded layout's rows."""
+    before, after = window_sides(causal, window)
+    # NumPy coordinates stay NumPy's, so a program that traces knows a static window as it traces.
+    xp = jnp if any(isinstance(x, jax.Array) for x in (query, key)) else np
+    query, key = xp.asarray(query), xp.asarray(key)
+    ahead = query >= key
+    within_before = _distance(query, key, xp) <= before
+    if causal:
+        return ~ahead | within_before
+    return xp.where(ahead, within_before, _distance(key, query, xp) <= after)
+
+
+def _distance(far, near, xp):
+    """`far - near` where `far >= near`, exact for every integer pair: integers' difference taken in the
+    unsigned word of their common width, which holds it where the signed one wraps."""
+    common = xp.result_type(far, near)
+    if not np.issubdtype(common, np.integer):
+        return far - near
+    unsigned = np.dtype(f"uint{np.dtype(common).itemsize * 8}")
+    if xp is np:
+        return far.astype(common).view(unsigned) - near.astype(common).view(unsigned)
+    far, near = (jax.lax.bitcast_convert_type(x.astype(common), unsigned) for x in (far, near))
+    return far - near
 
 
 def visible(query, key, *, causal: bool, window: int | None = None):
@@ -32,10 +54,30 @@ def visible(query, key, *, causal: bool, window: int | None = None):
     return keep if window is None else keep & windowed(query, key, window, causal=causal)
 
 
+@overload
+def chunk_of(places: jax.Array, chunk: int) -> jax.Array: ...
+
+
+@overload
+def chunk_of(places: np.ndarray | int, chunk: int) -> np.ndarray: ...
+
+
+def chunk_of(places: jax.Array | np.ndarray | int, chunk: int) -> jax.Array | np.ndarray:
+    """Each place's chunk number of `chunk` places, in the places' own dtype: `place // chunk`, a chunk wider
+    than the dtype holds every place of one sign. The template's spans (`dew.nn.kernels.templates.attention
+    .spans`) and `same_chunk` count chunks by it; NumPy places stay NumPy's, as `windowed`'s do."""
+    xp = jnp if isinstance(places, jax.Array) else np
+    places = xp.asarray(places)
+    if chunk > xp.iinfo(places.dtype).max:
+        return xp.where(places >= 0, 0, -1).astype(places.dtype)
+    return places // chunk
+
+
 def same_chunk(query, key, chunk_size: int):
     """Whether a key falls in the query's chunk of `chunk_size` (broadcast), both counted from the
-    sequence start: transformers' `chunked_overlay`, `kv // chunk == q // chunk`."""
-    return query // chunk_size == key // chunk_size
+    sequence start (`chunk_of`): transformers' `chunked_overlay`, `kv // chunk == q // chunk`. The scalar
+    form of the template's spans' chunks, for coordinates no span holds."""
+    return chunk_of(query, chunk_size) == chunk_of(key, chunk_size)
 
 
 def same_group(query_groups, key_groups):
@@ -61,16 +103,10 @@ def role_blocks(segments, roles, assistant: int, *, starts=None, xp=jnp):
     places = xp.broadcast_to(xp.arange(segments.shape[-1], dtype=xp.int32), segments.shape)
     opens = starts if starts is not None else xp.concatenate(
         [xp.ones_like(segments[..., :1], bool), segments[..., 1:] != segments[..., :-1]], axis=-1)
-    start = _cummax(xp.where(opens, places, 0), xp)
-    spoken = _cummax(xp.where((segments > 0) & (roles == assistant), places, -1), xp) >= start
+    last = segments.ndim - 1
+    start = prefix_max(xp.where(opens, places, 0), last, xp=xp)
+    spoken = prefix_max(xp.where((segments > 0) & (roles == assistant), places, -1), last, xp=xp) >= start
     return xp.where((segments > 0) & ~spoken, segments, -1).astype(xp.int32)
-
-
-def _cummax(values, xp):
-    """The running maximum along the last axis, in `xp`."""
-    if xp is np:
-        return np.maximum.accumulate(values, axis=-1)
-    return jax.lax.cummax(values, axis=values.ndim - 1)
 
 
 def prefix_groups(documents, real, prefix: int | Literal["prompt"], *, positions=None, roles=None,
@@ -103,7 +139,7 @@ def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):
     valid = xp.asarray(valid, bool)
     if prefix == "prompt":
         return xp.where(valid, 1, -1).astype(xp.int32)
-    return prefix_blocks(valid.astype(xp.int32), xp.cumsum(valid, axis=1, dtype=xp.int32) - 1, prefix, xp=xp)
+    return prefix_blocks(valid.astype(xp.int32), prefix_sum(valid, dtype=np.int32, xp=xp) - 1, prefix, xp=xp)
 
 
 def served_blocks(real, prefix: int | Literal["prompt"]):
@@ -133,7 +169,7 @@ def block_starts(groups):
     batch, length = groups.shape
     index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
     opens = jnp.concatenate([jnp.ones((batch, 1), bool), groups[:, 1:] != groups[:, :-1]], axis=1)
-    return jax.lax.cummax(jnp.where(opens, index, 0), axis=1)
+    return prefix_max(jnp.where(opens, index, 0))
 
 
 def block_ends(groups):
@@ -144,7 +180,7 @@ def block_ends(groups):
     index = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
     # A run's last token: the next one's id differs, or the row ends there.
     last = jnp.concatenate([groups[:, 1:] != groups[:, :-1], jnp.ones((batch, 1), bool)], axis=1)
-    return jax.lax.cummin(jnp.where(last, index, length), axis=1, reverse=True) + 1
+    return prefix_min(jnp.where(last, index, length), reverse=True) + 1
 
 
 def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:

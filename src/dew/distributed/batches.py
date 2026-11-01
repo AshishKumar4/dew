@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import contextlib
 import json
 import logging
 import pickle
@@ -26,6 +27,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.batch import Batch
+from dew.cleanup import attempted
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.distributed.placement import Placement, placeable, placed_bytes, placed_shapes
 from dew.mesh import SEQUENCE_AXIS, batch_axes
@@ -311,6 +313,12 @@ def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PRE
     return (depth + 1) * placed_bytes(placed_shapes(batch, shardings))
 
 
+def restore_position(source: Checkpointable, saved: bytes) -> None:
+    """Set `source` to the position `saved` holds, as its own `get_state` gives one: the bytes
+    themselves, or the JSON they encode."""
+    source.set_state(saved if isinstance(source.get_state(), bytes) else json.loads(saved))
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -378,6 +386,10 @@ class DevicePrefetchIterator:
         # first `next` sets (`peek`).
         self._first: Batch | None = None
         self._placing = False
+        # The callers holding placements (`held`) and whether a batch is being placed now, both under
+        # `_ready`, which a stop notifies too, so a worker waiting out a hold still stops.
+        self._holds = 0
+        self._placing_now = False
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         self._withdraw_exit: Callable[[], None] | None = None
         # No source work may start until the caller owns this object. In
@@ -449,9 +461,7 @@ class DevicePrefetchIterator:
             if not self._stop.is_set() and self.source_state is not None:
                 if source is None:
                     raise TypeError(f"{self._source_name} cannot resume from a saved position")
-                saved = self.source_state
-                source.set_state(saved if isinstance(source.get_state(), bytes)
-                                 else json.loads(saved))
+                restore_position(source, self.source_state)
             while not self._stop.is_set():
                 with region("data.read"):
                     batch = next(iterator)
@@ -471,8 +481,18 @@ class DevicePrefetchIterator:
                         self._first = None
                     if self._stop.is_set():
                         break
-                with region("data.place"), nn.logical_axis_rules(self._rules):
-                    placed = shard_batch(mesh, batch, self._reads)
+                with self._ready:
+                    self._ready.wait_for(lambda: self._stop.is_set() or not self._holds)
+                    if self._stop.is_set():
+                        break
+                    self._placing_now = True
+                try:
+                    with region("data.place"), nn.logical_axis_rules(self._rules):
+                        placed = shard_batch(mesh, batch, self._reads)
+                finally:
+                    with self._ready:
+                        self._placing_now = False
+                        self._ready.notify_all()
                 batch = None
                 with region("data.enqueue"), self._ready:
                     self._ready.wait_for(lambda: self._stop.is_set() or len(self._queued) < self._depth)
@@ -506,6 +526,44 @@ class DevicePrefetchIterator:
                 with self._ready:
                     self._done.set()
                     self._ready.notify_all()
+
+    @contextlib.contextmanager
+    def held(self) -> Iterator[None]:
+        """Place no batch while the caller's block runs, a placement under way finishing first; the
+        worker reads on meanwhile, and its next placement waits for the block to end.
+
+        A run holds its prefetcher while it does device work beside its steps (a compile, an
+        evaluation, a checkpoint): XLA's GPU pool gives an allocation the lowest block it fits, so a
+        batch placed while that work holds memory lands past it, inside the free block the next step's
+        temporaries take whole, and stays there until a later step reads it (row 2088: a 4B's step that
+        fit its 50.35 GiB block before its first validation pass found it split after the pass, by a
+        batch the stream read ahead of the pass). The block must not read this iterator, whose next
+        batch may wait on the placement it holds, but through `read_held`; closing it stops the worker
+        as ever."""
+        with self._ready:
+            self._holds += 1
+            self._ready.wait_for(lambda: not self._placing_now)
+        try:
+            yield
+        finally:
+            with self._ready:
+                self._holds -= 1
+                self._ready.notify_all()
+
+    def read_held(self) -> Batch:
+        """The next batch, read by a block that holds this iterator's placements (`held`): the hold is
+        let go for the read, whose batch may wait on a placement, and taken again after it, once a
+        placement it let through finishes. A rollout that draws further batches reads them so
+        (`dew.training.rollout.rolled_out`)."""
+        with self._ready:
+            self._holds -= 1
+            self._ready.notify_all()
+        try:
+            return next(self)
+        finally:
+            with self._ready:
+                self._holds += 1
+                self._ready.wait_for(lambda: not self._placing_now)
 
     def _discard(self) -> None:
         """Drop every batch already queued, without waiting for more."""
@@ -560,12 +618,7 @@ class DevicePrefetchIterator:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        try:
-            self.close()
-        except BaseException as error:
-            if exc is None:
-                raise
-            exc.add_note(f"Prefetch cleanup failed: {error!r}")
+        attempted((("Prefetch cleanup", self.close),), primary=exc)
 
     def __iter__(self):
         return self

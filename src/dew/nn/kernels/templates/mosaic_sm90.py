@@ -15,9 +15,10 @@ from dew.nn.kernels.templates import mosaic
 
 class Wgmma(mosaic.RingFamily):
     """wgmma's bundle: a warpgroup's 64 rows, TMA rings fed by a producer warpgroup (`mosaic.RingFamily`),
-    products from shared memory or registers into a warpgroup accumulator in the WGMMA layout, asynchronous
-    until waited for. Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA:
-    interpreted, such a product is the dot it would compute."""
+    multicast across a pair of multiprocessors where a cluster shares a ring's blocks, products from shared
+    memory or registers into a warpgroup accumulator in the WGMMA layout, asynchronous until waited for.
+    Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a warpgroup MMA: interpreted, such a
+    product is the dot it would compute."""
 
     name = "wgmma"
     takes_tf32 = True
@@ -26,6 +27,7 @@ class Wgmma(mosaic.RingFamily):
     role_rows = 64
     widest_product = 256
     most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
+    cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
     @property
     def layout(self):
@@ -41,6 +43,32 @@ class Wgmma(mosaic.RingFamily):
 
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
+    held_registers = 4
+    """A consumer thread's own state beside its tiles: its lane's coordinates in its fragment and the walk's
+    counters where they diverge. Descriptors, barriers and TMA coordinates are warp-uniform and live in the
+    uniform registers (ET-BATCH1's dK/dV SASS: HGMMA gdesc[UR16], SYNCS.PHASECHK [UR17], TMA [UR48], the
+    descriptor's UIADD3.64): the tensormap pair, the barrier and the warpgroup's id (3117's census of the
+    sm90 recurrence, GEMM and attention launches). A store's staging and a hook's values are the
+    launches' own phases, not this; its addresses into the tiles it reads and writes itself are its
+    `scalar_registers`'."""
+
+    def scalar_registers(self, addressed=()) -> int:
+        # The core words and a thread's own shared-memory addresses (`mosaic.addresses`), which the
+        # recurrence's states launches and the exact normed kernel gradient spilled without (28 to 392 bytes
+        # at the four core words alone).
+        return self.held_registers + mosaic.addresses(addressed)
+
+    def column_registers(self, columns: int, dtype) -> int:
+        # The column layout repeats a vector over the warpgroup's four warps and eight lanes of each, so a
+        # thread holds a quarter of its columns: FS-K01-CAUSE-VECTOR, an fp32 column vector's epilogue at
+        # 128 and 256 columns needs 104 and 200 against a row vector's 96 and 160.
+        return -(-columns * jnp.dtype(dtype).itemsize // 16)
+
+    def row_registers(self, rows: int, dtype) -> int:
+        # Each warp's 16 rows of an MMA, a thread two of them, so a thread holds a 32nd of a consumer's rows:
+        # the fast attention backward's dQ consumer carries seven fp32 row vectors, 4 registers each at 128
+        # rows (DQROWPROOF64: 260 against ptxas's 255 and 512 bytes spilled; DQROWPROOF128: 184 at 64 rows).
+        return -(-rows * jnp.dtype(dtype).itemsize // 128)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
@@ -83,19 +111,6 @@ class Wgmma(mosaic.RingFamily):
 
         return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
-        mosaic.unscaled(parts)
-        for place, (part, _) in enumerate(parts):
-            buffers.at[place][...] = part.astype(buffers.dtype)
-        plgpu.commit_smem()
-        for place in range(len(parts)):
-            lhs = buffers.at[place].transpose((1, 0)) if transposed else buffers.at[place]
-            if interpret:
-                acc = acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-            else:
-                plgpu.wgmma(acc, lhs, rhs)
-        return acc
-
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         if interpret:
             return self.register_products(scale(acc), parts, rhs, interpret)
@@ -137,5 +152,17 @@ class Wgmma(mosaic.RingFamily):
 
 WGMMA = Wgmma()
 """The wgmma family's bundle."""
+
+
+class WgmmaFed(mosaic.ConsumerFed, Wgmma):
+    """wgmma's bundle without a producer: its consumers feed their own rings (`mosaic.ConsumerFed`), each
+    at its program's entry registers, the layout a tile whose consumers need more than a producer leaves
+    them takes."""
+
+    name = "wgmma.fed"
+
+
+FED = WgmmaFed()
+"""wgmma's bundle without a producer."""
 
 

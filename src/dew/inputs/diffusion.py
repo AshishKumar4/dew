@@ -15,9 +15,9 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.batch import Variables
+from dew.batch import Variables, coordinates
 from dew.diffusion.process import DenoisingCondition
-from dew.inputs.encoders import ConditionEncoder, ConditionWork
+from dew.inputs.condition import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
 from dew.nn.flops import counted_flops, projection_flops
 from dew.nn.precision import accumulated
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
     from dew.data.text import PinnedTokenizer
     from dew.distributed.placement import Layout, MeshSpec
+    from dew.nn.attention import AttentionImpl
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -190,7 +191,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
-                        attention_impl: str = "auto", params: Variables | None = None,
+                        attention_impl: AttentionImpl = "auto", params: Variables | None = None,
                         mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                         height: int | None = None, width: int | None = None):
         """The pipeline's conditioning; `height` and `width` replace the image size its
@@ -405,7 +406,7 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
-                        attention_impl: str = "auto", tokens: int = 512,
+                        attention_impl: AttentionImpl = "auto", tokens: int = 512,
                         params: Variables | None = None, mesh: MeshSpec | Mesh | None = None,
                         layout: Layout | None = None):
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
@@ -575,8 +576,9 @@ class HiddenStatesConditioner(_LanguageText):
                              "are no layer's output")
         states = _layer_states(self.tower, {"params": params["text_encoder"]["params"]}, ids,
                                [layer - 1 for layer in self.layers],
-                               attention_mask=jnp.asarray(tokens["attention_mask"], bool),
-                               positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape))
+                               coordinates=coordinates(
+                                   ids.shape, valid=jnp.asarray(tokens["attention_mask"], bool),
+                                   positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape)))
         guidance = None if self.guidance is None else jnp.asarray(tokens["guidance"], jnp.float32)
         return DenoisingCondition(jnp.concatenate(states, axis=-1),
                                   mask=jnp.asarray(tokens["attention_mask"], bool), guidance=guidance)

@@ -14,9 +14,11 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from float64_terms import float64_forward
 from interop_support import allocated_bytes, written_tensors
+from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
-from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
+from reference_error import ieee_fixture
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
@@ -227,13 +229,14 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
 
 
 def joint_logits(decide) -> np.ndarray:
-    """Dew's logits of every question the cases lay out, in the fixture's order."""
+    """Dew's logits of every question the cases lay out, in the fixture's order, each case's pass the
+    task's own, as a served request scores it (`Decide.scored`)."""
     found = []
     for request in CASES.values():
         questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
         [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
-        scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0)))
-        found += [scores[0, slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
+        [scores] = decide.scored([row])
+        found += [scores[slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
     return np.concatenate(found)
 
 
@@ -347,6 +350,78 @@ def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
             np.testing.assert_array_equal(alone[name], np.asarray(tensor), err_msg=name, strict=True)
 
 
+def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_path):
+    """A loaded task holds its backbone's projections packed to serve (`Decide._served`, ledger 2299); a
+    run trained from it reads the model's own tree, the projections split back (`unpacked`), as a run
+    from the release does (`Decide.released`), so the run's checkpoint is the tree its resume builds."""
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+
+    def backbone(variables):
+        return jax.tree.structure(variables["params"]["backbone"])
+
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    own = backbone(Decide.released(bundle).variables)
+    task = Decide.from_pretrained(release, attention_impl="xla")
+    assert backbone(task.variables) != own
+    trained = DecisionObjective(task, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+    assert backbone(trained) == own
+
+
+@pytest.mark.parametrize("frozen", ["trunk", "keys and values"])
+def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_path, frozen):
+    """A run that held its trunk frozen, or some members of a projection group (each attention layer's
+    keys and values, its queries trained), loads as a task whose backbone packs as its export's, the
+    same weights in one collection, does (`dew.inference.projections`, ledger 2439): one layout, so the
+    two loads compute alike and answer alike. A run trained from either task holds frozen exactly what
+    its run held frozen (`trained_tree`), a group's frozen members among them."""
+    from dew.batch import FROZEN, freeze, part, thaw
+    from dew.inference.projections import inference_projections
+    from dew.objectives.base import joined
+
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+    trains = {"trunk": lambda path: path[1] == "head",
+              "keys and values": lambda path: not {"k_proj", "v_proj"} & set(path)}[frozen]
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    start = Decide.released(bundle)
+    objective = DecisionObjective(replace(start, variables=freeze(start.variables, trains)),
+                                  layout=JointLayout(max_len=1024))
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    examples = [Example(state, {"team": team}, {"team": label})
+                for state, label in (("charged twice", "billing"), ("site is down", "technical"))] * 4
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        decision_rows(examples, 8, examples, objective=objective.data()), steps=1, log_every=100,
+        checkpoint_every=1)
+    checkpoints.wait()
+    assert FROZEN in state.variables
+
+    # The run's weights in one collection, as its export holds them, packed as a load packs them and
+    # placed where the loaded task holds each.
+    trained = thaw(jax.device_get(state.variables))
+    loaded = Decide.from_run(str(run))
+    held = thaw(loaded.variables)["params"]
+    weights = joined({"backbone": inference_projections(loaded.model.backbone, part(trained, "backbone")),
+                      "head": part(trained, "head")})["params"]
+    assert jax.tree.structure(held) == jax.tree.structure(weights)
+    for leaf, alike in zip(jax.tree.leaves(held), jax.tree.leaves(weights), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike), strict=True)
+    unsplit = replace(loaded, variables={"params": jax.tree.map(
+        lambda leaf, alike: jax.device_put(alike, leaf.sharding), held, weights)})
+    for state_text in ("charged twice!", "is the site down?"):
+        found, expected = loaded(state_text, {"team": team}), unsplit(state_text, {"team": team})
+        np.testing.assert_array_equal(found["team"].probabilities, expected["team"].probabilities)
+    resumed = DecisionObjective(loaded, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+    for collection in ("params", FROZEN):
+        assert jax.tree.structure(resumed[collection]) == jax.tree.structure(state.variables[collection])
+
+
 def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
     """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone, joint head and layout
     train together on rows of several questions, and the saved run loads back as a task with identical
@@ -372,7 +447,7 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=1024))
     data = decision_rows(examples, 8, examples, objective=objective.data())
-    start = objective.init(jax.random.key(0))
+    start = jax.jit(objective.init)(jax.random.key(0))
     runs, states = [], []
     for index, steps in enumerate((2, 1)):
         run = tmp_path / f"run{index}"

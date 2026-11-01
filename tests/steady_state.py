@@ -18,7 +18,7 @@ explicit ones through.
 JAX's guard refuses an implicit device-to-host read where the read copies,
 on a GPU; on the CPU backend an array reaches numpy as a view, with no copy
 for upstream's guard to refuse (jax-ml/jax#16602). Dew's JAX build holds a
-CPU array's read to the guard too (constraints.txt: its host value, its copy
+CPU array's read to the guard too (docs/installation.md: its host value, its copy
 to host and its buffer, as an accelerator's copy is held), so a block's
 `float(x)` fails on the CPU suite as it does on a GPU.
 

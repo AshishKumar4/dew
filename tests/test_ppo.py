@@ -10,25 +10,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from episode_support import (
-    GROUPS,
-    PROMPT,
-    RESPONSE,
-    SAMPLING,
-    TURNS,
-    VOCAB,
-    Harness,
-    ToolPolicy,
-    collect,
-    per_call,
-    verify,
-)
+from episode_support import SAMPLING, Harness, collect, per_call, verify
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 from rl_support import clipped_surrogate, token_mean
+from tool_policy import GROUPS, PROMPT, RESPONSE, TURNS, VOCAB, ToolPolicy
 
 from dew.batch import part
 from dew.data.dataset import Loader
+from dew.nn.progress import END, Progress
 from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeCollector, EpisodeStatus, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
@@ -48,7 +38,7 @@ FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
 
 class TokenFeatures(nn.Module):
     @nn.compact
-    def hidden_states(self, tokens, train=False, *, segment_ids=None, positions=None):
+    def hidden_states(self, tokens, train=False, *, coordinates=None):
         scale = self.param("scale", nn.initializers.ones, (VOCAB,))
         return jax.nn.one_hot(tokens, VOCAB) * scale
 
@@ -130,35 +120,53 @@ def episode_returns(rewards, values, gamma, lam, dtype):
     return out
 
 
+STEP_REWARD_SEEDS = 8
+"""The step rewards' returns' declared seeds for check 1, each a rollout (`assert_as_exact`), sized by
+`seeds_for` paired with PPORollout's returns on the CPU."""
+
+
 def test_each_step_reward_lands_on_the_last_action_of_the_call_it_paid_for():
     """A square tool that pays 0.5 for its tool step and 0.25 for the answer step, beside the
     verifier's reward: GAE's returns over each episode's actions are verl's with each step reward
-    on the last action id of its call and the verifier's on the episode's last, as exact against
-    float64 as the same recursion in float32."""
+    on the last action id of its call and the verifier's on the episode's last, on par with the same
+    recursion in float32 from float64 over rollouts each declared seed draws (check 1)."""
     trainer, rollout = build_ppo()
     rollout = replace(rollout, episodes=replace(rollout.episodes, environment=Harness(paid=(0.5, 0.25))))
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    episodes = collect(rollout.episodes, state)
-    mine, reference, truth = [], [], []
-    for index, episode in enumerate(episodes):
-        ids = [(turn, position) for turn, transition in enumerate(episode.transitions)
-               for position in range(len(transition.action.tokens))]
-        rows = [index * TURNS + turn for turn, _ in ids]
-        if episode.status is not EpisodeStatus.COMPLETED:
-            continue
-        rewards = np.zeros(len(ids))
-        for turn, transition in enumerate(episode.transitions):
-            last = max(at for at, (call, _) in enumerate(ids) if call == turn)
-            rewards[last] += transition.observation.reward
-        rewards[-1] += episode.reward
-        values = per_call(batch, OLD_VALUES_KEY, episodes)[rows, [position for _, position in ids]]
-        mine.append(per_call(batch, RETURNS_KEY, episodes)[rows, [position for _, position in ids]])
-        reference.append(episode_returns(rewards, values, rollout.gamma, rollout.lam, np.float32))
-        truth.append(episode_returns(rewards, values, rollout.gamma, rollout.lam, np.float64))
-    assert mine
-    assert_as_exact_as_the_reference(np.concatenate(mine), np.concatenate(reference), np.concatenate(truth),
-                                     "episode returns with step rewards")
+    task = {"task_id": np.array([31], np.int32)}
+
+    @functools.cache
+    def drawn(seed):
+        """One rollout's returns and, per completed episode, its rewards and values."""
+        batch = rollout(state, task, jax.random.key(seed))
+        episodes = collect(rollout.episodes, state, seed, tasks=task["task_id"])
+        mine, rewards_of, values_of = [], [], []
+        for index, episode in enumerate(episodes):
+            ids = [(turn, position) for turn, transition in enumerate(episode.transitions)
+                   for position in range(len(transition.action.tokens))]
+            rows = [index * TURNS + turn for turn, _ in ids]
+            if episode.status is not EpisodeStatus.COMPLETED:
+                continue
+            rewards = np.zeros(len(ids))
+            for turn, transition in enumerate(episode.transitions):
+                last = max(at for at, (call, _) in enumerate(ids) if call == turn)
+                rewards[last] += transition.observation.reward
+            rewards[-1] += episode.reward
+            positions = [position for _, position in ids]
+            rewards_of.append(rewards)
+            values_of.append(per_call(batch, OLD_VALUES_KEY, episodes)[rows, positions])
+            mine.append(per_call(batch, RETURNS_KEY, episodes)[rows, positions])
+        assert mine
+        return np.concatenate(mine), rewards_of, values_of
+
+    def recursion(dtype):
+        return as_given(lambda seed: {"returns": np.concatenate([
+            episode_returns(rewards, values, rollout.gamma, rollout.lam, dtype)
+            for rewards, values in zip(*drawn(int(seed))[1:], strict=True)])})
+
+    assert_as_exact(as_given(lambda seed: {"returns": drawn(int(seed))[0]}), recursion(np.float32),
+                    lambda seed: (np.int32(seed),), "episode returns with step rewards",
+                    seeds=STEP_REWARD_SEEDS, truth_fn=recursion(np.float64))
 
 
 def test_episode_advantages_hold_at_values_and_rewards_far_above_them():
@@ -278,6 +286,77 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
         (np.asarray(rollout.objective.values(final.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2
     )
     assert new_error < old_error
+
+
+class OffsetFeatures(nn.Module):
+    """Token features offset by `offset`, or, where it states none, by the updates the run committed
+    before the step and -1 at the run's end: a critic's backbone whose computation changes over a run
+    (`dew.nn.progress`)."""
+
+    offset: float | None = None
+
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        return self.offset is None
+
+    def hidden_states(self, tokens, train=False, *, coordinates=None, progress: Progress = END):
+        offset = self.offset if self.offset is not None else (
+            -1.0 if progress.updates is None else progress.updates.astype(jnp.float32))
+        return jax.nn.one_hot(tokens, VOCAB) + offset
+
+
+def test_ppos_critic_reads_the_progress_its_step_passes():
+    """PPO's critic over a backbone that reads the run's progress is passed the step's
+    (`PPOObjective.passes_progress`, `ValueHead`; review of ledger 2537): its loss at a step three updates
+    came before is the loss of the critic offset by 3, and at a step that is no training step, the run's
+    end's, over the same weights."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    policy = CausalTransformer(vocab_size=VOCAB, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                               max_seq_len=8, qk_norm=False)
+
+    def objective(offset=None) -> PPOObjective:
+        return PPOObjective(policy, 5, critic=ValueHead(OffsetFeatures(offset)))
+
+    variables = Trainer(objective(), optax.sgd(0.), key=jax.random.key(0)).initial_state().variables
+    ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
+    mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
+    batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
+             "text_positions": jnp.broadcast_to(jnp.arange(6), ids.shape),
+             "response_mask": mask, "advantages": mask, "behavior_log_probs": jnp.full(ids.shape, -3.),
+             OLD_VALUES_KEY: jnp.zeros_like(mask), RETURNS_KEY: mask}
+
+    def critic_loss(objective: PPOObjective, step: Step) -> np.ndarray:
+        return np.asarray(objective.loss(variables, batch, step)[1].metrics["critic/loss"])
+
+    trained = Step(jnp.asarray(0), jax.random.key(1), None, committed=jnp.asarray(3, jnp.int32))
+    validated = replace(trained, training=False)
+    np.testing.assert_array_equal(critic_loss(objective(), trained), critic_loss(objective(3.0), trained))
+    np.testing.assert_array_equal(critic_loss(objective(), validated),
+                                  critic_loss(objective(-1.0), validated))
+    assert critic_loss(objective(), trained) != critic_loss(objective(), validated)
+
+
+def test_ppos_rollout_baseline_scores_the_critic_at_the_runs_committed_updates():
+    """PPO's rollout scores its baseline (`old_values`) with a critic that reads the run's progress at the
+    updates the run committed (`PPORollout`, ledger 3008), as its loss trains it: after three updates
+    they are the values of the critic offset by 3, not the run's end's."""
+    def objective(offset=None) -> PPOObjective:
+        return PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1, critic=ValueHead(OffsetFeatures(offset)),
+                            beta=.03)
+
+    reading = objective()
+    initial = Trainer(reading, optax.sgd(0.), key=jax.random.key(19)).initial_state()
+    episodes = EpisodeCollector(reading.policy(reading.init(jax.random.key(19))), Harness(), verify,
+                                PROMPT, RESPONSE, TURNS, sampling=SAMPLING)
+    rollout = PPORollout(reading, episodes, groups=GROUPS, gamma=.97, lam=.9)
+    state = replace(initial, updates=jnp.asarray(3, jnp.int32))
+    rolled = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    keep = rolled["response_mask"] != 0
+    committed = np.asarray(objective(3.0).values(state.variables, rolled), np.float32)
+    ended = np.asarray(objective(-1.0).values(state.variables, rolled), np.float32)
+    np.testing.assert_array_equal(rolled[OLD_VALUES_KEY][keep], committed[keep])
+    assert not np.array_equal(committed[keep], ended[keep])
 
 
 def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
@@ -496,3 +575,24 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
     changed = any(not np.array_equal(start, end) for start, end in zip(
         jax.tree.leaves(before["critic"]), jax.tree.leaves(state.variables["params"]["critic"]), strict=True))
     assert changed == (coefficient > 0)
+
+
+def test_a_value_head_takes_packed_rows_as_flat_fields_or_coordinates():
+    """`ValueHead`'s call is a public boundary (ledger 1122): packed rows' `segment_ids` and
+    `positions` lay out as their coordinates do, the same values bit for bit, and both together are
+    refused rather than one silently winning."""
+    from model_support import TINY_DECODER
+
+    from dew.batch import coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    head = ValueHead(CausalTransformer(vocab_size=VOCAB, **TINY_DECODER))
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], jnp.int32)
+    segments = jnp.asarray([[1, 1, 1, 2, 2, 2]], jnp.int32)
+    positions = jnp.asarray([[0, 1, 2, 0, 1, 2]], jnp.int32)
+    laid = coordinates(tokens.shape, segments=segments, positions=positions, max_segments=2)
+    variables = head.init(jax.random.key(0), tokens, coordinates=laid)
+    np.testing.assert_array_equal(head.apply(variables, tokens, segment_ids=segments, positions=positions),
+                                  head.apply(variables, tokens, coordinates=laid))
+    with pytest.raises(ValueError):
+        head.apply(variables, tokens, segment_ids=segments, coordinates=laid)

@@ -51,7 +51,8 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "rae": {"diffusers": "0.40.0", "transformers": "4.57.1"},
     "gptqmodel": {"gptqmodel": "7.5.0"},
     "trl": {"trl": "1.12.0"},
-    "peft": {"peft": "0.20.0", "transformers": tested("transformers"), "torch": "2.14.0"},
+    # The suite's locked PEFT, which tests/test_lora_peft.py and tests/test_lora.py run in the test.
+    "peft": {"peft": "0.21.2", "transformers": tested("transformers"), "torch": "2.14.0"},
     "verl": {"verl": "0.9.0"},
 }
 """Each cohort's pins: the distribution and the public release of it, a local

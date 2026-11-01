@@ -52,7 +52,7 @@ def discrete(response: dict) -> dict:
 def clear(decide: Decide, request: dict) -> bool:
     """Whether every choice of `request`, alone, holds its two likeliest options `MARGIN` apart."""
     questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-    [(answers, _)] = decide.batch([(request["state"], questions)])
+    [answers] = decide([(request["state"], questions)])
     gaps = [np.diff(np.sort(answer.probabilities)[-2:])[0] for answer in answers.values()
             if isinstance(answer, ChoiceAnswer) and len(answer.probabilities) > 1]
     return all(float(gap) > MARGIN for gap in gaps)
@@ -95,7 +95,7 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
     forwards = {}
 
     def scored(task: Decide, seed, *, together: bool) -> np.ndarray:
-        """The bodies' real options' logits, laid out as `Decide.batch` lays a batch out (`Decide.rows`)
+        """The bodies' real options' logits, laid out as a call over requests lays them out (`Decide.rows`)
         and scored in one pass together or each request alone, through the model compiled without
         YNNPACK's fusions: both arms are Dew's."""
         bodies = bodies_of(seed)
@@ -219,7 +219,8 @@ def test_a_long_scoring_backlog_does_not_hold_generation_back(decide):
 
 
 IMAGE_SEEDS = 8
-"""Check 1's declared seeds for two requests of images joined in one pass."""
+"""Check 1's declared seeds for two requests of images joined in one pass, sized by `seeds_for` over draws
+of one row length (8, 2026-10-29)."""
 
 
 def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_path):
@@ -238,16 +239,20 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
     pictures = [Image.fromarray(array) for array in np.load(backbone / "images.npy")][:2]
-    words = ["one", "two", "three", "four", "five", "six"]
+    words = ["one", "two", "three", "four", "five", "six", "seven", "eight"]
     task, variables = decide.scoring()
 
     def rows_of(reading, seed):
+        # A drawn order of the same words, each after a space: every draw's rows are as long, so each arm
+        # compiles its pass once.
         rng = np.random.default_rng([0x1A6E, int(seed)])
-        state = " ".join(rng.choice(words, 8))
+        state = "words: " + " ".join(rng.permutation(words))
         return [row for picture in pictures
                 for row in reading.admit({**CASES["quickstart"], "state": state, "images": [picture]}).rows]
 
-    assert task.fits(rows_of(task, 0))
+    plan = task.planned()
+    assert all(plan.add(row) for row in rows_of(task, 0))
+    assert len({len(row.encoded.tokens) for seed in range(IMAGE_SEEDS) for row in rows_of(task, seed)}) == 1
 
     forwards = {}
 

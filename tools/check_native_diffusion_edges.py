@@ -1,7 +1,8 @@
 """Native edge checks against diffusers, live: the source's timesteps exactly and its noise tables as
 near float64 as the source's float32 (tools/native_diffusion_edges_reference.py records both), and
-every walk, and the tiny UNet's output and its gradients, on par with diffusers' float32 run over
-drawn inputs, both measured from diffusers' run in float64 (check 1, tests/reference_error.py)."""
+every walk, and the tiny UNet's output and its gradients, in evaluation and in training, on par with
+diffusers' float32 run over drawn inputs, both measured from diffusers' run in float64 (check 1,
+tests/reference_error.py)."""
 import argparse
 import json
 import sys
@@ -16,15 +17,20 @@ from dew.diffusion.process import DenoisingCondition
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
 from dew.nn.backbones.unet_condition import UNet2DCondition
-from dew.sampling.sample import sample
+from dew.sampling.walks import sample
 
 ROWS = 256
 """Each walk's independent rows, so its distance from float64 is an RMS over many roundings."""
 STEPS = 4
 TIME = 13.0
 """The UNet's timestep, as the recorded reference took it."""
-WIDTHS = {"norm": 12, "odd": 10}
+WIDTHS = {"norm": 12, "odd": 10, "dropped": 12}
 """Each UNet case's latent width: 12 the group norm's whole groups, 10 an odd width."""
+DROPPED = {"dropped": 1.0}
+"""The UNet cases run in training, at the dropout their config is given: at 1.0 every dropout zeroes
+what it drops in both frameworks, so a training step is a function of its inputs alone, and where each
+applies dropout is compared: diffusers' residual blocks take the model's dropout and its transformers
+none."""
 TABLE_JITTER = 0.01
 """How far a walk's draw scales its beta table's ends. A walk's rounding is dominated by its few
 per-step coefficients, which the table fixes: a draw of the initial rows alone holds each arm to one
@@ -33,7 +39,7 @@ rounding of each coefficient, a coin flip no count of draws resolves (pndm-linsp
 correctly rounded one and diffusers' a step off, nearer the float64 table's by chance). Each draw rounds
 its own table's coefficients, and the walk holds check 1 at 128 draws."""
 SEEDS = {"ddim-linspace": 32, "pndm-linspace": 128, "ddim-clip": 8, "euler-zero-snr": 8, "dpm-karras": 128,
-         "norm": 64, "odd": 64}
+         "norm": 64, "odd": 64, "dropped": 16}
 """Each case's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
@@ -111,11 +117,14 @@ def check_unet(directory, case):
     from diffusers import UNet2DConditionModel
     from torch_precision import float64, float64_twin
 
-    model = UNet2DCondition(**unet_fields(json.loads((directory / "unet/config.json").read_text()),
-                                          attention_impl="xla"))
+    dropout = DROPPED.get(case)
+    changed = {} if dropout is None else {"dropout": dropout}
+    config = json.loads((directory / "unet/config.json").read_text()) | changed
+    model = UNet2DCondition(**unet_fields(config, attention_impl="xla"))
     params, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
-    source = UNet2DConditionModel.from_pretrained(directory / "unet").eval()
-    wide = float64_twin(source)
+    training = dropout is not None
+    source = UNet2DConditionModel.from_pretrained(directory / "unet", **changed).train(training)
+    wide = float64_twin(source).train(training)
     width = WIDTHS[case]
 
     def draw(seed):
@@ -127,7 +136,8 @@ def check_unet(directory, case):
     @jax.jit
     def predict(value, context):
         return model.apply({"params": params}, value, jnp.full((1,), TIME, value.dtype),
-                           conditioning=DenoisingCondition(context))
+                           conditioning=DenoisingCondition(context), train=training,
+                           rngs={"dropout": jax.random.key(0)})
 
     def torch_arm(unet):
         def run(value, context):
@@ -157,13 +167,8 @@ def check(directory, case):
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from reference_error import (
-        as_given,
-        assert_as_exact,
-        assert_as_exact_as_the_reference,
-        torch_with_gradients,
-        with_gradients,
-    )
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")

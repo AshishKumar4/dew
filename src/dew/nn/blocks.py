@@ -1,5 +1,6 @@
 """The convolutional and embedding pieces the UNets and the DiT sandwich share."""
 
+import functools
 from collections.abc import Callable
 from functools import partial
 
@@ -14,9 +15,10 @@ from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.dropout import Dropout
 
 from . import activations
-from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
+from .kernels.generation import linear_tangent
+from .norms import GroupNorm, RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec
@@ -42,19 +44,30 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     return rows_taken(table, ids).astype(dtype)
 
 
-# `jax.custom_vjp` is generic in its return type, and a `functools.partial`
-# decorator loses that binding, so it is built by hand, as `ssd_chunk_scan` is.
-table_rows = jax.custom_vjp(_table_rows, nondiff_argnums=(2,))
+def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
+    """`table[ids]` in `dtype` (`_table_rows`) differentiated at every order (`generation.linear_tangent`):
+    reverse mode adds each token's cotangent to its row in the table's dtype (`_table_rows_backward`), forward
+    mode (`jax.jvp`, `jax.linearize`) takes the gather's own tangent, which a custom VJP alone refused (row
+    1869, audit NN-06); the ids are not differentiable."""
+    return _rows(jnp.dtype(dtype))(table, ids)
 
 
-def _table_rows_forward(table: jax.Array, ids: jax.Array, dtype: Dtype):
-    return table_rows(table, ids, dtype), (table, ids)
+@functools.cache
+def _rows(dtype: jnp.dtype) -> Callable:
+    """The lookup in `dtype` as one function of the table and the ids (`table_rows`)."""
+    def forward(table, ids):
+        return _table_rows(table, ids, dtype), (table, ids)
+
+    return linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype))
 
 
-def _table_rows_backward(dtype: Dtype, residuals: tuple[jax.Array, jax.Array],
-                         cotangent: jax.Array) -> tuple[jax.Array, None]:
-    del dtype
-    table, ids = residuals
+def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, cotangent: jax.Array
+                         ) -> tuple:
+    del operands
+    table, ids = saved
+    # The ids are integers: their cotangent is float0's zero, as the lookup's own pullback gives it, typed as
+    # the ids arrive, not as a reshard below holds them (an Explicit axis splitting them is in their type).
+    untouched = jax.custom_derivatives.zero_from_primal(ids)
     # The gradient adds each token's cotangent to its row. Under a batch
     # split GSPMD scattered each device's tokens into a table-sized buffer
     # and summed the buffers across devices: a table's worth of traffic
@@ -68,10 +81,10 @@ def _table_rows_backward(dtype: Dtype, residuals: tuple[jax.Array, jax.Array],
     rows = cotangent.astype(table.dtype)
     placed = explicit_spec(ids)
     if placed is None:
-        return jnp.zeros_like(table).at[ids].add(rows), None
+        return jnp.zeros_like(table).at[ids].add(rows), untouched
     # Each device scatters its own rows and the sums are added across the axis.
     summed = jax.sharding.NamedSharding(placed.mesh, jax.typeof(table).sharding.spec)
-    return jnp.zeros_like(table).at[ids].add(rows, out_sharding=summed), None
+    return jnp.zeros_like(table).at[ids].add(rows, out_sharding=summed), untouched
 
 
 def _whole(x: jax.Array) -> jax.Array:
@@ -80,8 +93,6 @@ def _whole(x: jax.Array) -> jax.Array:
     placed = whole_spec(x, x.ndim)
     return constrain(x if placed is None else jax.sharding.reshard(x, placed), (None,) * x.ndim)
 
-
-table_rows.defvjp(_table_rows_forward, _table_rows_backward)
 
 
 def modulation(conditioning, features: int, pieces: int, *, name: str, silu: bool = True,
@@ -317,15 +328,19 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
 
 
 class Upsample(nn.Module):
-    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
+    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`, a module named `conv`
+    (its parameters' path, as the model owning them publishes it: a UNet's `Conv_0`, a KL autoencoder's
+    `conv`)."""
     features: int
     scale: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    conv: str = "Conv_0"
 
     @nn.nowrap
     def _convolution(self, **scope):
-        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision,
+                    **({"name": self.conv} if "parent" not in scope else {}), **scope)
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:

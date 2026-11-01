@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import flax.core
@@ -36,32 +36,43 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
-from dew.batch import Coordinates, Variables, coordinates as build_coordinates, merge, shifted_span
+from dew.batch import (
+    COORDINATES_FIELD,
+    Coordinates,
+    Variables,
+    coordinates as build_coordinates,
+    merge,
+    prefix_sum,
+    real_slots,
+    shifted_span,
+    token_coordinates,
+)
 from dew.mesh import LayoutRefused
+from dew.nn.attention import AttentionImpl
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.registry import from_record, read_arguments
 
 from ..activations import GatedActivation, Situ, ungated_activation
-from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
-from ..cross_attention import CrossAttention, GatedCrossAttention
+from ..cross_attention import CrossBlocks, crossed_flops
 from ..deepseek_v4 import DeepseekV4Mixer
+from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
-from ..engram import Engram, EngramHashes, EngramLayer
-from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, AltUpLayer, clamped_predictions, rescale_to
+from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
+from ..flops import counted_flops, parameter_flops
+from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..hyper_connections import (
     Carried,
     HyperConnections,
-    HyperHead,
     collapse_by,
     collapse_streams,
     expand_streams,
     first_stream,
+    stream_head,
 )
 from ..inputs import (
     AttentionMetadata,
@@ -71,13 +82,14 @@ from ..inputs import (
     coordinates_of,
     numbered_blocks,
 )
-from ..kv_cache import KVCache
+from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain
+from ..norms import RMSNorm
 from ..precision import (
     at_least_fp32,
     capped_logits,
@@ -85,12 +97,16 @@ from ..precision import (
     head_dot_general,
     head_product,
     l2norm,
+    output_dtype,
     scaled,
     scaled_logits,
 )
-from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
-from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
+from ..progress import Progress
+from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
+from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
+from ..value_experts import ValueExperts
+from . import decoder_counts
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -104,23 +120,23 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_fields import refuse_unbuildable
+from .decoder_fields import refuse_unbuildable, softmax_attention_layers
 from .decoder_stack import (
-    WRITTEN,
     DecoderBank,
     Loop,
-    PassView,
     PipelineStage,
-    SharedPassView,
     StackView,
     StageSplit,
+    banked_collections,
     microbatch_count,
+    on_host,
     run_pipeline,
     run_stack,
     split_stages,
     stored_by_stage,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_layers, group_name, layer_index, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_layers, layer_index, run_period, scan_groups
+from .looping import run_loop
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -149,7 +165,7 @@ class CausalTransformer(nn.Module):
     fields and needs no subclass. The field comments name the family that sets
     each one. A classic GPT block is `norm_type='layer'`, `norm_bias`, an
     ungated `mlp`, `mlp_bias` and learned positions; the learned positions
-    advance from each decode row's cache cursor.
+    advance from each decode row's count of its real tokens (`DecodeCursor`).
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
     each kind does. `kv_shared_layers` lists the layers that share by index: a
@@ -192,8 +208,9 @@ class CausalTransformer(nn.Module):
     MiMo-V2-Flash attends 192-wide queries and keys over 128-wide values."""
     mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
     mlp_bias: bool = False
-    """Whether both feed-forward projections have a bias. The `mlp` activations gelu,
-    gelu_exact and relu give an ungated feed-forward."""
+    """Whether both feed-forward projections have a bias: none by default, as Llama's published
+    `mlp_bias: false`, where Flax's Dense adds one. The `mlp` activations gelu, gelu_exact and relu
+    give an ungated feed-forward."""
     mlp_features: int | tuple[int, ...] | None = None
     """The dense feed-forward width. None means four times `emb_features`, a
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
@@ -214,7 +231,8 @@ class CausalTransformer(nn.Module):
     position_embedding_offset: int = 0
     """The number of reserved rows before learned position zero; OPT checkpoints have two."""
     rope_theta: float = 10000.0              # the base a kind does not override
-    rope_scaling: RopeScaling | LongRopeScaling | None = None
+    rope_scaling: Scaling | None = None
+    """The model's rope scaling: Llama 3.1's ramp, LongRoPE's factors or YaRN's record (`rotary_freqs`)."""
     partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     narrow_rotary_tables: bool = False
@@ -224,6 +242,7 @@ class CausalTransformer(nn.Module):
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
+    """Llama 2's and 3's and Mistral's published `rms_norm_eps`, where Flax's RMSNorm takes 1e-6."""
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
     norms: Mapping[str, NormSpec] | None = None
@@ -232,14 +251,24 @@ class CausalTransformer(nn.Module):
     epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
+    embedding_norm_reads: Literal['inputs', 'lookup'] = 'inputs'
+    """What `embedding_norm` normalizes: every input embedding, a caller's own and a media encoder's
+    among them, as BLOOM's and ModernBERT's embedding norms read their `inputs_embeds` ('inputs'); or
+    the table's lookup alone, before media take their slots, as Muse Glimmer's normed embedding module
+    does (`scaled_embeddings`, 'lookup')."""
     first_attention_norm: bool = True
     """Whether the first block norms its attention input. ModernBERT's first
     block reads the embedding norm's output as it is (modeling_modernbert.py,
     ModernBertEncoderLayer: attn_norm is Identity at layer 0)."""
-    scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
+    scale_offset: bool = False       # a norm's weight is (1 + w): Gemma's RMSNorm, GPT-3's LayerNorm
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
+    post_residual_norms: bool = False  # norm the stream after each sublayer joins it: post-LN, OPT-350m's
+    final_norm: bool = True            # end the trunk in a norm; OPT-350m's post-LN decoder has none
+    embedding_features: int | None = None
+    """The token embedding's width where it differs from the stream's (OPT-350m's word_embed_proj_dim),
+    bias-free `project_in` taking the lookup in and `project_out` the final states out to the head."""
     parallel_residual: bool = False
     """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
     shared_parallel_norm: bool = False
@@ -249,16 +278,19 @@ class CausalTransformer(nn.Module):
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
     layer_scalar: Literal["frozen", "trainable"] | None = None
-    attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
+    attention_bias: bool = False
+    """q/k/v biases, and o_proj's unless `o_proj_bias` says: none by default, as Llama's published
+    `attention_bias: false`, where Flax's Dense adds one."""
     o_proj_bias: bool | None = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: float | None = None  # None: head_dim ** -0.5
     value_scale: float | None = None
     """The factor that multiplies the values as they are projected, before
     they are cached: MiMo-V2-Flash's `attention_value_scale`."""
     attention_sinks: bool = False
-    yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
+    output_gate_activation: str = 'sigmoid'   # the gate's activation (MixerContext.output_gate_activation)
+    value_experts: ValueExperts | None = None  # MoVA: the routed layers' values from routed experts
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     embedding_multiplier: float = 1.0
     """The factor that multiplies the token embeddings before the first layer:
@@ -267,6 +299,8 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies every sublayer output before it is added to the
     residual stream: lm-engine's m_residual, and GraniteMoeHybrid's
     `residual_multiplier`."""
+    normed_residual: bool = False      # MiniMax's postnorm block (`BlockWiring.normed_residual`)
+    stream_multiplier: float = 1.0     # MiniMax's alpha factors (`BlockWiring.stream_multiplier`)
     residual_in_fp32: bool = False
     """Whether the residual stream between layers sums in at least fp32 whatever
     the compute dtype, as mamba_ssm's `residual_in_fp32` keeps it (transformers'
@@ -326,7 +360,7 @@ class CausalTransformer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
-    attention_impl: str = "auto"  # an AttentionImpl
+    attention_impl: AttentionImpl = "auto"
     kv_cache: KVCache = KVCache()
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
@@ -371,13 +405,11 @@ class CausalTransformer(nn.Module):
     over finished blocks of layers that replaces the running residual. None
     disables them."""
     engram: Engram | None = None
-    """DeepSeek-V4.1's n-gram lookups (`dew.nn.engram`). Each layer it names
-    gates its table rows into the residual streams before its attention. The
-    tokenizer's compressed vocabulary is stored as `engram_hashes/token_map` in
-    the `constants` collection. A loaded checkpoint derives it from its
-    tokenizer, and a fresh model fills it with each id modulo the compressed
-    vocabulary's size."""
-    cross_attention: CrossAttention | None = None
+    """DeepSeek-V4.1's n-gram lookups or Qwen4-Exp's per-layer embedding (`dew.nn.engram`) before each named
+    layer's attention, over the compressed vocabulary `constants` holds (`engram_hashes/token_map`)."""
+    dex: DifferentialExtension | None = None
+    """The chosen heads whose attention outputs take a learned differential (`dew.nn.dex`), or None."""
+    cross_attention: CrossBlocks | None = None
     """The layers that read a conditioning sequence through Flamingo's gated
     cross-attention (`dew.nn.cross_attention`), before their own sublayers; None
     for a model without them. A call passes the sequence as its `conditioning`."""
@@ -399,7 +431,9 @@ class CausalTransformer(nn.Module):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = False                 # runs of like layers under flax's scan
+    scan_layers: bool = False
+    """Runs of like layers under flax's scan; a decode step over resident weights scans a period's repeats as
+    one body too (`scan_groups(periodic=True)`), so its program grows with the period, not the depth."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -475,8 +509,10 @@ class CausalTransformer(nn.Module):
         field of its own (docs/design/api.md): the one value the stack's blocks, the prediction depths,
         DSpark's stages and the FLOP count build with."""
         return BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
+                           residual_norms=self.post_residual_norms,
                            layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                           shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
+                           shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt,
+                           normed_residual=self.normed_residual, stream_multiplier=self.stream_multiplier)
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
@@ -488,6 +524,18 @@ class CausalTransformer(nn.Module):
         hidden = self.initializer_range / math.sqrt(self.logits_scaling)
         output = hidden / math.sqrt(2 * self.num_layers) if self.depth_scaled_init else hidden
         return hidden, output
+
+    @property
+    def position_rows(self) -> int:
+        """The rows of the learned position table (`position_embedding_size`, else `max_seq_len`)."""
+        return self.position_embedding_size or self.max_seq_len
+
+    @property
+    def position_capacity(self) -> int | None:
+        """The places a row's learned positions cover, the table's rows past its reserved offset; None for
+        rotary or ALiBi positions, which cover any (`PositionCapacity`)."""
+        learned = self.position_embedding == 'learned'
+        return self.position_rows - self.position_embedding_offset if learned else None
 
     @property
     def kv_heads(self) -> int:
@@ -527,7 +575,8 @@ class CausalTransformer(nn.Module):
         return tuple(self.layer_types)
 
     def kind_of(self, layer_type: str) -> "ResolvedKind":
-        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset."""
+        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset.
+        A kind's rope scaling takes the model's place."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
         return ResolvedKind(
             window=kind.window,
@@ -536,7 +585,6 @@ class CausalTransformer(nn.Module):
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
-            yarn=self.yarn if kind.yarn is None else kind.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
@@ -608,11 +656,12 @@ class CausalTransformer(nn.Module):
     def per_layer_vocab(self) -> int:
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
 
-    def mixer_context(self, kind: "ResolvedKind", layer_type: str,
-                      kv_shared: bool) -> MixerContext:
+    def mixer_context(self, kind: "ResolvedKind", layer_type: str, kv_shared: bool,
+                      dex: LayerDex | None = None, dex_start: DexStart | None = None,
+                      routed: bool = False) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
-        `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
+        `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
         rotary, the sinks and the query-key norm take the layer kind's resolved values
         (`kind_of`), and the precision the model's layers take (`products`). Every other field
         is the model's field of the same name. A kind builds its `DecoderBlock` factory
@@ -621,14 +670,16 @@ class CausalTransformer(nn.Module):
         """
         resolved = {
             "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
-            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling, "yarn": kind.yarn,
+            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling,
             "sliding_window": kind.window, "bidirectional_window": kind.bidirectional_window,
             "attention_chunk": kind.chunk,
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision}
+            "precision": self.precision, "dex": dex, "dex_start": dex_start,
+            "value_experts": self.value_experts if routed else None,
+            "mixture": self.mixture if routed else None}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -709,28 +760,14 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Real-row hidden-state work, summing the same block factories as setup. A context's
-        cross-attention work is `cross_flops`, which needs the context's lengths."""
-        return (self._layer_flops(lengths, counted_flops)
-                + self._root_flops(lengths, DepthAttention.depth_flops))
-
-    @nn.nowrap
-    def _root_flops(self, lengths, depth_counter) -> float:
-        maps = self.projections()
-        count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
-                     if name.startswith(('altup_projections_', 'altup_unembed_projections_')))
-        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
-            count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
-        if self.attention_residuals is not None:
-            sources = self.attention_residuals.blocks(self.num_layers) + 1
-            count += depth_counter(DepthAttention(self.emb_features, parent=None), lengths, sources)
-        return count
+        """Real-row hidden-state work, summing the same block factories as setup (`decoder_counts`). A
+        context's cross-attention work is `cross_flops`, which needs the context's lengths."""
+        return decoder_counts.model_flops(self, lengths)
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """Learned matrices, separately from nonparameter attention/state work."""
-        return (self._layer_flops(lengths, parameter_flops)
-                + self._root_flops(lengths, DepthAttention.depth_parameter_flops))
+        return decoder_counts.trained_flops(self, lengths)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -746,8 +783,11 @@ class CausalTransformer(nn.Module):
                           for index in range(self.altup.num_inputs - 1)})
         if self.loop is not None and self.loop.exit_gate:
             sites['early_exit_gate'] = (self.emb_features, 1)
+        if self.embedding_features is not None:
+            sites['project_in'] = (self.embedding_features, self.emb_features)
+            sites['project_out'] = (self.emb_features, self.embedding_features)
         if not self.tie_embeddings:
-            sites['lm_head'] = (self.emb_features, self.vocab_size)
+            sites['lm_head'] = (self.embedding_features or self.emb_features, self.vocab_size)
         if self.head_transform is not None:
             sites['head_dense'] = (self.emb_features, self.emb_features)
         if self.continuum is not None:
@@ -756,119 +796,57 @@ class CausalTransformer(nn.Module):
         return sites
 
     @nn.nowrap
-    def _layer_counts(self, lengths, counter) -> list[float]:
-        """Each layer's work by `counter`, over the passes a call runs it."""
-        types = self.per_layer_types
-        kinds = self.layer_kinds(types)
-        mixer = self.layer_mixer
-        specs = self._layer_specs(types, kinds, mixer)
+    def counted_blocks(self) -> list[DecoderBlock]:
+        """Each layer's block as setup builds it, unbound, which its counts read (`decoder_counts`)."""
+        types, mixer = self.per_layer_types, self.layer_mixer
+        specs = self._layer_specs(types, self.layer_kinds(types), mixer)
         factories = self.feedforward_factories()
-        return [self.layer_passes(index) * counter(
-                    self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}'), lengths)
+        return [self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
                 for index in range(self.num_layers)]
+
+    @nn.nowrap
+    def prediction_blocks(self) -> list[MTPBlock]:
+        """Each prediction depth's block as setup builds it, unbound, which its counts read."""
+        types, factories = self.per_layer_types, self.feedforward_factories()
+        return self._prediction_depths(types, self.layer_kinds(types), self.layer_mixer, factories[0],
+                                       factories[1], self.wiring)
 
     @nn.nowrap
     def replicated_flops(self, stages: int, lengths) -> float:
         """The work of the layers a pipeline of `stages` runs on every stage rather than once
         (`stage_split`): those before and after the run its stages repeat."""
-        split = self.stage_split(stages)
-        counts = self._layer_counts(lengths, counted_flops)
-        return sum(counts[:split.prefix]) + sum(counts[self.num_layers - split.suffix:])
-
-    @nn.nowrap
-    def _layer_flops(self, lengths, counter) -> float:
-        total = sum(self._layer_counts(lengths, counter))
-        if self.per_layer_input_dim:
-            total += projection_flops(lengths, *self.projections()['per_layer_model_projection'])
-        if self.loop is not None and self.loop.exit_gate:
-            total += self.loop.steps * projection_flops(lengths, *self.projections()['early_exit_gate'])
-        return total
+        return decoder_counts.replicated_flops(self, stages, lengths)
 
     @nn.nowrap
     def layer_passes(self, index: int) -> int:
         """How many times a call runs layer `index`: a loop's steps for a layer it repeats, else once."""
-        if self.loop is None:
-            return 1
-        start, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
-        return self.loop.steps if start <= index < end else 1
+        return decoder_counts.layer_passes(self, index)
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
-        """The vocabulary matrix and optional prediction transform. A tied head
-        reads the embedding table, `vocab_size` rows of `emb_features`."""
-        projections = self.projections()
-        count = projection_flops(lengths, *projections.get('lm_head', (self.emb_features, self.vocab_size)))
-        for site in ('head_dense', 'continuum_down', 'continuum_up'):
-            if site in projections:
-                count += projection_flops(lengths, *projections[site])
-        return count
+        """The vocabulary matrix and optional prediction transform, `project_out`'s included. A tied
+        head reads the embedding table, `vocab_size` rows of the embedding's width."""
+        return decoder_counts.logits_flops(self, lengths)
 
     @nn.nowrap
     def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
         """Each trained prediction depth shortens the real sequence by one token."""
-        return self._prediction_flops(lengths, counted_flops, prediction_lengths)
+        return decoder_counts.prediction_flops(self, lengths, counted_flops, prediction_lengths)
 
     @nn.nowrap
     def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
         """The same shortened depth forwards' learned matrices, head included."""
-        return self._prediction_flops(lengths, parameter_flops, prediction_lengths)
-
-    @nn.nowrap
-    def _prediction_rows(self, lengths, prediction_lengths):
-        if prediction_lengths is not None:
-            return prediction_lengths
-        return [(shorter, shorter) for depth in range(1, self.num_nextn_predict_layers + 1)
-                for shorter in (np.maximum(np.asarray(lengths) - depth, 0),)]
-
-    @nn.nowrap
-    def _prediction_flops(self, lengths, counter, prediction_lengths) -> float:
-        types, factories = self.per_layer_types, self.feedforward_factories()
-        kinds = self.layer_kinds(types)
-        blocks = self._prediction_depths(types, kinds, self.layer_mixer, factories[0], factories[1],
-                                         self.wiring)
-        count = 0.0
-        rows = self._prediction_rows(lengths, prediction_lengths)
-        for block, (inputs, outputs) in zip(blocks, rows, strict=True):
-            count += counter(block, inputs) + self.logits_flops(outputs)
-        return count
+        return decoder_counts.prediction_flops(self, lengths, parameter_flops, prediction_lengths)
 
     @nn.nowrap
     def prediction_matrix_usage(self, path: tuple[str, ...], lengths, *, prediction_lengths=None):
         """Each depth's maps run once; the shared head runs on every shorter state."""
-        relative = path[1:] if path and path[0] == 'params' else path
-        if not relative:
-            raise MissingFlopsCount("CausalTransformer prediction matrix has no native scope")
-        lengths = np.asarray(lengths)
-        rows = self._prediction_rows(lengths, prediction_lengths)
-        if relative[0].startswith('mtp_'):
-            depth = int(relative[0].removeprefix('mtp_'))
-            copies = (self.mtp_hyper_connections.hc_mult
-                      if relative[1] == 'h_proj' and self.mtp_hyper_connections is not None else 1)
-            return rows[depth][0] * copies
-        if relative[0] in ('lm_head', 'head_dense', 'continuum'):
-            return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
-        return np.zeros_like(lengths)
+        return decoder_counts.prediction_matrix_usage(self, path, lengths, prediction_lengths)
 
     @nn.nowrap
     def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):
         """Native matrix scopes declare head versus trunk work and repeated loop passes."""
-        relative = path[1:] if path and path[0] == 'params' else path
-        if not relative:
-            raise MissingFlopsCount("CausalTransformer adapter matrix has no native scope")
-        # The continuum level stands before the head, which every head read takes it through.
-        head = relative[0] in ('lm_head', 'head_dense', 'continuum')
-        if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
-            return np.zeros(np.shape(lengths), np.int64)
-        passes = 1
-        if self.loop is not None and relative[0].startswith('layers_'):
-            layer = int(relative[0].removeprefix('layers_'))
-            first, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
-            if first <= layer < end:
-                passes = self.loop.steps
-        if self.altup is not None and relative[-1] == 'modality_router':
-            site = AltUpLayer(self.altup, self.emb_features, parent=None)
-            passes *= site.projection_uses()['modality_router']
-        return np.asarray(lengths) * passes
+        return decoder_counts.matrix_usage(self, path, lengths, logits=logits)
 
     def setup(self):
         """Build the embeddings, the layers, the prediction depths `mtp`, the final
@@ -883,24 +861,7 @@ class CausalTransformer(nn.Module):
         projections = self.projections()
         ple = self.per_layer_input_dim
 
-        self.embed_tokens = TokenEmbedding(
-            num_embeddings=self.vocab_size, features=self.emb_features,
-            dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
-            embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                            else nn.initializers.normal(self.initializer_range)))
-        if self.embedding_dropout_rate:
-            self.embedding_dropout = Dropout(self.embedding_dropout_rate, name="embedding_dropout")
-        if self.embedding_norm:
-            self.embedding_layernorm = decoder_norm(
-                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
-                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
-        if self.position_embedding == 'learned':
-            self.embed_positions = TokenEmbedding(
-                num_embeddings=self.position_embedding_size or self.max_seq_len,
-                features=self.emb_features, dtype=self.dtype, name='embed_positions',
-                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                                else nn.initializers.normal(self.initializer_range)))
+        self._embeddings(projections)
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -952,9 +913,9 @@ class CausalTransformer(nn.Module):
                 projection(projections[f'altup_unembed_projections_{index}'][1],
                            name=f'altup_unembed_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
-        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
-            self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
-                                     norm_eps=self.norm_eps, name='hc_head')
+        if self.hyper_connections is not None and self.hyper_connections.head in ('weighted', 'gated'):
+            self.hc_head = stream_head(self.hyper_connections, self.emb_features, self.norm_eps,
+                                       name='hc_head')
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
                                              name='output_res')
@@ -1018,10 +979,13 @@ class CausalTransformer(nn.Module):
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids
                         else self.engram.layer_ids.index(index)),
-                cross=self.cross_attention is not None and index in self.cross_attention.layer_ids,
+                cross=((self.cross_attention.layer_key(self, index),)
+                       if self.cross_attention is not None and index in self.cross_attention.layer_ids
+                       else None),
                 prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
                                    else None),
-                attention_norm=index > 0 or self.first_attention_norm)
+                attention_norm=index > 0 or self.first_attention_norm,
+                dex=None if self.dex is None else self.dex.layer(index))
             for index, layer_type in enumerate(types))
 
     @nn.nowrap
@@ -1034,8 +998,8 @@ class CausalTransformer(nn.Module):
         ple = self.per_layer_input_dim
         spec = specs[index]
         return DecoderBlock(
-            mixer=(spec.kind.mixer or mixer_spec).build(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
+            mixer=(spec.kind.mixer or mixer_spec).build(self.mixer_context(
+                spec.kind, spec.layer_type, spec.kv_shared, spec.dex, self._dex_start(index), spec.routed)),
             feedforward=(
                 functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
                 if spec.hash_routed and routed is not None else
@@ -1051,12 +1015,17 @@ class CausalTransformer(nn.Module):
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
-                EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
+                EngramLayer if self.engram.ple_conv_kernel_size is None else functools.partial(
+                    PLELayer, kernel_size=self.engram.ple_conv_kernel_size,
+                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts,
+                    use_bias=self.engram.ple_bias),
+                rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
-            cross=self._cross_layer(index) if spec.cross else None,
+            cross=(self.cross_attention.block(self, index)
+                   if spec.cross is not None and self.cross_attention is not None else None),
             prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
@@ -1082,42 +1051,28 @@ class CausalTransformer(nn.Module):
             name=name)
 
     @nn.nowrap
-    def _cross_layer(self, index: int) -> Callable[..., GatedCrossAttention]:
-        """Layer `index`'s gated cross-attention factory: the model's norms, none under nGPT, a
-        gated MLP of the block's own activation at its width, with nGPT's gains under nGPT, and the
-        model's attention heads, kernel, initializers and dtypes."""
-        cross = self.cross_attention
-        assert cross is not None
-        init_std, output_init_std = self.init_stds
-        return functools.partial(
-            GatedCrossAttention,
-            norm=None if self.ngpt is not None else decoder_norm(
-                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype, specs=self.norms),
-            ngpt=self.ngpt is not None,
-            feedforward=functools.partial(
-                GatedMLP, hidden_features=cross.intermediate_size or self.mlp_widths[index],
-                out_features=self.emb_features, activation=cross.activation, ngpt=self.ngpt,
-                init_std=init_std, output_init_std=output_init_std, dtype=self.dtype,
-                precision=self.precision),
-            emb_features=self.emb_features,
-            context_features=self.context_width,
-            context_length=cross.context_length, heads=self.num_heads, kv_heads=self.kv_heads,
-            head_dim=self.features_per_head, dropout_rate=self.dropout_rate,
-            attention_impl=self.attention_impl, force_fp32_for_softmax=self.force_fp32_for_softmax,
-            dtype=self.dtype, precision=self.precision)
+    def mixer_of(self, index: int) -> nn.Module:
+        """Layer `index`'s mixer, unbound, as its kind builds it over the layer's context."""
+        types = self.per_layer_types
+        spec = self._layer_specs(types, self.layer_kinds(types), self.layer_mixer)[index]
+        context = self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex,
+                                     self._dex_start(index), spec.routed)
+        return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
+
+    @nn.nowrap
+    def _dex_start(self, index: int) -> DexStart | None:
+        """What layer `index`'s extension starts from, which its variables keep (`dew.nn.dex`)."""
+        return None if self.dex is None else self.dex.start(index)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
-        """The cross-attention blocks' work over rows of `lengths` tokens reading contexts of
-        `context_lengths` tokens (`GatedCrossAttention.cross_flops`), each block on every pass of its
-        layer (`layer_passes`), which `model_flops` leaves out: a call without a context runs none
-        of it."""
-        cross = self.cross_attention
-        if cross is None:
-            return 0.0
-        return sum(self.layer_passes(index) * self._cross_layer(index)(parent=None).cross_flops(
-            lengths, context_lengths) for index in cross.layer_ids)
+        """The cross-attention blocks' work, which `model_flops` leaves out (`crossed_flops`)."""
+        return crossed_flops(self, lengths, context_lengths)
+
+    @nn.nowrap
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        """The part of `cross_flops` its own matrices do, which train as its trunk does (`crossed_flops`)."""
+        return crossed_flops(self, lengths, context_lengths, held=True)
 
     @nn.nowrap
     def _prediction_depths(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec,
@@ -1234,7 +1189,7 @@ class CausalTransformer(nn.Module):
             x = collapse_by(x.pre, x.streams)
         elif hc is not None:
             x = collapse_streams(x.streams if isinstance(x, Carried) else x,
-                                 self.hc_head if hc.head == 'weighted' else None)
+                                 self.hc_head if hc.head in ('weighted', 'gated') else None)
         if self.attention_residuals is not None:
             # Every block is finished after the last layer, so the whole state,
             # the blocks and the last partial, is what the output site mixes
@@ -1248,14 +1203,17 @@ class CausalTransformer(nn.Module):
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
-                 conditioning: Mapping[str, jax.Array] | None = None):
+                 conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None):
+        # The call's token layout, converted once (`token_coordinates`): the trunk and the
+        # prediction depths read its coordinates alone.
+        coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
+                                        valid=attention_mask, positions=positions, right_padded=right_padded)
         x, prediction = self.hidden_and_mtp_inputs(
-            tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
+            tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
-            attention_key_runs=attention_key_runs, right_padded=right_padded,
-            coordinates=coordinates, conditioning=conditioning)
+            attention_key_runs=attention_key_runs, coordinates=coordinates, conditioning=conditioning,
+            progress=progress)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1263,9 +1221,7 @@ class CausalTransformer(nn.Module):
             # main forward never enters the prediction depths. Reaching them
             # here, during init only, makes the model's tree the model's
             # business: a plain init holds every depth.
-            self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
-                                   segment_ids=segment_ids, input_embeddings=input_embeddings,
-                                   attention_mask=attention_mask,
+            self.mtp_hidden_states(prediction, tokens, train=train, input_embeddings=input_embeddings,
                                    image_groups=image_groups, block_groups=block_groups,
                                    rotary_positions=rotary_positions, coordinates=coordinates)
         return self._logits(x)
@@ -1304,6 +1260,18 @@ class CausalTransformer(nn.Module):
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
 
+    def affine_head(self) -> bool:
+        """Whether the head past the continuum level (`head_logits`) is affine in its states, read from
+        the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
+        quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
+        modules alone leaves it affine, and a tied head reads its table with none."""
+        # The head's own inputs: `lm_head`'s, and `project_out`'s before it past an embedding's own width.
+        heads = [*([] if self.tie_embeddings else [self.lm_head]), *([] if self.embedding_features is None
+                                                                  else [self.project_out])]
+        quantized = any(self._quantizer(head) is not None for head in heads)
+        return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
+                and not quantized)
+
     @nn.nowrap
     def in_context_level(self, variables):
         """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
@@ -1324,8 +1292,11 @@ class CausalTransformer(nn.Module):
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a
         model without one's final states: `_logits` past the level."""
+        # A stream-width transform reads the final states before `project_out` takes them to the table's.
         if self.head_transform is not None:
             x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))
+        if self.embedding_features is not None:
+            x = self.project_out(x)
         # fp32 logits whose product follows the compute dtype
         # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
         if self.tie_embeddings:
@@ -1333,18 +1304,19 @@ class CausalTransformer(nn.Module):
                                   self.precision)
         else:
             logits = self.lm_head(x)
-        logits = logits.astype(at_least_fp32(logits.dtype))
+        # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
+        computed, logits = logits.dtype, logits.astype(at_least_fp32(logits.dtype))
+        # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
         return capped_logits(scaled_logits(logits, self._token_gains(),
                                            self.head_bias_value if self.head_bias else None),
-                             self.final_logit_softcap)
+                             self.final_logit_softcap).astype(
+            output_dtype(computed if self.dtype is None else self.dtype))
 
     def _token_gains(self) -> jax.Array | None:
         """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
         return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits)
 
-    def mtp_hidden_states(self, hidden, tokens, train: bool = False,
-                          positions=None, segment_ids=None, input_embeddings=None,
-                          attention_mask=None,
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False, input_embeddings=None,
                           image_groups=None, block_groups=None, rotary_positions=None,
                           coordinates: Coordinates | None = None,
                           conditioning: Mapping[str, jax.Array] | None = None):
@@ -1362,28 +1334,22 @@ class CausalTransformer(nn.Module):
         del conditioning
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
-        if coordinates is None and (segment_ids is not None or attention_mask is not None
-                                    or positions is not None):
-            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
-                                            positions=positions)
-        if coordinates is not None:
-            segment_ids, positions, attention_mask = (coordinates.segments, coordinates.positions,
-                                                     coordinates.valid)
-        embeds = self._prepared(self.token_embeddings(tokens), input_embeddings)
+        documents, given, given_valid = ((None, None, None) if coordinates is None else
+                                         (coordinates.segments, coordinates.positions, coordinates.valid))
+        embeds = self._prepared(self.stream_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
         # and no validity says that: an all-true array would make the depth
         # build a mask and drop off the fused kernel.
         valid = None
-        if segment_ids is not None or attention_mask is not None:
-            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+        if documents is not None or given_valid is not None:
+            valid = jnp.ones(tokens.shape, bool) if given_valid is None else given_valid
         states = []
         for depth, block in enumerate(self.mtp, start=1):
             if valid is not None:
-                documents = None if segment_ids is None else segment_ids[:, depth - 1:]
-                valid = shifted_span(valid.shape, 1, valid=valid, segments=documents)
-            segments, places = (None if field is None else field[:, depth:]
-                                for field in (segment_ids, positions))
+                valid = shifted_span(valid.shape, 1, valid=valid,
+                                     segments=None if documents is None else documents[:, depth - 1:])
+            segments, places = (None if field is None else field[:, depth:] for field in (documents, given))
             metadata = AttentionMetadata(
                 # Cross-document pairs leave holes even when the token rows were right-padded.
                 coordinates=None if coordinates is None else build_coordinates(
@@ -1396,20 +1362,20 @@ class CausalTransformer(nn.Module):
             states.append(hidden)
         return states
 
-    def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
-                   segment_ids=None, input_embeddings=None,
-                   attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
+    def mtp_logits(self, hidden, tokens, train: bool = False, input_embeddings=None,
+                   image_groups=None, block_groups=None, rotary_positions=None,
+                   coordinates: Coordinates | None = None,
                    conditioning: Mapping[str, jax.Array] | None = None):
         """Return the shared language head's logits for each prediction depth's hidden states; a
         call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
         return [self._logits(state) for state in self.mtp_hidden_states(
-            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
-            input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            block_groups=block_groups, rotary_positions=rotary_positions, conditioning=conditioning)]
+            hidden, tokens, train=train, input_embeddings=input_embeddings, image_groups=image_groups,
+            block_groups=block_groups, rotary_positions=rotary_positions, coordinates=coordinates,
+            conditioning=conditioning)]
 
-    def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
-                 input_embeddings=None, attention_mask=None, rotary_positions=None,
-                 decode: bool = False, prediction_phase: PredictionPhase = "ordinary"):
+    def mtp_step(self, hidden, tokens, *, depth: int = 0, input_embeddings=None, rotary_positions=None,
+                 decode: bool = False, prediction_phase: PredictionPhase = "ordinary",
+                 coordinates: Coordinates | None = None):
         """Run one unshifted prediction step, optionally appending to the depth's own KV cache.
 
         Call `init_mtp_cache` before cached steps. `hidden` is the target
@@ -1419,21 +1385,17 @@ class CausalTransformer(nn.Module):
         that state in place of the target's. With
         `index_share_for_mtp_iteration`, a cached "extend" step publishes its
         index selections and a "draft" step reuses them, while "ordinary"
-        always recomputes them.
+        always recomputes them. Its tokens are laid out by their `coordinates`.
         """
         if prediction_phase not in ("ordinary", "extend", "draft"):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
-        embeds = self.token_embeddings(tokens) if input_embeddings is None else input_embeddings
-        given = attention_mask is not None or positions is not None
+        embeds = self.stream_embeddings(tokens) if input_embeddings is None else input_embeddings
         state, prediction = self.mtp[depth].states(
             hidden, embeds, decode=decode,
             prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
-            attention_metadata=AttentionMetadata(
-                coordinates=build_coordinates(hidden.shape[:2], valid=attention_mask, positions=positions)
-                if given else None,
-                rotary_positions=rotary_positions))
+            attention_metadata=AttentionMetadata(coordinates=coordinates, rotary_positions=rotary_positions))
         return self._logits(state), prediction
 
     def token_embeddings(self, tokens):
@@ -1448,11 +1410,19 @@ class CausalTransformer(nn.Module):
             lookup = jnp.where(tokens == token_id, 0, lookup)
         return self.embed_tokens(lookup)
 
+    def stream_embeddings(self, tokens):
+        """`token_embeddings` at the stream's width, through `project_in` past an embedding's own: what a
+        prediction depth pairs with `tokens`, and a context's tokens a cross-attention reads by the table."""
+        looked = self.token_embeddings(tokens)
+        return looked if self.embedding_features is None else self.project_in(looked)
+
     def scaled_embeddings(self, x):
         """Return the token embeddings `x` scaled the way the first layer reads them.
 
-        `x` is multiplied by sqrt(emb_features) when `embedding_scale` is set
-        (Gemma), then by `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
+        `x` is normalized first where the norm reads the lookup alone
+        (`embedding_norm_reads`, Muse Glimmer), multiplied by
+        sqrt(emb_features) when `embedding_scale` is set (Gemma), then by
+        `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
         The decoder, the multimodal wrapper and the Qwen-Image conditioner all
         scale here.
 
@@ -1463,10 +1433,13 @@ class CausalTransformer(nn.Module):
         """
         # Gemma's cast: modeling_gemma3.py:117. lm-engine's fp32 opmath:
         # mixins/dense/base.py at 45b6b57b.
+        if self.embedding_norm and self.embedding_norm_reads == 'lookup':
+            x = self.embedding_layernorm(x)
         if self.embedding_scale:
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
-        return scaled(x, self.embedding_multiplier)
+        x = scaled(x, self.embedding_multiplier)
+        return x if self.embedding_features is None else self.project_in(x)
 
     @property
     def embedding_factor(self) -> float:
@@ -1475,12 +1448,16 @@ class CausalTransformer(nn.Module):
         (`dew.nn.diffusion_gemma.soft_embeddings`)."""
         return (math.sqrt(self.emb_features) if self.embedding_scale else 1.0) * self.embedding_multiplier
 
-    def draft(self, context, tokens, *, decode: bool = True, valid=None, choose=None):
+    def draft(self, context, tokens, *, decode: bool = True, coordinates: Coordinates | None = None,
+              choose=None):
         """Draft a DSpark block after each row's last context position.
 
         `context` `[B, M, targets * D]` comes from `draft_context` (the stream
-        means the target layers sow), `valid` `[B, M]` marks its real
-        positions, and `tokens` `[B]` are the tokens drawn after it. Returns
+        means the target layers sow), its `coordinates` mark its real
+        positions (`real_slots`: its validity less a padding document, every
+        one where None; one document a row, as a draft continues one), and
+        `tokens` `[B]` are the
+        tokens drawn after it. Returns
         `(ids [B, block + 1], logits [B, block, vocab], confidence [B, block])`.
         Tokens are chosen by `choose(index, logits)`, or greedily when `choose`
         is None (`dew.nn.dspark.draft`). For a cached draft, call
@@ -1492,8 +1469,9 @@ class CausalTransformer(nn.Module):
             raise ValueError("this model has no DSpark drafter")
         hc = self.hyper_connections
         assert hc is not None
-        return dspark_draft(self.dspark_stages, self.dspark, self.token_embeddings, self._logits,
-                            hc, context, tokens, decode=decode, valid=valid, choose=choose)
+        return dspark_draft(self.dspark_stages, self.dspark, self.stream_embeddings, self._logits,
+                            hc, context, tokens, decode=decode,
+                            valid=self._draft_context_validity(context, coordinates), choose=choose)
 
     def reach_drafter(self, tokens, dtype):
         """Create the DSpark drafter's parameters, which no forward pass reaches.
@@ -1504,6 +1482,17 @@ class CausalTransformer(nn.Module):
         assert self.dspark is not None
         width = len(self.dspark.target_layers) * self.emb_features
         self.draft(jnp.zeros((tokens.shape[0], 1, width), dtype), tokens[:, -1], decode=False)
+
+    @nn.nowrap
+    def _draft_context_validity(self, context, coordinates: Coordinates | None) -> jax.Array | None:
+        """The draft context's real positions `[B, M]` (`draft`): its layout's real slots, a padding
+        document's left out (`real_slots`), None where every one is; a context of several documents a
+        row is refused, since a draft continues one."""
+        if coordinates is None:
+            return None
+        if coordinates.segments is not None and coordinates.max_segments > 1:
+            raise ValueError("a draft continues one document a row, and this context holds several")
+        return real_slots({COORDINATES_FIELD: coordinates}, tuple(context.shape[:2]))
 
     def draft_context(self, prediction_inputs: Mapping) -> jax.Array:
         """Return DSpark's context `[B, S, targets * D]` from `prediction_inputs`.
@@ -1580,20 +1569,20 @@ class CausalTransformer(nn.Module):
         return self._logits(hidden)
 
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
-                              positions=None, segment_ids=None,
-                              input_embeddings=None,
-                              attention_mask=None, image_groups=None, block_groups=None,
+                              input_embeddings=None, image_groups=None, block_groups=None,
                               rotary_positions=None, attention_pairwise_mask=None,
                               attention_key_positions=None, attention_key_runs=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
-                              right_padded: bool = False, coordinates: Coordinates | None = None,
-                              conditioning: Mapping[str, jax.Array] | None = None):
+                              coordinates: Coordinates | None = None,
+                              conditioning: Mapping[str, jax.Array] | None = None,
+                              whole_blocks: bool = False, progress: Progress | None = None):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
         and the final norm; other depths read the final normalized states.
-        Packed `positions` and `segment_ids` reach the layers as the call's
-        `Coordinates`, the one description of its tokens every layer reads.
+        The tokens' layout is their `coordinates`, the one description of them
+        every layer reads; only `__call__` takes flat layout fields and converts
+        them (`token_coordinates`, ledger 1122).
 
         - `input_embeddings` `[B, S, D]` replace the scaled token embeddings,
           for a caller that fuses in another encoder's output. The token ids
@@ -1618,25 +1607,23 @@ class CausalTransformer(nn.Module):
           selects for them.
         - `admitted` makes a cached call a serving step's mixed call
           (`dew.nn.inputs.Admitted`).
-        - `right_padded` says each row of `attention_mask` holds its real
-          tokens first and its padding after, as a training batch pads them
-          (`dew.nn.inputs.AttentionMetadata.right_padded`). The real tokens'
-          states are the masked call's, the padding's are unspecified, and a
-          causal layer runs as an unpadded call does.
         - `coordinates` are the tokens' documents, validity and positions as
           the batch's builder made them (`dew.batch.coordinates`, with the
-          packer's `max_segments`); where None they are built here from
-          `segment_ids`, `attention_mask`, `positions` and `right_padded`.
+          packer's `max_segments`, and `right_padded` where each row holds its
+          real tokens first); None for one document a row, every token real.
         - `conditioning` carries the sequence the `cross_attention` layers read
           (`dew.nn.inputs.CONTEXT`) and its rows' lengths (`CONTEXT_LENGTHS`).
           A cached call that carries it keeps its keys and values for the
           calls after it. A model without cross-attention takes none.
+        - `whole_blocks` states that each of `block_groups`' blocks is its
+          document's whole run of real tokens (`AttentionMetadata.whole_blocks`).
+        - `progress` is a training step's (`dew.nn.progress`), which its DEX
+          layers anneal over; None is the run's end, outside a training step.
         """
         attention_metadata = self._attention_metadata(
-            tokens, decode, positions, segment_ids, attention_mask, image_groups, block_groups,
-            rotary_positions, attention_pairwise_mask, attention_key_positions, attention_key_runs,
-            media_mask, admitted,
-            right_padded, coordinates, conditioning)
+            tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
+            attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
+            whole_blocks=whole_blocks, progress=progress)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -1644,18 +1631,16 @@ class CausalTransformer(nn.Module):
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
-            # caller gave them in; a cached call's continue from its cache's cursor.
+            # caller gave them in; a cached call's continue from the model's own count of each row's
+            # real tokens (`DecodeCursor`), whatever mixer its first layer runs.
             tokens_at = coordinates_of(attention_metadata, *tokens.shape)
-            places = tokens_at.positions
-            if places is None:
-                valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
-                places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
-                # A first cached call finds no cursor yet: its tokens start the row.
-                start = self.layers[0].self_attn.get_variable('cache', 'cache_index') if decode else None
-                if start is not None:
-                    places = places + start[:, None]
+            valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
+            # Every cached call counts its real tokens, those at given places too, so a later call
+            # without places continues after them.
+            counted = self.decode_cursor(valid) if decode else prefix_sum(valid, dtype=jnp.int32) - 1
+            places = counted if tokens_at.positions is None else tokens_at.positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
-        if self.embedding_norm:
+        if self.embedding_norm and self.embedding_norm_reads == 'inputs':
             x = self.embedding_layernorm(x)
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
@@ -1663,7 +1648,7 @@ class CausalTransformer(nn.Module):
         # replacements in place, which token ids cannot rebuild. Sowing costs
         # nothing unless a caller opens the collection; init leaves it out.
         if not self.is_initializing():
-            prepared = self._prepared(self.token_embeddings(tokens), input_embeddings)
+            prepared = self._prepared(self.stream_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
@@ -1680,7 +1665,7 @@ class CausalTransformer(nn.Module):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
+        hidden = constrain(x if self.ngpt is not None or not self.final_norm else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in at least fp32 scores
@@ -1696,17 +1681,18 @@ class CausalTransformer(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
 
-    def _attention_metadata(self, tokens, decode: bool, positions, segment_ids, attention_mask, image_groups,
-                            block_groups, rotary_positions, pairwise_mask, key_positions, key_runs,
-                            media_mask, admitted=None,
-                            right_padded: bool = False,
+    def _attention_metadata(self, tokens, decode: bool, image_groups, block_groups, rotary_positions,
+                            pairwise_mask, key_positions, key_runs, media_mask, admitted=None,
                             coordinates: Coordinates | None = None,
-                            conditioning: Mapping[str, jax.Array] | None = None) -> AttentionMetadata | None:
+                            conditioning: Mapping[str, jax.Array] | None = None, *,
+                            whole_blocks: bool = False, progress: Progress | None = None
+                            ) -> AttentionMetadata | None:
         """What the layers read beside the residual, None for a call that
-        carries none of it: the masks and positions `hidden_and_mtp_inputs`
-        takes, the token ids a hash router selects by, the engram layers'
-        bucket ids, the media mask, which only a model with engram or a
-        router with a media bias reads, and the cross-attention's context."""
+        carries none of it: the tokens' layout `hidden_and_mtp_inputs`
+        converted (`coordinates`), the token ids a hash router selects by,
+        the engram layers' bucket ids, the media mask, which only a model
+        with engram or a router with a media bias reads, and the
+        cross-attention's context."""
         if conditioning and self.cross_attention is None:
             raise TypeError(f"this decoder has no cross-attention to read the conditioning "
                             f"{sorted(conditioning)}")
@@ -1717,7 +1703,7 @@ class CausalTransformer(nn.Module):
         if context is not None:
             # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
             # a standalone call, and a cached and a full one, project the same values.
-            context = CrossContext(context.embeddings.astype(self.context_dtype), context.lengths)
+            context = dataclasses.replace(context, embeddings=context.embeddings.astype(self.context_dtype))
         # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None and key_runs is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask or "
@@ -1727,17 +1713,18 @@ class CausalTransformer(nn.Module):
                              "visibility; pass one")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
-        if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded
-                                    or positions is not None):
-            coordinates = build_coordinates(tokens.shape[:2], segments=segment_ids, valid=attention_mask,
-                                            positions=positions, right_padded=right_padded)
         if decode and coordinates is not None and coordinates.max_segments > 1:
             raise ValueError(
                 "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
                 "call would attend across documents; prefill each document into a row of its own")
-        engram_ids = (None if self.engram is None else self.engram_hashes(
-            tokens, None if coordinates is None else coordinates.valid,
-            None if coordinates is None else coordinates.positions, decode, media_mask))
+        engram_ids = (None if self.engram is None else self.engram_hashes(tokens, coordinates, decode,
+                                                                          media_mask))
+        if context is not None and context.segments is not None:
+            # A context of several documents is read by the call's tokens of each document alone.
+            if coordinates is None or coordinates.segments is None:
+                raise ValueError("a context of several documents is read by packed rows, which name "
+                                 "their tokens' documents (segment_ids or coordinates)")
+            context = dataclasses.replace(context, queries=coordinates.segments)
         # A block router's blocks are numbered once for every routed layer.
         block = None if self.mixture is None else self.mixture.routing_block
         blocks = None if block is None else numbered_blocks(
@@ -1747,60 +1734,25 @@ class CausalTransformer(nn.Module):
                 and pairwise_mask is None and key_positions is None and key_runs is None
                 and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None and blocks is None
-                and context is None):
+                and context is None and (progress is None or progress.updates is None)):
             return None
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
             key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
             media=media_mask,
-            admitted=admitted, blocks=blocks, context=context, routing_block=block)
+            admitted=admitted, blocks=blocks, context=context,
+            # One row's progress apiece, as the metadata's other inputs are held by row, which a
+            # pipeline's microbatches slice (`run_pipeline`).
+            progress=None if progress is None or progress.updates is None else jnp.broadcast_to(
+                jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
+            routing_block=block,
+            whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):
-        """Run the layer stack over `x` once, or as `loop` says: the layers before
-        its block once, the block `steps` times, each pass after the first
-        reading the last one's output, normed under `step_norm`, and the layers
-        after it once; the passes before the last `backprop_steps` pass no
-        gradient back. `remat` checkpoints each block pass outside decode,
-        leaving its span and the train/decode choices static in the closure;
-        the per-pass collection view stays outside that checkpoint."""
-        loop = self.loop
-        if loop is None:
-            return self.stack(x, **stack)
-        first, end = loop.layers or (0, self.num_layers)
-        block = None if loop.layers is None else (first, end)
-        train, decode = stack['train'], stack['decode']
-        dynamic = {name: value for name, value in stack.items() if name not in ('train', 'decode')}
-
-        def pass_block(module, x, **inputs):
-            return module.stack(x, span=block, train=train, decode=decode, **inputs)
-
-        run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
-        if first:
-            x = self.stack(x, span=(0, first), **stack)
-        injected = x
-        shared = SharedPassView() if loop.shared_cache else None
-        first_pass = run_block if shared is None else nn.map_variables(
-            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
-            mutable=True)
-        x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
-        for step in range(1, loop.steps):
-            normed = self.norm(x)
-            self._gate_exit(normed)
-            x = normed if loop.step_norm else x
-            if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
-                x = jax.lax.stop_gradient(x)
-            if loop.reinject:
-                x = self.norm(x + injected)
-            view = shared or PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
-            run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
-                                   trans_out_fn=view.outside, mutable=True)
-            x = run(self, x, **dynamic)
-        if loop.reinject:
-            x = self.norm(x)
-        if end < self.num_layers:
-            x = self.stack(x, span=(end, self.num_layers), **stack)
-        return x
+        """Run the layer stack over `x` once, or as `loop` says (`looping.run_loop`): its block's later
+        passes under one scan, so a step's program holds two passes whatever the loop's count."""
+        return run_loop(self, x, **stack)
 
     def _gate_exit(self, normed):
         """Sow the exit gate's logit for a pass's normed states into `exits`."""
@@ -1842,7 +1794,11 @@ class CausalTransformer(nn.Module):
         # supplied layout; the scan's init=True pass would draw over it first.
         if (self.is_initializing() and stages == 1 and not decode
                 and not self.has_variable('params', f'layers_{first}')):
-            groups = spanned
+            # A run draws its layers under one scan where they draw alike: a layer whose start is its own
+            # (DEX's heads and lambda_init, `_dex_start`) draws apart, and its run stacks it after.
+            drawn = tuple((key, self._dex_start(index)) for index, key in enumerate(self.scan_keys))
+            groups = tuple((first + start, count)
+                           for start, count in scan_groups(drawn[first:end], self.bank_layers))
             if any(count > 1 for _, count in groups):
                 view = StackView(groups)
                 run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
@@ -1859,7 +1815,16 @@ class CausalTransformer(nn.Module):
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            view, split = (StackView(self.groups if span is None else spanned, banked=banked),
+            groups = self.groups if span is None else spanned
+            # A decode step over resident weights scans by period; weights a step reads a layer at
+            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
+            # and a layer that leaves what a later one reads (`_provides`) runs alone.
+            if decode and not (banked or self._provides or 'streaming' in self.variables
+                               or on_host(self.variables.get('params', {}))):
+                keys = self.scan_keys[first:end]
+                groups = tuple((first + start, count) for start, count in scan_groups(keys, periodic=True))
+            periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
+            view, split = (StackView(groups, banked=banked, periods=periods),
                            StageSplit(0, self.num_layers, 0))
         else:
             view, split = self._pipelined(x, stages, decode=decode, banked=banked, span=span)
@@ -1946,39 +1911,7 @@ class CausalTransformer(nn.Module):
         `ValueError`, and so do some banks without the others when there are
         no rows.
         """
-        runs = {group_name(first, count): [f'layers_{index}' for index in range(first, first + count)]
-                for first, count in self.groups if count > 1}
-        banked = []
-        for collection, tree in self.variables.items():
-            banks = set(tree) & set(runs)
-            if not banks:
-                continue
-            mixed = False
-            for bank, layers in runs.items():
-                rows = [layer for layer in layers if layer in tree]
-                if not rows:
-                    continue
-                mixed = True
-                if bank not in tree:
-                    continue
-                shared = {tuple(entry.key for entry in path)
-                          for path, _ in jax.tree_util.tree_leaves_with_path(tree[bank])}
-                for layer in rows:
-                    overlap = shared & {tuple(entry.key for entry in path)
-                                        for path, _ in jax.tree_util.tree_leaves_with_path(tree[layer])}
-                    if overlap:
-                        raise ValueError(
-                            f"collection {collection!r} holds {'/'.join(overlap.pop())} both in "
-                            f"the bank {bank} and in its layer {layer}; a leaf is read from one")
-            if mixed:
-                continue
-            if banks != set(runs):
-                raise ValueError(
-                    f"collection {collection!r} holds the banks {sorted(banks)} "
-                    f"of the runs {sorted(runs)} and not the others; a store holds every "
-                    f"run's bank or every layer's own subtree")
-            banked.append(collection)
-        return tuple(banked)
+        return banked_collections(self.groups, self.variables)
 
     def residual_dtype(self, x, *, train: bool, decode: bool, per_layer_input,
                        attention_metadata=None) -> jnp.dtype:
@@ -2067,7 +2000,7 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                banked='params' in view.banked)
+                banked='params' in view.banked, periods=view.periods)
         return run_pipeline(
             self,
             view,
@@ -2082,10 +2015,16 @@ class CausalTransformer(nn.Module):
     def _layer_inputs(self, tokens, x, routed_experts, routed) -> LayerInputs | None:
         """The per-layer signal and routing replay the stack slices by layer."""
         embeddings = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
+        # A mixer computing by its layer's place reads it as data (`MixerBase.reads_depth`).
+        mixers = {self.kind_of(kind).mixer or self.layer_mixer for kind in set(self.per_layer_types)}
+        reads = any(mixer.reads_depth for mixer in mixers)
+        depth = None if not reads else jnp.broadcast_to(jnp.arange(self.num_layers, dtype=jnp.int32),
+                                                        (*tokens.shape, self.num_layers))
         if routed_experts is None:
             if routed is not None:
                 raise ValueError("routed marks the tokens a routing record covers; pass routed_experts")
-            return None if embeddings is None else LayerInputs(embeddings=embeddings)
+            return None if embeddings is None and depth is None else LayerInputs(embeddings=embeddings,
+                                                                                 depth=depth)
         routed_experts = jnp.asarray(routed_experts)
         if routed_experts.ndim != 4 or routed_experts.shape[:3] != (*tokens.shape, self.num_layers):
             raise ValueError(
@@ -2093,7 +2032,7 @@ class CausalTransformer(nn.Module):
                 f"leading for this model; got {routed_experts.shape}")
         coverage = None if routed is None else jnp.broadcast_to(
             jnp.asarray(routed, bool)[:, :, None], routed_experts.shape[:3])
-        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage)
+        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage, depth=depth)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
         """Return every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
@@ -2135,35 +2074,41 @@ class CausalTransformer(nn.Module):
         return prepared.astype(x.dtype)
 
     def output_table(self) -> OutputTable | None:
-        """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
-        its product follows and a checkpoint's quantizer of its input.
-        None where no matrix alone is the head: past a `head_transform` or a continuum level, or
-        where `lm_head`'s parameters are not its kernel alone: `dew.lora`'s factors beside it, which
-        its interceptor adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product
-        reads instead."""
-        head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
+        """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables
+        (`_head_table`). None where no matrix alone is the head: past a `head_transform` or a continuum
+        level, or where `lm_head`'s or `project_out`'s parameters are not its kernel alone: `dew.lora`'s
+        factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's."""
+        layers = [*([] if self.tie_embeddings else [self.lm_head]),
+                  *([] if self.embedding_features is None else [self.project_out])]
         if (self.head_transform is not None or self.continuum is not None
-                or (head is not None and set(head) != {"kernel"})):
+                or any(set(layer.variables.get("params", {})) != {"kernel"} for layer in layers)):
             return None
         return self._head_table()
 
     def vocabulary_rows(self) -> jax.Array:
         """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
-        table is: past a `head_transform` the matrix's, which the transformed states meet, and with
-        an adapter on the head its rows as the adapter updates them (`applied_kernel`)."""
-        return self._head_table().rows()
+        table is: past a `head_transform` the matrix's, with an adapter on the head as it updates them
+        (`applied_kernel`), and past an embedding's own width in the stream's, through `project_out`."""
+        table = self._head_table()
+        rows = table.rows()
+        return rows if table.projection is None else rows @ table.projection.kernel.T.astype(rows.dtype)
+
+    def _quantizer(self, layer: nn.Module):
+        """A checkpoint's quantizer of `layer`'s input, None where the model computes under none."""
+        return self.input_quantizer(layer) if isinstance(self, QuantizesInputs) else None
 
     def _head_table(self) -> OutputTable:
         """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
-        embeddings, with `_logits`'s scale, bias, softcap and precision, the compute dtype its
-        product follows and a checkpoint's quantizer of its input."""
+        embeddings, with `_logits`'s scale, bias, softcap, precision and compute dtype, a checkpoint's
+        quantizer of its input, and `project_out` before it past an embedding's own width (`Projection`)."""
         matrix = self.embed_tokens.embedding if self.tie_embeddings else self.applied_kernel("lm_head")
-        quantizer = (self.input_quantizer(self.lm_head)
-                     if isinstance(self, QuantizesInputs) and not self.tie_embeddings else None)
+        projection = None if self.embedding_features is None else Projection(
+            self.applied_kernel("project_out"), self.precision, compute=self.dtype,
+            input_quantizer=self._quantizer(self.project_out))
         return OutputTable(matrix, self.tie_embeddings, self.head_bias_value if self.head_bias else None,
                            self.final_logit_softcap, self.precision, compute=self.dtype,
-                           input_quantizer=quantizer, scale=self._token_gains())
+                           input_quantizer=None if self.tie_embeddings else self._quantizer(self.lm_head),
+                           scale=self._token_gains(), projection=projection)
 
     def applied_kernel(self, name: str) -> jax.Array:
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
@@ -2183,6 +2128,33 @@ class CausalTransformer(nn.Module):
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
     # The serving and training hooks (`dew.nn.protocols`).
+
+    def _embeddings(self, projections):
+        """The token and position embeddings, their dropout and norm, and their projections in and out."""
+        self.embed_tokens = TokenEmbedding(
+            num_embeddings=self.vocab_size, features=self.embedding_features or self.emb_features,
+            dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
+            embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
+                            else nn.initializers.normal(self.initializer_range)))
+        if self.embedding_features is not None:
+            projection = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                           **normal_kernel(self.initializer_range))
+            self.project_in = projection(projections['project_in'][1], name='project_in')
+            self.project_out = projection(projections['project_out'][1], name='project_out')
+        if self.embedding_dropout_rate:
+            self.embedding_dropout = Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+        if self.embedding_norm:
+            self.embedding_layernorm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
+        if self.position_embedding == 'learned':
+            self.embed_positions = TokenEmbedding(
+                num_embeddings=self.position_rows,
+                features=self.emb_features, dtype=self.dtype, name='embed_positions',
+                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
+                                else nn.initializers.normal(self.initializer_range)))
+            self.decode_cursor = DecodeCursor()
 
     def _final_norm(self):
         """The norm before the head and between a loop's passes: under nGPT the unit norm itself,
@@ -2257,9 +2229,44 @@ class CausalTransformer(nn.Module):
         return at_least_fp32(self.dtype)
 
     @nn.nowrap
-    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+    def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         """This decoder with `cross` as its cross-attention layers (`CrossAttending`), None for none."""
         return self.clone(cross_attention=cross)
+
+    @nn.nowrap
+    def with_dex(self, extension: DifferentialExtension | None) -> Self:
+        """This decoder with `extension`'s differential on its chosen heads (`dew.nn.dex`), None for none."""
+        return self.clone(dex=extension)
+
+    @nn.nowrap
+    def with_scanned_layers(self) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
+        return self.clone(scan_layers=True)
+
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        """Whether its computation changes over a run (`dew.nn.progress.ReadsProgress`): its DEX layers'
+        lambda anneals over the run's updates."""
+        return self.dex is not None
+
+    @nn.nowrap
+    def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+        """`variables` as an export writes them, each DEX layer's differential folded into its output
+        projection at the operands its layers multiply in (`dew.nn.dex.folded`); `ValueError` names a
+        layer whose heads' outputs pass through more before it, which does not fold."""
+        for index, _ in () if self.dex is None else self.dex.layers:
+            mixer = self.mixer_of(index)
+            refusal = mixer.dex_fold_refusal() if isinstance(mixer, HeadOutputs) else None
+            if refusal is not None:
+                raise ValueError(f"the source's format holds no differential extension (DEX), and layer "
+                                 f"{index}'s does not fold into its output projection: {refusal}; a run's "
+                                 f"checkpoint keeps this model")
+        return folded(variables, self.dtype)
+
+    @nn.nowrap
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        """Its parameters at the root of `params`, and its softmax attention layers (`Differential`)."""
+        return (), softmax_attention_layers(self)
 
     def with_remat(self, policy: RematPolicy | None) -> Self:
         """Start at `policy`, including policies outside `DECODER_REMAT`.
@@ -2277,7 +2284,8 @@ class CausalTransformer(nn.Module):
     def recompute_more(self) -> Self | None:
         """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
         these layers mark than the rung above it (`MixerBase.marks`), whose step would
-        compile the same; None at the top or off the ladder."""
+        compile the same; None at the top, off the ladder, or where the top keeps what
+        this rung keeps, so no rung above holds less."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
         marked = self.marked_residuals()
@@ -2294,6 +2302,8 @@ class CausalTransformer(nn.Module):
         while (index < len(DECODER_REMAT) - 1
                and kept(DECODER_REMAT[index]) in (kept(self.remat), kept(DECODER_REMAT[index + 1]))):
             index += 1
+        if kept(DECODER_REMAT[index]) == kept(self.remat):
+            return None
         return self.clone(remat=DECODER_REMAT[index])
 
     @nn.nowrap
@@ -2308,14 +2318,20 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
-        (`MixerBase.marks`, every name where a kind does not say) and the MLP's."""
+        (`MixerBase.marks`, every name where a kind does not say) and, where a layer, its
+        gated cross-attention, a prediction depth or the drafter has a feed-forward, its
+        (`MLP_RESIDUALS`, the dense MLP's and the experts' alike)."""
         types = self.per_layer_types
-        mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
+        kinds = self.layer_kinds(types)
+        mixers = [kind.mixer or self.mixer for kind in kinds.values()]
         if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.marks() or ()
-                                                for mixer in mixers))
+        feeds = (any(spec.routed or spec.width or spec.cross is not None
+                     for spec in self._layer_specs(types, kinds, self.layer_mixer))
+                 or self.num_nextn_predict_layers or self.dspark is not None)
+        marked = (default if mixer is None else mixer.marks() or () for mixer in mixers)
+        return frozenset(MLP_RESIDUALS if feeds else ()).union(*marked)
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
@@ -2341,13 +2357,22 @@ class CausalTransformer(nn.Module):
 
     @property
     def cache_rebuild_position(self) -> int | None:
-        scaling = self.rope_scaling
-        return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+        """Where LongRoPE's factors switch from short to long, past which cached keys go stale: the
+        original length of every trunk layer's LongRoPE, its kind's or the model's (`kind_of`), None
+        where no layer takes LongRoPE. Kinds that switch at different lengths are refused, since a cache
+        rebuilds at one."""
+        originals = {kind.rope_scaling.original_max_position_embeddings
+                     for kind in map(self.kind_of, set(self.per_layer_types))
+                     if isinstance(kind.rope_scaling, LongRopeScaling)}
+        if len(originals) > 1:
+            raise ValueError(f"layer kinds switch LongRoPE's factors at {sorted(originals)} tokens; a cache "
+                             "rebuilds its keys at one")
+        return next(iter(originals), None)
 
     @nn.nowrap
     def block_chunks(self) -> tuple[int | None, ...]:
         """The attention chunk of each trunk layer that reads a block whole
-        (`AttentionMixer.bidirectional_blocks`), None where a layer has none (`BlockReading`). Each layer's
+        (`MixerBase.reads_blocks`), None where a layer has none (`BlockReading`). Each layer's
         mixer is `_layer_specs`' own, the kind's or the model's layer mixer, so a prediction depth's or the
         drafter's kind, which the trunk never runs, reads none here."""
         types = self.per_layer_types
@@ -2355,8 +2380,7 @@ class CausalTransformer(nn.Module):
         default = self.layer_mixer
         built = [(spec.kind.mixer or default, spec.kind.chunk)
                  for spec in self._layer_specs(types, kinds, default)]
-        return tuple(chunk for mixer, chunk in built
-                     if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks)
+        return tuple(chunk for mixer, chunk in built if mixer.reads_blocks)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
@@ -2377,7 +2401,8 @@ class CausalTransformer(nn.Module):
         default = self.layer_mixer
         for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
             refusal = (spec.kind.mixer or default).mixed_refusal(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared))
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex,
+                                   self._dex_start(index), spec.routed))
             if refusal is not None:
                 return f"layer {index}: {refusal}"
         return None

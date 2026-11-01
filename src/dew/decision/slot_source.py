@@ -17,11 +17,13 @@ from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
 from dew.interop.pretrained import Pretrained, with_overrides
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.nn.attention import AttentionImpl
 from dew.registry import dtype_name, from_record, import_path
 
 from .calibration import Calibration
 from .head import Head, LabelReadout, SlotReadout
 from .layout import (
+    LABEL_NAMES,
     LETTERS,
     AnswerCue,
     Framing,
@@ -39,8 +41,7 @@ SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the liste
                "its uppercase letter, with no explanation or reasoning.")
 _NOT_ONE_TOKEN = frozenset(["BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY", "FJ", "FQ", "FV", "FZ",
                             "GJ", "GK", "GQ", "GZ", "HJ", "IY", "JF", "JG", "JH", "JL", "JN", "JQ"])
-SLOT_LABELS = (*LETTERS, *[first + second for first in LETTERS for second in LETTERS
-                           if first + second not in _NOT_ONE_TOKEN][:256 - 26])
+SLOT_LABELS = tuple(name for name in LABEL_NAMES if name not in _NOT_ONE_TOKEN)[:256]
 """OneJev qev/prompt.py's 256 labels at 81ce62f1597c91e46767d4d02d6ac2e18534fe94."""
 _PATHS = {"slot": ("slots",), "q.weight": ("q",), "k.weight": ("k",)}
 _LABELS = Labels(variants=("{}",), names=SLOT_LABELS)
@@ -100,7 +101,7 @@ def _labels(tokenizer: HFTokenizer, count: int) -> tuple[Labels, tuple[tuple[int
 
 @dataclasses.dataclass(frozen=True)
 class SlotHeadSource(HeadComponent):
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: str, *,
+    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         if backbone is None:
             raise ValueError("a slot readout needs its native backbone")

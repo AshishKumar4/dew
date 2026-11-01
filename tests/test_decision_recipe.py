@@ -16,6 +16,7 @@ from dew.decision import Choice, Decide, decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
+from dew.training import LocalTracker
 from dew.training.evaluation import Summary
 
 pytestmark = pytest.mark.mesh
@@ -45,7 +46,8 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.steps", "2", "--trainer.eval-every", "2",
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
+        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32",
+        "--trainer.scored-to", str(tmp_path / "scored")],
         default=DecisionRunConfig(data=asked(train), validation=asked(held)))
     assert config.data.facts()["batch"] == 8
     assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
@@ -56,6 +58,9 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     answer = decide("I was billed twice", {"team": Choice("Which team?", ["billing", "technical", "sales"])})
     assert answer["team"].choice in ("billing", "technical", "sales")
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
+    # The run kept every validation batch's decisions of its evaluation, as `--trainer.scored-to` asked.
+    kept = sorted(path.name for path in (tmp_path / "scored" / "step-2").iterdir())
+    assert kept and kept == [f"val-{batch:05d}.npz" for batch in range(len(kept))]
 
 
 def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_their_summary(tmp_path):
@@ -89,10 +94,9 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
         default=DecisionRunConfig(data=asked(train), validation={"val": asked(held), "test": asked(held)}))
     config.run()
     run = tmp_path / "runs" / "splits"
-    logged = [json.loads(line) for line in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
     scores = {}
-    for row in logged:
-        scores.setdefault(row["step"], {}).update(row["scalars"])
+    for step, values in LocalTracker(run / "tracking").scalars():
+        scores.setdefault(step, {}).update(values)
     for step in (1, 2):
         names = {name for name in scores[step] if name.rpartition("/")[0] in ("val", "test", Summary.SPLIT)}
         assert names == {"val/loss", "val/accuracy", "test/loss", "test/accuracy", "test/brier", board}
@@ -304,8 +308,7 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
     [summary] = [entry["value"]["summary"] for entry in recorded if entry["type"] == "RunRecord"]
     assert summary["mixture"] == {"tickets": 3.0, "billing": 2.0}
     assert summary["made"] == json.loads(Path(descriptor).read_text())
-    logged = [json.loads(line) for line in (tracking / "scalars.jsonl").read_text().splitlines()]
-    assert any("val/loss" in row["scalars"] for row in logged)
+    assert any("val/loss" in values for _, values in LocalTracker(tracking).scalars())
     with pytest.raises(ValueError):
         mixture(str(tmp_path / "mixture"), weights={"tickets": 0.0, "billing": 0.0}, descriptor=descriptor)
 
@@ -532,9 +535,19 @@ def test_a_decision_run_reads_letters_as_its_letter_readout():
     from dew.data.dataset import DataPartition
     from dew.decision.config import Letters
     from dew.decision.head import LabelReadout
-    from dew.decision.layout import Labels, QuestionLayout
+    from dew.decision.layout import (
+        AnswerCue,
+        Instructions,
+        Labels,
+        OptionLines,
+        QuestionLayout,
+        RowSegment,
+        State,
+        Text,
+    )
     from dew.decision.objective import tokenizer_of
     from dew.interop import Pretrained
+    from dew.registry import from_record, to_record
 
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
@@ -547,10 +560,18 @@ def test_a_decision_run_reads_letters_as_its_letter_readout():
     assert tokenizer is not None
     assert isinstance(head, LabelReadout) and head.label_ids == labels.ids(tokenizer, 4)
     assert isinstance(layout, QuestionLayout)
-    assert layout.labels == dataclasses.replace(labels, names=labels.names_for(4))
+    assert layout.labels == labels.spelled(tokenizer, 4)
     with pytest.raises(ValueError):
         _, few = dataclasses.replace(run, head=Letters(labels=labels, count=2)).prepare().train("x")
         next(iter(few.train(DataPartition())))
+    # The run names the row's segments: the question first, the state after it.
+    question_first = (Instructions({"choice": "Question: {}", "noul": "Question: {}", "score": "Rate: {}"}),
+                      Text("\nOptions:\n"), OptionLines(), Text("\n<state>\n"), State(render="state"),
+                      Text("\n</state>\n"), AnswerCue())
+    ordered, _ = dataclasses.replace(run, segments=question_first).prepare().train("x")
+    assert isinstance(ordered.layout, QuestionLayout) and ordered.layout.segments == question_first
+    assert from_record(tuple[RowSegment, ...], json.loads(json.dumps(
+        to_record(question_first, tuple[RowSegment, ...]))), dtypes=False) == question_first
 
 
 def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked():
@@ -586,6 +607,22 @@ def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_wher
     assert "backbone" in adapted.variables[FROZEN]
     with pytest.raises(ValueError):
         dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
+
+
+def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
+    """A fresh joint head's run whose segments hold an answer cue, which a joint row has no place for,
+    is refused as it is prepared, never trained on rows that dropped it; the same run without the cue
+    prepares (row 1943)."""
+    from dew.decision.config import JointShape
+    from dew.decision.layout import AnswerCue, Schema, State
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=JointShape(), max_len=1024,
+                              segments=(Schema(), State()))
+    run.prepare()
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, segments=(Schema(), State(), AnswerCue())).prepare()
 
 
 def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
@@ -648,6 +685,38 @@ def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
     assert not plain.layout.blocks
     with pytest.raises(ValueError):
         dataclasses.replace(run, head=JointShape()).prepare()
+
+
+def test_a_decision_run_writes_its_rows_in_the_order_and_blocks_it_names():
+    """`--order` writes a fresh head's rows in its order and `--split` splits them where it says, the
+    whole row one block where its source reads blocks; a split of rows its source reads in order is
+    refused, a run of the rows' own segments and an order beside them too, and a framing of the
+    layout's own row, which is written unframed."""
+    from dew.config import SourceOptions
+    from dew.decision.layout import AnswerCue, Framing, Instructions, OptionLines, QuestionLayout, State
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source,
+                              order="re_read", split="whole")
+    objective, _ = run.prepare().train("x")
+    layout = objective.layout
+    assert isinstance(layout, QuestionLayout)
+    assert (layout.order, layout.split, layout.blocks) == ("re_read", "whole", True)
+    [row] = layout.rows(objective.tokenizer, objective.specials, "my card is lost",
+                        {"q": Choice("Which?", ["a", "b"])})
+    assert row.blocks == (0,) * len(row.tokens)
+    plain = dataclasses.replace(run, source=SourceOptions(text_only=True))
+    with pytest.raises(ValueError):
+        plain.prepare()
+    ordered, _ = dataclasses.replace(plain, split=None, order="question_first").prepare().train("x")
+    assert isinstance(ordered.layout, QuestionLayout) and ordered.layout.order == "question_first"
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, split=None, segments=(Instructions({"choice": "{}"}), OptionLines(),
+                                                         State(), AnswerCue())).prepare()
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, split=None, framing=Framing()).prepare()
 
 
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():

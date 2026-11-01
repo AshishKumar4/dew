@@ -5,6 +5,7 @@ small private tmpfs scratch mounts. Models and compiled programs belong to the
 separate serving uid and are never loaded into these kernel processes.
 """
 
+import asyncio
 import json
 import os
 import queue
@@ -13,12 +14,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from guests import GUEST_UIDS, user
+from guests import GUEST_UIDS, idle_seconds, user
 from kernel_gateway.services.kernels.manager import (
     KernelGatewayIOLoopKernelManager,
     SeedingMappingKernelManager,
 )
-from traitlets import default
+from traitlets import Set, default
 
 _uids = queue.SimpleQueue()
 for _uid in GUEST_UIDS:
@@ -65,12 +66,18 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             _uids.put(uid)
             self.guest_uid = None
 
+    def _guest_uid(self) -> int:
+        """This kernel's guest uid: the one it holds, as a restart's relaunch does (a restart releases none,
+        `cleanup_connection_file` being a full shutdown's alone), else one from the pool."""
+        if getattr(self, "guest_uid", None) is None:
+            try:
+                self.guest_uid = _uids.get_nowait()
+            except queue.Empty:
+                raise RuntimeError("the shared container has no free isolated kernel uid") from None
+        return self.guest_uid
+
     async def _async_launch_kernel(self, kernel_cmd, **kwargs):
-        try:
-            uid = _uids.get_nowait()
-        except queue.Empty:
-            raise RuntimeError("the shared container has no free isolated kernel uid") from None
-        self.guest_uid = uid
+        uid = self._guest_uid()
         if len(kernel_cmd) < 3 or kernel_cmd[1:3] != ["-m", "ipykernel_launcher"]:
             raise ValueError("only the Python demo kernel may be started")
         connection = Path('/sessions/connections') / Path(self.connection_file).name
@@ -151,6 +158,64 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
 
 
 class LimitedMappingKernelManager(SeedingMappingKernelManager):
+    """The gateway's kernels, each launched isolated (`LimitedKernelManager`), and culled by jupyter-server's
+    own culler once no connection holds one and it has been idle for the live contract's idle time
+    (`guests.idle_seconds`), looked for every tenth of it: a kernel whose create the bridge gave up on while
+    the gateway went on making it, which no context, close or cleanup knows. A page's kernels hold the
+    bridge's channels, and an IPC client's (benchmark_gateway.py) is active while its requests run.
+
+    A kernel's resources (its connection file, uid and mounts) are released by `shutdown_kernel` alone,
+    whatever ends it: a delete, the culler, or its restarts failing (`_handle_kernel_died`)."""
+
+    _releasing = Set()
+    """The shutdowns of dead kernels under way (`_handle_kernel_died`)."""
+
     @default("kernel_manager_class")
     def _kernel_manager_class_default(self):
         return "gateway_manager.LimitedKernelManager"
+
+    @default("cull_idle_timeout")
+    def _cull_idle_timeout_default(self):
+        return idle_seconds()
+
+    @default("cull_interval")
+    def _cull_interval_default(self):
+        return max(1, idle_seconds() // 10)
+
+    async def shutdown_kernel(self, kernel_id, now=False, restart=False):
+        """`kernel_id` shut down, and its resources released, the one place they are: a restart under way
+        settles first, as jupyter-client reads its `ready` as done (a delete mid-restart raised and kept the
+        kernel), and one whose restart failed is released here, where jupyter-client drops it releasing none
+        (ledger 2516). Then jupyter-server's own shutdown: its activity, buffers and count."""
+        kernel = self.get_kernel(kernel_id)
+        # A restart replaces `ready` for each of its phases, its shutdown's then its start's: each is waited
+        # for, its end read below (`asyncio.wait` neither raises it nor cancels the phase), within the
+        # server's own bound on a kernel's start (`kernel_info_timeout`).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.kernel_info_timeout
+        while not kernel.ready.done() and loop.time() < deadline:
+            await asyncio.wait([kernel.ready], timeout=deadline - loop.time())
+        if not kernel.ready.done():
+            # A restart hung past that bound: its process stopped and its resources released, and it is
+            # dropped, as no shutdown can read a `ready` that never settles.
+            if kernel.provisioner is not None:
+                await kernel.provisioner.kill(restart=False)
+            await kernel.cleanup_resources(restart=False)
+            self.stop_watching_activity(kernel_id)
+            self.stop_buffering(kernel_id)
+            self.remove_kernel(kernel_id)
+            return None
+        # Its restart failed: its relaunch raised, or it never answered.
+        if not kernel.ready.cancelled() and kernel.ready.exception() is not None:
+            await kernel.cleanup_resources(restart=False)
+        return await super().shutdown_kernel(kernel_id, now=now, restart=restart)
+
+    def _handle_kernel_died(self, kernel_id):
+        """A kernel whose restarts failed, as the guests' OOM killer leaves one under memory pressure, shut
+        down as a delete would (`shutdown_kernel`): jupyter-server drops it releasing nothing (2.21.1's
+        `_handle_kernel_died`), so its connection file outlived its page's close, no delete reaching a kernel
+        the gateway no longer holds (ledger 843: "contexts left open after their pages closed")."""
+        # A callback of the restarter's, on the gateway's loop: the shutdown runs there, held till it ends.
+        ended = asyncio.ensure_future(self.shutdown_kernel(kernel_id, now=True))
+        self._releasing.add(ended)
+        ended.add_done_callback(self._releasing.discard)

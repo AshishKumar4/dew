@@ -1,4 +1,5 @@
-"""Fresh SSD inputs and exact head, channel and state-coordinate orbits."""
+"""Fresh SSD inputs and exact head, channel and state-coordinate orbits, and the recurrence's float64
+oracle (`stepwise_scan`)."""
 
 import jax
 import jax.numpy as jnp
@@ -102,3 +103,14 @@ def mamba_ssd_xla(arrays, chunk, dtype=None):
                               jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
 
 
+def stepwise_scan(x, b, c, a, state):
+    """The recurrence one step at a time, no chunks: `h_t = exp(a_t) h_{t-1}
+    + x_t b_t^T`, `y_t = h_t c_t`. Written apart from both chunked paths, so
+    in float64 it is an oracle neither of them shares a line with."""
+    def step(h, inputs):
+        x, b, c, a = inputs
+        h = jnp.exp(a)[..., None, None] * h + x[..., :, None] * b[..., None, :]
+        return h, jnp.einsum('bhpn,bhn->bhp', h, c)
+
+    final, ys = jax.lax.scan(step, state, tuple(jnp.moveaxis(t, 1, 0) for t in (x, b, c, a)))
+    return jnp.moveaxis(ys, 0, 1), final

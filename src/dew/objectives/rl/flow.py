@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import jax
@@ -29,18 +29,19 @@ from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, 
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
-from dew.diffusion.process import Process
+from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules.source import SourceGrid
 from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import CFG, Walk
+from dew.sampling.guidance import CFG, Guidance, Pair, Prediction, Walk, pair_of
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -50,9 +51,6 @@ REWARDS_KEY = "rewards"
 
 if TYPE_CHECKING:
     from dew.state import TrainState
-
-Predictor = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
-
 
 
 def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
@@ -131,21 +129,24 @@ class FlowGRPOObjective(DiffusionObjective):
         return ("Flow-GRPO has no source-batch validation loss; rank checkpoints by a reward metric "
                 "with an explicit Best, or pass no validation data")
 
-    def _walk(self, params: Variables, batch: Batch) -> Walk:
-        """The walk of the denoiser this batch's conditions select, guided as
-        the rollout's walk was: over its `rollout_steps` points, a
-        transition's column being its step's index."""
+    def _policy(self, params: Variables, batch: Batch, opened: tuple[str, ...] = ()) -> Denoiser:
+        """The denoiser this batch's conditions select, its model's calls opening `opened`."""
         given = self.encoded_conditions(params, batch)
         # An inpainting model's masked-image inputs, as the rollout encoded them (`FlowRollout`).
         spatial = batch.get("spatial", {})
-        denoise = self.denoiser(params, {**given, **spatial},
-                                {**self.blank_conditions(params, given), **spatial})
-        points = jnp.asarray(batch["rollout_steps"], jnp.int32)
-        return Walk.over(denoise, self.guidance, points[0] - 1)
+        policy = self.denoiser(params, {**given, **spatial},
+                               {**self.blank_conditions(params, given), **spatial})
+        return replace(policy, opened=opened)
 
-    def _transition(self, predict: Predictor, x: jax.Array,
+    def _walk(self, params: Variables, batch: Batch, opened: tuple[str, ...] = ()) -> Walk:
+        """The walk of the denoiser this batch's conditions select (`_policy`), guided as the rollout's
+        walk was: over its `rollout_steps` points, a transition's column being its step's index."""
+        points = jnp.asarray(batch["rollout_steps"], jnp.int32)
+        return Walk.over(self._policy(params, batch, opened), self.guidance, points[0] - 1)
+
+    def _transition(self, pair: tuple[jax.Array, jax.Array], x: jax.Array,
                     t: jax.Array, following: jax.Array) -> GaussianTransition:
-        denoised, eps = predict(x, t)
+        denoised, eps = pair
         return self.sde.transition(x, t, following, denoised, eps, self.process)
 
     def _window(self, batch: Batch) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -180,7 +181,7 @@ class FlowGRPOObjective(DiffusionObjective):
 
         def score(_, values):
             x, action, t, s, index = values
-            return None, self._transition(walk.at((), index), x, t, s).log_prob(action)
+            return None, self._transition(pair_of(walk.at((), index)(x, t)), x, t, s).log_prob(action)
 
         _, values = jax.lax.scan(score, None, (*(
             jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)),
@@ -205,7 +206,10 @@ class FlowGRPOObjective(DiffusionObjective):
         if advantages.shape != times.shape:
             raise ValueError("advantages must hold one value per trajectory or per transition")
         advantages = jnp.clip(advantages, -self.adv_clip_max, self.adv_clip_max)
-        walk = self._walk(variables, batch)
+        # A watched step's policy calls return what they sow, through its guidance's own outputs
+        # (`Guidance`), so the step summarizes the forward that trains.
+        opened = (INSPECTED,) if step.watched is not None else ()
+        walk = self._walk(variables, batch, opened)
         reference = None
         if self.beta > 0:
             if step.ema is None:
@@ -215,7 +219,8 @@ class FlowGRPOObjective(DiffusionObjective):
 
         def terms(_, values):
             x, action, t, s, old_log_prob, advantage, selected, index = values
-            transition = self._transition(walk.at((), index), x, t, s)
+            pair, sown = observed(walk.at((), index)(x, t), opened, self.guidance)
+            transition = self._transition(pair, x, t, s)
             # NaN variance remains selected and fails the numerical check. Only
             # a zero-variance interval is outside the Gaussian policy's support.
             keep = selected & (transition.variance != 0)
@@ -231,12 +236,12 @@ class FlowGRPOObjective(DiffusionObjective):
             if reference is not None:
                 # The released scripts/train_sd3.py that the module docstring
                 # compares this KL with is at 879042cf5707f8b90daa98d147d7deac2317c5da.
-                reference_mean = self._transition(reference.at((), index), x, t, s).mean
+                reference_mean = self._transition(pair_of(reference.at((), index)(x, t)), x, t, s).mean
                 kl, _ = weighted_total(transition.kl(reference_mean) / dimensions, keep)
             clipped_count = (keep & (jnp.abs(ratio - 1) > self.clip_range)).sum()
-            return None, (pg, kl, mass, clipped_count)
+            return None, ((pg, kl, mass, clipped_count), sown)
 
-        _, summed = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
+        _, (summed, sown) = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
             latents, following, times, next_times, old, advantages, mask)), jnp.arange(times.shape[1])))
         pg, kl, mass, clipped_count = (value.sum() for value in summed)
         denominator = jnp.where(mass > 0, mass, 1)
@@ -245,11 +250,29 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        return Ratio(pg + self.beta * kl, mass), Aux(metrics)
+        # The policy's forward at each trajectory's first transition, its own trained call's.
+        inspected = None if sown is None else jax.tree.map(lambda summary: summary[0], sown).get(
+            INSPECTED, {})
+        return Ratio(pg + self.beta * kl, mass), Aux(metrics, inspected=inspected)
 
     def _rows(self, batch: Batch) -> int:
         """One sample per source row, which a prompt-only batch has too."""
         return _source(self.inputs, batch).shape[0]
+
+
+def observed(predicted: Prediction, opened: tuple[str, ...], guidance: Guidance | None
+             ) -> tuple[Pair, Variables | None]:
+    """A walk's prediction as its pair and what its policy's call opened (`Denoiser.observed`), None where
+    the walk's denoiser opens nothing; refused by name where a guidance returns a bare pair over an opened
+    denoiser, which the `Guidance` protocol asks it not to."""
+    if not opened:
+        return pair_of(predicted), None
+    pair, sown = predicted
+    if not isinstance(pair, tuple) or not isinstance(sown, Mapping):
+        raise TypeError(f"{type(guidance).__name__}'s prediction over an opened denoiser returns no "
+                        "observation: read the model through raw_observed or raw_both_observed and return "
+                        "denoise.observed(pair, sown) (dew.sampling.guidance.Guidance)")
+    return pair, dict(sown)
 
 
 type FlowReward = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequence[float]]
@@ -257,73 +280,36 @@ type FlowReward = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequenc
 
 
 @dataclass(frozen=True)
-class FlowRollout:
-    """Collects complete prompt groups and the first `train_steps` transitions of each trajectory.
+class GroupedRollout:
+    """A rollout of complete prompt groups: each source row sampled `groups` times by a policy of the
+    state (`_policy`) over `steps` time points (`_generate_impl`), every sample scored once on process
+    zero by `reward` and the scores broadcast, then cut into this process's training rows
+    (`_training_rows`). A flow method supplies the three; the expansion, the gathering and the scoring
+    are this one's.
 
-    Each source row is sampled `groups` times. `steps` counts time points, so
-    `steps=11` draws ten transitions, and `train_steps` None trains on all of
-    them.
+    The trainer passes global arrays on every process. Generation runs on every process, rewards are
+    computed once on process zero, and the result holds only the rows this process owns, for the
+    trainer's `shard_batch`. Gathering to the host uses `collective_host`, which copies the whole
+    generation to every process before each selects its local rows."""
 
-    A sample's advantage is its reward minus its group's mean, divided by
-    the group's population standard deviation plus 1e-4, as Flow-GRPO's
-    PerPromptStatTracker computes it. Each prompt row is its own group, so
-    equal prompt text in other rows does not merge groups. Rows with zero
-    advantage are masked, as the reference training loop filters them out.
-
-    Rewards stay in float64 from the callback, through the JSON and byte
-    transport, to the population statistics, and they stay float64 on the
-    host. The training advantages are float32 after normalization. The `reward` metric
-    is a float32 diagnostic, and JAX's device transfer also narrows the
-    reward column when x64 is off.
-
-    The trainer passes global arrays on every process. Generation runs on
-    every process, rewards are computed once on process zero, and the result
-    holds only the rows this process owns, for the trainer's `shard_batch`.
-    Gathering to the host currently uses `collective_host`, which copies the
-    whole trajectory to every process before each selects its local rows.
-    """
-
-    objective: FlowGRPOObjective
+    objective: DiffusionObjective
     reward: FlowReward
     groups: int = 4
     steps: int = 11
-    train_steps: int | None = None
 
-    def __post_init__(self) -> None:
-        if self.groups < 2:
-            raise ValueError("a flow reward group needs at least two samples")
-        if self.steps < 2:
-            raise ValueError("a flow rollout needs at least two time points")
-        if self.train_steps is not None and not 1 <= self.train_steps < self.steps:
-            raise ValueError("train_steps must select between one and steps-1 transitions")
-        if self.objective.sde.noise_level == 0:
-            raise ValueError("online FlowGRPO needs positive noise for stochastic transitions")
-        self.objective.sde.validate(self.objective.process, self.objective.process.times(self.steps))
-        reserved = {"latents", "next_latents", "timesteps", "next_timesteps", "rollout_steps", "spatial",
-                    OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
-        if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
-            raise ValueError("conditioning fields must not overwrite FlowGRPO transition fields")
+    def _policy(self, state: TrainState) -> Variables:
+        """The weights a rollout samples with."""
+        raise NotImplementedError
 
+    def _generate_impl(self, params: Variables, batch: Batch, key: jax.Array):
+        """`(generated, decoded samples in [-1, 1], spatial inputs)` of one sample per row."""
+        raise NotImplementedError
 
+    def _training_rows(self, generated, context: Batch, spatial: Mapping[str, np.ndarray],
+                       rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
+        """This process's training rows of a generation and its float64 rewards."""
+        raise NotImplementedError
 
-    def _generate_impl(self, params: Variables, batch: Batch,
-                       key: jax.Array) -> tuple[FlowTrajectory, jax.Array, dict[str, jax.Array]]:
-        """Sample one SDE trajectory per row, decode its final samples, and return the masked-image
-        inputs an inpainting model read, which its rescoring reads again."""
-        objective = self.objective
-        given = objective.encoded_conditions(params, batch)
-        spatial = objective._spatial(params, batch, key)
-        denoise = objective.denoiser(params, {**given, **spatial},
-                                     {**objective.blank_conditions(params, given), **spatial})
-        noise_key, sample_key = jax.random.split(key)
-        count = _source(objective.inputs, batch).shape[0]
-        initial = objective.process.noise(noise_key, (count, *objective.latent_shape))
-        trajectory = objective.sde.trajectory(denoise, initial, self.steps,
-                                              guidance=objective.guidance, key=sample_key)
-        samples = trajectory.samples
-        if objective.autoencoder is not None:
-            samples = objective.autoencoder.decode(params["autoencoder"], samples)
-        return trajectory, jnp.clip(samples, -1, 1), spatial
 
     def _owned_rows(self, source: jax.Array) -> slice | np.ndarray:
         """Select the expanded rows this process owns.
@@ -372,50 +358,13 @@ class FlowRollout:
 
         return jax.tree.map(repeat, batch), owned, count
 
-    def _transitions(self, trajectory: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
-                     rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
-        """Cut the trajectory into this rank's training rows.
-
-        Rewards are centred within their prompt's group, only the first
-        `train_steps` transitions train, and a row whose group gave it no
-        advantage is masked out of the loss.
-        """
-        # The author code uses float64 population statistics on the host, and 1e-4; text GRPO's
-        # estimator (`group_advantage`) float32 and ddof=1, which would change this loss.
-        advantages = group_normalised(rewards.reshape(-1, self.groups), ddof=0, eps=1e-4, xp=np)
-        advantages = advantages.astype(np.float32).reshape(-1)
-        if not np.isfinite(advantages).all():
-            raise ValueError("flow group advantages must remain finite")
-        selected = self.steps - 1 if self.train_steps is None else self.train_steps
-        local_advantages = advantages[owned]
-        shape = (local_advantages.shape[0], selected)
-        prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
-                                                 context[condition.field])
-                    for condition in self.objective.inputs.conditions.values()}
-        prepared.update({
-            "latents": np.asarray(trajectory.states)[owned, :selected],
-            "next_latents": np.asarray(trajectory.states)[owned, 1:selected + 1],
-            "timesteps": np.broadcast_to(trajectory.times[:selected], shape),
-            "next_timesteps": np.broadcast_to(trajectory.times[1:selected + 1], shape),
-            "rollout_steps": np.full(shape[:1], self.steps, np.int32),
-            OLD_LOG_PROBS_KEY: np.asarray(trajectory.log_probs)[owned, :selected],
-            "transition_mask": (np.asarray(trajectory.stochastic)[owned, :selected]
-                                & (local_advantages[:, None] != 0)),
-            ADVANTAGES_KEY: local_advantages,
-            REWARDS_KEY: rewards[owned],
-        })
-        if spatial:
-            prepared["spatial"] = {name: np.asarray(value)[owned] for name, value in spatial.items()}
-        return prepared
-
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
-        """Collect one batch of trajectories and return this process's training rows.
+        """Collect one batch of samples and return this process's training rows.
 
         It expands each prompt into its group, generates on every process,
-        scores on process zero and broadcasts the rewards. Then it centres
-        the rewards within each group and cuts each trajectory to its first
-        `train_steps` transitions. The processes agree that each phase
-        succeeded before the next collective runs.
+        scores on process zero and broadcasts the rewards, then cuts the
+        generation into training rows (`_training_rows`). The processes agree
+        that each phase succeeded before the next collective runs.
         """
         # The text a reward reads stays on each host (`split_fields`); the rest is placed. Every process
         # agrees which host fields there are before any of them gathers them.
@@ -425,8 +374,9 @@ class FlowRollout:
                 host, is_leaf=lambda column: not isinstance(column, Mapping))))
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
         # The objective owns the program; the rollout fixes only its count of time points.
-        generate = self.objective.program(f"flow rollout over {self.steps} time points", self._generate_impl)
-        generated = agreed("flow rollout generation", lambda: generate(state.variables, expanded, key))
+        generate = self.objective.program(f"{type(self).__name__} over {self.steps} time points",
+                                          self._generate_impl)
+        generated = agreed("flow rollout generation", lambda: generate(self._policy(state), expanded, key))
         source = _source(self.objective.inputs, batch)
         # In a pool the source is placed across processes (`_expanded`), and each source row's origin rides
         # the rollout's own collective (`row_origins`), so its host fields meet in that order.
@@ -435,7 +385,7 @@ class FlowRollout:
                 and isinstance(placed.mesh, jax.sharding.Mesh) and not source.is_fully_addressable else None)
         rows = rows_of(host) if fields else 0
         origins = row_origins(mesh, rows) if fields and mesh is not None else None
-        (trajectory, images, spatial), context, origins = collective_host(
+        (generation, images, spatial), context, origins = collective_host(
             (generated, expanded, origins), phase="flow rollout")
         # The reward reads the host fields beside the samples' context, each source row's repeated into its
         # group as the context's are; the training rows read neither.
@@ -459,8 +409,107 @@ class FlowRollout:
         rewards = np.asarray(broadcast_from_process_zero(
             None if rewards is None else rewards.tolist()), np.float64)
         return agreed("flow rollout batching",
-                      lambda: self._transitions(trajectory, context, spatial, rewards, owned))
+                      lambda: self._training_rows(generation, context, spatial, rewards, owned))
 
 
-__all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout"]
+@dataclass(frozen=True)
+class FlowRollout(GroupedRollout):
+    """Collects complete prompt groups and the first `train_steps` transitions of each trajectory.
+
+    Each source row is sampled `groups` times. `steps` counts time points, so
+    `steps=11` draws ten transitions, and `train_steps` None trains on all of
+    them.
+
+    A sample's advantage is its reward minus its group's mean, divided by
+    the group's population standard deviation plus 1e-4, as Flow-GRPO's
+    PerPromptStatTracker computes it. Each prompt row is its own group, so
+    equal prompt text in other rows does not merge groups. Rows with zero
+    advantage are masked, as the reference training loop filters them out.
+
+    Rewards stay in float64 from the callback, through the JSON and byte
+    transport, to the population statistics, and they stay float64 on the
+    host. The training advantages are float32 after normalization. The `reward` metric
+    is a float32 diagnostic, and JAX's device transfer also narrows the
+    reward column when x64 is off. It samples with the live weights.
+    """
+
+    objective: FlowGRPOObjective
+    train_steps: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.groups < 2:
+            raise ValueError("a flow reward group needs at least two samples")
+        if self.steps < 2:
+            raise ValueError("a flow rollout needs at least two time points")
+        if self.train_steps is not None and not 1 <= self.train_steps < self.steps:
+            raise ValueError("train_steps must select between one and steps-1 transitions")
+        if self.objective.sde.noise_level == 0:
+            raise ValueError("online FlowGRPO needs positive noise for stochastic transitions")
+        self.objective.sde.validate(self.objective.process, self.objective.process.times(self.steps))
+        reserved = {"latents", "next_latents", "timesteps", "next_timesteps", "rollout_steps", "spatial",
+                    OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
+        if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
+            raise ValueError("conditioning fields must not overwrite FlowGRPO transition fields")
+
+
+
+    def _policy(self, state: TrainState) -> Variables:
+        return state.variables
+
+    def _generate_impl(self, params: Variables, batch: Batch,
+                       key: jax.Array) -> tuple[FlowTrajectory, jax.Array, dict[str, jax.Array]]:
+        """Sample one SDE trajectory per row, decode its final samples, and return the masked-image
+        inputs an inpainting model read, which its rescoring reads again."""
+        objective = self.objective
+        given = objective.encoded_conditions(params, batch)
+        spatial = objective._spatial(params, batch, key)
+        denoise = objective.denoiser(params, {**given, **spatial},
+                                     {**objective.blank_conditions(params, given), **spatial})
+        noise_key, sample_key = jax.random.split(key)
+        count = _source(objective.inputs, batch).shape[0]
+        initial = objective.process.noise(noise_key, (count, *objective.latent_shape))
+        trajectory = objective.sde.trajectory(denoise, initial, self.steps,
+                                              guidance=objective.guidance, key=sample_key)
+        samples = trajectory.samples
+        if objective.autoencoder is not None:
+            samples = objective.autoencoder.decode(params["autoencoder"], samples)
+        return trajectory, jnp.clip(samples, -1, 1), spatial
+
+    def _training_rows(self, generated: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
+                       rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
+        """Cut the trajectory into this rank's training rows.
+
+        Rewards are centred within their prompt's group, only the first
+        `train_steps` transitions train, and a row whose group gave it no
+        advantage is masked out of the loss.
+        """
+        # The author code uses float64 population statistics on the host, and 1e-4; text GRPO's
+        # estimator (`group_advantage`) float32 and ddof=1, which would change this loss.
+        advantages = group_normalised(rewards.reshape(-1, self.groups), ddof=0, eps=1e-4, xp=np)
+        advantages = advantages.astype(np.float32).reshape(-1)
+        if not np.isfinite(advantages).all():
+            raise ValueError("flow group advantages must remain finite")
+        selected = self.steps - 1 if self.train_steps is None else self.train_steps
+        local_advantages = advantages[owned]
+        shape = (local_advantages.shape[0], selected)
+        prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
+                                                 context[condition.field])
+                    for condition in self.objective.inputs.conditions.values()}
+        prepared.update({
+            "latents": np.asarray(generated.states)[owned, :selected],
+            "next_latents": np.asarray(generated.states)[owned, 1:selected + 1],
+            "timesteps": np.broadcast_to(generated.times[:selected], shape),
+            "next_timesteps": np.broadcast_to(generated.times[1:selected + 1], shape),
+            "rollout_steps": np.full(shape[:1], self.steps, np.int32),
+            OLD_LOG_PROBS_KEY: np.asarray(generated.log_probs)[owned, :selected],
+            "transition_mask": (np.asarray(generated.stochastic)[owned, :selected]
+                                & (local_advantages[:, None] != 0)),
+            ADVANTAGES_KEY: local_advantages,
+            REWARDS_KEY: rewards[owned],
+        })
+        if spatial:
+            prepared["spatial"] = {name: np.asarray(value)[owned] for name, value in spatial.items()}
+        return prepared
+
+__all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout", "GroupedRollout"]
 

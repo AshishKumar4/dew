@@ -8,11 +8,76 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from dew.nn.kernels import generation
-from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement, select
+from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, Requirement, analysed, select
 from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
+from dew.nn.kernels.tuning import Unpinnable
+
+
+def test_a_dependent_named_choice_holds_unless_the_child_names_its_own():
+    operation = Op("delta_decode", (
+        Kernel("wide", ()),
+        Kernel("narrow", (Requirement("width", lambda width: width <= 4,
+                                       "the narrow launch holds four columns", row=generation.INHERENT),))),
+        preferred=lambda _: "wide", named_from={("gated_delta_rule", "xla"): "narrow"})
+    select(operation, 5)
+    with generation.chosen(gated_delta_rule="xla"):
+        with pytest.raises(KernelRefused):
+            select(operation, 5)
+        with generation.chosen(delta_decode="wide"):
+            select(operation, 5)
+    select(operation, 5)
+
+
+def test_a_gemm_pullback_keeps_its_named_choice_and_restores_the_callers_scope():
+    from dew.nn.kernels.templates.gemm import template
+
+    with jax.enable_x64(new_val=True):
+        x = jnp.arange(8, dtype=jnp.float64).reshape(2, 4) / 8
+        weight = jnp.arange(12, dtype=jnp.float64).reshape(4, 3) / 16
+
+        def projected(x, weight):
+            return template.gemm(x, weight, None, out_dtype=jnp.float64)
+
+        with generation.chosen(grouped_matmul="xla"):
+            value, pullback = jax.vjp(projected, x, weight)
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            dx, dw = pullback(jnp.ones_like(value))
+            # The bound call's XLA scope must not leak into this new call. Mosaic cannot take fp64.
+            with pytest.raises(KernelRefused):
+                projected(x, weight)
+        np.testing.assert_array_equal(dx, np.broadcast_to(np.asarray(weight).sum(axis=1), x.shape))
+        np.testing.assert_array_equal(dw, np.broadcast_to(np.asarray(x).sum(axis=0)[:, None], weight.shape))
+
+
+def test_a_templates_refusal_reaches_the_forced_call_without_reconstruction():
+    limit = Refusal("workspace", "the call exceeds the available workspace", "resource model")
+    operation = Op("grouped_matmul", (
+        Kernel("native", (analysed("workspace", lambda size: limit if size > 4 else None,
+                                               "resource model"),)),
+        Kernel("plain", (), generic=True)))
+    select(operation, 4, named="native")
+    with pytest.raises(KernelRefused) as refused:
+        select(operation, 5, named="native")
+    assert refused.value.refusals == [limit]
+
+
+def test_a_tensor_memory_launch_refuses_an_automatic_mesh_axis():
+    from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
+
+    mesh = jax.sharding.AbstractMesh((2,), ("data",), axis_types=(jax.sharding.AxisType.Auto,))
+
+    def copy(source, output):
+        output[...] = source[...]
+
+    launch = TCGEN05.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
+                            grid_names=("programs",), scratch=(), interpret=True)
+    # A launch is built once for every call of its facts; each call checks the mesh it runs in.
+    with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError):
+        launch(jnp.zeros((128,), jnp.float32))
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -175,3 +240,33 @@ def test_a_selector_runs_the_first_kernel_that_takes_the_call_and_a_named_one_on
     assert _selected({"named": None, "b": True}, ("xla",)) == "b"
     assert _selected({"named": None}, ("xla",)) == "xla"
     assert _selected({"named": None, "b": True}, ("xla",), named="named") == "named"
+
+
+def test_an_explicit_config_the_call_cannot_hold_is_refused_as_a_pin_is():
+    """A config the op carries passes the same check a pin does on the call itself (row 1866 K1): 64 rows
+    of 512 fp32 columns stage 128 KiB, past an A10's block, so a launch carrying it raises `Unpinnable`
+    on an A10 and runs on an A100."""
+    x = jnp.ones((4096, 512), jnp.float32)
+    with generation.assumed("sm86"), pytest.raises(Unpinnable):
+        Doubling().replace(config=Block(64))(x)
+    with generation.assumed("sm80"):
+        assert jnp.array_equal(Doubling().replace(config=Block(64))(x), x * 2)
+
+
+def test_a_launch_builds_its_key_only_where_something_reads_it():
+    """A launch with no collector, pin or tuning read never builds its key (`KernelOp.keyed`, which traces
+    its hooks; row 1866 K4); a collector reads it."""
+    built = []
+
+    class Counted(Doubling):
+        def keyed(self, ba):
+            built.append(1)
+            return super().keyed(ba)
+
+    x = jnp.ones((64, 8), jnp.float32)
+    with generation.assumed("sm80"):
+        Counted()(x)
+        assert built == []
+        with tuning.seen():
+            Counted()(x)
+    assert built == [1]

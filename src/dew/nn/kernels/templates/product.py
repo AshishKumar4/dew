@@ -4,6 +4,8 @@ kernels do not compute it where they do not. A template declares a product once,
 caller asked for, and keeps the declaration through every mainloop and its VJP's products."""
 
 import dataclasses
+import itertools
+from collections.abc import Iterator
 
 import jax
 import jax.numpy as jnp
@@ -75,3 +77,61 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
                                        preferred_element_type=jnp.float64)
             return wide.astype(jnp.float32)
     return jax.lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32)
+
+
+BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
+"""bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
+
+
+def bf16_parts(x: jax.Array, count: int, *, saturating: int) -> Iterator[jax.Array]:
+    """fp32 `x` as `count` bf16 parts, largest first, each the last's remainder rounded (exact) and formed
+    only as it is taken, so a mainloop retiring each part's product before the next holds one part's
+    registers: three sum to `x` exactly, two to 16 of its significand's bits. The first `saturating`
+    saturate at bf16's largest (an fp32 value past it rounds to infinity in bf16, its remainder then NaN),
+    the next parts taking the difference; on a finite `x` the later ones never reach it, so only a
+    nonfinite one tells them apart."""
+    rest = x
+    for index in range(count):
+        held = jnp.clip(rest, -BF16_LARGEST, BF16_LARGEST) if index < saturating else rest
+        part = held.astype(jnp.bfloat16)
+        yield part
+        if index + 1 < count:
+            rest = rest - part.astype(jnp.float32)
+
+
+def formed(x: jax.Array, count: int) -> tuple[jax.Array, ...]:
+    """`bf16_parts` of `x`, every part saturating, all formed at once."""
+    return tuple(bf16_parts(x, count, saturating=count))
+
+
+def terms(left: int, right: int) -> list[tuple[int, int]]:
+    """The pairs `(i, j)` of two operands' parts (`formed`, `left` and `right` of them) a product of them
+    issues, smallest first: those whose orders sum under the larger count, each part's bits beside the
+    other's leading ones (three parts each, 24 bits of each operand's significand)."""
+    count = max(left, right)
+    return sorted(((i, j) for i, j in itertools.product(range(left), range(right)) if i + j < count),
+                  key=lambda term: -sum(term))
+
+
+class Transposed:
+    """A register operand a product takes transposed, `value^T`: a mainloop stages it and reads the tile
+    transposed, where a transpose of registers would move every element between threads."""
+
+    def __init__(self, value: jax.Array):
+        self.value = value
+
+    @property
+    def shape(self) -> tuple:
+        return (*self.value.shape[:-2], self.value.shape[-1], self.value.shape[-2])
+
+
+class Exact:
+    """A register operand exact in a 16-bit dtype (a mask of zeros and ones): a mainloop stages it as one
+    part, where an fp32 operand takes three."""
+
+    def __init__(self, value: jax.Array):
+        self.value = value
+
+    @property
+    def shape(self) -> tuple:
+        return self.value.shape

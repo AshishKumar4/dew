@@ -7,6 +7,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import moved
 
 from dew.diffusion.block import BlockProcess
 from dew.interop import Pretrained
@@ -119,7 +120,7 @@ def assert_transformers_reads(export, model, variables, reference):
     prompt and canvas, in fp32 and float64, hold Dew's (`model` on
     `variables`) to tests/reference_error.py's rule. Returns its fp32 model."""
     import torch
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
     from test_block_diffusion import prefill
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
@@ -166,10 +167,7 @@ def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path)
     from tools.diffusion_gemma_reference import reference_generation
 
     bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
-    leaves, tree = jax.tree.flatten(bundle.variables)
-    keys = jax.random.split(jax.random.key(5), len(leaves))
-    changed = jax.tree.unflatten(tree, [leaf + 0.02 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                        for leaf, key in zip(leaves, keys, strict=True)])
+    changed = moved(bundle.variables, jax.random.key(5), 0.02)
     bundle.save(str(tmp_path), variables=changed)
     with np.load(FIXTURE / "reference.npz") as stored:
         reference = {name: stored[name] for name in stored.files}
@@ -198,7 +196,7 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
 
     run = tmp_path / "run"
     run.mkdir()
-    make_block_run(run, moved=0.02, tokenizer=str(FIXTURE), pad_token_id=5)
+    make_block_run(run, scale=0.02, tokenizer=str(FIXTURE), pad_token_id=5)
     exported = Pretrained.from_run(str(run), ema=False)
     exported.save(tmp_path / "export")
     assert (tmp_path / "export" / "tokenizer.json").read_bytes() == (FIXTURE / "tokenizer.json").read_bytes()
