@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels.options import OuterProgram
 from dew.rl.env import Env, Memory, Policy, TimeStep, env_rollout, start, view
 
 Params = Mapping[str, object]
@@ -26,7 +27,7 @@ def first_episodes(following: TimeStep) -> jax.Array:
 def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Memory] | None = None,
              reached: Sequence[str] = ()) -> Callable[[Params, jax.Array], dict[str, float]]:
     """A scorer of `policy` in fresh environments of `env`, flown `steps` steps without restarting
-    (`dew.rl.env.env_rollout`, one jitted program): called with the policy's variables and a key, it
+    (`dew.rl.env.env_rollout`, one program, `OuterProgram`): called with the policy's variables and a key, it
     returns the first episodes' mean `return` and `steps`, and for each observation view in `reached` the
     mean of its value at each first episode's last step. `env` is batched, or one environment, scored as a
     batch of one. `memory(count)` is a recurrent policy's starting state over a batched env's `count`
@@ -35,7 +36,7 @@ def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Me
     count = reward.shape[0] if reward.ndim else 1
     starting = None if memory is None else memory(count)
 
-    @jax.jit
+    @OuterProgram
     def scored(variables: Params, key: jax.Array) -> dict[str, jax.Array]:
         taken = env_rollout(env, policy, variables, start(env, key, starting), steps, reset=False)[1]
         # One environment's steps `[T]` taken as a batch of one's `[T, 1]`.
