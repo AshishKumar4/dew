@@ -232,6 +232,7 @@ def test_armadas_word_that_a_container_is_fresh_reaches_no_process_a_gpu_lane_st
     [name] = gpu_lane_at(tmp_path, monkeypatch, url, 1)
     (tmp_path / name).write_text("import os\ndef test_env():\n    assert 'ARMADA_FRESH' not in os.environ\n")
     interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
     out = tmp_path / "verdict.json"
     monkeypatch.setenv("ARMADA_FRESH", "1")
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-lane", f"--tests={name}", f"--out={out}", "--cache=on",
@@ -2091,10 +2092,10 @@ def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_d
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
 
 
-def test_a_kept_task_reuses_each_files_own_row_where_files_share_a_key_and_names_every_file_once(
+def test_a_kept_task_reuses_each_files_own_row_where_files_run_the_same_code_and_names_every_file_once(
         ci, tmp_path, monkeypatch, cache_worker):
-    """Files whose runs read the same inputs, each importing the others, keep a row each: a kept task reuses
-    each file's own green row (`green_key`, kept at the row's place), runs none of them again, and names
+    """Files whose runs execute the same code, each importing the others and collecting one shared test, keep
+    a row each: a kept task reuses each file's own green row (`green_key`), runs none of them again, and names
     every file once (2026-10-30: a kept task reported one file's row for six files, and a verdict was not
     graded)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
@@ -2109,11 +2110,12 @@ def test_a_kept_task_reuses_each_files_own_row_where_files_share_a_key_and_names
               "    with Path('runs-' + request.module.__name__[-1]).open('a') as runs: runs.write('x')\n")
     written(tmp_path, {"shared_case.py": shared, **{f"test_{name}.py": body(name) for name in "abc"}})
     armada_task(ci, monkeypatch, verdict)
-    # Each read every file, so each key hashes the same inputs: the keys are one, and the rows still three.
+    # Each ran first in a fresh container, so each keeps a key; a key covers its own file whole (`inputs`), so
+    # the three differ though their runs executed the same code.
     common = ci.shared("3.12")
     keys = [ci.recorded(ci.record_key("3.12", f"3.12:tests/test_{name}.py", ci.device_class(), common),
                         "token")["key"] for name in "abc"]
-    assert None not in keys and len(set(keys)) == 1, keys
+    assert None not in keys and len(set(keys)) == 3, keys
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
