@@ -602,21 +602,48 @@ def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Arr
     return jax.tree.map(captured, states, cache, is_leaf=lambda x: x is None)
 
 
-def state_programs(formats: Formats, states: Variables) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+def _layout_key(tree) -> tuple[tuple, str]:
+    """A tree of formats or placements as a key: its leaves and its structure's text, as the tree holds the
+    cache mapping and is not hashable itself."""
+    leaves, structure = jax.tree_util.tree_flatten(tree)
+    return tuple(leaves), str(structure)
+
+
+_STATE_PROGRAMS: dict[Hashable, tuple[OuterProgram, OuterProgram]] = {}
+"""One pair of row-state programs per resident layout and store placement; see `state_programs`."""
+
+
+def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, OuterProgram]:
     """The programs that move row states between the resident state, kept in `formats`, and a store of
     them placed as `states` is: restoring a store's entries into slots, the resident matrices donated, and
-    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`)."""
-    resident, carried = split_donated(formats)
+    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`). Each compiles
+    through Dew's one compile point (`OuterProgram`), once per layout and placement, as the step programs
+    are (`decode_programs`)."""
     placed = jax.tree.map(lambda leaf: leaf.sharding, states)
-    return (jax.jit(_restored, donate_argnums=(0,), in_shardings=(resident, carried, placed, None, None),
-                    out_shardings=(resident, carried)),
-            jax.jit(_captured, donate_argnums=(0,), in_shardings=(placed, resident, carried, None, None),
-                    out_shardings=placed))
+    key = (_layout_key(formats), _layout_key(placed))
+    programs = _STATE_PROGRAMS.get(key)
+    if programs is None:
+        resident, carried = split_donated(formats)
+        programs = _STATE_PROGRAMS[key] = (
+            OuterProgram(_restored, donate_argnums=(0,), in_shardings=(resident, carried, placed, None, None),
+                         out_shardings=(resident, carried)),
+            OuterProgram(_captured, donate_argnums=(0,), in_shardings=(placed, resident, carried, None, None),
+                         out_shardings=placed))
+    return programs
 
 
-def opened_in(formats: Formats) -> jax.stages.Wrapped:
-    """`opened`, allocating its state in `formats`."""
-    return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+_OPENED: dict[Hashable, OuterProgram] = {}
+"""One state-opening program per resident layout; see `opened_in`."""
+
+
+def opened_in(formats: Formats) -> OuterProgram:
+    """`opened`, allocating its state in `formats`, compiled through Dew's one compile point
+    (`OuterProgram`), once per layout."""
+    key = _layout_key(formats)
+    program = _OPENED.get(key)
+    if program is None:
+        program = _OPENED[key] = OuterProgram(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+    return program
 
 
 _PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, Option], ...]],
@@ -660,13 +687,12 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     it leaves it runs that compile as its decoding step instead
     (`resident_formats`). The formats tree holds the cache mapping and is
     not hashable itself, so its leaves and its structure's text key the
-    programs. Each compiles through the kernel templates' reports as every
+    programs (`_layout_key`). Each compiles through the kernel templates' reports as every
     outer program does (`dew.nn.kernels.options.OuterProgram`), but they stay
     apart from `dew.nn.kernels.options.program`: they donate the cache they
     step and take its formats as placements, neither of which that seam's
     arguments carry."""
-    leaves, structure = jax.tree_util.tree_flatten(formats)
-    key = (tuple(leaves), str(structure), rows, tuple(sorted(options.items())))
+    key = (*_layout_key(formats), rows, tuple(sorted(options.items())))
     programs = _PROGRAMS.get(key)
     if programs is None:
         halves = split_donated(formats)

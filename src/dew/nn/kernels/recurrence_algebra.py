@@ -850,7 +850,8 @@ def _laid_references(reference: Callable[[int, int], tuple], c, index: jax.Array
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
                       gates: Callable[[int], tuple],
                       reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
-                      chunk: int, strict: bool, rolled: bool, sub: int = SUB):
+                      chunk: int, strict: bool, rolled: bool, sub: int = SUB,
+                      shifted: "Shifted | None" = None):
     """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
     g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
     write-gated keys) and keys `keys(c)` of each key block `c` of `columns`, fp32, `gates(c)` its prefix
@@ -863,15 +864,21 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
     rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
     attention's intra launch, 1170 registers a thread on an A100, 519 on an H100). The key blocks are a
-    rolled loop where `rolled`, else unrolled."""
+    rolled loop where `rolled`, else unrolled.
+
+    Where `shifted` is given (no declared floor bounds the call, `factored_range`), each sub-chunk's factored
+    product takes the keys before it alone, its factors' exponents at most zero at any decay, and its own
+    keys' pairs are each their own decay (`key_diagonal_pairs`): fla_kda's token-parallel diagonal
+    (chunk_kda_fwd_intra_token_parallel), finite wherever the recurrence is."""
     def products(s, c, prefix, down):
         place = s * sub
         start_whole, start_fraction = separated(*reference(s, c))
         start = start_whole[None, :], start_fraction[None, :]
         index, _ = _grid(prefix[0].shape)
         # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
+        before = index < (place if shifted is not None else place + sub)
         yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
-               lambda: Transposed(jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)))
+               lambda: Transposed(jnp.where(before, keys(c) * between(start, prefix), 0.0)))
 
     def block(c, total):
         # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
@@ -890,8 +897,44 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     else:
         for c in range(columns):
             total = block(c, total)
+    if shifted is not None:
+        total = total + key_diagonal_pairs(rows, shifted, columns, gates, chunk=chunk, strict=strict, sub=sub)
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
+
+
+Shifted = Callable[[int], Callable[[jax.Array], tuple]]
+"""A key block's shifted reads (`key_diagonal_pairs`): `shifted(c)` readies block `c`'s, `shifted(c)(e)` its
+keys and separated prefix (`separated`'s whole and fraction) each row holding the token `e` before its own's:
+separated once as they are staged, not again at each of a sub-chunk's offsets."""
+
+
+def key_diagonal_pairs(rows: Callable[[int], jax.Array], shifted: Shifted, columns: int,
+                       gates: Callable[[int], tuple], *, chunk: int, strict: bool,
+                       sub: int = SUB) -> jax.Array:
+    """The pairs within each sub-chunk of `sub` rows under a decay a key dimension, each its own decay:
+    `sum_k r_ik k_jk exp2(g_ik - g_jk)` for `j <= i` in `i`'s sub-chunk (`j < i` where `strict`), zero
+    elsewhere, `[C, C]` fp32, its exponent at most zero at any decay (fla_kda's token-parallel diagonal,
+    chunk_kda_fwd_intra_token_parallel). The rows `rows(c)` and prefix halves `gates(c)` of key block `c` of
+    `columns`; `shifted(c)` readies the block's shifted reads (a mainloop stages it once) and `shifted(c)(e)`
+    gives its keys and separated prefix `(keys, whole, fraction)`, each row `i` holding token `i - e`'s, any
+    value where `i < e` (masked). Each offset `e` of a pair below its row's diagonal is a row's sum over the
+    keys, placed at `(i, i - e)`: a rolled loop over the offsets, a row's vector each."""
+    rows_index, columns_index = _grid((chunk, chunk))
+    total = jnp.zeros((chunk, chunk), jnp.float32)
+    for c in range(columns):
+        own, prefix, at = rows(c), separated(*gates(c)), shifted(c)
+        index, _ = _grid(prefix[0].shape)
+
+        def offset(e, total, own=own, prefix=prefix, index=index, at=at):
+            keys, *earlier = at(e)
+            decay = between(prefix, tuple(earlier))
+            terms = jnp.sum(jnp.where(index % sub >= e, own * keys * decay, 0.0), axis=1)
+            placed = (columns_index == rows_index - e) & (rows_index % sub >= e)
+            return total + jnp.where(placed, terms[:, None], 0.0)
+
+        total = jax.lax.fori_loop(1 if strict else 0, sub, offset, total)
+    return total
 
 
 def key_decayed_write(key, gate, low, last, last_low):
@@ -1124,7 +1167,10 @@ def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
                            gates: Callable[[int], tuple], reference: Callable[[int, int], tuple],
                            summed: Callable[..., jax.Array], *, chunk: int,
-                           emit: Callable[[str, int, int, jax.Array], None], sub: int = SUB) -> None:
+                           emit: Callable[[str, int, int, jax.Array], None], sub: int = SUB,
+                           shifted: "Shifted | None" = None,
+                           lower: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+                           d_loads: list | None = None) -> None:
     """`key_decayed_pairs`' transpose, its sub-chunk factoring the same: for each pairs' gradient
     `d_pairs[p]` `[C, C]` (a tile, causal or strict as its pairs were, zero elsewhere, scaled as they were)
     of rows `rows[p](c)` against the same keys `keys(c)` fp32, each key block `c`'s gradients to `emit`:
@@ -1136,7 +1182,12 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
     ('pairs'). As `key_decayed_pairs` takes its own, the sub-chunks are a rolled loop, the rows' and keys'
     gradients carried across it, the gated rows formed as their product stages them and the keys' products
     into one accumulator (`summed`): unrolled, every sub-chunk's tiles at once, an H100's launch spilled 1756
-    bytes a thread (kda-gate3 at ee3734584)."""
+    bytes a thread (kda-gate3 at ee3734584).
+
+    Where `shifted` is given (no declared floor, `key_decayed_pairs`'), the factored products take the keys
+    before each sub-chunk alone and each sub-chunk's own pairs are each their own decay
+    (`key_diagonal_pairs_back`, `lower` moving a tile's rows up to the keys they belong to, `d_loads` the
+    pairs' gradients' loads where `d_pairs` are tiles in memory)."""
     for c in range(columns):
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
@@ -1147,7 +1198,8 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
             d_rows, d_keys = carried
             place = s * sub
             whole, fraction = separated(*reference(s, c))
-            up = jnp.where(index < place + sub, between((whole[None, :], fraction[None, :]), prefix), 0.0)
+            before = index < (place if shifted is not None else place + sub)
+            up = jnp.where(before, between((whole[None, :], fraction[None, :]), prefix), 0.0)
             within = (index >= place) & (index < place + sub)
             # The keys gated up staged once, every pairs' product reading them.
             raised_keys = key * up
@@ -1159,9 +1211,49 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
 
         zero = jnp.zeros(index.shape, jnp.float32)
         d_rows, d_keys = jax.lax.fori_loop(0, chunk // sub, turn, ((zero,) * len(d_pairs), zero))
+        d_rows = tuple(total * down for total in d_rows)
+        if shifted is not None:
+            assert lower is not None, "the keys' own pairs move their rows up to their keys"
+            d_rows, d_keys = key_diagonal_pairs_back(d_loads or [functools.partial(lambda x: x, d_pair)
+                                                                 for d_pair in d_pairs],
+                                                     [row(c) for row in rows], prefix, shifted(c), lower,
+                                                     d_rows, d_keys, sub=sub)
         for p, total in enumerate(d_rows):
-            emit("rows", p, c, total * down)
+            emit("rows", p, c, total)
         emit("keys", 0, c, d_keys)
+
+
+def key_diagonal_pairs_back(d_loads: list, own: list, prefix: tuple, behind: Callable[[jax.Array], tuple],
+                            lower: Callable[[jax.Array, jax.Array], jax.Array], d_rows: tuple, d_keys,
+                            *, sub: int = SUB) -> tuple:
+    """`key_diagonal_pairs`' transpose on one key block, added onto its gradients so far `d_rows` (one a
+    pairs' gradient) and `d_keys`: for each offset `e` the band `dP[i, i - e]` of each pairs' gradient
+    `d_loads[p]()` within `i`'s sub-chunk (a load each offset reads afresh: held across the offsets, the
+    pairs' two [C, C] gradients spilled 88 bytes a thread on an H100 and an A100, kda-gate at dab20ca57), a
+    row's vector, and each pair's own decay `exp2(g_i - g_{i - e})` (`behind(e)`: the keys and separated
+    prefix each row holding the token `e` before its own's, as `key_diagonal_pairs` reads them); the rows'
+    `dP[i, i - e] k_{i - e}` decayed, and the keys' `sum_p dP[i, i - e] r_i` decayed, formed on the rows `i`
+    and moved up to the keys `i - e` (`lower(e, x)`: row `i` of `x` at row `i - e`, any value past the tile's
+    end, masked). Each exponent at most zero at any decay (fla_kda's token-parallel diagonal's gradient,
+    chunk_kda_bwd_intra's diagonal blocks)."""
+    rows_index, columns_index = _grid((own[0].shape[0],) * 2)
+    index, _ = _grid(prefix[0].shape)
+
+    def offset(e, carried):
+        d_rows, d_keys = carried
+        keys, *earlier = behind(e)
+        # Selected, never scaled by zero: a row before its offset reads past the shifted tile's start, any
+        # value (an interpreter's NaN in shared memory left unwritten).
+        within = index % sub >= e
+        decay = jnp.where(within, between(prefix, tuple(earlier)), 0.0)
+        band = (columns_index == rows_index - e) & (rows_index % sub >= e)
+        bands = [jnp.sum(jnp.where(band, load(), 0.0), axis=1)[:, None] for load in d_loads]
+        d_rows = tuple(total + jnp.where(within, strip * keys * decay, 0.0)
+                       for total, strip in zip(d_rows, bands, strict=True))
+        weighted = functools.reduce(jnp.add, (strip * row for strip, row in zip(bands, own, strict=True)))
+        return d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * decay), 0.0)
+
+    return jax.lax.fori_loop(0, sub, offset, (d_rows, d_keys))
 
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,

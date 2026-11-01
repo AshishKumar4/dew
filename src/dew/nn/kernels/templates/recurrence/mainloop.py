@@ -110,12 +110,12 @@ class Tiles:
 
 def per_key_refusal(dtype, floor: float | None) -> str | None:
     """Why the mainloop refuses a call of `dtype` under a decay a key dimension, None where it takes it: its
-    intra launch factors each pair's decay over the chunk's sub-chunks (`algebra.key_decayed_pairs`), which
-    needs the layer's declared `floor` bounding a sub-chunk's range (`algebra.factored_range`), and rounds
-    each side's gate once, where the fp32 recurrence rounds each pair's (1.98 times its distance from
-    float64 in an fp32 call, fam-t)."""
-    if floor is None or not algebra.factored_range(floor):
-        return f"a decay a key dimension needs a declared floor its sub-chunks factor under, not {floor}"
+    intra launch factors each pair's decay over the chunk's sub-chunks (`algebra.key_decayed_pairs`), each
+    sub-chunk's own pairs too where the layer's declared `floor` bounds a sub-chunk's range
+    (`algebra.factored_range`), else each its own decay (`algebra.key_diagonal_pairs`), and rounds each
+    side's gate once, where the fp32 recurrence rounds each pair's (1.98 times its distance from float64 in
+    an fp32 call, fam-t)."""
+    del floor
     if jnp.dtype(dtype) == jnp.float32:
         return "an fp32 call's decay a key dimension is the portable math's"
     return None
@@ -223,6 +223,10 @@ class _Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
+    factored: bool = True
+    """Whether a decay a key dimension's pairs factor over whole sub-chunks (`algebra.factored_range` of the
+    call's declared floor): where not, each sub-chunk's own pairs are each their own decay
+    (`algebra.key_diagonal_pairs`)."""
 
     @property
     def gated_keys(self) -> bool:
@@ -991,7 +995,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                        keys=call.given.views(k_ref, row, CHUNK, keyed, width),
                        gates=gates.views(hi_ref, row, CHUNK, h * width, width),
                        lows=gates.views(lo_ref, row, CHUNK, h * width, width))
-        pairing, referenced = staging
+        pairing, referenced, *padded = staging
 
         def step(index, slots, carry, accumulators):
             del index
@@ -1026,9 +1030,18 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             def gated(c):
                 return block("gates", gates, c), block("lows", gates, c)
 
+            def shifted(c):
+                """Key block `c`'s keys and separated prefix staged below `SUB` rows of any values (a pair
+                they reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`)."""
+                (tiles,) = padded
+                for i, value in enumerate((operand("keys")(c), *algebra.separated(*gated(c)))):
+                    tiles.at[i, pl.ds(algebra.SUB, CHUNK)][...] = value
+                return lambda e: tuple(family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK)])
+                                       for i in range(3))
+
             pairs = functools.partial(algebra.key_decayed_pairs, columns=width // keys, gates=gated,
                                       reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
-                                      chunk=CHUNK, rolled=rolled)
+                                      chunk=CHUNK, rolled=rolled, shifted=None if call.factored else shifted)
             scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
             held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             if call.delta:
@@ -1068,7 +1081,10 @@ def _intra_staged(call: _Call, keys: int) -> tuple:
     landing = {"square": dataclasses.replace(call.held, rows=call.rows).landing(CHUNK, CHUNK)}
     if call.delta:
         landing["system"] = _systems(call).landing(CHUNK, CHUNK)
-    return (_pairing(call, keys), plgpu.SMEM(referenced, jnp.float32)), landing
+    # Where the call's pairs do not factor (`_Call.factored`), a key block's keys and prefix halves below a
+    # sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted reads).
+    padded = () if call.factored else (plgpu.SMEM((3, algebra.SUB + CHUNK, keys), jnp.float32),)
+    return (_pairing(call, keys), plgpu.SMEM(referenced, jnp.float32), *padded), landing
 
 
 def _pairing_operand(call: _Call) -> _Operand:
@@ -1884,7 +1900,8 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     # float64).
     held = given if delta or rounded else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                 interpret, generation.gpu_target(), ranged=ranged)
+                 interpret, generation.gpu_target(), ranged=ranged,
+                 factored=not per_key or (floor is not None and algebra.factored_range(floor)))
     hi, lo = algebra.prefix(laid(g).reshape(chunks, CHUNK, -1))
     # A decay a head's prefix a head's row of vectors `[HV, R]`, one a key dimension's tiles `[R, HV * Dk]`.
     hi, lo = (x.reshape(rows, -1) if per_key else x.reshape(rows, heads).T for x in (hi, lo))

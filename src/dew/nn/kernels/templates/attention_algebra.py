@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.algebra import derive
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import (
     LOG2E,
@@ -48,6 +49,7 @@ from dew.nn.precision import (
     added_to,
     compensated_sum,
     compensates_loops,
+    float32_einsum,
     running_sum,
     running_total,
     two_product,
@@ -1921,18 +1923,30 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     return dq, delta + refined, total, mass, grads
 
 
-def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
+def safe_peak(peak: jax.Array) -> jax.Array:
+    """A query's forward maximum as `exponent` reads it unclamped (`safe`): +inf where it saw no key (its
+    -inf), so each of its weights is exp(-inf) = 0 whatever its logit, a row's select in place of each
+    entry's clamp (the fast backward's dQ launch: FMNMX 128 to 64 of 2080 instructions, its dK/dV's 48 to
+    32, at Qwen3-8B's widths, ptxas 12.9 sm90a)."""
+    return jnp.where(peak == -jnp.inf, jnp.inf, peak)
+
+
+def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, *, safe: bool = False) -> jax.Array:
     """`exp(s - m)` for a tile's logits recomputed in the backward against the forward's maximum `m`,
     fp32, in the forward's units (`Recompute`): `m` is every key's maximum, so a logit past it by the
     rounding the two passes do not share (the forward's maximum taken in base 2 and back, or another tile
     shape's product) is the maximum itself, its weight 1, never past it; in the accurate form one at it
     weighs 1 however a compiler contracts its scaling into the subtraction (`weights`)."""
-    return jnp.exp(exponent(logits, peak, how))
+    return jnp.exp(exponent(logits, peak, how, safe=safe))
 
 
-def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
-    """The natural exponent `s - m` (at most 0) of `below`'s weights."""
+def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, *, safe: bool = False) -> jax.Array:
+    """The natural exponent `s - m` (at most 0) of `below`'s weights; unclamped where `peak` is `safe_peak`'s
+    and the recompute plain, a logit past its maximum by the passes' rounding then weighing at most that
+    rounding past 1."""
     peak = expand(peak, logits)
+    if safe and how == PLAIN:
+        return logits - peak
     if how.factor is not None:
         # Raw products: the difference is taken first, so the largest's is exactly 0.
         return jnp.minimum(logits - peak, 0.0) * how.factor
@@ -1941,11 +1955,11 @@ def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.
     return jnp.minimum(logits - peak, 0.0)
 
 
-def normalized(logits: jax.Array, peak: jax.Array, inverse_total: jax.Array, how: Recompute = PLAIN
-               ) -> tuple[jax.Array, jax.Array]:
-    """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, those over each query's
-    denominator (`inverse_total`, its `inverse`), fp32."""
-    exponentials = below(logits, peak, how)
+def normalized(logits: jax.Array, peak: jax.Array, inverse_total: jax.Array, how: Recompute = PLAIN, *,
+               safe: bool = False) -> tuple[jax.Array, jax.Array]:
+    """A tile's unnormalized weights `exp(s - m)` (`below`, unclamped where `safe`) and its weights `p`,
+    those over each query's denominator (`inverse_total`, its `inverse`), fp32."""
+    exponentials = below(logits, peak, how, safe=safe)
     return exponentials, exponentials * expand(inverse_total, exponentials)
 
 
@@ -1960,7 +1974,7 @@ def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.A
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
                 seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array,
-                multiplier: jax.Array | None = None) -> jax.Array:
+                multiplier: jax.Array | None = None, weights: jax.Array | None = None) -> jax.Array:
     """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
     `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
     denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every intermediate
@@ -1974,6 +1988,10 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
+    if weights is not None:
+        # The weights a launch forms anyway times `(dP - c) - (D - c)`: one product fewer an entry (the fast
+        # backward's dK/dV launch: FMUL 112 to 96 at Qwen3-8B's widths, ptxas 12.9 sm90a).
+        return where_seen(seen, weights * (relative - expand(delta, relative)), 0.0)
     centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
     return where_seen(seen, exponentials * centred, 0.0)
 
@@ -2227,3 +2245,60 @@ def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: b
     if dropped:
         return narrowed(exponentials, dtype)
     return exponentials.astype(dtype).astype(jnp.float32)
+
+
+def softmax_of(logits: jax.Array, seen: jax.Array, values: jax.Array, *, base2: bool) -> jax.Array:
+    """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
+    query's softmax over the keys it sees of its `logits` `[rows, keys]` (scaled, in the exponent's base),
+    its weights' sum of the `values` `[keys, width]` over their total, Dew's product (`float32_einsum`); a
+    query that sees no key, zeros (its weights selected away, whatever its maximum's)."""
+    exponent = jnp.exp2 if base2 else jnp.exp
+    s = jnp.where(seen, logits, -jnp.inf)
+    m = jnp.max(s, axis=-1)
+    p = jnp.where(seen, exponent(s - m[:, None]), 0.0)
+    total = jnp.sum(p, axis=-1)
+    return float32_einsum("qk,kd->qd", p, values) / jnp.where(total == 0, 1.0, total)[:, None]
+
+
+def declaration(*, base2: bool):
+    """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
+    template's formed tiles, walked along the keys, its exponent the base the template folds
+    (`folds`: 2 where it folds `log2(e)` into its logits). Its derived forms stand beside this module's
+    (`peak`, `stepped`, `merge`, `finish`), which they replace only on par with them against float64 and
+    no slower in the kernel (docs/design/algebra.md)."""
+    axes = {"logits": ("rows", "keys"), "seen": ("rows", "keys"), "values": ("keys", "width")}
+    return derive.Reduction(functools.partial(softmax_of, base2=base2), axes, walked="keys",
+                            exponent=2 if base2 else "e")
+
+
+def softmax_gradients(q, k, values, dout, peak, total, delta, seen, *, scale: float):
+    """Attention's gradients from its residuals, whole (theme A's backward declaration,
+    `backward_declaration`): each query's weights recomputed from its maximum `peak` and denominator `total`
+    over the keys it sees (`seen`), the forward's own rows (a log-sum-exp rounds `log(total)` into a value
+    as large as the logits, its weights' error that much larger), its score cotangents `p (dO Vᵀ - delta)`
+    with `delta` its rowsum(dO O), and the queries', keys' and values' gradients their products at `scale`,
+    each product Dew's (`float32_einsum`, a template's every product). The rows are natural whatever base
+    the forward walked (`finished_rows`), so the backward's exponent is `e`; each exponent at most 0, a
+    logit past the forward's maximum by the rounding the two passes do not share the maximum itself
+    (`below`: unclamped, a causal dV walked queries first erred 1.62 times the template's against
+    float64, its early keys' rows' largest weights past 1); a query that sees no key, zeros (its weights
+    selected away, over a denominator of 1)."""
+    s = float32_einsum("qd,kd->qk", q, k) * scale
+    over = jnp.where(total == 0, 1.0, total)
+    p = jnp.where(seen, jnp.exp(jnp.minimum(s - peak[:, None], 0.0)), 0.0) / over[:, None]
+    ds = p * (float32_einsum("qd,kd->qk", dout, values) - delta[:, None])
+    return (float32_einsum("qk,kd->qd", ds, k) * scale, float32_einsum("qk,qd->kd", ds, q) * scale,
+            float32_einsum("qk,qd->kd", p, dout))
+
+
+def backward_declaration(*, scale: float, walked: str):
+    """Attention's backward as theme A's declaration (`softmax_gradients`), walked over its key tiles
+    (`walked="keys"`, queries first: dQ the walk's sum, dK and dV each tile's own) or its query tiles
+    (`"rows"`, keys first: dK and dV the walk's sums, dQ each tile's own), from the forward's natural
+    residual rows."""
+    axes = {"q": ("rows", "width"), "k": ("keys", "width"), "values": ("keys", "values"),
+            "dout": ("rows", "values"), "peak": ("rows",), "total": ("rows",), "delta": ("rows",),
+            "seen": ("rows", "keys")}
+    return derive.Reduction(functools.partial(softmax_gradients, scale=scale), axes, walked=walked,
+                            exponent="e")
+

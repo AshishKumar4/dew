@@ -1487,3 +1487,45 @@ def test_a_watched_flow_step_runs_its_unwatched_steps_matmuls(guided):
         return flops.hardware
 
     assert work(watched=True) == work(watched=False)
+
+
+@pytest.mark.parametrize("guided", ["unguided", "branched"])
+def test_a_flow_steps_watched_cotangents_reach_its_policys_calls(guided):
+    """A Flow-GRPO step that summarizes its watched policy's cotangents (row 2324) carries its probe to
+    the policy's call at every transition its scan takes, under a custom guidance's own `lax.cond` too: the
+    loss's cotangent reaches it from each, rows by features by transitions entries, and the parameters'
+    gradient is the unprobed step's to the bit."""
+    from dew.nn.inspection import Watched
+    from dew.training.transaction import probed_loss
+
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = {"branched": Branched()}.get(guided)
+    objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
+                                  sde=FlowSDE(0.5), guidance=guidance)
+    variables = objective.init(jax.random.key(30))
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+
+    def step(cotangents):
+        return Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                    watched=Watched(("AffineVelocity",), cotangents=cotangents))
+
+    def reduced(stats):
+        return objective.reduce_loss(stats)[0]
+
+    def gradients():
+        stats, back, _ = probed_loss(objective, variables, batch, step(cotangents=True))
+        _, seed = jax.vjp(reduced, stats)
+        return back(seed(jnp.ones(()))[0])
+
+    def plain():
+        return jax.grad(lambda params: reduced(objective._loss({**variables, "params": params}, batch,
+                                                                step(cotangents=False))[0]))(variables["params"])
+
+    (params, probes), expected = jax.jit(gradients)(), jax.jit(plain)()
+    (probe,) = jax.tree.leaves(probes)
+    transitions = batch["latents"].shape[1]
+    assert probe[0] == rows * 2 * transitions and np.isfinite(probe[2])
+    assert all((left == right).all()
+               for left, right in zip(jax.tree.leaves(params), jax.tree.leaves(expected), strict=True))

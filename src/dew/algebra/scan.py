@@ -12,7 +12,8 @@ no correction Mamba-2's state space. The readout must contract the
 state with a vector `q_t` along `B_t`'s axis, plus a part free of it. Over a chunk, with `G` the decay
 exponents' inclusive prefix (per key), `Gamma[i, j, k] = exp(G_ik - G_jk)` for `j <= i` and
 `gamma = exp(G)`, the inputs each token's correction leaves, `w`, solve the unit lower-triangular system
-(the compact WY form, its solve the UT transform), each overlap a decayed contraction over keys:
+(the compact WY form, its inverse by doubling, products alone), each overlap a decayed contraction over keys
+(a scalar decay's the keys' product decayed after it):
 
     (I + diag(s) strictly_lower(sum_k C_ik B_jk Gamma_ijk)) w = U - diag(s) (C * gamma) h_in,
     o = (Q * gamma) h_in + lower(sum_k Q_ik B_jk Gamma_ijk) w + r,
@@ -22,7 +23,10 @@ Mamba-2's state-space dual where no token corrects (`w = U`), derived from the t
 written. The prefix is taken compensated (each partial a float and its rounding error, `two_sum`), and every
 difference of two partials from both parts: a plain prefix loses about 1e-6 of a deep decay (ledger 2098). A
 chunk's adjoint (`backward`) is its forms' derivative, each exponent's from the decays whose sums hold it,
-summed without one term added and taken away again (`_decays_backward`).
+summed without one term added and taken away again (`_decays_backward`). A token a reset marks (`Scan.reset`,
+a packed document's first) takes the exponent `RESET_DECAY` in place of its own, so every decay spanning it is
+zero and every other its own: the forms, their merge and their adjoint unchanged, the exponent its reset
+replaced given no gradient.
 Every other update or readout is refused, named.
 """
 
@@ -40,10 +44,19 @@ from jax import lax
 from jax.extend import core as jcore
 
 from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
-from dew.nn.precision import float32_einsum, float32_matmul, two_sum
+from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
 
 Axes = tuple[str, ...]
 Atom = jcore.Var | jcore.Literal
+
+RESET_DECAY = -1e4
+"""The exponent a reset token's decay takes in place of its own (natural or base 2): the state entering it
+is multiplied by `exp(-1e4)`, which is 0 in fp32. A token's own exponent is never positive, so every span
+holding a reset sums to at most this and decays to exactly 0, and a span without one never sees it. Finite,
+so a span's exponent is a difference of finite partials (an infinity less an infinity is a NaN), and a
+kernel's segment sums formed as a matmul against a 0/1 triangle stay finite (an infinity times 0 is a NaN);
+thousands of resets in a walk's sum stay far inside fp32's range, and the compensated prefix keeps each
+difference of two partials exact past them."""
 
 _KEEPING = frozenset({"convert_element_type", "reshape", "expand_dims", "squeeze", "copy", "copy_p"})
 """Equations that keep a value's elements and shape class (a cast, a unit-axis reshape)."""
@@ -53,13 +66,16 @@ _KEEPING = frozenset({"convert_element_type", "reshape", "expand_dims", "squeeze
 class Scan:
     """A recurrence over its `walked` axis (time): `update(h, **token)` the state after one token,
     `readout(h, **token)` that token's output from the state after it, each in plain JAX on one token's
-    operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype."""
+    operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype.
+    `reset`, where given, names an operand of `operands`, booleans along the walked axis alone that neither
+    reads, marking each token a zero state enters (a packed document's first)."""
 
     update: Callable
     readout: Callable
     operands: Mapping[str, Axes]
     walked: str
     state: tuple[tuple[int, ...], jnp.dtype]
+    reset: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,14 +111,15 @@ class _Symbolic:
 @dataclasses.dataclass(frozen=True)
 class _Affine:
     """A token's affine update and linear readout as the traced jaxprs' values: the decay's exponent
-    (`exponent`, base 2 where `base2`), the input (`input`), the corrections (`corrections`, each with the
-    decay among its factors, which `strength` leaves out), the readout's contraction (`read`) and its free
-    terms (`free`)."""
+    (`exponent`, base 2 where `base2`, a scalar or each key's own where `per_key`), the input (`input`), the
+    corrections (`corrections`, each with the decay among its factors, which `strength` leaves out), the
+    readout's contraction (`read`) and its free terms (`free`)."""
 
     update: Program
     readout: Program
     exponent: Atom
     base2: bool
+    per_key: bool
     decay: Atom
     input: _Term
     corrections: tuple[_Term, ...]
@@ -114,9 +131,9 @@ def derive_scan(declaration: Scan) -> Derived:
     """`declaration`'s chunk forms (the module's account): `init(shapes)` a zero state and no decay,
     `step(state, chunk)` the state after a chunk of tokens, `mapped(chunk, state)` the chunk's outputs from
     the state entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's from zero),
-    `finish(state, operands)` the final state. Refused (`Refused`) where the update or the readout is not of
-    the module's form."""
-    names = tuple(declaration.operands)
+    `finish(state, operands)` the final state; `backward` a chunk's adjoint, a cotangent for each operand
+    but the reset's. Refused (`Refused`) where the update or the readout is not of the module's form."""
+    names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
@@ -142,8 +159,14 @@ def derive_scan(declaration: Scan) -> Derived:
         # An operand with no walked axis (a rate, a skip) is every token's.
         axes = [declaration.operands[name].index(declaration.walked)
                 if declaration.walked in declaration.operands[name] else None for name in names]
-        values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(*[chunk[name] for name in names])
-        return affine, values
+        exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
+            *[chunk[name] for name in names])
+        # The exponents summed in float32 at least: a narrower prefix loses a decay's digits to its partials'
+        # magnitude, and float16's overflows past six resets (65504).
+        exponent = exponent.astype(at_least_fp32(exponent.dtype))
+        if declaration.reset is not None:
+            exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
+        return affine, (exponent, *values)
 
     def init(shapes):
         del shapes
@@ -163,7 +186,7 @@ def derive_scan(declaration: Scan) -> Derived:
         _, h = state
         decays = _decays(exponent, affine.base2)
         w = _corrected(decays, B, U, s, C, h)
-        scores = float32_einsum("ik,ijk->ij", Q, B[None] * decays.between)
+        scores = _paired(Q, B, decays.between)
         return float32_matmul(Q * decays.entering, h) + float32_matmul(scores, w) + R
 
     def merge(a, b):
@@ -181,11 +204,12 @@ def derive_scan(declaration: Scan) -> Derived:
     def backward(chunk, state, d_state, d_outputs):
         # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
         # forward forms' derivative (their prefix, substitution and Dew products differentiated).
+        # The reset's booleans held, no operand of the derivative.
         def forward(h, operands):
-            entering = (state[0], h)
-            return mapped(operands, entering), step(entering, operands)[1]
+            entering, tiles = (state[0], h), {**chunk, **operands}
+            return mapped(tiles, entering), step(entering, tiles)[1]
 
-        _, pullback = jax.vjp(forward, state[1], dict(chunk))
+        _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
         d_h, d_chunk = pullback((d_outputs, d_state))
         return d_h, d_chunk
 
@@ -420,7 +444,8 @@ def _affine(update: Program, readout: Program) -> _Affine:
     if len(reads) != 1:
         raise Refused("the readout reads the state other than once")
     free = tuple(term for term in read.terms if term.kind == "free")
-    return _Affine(update, readout, exponent, base2, decay, given, corrections, reads[0], free)
+    return _Affine(update, readout, exponent, base2, state.diag is not None, decay, given, corrections,
+                   reads[0], free)
 
 
 def _decay(jaxpr, state: _Term) -> tuple[Atom, Atom, bool]:
@@ -477,7 +502,7 @@ def _token(affine: _Affine, token: tuple) -> tuple:
     Q = coefficient(affine.read, out) * out(affine.read.right)
     R = sum((coefficient(term, out) * out(term.right) for term in affine.free),
             jnp.zeros((aval(update.jaxpr.invars[0]).shape[1],), jnp.float32))
-    keys = aval(update.jaxpr.invars[0]).shape[0]
+    keys = aval(update.jaxpr.invars[0]).shape[0] if affine.per_key else 1
     return jnp.broadcast_to(read(affine.exponent), (keys,)), B, U, s, C, Q, R
 
 
@@ -485,44 +510,73 @@ def _corrected(decays: _Decays, B, U, s, C, h):
     """The inputs each token's correction leaves (the module's `w`): the unit lower-triangular solve of the
     corrections' decayed overlaps, from the state entering the chunk."""
     strictly = jnp.tril(jnp.ones(decays.between.shape[:2], bool), -1)[:, :, None]
-    earlier = jnp.where(strictly, decays.between, 0.0)
-    overlaps = s[:, None] * float32_einsum("ik,ijk->ij", C, B[None] * earlier)
+    overlaps = s[:, None] * _paired(C, B, jnp.where(strictly, decays.between, 0.0))
     given = U - s[:, None] * float32_matmul(C * decays.entering, h)
-    return _substituted(overlaps, given)
+    return _solved(overlaps, given)
+
+
+def _paired(left, right, between):
+    """Each pair's decayed contraction over keys, `sum_k left_ik right_jk between_ijk` `[C, C]`: a decay a
+    key dimension's over the pairs' every key; a scalar decay's (`between` `[C, C, 1]`) the keys'
+    product decayed after it, `(left right^T) between`, which spans no `[C, C, K]` tensor (Qwen3.5-27B's
+    derived forward took 66 ms on an H100 spanning it, derived-cells-h100-6d105a908)."""
+    if between.shape[-1] == 1:
+        return float32_matmul(left, right.T) * between[..., 0]
+    return float32_einsum("ik,ijk->ij", left, right[None] * between)
 
 
 @jax.custom_vjp
-def _substituted(overlaps, given):
-    """`w` with `(I + overlaps) w = given`, `overlaps` strictly lower: forward substitution, each row's sum of
-    the rows before it a Dew product (`float32_matmul`), as a token-by-token walk takes it. Its derivative
-    is the transposed system's backward substitution, each row's sum a Dew product alike, and the
-    overlaps' cotangent `-x w^T` below the diagonal (`_substituted_backward`), where autodiff of the loop
-    summed each row's terms one addition at a time."""
-    def row(index, solved):
-        return solved.at[index].set(given[index] - float32_matmul(overlaps[index][None], solved)[0])
-
-    return lax.fori_loop(0, given.shape[0], row, jnp.zeros_like(given))
-
-
-def _substituted_forward(overlaps, given):
-    solved = _substituted(overlaps, given)
-    return solved, (overlaps, solved)
+def _solved(overlaps, given):
+    """`w` with `(I + overlaps) w = given`, `overlaps` strictly lower: the inverse by doubling (`_inverse`),
+    then one product, each a Dew product (`float32_matmul`): the template's own form (recurrence_algebra's
+    `doubled` and `weighted`), log2(C) levels of products where a forward substitution took C dependent row
+    steps (the derived forward's every chunk 64 launches in sequence). The unit diagonal is added outside
+    the product (`given + L given`, `L` the inverse less it), as `weighted` adds it, so the product rounds
+    the off-diagonal terms alone. Its derivative `back = X^T dw` alike and the overlaps' cotangent
+    `-back w^T` below the diagonal."""
+    return _applied(_below(_inverse(overlaps)), given)
 
 
-def _substituted_backward(residuals, d_solved):
-    overlaps, solved = residuals
-    count = d_solved.shape[0]
-
-    def row(step, back):
-        index = count - 1 - step
-        return back.at[index].set(d_solved[index] - float32_matmul(overlaps[:, index][None], back)[0])
-
-    back = lax.fori_loop(0, count, row, jnp.zeros_like(d_solved))
-    below = jnp.tril(jnp.ones((count, count), bool), -1)
-    return jnp.where(below, -float32_matmul(back, solved.T), 0.0), back
+def _applied(lower, given):
+    """`(I + lower) @ given`, the identity outside the product."""
+    return given + float32_matmul(lower, given)
 
 
-_substituted.defvjp(_substituted_forward, _substituted_backward)
+def _below(square):
+    """`square`'s strictly lower part."""
+    return jnp.where(jnp.tril(jnp.ones(square.shape, bool), -1), square, 0.0)
+
+
+def _solved_forward(overlaps, given):
+    lower = _below(_inverse(overlaps))
+    solved = _applied(lower, given)
+    return solved, (lower, solved)
+
+
+def _solved_backward(residuals, d_solved):
+    lower, solved = residuals
+    back = _applied(lower.T, d_solved)
+    return _below(-float32_matmul(back, solved.T)), back
+
+
+_solved.defvjp(_solved_forward, _solved_backward)
+
+
+def _inverse(overlaps):
+    """`(I + overlaps)^-1` of a strictly lower `overlaps` `[C, C]` by doubling: from the two-wide blocks, each
+    level joins pairs of `w`-blocks as `X_2w = X_w + (M_w * (X_w A)) X_w`, `A = -overlaps` and `M_w` each
+    pair's lower block (recurrence_algebra's `doubled`), until one block spans the chunk: a chunk of any
+    length, its last blocks shorter."""
+    a = -overlaps
+    size = a.shape[0]
+    rows, cols = jnp.arange(size)[:, None], jnp.arange(size)[None, :]
+    inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
+    width = 2
+    while width < size:
+        lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
+        inverse = inverse + float32_matmul(jnp.where(lower, float32_matmul(inverse, a), 0.0), inverse)
+        width *= 2
+    return inverse
 
 
 def _compensated(values, *, reverse: bool = False) -> tuple[jax.Array, jax.Array]:

@@ -376,6 +376,34 @@ def test_the_mosaic_launches_state_their_work(training):
     assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
 
 
+@lowers('sm80')
+@pytest.mark.parametrize('target', ['sm80', 'sm86'])
+def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(target):
+    """A decay a key dimension 16 wide over values 8 wide (the recurrence stability sites' geometry), its
+    floored gradient through the template lowered for an Ampere GPU: the key memory backward copies the
+    entered memory's 8 rows of 64 bf16 columns in with cp.async, one 8-row tile at its rows' 128-byte
+    swizzle, whose copy layout Mosaic GPU refuses ('Number of tiles is not a multiple of 4',
+    stab-floorless-a100-deba5b564); staged at the swizzle the copy tiles it lowers."""
+    rows, length, value_heads, width, value_width = 2, 70, 16, 16, 8
+    operands = [jax.ShapeDtypeStruct((rows, length, 1, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, value_width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, floor=FLOOR, write_bound=1.0)
+
+    def rule(*given):
+        return chunk_on('mosaic_gpu', hooks, Chunk(*given[:3], log_decay=given[3], beta=given[4]))
+
+    def loss(*given):
+        out, final = rule(*given)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    # Abstract devices stating the GPU's capability, which Mosaic GPU lowers cp.async's waits for.
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), target)
+    with generation.assumed(target), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
+
+
 def test_each_launch_lowers_once_however_many_layers_call_it():
     """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
     test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
@@ -557,9 +585,20 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
 
 
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
+                   'kimi-linear-kda, no floor': (32, 32, 128, 128, True),
                    'nemotron-h-4b-ssd': (8, 96, 128, 80, False)}
 """The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`): key heads,
 value heads, key and value widths, and whether the decay is a key dimension's."""
+
+FLOORLESS = frozenset({'kimi-linear-kda, no floor'})
+"""The gate's geometries under a decay a key dimension that declare no floor: each sub-chunk's own pairs
+each their own decay (`algebra.key_diagonal_pairs`), the forward's staging and the backward's beside them."""
+
+
+def resource_floor(name: str) -> float | None:
+    """`name`'s declared floor: `FLOOR` under a decay a key dimension, none where it declares none
+    (`FLOORLESS`) or the decay is a head's."""
+    return FLOOR if RESOURCE_SHAPES[name][4] and name not in FLOORLESS else None
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
@@ -715,6 +754,7 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
                                                            ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('kimi-linear-kda', jnp.bfloat16),
+                                                           ('kimi-linear-kda, no floor', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16)})
                and not (variant is not None and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
@@ -745,12 +785,11 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
     def cases(name: str, dtype, *, training: bool, packed: bool, variant: int | None) -> list:
         """The case's kernels at its derived tiles, or, one row's forward, at its `variant`-th other variant
         (`Mosaic.variants`)."""
-        per_key = RESOURCE_SHAPES[name][4]
         args = resource_operands(name, dtype, rows, length)
         starts = jax.ShapeDtypeStruct((rows, length), jnp.bool_) if packed else None
         # A delta rule's layer declares unit keys and sigmoid write gates (`recurrence.Hooks.inverse_bound`).
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
-                                     floor=FLOOR if per_key else None, bound=None if name in RATED else 1.0,
+                                     floor=resource_floor(name), bound=None if name in RATED else 1.0,
                                      **form(name, dtype))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
@@ -773,7 +812,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
             if training and not mainloop_backward.backward_holds(
                     *args, tiles=derived, family=family, target=facts, starts=starts,
-                    max_segments=8 if packed else None, floor=FLOOR if per_key else None, **unwide):
+                    max_segments=8 if packed else None, floor=resource_floor(name), **unwide):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
@@ -805,7 +844,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
-        _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
+        _, value_heads, key_width, value_width, _ = RESOURCE_SHAPES[name]
 
         def array(*shape, kind=dtype):
             return jax.ShapeDtypeStruct(shape, kind)
@@ -817,7 +856,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or mainloop_backward.backward_holds(
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
-                floor=FLOOR if per_key else None, **unwide)
+                floor=resource_floor(name), **unwide)
         if not held:
             # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`,
             # as at the derived tiles): the launches its model refuses held apart (`apart_failures`).
@@ -831,7 +870,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                           array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
             formed = {key: value for key, value in form(name, dtype).items() if key != 'wide' or not training}
             run = functools.partial(mainloop_backward.gradients if training else mainloop.forward, **formed,
-                                    floor=FLOOR if per_key else None)
+                                    floor=resource_floor(name))
 
             def fn(*operands):
                 *operands, documents = operands if packed else (*operands, None)

@@ -1,12 +1,12 @@
 """Float-range and nested-derivative contracts of the samplers' seams: the flow time shift, a Gaussian
-transition's quadratic term and KL, the KL's forward mode, a guided prediction (ledger 2641; the harness
-is tests/contract_support.py)."""
+transition's quadratic term and KL, a guided prediction (ledger 2641; the harness is
+tests/contract_support.py)."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, GRADIENT_ORDERS, REVERSE_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, assert_contract, normal_draw
 
 from dew.diffusion.schedules.flow import time_shift
 
@@ -44,11 +44,14 @@ def half_squared_over(value, mean, variance):
 def test_a_transitions_quadratic_term_holds_every_order(edge):
     """`flow._half_mahalanobis` (a custom JVP whose tangent is the plain formula's, scaled to range): every
     order finite wherever float64 is a normal float32, past where the plain formula overflows, at values,
-    means and variances near float32's ends. A value equal to its mean, whose second forward derivative is
-    NaN, is ledger 2383's, whose head adds it."""
+    means and variances near float32's ends, a value equal to its mean among them (ledger 2383); there,
+    at zero, at one and near float32's least normal, under tangents of their own scales, the second
+    forward derivative and the gradient's forward derivative are the plain formula's, |t|**2 / v and
+    t / v, exactly (each a power of two)."""
     from dew.sampling import flow
 
     value, mean = normal_draw(2283, (3, 4), (3, 4), scale=EDGES[edge])
+    value = value.at[0].set(mean[0])
     variance = positive_draw(2284, (3,), EDGES[edge])
     direction = (*normal_draw(2285, (3, 4), (3, 4), scale=EDGES[edge]),
                  positive_draw(2286, (3,), EDGES[edge]))
@@ -56,13 +59,28 @@ def test_a_transitions_quadratic_term_holds_every_order(edge):
     assert_contract(flow._half_mahalanobis, (value, mean, variance), direction, cotangent,
                     f"a transition's quadratic term {edge}", truth_fn=half_squared_over)
 
+    unit = jnp.ones((1,), jnp.float32)
+    for level, scale in ((0.0, 1.0), (1.0, 2.0**10), (2.0**-100, 2.0**-40)):
+        at, along = jnp.full((1, 3), level, jnp.float32), jnp.full((1, 3), scale, jnp.float32)
+
+        def term(value, at=at):
+            return flow._half_mahalanobis(value, at, unit)
+
+        def moved(value, term=term, along=along):
+            return jax.jvp(term, (value,), (along,))[1]
+
+        np.testing.assert_array_equal(np.asarray(jax.jvp(moved, (at,), (along,))[1]), [3 * scale**2])
+        gradient = jax.grad(lambda value, term=term: term(value).sum())
+        np.testing.assert_array_equal(np.asarray(jax.jvp(gradient, (at,), (along,))[1]),
+                                      np.full((1, 3), scale))
+
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_transitions_kl_holds_every_order(edge):
-    """`GaussianTransition.kl` (`flow._gaussian_kl`, Dew's seam over `generation.linear_tangent`: its forward
-    mode `_directional`'s, its reverse mode `_kl_pullback`'s): every order it takes finite wherever float64 is
-    a normal float32 and the KL as written is, in the mean, the reference and the variance; its gradient takes
-    no derivative (ledger 2383)."""
+    """`GaussianTransition.kl` (`flow._gaussian_kl`, a custom JVP whose tangent is one linear map: its
+    forward mode `_kl_tangent`'s, its reverse mode `_kl_pullback`'s, each formed in range): every order
+    finite wherever float64 is a normal float32 and the KL as written is, in the mean, the reference and
+    the variance, a forward derivative of its gradient included (ledger 2383)."""
     from dew.sampling import flow
 
     mean, reference = normal_draw(2288, (3, 4), (3, 4), scale=EDGES[edge])
@@ -75,24 +93,7 @@ def test_a_transitions_kl_holds_every_order(edge):
         return flow.GaussianTransition(mean, variance).kl(reference)
 
     assert_contract(kl, (mean, reference, variance), direction, cotangent, f"a transition's KL {edge}",
-                    truth_fn=half_squared_over, plain_fn=half_squared_over, without=GRADIENT_ORDERS)
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_a_kls_forward_mode_holds_its_orders(edge):
-    """`flow._directional` (the KL's forward mode, a custom JVP whose tangent reads its tangents'
-    exponents): each forward order finite wherever float64 is a normal float32 and the KL as written is; it
-    is forward mode alone by design, its reverse mode `_kl_pullback`'s, which the KL's contract holds."""
-    from dew.sampling import flow
-
-    mean, reference = normal_draw(2293, (3, 4), (3, 4), scale=EDGES[edge])
-    variance = positive_draw(2294, (3,), EDGES[edge])
-    direction = (*normal_draw(2295, (3, 4), (3, 4), scale=EDGES[edge]),
-                 positive_draw(2296, (3,), EDGES[edge]))
-    (cotangent,) = normal_draw(2297, (3,))
-    assert_contract(flow._directional, (mean, reference, variance), direction, cotangent,
-                    f"a KL's forward mode {edge}", truth_fn=half_squared_over, plain_fn=half_squared_over,
-                    without=REVERSE_ORDERS)
+                    truth_fn=half_squared_over, plain_fn=half_squared_over)
 
 
 @pytest.mark.parametrize("edge", EDGES)

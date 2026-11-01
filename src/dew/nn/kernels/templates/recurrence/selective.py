@@ -88,8 +88,8 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     fp32 and `resets` `[R, T, RESET_WIDTH]` int8 (a token's flag in every column; ignored unless
     `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype, the final state `[R, N, D]` fp32 and, with
     `scan.entered`, the entering state of each chunk opening a backward block `[R, chunks / opening, N, D]`
-    fp32 (`Scan.opening`; None without): every chunk's, at 2048-token blocks of 32-token chunks, kept 64
-    times what the backward reads (4.3 GB at Falcon 7B's step, 2970)."""
+    fp32 (`Scan.opening`; None without): every chunk's kept 64 times what 2048-token blocks of 32-token
+    chunks read (4.3 GB at Falcon 7B's step, 2970)."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
     blocks = {"x": ((chunk, block), x.dtype), "dt": ((chunk, block), dt.dtype),
               "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype)}
@@ -193,13 +193,16 @@ sequential adds put B's gradient 1.95 times the portable scan's distance from fl
 starting at every chunk (the interpreted regime test); the adds a buffer takes fewer, as contended."""
 
 
-POSITIONS_PER_THREAD = 16
-"""The tokens a backward thread takes, mamba_ssm's kNItems: its warpgroup's 2048 a block. ptxas fills the
-registers a kernel leaves it (Mosaic GPU asks one program a multiprocessor, nvvm.minctasm 1, jaxlib's
-mosaic/gpu/passes.cc:211), so fewer tokens hold no more programs: at 8 the backward needed 152 registers
-spill-free and took 202, at 16 needed 224 and took 254, two programs a multiprocessor either way
-(need-*-sm90 at 1213539d0 and 02c73b9f0). Three, mamba_ssm's kMinBlocks, would take a register cap
-(`.maxnreg`, or minctasm 3) at 8 tokens, which jaxlib's compile does not take."""
+RESIDENT = 3
+"""The backward's programs a multiprocessor holds at once, mamba_ssm's kMinBlocks at 128 threads
+(`__launch_bounds__(128, 3)`, selective_scan_bwd_kernel.cuh): its compile caps a thread's registers at the
+register file's third (`mosaic.compiler_params`' `resident`, jax 0.12.0.1.post42's `min_blocks_per_sm`), where
+ptxas otherwise fills them, two programs a multiprocessor at any tokens a thread (row 2940)."""
+
+POSITIONS_PER_THREAD = 8
+"""The tokens a backward thread takes: the most whose registers fit `RESIDENT` programs, 65536 / (3 x 128) =
+170 a thread: at 8 the backward needed 152 spill-free (ptxas at minctasm 3, 165 taken), at 16 it needed 224
+(need-*-sm90 at 1213539d0 and 02c73b9f0, minctasm-1213539d0); its warpgroup's 1024 tokens a block."""
 
 
 def block_positions(length: int) -> int:
@@ -302,7 +305,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 sized((rows, states, channels), jnp.float32))
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, channels), grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
-                             name="selective_scan_backward",
+                             name="selective_scan_backward", resident=RESIDENT,
                              scratch=(block_scan.scratch(), block_scan.exchange_scratch(positions),
                                       plgpu.SMEM((2, states), jnp.float32)))
     def accumulated(refs):

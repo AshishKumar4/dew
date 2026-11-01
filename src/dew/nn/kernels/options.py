@@ -22,8 +22,10 @@ import jax
 import numpy as np
 from jax._src import api_util, config as jax_config, core as jax_core
 from jax._src.array import ArrayImpl
+from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
+from dew import algebra
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
 
@@ -137,9 +139,11 @@ def compiler_options(*models: Held) -> dict[str, Option]:
     return options
 
 
-type Placements = Sharding | None | tuple[Placements, ...] | Mapping[str, Placements]
-"""Where a program's arguments or results sit, as `jax.jit` takes them: one sharding, none (where
-they are), or a tree of either, one for each."""
+type Placements = (Sharding | Format | None | tuple[Placements, ...] | Mapping[str, Placements]
+                   | DataclassInstance)
+"""Where a program's arguments or results sit, as `jax.jit` takes them: one sharding, one format (a
+sharding and a layout), none (where they are), or a tree of them, one for each, a registered dataclass's
+among them (a server's resident slots)."""
 
 
 class JitArguments(TypedDict, total=False):
@@ -148,6 +152,8 @@ class JitArguments(TypedDict, total=False):
 
     static_argnums: int | tuple[int, ...]
     static_argnames: str | tuple[str, ...]
+    donate_argnums: int | tuple[int, ...]
+    donate_argnames: str | tuple[str, ...]
     in_shardings: Placements
     out_shardings: Placements
 
@@ -158,12 +164,13 @@ class OuterProgram:
     config is refused and the function traced afresh, by a new jit of a new callable past JAX's trace
     cache, and compiled once more, the launch's derivation taking the next config. Called as its jit
     is, it runs the executable that what jit keys its own on chooses (`_keyed`): the static arguments,
-    the others' structure, shapes, dtypes and placements, and the trace context, the `CACHED` latest;
+    the others' structure, shapes, dtypes and placements, and the trace context, the `CACHED` latest compiled;
     `lower` and `trace` are its jit's. Called within another trace (a `jax.grad`, a `jax.vmap`, an
     enclosing jit), it is its jit, which the enclosing program compiles as its own."""
 
     CACHED: ClassVar[int] = 4096
-    """The executables a program keeps, the latest called, as jit's own cache is bounded."""
+    """The executables a program keeps, the latest compiled, so its cache is bounded as jit's is: a call of
+    one compiled before reads it without refreshing its place (row 3326)."""
 
     def __init__(self, function: Callable, **arguments):
         self.function, self.arguments = function, arguments
@@ -177,12 +184,19 @@ class OuterProgram:
         self.names = frozenset(() if names is None else (names,) if isinstance(names, str) else names)
         self._executables: collections.OrderedDict[Hashable, Future[jax.stages.Compiled]] = (
             collections.OrderedDict())
+        # Each compiled executable by its key, read without the lock: a call of a signature compiled before
+        # costs its key and one lookup (row 3326).
+        self._ready: dict[Hashable, jax.stages.Compiled] = {}
         self._compiling = threading.Lock()
 
     def _jitted(self) -> jax.stages.Wrapped:
         @functools.wraps(self.function)
         def traced(*args, **kwargs):
-            return self.function(*args, **kwargs)
+            # The algebra pass rewrites the function where it is jitted, so its lowering, its trace, its
+            # executable and every relowering read one program (docs/design/algebra.md §6.7); its switch is
+            # in JAX's trace context, so a held program traces afresh as it changes.
+            return algebra.rewritten(self.function, static_argnums=self.numbers,
+                                     static_argnames=tuple(self.names))(*args, **kwargs)
         return jax.jit(traced, **self.arguments)
 
     def __call__(self, *args, **kwargs):
@@ -192,13 +206,15 @@ class OuterProgram:
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self.jitted(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
-        return self._kept(key, args, kwargs)(*dynamic, **named)
+        ready = self._ready.get(key)
+        return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
 
     def executable(self, *args, **kwargs) -> jax.stages.Compiled:
         """The executable a call with these arguments runs, compiled at the first: called with the dynamic
         arguments alone, as a caller that calls it every step does, building no dispatch key."""
         key, _, _ = self._keyed(args, kwargs)
-        return self._kept(key, args, kwargs)
+        ready = self._ready.get(key)
+        return self._kept(key, args, kwargs) if ready is None else ready
 
     def _kept(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled:
         """The executable kept under `key`, compiled where none is (`compiled`): the map alone is held,
@@ -209,11 +225,15 @@ class OuterProgram:
             if owner:
                 pending = self._executables[key] = Future()
                 if len(self._executables) > self.CACHED:
-                    self._executables.popitem(last=False)
+                    self._ready.pop(self._executables.popitem(last=False)[0], None)
             self._executables.move_to_end(key)
         if owner:
             try:
-                pending.set_result(self.compiled(*args, **kwargs))
+                executable = self.compiled(*args, **kwargs)
+                pending.set_result(executable)
+                with self._compiling:
+                    if key in self._executables:
+                        self._ready[key] = executable
             except BaseException as error:
                 with self._compiling:
                     self._executables.pop(key, None)
@@ -247,6 +267,10 @@ class OuterProgram:
     def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
         ones dropped."""
+        if not self.numbers and not self.names:
+            leaves, structure = jax.tree.flatten((args, kwargs))
+            return (len(args), ((), ()), structure, tuple(map(_signature, leaves)),
+                    jax_config.trace_context()), args, kwargs
         numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
         named = {name: value for name, value in kwargs.items() if name not in self.names}
@@ -277,17 +301,18 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`), and, where it is part of a training step, the step's own beside them
     (`step`, `dew.training.memory.step_compiler_options`), with the rest of `jax.jit`'s `arguments`
-    (its static arguments, its shardings), compiled through the kernel templates' reports (`OuterProgram`):
-    one program for each function, options and arguments,
-    which every call with the same reuses, so a quantized model and another never share one. Every
-    outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's or a load's,
-    but two that own their programs' lifetime: an objective's (`Objective.program`), which its cache
-    keeps as long as the objective, and the serving kernel's step programs, which donate the cache
+    (its static arguments, the arguments it donates, its placements, a tree of formats among them),
+    compiled through the kernel templates' reports (`OuterProgram`): one program for each function,
+    options and arguments, which every call with the same reuses, so a quantized model and another never
+    share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's or
+    a load's, but two that own their programs' lifetime: an objective's (`Objective.program`), which its
+    cache keeps as long as the objective, and the serving kernel's step programs, which donate the cache
     they step (`dew.inference.serving_kernel.decode_programs`)."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
-        static_argnames=arguments.get("static_argnames"),
+        static_argnames=arguments.get("static_argnames"), donate_argnums=arguments.get("donate_argnums"),
+        donate_argnames=arguments.get("donate_argnames"),
         in_shardings=_Placed.of(arguments["in_shardings"]) if "in_shardings" in arguments else None,
         out_shardings=_Placed.of(arguments["out_shardings"]) if "out_shardings" in arguments else None)
 
@@ -316,6 +341,8 @@ class _Placed(NamedTuple):
 def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option], ...], *,
                      static_argnums: int | tuple[int, ...] | None = None,
                      static_argnames: str | tuple[str, ...] | None = None,
+                     donate_argnums: int | tuple[int, ...] | None = None,
+                     donate_argnames: str | tuple[str, ...] | None = None,
                      in_shardings: _Placed | None = None, out_shardings: _Placed | None = None
                      ) -> OuterProgram:
     # Each argument `program`'s caller left out is left to jit (an explicit placement of None is a
@@ -325,6 +352,10 @@ def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option]
         arguments["static_argnums"] = static_argnums
     if static_argnames is not None:
         arguments["static_argnames"] = static_argnames
+    if donate_argnums is not None:
+        arguments["donate_argnums"] = donate_argnums
+    if donate_argnames is not None:
+        arguments["donate_argnames"] = donate_argnames
     if in_shardings is not None:
         arguments["in_shardings"] = in_shardings.tree()
     if out_shardings is not None:
