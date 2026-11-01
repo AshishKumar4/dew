@@ -503,9 +503,13 @@ class DreamerV3Objective(Objective[Ratio]):
         (`AUXILIARY_SCALE` unless set; pretraining from demonstrations sets `policy`, `value` and
         `replay_value` to 0, and imagination is then skipped); `imitation` weighs
         behaviour cloning, the actor's negative log-likelihood of each replayed action at its posterior
-        state, which reaches the actor alone."""
+        state, which reaches the actor alone. An auxiliary head named as one of the objective's own losses
+        is refused: its loss and weight would take that loss's place."""
         if imagination < 1 or not 0 <= lam <= 1 or horizon <= 1:
             raise ValueError("imagination must be positive, lam in [0, 1] and the horizon past one step")
+        clashing = sorted({name for name, _, _ in model.auxiliary} & {*type(self).scales, "imitation"})
+        if clashing:
+            raise ValueError(f"auxiliary heads named as the objective's losses {clashing}: name them apart")
         known = {**type(self).scales, **{name: AUXILIARY_SCALE for name, _, _ in model.auxiliary}}
         unknown = set(scales or {}) - set(known)
         if unknown or imitation < 0:
