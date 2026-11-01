@@ -114,7 +114,7 @@ because its Python API is still marked as subject to change.
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules`, the registry and the sets: `linear`, `identities`, `reuse`, `decoupled` |
+| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets: `linear`, `identities`, `reuse`, `decoupled`, `linear_scan`, `error_free` |
 | `dew.algebra.cost` | `Price`, `CostModel` and DAG extraction |
 | `dew.algebra.program` | The pass at `options.program` and its report |
 | `dew.algebra.derive` | Template declarations and their derived forms |
@@ -136,19 +136,31 @@ class Term(Expr):
     def literal(cls, value: f64Like, dtype: StringLike) -> Term: ...
     @classmethod
     def opaque(cls, equation: i64Like, output: i64Like) -> Term: ...  # never rewritten (§1)
+    @classmethod
+    def semantic(cls, name: StringLike, operands: Vec[Term], output: i64Like) -> Term: ...
     def __add__(self, other: Term) -> Term: ...                 # add, sub, mul, div, max, min, ...
-    def unary(self, name: StringLike) -> Term: ...             # neg, exp, log, sqrt, rsqrt, abs, sign
+    def unary(self, name: StringLike) -> Term: ...             # neg, exp, exp2, log, sqrt, rsqrt, abs, sign
+    def compare(self, kind: StringLike, other: Term) -> Term: ...  # lt, le, eq, ne, ge, gt
+    @classmethod
+    def iota(cls, shape: Vec[i64], dimension: i64Like) -> Term: ...
+    def prefix(self, monoid: StringLike, axis: i64Like, reverse: BoolLike) -> Term: ...  # cumsum, cummax, ...
     def convert(self, dtype: StringLike) -> Term: ...
     def broadcast(self, shape: Vec[i64], dimensions: Vec[i64]) -> Term: ...
     def reshape(self, shape: Vec[i64]) -> Term: ...
     def transpose(self, permutation: Vec[i64]) -> Term: ...
-    def reduce(self, monoid: StringLike, axes: Vec[i64]) -> Term: ...   # "sum" | "max"
+    def reduce(self, monoid: StringLike, axes: Vec[i64]) -> Term: ...   # a registered monoid (§6.3)
     @classmethod
     def dot(cls, lhs: Term, rhs: Term, contracting: Vec[i64], batch: Vec[i64], result: StringLike) -> Term: ...
     @classmethod
     def select(cls, predicate: Term, true: Term, false: Term) -> Term: ...
 ```
 
+- `semantic` is a primitive whose meaning is declared, not computed by the e-graph. Rules can equate it with other
+  terms, but never rewrite inside it. These primitives are:
+  - the error-free transformations, `two_sum`, `two_product` and scaling by `2**k`, exact barring overflow;
+  - `bounded_split(x, dtype)`, hi = dtype(x) and lo = dtype(x − hi), whose declared error bound is the dtype's
+    rounding of lo;
+  - `triangular_inverse`.
 - `terms.region(jaxpr, equations) -> (Term roots, Leaves)` converts a region of equations:
   - every equation outside the language becomes `opaque`;
   - every value the region reads but does not compute becomes an `input`.
@@ -169,20 +181,41 @@ derive it from its arguments' facts.
 | `dtype(t)` | `String` | equal or fail | casts, rounding |
 | `constant_axes(t)` | `Set[i64]` | union | hoisting a scalar out of a reduction |
 | `sharded_axes(t)` | `Map[i64, String]` (axis to mesh axes) | equal or fail | a sum over a sharded axis is a collective |
-| `tiled_axis(t)` | `i64` (−1 for none) | equal or fail | the toolkit's derived forms |
-| `combine(t, axis)` | `String` (the monoid that joins two tiles: `sum`, `max`, `logsumexp`, `moments`) | equal or fail | the work scheduler's fix-up |
+| `walked_axis(t)` | `i64` (−1 for none) | equal or fail | the toolkit's derived forms |
+| `per_token(t)` | `Bool` (varies along the walked axis) | or | hoisting across tiles; factors that commute through WY |
+| `decay(t)` | `String` (`scalar`, `per_head`, `per_key`) | equal or fail | a recurrence's decay hoisting |
+| `structure(t)` | `String` (a state update's `A_t`: `scalar`, `diagonal`, `rank_one_correction`) | equal or fail | the linear-scan rules |
+| `range(t)` | `Pair[f64, f64]` (bounds, where cheap) | intersect | a stable correction (exp arguments at most 0) |
+| `rounding(t)` | `String` (`exact`, `reorders`, `bounded`) and `error(t)`, an `f64` bound | the worse | accurate extraction |
 
 Two notes on the table:
 - "equal or fail" means members of one e-class that disagree raise, naming the rule that united them.
-- The inputs' facts come from the traced avals and their shardings.
+- The inputs' facts come from the traced avals, their shardings, and a declaration's roles (§6.9).
+
+Monoids are an open registry, so a reduction, a prefix and a derived form's merge all name one:
+
+```python
+@dataclass(frozen=True)
+class Monoid:
+    name: str                          # "sum", "max", "softmax" (m, total, acc), "affine" (A, b),
+                                       # "compensated" (sum, error), "argmax", "moments", ...
+    combine: jax.core.ClosedJaxpr      # (state, state) -> state
+    identity: jax.core.ClosedJaxpr     # () -> state
+    associative: bool                  # False: an ordered fold, never reassociated
+    rounding: str                      # its combine's rounding class
+    tie_break: str | None = None       # a total order where combine chooses (argmax: lowest position)
+
+MONOIDS: Mapping[str, Monoid]
+def register_monoid(monoid: Monoid) -> None: ...
+```
 
 ### 6.4 Rules
 
 ```python
 @dataclass(frozen=True)
 class Rules:
-    name: str                                # "linear", "identities", "reuse", "decoupled", ...
-    rounding: Literal["exact", "reorders"]   # "reorders": applied under default numerics only
+    name: str                                # "linear", "identities", "reuse", "decoupled", "linear_scan", ...
+    rounding: Literal["exact", "reorders", "bounded"]   # the rounding class each of its rewrites gives
     ruleset: egglog.Ruleset
     receipt: str                             # the measurement it ships with: a ledger row and its receipts
 
@@ -193,13 +226,18 @@ def admitted(numerics) -> tuple[Rules, ...]  # the sets a program's precision po
 
 - A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
 - Each rule's float64 identity test names the rule (§3).
-- `--precision accurate` admits only `exact` sets.
+- A rewrite's result joins its e-class with its rounding class and error bound (§6.3). Under default numerics
+  every set is admitted. Under `--precision accurate`:
+  - `exact` sets are admitted;
+  - `bounded` and `reorders` forms are admitted only where extraction finds their error bound within the
+    hand-written form's (§6.5).
 
 ### 6.5 Cost and extraction
 
 ```python
 @dataclass(frozen=True, order=True)
 class Price:                # compared in this order (§1)
+    error: float            # under --precision accurate only: the form's error bound; 0 under default numerics
     bytes: int              # passes over large tensors, each elementwise op fused into its consumer
     depth: int              # the longest chain of dependent reductions
     collectives: int
@@ -225,6 +263,10 @@ class Extraction:
 - Ties break by node order in the serialization, which is deterministic with one thread.
 - `fired` comes from the nodes each set's run added, recorded between runs of the sets.
 - A device's cost model is calibrated against measured profiles, its parameters measured on that device.
+- Two cost models implement the protocol:
+  - the program model, in passes over HBM;
+  - the kernel model, for derived template forms: values live per thread (registers), instructions per tile and
+    the dependent-reduction depth inside a step, read from the toolkit's register model.
 
 ### 6.6 Saturation
 
@@ -269,17 +311,51 @@ class Rewrite:
 
 ### 6.9 Derived template forms
 
+A declaration states semantics only: plain JAX on whole operands, or token functions along a walked axis. It never
+states a hand-written form.
+
 ```python
 @dataclass(frozen=True)
-class Declaration:
-    function: jax.core.ClosedJaxpr   # attention's score function, mask and reduction, or a state update
-    roles: Mapping[str, str]         # which inputs are queries, keys, values, state, ...
-    reduction: str                   # the reduction's monoid
-    tiled_axis: int
+class Reduction:                     # attention, and any walk whose state is a monoid's
+    function: jax.core.ClosedJaxpr   # the math on whole operands: softmax_keys(where(seen, score(q, k), -inf)) @ v
+    operands: Mapping[str, Axes]     # each operand's named axes: q (rows, d), k (keys, d), v (keys, e)
+    walked: str                      # the axis the kernel walks in tiles: "keys"
+    hooks: tuple[Hook, ...] = ()     # score, mask and output hooks with their parameter kinds
+    exponent: Literal[2, "e"] = "e"  # the template's choice, not a rewrite found per call
 
-def derive(declaration: Declaration, forms: Sequence[str]) -> Mapping[str, Callable]: ...
+@dataclass(frozen=True)
+class Scan:                          # a recurrence
+    update: jax.core.ClosedJaxpr     # (h, x_t) -> h, seen as h <- A_t h + b_t
+    readout: jax.core.ClosedJaxpr    # (h, x_t) -> o_t
+    operands: Mapping[str, Axes]
+    walked: str                      # "time"
+    structure: str                   # A_t: "scalar", "diagonal" or "rank_one_correction"
+
+Declaration = Reduction | Scan
+
+class Derived(NamedTuple):
+    state: Pytree                    # the per-row values carried along the walked axis
+    init: Callable                   # rows -> state, the empty partial
+    step: Callable                   # (state, tile as the template forms it, coords) -> state
+    merge: Callable                  # (state, state) -> state: split walks, the work scheduler's fix-up
+    finish: Callable                 # state -> outputs and the residuals a backward reads
+    backward: Derived | None         # the same for the backward walk
+    report: AlgebraReport            # rule sets fired, price, each form's rounding class and error bound
+
+def derive(declaration: Declaration, numerics, cost: CostModel) -> Derived: ...
 ```
 
-- `forms` names the forms wanted, among `online`, `tiled`, `combine` and `backward`.
-- Each derived form has the signature of the hand-written form in `attention_algebra` or `recurrence_algebra`, so
-  it replaces that form in place once it passes the accuracy gate against it and is at least as fast (§2).
+- `step` takes the walk's tile as the template forms it: logits scaled, coordinates, and the mask and score
+  hook applied. Places and tile layouts are the schedule's, not the algebra's.
+- The hand-written forms (`attention_algebra`, `recurrence_algebra`) are adapted to the same coarse interface.
+  The derived and hand-written forms then swap behind one switch, which check 1 drives both ways.
+- A derived form replaces the hand-written one when it passes the accuracy gate against the float64 truth and
+  is at least as fast in the kernel (§2). Its internals need not decompose into the hand-written functions.
+- The rule sets derivation needs beside §6.4's:
+  - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
+    log-sum-exp and moment merges;
+  - `linear_scan`: the affine monoid, compact WY with `triangular_inverse`, decay hoisting as exp of prefix
+    sums (the compensated prefix under accurate numerics), and a scan's adjoint;
+  - `error_free`: the compensated sum, the natural exponent through `two_product` and `2**k`, and an argmax
+    anchor's split identity. Under accurate numerics, extraction keeps these wherever the hand-written form's
+    error bound requires them.
