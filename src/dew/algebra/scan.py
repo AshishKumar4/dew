@@ -22,7 +22,10 @@ Mamba-2's state-space dual where no token corrects (`w = U`), derived from the t
 written. The prefix is taken compensated (each partial a float and its rounding error, `two_sum`), and every
 difference of two partials from both parts: a plain prefix loses about 1e-6 of a deep decay (ledger 2098). A
 chunk's adjoint (`backward`) is its forms' derivative, each exponent's from the decays whose sums hold it,
-summed without one term added and taken away again (`_decays_backward`).
+summed without one term added and taken away again (`_decays_backward`). A token a reset marks (`Scan.reset`,
+a packed document's first) takes the exponent `RESET_DECAY` in place of its own, so every decay spanning it is
+zero and every other its own: the forms, their merge and their adjoint unchanged, the exponent its reset
+replaced given no gradient.
 Every other update or readout is refused, named.
 """
 
@@ -45,6 +48,15 @@ from dew.nn.precision import float32_einsum, float32_matmul, two_sum
 Axes = tuple[str, ...]
 Atom = jcore.Var | jcore.Literal
 
+RESET_DECAY = -1e4
+"""The exponent a reset token's decay takes in place of its own (natural or base 2): the state entering it
+is multiplied by `exp(-1e4)`, which is 0 in fp32. A token's own exponent is never positive, so every span
+holding a reset sums to at most this and decays to exactly 0, and a span without one never sees it. Finite,
+so a span's exponent is a difference of finite partials (an infinity less an infinity is a NaN), and a
+kernel's segment sums formed as a matmul against a 0/1 triangle stay finite (an infinity times 0 is a NaN);
+thousands of resets in a walk's sum stay far inside fp32's range, and the compensated prefix keeps each
+difference of two partials exact past them."""
+
 _KEEPING = frozenset({"convert_element_type", "reshape", "expand_dims", "squeeze", "copy", "copy_p"})
 """Equations that keep a value's elements and shape class (a cast, a unit-axis reshape)."""
 
@@ -53,13 +65,16 @@ _KEEPING = frozenset({"convert_element_type", "reshape", "expand_dims", "squeeze
 class Scan:
     """A recurrence over its `walked` axis (time): `update(h, **token)` the state after one token,
     `readout(h, **token)` that token's output from the state after it, each in plain JAX on one token's
-    operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype."""
+    operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype.
+    `reset`, where given, names an operand of `operands`, booleans along the walked axis alone that neither
+    reads, marking each token a zero state enters (a packed document's first)."""
 
     update: Callable
     readout: Callable
     operands: Mapping[str, Axes]
     walked: str
     state: tuple[tuple[int, ...], jnp.dtype]
+    reset: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,9 +129,9 @@ def derive_scan(declaration: Scan) -> Derived:
     """`declaration`'s chunk forms (the module's account): `init(shapes)` a zero state and no decay,
     `step(state, chunk)` the state after a chunk of tokens, `mapped(chunk, state)` the chunk's outputs from
     the state entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's from zero),
-    `finish(state, operands)` the final state. Refused (`Refused`) where the update or the readout is not of
-    the module's form."""
-    names = tuple(declaration.operands)
+    `finish(state, operands)` the final state; `backward` a chunk's adjoint, a cotangent for each operand
+    but the reset's. Refused (`Refused`) where the update or the readout is not of the module's form."""
+    names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
@@ -142,8 +157,11 @@ def derive_scan(declaration: Scan) -> Derived:
         # An operand with no walked axis (a rate, a skip) is every token's.
         axes = [declaration.operands[name].index(declaration.walked)
                 if declaration.walked in declaration.operands[name] else None for name in names]
-        values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(*[chunk[name] for name in names])
-        return affine, values
+        exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
+            *[chunk[name] for name in names])
+        if declaration.reset is not None:
+            exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
+        return affine, (exponent, *values)
 
     def init(shapes):
         del shapes
@@ -181,11 +199,12 @@ def derive_scan(declaration: Scan) -> Derived:
     def backward(chunk, state, d_state, d_outputs):
         # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
         # forward forms' derivative (their prefix, substitution and Dew products differentiated).
+        # The reset's booleans held, no operand of the derivative.
         def forward(h, operands):
-            entering = (state[0], h)
-            return mapped(operands, entering), step(entering, operands)[1]
+            entering, tiles = (state[0], h), {**chunk, **operands}
+            return mapped(tiles, entering), step(entering, tiles)[1]
 
-        _, pullback = jax.vjp(forward, state[1], dict(chunk))
+        _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
         d_h, d_chunk = pullback((d_outputs, d_state))
         return d_h, d_chunk
 
