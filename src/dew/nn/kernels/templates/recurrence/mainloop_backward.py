@@ -24,6 +24,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Launch,
     Tiles,
     Work,
+    _addressed,
     _axis,
     _block_stored,
     _Call,
@@ -257,13 +258,16 @@ def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_d
 # XLA adds.
 
 
-def _value_block(call: _Call, held: Callable[[int], _Held], consumers: int = 1) -> int:
+def _value_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple],
+                 consumers: int = 1) -> int:
     """A launch's value block where it takes a value row a block at a time: the call's value width, halved
-    while its register model (`held(block)`, `_Held`) is past a consumer thread's registers
+    while its register model (`held(block)`, `_Held`, beside its addresses into its staging and landing
+    tiles there, `staged(block)`, as `mainloop._key_block` prices them) is past a consumer thread's registers
     (`Family.registers`) and the block stays whole blocks (`_Call.block`); the narrowest where none holds,
     which the launch then refuses."""
-    block = call.value_width
-    while block > call.block and held(block).registers(call.family) > call.family.registers(consumers):
+    block, family = call.value_width, call.family
+    while block > call.block and (held(block).registers(family, _addressed(*staged(block)))
+                                  > family.registers(consumers)):
         block //= 2
     return block
 
@@ -281,6 +285,13 @@ def _local_back_held(call: _Call, vb: int) -> _Held:
          *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, vb))]))
 
 
+def _local_back_staged(call: _Call, vb: int) -> tuple:
+    """`_local_back`'s staging tiles and landings at value block `vb`: the scores' narrow form and a value
+    block's gradient's landing."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    return _staging(held, (CHUNK, CHUNK)), {"row": _value_grads(call).landing(CHUNK, vb)}
+
+
 @_lowered_once
 def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     """`[R, HV * Dv]` in `_value_grads`' form: the corrected values' gradient from each chunk's own output
@@ -288,9 +299,9 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     (persistent): apart from the memory's reverse walk (`_reverse`), whose tiles beside these spilled 80
     bytes a thread on an H100's."""
     width, value_width, family = call.width, call.value_width, call.family
-    held, given = dataclasses.replace(call.held, rows=call.rows), call.given
-    grads = _value_grads(call)
-    vb = _value_block(call, functools.partial(_local_back_held, call))
+    given, grads = call.given, _value_grads(call)
+    vb = _value_block(call, functools.partial(_local_back_held, call),
+                      functools.partial(_local_back_staged, call))
 
     def program(q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
@@ -335,11 +346,11 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
     work = Work(2 * CHUNK * CHUNK * (width + value_width), exponentials=CHUNK * CHUNK)
+    staging, landing = _local_back_staged(call, vb)
     return _kernel(program, call, out_type=grads.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
-                   live=_taken(7), work=work, held=_local_back_held(call, vb),
-                   staging=_staging(held, (CHUNK, CHUNK)), landing={"row": grads.landing(CHUNK, vb)},
-                   persistent=True)(
+                   live=_taken(7), work=work, held=_local_back_held(call, vb), staging=staging,
+                   landing=landing, persistent=True)(
         q, k, do, hi, lo, hi, lo, taken)
 
 
@@ -669,10 +680,12 @@ def _memory_sum(call: _Call, issue: Issuer, entered: Parts, leaving: Parts) -> j
 
 
 def _query_key_held(call: _Call) -> _Held:
-    """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum,
-    its memory product and its scores' product, and a block's queries or keys in fp32 for the range terms;
-    then `sum(S dS)` (`_memory_sum`): the memories' product and its diagonal's mask where products read
-    registers, with a block of each operand, else the memories in fp32."""
+    """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum
+    (one accumulator over the value blocks), that sum gated, its scores' product, and a block's queries or
+    keys in fp32 for the range terms; then `sum(S dS)` (`_memory_sum`): the memories' product and its
+    diagonal's mask where products read registers, with a block of each operand, else the memories in fp32.
+    An accumulator a value block, the SSD's spilled 168 bytes a thread on an A100, where one needed 249
+    registers (gateqk at c2808ebbe)."""
     held, memories, given = call.held, call.memories, call.given
     block = (memories, call.block, call.block)
     summed = ([_f32(call.block, call.block), *_masks(call.block, call.block), *_fragments(call, block, block)]
@@ -773,7 +786,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
                 functools.partial(column, "value_grads", held) if call.delta else None,
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
-                blocks, ds if splits == 1 else None, gate, low, ending, ending_low, None, scale, issue,
+                blocks, ds if splits == 1 else None, gate, low, ending, ending_low, None, scale, issue.summed,
                 emit=stored, row_scale=family.rows_of(beta_ref.at[h, span]) if call.gated_keys else None)
             if splits > 1 and ds is not None:
                 # The scores' gradient's products the first split's alone, added after its memory products.
@@ -893,7 +906,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
                 functools.partial(column, "queries", given), functools.partial(column, "keys", given),
                 width // call.block, functools.partial(column, "values", held),
                 functools.partial(column, "out", given), blocks, gate, low, scale,
-                grads.dtype if accumulated is None else jnp.float32, Issuer(call), laid=laid,
+                grads.dtype if accumulated is None else jnp.float32, Issuer(call).summed, laid=laid,
                 column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None)
             # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
             # pairs are gone.
@@ -932,12 +945,13 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
     work = Work(2 * CHUNK * CHUNK * (value_width + width + CHUNK) * group, group,
                 exponentials=CHUNK * CHUNK * group)
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
-    # the pairs' sum's product: four fp32 tiles at once, the decays taken before the scores' product
-    # (`algebra.scores_gradient`); five stated an A100's 280 registers where ptxas needed 240. A key head's
-    # sum read back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the
-    # remainder each part after the first is formed from (`product.formed`): without it the model stated
-    # 232 registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (4 + (group > 1) + (grads.parts > 1))
+    # the pairs' sum's product: three fp32 tiles at once, the decays taken before the scores' product and
+    # each block sum into one accumulator (`algebra.scores_gradient`; an accumulator a block, four, and an
+    # H100's need was 232 in a bf16 call, 192 in one, back-need-one-32 at 9482e4d26). A key head's sum read
+    # back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the remainder each
+    # part after the first is formed from (`product.formed`): without it the model stated 232 registers
+    # where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (3 + (group > 1) + (grads.parts > 1))
                                + _held(grads, CHUNK, CHUNK)
                                + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
