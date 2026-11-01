@@ -57,11 +57,13 @@ Scope is per rule, because the rules are not all about the same thing:
   rounded reciprocal, not correctly rounded (rows 1402, 1403); `precision.
   divided` divides as IEEE does. It reports only an operand it proves is an
   array (`_array`), so a Python number or a name it cannot prove passes.
-- SLOP025 is about the packages of `src/<package>` that own their programs'
-  compiles (`COMPILED_THROUGH`: RL's rollouts and simulators, serving's steps):
-  none compiles by a bare `jax.jit` or `jax.pmap`, by any name it is imported as; each program
-  is a `dew.nn.kernels.options.OuterProgram`, Dew's one compile point, whose
-  every compile admits its communicators and takes the algebra pass.
+- SLOP025 is about `src/<package>`: no program compiles by a bare `jax.jit` or
+  `jax.pmap`, by any name it is imported as, but the compile point's own
+  (`OuterProgram`) and the nested program's (`dew.nn.nested.nested`), which
+  compiles nothing at the top level (`COMPILE_POINT`); every program is compiled
+  through `dew.nn.kernels.options.program` or `owned_program`, whose every
+  compile admits its communicators and takes the algebra pass, and a trace that
+  compiles nothing traces (`jax.make_jaxpr`, `jax.eval_shape`).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1899,25 +1901,38 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
-COMPILED_THROUGH = ("rl", "objectives/rl", "inference")
-"""The packages of `src/<package>` whose every program compiles through `OuterProgram` (SLOP025)."""
+COMPILE_POINT = (("nn/kernels/options.py", "OuterProgram"), ("nn/nested.py", "nested"))
+"""The two places of `src/<package>` that compile by a bare jit (SLOP025), each `path` below it and the
+definition the jit is in: Dew's one compile point, through which every program compiles
+(`dew.nn.kernels.options.program`, `owned_program`), and the nested program, a sub-program an outer one
+compiles and that compiles nothing at the top level (`dew.nn.nested.nested`)."""
 
 BARE_COMPILERS = frozenset({"jax.jit", "jax.pmap"})
-"""JAX's own compiles of a program, which SLOP025 reports in `COMPILED_THROUGH`."""
+"""JAX's own compiles of a program, which SLOP025 reports outside `COMPILE_POINT`."""
+
+
+def _within(tree: ast.Module, name: str) -> set[int]:
+    """The identity of every node of `tree` inside its top-level class or function `name`."""
+    return {id(node) for statement in tree.body
+            if isinstance(statement, ast.ClassDef | ast.FunctionDef) and statement.name == name
+            for node in ast.walk(statement)}
 
 
 def compile_points(module: Module) -> Iterator[Finding]:
     """SLOP025: a bare `jax.jit` or `jax.pmap` (`BARE_COMPILERS`), its name read through the imports of its
-    scope, in a package whose programs compile through Dew's one compile point (`COMPILED_THROUGH`)."""
-    owned = (f"src/{module.package}/{package}/" for package in COMPILED_THROUGH)
-    if not any(module.relative.startswith(prefix) for prefix in owned):
+    scope, anywhere in `src/<package>` but the two definitions `COMPILE_POINT` names."""
+    prefix = f"src/{module.package}/"
+    if not module.relative.startswith(prefix):
         return
+    relative = module.relative.removeprefix(prefix)
+    inside = {node for path, owner in COMPILE_POINT if relative == path
+              for node in _within(module.tree, owner)}
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         compiler = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
-        if compiler in BARE_COMPILERS:
+        if compiler in BARE_COMPILERS and id(node) not in inside:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP025",
-                          f"compiles by a bare {compiler}; compile through "
-                          "`dew.nn.kernels.options.OuterProgram`, Dew's one compile point")
+                          f"compiles by a bare {compiler}; compile through `dew.nn.kernels.options.program` "
+                          "or `owned_program`, Dew's one compile point, or nest it (`dew.nn.nested.nested`)")
 
 
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",

@@ -32,7 +32,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import compiler_options, program
 from dew.nn.kernels.templates import report
 from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
@@ -170,7 +170,7 @@ class SampledStep(NamedTuple):
     executable: jax.stages.Compiled
 
 
-@jax.jit
+@program
 def whole_step(outputs):
     """A step's outputs from those of the microbatches it was read in: the
     last one's loss, pooled over the window where it commits, and its

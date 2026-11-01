@@ -25,6 +25,7 @@ import numpy as np
 
 from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
+from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
@@ -100,7 +101,7 @@ def fresh_book(loss: jax.Array) -> Book:
     return Book(*jax.device_put(zeros, loss.sharding))
 
 
-@jax.jit
+@program
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, training=0.0,
              tokens=(0, 0), scored=(0, 0)) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
@@ -380,12 +381,12 @@ class TokenClock:
         self.read, self.held = read, pending
 
 
-@jax.jit
+@program
 def _added_tokens(left: jax.Array, right: jax.Array) -> jax.Array:
     return _TokenCount.add(left, right)
 
 
-@jax.jit
+@program
 def held(rate: jax.typing.ArrayLike | None,
          scale: jax.Array | None) -> tuple[jax.Array | None, jax.Array | None]:
     """Copies, in device memory, of the learning rate and the loss scale a

@@ -55,6 +55,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
 from dew.nn.kernels import generation
+from dew.nn.kernels.options import program
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
@@ -1160,7 +1161,7 @@ def _collapsed(mask_info: mask_info_lib.MaskInfo) -> mask_info_lib.MaskInfo:
     return mask_info._replace(partial_mask_blocks=blocks.reshape(-1, *blocks.shape[-2:]))
 
 
-@functools.partial(jax.jit, static_argnames=_NONDIFF)
+@functools.partial(program, static_argnames=_NONDIFF)
 def _splash(
     fwd_mask_info,
     dq_mask_info,

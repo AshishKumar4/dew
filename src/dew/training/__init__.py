@@ -19,7 +19,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.training.budget import Pause, Plateau
     from dew.training.cooldown import Cooldowns
     from dew.training.diloco import DiLoCo
-    from dew.training.evaluation import EvalSuite, Evaluation
+    from dew.training.evaluation import Episodes, EvalSuite, Evaluation
     from dew.training.inspection import Inspection, inspected
     from dew.training.observe import Observe
     from dew.training.profiling import ProfileWindow
@@ -46,6 +46,7 @@ _EXPORTS = {
     "Inspection": "dew.training.inspection",
     "inspected": "dew.training.inspection",
     "EMASpec": "dew.objectives.base",
+    "Episodes": "dew.training.evaluation",
     "EvalSuite": "dew.training.evaluation",
     "Evaluation": "dew.training.evaluation",
     "Keep": "dew.checkpoints",
@@ -90,6 +91,7 @@ __all__ = [
     "Cooldowns",
     "DiLoCo",
     "EMASpec",
+    "Episodes",
     "EvalSuite",
     "Evaluation",
     "Inspection",

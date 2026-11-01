@@ -2,6 +2,8 @@
 (`dew.objectives.rl.control`): each held to a step-by-step loop, an exact index bookkeeping or a
 float64 transcription of the arithmetic, apart from Dew's code."""
 
+import contextlib
+import copy
 import itertools
 
 import jax
@@ -10,8 +12,10 @@ import numpy as np
 import optax
 import pytest
 from flax import struct
+from recording import bits
 from reference_error import assert_computes_the_oracle, chain_roundings
 
+from dew.objectives.base import Shown
 from dew.objectives.rl.control import (
     ActorCritic,
     ControlPPOObjective,
@@ -218,6 +222,24 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
     assert after > before, (before, after)
 
 
+def test_one_unbatched_environments_episode_return_is_the_reward_its_first_episode_earns():
+    """`episode_return` of one environment, unbatched, is the reward its greedy policy's first episode
+    earns, summed as the episode is flown by hand a step at a time; walks' rewards are integers, so
+    every order sums them exactly."""
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9)
+    variables = objective.init(jax.random.key(0))
+    env, key = TimeLimit(Walk(limit=4.0), episode_length=8), jax.random.key(6)
+    carry = start(env, key)
+    state, observation, earned = carry.state, carry.observation, 0.0
+    for _ in range(12):
+        state, following = env.step(state, objective.greedy(variables, observation, key, None)[0])
+        earned += float(following.reward)
+        if bool(following.terminated | following.truncated):
+            break
+        observation = following.observation
+    assert episode_return(objective, env, variables, key, 12) == earned
+
+
 @pytest.mark.parametrize("asked", [{"discount": 1.5}, {"lam": -0.1}, {"clip": 0.0}])
 def test_a_discount_lambda_or_clip_outside_its_range_is_refused(asked):
     with pytest.raises(ValueError):
@@ -265,6 +287,24 @@ class HostWalks:
         self.x = np.where(mask, self.starts(), self.x).astype(np.float32)
         self.steps = np.where(mask, 0, self.steps)
         return self.x[:, None].copy()
+
+
+@contextlib.contextmanager
+def kept_as_left(walks):
+    """A host simulator's walks stepped in a cooldown branch, then put back as the run left them: their
+    positions, steps and draws (a simulator's `branch`, `dew.rl.simulator.Branching`)."""
+    kept = walks.x.copy(), walks.steps.copy(), copy.deepcopy(walks.rng)
+    try:
+        yield
+    finally:
+        walks.x, walks.steps, walks.rng = kept
+
+
+class KeptWalks(HostWalks):
+    """`HostWalks` that a cooldown branch steps and then leaves as the run left them (`kept_as_left`)."""
+
+    def branch(self):
+        return kept_as_left(self)
 
 
 class ShardedWalks(HostWalks):
@@ -366,3 +406,295 @@ def test_a_driven_simulator_records_what_a_driven_env_records():
     jax.tree.map(np.testing.assert_array_equal, (simulated.observation, simulated.action),
                  (expected.observation, expected.action))
     assert np.asarray(expected.observation["first"])[1:].any()
+
+
+@pytest.mark.parametrize("where", ["persistent", "local"])
+def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_stopped(tmp_path, where):
+    """A PPO run on walks, checkpointed every update to its run's directory or to its local one, stopped at
+    its third update and resumed from that checkpoint by a fresh rollout over fresh environments: the
+    checkpoint holds the rollout's walks mid episode, the collection it serves and its minibatches' order
+    (`ControlRollout.saved`), so the resumed run's last state is the uninterrupted run's, every leaf bit
+    for bit, the key's as its raw bits; a run whose checkpoints were written without the rollout's state
+    resumes to another state, its walks begun again."""
+    from dew.checkpoints import Checkpoints, Keep
+    from dew.data.dataset import Loader, replayed
+    from dew.training import Trainer
+
+    def walks():
+        return Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16)
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+
+    def trained(directory, steps, rollout):
+        local = {"local_directory": str(directory / "local"), "local_every": 1} if where == "local" else {}
+        trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
+                          checkpoints=Checkpoints(str(directory / "run"), keep=Keep(latest=8), **local))
+        # A local run keeps its local checkpoint alone, so the resume reads it.
+        every = {"checkpoint_every": 1} if where == "persistent" else {"checkpoint_final": False}
+        return trainer.fit(data, steps=steps, log_every=1, **every)
+
+    def resumed(directory, made):
+        trained(directory, 3, made())
+        return trained(directory, 6, made())
+
+    def made():
+        return ControlRollout(objective, walks(), unroll_length=8, epochs=2, minibatches=2)
+
+    whole = trained(tmp_path / "whole", 6, made())
+    again = resumed(tmp_path / "stopped", made)
+    for one, other in zip(bits(whole), bits(again), strict=True):
+        np.testing.assert_array_equal(one, other)
+
+    class Forgetting(ControlRollout):
+        """The rollout saving nothing of what it carries, as one did before checkpoints held it."""
+
+        def saved(self):
+            return None
+
+    def forgetting():
+        return Forgetting(objective, walks(), unroll_length=8, epochs=2, minibatches=2)
+
+    afresh = resumed(tmp_path / "forgot", forgetting)
+    assert not all(np.array_equal(one, other)
+                   for one, other in zip(bits(whole), bits(afresh), strict=True))
+
+
+def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path):
+    """A PPO run on walks with a cooldown at its fourth update ends, every leaf bit for bit, where the run
+    with no cooldown does: the branch's updates run on the rollout's walks and collection and leave them as
+    the run left them (`ControlRollout.branch`). Preempted as its branch begins, the run saves its step's
+    state with the rollout's as the run left it, and its resume runs the branch again and ends there too."""
+    from recording import preempting
+
+    from dew.checkpoints import Checkpoints, Keep
+    from dew.data.dataset import Loader, replayed
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite, Preempted, Trainer
+    from dew.training.cooldown import Cooldowns
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+    # A cooldown branch is scored by the run's validation: here the walks the greedy policy flies.
+    flights = {"flight": EvalSuite(Episodes(episodes(objective.greedy, Batched(TimeLimit(
+        Walk(limit=50.0), episode_length=8), 8), 8), {"return": Shown(better="higher"), "steps": Shown()}),
+        every=8)}
+
+    def trained(directory=None, **options):
+        walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16)
+        checkpoints = None if directory is None else Checkpoints(str(directory), keep=Keep(latest=8))
+        # A cooldown scales the rate the optimizer's state holds.
+        trainer = Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=3e-3),
+                          key=jax.random.key(5), checkpoints=checkpoints,
+                          rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
+        return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
+
+    plain = bits(trained())
+    cooldowns = Cooldowns(at=(4,), length=2)
+    for one, other in zip(plain, bits(trained(cooldowns=cooldowns)), strict=True):
+        np.testing.assert_array_equal(one, other)
+    with pytest.raises(Preempted):
+        trained(tmp_path / "run", cooldowns=cooldowns, checkpoint_every=1, observe=preempting(3))
+    assert Checkpoints(str(tmp_path / "run")).latest == 4
+    again = trained(tmp_path / "run", cooldowns=cooldowns, checkpoint_every=1)
+    for one, other in zip(plain, bits(again), strict=True):
+        np.testing.assert_array_equal(one, other)
+
+
+def test_a_control_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():
+    """A PPO run on walks a simulator steps, with a cooldown at its fourth update whose branch collects
+    steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the rollout keeps
+    its state and the simulator its own walks (their `branch()`, `dew.rl.simulator.branched`). A simulator
+    with no `branch()` is refused the cooldown."""
+    from dew.data.dataset import Loader, replayed
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite, Trainer
+    from dew.training.cooldown import Cooldowns
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+    flights = {"flight": EvalSuite(Episodes(episodes(objective.greedy, Batched(TimeLimit(
+        Walk(limit=50.0), episode_length=8), 8), 8), {"return": Shown(better="higher"), "steps": Shown()}),
+        every=8)}
+
+    def trained(walks, **options):
+        # A cooldown scales the rate the optimizer's state holds.
+        trainer = Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=3e-3),
+                          key=jax.random.key(5),
+                          rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
+        return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
+
+    plain = bits(trained(KeptWalks(16, 8, limit=50.0, drawn=True)))
+    cooldowns = Cooldowns(at=(4,), length=2)
+    cooled = trained(KeptWalks(16, 8, limit=50.0, drawn=True), cooldowns=cooldowns)
+    for one, other in zip(plain, bits(cooled), strict=True):
+        np.testing.assert_array_equal(one, other)
+    with pytest.raises(TypeError):
+        trained(HostWalks(16, 8, limit=50.0, drawn=True), cooldowns=cooldowns)
+
+
+@struct.dataclass
+class Seen(Walk):
+    """`Walk` observed through named views: its `position`, its `distance` from the origin, and the `push`
+    it was last given (none at its start), which a policy's weights move continuously."""
+
+    def reset(self, key):
+        x, _ = super().reset(key)
+        unended = jnp.zeros((), bool)
+        return x, TimeStep(self.seen(x, jnp.zeros(1)), jnp.zeros(()), unended, unended)
+
+    def step(self, x, action):
+        x, stepped = super().step(x, action)
+        return x, TimeStep(self.seen(x, action), stepped.reward, stepped.terminated, stepped.truncated)
+
+    @staticmethod
+    def seen(x, push):
+        return {"position": x[None], "distance": jnp.abs(x)[None], "push": push}
+
+
+def flown_by_hand(objective, variables, key, count: int, steps: int) -> dict[str, float]:
+    """The greedy policy flown over `count` fresh `Seen` walks for `steps` steps from `key`, scored by
+    hand: each walk's first episode's undiscounted return, its steps, and its distance and last push at its
+    last step, each a mean over the walks."""
+    env = Batched(TimeLimit(Seen(limit=50.0), episode_length=8), count)
+    taken = env_rollout(env, objective.greedy, variables, start(env, key), steps, reset=False)[1]
+    done = np.asarray(taken.following.done)
+    inside = (np.cumsum(done, 0) - done) == 0
+    last = inside.sum(0) - 1
+
+    def at_last(name):
+        value = np.asarray(taken.following.observation[name]).reshape(steps, count)
+        return float(value[last, np.arange(count)].mean())
+
+    return {"return": float(np.where(inside, np.asarray(taken.following.reward), 0).sum(0).mean()),
+            "steps": float(inside.sum(0).mean()), "distance": at_last("distance"), "push": at_last("push")}
+
+
+def evaluation_key(run_key, step: int):
+    """The key a split's episodes fly from at `step`: the run's key folded with 'EVAL', the step and
+    'EPIS', as `dew.training.Episodes` says."""
+    folded = jax.random.fold_in(jax.random.fold_in(run_key, 0x4556414C), step)
+    return jax.random.fold_in(folded, 0x45504953)
+
+
+SHOWN = {"return": Shown(better="higher"), "steps": Shown(better="higher"),
+         "distance": Shown(better="lower"), "push": Shown()}
+"""How a walk's episode scores show: a longer and better-paid episode, nearer the origin, is better."""
+
+
+def test_a_split_scored_by_its_episodes_reports_its_averaged_weights_first_episodes(tmp_path):
+    """A PPO run on walks that keeps averaged weights (an EMA of decay 0.5), validated by its episodes
+    (`EvalSuite(Episodes(dew.rl.evaluation.episodes(...)))`), reports at its end `flight/return`,
+    `flight/steps` and `flight/distance`: what its averaged weights earn flown, from the key the run's key
+    gives at its last step, over the walks' first episodes scored by hand; its live weights' flight is
+    another. A warming flight before the first step reports nothing."""
+    from dew.data.dataset import Loader, replayed
+    from dew.objectives.base import EMASpec
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite, Trainer
+    from dew.training.tracker import LocalTracker
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3,
+                                    reads=("position",))
+    objective.ema = EMASpec(lambda step: 0.5)
+    walks = Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 32)
+    flown = episodes(objective.greedy, walks, 12, reached=("distance", "push"))
+    suite = EvalSuite(Episodes(flown, SHOWN), every=4)
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+    tracker = LocalTracker(str(tmp_path / "tracked"))
+    rollout = ControlRollout(objective, Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 16),
+                             unroll_length=8, epochs=2, minibatches=2)
+    state = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
+                    tracker=tracker).fit(data, steps=4, log_every=2, validation={"flight": suite})
+    logged = [(step, scalars) for step, scalars in tracker.scalars() if "flight/return" in scalars]
+    tracker.close()
+    assert [step for step, _ in logged] == [4]
+    key = evaluation_key(state.key, 4)
+    expected = flown_by_hand(objective, state.averaged, key, 32, 12)
+    assert {name: logged[0][1][f"flight/{name}"] for name in expected} == expected
+    assert flown_by_hand(objective, state.variables, key, 32, 12) != expected
+
+
+@pytest.mark.parametrize("selected", ["by name", "by metric", "by its only metric"])
+def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path, selected):
+    """A PPO run on walks validated by its episodes every other update keeps, as its best checkpoint (better
+    higher as its `Episodes` declares), a step whose logged return is the highest any evaluation logged:
+    selected by the score's name (`Best("flight/return")`), by its metric (`Best(split.metrics[0])`, the
+    very one the run declares), or by that metric where the suite asks for it alone, which logs it alone
+    though the episodes report every score they declare."""
+    from dew.checkpoints import Checkpoints, Keep
+    from dew.data.dataset import Loader, replayed
+    from dew.rl.evaluation import episodes
+    from dew.training import Best, Episodes, EvalSuite, Trainer
+    from dew.training.tracker import LocalTracker
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3,
+                                    reads=("position",))
+    walks = Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 32)
+    flown = episodes(objective.greedy, walks, 12, reached=("distance", "push"))
+    split = Episodes(flown, SHOWN)
+    asked = split.metrics[:1] if selected == "by its only metric" else ()
+    suite = EvalSuite(split, metrics=asked, every=2)
+    best = Best("flight/return") if selected == "by name" else Best(split.metrics[0])
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+    tracker = LocalTracker(str(tmp_path / "tracked"))
+    checkpoints = Checkpoints(str(tmp_path / "run"), keep=Keep(latest=1))
+    rollout = ControlRollout(objective, Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 16),
+                             unroll_length=8, epochs=2, minibatches=2)
+    Trainer(objective, optax.adam(3e-2), key=jax.random.key(5), rollout=rollout, tracker=tracker,
+            checkpoints=checkpoints).fit(data, steps=8, log_every=2, validation={"flight": suite},
+                                         best=best, checkpoint_every=2)
+    returns = {step: scalars["flight/return"] for step, scalars in tracker.scalars()
+               if "flight/return" in scalars}
+    flown_names = {name for _, scalars in tracker.scalars() for name in scalars if name.startswith("flight/")}
+    tracker.close()
+    checkpoints.wait()
+    assert sorted(returns) == [2, 4, 6, 8]
+    assert returns[checkpoints.best] == max(returns.values())
+    assert flown_names == ({"flight/return"} if asked else {f"flight/{name}" for name in SHOWN})
+
+
+def test_a_pool_is_refused_a_rollout_that_checkpoints_its_state_as_its_run_starts(tmp_path):
+    """A trainer over a rollout that checkpoints the state it carries, made from an integer seed before
+    its process joins a pool (made without opening JAX's backend, which a pool forms only before), is
+    refused as its fit starts, before it restores or steps, on every process of a pool of two, and
+    trains on a pool of one; a pool of two placing the one's checkpointed run is refused it too, before
+    its rollout restores: each process holds its own environments, a checkpoint the pool's tree."""
+    from pathlib import Path
+
+    from process_support import run_pool
+
+    script = Path(__file__).with_name("rollout_state_worker.py")
+    pooled = run_pool("fitted", tmp_path / "two", 2, script=script, devices=1, timeout=300)
+    alone = run_pool("fitted", tmp_path / "one", 1, script=script, devices=1, timeout=300)
+    assert pooled == [{"processes": 2, "refused": "ValueError"}] * 2
+    assert alone == [{"processes": 1, "refused": None}]
+    # The one process's run, its rollout's state checkpointed, placed by a pool of two: refused the
+    # rollout that would restore that state, where a trainer whose rollout keeps none places it.
+    placed = run_pool("placed", tmp_path / "one", 2, script=script, devices=1, timeout=300)
+    assert placed == [{"processes": 2, "refused": {"stateful": "ValueError", "stateless": None}}] * 2
+
+
+def test_a_pools_split_scored_by_its_episodes_agrees_and_fails_together(tmp_path):
+    """A pool of two evaluates a split scored by its episodes as one: every process reports process 0's
+    scores and one event key; a scorer that fails on one process alone, or reports there fewer scores than
+    its split declares, fails the evaluation on both, that process raising its own error and its peer a
+    `PeerFailure`, rather than leaving the peer waiting."""
+    from pathlib import Path
+
+    from process_support import run_pool
+
+    reports = run_pool("flown", tmp_path, 2, script=Path(__file__).with_name("rollout_state_worker.py"),
+                       devices=1, timeout=300)
+    assert reports[0]["scores"] == reports[1]["scores"] and set(reports[0]["scores"]) == {"flight/return",
+                                                                                          "flight/steps"}
+    assert reports[0]["event"] == reports[1]["event"]
+    peer, failing = (report["failed"] for report in reports)
+    assert peer == {"raising": "PeerFailure", "incomplete": "PeerFailure"}
+    assert failing == {"raising": "RuntimeError", "incomplete": "ValueError"}
+

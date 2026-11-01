@@ -191,8 +191,8 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     from dew.nn.kernels.generation import assumed
 
     with assumed("cpu"):
-        traced = jax.jit(function).trace(*arguments, **keywords)
-    return _program_flops(traced.jaxpr)
+        traced = jax.make_jaxpr(function)(*arguments, **keywords)
+    return _program_flops(traced)
 
 
 def _program_flops(program: jaxpr_core.Jaxpr) -> float:

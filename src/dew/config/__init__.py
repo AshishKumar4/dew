@@ -67,6 +67,7 @@ from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
+    Configured,
     ModelConfig,
     Registered,
     declared_type,
@@ -89,7 +90,7 @@ from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_s
 from dew.training.cooldown import Cooldowns
 from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
-from dew.training.evaluation import EvalSuite, Summary
+from dew.training.evaluation import EvalSuite, Split, Summary
 from dew.training.inspection import Inspection
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
@@ -172,7 +173,8 @@ def _metric_class(name: str) -> type:
     return member
 
 
-def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
+def _member_flags(member: type | Callable[..., Configured],
+                  given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
     """A dataclass of `member`'s own fields, one flag each, defaulting to
     `given` over the member's defaults, and the value each flag starts at.
 
@@ -881,7 +883,7 @@ class Prepared[LossT, EffectsT]:
     metrics: Sequence[Metric] = ()
     rollout: Rollout | None = None
     summary: Mapping[str, object] | None = None
-    validation: Dataset | Mapping[str, Dataset | Reader] | None = None
+    validation: Dataset | Mapping[str, Dataset | Split] | None = None
     after: Callable[[TrainState, str], None] | None = None
 
     def train(self, name: str) -> TrainState:
@@ -1203,8 +1205,8 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
         if not (dataclasses.is_dataclass(held) and group in _names(held)):
             raise KeyError(f"{path} names no group of the run record")
         held = getattr(held, group)
-    if isinstance(held, ModelConfig | ObjectiveConfig) and field not in _names(held):
-        member = models[held.name] if isinstance(held, ModelConfig) else objectives[held.name]
+    if isinstance(held, Registered) and field not in _names(held):
+        member = held.member
         # A flag's annotation types the value, as `--model.<field>` reads it;
         # an argument without a flag (the loss a `Supervised` is given) takes JSON.
         annotation = declared_type(_member_flags(member, held.fields)[0], field)
@@ -1637,7 +1639,7 @@ class RunConfig:
         `validates`: what each split scores where `val_metrics` names none (`suites`)."""
         return tuple(self.metric(config) for config in self.default_metrics(validates=validates))
 
-    def suites(self, dataset: Loader, validation: Mapping[str, Reader] | None, metrics: Sequence[Metric] = (),
+    def suites(self, dataset: Loader, validation: Mapping[str, Split] | None, metrics: Sequence[Metric] = (),
                ) -> Mapping[str, EvalSuite] | None:
         """Each split the run validates, `validation`'s or `dataset.val` as `val`, with the metrics
         `val_metrics` names for it built (`metric`), else the kind's own `metrics`, at its cadence in
@@ -1667,9 +1669,9 @@ class RunConfig:
                              "preset (dew.data.presets), in Python or in run.json")
         return self.data
 
-    def compiled(self, objective: ObjectiveData, dataset: Dataset | Loader,
-                 validation: Dataset | Mapping[str, Dataset | Reader] | None,
-                 ) -> tuple[Loader, Mapping[str, Reader] | None]:
+    def compiled[Entry: Split](self, objective: ObjectiveData, dataset: Dataset | Loader,
+                               validation: Dataset | Mapping[str, Dataset | Entry] | None,
+                               ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
         stages and `data_seed`, the training read bounded to `trainer.examples` where the run counts
         them, so its length is read off the loader this returns."""
@@ -1795,8 +1797,8 @@ class RunConfig:
                              "with them before anything calls JAX")
 
     def readied(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader,
-                validation: Dataset | Mapping[str, Dataset | Reader] | None, metrics: Sequence[Metric],
-                name: str) -> tuple[Self, Loader, Mapping[str, Reader] | None, Mapping[str, EvalSuite] | None,
+                validation: Dataset | Mapping[str, Dataset | Split] | None, metrics: Sequence[Metric],
+                name: str) -> tuple[Self, Loader, Mapping[str, Split] | None, Mapping[str, EvalSuite] | None,
                                     int | None]:
         """This run as it trains `objective` under `name`, and what it trains on, before anything is
         placed (`train`, `viewed`): its data compiled with the objective's own stages and its validation
@@ -1819,7 +1821,7 @@ class RunConfig:
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
-              validation: Dataset | Mapping[str, Dataset | Reader] | None = None,
+              validation: Dataset | Mapping[str, Dataset | Split] | None = None,
               after: Callable[[TrainState, str], None] | None = None) -> TrainState:
         """Train `objective` on `dataset` as this config describes; every kind of run calls this after
         building both.
@@ -1945,7 +1947,7 @@ class RunConfig:
 
     def viewed(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
                rollout: Rollout | None = None,
-               validation: Dataset | Mapping[str, Dataset | Reader] | None = None) -> dict[str, float]:
+               validation: Dataset | Mapping[str, Dataset | Split] | None = None) -> dict[str, float]:
         """The run's inspection of one sampled update over the batch its first step takes
         (`dew.training.inspected`, `first_step_batch`), the run readied as `train` readies it
         (`readied`) and its trainer built as `train` builds it, from the checkpoints its directory `name`

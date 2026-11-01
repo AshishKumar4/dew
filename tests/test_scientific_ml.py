@@ -8,6 +8,7 @@ not, each on par with NumPy's solve of the same normal equations, and the traine
 A float64 run keeps float64 through its parameters, optimizer state, loss and checkpoints.
 """
 
+import dataclasses
 import json
 
 import jax
@@ -231,6 +232,100 @@ def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named
     label = f"grouped gauss-newton {named}"
     assert_as_exact(grouped, numpy, draw, label, truth_fn=exact,
                     seeds=seeds_for(numpy, draw, label, truth_fn=exact, dew_fn=grouped))
+
+
+@pytest.mark.parametrize("clip", [0.0, 0.05])
+def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_step(clip, tmp_path):
+    """A run whose command line names Gauss-Newton by its import path and its damping 1e-3, setting no
+    learning rate: its rate is Gauss-Newton's own, the whole step (1.0, recorded as the config's), so its
+    optimizer steps the damped solve's step from zero, on par with NumPy's float32 solve from its float64
+    solve (check 1), with `clip_grads` set that step capped to the clip's norm; and the run's own path
+    (`RunConfig.train`) trains the least-squares objective one step with it (rows 3359, 3360)."""
+    from dew.config import RunConfig, TrainerConfig
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.gauss_newton import solves_equations
+
+    flags = ["--optim.optimizer", "dew.gauss_newton:gauss_newton", "--optim.optimizer-opts",
+             json.dumps({"damping": 1e-3}), "--optim.clip-grads", str(clip)]
+    trainer = TrainerConfig(steps=1, checkpoint_final=False, checkpoint_dir=str(tmp_path), eval_every=None,
+                            checkpoint_every=None)
+    config = dataclasses.replace(RunConfig.cli(flags), trainer=trainer)
+    assert config.optim.learning_rate == 1.0
+    rows, features = 64, 8
+    draw = least_squares_draw(rows, features, 0x6E)
+
+    def capped(step):
+        norm = np.linalg.norm(step)
+        return step if not clip or norm <= clip else step * (clip / norm)
+
+    numpy = as_given(lambda x, y: capped(-solved(x, y, 1e-3)).astype(x.dtype))
+    exact = as_given(lambda x, y: capped(-solved(x.astype(np.float64), y.astype(np.float64), 1e-3)))
+    configured = gauss_newton_arm(rows, features, 1, config.optim.build(1))
+    label = f"configured whole gauss-newton step clip {clip}"
+    assert_as_exact(configured, numpy, draw, label, truth_fn=exact,
+                    seeds=seeds_for(numpy, draw, label, truth_fn=exact, dew_fn=configured))
+    x, y = draw(0)
+    state = config.train(LeastSquares(features), Pipeline(Memory({"x": x, "y": y})).batch(rows), name="run")
+    assert int(state.updates) == 1 and solves_equations(state.opt_state)
+
+
+@pytest.mark.parametrize("groups", [False, True])
+def test_a_gauss_newton_cap_its_options_state_holds_in_param_groups_as_without(groups):
+    """Gauss-Newton capped by its own option (`optimizer_opts={"clip": 0.05}`, `clip_grads` unset), under one
+    param group that claims every parameter or under none: the unit system's whole step of 1 capped to
+    0.05, the same either way (row 3360's review)."""
+    from dew.gauss_newton import NormalEquations
+    from dew.optim import OptimConfig, ParamGroup
+
+    grouped = (ParamGroup("all", ("*",)),) if groups else ()
+    config = OptimConfig(optimizer="gauss_newton", learning_rate=1.0,
+                         optimizer_opts={"clip": 0.05}, param_groups=grouped)
+    solver = config.build(1)
+    params = {"w": jnp.zeros((1,), jnp.float32)}
+    system = NormalEquations(total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(1),
+                             pulled=jnp.asarray([1.0], jnp.float32),
+                             normal=jnp.asarray([[1.0]], jnp.float32), update=1)
+    update, _ = solver.update(params, solver.init(params), params, statistics=system)
+    np.testing.assert_array_equal(np.asarray(update["w"]), np.asarray([-0.05], np.float32))
+
+
+def test_a_capped_gauss_newton_direction_keeps_a_cap_far_below_its_norm():
+    """A float32 solved direction of norm 1e18 capped at 1e-30 (`solved_directions(clip=)`) is the
+    direction scaled to that cap, as Optax's global-norm clip scales a gradient, not a zero underflowed
+    from the cap over the norm (row 3360's review)."""
+    from dew.gauss_newton import NormalEquations, solved_directions
+
+    capped = solved_directions(0.0, clip=1e-30)
+    params = {"w": jnp.zeros((1,), jnp.float32)}
+    system = NormalEquations(total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(1),
+                             pulled=jnp.asarray([1e18], jnp.float32),
+                             normal=jnp.asarray([[1.0]], jnp.float32), update=1)
+    direction, _ = capped.update(params, capped.init(params), params, statistics=system)
+    np.testing.assert_array_equal(np.asarray(direction["w"]), np.asarray([1e-30], np.float32))
+
+
+@pytest.mark.parametrize("clip", [0.0, 0.05])
+@pytest.mark.parametrize("groups", [False, True])
+def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before_it(clip, groups):
+    """A configured Gauss-Newton optimizer's state, clipped or not, in param groups or not, holds the tree
+    the optimizer a run saved before its clip took effect held (the rate injected around the whole update,
+    a clip chained before it), so such a run's checkpoint restores onto it (row 3360's review)."""
+    from dew.gauss_newton import solved_directions
+    from dew.optim import OptimConfig, ParamGroup, _rate_only, param_labels, scheduled_solver
+
+    params = LeastSquares(8, bias=True).init(jax.random.key(0))["params"]
+    grouped = (ParamGroup("kernels", ("*kernel",)), ParamGroup("rest", ("*",))) if groups else ()
+    config = OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": 1e-3}, clip_grads=clip,
+                         param_groups=grouped)
+    if groups:
+        solvers = {group.name: group.solver(_rate_only, 1.0, 1, {}) for group in grouped}
+        earlier = optax.chain(solved_directions(1e-3), optax.multi_transform(solvers, param_labels(grouped)))
+    else:
+        earlier = scheduled_solver(gauss_newton, 1.0, 1, {"damping": 1e-3})
+    if clip:
+        earlier = optax.chain(optax.clip_by_global_norm(clip), earlier)
+    assert jax.tree.structure(config.build(1).init(params)) == jax.tree.structure(earlier.init(params))
 
 
 def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():

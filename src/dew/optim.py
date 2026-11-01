@@ -2199,8 +2199,10 @@ def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
     def number(value) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
 
-    def read(given: list[str]) -> float | ScheduleBase:
+    def read(given: list[str]) -> float | ScheduleBase | None:
         value = json.loads(given[0])
+        if value is None:
+            return None
         if number(value):
             return float(value)
         built = from_record(annotation, value, dtypes=False)
@@ -2210,8 +2212,17 @@ def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
 
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1, metavar="RATE|JSON", instance_from_str=read,
-        is_instance=lambda given: number(given) or isinstance(given, ScheduleBase),
-        str_from_instance=lambda given: [json.dumps(to_record(given, annotation))])
+        is_instance=lambda given: given is None or number(given) or isinstance(given, ScheduleBase),
+        str_from_instance=lambda given: [json.dumps(
+            None if given is None else to_record(given, annotation))])
+
+
+DEFAULT_RATE = 2.7e-4
+"""The learning rate a config that sets none takes for a first-order optimizer
+(`OptimConfig.learning_rate`)."""
+
+OWN_RATES: dict[Callable[..., optax.GradientTransformation], float] = {gauss_newton: 1.0}
+"""An optimizer's own rate where it has one other than `DEFAULT_RATE`: Gauss-Newton's whole step."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2225,8 +2236,10 @@ class OptimConfig:
     on an Optax transformation records the same optimizer it ran. The decay spares biases and norm
     scales for a factory that takes a `mask`."""
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
-    learning_rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
-    """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
+    learning_rate: Annotated[float | ScheduleSpec | None, _rate_argument()] = None
+    """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`); unset,
+    the optimizer's own (`OWN_RATES`: Gauss-Newton's whole step, 1.0, the rest's 2.7e-4), which the config
+    then records.
 
     The kinds are cosine, power (lm-engine's power law with an optional linear
     tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
@@ -2285,13 +2298,25 @@ class OptimConfig:
     Empty keeps none.
     """
 
+    @property
+    def rate(self) -> float | ScheduleBase:
+        """Its learning rate, the optimizer's own where it set none (`__post_init__`)."""
+        assert self.learning_rate is not None, "a config resolves its rate as it is made"
+        return self.learning_rate
+
+    def __post_init__(self):
+        if self.learning_rate is None:
+            # Unset, the rate is the optimizer's own, recorded as the config's.
+            own = OWN_RATES.get(optimizers[self.optimizer], DEFAULT_RATE)
+            object.__setattr__(self, 'learning_rate', own)
+
     def schedules(self) -> list[tuple[str, ScheduleBase]]:
         """The schedules its solvers run, by where the config holds them: its learning rate's, or each
         param group's rate (`ParamGroup.rate`, the config's own where the group names none) and b1."""
-        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
+        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.rate)]
         for group in self.param_groups:
             rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
-            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
+            held += [(rate, group.rate(self.rate)), (f"param_groups.{group.name}.b1", group.b1)]
         return [(name, schedule) for name, schedule in held if isinstance(schedule, ScheduleBase)]
 
     def reads_progress(self) -> bool:
@@ -2352,13 +2377,17 @@ class OptimConfig:
         elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
             # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
-        # Gauss-Newton's one solve spans every parameter: each group scales its leaves of its direction.
+        # Gauss-Newton solves its own direction, which it caps at `clip_grads` (the gradient it is handed
+        # it never reads): one solve over every parameter, each param group's rate its leaves of it.
         solved = None
-        if self.param_groups and make is gauss_newton:
-            damping = opts.pop('damping', 0.0)
-            if not isinstance(damping, int | float):
-                raise ValueError(f"Gauss-Newton's damping is a number, got {damping!r}")
-            solved, make = solved_directions(float(damping)), _rate_only
+        if make is gauss_newton and self.clip_grads > 0:
+            opts['clip'] = self.clip_grads
+        if make is gauss_newton and self.param_groups:
+            damping, clip = opts.pop('damping', 0.0), opts.pop('clip', None)
+            if not isinstance(damping, int | float) or not (clip is None or isinstance(clip, int | float)):
+                raise ValueError(f"Gauss-Newton's damping and clip are numbers, got {damping!r} and {clip!r}")
+            solved = solved_directions(float(damping), None if clip is None else float(clip))
+            make = _rate_only
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
@@ -2372,7 +2401,7 @@ class OptimConfig:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
                 grouped = {**opts, **decay}
                 spared = {'mask': weight_decay_mask} if group.spared and self._spares(make) else {}
-                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared},
+                solvers[group.name] = group.solver(make, self.rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
             if solved is not None:
@@ -2380,7 +2409,7 @@ class OptimConfig:
         else:
             if self.spared and self._spares(make):
                 opts['mask'] = weight_decay_mask
-            solver = scheduled_solver(make, self.learning_rate, steps, opts, clocked=clocked)
+            solver = scheduled_solver(make, self.rate, steps, opts, clocked=clocked)
 
         if self.clip_grads > 0:
             solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
@@ -2402,7 +2431,7 @@ class OptimConfig:
         modules at `FRESH_LEARNING_RATE` at the peak of this config's schedule, on its shape (its rate
         times their quotient), or at its own where that is higher, and every other parameter at its own,
         each sparing what the ungrouped decay spares (`ParamGroup.spared`)."""
-        rate = self.learning_rate
+        rate = self.rate
         peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
         multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
         # The groups a run takes in place of none decay as its ungrouped optimizer would.
@@ -2433,8 +2462,8 @@ class OptimConfig:
         them over its checkpoint's (`with_rates`), so the configured
         rate is the one it steps at."""
         if not self.param_groups:
-            return {None: rates_of(self.learning_rate)}
-        return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
+            return {None: rates_of(self.rate)}
+        return {group.name: group.rates(self.rate) for group in self.param_groups}
 
 
 __all__ = ["BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",

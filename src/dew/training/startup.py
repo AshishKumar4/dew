@@ -12,11 +12,11 @@ from collections.abc import Iterator, Mapping
 from typing import Protocol
 
 from dew.data.compile import Handed, fitted
-from dew.data.dataset import Loader, Reader
+from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.telemetry.instrumentation import count_compilation_cache
 from dew.training.budget import run_length, run_steps, run_tokens
-from dew.training.evaluation import EvalSuite
+from dew.training.evaluation import EvalSuite, Split
 from dew.training.runtime import ready_process
 
 _log = logging.getLogger(__name__)
@@ -68,10 +68,10 @@ class DataObjective(Protocol):
 
 
 def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
-             validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None, *,
+             validation: Dataset | Mapping[str, Dataset | Split | EvalSuite] | None, *,
              steps: int | None, epochs: int | None, tokens: int | None, examples: int | None,
              accumulation: int, startup: Startup,
-             ) -> tuple[Loader, Mapping[str, Reader | EvalSuite] | None, int | None, int | None]:
+             ) -> tuple[Loader, Mapping[str, Split | EvalSuite] | None, int | None, int | None]:
     """A fit's data and its length: its length named once (`run_length`), the process readied, the data
     and its validation compiled with the objective's steps (`fitted`), its token budget and its
     microsteps (`run_tokens`, `run_steps`), each long phase reported (`Startup`)."""

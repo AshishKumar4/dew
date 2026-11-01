@@ -19,6 +19,7 @@ import numpy as np
 import optax
 import pytest
 from episode_support import environment as sandbox
+from recording import bits
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader, replayed, tapped
@@ -253,14 +254,8 @@ class Recording(RolloutScheduler):
         if not self.calls:
             self.before_first()
         packed = super().__call__(state, batch, key)
-        self.calls.append((leaves(state), np.asarray(batch["task_id"]), packed))
+        self.calls.append((bits(state), np.asarray(batch["task_id"]), packed))
         return packed
-
-
-def leaves(state):
-    """Every leaf of a training state on the host, a key as its words."""
-    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-            for leaf in jax.tree.leaves(state)]
 
 
 ESCAPE_SECONDS = 300
@@ -399,7 +394,7 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
     [(_, trained, packed), (restored, again, repacked)] = recording.calls
     # The resumed call starts from the first fit's whole state, key and counters included, and
     # trains the second batch.
-    for got, want in zip(restored, leaves(first), strict=True):
+    for got, want in zip(restored, bits(first), strict=True):
         np.testing.assert_array_equal(got, want)
     np.testing.assert_array_equal(trained, np.arange(tasks))
     np.testing.assert_array_equal(again, np.arange(tasks, 2 * tasks))

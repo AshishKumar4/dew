@@ -578,9 +578,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     """Every instruction of the module in `text` (`compiled.as_text()`, or an XLA
     dump's after-optimizations HLO, whole or as its lines) by name, read by the
     parser the FLOP count reads (`hlo_flops`). Each computation's body is
-    gathered once, so the fusions that call one share its sets. The
-    communicators Dew keeps are read through it, under a digest of its code
-    (`dew.communicators.READER`)."""
+    gathered once, so the fusions that call one share its sets."""
     computations, entry = _parse(text)
     weights = {} if entry is None else _weights(computations, entry)
     bodies: dict[str, tuple[frozenset[str], frozenset[str], float]] = {}
