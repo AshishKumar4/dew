@@ -8,6 +8,7 @@ import sys
 
 
 def main() -> None:
+    started_coverage()
     cpu, memory, parent = (int(value) for value in sys.argv[1:4])
     command = sys.argv[4:]
     resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
@@ -25,10 +26,18 @@ def main() -> None:
     os.execvpe(command[0], command, os.environ)
 
 
+def started_coverage() -> None:
+    """Where the parent is measured (`launched` passes its coverage startup on), this launcher is measured
+    too: `-I` reads no startup of its own."""
+    if "COVERAGE_PROCESS_START" in os.environ or "COVERAGE_PROCESS_CONFIG" in os.environ:
+        import coverage
+
+        coverage.process_startup()
+
+
 def saved_coverage() -> None:
-    """Where the parent is measured, coverage's startup measures this launcher too (site's coverage `.pth`
-    reads the variables `launched` passes on); an exec replaces the process without its exit, where coverage
-    saves, so its data is saved first."""
+    """A measured launcher's data saved before the exec replaces the process: an exec skips the exit, where
+    coverage saves."""
     measured = sys.modules.get("coverage")
     current = None if measured is None else measured.Coverage.current()
     if current is not None:

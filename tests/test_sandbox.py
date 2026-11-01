@@ -1,5 +1,6 @@
 """SubprocessEnvironment: real workers, real limits, real cleanup."""
 
+import inspect
 import json
 import os
 import signal
@@ -67,9 +68,10 @@ def test_a_measured_parent_measures_the_launcher_it_starts(tmp_path, monkeypatch
         assert process.wait(timeout=60) == 0
     combined = coverage.Coverage(data_file=str(tmp_path / "combined"))
     combined.combine([str(tmp_path)])
-    measured = combined.get_data().lines(_sandbox_exec.__file__) or []
-    started = _sandbox_exec.main.__code__.co_firstlineno
-    assert started + 1 in measured
+    measured = set(combined.get_data().lines(_sandbox_exec.__file__) or ())
+    body, first = inspect.getsourcelines(_sandbox_exec.main)
+    # Coverage starts in main's first statement, so its later statements are what it measured.
+    assert measured & set(range(first + 2, first + len(body)))
 
 
 def test_parent_death_kills_the_worker(tmp_path):
