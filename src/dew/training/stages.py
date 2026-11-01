@@ -68,14 +68,27 @@ def _walked(tree, sites: Sequence[DecoderBank], convert: Callable[[DecoderBank, 
     """`tree` with every mapping that holds a site's run converted by `convert(site, where, node)`: a
     variables tree's collection's subtree at the site's namespace, and a mirror's of the parameters
     (an optimizer's moment, an accumulated gradient) whose root is the first mapping its containers
-    reach. `path` is the node's dict keys from that first mapping."""
+    reach. `path` is the node's keys from that first mapping. Every other mapping keeps its own kind
+    (an optimizer's record that is a mapping of its own, a `FrozenDict`), rebuilt from its pytree
+    definition, as the step that reads it takes it."""
     if not isinstance(tree, Mapping):
         return jax.tree.map(lambda node: _walked(node, sites, convert) if isinstance(node, Mapping) else node,
                             tree, is_leaf=lambda node: isinstance(node, Mapping))
     for site in sites:
         if site.namespace in (path, path[1:]) and site.view.holds(tree):
             return convert(site, "/".join(path), tree)
-    return {key: _walked(value, sites, convert, (*path, key)) for key, value in tree.items()}
+    children, definition = jax.tree_util.tree_flatten_with_path(tree, is_leaf=lambda node: node is not tree)
+    if definition.num_leaves == 1 and children[0][1] is tree:
+        return tree
+    return definition.unflatten([_walked(child, sites, convert, (*path, _key(where)))
+                                 for where, child in children])
+
+
+def _key(where: tuple) -> str:
+    """The name of a mapping's child from its one-step key path (`jax.tree_util.DictKey`'s key, or a
+    record's field)."""
+    (step,) = where
+    return str(getattr(step, "key", getattr(step, "name", step)))
 
 
 def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
