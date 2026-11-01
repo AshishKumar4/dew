@@ -205,6 +205,8 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
     from reference_error import chain_roundings, widened
     from test_recurrence_chunk import chunk_on, token_by_token
 
+    from dew.nn.kernels.selection import KernelRefused
+
     version, device = worker.start().split(maxsplit=1)
     requests = tempfile.mkdtemp(prefix="fla-")
     stored = {}
@@ -237,10 +239,16 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
             functools.partial(chunk_on, 'xla', hooks), arrays, leaves), site.hooks, leaves=site.leaves)
         if site.paired:
             # Sized paired with the template's own arm, no proxy planning it: the site's errors are
-            # heavy-tailed across draws alike in both arms, which no count of either alone resolves.
+            # heavy-tailed across draws alike in both arms, which no count of either alone resolves. Where
+            # the template refuses the call its test skips the site, which no recording then serves.
             dew = jax.jit(functools.partial(lambda hooks, arrays, leaves: ruled(
                 functools.partial(chunk_on, 'mosaic_gpu', hooks), arrays, leaves), site.hooks,
                 leaves=site.leaves))
+            try:
+                dew(sample)
+            except KernelRefused as refused:
+                print(f"{name}: not recorded, the template refuses it ({refused})", flush=True)
+                continue
             stored.update(record_case(name, site.arrays, evaluate, store_inputs=False, summary=True, dew=dew))
         else:
             stored.update(record_case(name, site.arrays, evaluate, portable, truth_proxy=exact_run,
