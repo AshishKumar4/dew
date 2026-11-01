@@ -19,7 +19,7 @@ from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import mosaic_sm90, product, resources
+from dew.nn.kernels.templates import mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, mosaic_tpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -710,6 +710,32 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw, "dense depth 96",
                         seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "traced"])
+@pytest.mark.parametrize("minor_dim", [0, 1])
+@pytest.mark.parametrize(("major", "minor", "width"),
+                         [(3, 45, 16), (8, 48, 16), (1, 5, 4), (5, 7, 1), (4, 3, 8)])
+def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width, minor_dim, dynamic):
+    """The persistent walk's tile order (`tail.planar_snake`), jitted, its grid's sides static or traced:
+    the minor dimension in bands `width` tiles wide (a last one narrower), each band a line at a time along
+    the major dimension, every other band's major order reversed; full bands of a power-of-two width and of
+    another, a last band partial or none."""
+    shape = (minor, major) if minor_dim == 0 else (major, minor)
+    expected = []
+    for band in range(-(-minor // width)):
+        for line in range(major):
+            along = line if band % 2 == 0 else major - 1 - line
+            for offset in range(min(width, minor - band * width)):
+                across = band * width + offset
+                expected.append((across, along) if minor_dim == 0 else (along, across))
+
+    def walked(indices, first, second):
+        grid = (first, second) if dynamic else shape
+        return jax.vmap(lambda index: tail.planar_snake(index, grid, minor_dim, width))(indices)
+
+    walk = jax.jit(walked)(jnp.arange(major * minor, dtype=jnp.int32), *shape)
+    np.testing.assert_array_equal(np.stack(walk, axis=1), np.asarray(expected))
 
 
 @runs("sm90")

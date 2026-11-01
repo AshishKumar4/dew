@@ -21,7 +21,8 @@ from jax.extend import core as jcore
 
 from dew.nn.precision import PROTECTED
 
-BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "rem", "nextafter"})
+BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "rem", "nextafter", "and",
+                    "or", "xor"})
 UNARY = frozenset({"neg", "exp", "exp2", "log", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign", "tanh",
                    "logistic", "integer_pow", "square", "sin", "cos", "erf", "erf_inv", "floor", "ceil",
                    "round", "is_finite", "not"})
@@ -68,6 +69,26 @@ class Term(Expr):
 
     @method(cost=1)
     def dot(self, other: Term, params: i64Like) -> Term: ...
+
+    # The derivation's (`dew.algebra.derive`, §6.9): a walked reduction's value over the tiles before the one
+    # a form reads (`state`, by the reduction's index, one side's of a merge), and a value as a step, a merge,
+    # a finish or a carried state reads it (`stepped`, `merged`, `finished`, `held`), each rewritten into the
+    # language by the derivation's rules and never extracted itself.
+
+    @classmethod
+    def state(cls, index: i64Like, side: i64Like) -> Term: ...
+
+    @method(cost=1)
+    def held(self, side: i64Like) -> Term: ...
+
+    @method(cost=1)
+    def stepped(self) -> Term: ...
+
+    @method(cost=1)
+    def merged(self) -> Term: ...
+
+    @method(cost=1)
+    def finished(self) -> Term: ...
 
 
 @dataclasses.dataclass
@@ -199,7 +220,8 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     """The primitives a stable rule writes where the program held none (`rules.stock`), each at the
     parameters JAX binds it with by default, read from JAX's own trace of them."""
     scalar = jnp.ones((), jnp.float32)
-    traced = jax.make_jaxpr(lambda a: (a / a, a - a, jnp.exp(a), jnp.log1p(a), jnp.expm1(a)))(scalar)
+    traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
+                                       jnp.log1p(a), jnp.expm1(a)))(scalar)
     return {equation.primitive.name: (equation.primitive, dict(equation.params))
             for equation in traced.jaxpr.eqns}
 
@@ -222,7 +244,7 @@ def form_value(region_: Region, form: Term, values: list) -> jax.Array:
     def value(term: Term) -> jax.Array:
         key = str(term)
         if key not in known:
-            known[key] = _value(term, value, region_, values)
+            known[key] = value_of(term, value, region_, values)
         return known[key]
 
     return value(form)
@@ -270,7 +292,7 @@ def _index(argument) -> int:
     return int(get_literal_value(argument))
 
 
-def _value(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: list) -> jax.Array:
+def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: list) -> jax.Array:
     """One term's value, its operands' from `value`."""
     if (args := get_callable_args(term, Term.leaf)) is not None:
         return leaves[_index(args[0])]

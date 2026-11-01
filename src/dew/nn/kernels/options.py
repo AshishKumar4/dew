@@ -304,10 +304,9 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     (its static arguments, the arguments it donates, its placements, a tree of formats among them),
     compiled through the kernel templates' reports (`OuterProgram`): one program for each function,
     options and arguments, which every call with the same reuses, so a quantized model and another never
-    share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's or
-    a load's, but two that own their programs' lifetime: an objective's (`Objective.program`), which its
-    cache keeps as long as the objective, and the serving kernel's step programs, which donate the cache
-    they step (`dew.inference.serving_kernel.decode_programs`)."""
+    share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's, a
+    load's or a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
+    `step`), but an objective's (`Objective.program`), which its cache keeps as long as the objective."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
