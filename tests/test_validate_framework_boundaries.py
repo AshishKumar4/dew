@@ -89,12 +89,15 @@ def test_mesh_assignment_specializes_the_executable(mesh_key, static):
         pytest.fail(result.stdout + result.stderr, pytrace=False)
 
 
-@pytest.mark.parametrize("mode", ["flat-original-red", "flat-boxed-control-green", "headed-control-green"])
+@pytest.mark.parametrize("mode", ["flat-original-red", "flat-boxed-control-green", "flat-renamed-control-green",
+                                  "headed-control-green"])
 def test_normal_attention_muon_initialization(mode):
-    """Only the parameter-local axis declarations change between the flat red/green arms."""
+    """Keep the flat layout, but correct its axis metadata or remove the suffix match in controls."""
     flat = mode != "headed-control-green"
-    model = NormalAttention(query_dim=8, heads=2, dim_head=4, flat=flat, attention_impl="xla")
-    params = model.init(jax.random.key(0), jnp.zeros((1, 2, 8), jnp.float32))["params"]
+    names = ({"names": ("audit_q", "audit_k", "audit_v", "audit_out")}
+             if mode == "flat-renamed-control-green" else {})
+    model = NormalAttention(query_dim=12, heads=2, dim_head=4, flat=flat, attention_impl="xla", **names)
+    params = model.init(jax.random.key(0), jnp.zeros((1, 2, 12), jnp.float32))["params"]
     declared = declarations(params)
     before = {"/".join(parameter_path(path)): {"shape": leaf.shape,
                                              "axes": declared_axes(path, leaf.ndim, declared)}
