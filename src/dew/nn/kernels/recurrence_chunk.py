@@ -577,7 +577,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
                                      floor=hooks.floor, bound=hooks.inverse_bound, rounded=fast_rounding())
             if kernel == 'derived':
-                return derived_rule(query, key, value, g, beta, state, scale=scale, delta=hooks.delta,
+                return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
                                     chunk_size=chunk_size, dtype=work)
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
@@ -750,15 +750,12 @@ MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
 DERIVED_SUPPORTS: tuple[Requirement[PortCase], ...] = (
-    Requirement('documents', lambda case: not case.packed,
-                "packed documents, whose resets the derived forms hold none of (`derived_rule`)",
-                row=INHERENT),
     Requirement('measured', lambda case: False,
                 "the forms derived from the token update (`derived_rule`), taken where a call names them: "
                 "held on par with the portable math by check 1 and not yet measured against it",
                 row=INHERENT, kind='measured'),
 )
-"""Where the derived forms run (`derived_rule`): a call that names them, of no packed documents."""
+"""Where the derived forms run (`derived_rule`): a call that names them."""
 
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
                                (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('derived', DERIVED_SUPPORTS),
@@ -770,15 +767,15 @@ recurrence template at its derived tiles, else the port on any GPU Dew's Triton 
 portable math; the forms derived from the token update (`derived_rule`) where a call names them."""
 
 
-def derived_rule(query, key, value, g, beta, state=None, *, scale: float, delta: bool, chunk_size: int,
-                 dtype):
+def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,
+                 chunk_size: int, dtype):
     """The recurrence over chunks by the forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written): each value head's update `h = D h - beta k (k^T D h) + beta
     k v^T` with the delta rule (`recurrence.update`'s), `h = D h + beta k v^T` without it, `D = exp(g)` a
     head's or each key's own, read `scale q^T h`; `(output, final memory)` in `dtype`, the memory entering
     `state` (zero where None). A length off the chunk grid is padded with tokens that leave the memory as it
-    was (zero keys and write gates, a unit decay). Packed documents it does not take (no reset in its forms:
-    `GATED_DELTA`'s 'documents')."""
+    was (zero keys and write gates, a unit decay). `starts` `[B, S]`, where given, marks packed documents'
+    first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`)."""
     from dew.algebra import scan
 
     group = value.shape[2] // key.shape[2]
@@ -800,17 +797,24 @@ def derived_rule(query, key, value, g, beta, state=None, *, scale: float, delta:
 
     axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
-    forms = scan.derive_scan(scan.Scan(update, readout, axes, walked="time", state=((width, columns), dtype)))
+    reset = None if starts is None else "first"
+    declared = axes if reset is None else {**axes, reset: ("time",)}
+    forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
+                                       state=((width, columns), dtype), reset=reset))
     chunks = -(-length // chunk_size)
     padded = chunks * chunk_size - length
 
     def laid(x):
         # [B, S, H, ...] padded and laid out as [B, H, chunks, C, ...].
-        x = jnp.pad(x.astype(dtype), [(0, 0), (0, padded)] + [(0, 0)] * (x.ndim - 2))
+        x = jnp.pad(x, [(0, 0), (0, padded)] + [(0, 0)] * (x.ndim - 2))
         x = jnp.moveaxis(x, 2, 1)
         return x.reshape(rows, heads, chunks, chunk_size, *x.shape[3:])
 
-    operands = {"q": laid(query), "k": laid(key), "v": laid(value), "g": laid(g), "beta": laid(beta)}
+    operands = {name: laid(x.astype(dtype))
+                for name, x in zip(axes, (query, key, value, g, beta), strict=True)}
+    if reset is not None:
+        # Each head's tokens reset where their row's document starts; a padded token starts none.
+        operands[reset] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
     entering = (jnp.zeros((rows, heads, width, columns), dtype) if state is None else state.astype(dtype))
 
     def walked(operands, h):
