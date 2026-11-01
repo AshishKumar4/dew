@@ -317,8 +317,10 @@ def outputs(found: str, argv: list[str], directory: str) -> list[str] | None:
     write anywhere: none for one that only reads (uname, file, nvidia-smi, ffplay) or git's commands that
     change no repository (`GIT_READS`); else the repository git changes, the file ptxas or cc writes (`-o`,
     else any in the directory), the last argument of ffmpeg and rsync (their output); wandb's service writes
-    where its run's settings say, which its start never names."""
-    if found in ("uname", "file", "nvidia-smi", "ffplay"):
+    where its run's settings say, which its start never names. A run asking only for the tool's version or
+    help writes nothing; a repository git changes is its git directory (`.git`, hidden: no read keys it)."""
+    if found in ("uname", "file", "nvidia-smi", "ffplay") or (
+            argv[1:] and all(word in ("--version", "-V", "--help", "-h") for word in argv[1:])):
         return []
     if found == "git":
         words, at, also = argv[1:], directory, []
@@ -330,7 +332,7 @@ def outputs(found: str, argv: list[str], directory: str) -> list[str] | None:
                 also += [os.path.join(at, value)] if option in ("--git-dir", "--work-tree") else []
             elif option.startswith(("--git-dir=", "--work-tree=")):
                 also.append(os.path.join(at, option.partition("=")[2]))
-        return [] if words and words[0] in GIT_READS else [at, *also]
+        return [] if words and words[0] in GIT_READS else [os.path.join(at, ".git"), *also]
     if found in ("ptxas", "cc"):
         for index, word in enumerate(argv):
             if word in ("-o", "--output-file") and index + 1 < len(argv):
@@ -346,8 +348,8 @@ def outputs(found: str, argv: list[str], directory: str) -> list[str] | None:
 @unprobed
 def tool_writes(event: str, args: tuple) -> str | None:
     """The `WROTE` mark of a start of a program of `TOOLS` (`native`) that may write where a later file of the
-    task reads (`outputs`, not this file's own), or None: but `subprocess`'s own start beneath the Popen its
-    audit already named."""
+    task reads (`outputs`, each of which `written` marks), or None: but `subprocess`'s own start beneath the
+    Popen its audit already named."""
     if event not in ("subprocess.Popen", "os.posix_spawn", "os.exec", "os.spawn") or (
             event != "subprocess.Popen" and _beneath_popen()):
         return None
@@ -361,7 +363,7 @@ def tool_writes(event: str, args: tuple) -> str | None:
     directory = os.path.abspath(os.fsdecode(args[2])) if event == "subprocess.Popen" and args[2] is not None \
         else os.getcwd()
     paths = outputs(found, argv, directory)
-    if paths is not None and all(own(os.path.abspath(path)) for path in paths):
+    if paths is not None and all(written(os.path.abspath(path)) is None for path in paths):
         return None
     return f"{WROTE}{found} in {directory}"
 

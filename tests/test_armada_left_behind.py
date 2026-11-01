@@ -56,26 +56,31 @@ def test_a_write_to_the_home_shared_scratch_or_a_hidden_directory_leaves_it_for_
     (["git", "status", "--short"], True, False),
     (["git", "-C", "{checkout}", "log", "-1"], False, False),
     (["git", "commit", "-qm", "x"], True, True),
+    (["git", "--version"], True, False),
+    (["ptxas", "--version"], True, False),
     (["git", "-C", "{private}", "commit", "-qm", "x"], True, False),
     (["ptxas", "-arch=sm_90a", "{private}/k.ptx", "-o", "{private}/k.cubin"], True, False),
-    (["ptxas", "-arch=sm_90a", "{private}/k.ptx"], True, True),
+    (["ptxas", "-arch=sm_90a", "{private}/k.ptx"], True, False),
     (["uname", "-m"], True, False),
     (["file", "-b", "{checkout}/x"], True, False),
-    (["rsync", "-a", "{private}/a", "{checkout}/b"], False, True),
-], ids=["git-status", "git-log", "git-commit", "git-commit-private", "ptxas-out", "ptxas-cwd", "uname",
-        "file", "rsync"])
-def test_a_tool_leaves_what_it_writes_outside_the_files_own(followed, tmp_path, argv, in_checkout, leaves):
+    (["rsync", "-a", "{private}/a", "{shared}/b"], False, True),
+], ids=["git-status", "git-log", "git-commit", "git-version", "ptxas-version", "git-commit-private",
+        "ptxas-out", "ptxas-cwd", "uname", "file", "rsync"])
+def test_a_tool_leaves_what_it_writes_where_no_read_keys_it(
+        followed, tmp_path, monkeypatch, argv, in_checkout, leaves):
     """A tool a file may run and keep its key (followed.py's `TOOLS`) leaves something for a later file where
-    what it writes is not the file's own (`outputs`): git's commands that change a repository but its own
-    scratch's, ptxas's output or, with none named, its working directory, rsync's destination; uname, file
-    and git's reads leave nothing."""
+    what it writes (`outputs`) is neither the file's own nor a checkout path a read keys (`written`): git's
+    commands that change a repository (its hidden git directory) but its own scratch's, rsync's destination
+    in shared scratch; ptxas's output in the checkout or the file's scratch, uname, file, git's reads and any
+    tool's version leave nothing."""
     checkout, private = tmp_path / "checkout", tmp_path / "own" / "tmp"
     checkout.mkdir()
-    words = [word.format(checkout=checkout, private=private) for word in argv]
+    monkeypatch.setenv("DEW_EXECUTED_ROOT", str(checkout))
+    words = [word.format(checkout=checkout, private=private, shared=tmp_path / "shared") for word in argv]
     directory = str(checkout if in_checkout else private)
     paths = followed.outputs(words[0], words, directory)
     assert paths is not None
-    assert (not all(followed.own(os.path.abspath(path)) for path in paths)) is leaves
+    assert any(followed.written(os.path.abspath(path)) is not None for path in paths) is leaves
 
 
 @pytest.mark.parametrize(("event", "args"), [
@@ -126,7 +131,7 @@ def test_the_recorders_own_questions_of_a_path_are_no_runs_probes(followed, tmp_
         hooks.setattr(os, "lstat", followed.probed(os.lstat, notes.append, root))
         hooks.setattr(os, "stat", followed.probed(os.stat, notes.append, root))
         if asked == "written":
-            assert followed.written(str(tmp_path / "checkout/x")) is not None
+            assert followed.written(str(tmp_path / "checkout/.memo/x")) is not None
         elif asked == "private":
             followed.private()
         else:
