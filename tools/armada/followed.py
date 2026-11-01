@@ -193,7 +193,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
-    if digesting(sys._getframe(2)):
+    # The interpreter audits the main script's open from no frame (`sys._getframe(1)` is the audit hook's).
+    if digesting(sys._getframe(1).f_back):
         return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).

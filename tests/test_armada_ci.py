@@ -186,12 +186,13 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
                                                                "tests/test_pass.py::test_skip"}
     assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
         "tests/test_split.py::TestB::test_b"
-    # A process that dies after its report is written leaves every row it ran red, green cases included.
+    # A process that dies after its report is written leaves the file it ran red, green cases included; each
+    # file runs in a process of its own (`alone`), so its taskmate keeps its row.
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
                                                  "def test_ok(): pass\n")
     ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
-    assert {row["name"]: (row["exitCode"], row["kind"]) for row in json.loads(out.read_text())["rows"]} == {
-        "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
+    assert {row["name"]: (row["exitCode"], row.get("kind")) for row in json.loads(out.read_text())["rows"]} == {
+        "3.12:tests/test_pass.py": (0, None), "3.12:tests/test_dies.py": (1, "whole")}
 
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):

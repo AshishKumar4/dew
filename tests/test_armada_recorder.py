@@ -247,24 +247,6 @@ def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, t
     assert reused() == [True, False]
 
 
-def test_a_file_a_session_parameter_revisits_takes_what_ran_between_its_visits(ci, tmp_path, monkeypatch,
-                                                                                cache_worker):
-    """A session-scoped parameter runs A[0], B[0], A[1], B[1]: what B's first visit executed and cached
-    serves A's second, so it is A's input though A ran first; an edit to it reruns A."""
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "conftest.py": ON_SRC + "import pytest\n@pytest.fixture(scope='session', params=[0, 1])\n"
-                                "def visit(request):\n    return request.param\n",
-        "holder.py": "VALUES = {}\n",
-        "test_a.py": "import holder\ndef test_a(visit):\n"
-                     "    assert visit == 0 or holder.VALUES['m'] == 1\n",
-        "test_b.py": "import holder\ndef test_b(visit):\n    import m\n"
-                     "    holder.VALUES.setdefault('m', m.VALUE)\n"},
-        {"m.py": "VALUE = 1\n"})
-    assert reused() == [True, True]
-    (tmp_path / "src/m.py").write_text("VALUE = 2\n")
-    assert reused() == [False, False]
-
-
 def test_each_start_needs_its_own_record_though_two_start_alike(ci, tmp_path, monkeypatch, cache_worker):
     """Two children a file starts alike are two starts, each owing a record: two that record themselves
     keep the file's key, and one that records itself beside one that starts with no site (-S), which no
@@ -303,10 +285,10 @@ class Shape:
 
 @pytest.mark.parametrize(("edit", "rerun"), [
     (("def unused(x):\n    return x - 1", "def unused(x):\n    return x - 2"), [False, False]),
-    (("    return x * by", "    return by * x + 0"), [True, True]),
+    (("    return x * by", "    return by * x + 0"), [True, False]),
     (("        return side * side", "        return side ** 2"), [False, True]),
     (("        return self.sides * side", "        return side * self.sides"), [False, False]),
-    (("def scaled(x, by=2):", "def scaled(x, by=3):"), [True, True]),
+    (("def scaled(x, by=2):", "def scaled(x, by=3):"), [True, False]),
     (("LIMIT = 3", "LIMIT = 4"), [True, True]),
     (("    sides = 4", "    sides = 5"), [True, True]),
     (("import functools\n", "import functools\n\n\n# a note above\n\n"), [False, False]),
@@ -317,8 +299,8 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
     """A file's key covers the code its run executed, each function it ran and the top level of each module
     it imported (all but function bodies: its imports, constants, classes' attributes and methods'
     signatures, defaults and decorators), not a module's whole text: an edit to a function no run executed,
-    or one that only moves lines, reruns no file, and an edit to what a run executed reruns it and the files
-    its process ran after it, which what it ran may serve."""
+    or one that only moves lines, reruns no file, and an edit to what a run executed reruns that file alone,
+    each file in a process of its own (ci.py's `alone`)."""
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_a.py": ON_SRC + "import m\ndef test_a():\n    assert m.scaled(2) == 4\n",
         "test_b.py": ON_SRC + "import m\ndef test_b():\n    assert m.Shape().area(3) == 9\n"},
@@ -423,11 +405,12 @@ def test_a_process_ending_1_after_its_tests_passed_is_red(ci, tmp_path, monkeypa
         == [(1, True)] * 2
 
 
-def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, monkeypatch, cache_worker):
+def test_each_files_record_is_its_own_where_files_share_a_task(ci, tmp_path, monkeypatch, cache_worker):
     """Each input moves exactly the files that may have seen it (row 2642): a fixture's arrival reruns its
-    prober, the process's last file, alone; a helper shadowing a name only a file's child imported reruns
-    that file alone; a module one file imported lazily reruns it and every file the process ran after it,
-    which what it left may serve; and two files whose records share inputs never take each other's row."""
+    prober, the task's last file, alone; a helper shadowing a name only a file's child imported reruns that
+    file alone; a module one file imported lazily reruns it alone, as each file runs in a process of its own
+    (ci.py's `alone`) that nothing it left can serve; and two files whose records share inputs never take
+    each other's row."""
     child = ("import site, sysconfig; site.addsitedir(sysconfig.get_paths()['purelib']); "
              "import tabnanny")
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
@@ -448,7 +431,7 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
     assert reused() == [False, True, True, True]
     (tmp_path / "tests/tabnanny.py").unlink()
     (tmp_path / "src/lazy.py").write_text("VALUE = 2\n")
-    assert reused() == [True, False, False, False]
+    assert reused() == [True, False, True, True]
     (tmp_path / "src/lazy.py").write_text("VALUE = 1\n")
     common = ci.shared("3.12")
     names = ("tests/test_lazy.py", "tests/test_later.py")
