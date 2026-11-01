@@ -41,6 +41,8 @@ from dew.rl.skydreamer import Sky, SkyDreamerRace
 ENVIRONMENTS, PIXELS, REPLAY = 16, 64, 2_000_000
 EVALUATION_SEED, HELD_OUT_SEED = 0xE7A1, 0x5EED
 """The seeds every judgement's episodes start from, apart from the training's (the run's key)."""
+JUDGING = "untrained beside each point; Table III evaluation and held-out training episodes, fixed seeds"
+"""How a report's points were judged, which a run going on in its OUT must share."""
 SENSED = (("rates", 3), ("motors", 4), ("plan", 24))
 """What the encoder reads beside the image, each entry and its width."""
 DECODED = (("state", 16, 256), ("rates", 3, 256), ("motors", 4, 256))
@@ -98,7 +100,10 @@ def trained(out: Path, assets: Path, updates: int, every: int) -> dict:
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     path = out / "base.json"
-    report: dict = json.loads(path.read_text()) if path.exists() else {"points": []}
+    report: dict = json.loads(path.read_text()) if path.exists() else {"points": [], "judging": JUDGING}
+    if report.get("judging") != JUDGING:
+        raise ValueError(f"{path} was judged otherwise than this tool judges ({JUDGING}); go on in a "
+                         "fresh OUT")
     done = 0
     if (out / "base").is_dir():
         with Checkpoints(str(out / "base")) as checkpoints:

@@ -31,10 +31,11 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"no recorded run is named {unknown}; the runs are {sorted(runs)}")
     receipt = {}
+    qualified = test_dory.test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count
     for name in chosen:
         began = time.perf_counter()
         try:
-            test_dory.the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count(runs[name])
+            qualified(runs[name])
             receipt[name] = {"verdict": "passed"}
         except Exception as error:
             message = "".join(traceback.format_exception_only(error))
