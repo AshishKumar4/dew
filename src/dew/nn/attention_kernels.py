@@ -518,10 +518,10 @@ reference path, which takes every call, so it runs where the preference names it
 
 
 def _decode_preferred(case: AttentionCase) -> str:
-    """The kernel a decode call runs: on a GPU the decode kernel, the template's decode mainloop (measured
-    1.57 times as fast as cuDNN in geometric mean on an A100 over Qwen3-0.6B's 28 decode shapes; no cell
-    declares cuDNN, `generation.TARGETS`' note), which hands a call it does not take to the next kernel by
-    legality; xla elsewhere."""
+    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`, no
+    template's yet: ledger row 3424; measured 1.57 times as fast as cuDNN in geometric mean on an A100 over
+    Qwen3-0.6B's 28 decode shapes; no cell declares cuDNN, `generation.TARGETS`' note), which hands a call
+    it does not take to the next kernel by legality; xla elsewhere."""
     return 'decode' if generation.backend() == 'gpu' else 'xla'
 
 
