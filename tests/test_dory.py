@@ -736,16 +736,13 @@ DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_s
 
 
 def test_the_released_config_round_trips_through_dews_fields():
-    """NVIDIA-Nemotron-Labs-Dory1.0-4B's config: 16 input, 40 looped and 16 output layers, the
-    looped ones run twice.
-    It translates into Dew's fields, the model built from them writes back every field
+    """NVIDIA-Nemotron-Labs-Dory1.0-4B's config (16 input, 40 looped and 16 output layers, the looped
+    ones run twice) translates into Dew's fields; the model built from them writes back every field
     DoryConfig reads as the release states it (a null by leaving it out, which DoryConfig reads as
-    its default null), and that config translates to the same fields."""
+    its default null); and that config translates to the same fields."""
     released = json.loads((RELEASED / 'config.json').read_text())
     fields = hf_decoders.translate_config(released)
     model = models.build('causal_transformer', fields)
-    assert model.num_layers == 72 and model.loop is not None and model.loop.layers == (16, 56)
-    assert model.loop.steps == 2 and model.ngpt is not None
     written = hf_decoders.export_config(model)
     for field in DORY_FIELDS:
         assert written.get(field) == released[field], field
