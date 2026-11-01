@@ -47,7 +47,7 @@ def test_situ_matches_the_released_activation():
 FIXTURE = TINY / RECORDING
 OUTPUTS = ("logits", "stepped")
 """The leaves `dew` gives, the site's recorded leaves (tools/venv_reference.py's `kimi-k3`)."""
-SEEDS = 8
+SEEDS = 32
 """The declared seeds, sized by `seeds_for` paired as the recording confirmed them."""
 draw = drawn_batch
 dew = recorded_dew(TINY, OUTPUTS)

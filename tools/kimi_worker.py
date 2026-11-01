@@ -25,13 +25,16 @@ import numpy as np
 import torch
 from reference_worker import serve
 
+STEPPED_PREFILL = 40
+"""The prefill of the cached decode whose shapes `stepped` is scored at, which tests/kimi_support.py's
+cached decode reads from here."""
+
 
 def outputs(model: torch.nn.Module, inputs: dict[str, np.ndarray], device: str,
             stepped: bool) -> dict[str, np.ndarray]:
     """`model`'s leaves over a batch: each valid position's logits of its forward (`logits`) and, where
-    `stepped`, its first row's first `prefill` positions (the batch's, tests/kimi_support.py's
-    `STEPPED_PREFILL`) from one forward over them and each later one from a forward over the row up to
-    it (`stepped`)."""
+    `stepped`, its first row's first `STEPPED_PREFILL` positions from one forward over them and each
+    later one from a forward over the row up to it (`stepped`)."""
     # 64-bit, as each tool's fixture batch hands them (`kimi_k3_reference.fixture_on_gpu`).
     ids = torch.tensor(inputs["input_ids"], dtype=torch.long, device=device)
     mask = torch.tensor(inputs["attention_mask"], dtype=torch.long, device=device)
@@ -42,9 +45,8 @@ def outputs(model: torch.nn.Module, inputs: dict[str, np.ndarray], device: str,
             def forward(length: int) -> np.ndarray:
                 return model(input_ids=ids[:1, :length], use_cache=False).logits[0].cpu().numpy()
 
-            prefill = int(inputs["prefill"])
-            found["stepped"] = np.concatenate([forward(prefill), *(
-                forward(length)[-1:] for length in range(prefill + 1, ids.shape[1] + 1))])
+            found["stepped"] = np.concatenate([forward(STEPPED_PREFILL), *(
+                forward(length)[-1:] for length in range(STEPPED_PREFILL + 1, ids.shape[1] + 1))])
     return found
 
 
@@ -86,7 +88,7 @@ def main() -> None:
     def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         out = {}
         for name in sorted({key.split(".", 1)[0] for key in cases}):
-            inputs = {key: cases[f"{name}.{key}"] for key in ("input_ids", "attention_mask", "prefill")}
+            inputs = {key: cases[f"{name}.{key}"] for key in ("input_ids", "attention_mask")}
             out |= {f"{name}.reference.{leaf}": value
                     for leaf, value in outputs(narrow, inputs, "cuda", stepped).items()}
             with wide_context():

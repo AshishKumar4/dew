@@ -13,6 +13,7 @@ from model_support import parameter_loss
 from reference_error import FACTOR, assert_as_exact_over_orders, distance, ieee_fixture
 from residual_orders import permuted
 from scipy.special import log_softmax
+from tool_support import run_from
 
 from dew.batch import Variables
 from dew.interop import Pretrained
@@ -35,19 +36,19 @@ RECORDING = "recording.npz"
 """Each fixture's check-1 evidence of its release over drawn batches (`drawn_batch`), recorded by
 tools/venv_reference.py's `kimi-k3` and `kimi-linear` sites (tools/kimi_worker.py)."""
 
-STEPPED_PREFILL = 40
-"""The prefill of the cached decode `recorded_dew`'s `stepped` scores, which each drawn batch hands the
-reference's worker (`drawn_batch`'s `prefill`, tools/kimi_worker.py)."""
+with run_from("kimi_worker", "tools") as _worker:
+    STEPPED_PREFILL = _worker.STEPPED_PREFILL
+"""The prefill of the cached decode `recorded_dew`'s `stepped` scores: the reference's worker's, which
+records the release at the shapes that decode computes (tools/kimi_worker.py)."""
 
 
 def drawn_batch(seed: int) -> dict[str, np.ndarray]:
     """A seed's batch of the fixtures' geometry: two rows of 70 ids past the specials, past one 64-token KDA
-    chunk, the second left-padded by 9, a stream of its own for each seed, and the prefill its cached
-    decode is scored at (`STEPPED_PREFILL`)."""
+    chunk, the second left-padded by 9, a stream of its own for each seed."""
     ids = np.random.default_rng([0x3755, seed]).integers(3, 512, (2, 70)).astype(np.int32)
     mask = np.ones_like(ids)
     ids[1, :9], mask[1, :9] = 0, 0
-    return {"input_ids": ids, "attention_mask": mask, "prefill": np.asarray(STEPPED_PREFILL, np.int32)}
+    return {"input_ids": ids, "attention_mask": mask}
 
 
 VALID = drawn_batch(0)["attention_mask"].astype(bool)
