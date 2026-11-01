@@ -78,8 +78,8 @@ if TYPE_CHECKING:
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
-    from dew.optim import ScheduleBase
     from dew.sampling.solvers import Solver
+    from dew.schedules import ScheduleBase
 
 # A type annotation as a value: a class, a union of them, a subscripted
 # generic, a PEP 695 alias, or the None a field with no resolvable annotation
@@ -1477,12 +1477,12 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
 }, base="dew.nn.vision.common:ProjectorBase")
 schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
-    "cosine": "dew.optim:Cosine",
-    "exponential": "dew.optim:Exponential",
-    "linear": "dew.optim:Linear",
-    "one_cycle": "dew.optim:OneCycle",
-    "power": "dew.optim:Power",
-}, base="dew.optim:ScheduleBase")
+    "cosine": "dew.schedules:Cosine",
+    "exponential": "dew.schedules:Exponential",
+    "linear": "dew.schedules:Linear",
+    "one_cycle": "dew.schedules:OneCycle",
+    "power": "dew.schedules:Power",
+}, base="dew.schedules:ScheduleBase")
 
 
 # A run config's own class sits above the registry, so the table's type names none. A run record

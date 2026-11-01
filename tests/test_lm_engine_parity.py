@@ -28,7 +28,8 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.moe import global_router_loss
 from dew.objectives.routing import router_moments, router_scores, router_z_terms
-from dew.optim import OptimConfig, ParamGroup, Power, linear_schedule, param_labels, power_schedule
+from dew.optim import OptimConfig, ParamGroup, param_labels
+from dew.schedules import Power, linear_schedule, power_schedule
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "lm_engine"
 COEF = 0.01  # the fixture's router_aux_loss_coef

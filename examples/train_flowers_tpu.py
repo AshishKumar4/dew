@@ -40,10 +40,11 @@ from dew.diffusion.presets import EDM
 from dew.distributed import collective_host
 from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
-from dew.optim import Cosine, OptimConfig
+from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
+from dew.schedules import Cosine
 from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")

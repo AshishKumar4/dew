@@ -28,8 +28,9 @@ from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
 from dew.nn.precision import DTYPE_PRESETS, MATMUL_PRECISIONS, Numerics
-from dew.optim import OneCycle, OptimConfig, ParamGroup, optimizers
+from dew.optim import OptimConfig, ParamGroup, optimizers
 from dew.registry import ModelConfig
+from dew.schedules import OneCycle
 from dew.training._lowering import Lowered
 
 pytestmark = pytest.mark.mesh

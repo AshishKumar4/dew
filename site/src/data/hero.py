@@ -3,8 +3,9 @@ from dew import Trainer
 from dew.data import ByteTokenizer, Hub, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
+from dew.optim import OptimConfig
 from dew.sampling import Sampling, generate
-from dew.optim import Cosine, OptimConfig
+from dew.schedules import Cosine
 
 steps = 1000
 

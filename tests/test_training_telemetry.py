@@ -16,7 +16,8 @@ import dew.config
 from dew.config import RunConfig, TrainerConfig
 from dew.data.dataset import Loader
 from dew.objectives import Aux, Objective
-from dew.optim import Cosine, OptimConfig
+from dew.optim import OptimConfig
+from dew.schedules import Cosine
 from dew.training import Trainer, Wandb, WandbTracker
 
 

@@ -42,8 +42,9 @@ from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import Perplexity
-from dew.optim import Cosine, OptimConfig
+from dew.optim import OptimConfig
 from dew.registry import ModelConfig
+from dew.schedules import Cosine
 from dew.training import MeshSpec, prepare_process
 
 EOS, PAD, IMAGE = 256, 257, 258

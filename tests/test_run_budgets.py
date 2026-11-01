@@ -21,7 +21,8 @@ from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import ObjectiveData, Pipeline
 from dew.distributed.batches import batch_signature
 from dew.objectives import Aux, Objective
-from dew.optim import Cosine, Linear, OneCycle, OptimConfig
+from dew.optim import OptimConfig
+from dew.schedules import Cosine, Linear, OneCycle
 from dew.telemetry.records import FitStarted
 from dew.training import Best, Checkpoints, Pause, Trainer
 from dew.training.interval import CONSUMED_COMMITTED, CONSUMED_EXAMPLES

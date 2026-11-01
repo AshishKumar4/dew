@@ -42,7 +42,8 @@ def examples_clock(args) -> dict:
     from dew.data.dataset import Closeable, DataPartition
     from dew.data.pipeline import ObjectiveData, Pipeline
     from dew.objectives.base import Aux, Objective
-    from dew.optim import Linear, OptimConfig
+    from dew.optim import OptimConfig
+    from dew.schedules import Linear
     from dew.training import Checkpoints, Cooldowns, MeshSpec, Pause, Trainer
 
     expands = args.deal != "order"

@@ -266,7 +266,8 @@ def test_a_supplied_diloco_state_trains_on_from_each_groups_own_state():
     """A DiLoCo state supplied to a fit (`fit(state=...)`), its optimizer a schedule's, trains on from each
     group's inner state and the outer model it holds: two more steps, each a meeting, move the outer
     parameters, all finite."""
-    from dew.optim import Cosine, OptimConfig
+    from dew.optim import OptimConfig
+    from dew.schedules import Cosine
 
     def run():
         return trainer(2, diloco=DiLoCo(every=1, rate=1.0, momentum=0.0),

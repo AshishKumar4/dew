@@ -18,7 +18,8 @@ import optax
 import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.optim import Cosine, Exponential, Linear, OneCycle, OptimConfig, ParamGroup, Power, stepped
+from dew.optim import OptimConfig, ParamGroup, stepped
+from dew.schedules import Cosine, Exponential, Linear, OneCycle, Power
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2

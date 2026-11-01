@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.optim import Cosine, Exponential, Linear, OneCycle, Power, PowerTail, ProgressState, RateState, _Rate
+from dew.optim import ProgressState, RateState, _Rate
+from dew.schedules import Cosine, Exponential, Linear, OneCycle, Power, PowerTail
 
 STEPS = 40
 """The updates of the lockstep run: each consumes one fortieth of its bound."""

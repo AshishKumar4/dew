@@ -11,7 +11,8 @@ import pytest
 from test_optim import assert_updates_as
 
 from dew.nn.cross_attention import CrossAttention, crossing
-from dew.optim import FRESH_LEARNING_RATE, Exponential, Linear, OptimConfig, ParamGroup, param_labels
+from dew.optim import FRESH_LEARNING_RATE, OptimConfig, ParamGroup, param_labels
+from dew.schedules import Exponential, Linear
 
 RATE, MULTIPLIER = 1e-5, 30.0
 FRESH = ParamGroup("fresh", fresh=True, learning_rate_multiplier=MULTIPLIER, spared=True)
