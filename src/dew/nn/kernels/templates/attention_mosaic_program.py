@@ -183,11 +183,12 @@ class _Issuing(NamedTuple):
 
 
 def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
-    """`acc` with each of `parts`' products with `rhs` issued into it in place (`operands.Issuer`'s carried
-    accumulator), each part's left operand in registers and formed as it is taken
-    (`algebra.formed_parts`)."""
+    """`acc` with each of `parts`' products with `rhs`, a tile in shared memory, issued into it in place
+    (`operands.Issuer`'s carried accumulator), each part's left operand in registers and formed as it is
+    taken (`algebra.formed_parts`)."""
     issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1})
-    return issuer.summed((("part", part, rhs) for part in parts), into=acc)
+    right = operands.Parts((rhs,), rhs.dtype)
+    return issuer.summed((("part", part, right) for part in parts), into=acc)
 
 
 def _block(config: Tiles | BackwardTiles) -> int:
