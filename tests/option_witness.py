@@ -465,15 +465,27 @@ def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict
     return failed
 
 
-def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere: frozenset[str] = frozenset()
-                 ) -> tuple[dict[str, Option], dict[str, str], bool]:
+class Witnessed(typing.NamedTuple):
+    """What a run witnessed (`witnessed_on`): the options it set (`chosen`'s, or all it holds), why each it
+    did not witness was not, whether it exported, and every option it holds."""
+
+    options: dict[str, Option]
+    failures: dict[str, str]
+    exports: bool
+    held: frozenset[str]
+
+
+def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere: frozenset[str] = frozenset(),
+                 chosen: frozenset[str] | None = None) -> Witnessed:
     """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
     witness is not: one with no path its settings do not declare derived, or derived from data the run
     leaves unfilled; one set alone to each alternative in turn (`witnessed_by`) none of which trains, saves
     it and has its loaded task consume it: hold it where it held another before (`held`) and answer apart
     from the same task with what it held before in its place, the consumer's work, not its record
     (`unread`), a released task's export too (`dew export`), where the run exports, which it says. An
-    option another run witnessed already (`elsewhere`) is not set again here."""
+    option another run witnessed already (`elsewhere`) is not set again here. Where `chosen` names some, it
+    witnesses those of its options alone, so its options' witnesses can run apart (each beside the run's
+    own unset save); it holds the rest as ever."""
     import dew
     from dew.objectives.base import ReleasedTask
 
@@ -487,6 +499,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
     # layers its checkpoint keeps alone): its witnesses' exports then hold them too.
     exports = released and exported(root / "runs" / "unset", root / "exported" / "unset")
     options = {option.name: option for option in options_of(run, objective, settings, base)}
+    holding = frozenset(options)
+    options = {name: option for name, option in options.items() if chosen is None or name in chosen}
     failures = {}
     for name, option in options.items():
         if option.found is None and "derived" not in option.field.metadata:
@@ -528,7 +542,7 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
         return missed
     witnessing = witnessed_by(run, root, settings, flags, queued, consumed)
     failures.update({name: f"no alternative witnesses it: {why}" for name, why in witnessing.items()})
-    return options, failures, exports
+    return Witnessed(options, failures, exports, holding)
 
 
 UNHELD = ("states a layout's window, budgets and option layout alone",
