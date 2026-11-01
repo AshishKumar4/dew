@@ -28,7 +28,7 @@ _EXPORTS = {
     "normalize_targets": "dew.objectives.jepa.objective",
     "representation_health": "dew.objectives.jepa.objective",
 }
-__getattr__ = _lookup(__name__, _EXPORTS)
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 __all__ = [
     "FactorizedTokenStack",
@@ -45,7 +45,3 @@ __all__ = [
     "normalize_targets",
     "representation_health",
 ]
-
-
-def __dir__() -> list[str]:
-    return list(__all__)
