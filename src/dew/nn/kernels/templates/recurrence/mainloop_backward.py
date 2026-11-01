@@ -559,10 +559,10 @@ def _query_key_views(call: _Call, keyed: tuple, served: tuple, memory: tuple, *,
 def _query_key_split(call: _Call) -> int:
     """`_query_key`'s value columns a program takes of each value head: all of them, halved while its
     streams (each step's values, output gradient and corrected values' gradient `[C, vq]`, its memories
-    `[block, vq]`, the queries', keys' and scores' gradient's blocks) are past the block's shared memory
-    (`generation.shared_budget`), whole blocks (`_Call.block`) at least: an fp32 call's two parts at
-    Qwen3.5-27B's widths took 237824 bytes and a 256-wide value row's 215040 on an A100, past its 166912
-    (fp32-plan-sm90 at cdcd620ef, wide-backward)."""
+    `[block, vq]`, the queries', keys' and scores' gradient's blocks, and the latter's parts where it forms
+    them, `_scores_parted`) are past the block's shared memory (`generation.shared_budget`), whole blocks
+    (`_Call.block`) at least: an fp32 call's two parts at Qwen3.5-27B's widths took 237824 bytes and a
+    256-wide value row's 215040 on an A100, past its 166912 (fp32-plan-sm90 at cdcd620ef, wide-backward)."""
     held, memories, given = call.held, call.memories, call.given
 
     def streamed(vq: int) -> int:
@@ -570,6 +570,8 @@ def _query_key_split(call: _Call) -> int:
                     (memories, call.block, vq), (memories, call.block, vq), (given, CHUNK, call.block),
                     (given, CHUNK, call.block), (_score_grads(call), CHUNK, CHUNK)]
         landed = CHUNK * call.block * (jnp.dtype(held.stored).itemsize + 4)
+        if _scores_parted(call):
+            operands.append((held, CHUNK, CHUNK))
         return landed + sum(rows * columns * jnp.dtype(operand.stored).itemsize * operand.parts
                             for operand, rows, columns in operands)
 
@@ -620,16 +622,18 @@ def _query_key_held(call: _Call) -> _Held:
     """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum,
     its memory product and its scores' product, and a block's queries or keys in fp32 for the range terms;
     then `sum(S dS)` (`_memory_sum`): the memories' product and its diagonal's mask where products read
-    registers, with a block of each operand, else the memories in fp32."""
+    registers, with a block of each operand, else the memories in fp32; and before them, where it forms the
+    scores' gradient's parts (`_scores_parted`), the gradient, their remainder and the parts."""
     held, memories, given = call.held, call.memories, call.given
     block = (memories, call.block, call.block)
     summed = ([_f32(call.block, call.block), *_masks(call.block, call.block), *_fragments(call, block, block)]
               if call.family.operands_in_registers else [_f32(call.block, call.block)] * 2)
+    parted = ([_f32(CHUNK, CHUNK)] * 2 + _held(held, CHUNK, CHUNK),) if _scores_parted(call) else ()
     return _Held(phases=(
         [_f32(CHUNK, call.block)] * 4
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block), (memories, call.block,
                                                                                       call.block)),
-        summed))
+        summed, *parted))
 
 
 def _query_key_launched(call: _Call, vq: int) -> tuple[dict, tuple]:
@@ -677,7 +681,6 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     def program(q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
                 beta_ref, dq_ref, dk_ref, dw_ref, after_ref, leaving_ref, memory_ref, *, streams, staging,
                 landing):
-        del staging
         c, n, keyed = lax.axis_index("blocks"), lax.axis_index("chunks"), lax.axis_index("heads")
         split = lax.axis_index("values")
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
@@ -716,6 +719,11 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
 
             issue = Issuer(call)
             ds = _tile(slots, "ds", grads) if scores else None
+            if ds is not None and _scores_parted(call):
+                (buffers,) = staging
+                parts = product.formed(ds.value(), held.parts)
+                ds = Parts([family.staged(part, buffer) for part, buffer in zip(parts, buffers, strict=True)],
+                           jnp.float32)
             after, leaving = algebra.memory_gradients(
                 functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
@@ -764,6 +772,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=_taken(10),
         work=work, held=_query_key_held(call),
+        staging=_staging(call.held, (CHUNK, CHUNK)) if _scores_parted(call) else (),
         landing={"weights": held.landing(CHUNK, call.block) if splits == 1
                  else ((CHUNK, call.block), jnp.float32), "sums": ((CHUNK, call.block), jnp.float32)})(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
@@ -789,9 +798,20 @@ def _score_grads(call: _Call) -> _Operand:
     over its value heads in fp32 first, as mamba_ssm sums its `dCB` over a group's heads before its products
     round it to bf16 (`_chunk_scan_bwd_dcb`, `_bmm_chunk_bwd`'s `dot_dtype`). Each value head's rounded on
     its own, even in two bf16 parts, a one-token document's C row, its size 1.3e-6 where the rest sat at 0.1
-    to 0.5, was 0.242 of it from float64 against mamba_ssm's allowed 0.223 (ssd-c-rows-h100-b9d82d9b7)."""
+    to 0.5, was 0.242 of it from float64 against mamba_ssm's allowed 0.223 (ssd-c-rows-h100-b9d82d9b7). Where
+    the held operand is in parts (an fp32 call's), fp32 itself, which `_query_key` forms into them
+    (`_scores_parted`): formed where it is stored, `_scores_back` held each part and their remainder beside
+    the scores' gradient, and ptxas spilled 32 bytes a thread past 255 on an H100 (back-need16 at
+    7e3f98ca7); stored whole it takes the parts' bytes."""
     held = dataclasses.replace(call.held, rows=call.rows)
-    return held if call.delta else dataclasses.replace(call.given, rows=call.rows)
+    if not call.delta:
+        return dataclasses.replace(call.given, rows=call.rows)
+    return held if held.parts == 1 else _Operand(call.rows, 1, jnp.dtype(jnp.float32))
+
+
+def _scores_parted(call: _Call) -> bool:
+    """Whether `_query_key` forms the scores' gradient into the held operand's parts (`_score_grads`)."""
+    return call.delta and call.held.parts > 1
 
 
 @_lowered_once
@@ -882,11 +902,10 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
     # the pairs' sum's product: four fp32 tiles at once, the decays taken before the scores' product
     # (`algebra.scores_gradient`); five stated an A100's 280 registers where ptxas needed 240. A key head's
-    # sum read back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the
-    # remainder each part after the first is formed from (`product.formed`): without it the model stated
-    # 232 registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (4 + (group > 1) + (grads.parts > 1))
-                               + _held(grads, CHUNK, CHUNK)
+    # sum read back beside them; and the scores' gradient's narrow form, where it leaves narrowed
+    # (`_score_grads`).
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (4 + (group > 1))
+                               + (_held(grads, CHUNK, CHUNK) if grads.stored != jnp.float32 else [])
                                + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
     summing = _summing(call) + ((plgpu.SMEM((CHUNK, CHUNK), jnp.float32),) if group > 1 else ())
