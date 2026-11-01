@@ -12,7 +12,7 @@ from reference_error import assert_as_exact
 
 from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.attention_masks import alibi_bias, chunk_mask, key_spans
+from dew.nn.attention_masks import alibi_bias, alibi_slopes, chunk_mask, key_spans
 from dew.nn.documents import CrossDocuments, cross_document_mask, document_mask
 from dew.nn.inputs import counted_places
 from dew.nn.kernels.templates import attention as template
@@ -350,7 +350,7 @@ HOOKS = {
 def hooks_of(hooks: dict, queries: int) -> template.Hooks:
     """The template's hooks for `hooks`: a softcap and ALiBi as one score_mod, sinks as the softmax's
     initial state."""
-    slopes = alibi_bias(jnp.ones((1, 1)), 4, dtype=jnp.float32).reshape(4)
+    slopes = jnp.asarray(alibi_slopes(4))
     cap = SOFTCAP if hooks.get("softcap") else None
 
     def score_mod(s, q_pos, k_pos, *params):
