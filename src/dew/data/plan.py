@@ -398,7 +398,7 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
-def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], object]:
+def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], JSON]:
     """A per-share read's saved position (its data plan and its Grain iterator's state) as `plan`, this
     run's, reads it: the plan as `earlier_plan` translates it, and the iterator's state, where the plan
     was written before version 8, with the counts version 8 keeps of what a read delivered (each
@@ -409,25 +409,24 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
     from dew.data.pipeline import CONSUMED, REFUSED
 
     written = record(saved.get("dew_data_plan"), "saved data plan")
-    iterator = saved.get("iterator")
+    iterator = json_value(saved.get("iterator"), "saved Grain iterator")
 
-    def counted(branch: object) -> object:
-        if isinstance(branch, list):
-            return [counted(child) for child in branch]
-        if not isinstance(branch, dict):
-            return branch
-        node = {name: counted(child) for name, child in branch.items()}
-        counter = node.get(COUNTER)
-        if isinstance(counter, dict) and isinstance(counter.get("counts"), dict):
-            counts = counter["counts"]
-            node[COUNTER] = {**counter, "counts": {"delivered_rows": counts.get("accepted", 0), **counts}}
-        held = node.get("held")
-        if {"parent", "skip", "held"} <= node.keys() and isinstance(held, dict) and CONSUMED in held \
-                and REFUSED not in held and isinstance(held[CONSUMED], dict):
-            consumed = held[CONSUMED]
-            tokens = consumed.get("tokens")
-            none = [0] * (len(tokens) if isinstance(tokens, list) else 0)
-            node["held"] = {**held, REFUSED: {"dtype": consumed.get("dtype"), "tokens": none}}
+    def counted(branch: JSON) -> JSON:
+        match branch:
+            case list():
+                return [counted(child) for child in branch]
+            case dict():
+                node = {name: counted(child) for name, child in branch.items()}
+            case _:
+                return branch
+        match node.get(COUNTER):
+            case {"counts": {**counts}} as counter:
+                node[COUNTER] = {**counter, "counts": {"delivered_rows": counts.get("accepted", 0), **counts}}
+        match node:
+            case {"parent": _, "skip": _, "held": {**held}} if CONSUMED in held and REFUSED not in held:
+                match held[CONSUMED]:
+                    case {"dtype": dtype, "tokens": list(tokens)}:
+                        node["held"] = {**held, REFUSED: {"dtype": dtype, "tokens": [0] * len(tokens)}}
         return node
 
     if written.get("version") == 7:
