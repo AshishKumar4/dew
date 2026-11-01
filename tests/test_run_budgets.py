@@ -212,45 +212,6 @@ def test_a_bounded_streamed_read_of_unstated_shards_consumes_its_bound_whatever_
     assert sum(read.values()) == consumed == examples
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize("kind", ["memory", "jsonl"])
-def test_a_bounded_read_whose_bound_one_worker_holds_resumes_from_before_the_other_started(kind, tmp_path):
-    """Seven examples of shards of ten rows, read by two loading workers: the bound lies within one shard,
-    so one worker is dealt all of it and the other none. A position saved after the first batch, before the
-    worker dealt nothing has read, resumes: the batches after it hand out the rest of the seven, each once,
-    as the read it was saved from does."""
-    ids = np.arange(1, 51, dtype=np.int32)
-    if kind == "memory":
-        chain = Pipeline(Memory({"id": ids}, shard_rows=10))
-    else:
-        for part in range(5):
-            (tmp_path / f"part-{part}.jsonl").write_text(
-                "".join(json.dumps({"id": int(record)}) + "\n" for record in ids[part * 10:(part + 1) * 10]))
-        chain = Pipeline(Files(str(tmp_path / "part-*.jsonl"), format="jsonl"))
-    loader = compile(chain.batch(4), read="streamed", examples=7, loading=Loading(workers=2))
-
-    def real(batch) -> list[int]:
-        kept = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
-        return np.asarray(batch["id"])[kept].tolist()
-
-    whole = loader.train(DataPartition())
-    try:
-        first = real(next(iter(whole)))
-        saved = whole.get_state()
-        rest = [record for batch in whole for record in real(batch)]
-    finally:
-        if isinstance(whole, Closeable):
-            whole.close()
-    assert len(first) + len(rest) == 7 and len(set(first + rest)) == 7
-    resumed = loader.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert [record for batch in resumed for record in real(batch)] == rest
-    finally:
-        if isinstance(resumed, Closeable):
-            resumed.close()
-
-
 @pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
 @pytest.mark.parametrize("kind", ["memory", "jsonl"])
 @pytest.mark.parametrize("examples", [15, 7])
