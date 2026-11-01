@@ -494,7 +494,7 @@ def a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left(tmp_path):
     from dew.nn.kernels import options
 
     gpu = jax.devices("gpu")[0]
-    ordinal = gpu.local_hardware_id if gpu.local_hardware_id is not None else gpu.id
+    ordinal = communicators.ordinal(gpu)
     needs = Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={ordinal: 2**20},
                   seconds=1.0)
     rows = jax.device_put(jnp.ones(8), gpu)
