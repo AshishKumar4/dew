@@ -40,6 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
+from dew.nn.nested import nested
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -498,7 +499,7 @@ def _traced_once(key: tuple) -> Callable:
     function, tree, leaves = key
     arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
     product = functools.partial(function, *arguments, **keywords)
-    return jax.jit(functools.partial(_summed_wide, product, preferred_element_type))
+    return nested(functools.partial(_summed_wide, product, preferred_element_type))
 
 
 def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Array:

@@ -41,6 +41,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.kernels.generation import linear_map
+from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Exact, Transposed
 from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul
@@ -98,7 +99,7 @@ def portable(name: str, left, right):
     return float32_matmul(left, right, exact_float32(None))
 
 
-@jax.jit
+@program
 def _cumulated(g, documents=None):
     """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)` (`compensated_add`),
     restarting at each of packed `documents`' first positions: one program JAX traces once for their types,

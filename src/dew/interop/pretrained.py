@@ -73,6 +73,7 @@ from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.objectives.base import SavedTask
@@ -606,7 +607,7 @@ class Pretrained:
             return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
                           lambda path: path[0] == "params" and crossing(path))
 
-        blocks = jax.jit(drawn)(request_key(key))
+        blocks = owned_program(drawn)(request_key(key))
         variables = merge(self.variables, blocks)
         # Each block's module, its path under `params` to and with the block's own name.
         added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
@@ -643,7 +644,7 @@ class Pretrained:
                           or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
 
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
-        added = jax.eval_shape(drawn, request_key(key)) if shaped else jax.jit(drawn)(request_key(key))
+        added = jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
         variables = merge(self.variables, added)
         if extension.trains == "attention":
             decoder, attention = model.dex_sites()

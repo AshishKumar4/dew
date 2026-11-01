@@ -47,7 +47,7 @@ import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxlib.xla_client import LoadedExecutable
 
-from dew.cache import dew_cache_dir
+from dew.cache import dew_cache_dir, package_digest
 from dew.devices import (
     backend_open,
     cuda_driver_version,
@@ -216,10 +216,9 @@ def configuration() -> dict:
 
 FORM = 6
 """The form of the measurements Dew keeps, which names their place in the cache: a change to what the child
-measures or how it writes it, or to how a program's communicators are read (`collectives_of`: the HLO parser
-`dew.telemetry.instrumentation.hlo_instructions` and the collective vocabulary
-`dew.telemetry.trace.COLLECTIVES`), takes the next, so a host measures and reads afresh rather than read an
-earlier one."""
+measures or how it writes it takes the next, so a host measures afresh rather than read an earlier one, and
+a change elsewhere in Dew measures nothing again. A program's communicators are kept under the digest of
+Dew's own code instead (`collectives_kept`)."""
 
 
 def measured(configured: Mapping, *, measure: Callable[[Mapping], Needs]) -> Needs:
@@ -304,8 +303,8 @@ def collectives_of(program: str, gpus: tuple[int, ...]) -> Collectives:
     (`dew.telemetry.trace.collective`): each distinct group of its collectives and of its all-to-alls,
     however XLA prints it, and its permutes' directed pairs on one clique of all its devices; a group whose
     positions lie past the assignment is taken as every device, and a send or a receive of no pairs read
-    as connecting every pair. A change to how it reads a program takes the next `FORM`, as the
-    communicators it kept are read again then (`collectives_kept`)."""
+    as connecting every pair. The communicators it read are kept under the digest of Dew's own code, so
+    a change to how it reads a program reads them again (`collectives_kept`)."""
     groups: set[tuple[int, ...]] = set()
     exchanges: set[tuple[int, ...]] = set()
     pairs: set[tuple[int, int]] = set()
@@ -459,9 +458,11 @@ def held() -> Sizing | None:
 
 def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...], text: Callable[[], str]) -> Collectives:
     """The communicators an executable makes on `gpus` (`collectives_of`), read from its `text` once per
-    executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, in this
-    `FORM`, so a warm start that loads it from the compilation cache reads no text."""
-    path = Path(dew_cache_dir()) / "communicators" / f"form-{FORM}" / "programs" / f"{fingerprint.hex()}.json"
+    executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, below
+    the digest of Dew's own code (`dew.cache.package_digest`), so a warm start that loads it from the
+    compilation cache reads no text, and another Dew's are read again."""
+    kept = Path(dew_cache_dir()) / "communicators" / "programs" / package_digest()
+    path = kept / f"{fingerprint.hex()}.json"
     if path.exists():
         return Collectives.of(json.loads(path.read_text()), gpus)
     positions = collectives_of(text(), tuple(range(len(gpus))))

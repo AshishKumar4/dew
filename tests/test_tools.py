@@ -1849,11 +1849,10 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "    return yaml\n"), "SLOP019", (5, 17, 22, 37, 54, 81))
 
 
-def test_a_bare_jit_in_a_package_that_compiles_through_dews_compile_point_is_reported(tmp_path):
-    """SLOP025: in a package whose programs compile through `OuterProgram` (RL's, serving's), a bare
-    `jax.jit` as a decorator, a call, within functools.partial or imported by its own name, and a bare
-    `jax.pmap`, are reported; a program that compiles through `OuterProgram` is not, nor a jit in another
-    package."""
+def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
+    """SLOP025: in any package of `src/<package>`, a bare `jax.jit` as a decorator, a call, within
+    functools.partial or imported by its own name, and a bare `jax.pmap`, are reported; a program that
+    compiles through Dew's compile point is not, nor a jit in the tests or the tools."""
     rollout = ("import functools\n"
                "import jax\n"
                "from jax import jit\n"
@@ -1866,10 +1865,29 @@ def test_a_bare_jit_in_a_package_that_compiles_through_dews_compile_point_is_rep
                "@OuterProgram\n"
                "def compiled(x): return x\n"
                "mapped = jax.pmap(acted)\n")
-    for package in ("rl", "objectives/rl", "inference"):
-        assert_reported(tmp_path / package.replace("/", "-"), f"src/sparx/{package}/rollout.py", rollout,
-                        "SLOP025", (5, 7, 8, 9, 12))
-    assert _linted(tmp_path / "other", {"src/sparx/training/step.py": rollout}) == []
+    for package in ("rl", "training", "checkpoints"):
+        assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
+                        (5, 7, 8, 9, 12))
+    assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
+
+
+def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
+    """SLOP025: the compile point's own class (`COMPILE_POINT`, `OuterProgram`) and the nested program
+    (`nested`) compile by a bare jit and no finding is made of them; the same jit in another class of the
+    compile point's module, or in the class's name elsewhere, is reported."""
+    point = ("import jax\n"
+             "class OuterProgram:\n"
+             "    def _jitted(self, f):\n"
+             "        return jax.jit(f)\n"
+             "class Other:\n"
+             "    def _jitted(self, f):\n"
+             "        return jax.jit(f)\n")
+    nesting = "import jax\ndef nested(f):\n    return jax.jit(f)\n"
+    found = _linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point,
+                               "src/sparx/nn/nested.py": nesting})
+    assert [finding for finding in found if finding[2] == "SLOP025"] == [
+        ("src/sparx/nn/kernels/options.py", 7, "SLOP025"), ("src/sparx/training/step.py", 4, "SLOP025"),
+        ("src/sparx/training/step.py", 7, "SLOP025")]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):

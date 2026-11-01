@@ -18,6 +18,7 @@ import jax
 import pytest
 
 from dew import communicators
+from dew.cache import package_digest
 from dew.communicators import Collectives, CommunicatorRoom, Needs
 from dew.devices import POOL_NAMES, pool_bound
 
@@ -187,13 +188,25 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
-def test_a_programs_communicators_kept_in_an_earlier_form_are_read_again(tmp_path, monkeypatch):
-    """A program's communicators kept by an earlier Dew, whose reading of a program's text may differ, are
-    not taken as this one's: the program's text is read again."""
+def test_a_programs_communicators_are_kept_under_the_digest_of_dews_code(tmp_path, monkeypatch):
+    """A program's communicators are kept under the digest of Dew's own code (`dew.cache.package_digest`),
+    the key every cache of what Dew's code computed reads: those kept under this Dew's digest are taken as
+    they are kept, its text unread, and those kept by another Dew's code, under its digest or none, are read
+    again from the program's text."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    earlier = tmp_path / "dew" / "communicators" / "programs" / f"{b'step'.hex()}.json"
-    earlier.parent.mkdir(parents=True)
-    earlier.write_text(json.dumps(Collectives(groups=frozenset({(0, 1, 2, 3)})).to_json()))
+    kept = tmp_path / "dew" / "communicators" / "programs"
+    planted = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+
+    def unread() -> str:
+        raise AssertionError("the text of a program whose communicators this Dew kept is read again")
+
+    ours = kept / package_digest() / f"{b'kept'.hex()}.json"
+    ours.parent.mkdir(parents=True)
+    ours.write_text(json.dumps(planted.to_json()))
+    assert communicators.collectives_kept(b"kept", (0, 1, 2, 3), unread) == planted
+    for earlier in (kept / f"{b'step'.hex()}.json", kept / ("0" * 64) / f"{b'step'.hex()}.json"):
+        earlier.parent.mkdir(parents=True, exist_ok=True)
+        earlier.write_text(json.dumps(planted.to_json()))
     program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
                "  %x = f32[8] parameter(0)\n"
                "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
