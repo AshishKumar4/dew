@@ -106,6 +106,10 @@ _EXPORTS = {
 
 __getattr__ = _lookup(__name__, _EXPORTS)
 
+
+def __dir__() -> list[str]:
+    return list(__all__)
+
 __all__ = [
     "DeepseekV41Projector",
     "DeepseekV41Vision",
