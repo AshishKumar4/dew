@@ -239,10 +239,10 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
         rng = np.random.default_rng([0xD04, seed])
         return tuple(rng.integers(12, vocabulary, length, dtype=np.int32) for length in (6, 8))
 
-    def forced(arm, prompt, tokens):
+    def decoded_by(arm, prompt, tokens):
         return arm.forced(prompt, tokens, prompt_rows=False)
 
-    reference, truth = transcribed(loaded.config, tensors, forced, mode=mode, loops=loops)
+    reference, truth = transcribed(loaded.config, tensors, decoded_by, mode=mode, loops=loops)
     assert_as_exact(decoded, reference, draw, f"Dory's {tag} decoding", seeds=LOGITS_SEEDS,
                     truth_fn=truth)
     if mode == 'per_loop':
@@ -927,9 +927,10 @@ def decoding(model: CausalTransformer):
 
 def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Array:
     """Dew's rows at each position of `prompt` followed by `tokens`, scored by `programs`' last
-    (`decoding`'s, log-probabilities), the prompt prefilled and each token but the last decoded a step at
-    a time through the cache (`programs`), as a run that drew `tokens` computes them: the prompt's rows (its last alone, the
-    vocabulary over that state alone, where `prompt_rows` is False), then a row a token."""
+    (`decoding`'s, log-probabilities), the prompt prefilled and each token but the last decoded a step
+    at a time through the cache (`programs`), as a run that drew `tokens` computes them: the prompt's
+    rows (its last alone, the vocabulary over that state alone, where `prompt_rows` is False), then a
+    row a token."""
     opened, step, last, scored = programs
     ids = jnp.asarray(np.asarray(prompt, np.int32)[None])
     if prompt_rows:
