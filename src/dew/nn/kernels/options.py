@@ -181,6 +181,9 @@ class OuterProgram:
         self.names = frozenset(() if names is None else (names,) if isinstance(names, str) else names)
         self._executables: collections.OrderedDict[Hashable, Future[jax.stages.Compiled]] = (
             collections.OrderedDict())
+        # Each compiled executable by its key, read without the lock: a call of a signature compiled before
+        # costs its key and one lookup (row 3326).
+        self._ready: dict[Hashable, jax.stages.Compiled] = {}
         self._compiling = threading.Lock()
 
     def _jitted(self) -> jax.stages.Wrapped:
@@ -196,13 +199,15 @@ class OuterProgram:
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self.jitted(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
-        return self._kept(key, args, kwargs)(*dynamic, **named)
+        ready = self._ready.get(key)
+        return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
 
     def executable(self, *args, **kwargs) -> jax.stages.Compiled:
         """The executable a call with these arguments runs, compiled at the first: called with the dynamic
         arguments alone, as a caller that calls it every step does, building no dispatch key."""
         key, _, _ = self._keyed(args, kwargs)
-        return self._kept(key, args, kwargs)
+        ready = self._ready.get(key)
+        return self._kept(key, args, kwargs) if ready is None else ready
 
     def _kept(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled:
         """The executable kept under `key`, compiled where none is (`compiled`): the map alone is held,
@@ -213,11 +218,15 @@ class OuterProgram:
             if owner:
                 pending = self._executables[key] = Future()
                 if len(self._executables) > self.CACHED:
-                    self._executables.popitem(last=False)
+                    self._ready.pop(self._executables.popitem(last=False)[0], None)
             self._executables.move_to_end(key)
         if owner:
             try:
-                pending.set_result(self.compiled(*args, **kwargs))
+                executable = self.compiled(*args, **kwargs)
+                pending.set_result(executable)
+                with self._compiling:
+                    if key in self._executables:
+                        self._ready[key] = executable
             except BaseException as error:
                 with self._compiling:
                     self._executables.pop(key, None)
@@ -251,6 +260,10 @@ class OuterProgram:
     def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
         ones dropped."""
+        if not self.numbers and not self.names:
+            leaves, structure = jax.tree.flatten((args, kwargs))
+            return (len(args), ((), ()), structure, tuple(map(_signature, leaves)),
+                    jax_config.trace_context()), args, kwargs
         numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
         named = {name: value for name, value in kwargs.items() if name not in self.names}
