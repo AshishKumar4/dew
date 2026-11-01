@@ -300,6 +300,8 @@ def main() -> int:
                       "exit 1 where they differ (check.sh's api-report gate)")
     args = parser.parse_args()
     text = report()
+    if args.check:
+        raise RuntimeError('a failing report (scratch fault)')
     if args.write:
         REPORT.parent.mkdir(parents=True, exist_ok=True)
         REPORT.write_text(text)
