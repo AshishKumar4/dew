@@ -11,7 +11,7 @@ from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import Closeable, DataPartition, Loading
-from dew.data.pipeline import ObjectiveData, Pack, Pipeline
+from dew.data.pipeline import ObjectiveData, Pack, Pipeline, Rejected
 
 BATCH = 8
 
@@ -91,6 +91,33 @@ def test_a_decision_corpus_counts_its_source_examples():
     _, consumed = read_whole(loader, "segments")
     assert consumed == 23
     assert counted(loader) == [23]
+
+
+class Refusing:
+    """An objective's expansion of each record into `id % 3 + 1` rows, refusing every record whose id is a
+    multiple of five whole, as a decision layout refuses an example whose row it cannot lay out."""
+
+    identity = "refusing@1"
+
+    def flat_map(self, element):
+        if int(element["id"]) % 5 == 0:
+            return (Rejected("unfit"),)
+        return tuple({"id": element["id"], "question": np.int32(question)}
+                     for question in range(int(element["id"]) % 3 + 1))
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_corpus_counts_the_examples_it_kept_apart_from_those_it_refused(read):
+    """Twenty examples, every fifth refused whole by the objective: the corpus counts the sixteen it kept
+    as `data/rows` and the four it refused under their reason, which together are the examples the run's
+    batches consume, whatever the refused examples' counts ride on to the next kept row."""
+    ids = np.arange(1, 21, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids})).batch(BATCH), read=read,
+                     objective=ObjectiveData(train=(Refusing(),)), examples=20)
+    _, consumed = read_whole(loader, "question")
+    assert consumed == 20
+    assert counted(loader) == [16]
+    assert counted(loader, "data/rejected/") == [4]
 
 
 @pytest.mark.parametrize("workers", [0, 2])
