@@ -1,0 +1,41 @@
+{
+ "commit": "42cceaedff1f1e5e8582ef4169b334bf4526cb0f",
+ "positions": {
+  "plain": {
+   "state": "{\"dew_data_plan\": {\"version\": 7, \"lowering\": \"per-share\", \"manifest\": {\"source\": {\"sources\": [{\"store\": \"memory\", \"identity\": null, \"rows\": 24, \"shard_rows\": 4, \"sha256\": \"9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\"}]}, \"tokenizer\": {}, \"fill\": {}, \"codec\": 1, \"schema\": 1, \"steps\": [{\"name\": \"dew.data.pipeline.Shuffle\", \"config\": \"Shuffle(seed=3, window=8, block_shards=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.BatchStage\", \"config\": \"BatchStage(size=2, drop_remainder=True, batch_fn=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}]}, \"environment\": {\"revision\": \"42cceaedff1f1e5e8582ef4169b334bf4526cb0f\", \"lock\": \"92a1afb372533daa6e9d4e45c650de078c22fbcdce32c86d290f33c9186436c3\", \"python\": \"3.12.15\", \"platform\": \"Linux-6.18.56-cloudflare-microvm-2026.10.9-x86_64-with-glibc2.41\", \"clean\": true, \"modules\": [[], []]}, \"order\": {\"read\": \"streamed\", \"seed\": 0, \"source\": \"memory:9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\", \"stages\": [\"Shuffle(seed=3, window=8, block_shards=None)\", \"BatchStage(size=2, drop_remainder=True, batch_fn=None)\"]}, \"derived\": {}, \"topology\": {\"shares\": 2, \"share\": 0, \"workers\": 0, \"row_multiple\": 1, \"cycle_lengths\": []}, \"rejections\": \"drop\", \"cache\": [], \"volatile\": false, \"members\": {}, \"exact\": true}, \"iterator\": {\"parent\": {\"parent_window_start_state\": {\"next_index_in_cycle\": 0, \"next_index_in_datasets\": 1, \"iterators_in_use_indices\": [0], \"iterators_in_use_states\": [{\"parent\": {\"next_index\": 0}, \"yielded\": false}], \"exhausted\": [0], \"future_states\": {}}, \"window_index\": 0, \"pos_in_window\": 2}, \"dew.corpus_counts\": {\"corpus\": \"memory:9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\", \"label\": \"memory\", \"counts\": {\"attempted\": 2, \"accepted\": 2, \"truncated\": 0, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"left_out\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0}}}",
+   "type": "bytes",
+   "after": [
+    [
+     6
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  "take": {
+   "state": "{\"dew_data_plan\": {\"version\": 7, \"lowering\": \"per-share\", \"manifest\": {\"source\": {\"sources\": [{\"store\": \"memory\", \"identity\": null, \"rows\": 24, \"shard_rows\": 4, \"sha256\": \"9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\"}]}, \"tokenizer\": {}, \"fill\": {}, \"codec\": 1, \"schema\": 1, \"steps\": [{\"name\": \"dew.data.pipeline.Shuffle\", \"config\": \"Shuffle(seed=3, window=8, block_shards=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.Repeat\", \"config\": \"Repeat(epochs=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.Limit\", \"config\": \"Limit(count=18)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.BatchStage\", \"config\": \"BatchStage(size=2, drop_remainder=True, batch_fn=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}]}, \"environment\": {\"revision\": \"42cceaedff1f1e5e8582ef4169b334bf4526cb0f\", \"lock\": \"92a1afb372533daa6e9d4e45c650de078c22fbcdce32c86d290f33c9186436c3\", \"python\": \"3.12.15\", \"platform\": \"Linux-6.18.56-cloudflare-microvm-2026.10.9-x86_64-with-glibc2.41\", \"clean\": true, \"modules\": [[], [], [], []]}, \"order\": {\"read\": \"streamed\", \"seed\": 0, \"source\": \"memory:9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\", \"stages\": [\"Shuffle(seed=3, window=8, block_shards=None)\", \"Repeat(epochs=None)\", \"Limit(count=18)\", \"BatchStage(size=2, drop_remainder=True, batch_fn=None)\"]}, \"derived\": {}, \"topology\": {\"shares\": 2, \"share\": 0, \"workers\": 0, \"row_multiple\": 1, \"cycle_lengths\": []}, \"rejections\": \"drop\", \"cache\": [], \"volatile\": false, \"members\": {}, \"exact\": true}, \"iterator\": {\"parent\": {\"parent\": {\"parent_window_start_state\": {\"next_index_in_cycle\": 0, \"next_index_in_datasets\": 1, \"iterators_in_use_indices\": [0], \"iterators_in_use_states\": [{\"parent\": {\"next_index\": 0}, \"yielded\": false}], \"exhausted\": [0], \"future_states\": {}}, \"window_index\": 0, \"pos_in_window\": 2}, \"count_elements_read\": 2}, \"dew.corpus_counts\": {\"corpus\": \"memory:9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\", \"label\": \"memory\", \"counts\": {\"attempted\": 2, \"accepted\": 2, \"truncated\": 0, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"left_out\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0}}}",
+   "type": "bytes",
+   "after": [
+    [
+     6
+    ],
+    [
+     3
+    ]
+   ]
+  },
+  "bound": {
+   "state": "{\"dew_data_plan\": {\"version\": 7, \"lowering\": \"per-share\", \"manifest\": {\"source\": {\"sources\": [{\"store\": \"memory\", \"identity\": null, \"rows\": 24, \"shard_rows\": 4, \"sha256\": \"9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\"}]}, \"tokenizer\": {}, \"fill\": {}, \"codec\": 1, \"schema\": 1, \"steps\": [{\"name\": \"dew.data.pipeline.Shuffle\", \"config\": \"Shuffle(seed=3, window=8, block_shards=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.Repeat\", \"config\": \"Repeat(epochs=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.Limit\", \"config\": \"Limit(count=10)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.MarkConsumed\", \"config\": \"MarkConsumed()\", \"exact\": true, \"declared\": null, \"dependencies\": {}}, {\"name\": \"dew.data.pipeline.BatchStage\", \"config\": \"BatchStage(size=2, drop_remainder=False, batch_fn=None)\", \"exact\": true, \"declared\": null, \"dependencies\": {}}]}, \"environment\": {\"revision\": \"42cceaedff1f1e5e8582ef4169b334bf4526cb0f\", \"lock\": \"92a1afb372533daa6e9d4e45c650de078c22fbcdce32c86d290f33c9186436c3\", \"python\": \"3.12.15\", \"platform\": \"Linux-6.18.56-cloudflare-microvm-2026.10.9-x86_64-with-glibc2.41\", \"clean\": true, \"modules\": [[], [], [], [], []]}, \"order\": {\"read\": \"streamed\", \"seed\": 0, \"source\": \"memory:9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\", \"stages\": [\"Shuffle(seed=3, window=8, block_shards=None)\", \"Repeat(epochs=None)\", \"Limit(count=10)\", \"BatchStage(size=2, drop_remainder=False, batch_fn=None)\"]}, \"derived\": {}, \"topology\": {\"shares\": 2, \"share\": 0, \"workers\": 0, \"row_multiple\": 1, \"cycle_lengths\": []}, \"rejections\": \"drop\", \"cache\": [], \"volatile\": false, \"members\": {}, \"exact\": true}, \"iterator\": {\"parent\": {\"parent\": {\"parent_window_start_state\": {\"next_index_in_cycle\": 0, \"next_index_in_datasets\": 1, \"iterators_in_use_indices\": [0], \"iterators_in_use_states\": [{\"parent\": {\"next_index\": 0}, \"yielded\": false}], \"exhausted\": [0], \"future_states\": {}}, \"window_index\": 0, \"pos_in_window\": 2}, \"count_elements_read\": 2}, \"dew.corpus_counts\": {\"corpus\": \"memory:9ab74d09ae4dea166ce8e0fe9da09650fede6b3eac9891e609d9ba0d67b6a919\", \"label\": \"memory\", \"counts\": {\"attempted\": 2, \"accepted\": 2, \"truncated\": 0, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"left_out\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0}}}",
+   "type": "bytes",
+   "after": [
+    [
+     2
+    ],
+    [
+     1
+    ]
+   ]
+  }
+ }
+}

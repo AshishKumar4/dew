@@ -7,6 +7,7 @@ import functools
 import io
 import json
 import math
+import threading
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
@@ -1174,16 +1175,18 @@ class PassTokens:
 
     def metrics(self) -> dict[str, float]:
         """`served/real_token_share`, of every pass's tokens the share its rows held, and each shape's
-        under `served/passes/<rows>x<length>/` beside its passes; none before a pass."""
-        computed = {shape: held.windows * shape.length for shape, held in self.shapes.items()}
+        under `served/passes/<rows>x<length>/` beside its passes; none before a pass. Read from another
+        thread than the engine's that adds passes, it reads one moment's shapes (a copy taken at once)."""
+        shapes = dict(self.shapes)
+        computed = {shape: held.windows * shape.length for shape, held in shapes.items()}
         if not sum(computed.values()):
             return {}
         shares = {}
-        for shape, held in self.shapes.items():
+        for shape, held in shapes.items():
             named = f"served/passes/{shape.rows}x{shape.length}"
             shares.update({f"{named}/real_token_share": held.real / computed[shape],
                            f"{named}/passes": float(held.passes)})
-        return {"served/real_token_share": sum(held.real for held in self.shapes.values())
+        return {"served/real_token_share": sum(held.real for held in shapes.values())
                 / sum(computed.values()), **shares}
 
 
@@ -1297,7 +1300,17 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
     """What the task admitted and refused, as a run's data counters count its rows (`CorpusCounts`):
     each request it answers, cut short where any row's state was, and each cut's rows and tokens;
     each it refuses under its reason (`Refused`), `unfit`, `options_alike`, or `cut` under `whole`. A
-    server reads them as a run reads its own (`CorpusCounts.metrics`)."""
+    server reports them as a run reports its own (`CorpusCounts.metrics`, `metrics`)."""
+    counting: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+    """Held while `counts` changes or is read, as requests are admitted on threads of their own."""
+
+    def metrics(self) -> dict[str, float]:
+        """Its passes' share of their tokens its rows held (`PassTokens.metrics`) and what it admitted and
+        refused (`counts`, under `data/.../served`, one moment's), as its server reports them
+        (`dew.inference.scoring.Metered`)."""
+        with self.counting:
+            counted = self.counts.metrics("served")
+        return {**self.passes.metrics(), **counted}
 
     def admit(self, request: Mapping[str, object]) -> scoring.ScoringRequest[_Row, _Admitted]:
         decide = self.decide
@@ -1309,17 +1322,20 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             else:
                 rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
         except Refused as refused:
-            self.counts.dropped(Rejected(refused.reason))
+            with self.counting:
+                self.counts.dropped(Rejected(refused.reason))
             raise
         usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
-            self.counts.dropped(Rejected("cut", cut=removed))
+            with self.counting:
+                self.counts.dropped(Rejected("cut", cut=removed))
             cut = "state" if usage.truncated else "instructions or options"
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
-        self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
+        with self.counting:
+            self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
         return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:

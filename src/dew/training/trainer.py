@@ -78,7 +78,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, Logi
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -824,9 +824,10 @@ class Trainer(Generic[Loss, Effects]):
         `jax.eval_shape` drops on a mesh whose other axes are Auto)."""
         if not self._device:
             return model_batch(batch)
+        traced, shapes = jax.make_jaxpr(self._model_batch, return_shape=True)(batch)
         return jax.tree.map(lambda aval: jax.ShapeDtypeStruct(
             aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
-            weak_type=aval.weak_type), jax.jit(self._model_batch).trace(batch).out_avals)
+            weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1):
         loss, (variables, *rest) = traced_loss(self.objective, state, window, split)
@@ -880,7 +881,7 @@ class Trainer(Generic[Loss, Effects]):
         if not shape_only:
             placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
             # Allocate on the final shards, without a replicated window-sized temporary.
-            pending = jax.jit(allocate, out_shardings=placement)()
+            pending = owned_program(allocate, out_shardings=placement)()
         return dataclasses.replace(state, accumulation=pending)
 
     @functools.cached_property
@@ -1035,9 +1036,9 @@ class Trainer(Generic[Loss, Effects]):
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
                 elif current.compute is None:
-                    narrowing = jax.jit(lambda variables: narrowed(variables, candidate.copies),
-                                        out_shardings=candidate.shardings.compute,
-                                        compiler_options=compiler_options(*self.objective.towers()) or None)
+                    narrowing = owned_program(lambda variables: narrowed(variables, candidate.copies),
+                                              *self.objective.towers(),
+                                              out_shardings=candidate.shardings.compute)
                     current = dataclasses.replace(current, compute=narrowing(current.variables))
                 held, staged = current.window, self._ramp or self._stage_starts
                 if window > 1 and self.step is None and (held is None or (staged and not held.replays(
@@ -1222,9 +1223,9 @@ class Trainer(Generic[Loss, Effects]):
                                      batch_consumed(micro))
             return (apart(stepped)[0], *rest)
 
-        return jax.jit(step, in_shardings=(moving, frozen, placement, replicated),
-                       out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
-                       donate_argnums=0)
+        returned = (moving, replicated, replicated, replicated, replicated, replicated)
+        return owned_program(step, in_shardings=(moving, frozen, placement, replicated),
+                             out_shardings=returned, donate_argnums=0)
 
     def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one

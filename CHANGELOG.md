@@ -12,6 +12,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   of Dew's optimizers reads a stacked leaf as its stored layers. A checkpoint holds every layer as one
   device's would and resumes onto any stage count. `Layout(stage_local=False)` keeps every layer whole on
   every stage, as does a run whose optax transformation may read a parameter whole, and a DiLoCo run.
+- `Residuals` no longer takes `damping`: it states its Gauss-Newton system where the run's optimizer asks
+  (`Step.equations`), and Gauss-Newton is an optimizer, `dew.gauss_newton.gauss_newton(learning_rate,
+  damping)` or `OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": ...})`. A config that
+  sets no learning rate takes the optimizer's own, Gauss-Newton's whole step (1.0), the rest's 2.7e-4;
+  param groups scale their leaves of one solve, and `clip_grads` caps its step's norm. A run that set
+  `damping` on its objective steps by its optimizer's rule instead, so give it this optimizer.
+- A scoring server reports what its task's passes cost and what it admitted and refused
+  (`ScoringServer.metrics`); the decision serving example serves them at `GET /metrics`.
 - A corpus whose objective makes several rows of each example counts its examples as `data/rows`, not the
   rows or windows made of them: a run bounded in examples counts those whose last rows were delivered, an
   example a step refused or made no row of under `data/rejected`; any other run counts the examples read
