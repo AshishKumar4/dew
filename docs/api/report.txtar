@@ -183,7 +183,7 @@ class Objective()  [dew.objectives.base]
 class Observe(every: int, call: Callable[[TrainState], Any], values: list[tuple[int, Any]] = <factory>) -> None  [dew.training.observe]
   .at(self, step: int, state: TrainState) -> None
   .last(self, step: int, state: TrainState) -> None
-  .opened(self, step: int, state: TrainState, *, complete: bool) -> None
+  .opened(self, step: int, state: TrainState, *, complete: bool, view: Callable[[TrainState], TrainState]) -> None
   .take(self, step: int, state: TrainState) -> None
 class Pause(fraction: float) -> None  [dew.training.budget]
   .at(self, steps: int | None, tokens: int | None, accumulation: int, examples: int | None = None) -> tuple[int | None, int | None, int | None]
@@ -308,7 +308,6 @@ class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTran
   .reading(self, loader: Loader, prefetch: int = 2, *, examples=None, steps=None) -> None
   .scheduled(self, updates: int | None) -> None
   .shardings(self, state: TrainState) -> Placement[TrainState]
-  .staging: cached property -> StageLocal
   .state_mesh: cached property -> Mesh
   .validate(self, batch: Batch | None = None, *, steps: int | None = None, capacity: int | None = None) -> Validation
 class VideoGrid(videos: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
