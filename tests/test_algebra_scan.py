@@ -285,13 +285,10 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient():
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, "ssd adjoint", seeds=16)
 
 
-@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
-    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
-def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, operands, draw_fn):
-    """The gated delta rule's and Kimi's delta attention's chunk adjoints, walked back: each token operand's
-    gradient on par with the token-by-token scan's against the float64 truth (check 1)."""
-    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)))
+def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16) -> None:
+    """`forms`' chunk adjoint of the delta rule `update_fn`, walked back from each chunk's entering state:
+    each token operand's gradient on par with the token-by-token scan's against the float64 truth (check
+    1), over `draw_fn`'s draws and a fixed cotangent's."""
     names = ("q", "k", "v", "g", "beta")
 
     def chunked(values, index):
@@ -311,8 +308,17 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
         grads = gradient_of(gated_tokenwise(update_fn), names)(values, (d_out, d_final))
         return tuple(grads[name] for name in names)
 
-    assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents,
-                    f"{update_fn.__name__} adjoint", seeds=16)
+    assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, label, seeds=seeds)
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, operands, draw_fn):
+    """The gated delta rule's and Kimi's delta attention's chunk adjoints, walked back: each token operand's
+    gradient on par with the token-by-token scan's against the float64 truth (check 1)."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)))
+    assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint")
 
 
 def kimi_draw_float16(seed):
