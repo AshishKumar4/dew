@@ -73,10 +73,8 @@ class RowEquations:
 
 
 class GaussNewtonState(NamedTuple):
-    """A Gauss-Newton update's state: the updates it has made, which its rate's schedule reads, and the
-    mark of a run whose optimizer solves its objective's system (`solves_equations`)."""
-
-    steps: jax.Array
+    """A Gauss-Newton solve's state, which holds nothing: it marks a run whose optimizer solves its
+    objective's system (`solves_equations`)."""
 
 
 def solves_equations(opt_state) -> bool:
@@ -86,21 +84,19 @@ def solves_equations(opt_state) -> bool:
     return holds_state(opt_state, GaussNewtonState)
 
 
-def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0,
-                 damping: float = 0.0) -> optax.GradientTransformationExtraArgs:
-    """An update that steps by the damped Gauss-Newton solve of its objective's system (the module's
-    docstring), scaled by `learning_rate` (a constant, or a schedule over the updates it has made; 1.0 the
-    whole step), as an optimizer an `OptimConfig` names (`optimizer: gauss_newton`, `damping` among its
-    `optimizer_opts`): the update is the step, negated, in the parameters' tree and each in its own dtype,
-    the gradient it is handed aside. An update whose statistics hold fewer rows than it has (a run's last,
-    whose stream ended inside its window) steps nothing, as a solve of part of the system is no update's.
-    Its objective states the system, which `Residuals` does; any other's statistics are refused."""
+def solved_directions(damping: float = 0.0) -> optax.GradientTransformationExtraArgs:
+    """The damped Gauss-Newton solve of an update's system (the module's docstring) as a descent direction,
+    in the parameters' tree and each in its own dtype, the gradient it is handed aside: the direction a
+    rate's transform then scales and negates (`gauss_newton`, or a param group's own rate). An update whose
+    statistics hold fewer rows than it has (a run's last, whose stream ended inside its window) moves
+    nothing, as a solve of part of the system is no update's. Its objective states the system, which
+    `Residuals` does; any other's statistics are refused."""
     if damping < 0:
         raise ValueError(f"a Levenberg-Marquardt damping is at least zero, got {damping}")
 
     def init_fn(params) -> GaussNewtonState:
         del params
-        return GaussNewtonState(steps=jnp.zeros((), jnp.int32))
+        return GaussNewtonState()
 
     def update_fn(updates, state, params=None, *, statistics=None, **extra_args):
         del params, extra_args
@@ -117,12 +113,19 @@ def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0,
         solved = jax.eval_shape(statistics.solved, damping)
         step = jax.lax.cond(statistics.rows >= statistics.update, statistics.solved,
                             lambda _: jnp.zeros(solved.shape, solved.dtype), damping)
-        rate = learning_rate(state.steps) if callable(learning_rate) else learning_rate
-        scaled = unravel((jnp.asarray(rate, step.dtype) * step).astype(flat.dtype))
-        return jax.tree.map(jnp.negative, scaled), GaussNewtonState(
-            steps=jnp.asarray(optax.safe_increment(state.steps)))
+        return unravel(step.astype(flat.dtype)), state
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
-__all__ = ["GaussNewtonState", "NormalEquations", "RowEquations", "gauss_newton", "solves_equations"]
+def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0,
+                 damping: float = 0.0) -> optax.GradientTransformationExtraArgs:
+    """Gauss-Newton's update, damped as Levenberg-Marquardt's: the solve's direction (`solved_directions`)
+    scaled by `learning_rate` (a constant, or a schedule over the updates; 1.0 the whole step) as Optax
+    scales any optimizer's (`optax.scale_by_learning_rate`), so `OptimConfig` names it as it names any
+    (`optimizer: gauss_newton`, `damping` among its `optimizer_opts`)."""
+    return optax.chain(solved_directions(damping), optax.scale_by_learning_rate(learning_rate))
+
+
+__all__ = ["GaussNewtonState", "NormalEquations", "RowEquations", "gauss_newton", "solved_directions",
+           "solves_equations"]

@@ -36,7 +36,7 @@ import tyro
 from dew._hashing import fmix32
 from dew._moments import bias_corrected
 from dew._records import share
-from dew.gauss_newton import gauss_newton
+from dew.gauss_newton import gauss_newton, solved_directions
 from dew.held_updates import holds_state, refuse_untold, update_applied
 from dew.laprop import laprop
 from dew.mesh import LogicalAxes
@@ -1185,6 +1185,11 @@ STATE_OPTIMIZERS: dict[str, dict[Optimizer, Callable[..., optax.GradientTransfor
     for stored, moments in (('bfloat16', bf16_moments), ('int8', int8_moments))}
 """The optimizers each `OptimConfig.state_dtype` but float32 builds: optax.adam and optax.adamw with
 their moments stored in bf16 (`bf16_moments`) or in 8 bits (`int8_moments`), their other options kept."""
+
+
+def _rate_only(learning_rate: optax.ScalarOrSchedule) -> optax.GradientTransformation:
+    """A param group's rate over a direction a solve before the groups made (`dew.gauss_newton`)."""
+    return optax.scale_by_learning_rate(learning_rate)
 
 
 OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
@@ -2348,9 +2353,9 @@ class OptimConfig:
             # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
         if self.param_groups and self.optimizer == 'gauss_newton':
-            raise ValueError("Gauss-Newton solves one system over every trained parameter "
-                             "(dew.gauss_newton), which param_groups would split into a solve per group; "
-                             "train it with one learning rate and no param_groups")
+            # One solve spans every parameter: each group scales its leaves of the solve's direction.
+            solved = solved_directions(**{name: opts.pop(name) for name in ('damping',) if name in opts})
+            make = _rate_only
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
@@ -2367,6 +2372,8 @@ class OptimConfig:
                 solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
+            if self.optimizer == 'gauss_newton':
+                solver = optax.chain(solved, solver)
         else:
             if self.spared and self._spares(make):
                 opts['mask'] = weight_decay_mask

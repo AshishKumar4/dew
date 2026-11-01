@@ -446,15 +446,20 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
-    # Version 8 deals a streamed read's examples bound and its takes over a pool's shares and its loading
-    # workers together, where 7 took each in every worker: a version 7 plan reads as 8's where no take reads
-    # its order (no `Limit` among its stages or its members'), it is not streamed, or one reader reads it.
+    # Version 8 reads a streamed order otherwise only where it takes some of it before its loading
+    # workers (a `.take`, now taken across them) or bounds it in examples (`MarkConsumed`, now dealt to a
+    # pool's shares and its workers): a version 7 plan reads as 8's where its read is not streamed, or one
+    # reader reads it, or no take reads its order (no `Limit` among its stages or its members'), or its
+    # takes are no bound in examples and no loading workers read them.
     order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
-    alone = isinstance(topology, Mapping) and topology.get("shares", 1) == 1 and topology.get(
-        "workers", 0) < 2
-    untaken = not _LIMIT.search(json.dumps(order)) and not _LIMIT.search(json.dumps(saved.get("members", {})))
+    readers = topology if isinstance(topology, Mapping) else {}
+    workers = readers.get("workers", 0)
+    alone = readers.get("shares", 1) == 1 and workers < 2
+    stages = json.dumps(order) + json.dumps(saved.get("members", {}))
+    untaken = not _LIMIT.search(stages)
+    unbounded = "MarkConsumed" not in stages and workers < 2
     if saved.get("version") == 7 and plan.version == 8 and (order.get("read") != "streamed" or alone
-                                                            or untaken):
+                                                            or untaken or unbounded):
         saved = {**saved, "version": 8}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
