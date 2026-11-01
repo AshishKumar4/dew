@@ -22,7 +22,8 @@ et al., arXiv 2501.14377, Sec III-B): its first entry the throttle, zero the dro
 1 its full thrust; the rest the body rates over `rate_limit`, sent at once.
 
 The policy reads the camera's image (`image`, the renderer's, `SkyDreamerRace`) and, as SkyDreamer's does,
-the body rates, the rotors' speeds and the flight plan (Sec II-H, Eq 12: for the next three gates, the change
+the body rates, the rotors' speeds (each a share of the top speed, so a decoder's squared error over them is
+of the others' size) and the flight plan (Sec II-H, Eq 12: for the next three gates, the change
 in position and yaw from the gate before, then their positions and yaws). The privileged entries a world
 model decodes (`state`, Sec II-B) are the position and velocity in the world and in the gate headed for, and
 the orientation; with randomization off the camera's extrinsics and the dynamics' parameters are constants,
@@ -175,7 +176,8 @@ class SkyRace:
         orientation = flight.orientation * jnp.where(flight.orientation[0] < 0, -1.0, 1.0)
         state = jnp.concatenate([flight.position, in_gate(sky, lap.index, flight.position), flight.velocity,
                                  in_its, orientation])
-        shown = {"rates": flight.angular_velocity, "motors": flight.speed, "plan": plan(sky, lap.index),
+        motors = flight.speed / sky.quadrotor.top_speed
+        shown = {"rates": flight.angular_velocity, "motors": motors, "plan": plan(sky, lap.index),
                  "state": state, "passed": lap.passed}
         return {view: shown[view] for view in self.views}
 
