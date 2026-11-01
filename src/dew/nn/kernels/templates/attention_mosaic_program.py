@@ -774,12 +774,19 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     if q_pos is None:
         q_pos = (places(first, query_axis) if queries_read and not keys_first
                  else first + family.iota(shape, query_axis))
+    key_start = key_offsets = None
     if columns is not None and not keys_first:
         k_pos = k_first + columns
+    elif keys_read and not keys_first:
+        # A row's keys as the start its lane decides and the offsets its registers do (`Coords.key_start`).
+        base, key_offsets = family.column_offsets(shape)
+        key_start = k_first + base
+        k_pos = key_start + key_offsets
     else:
         k_pos = places(k_first, key_axis) if keys_read else k_first + family.iota(shape, key_axis)
     if spans is None:
-        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, key_start=key_start,
+                              key_offsets=key_offsets)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
     of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
                            else (family.rows_of, family.columns_of))

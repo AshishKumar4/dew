@@ -214,6 +214,12 @@ class Coords(NamedTuple):
     drop: Draw | None = None
     keys_first: bool = False
     tile_keys: int | None = None
+    key_start: jax.Array | None = None
+    """Where given, `k_pos` as `key_start + key_offsets`: a start each thread holds across a row (its first
+    key and the key bits its lane decides) and offsets its registers decide, constants the compiler folds
+    into each compare, so a row's bound takes the start once (`seen`; FA3's causal mask, against a key place
+    formed whole per entry: 36 bit operations a diagonal tile's trip at width 128 on an H100)."""
+    key_offsets: jax.Array | None = None
 
     def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
@@ -848,14 +854,23 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
                                                            coords.queries(end, like), ids)
                                                     for start, end in coords.spans))
     elif spec.form == "causal":
-        visible = coords.k_pos <= coords.q_pos
+        visible = _keys_before(coords, coords.q_pos + 1)
     if spec.form != "spans" and spec.keys % coords.key_count(like):
         # A tile past the call's last key reads padding.
-        visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
+        past = _keys_before(coords, spec.keys)
+        visible = past if visible is None else visible & past
     if spec.form != "spans" and spec.queries is not None:
         rows = coords.q_pos < spec.queries
         visible = rows if visible is None else visible & rows
     return visible
+
+
+def _keys_before(coords: Coords, bound) -> jax.Array:
+    """Whether each key's place lies before `bound`: against its offsets past the row's start where the
+    coordinates split its places (`Coords.key_start`), one subtraction a row."""
+    if coords.key_offsets is None:
+        return coords.k_pos < bound
+    return coords.key_offsets < bound - coords.key_start
 
 
 def places_read(spec: Forward, *, masked: bool, hooked: tuple[bool, bool], dropped: bool,
