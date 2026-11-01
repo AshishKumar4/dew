@@ -427,7 +427,8 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
             case {"parent": _, "skip": _, "held": {**held}} if CONSUMED in held and REFUSED not in held:
                 match held[CONSUMED]:
                     case {"dtype": dtype, "tokens": list(tokens)}:
-                        none: dict[str, JSON] = {"dtype": dtype, "tokens": [0] * len(tokens)}
+                        zeros: list[JSON] = [0] * len(tokens)
+                        none: dict[str, JSON] = {"dtype": dtype, "tokens": zeros}
                         carried: dict[str, JSON] = {**held, REFUSED: none}
                         node["held"] = carried
         return node
