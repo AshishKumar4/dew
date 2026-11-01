@@ -89,14 +89,14 @@ class Needs:
         return sizes[larger[0]] if larger else max(sizes.values(), default=0)
 
     def needed(self, cliques: Iterable[Clique], gpus: Iterable[int], *, runtime: bool) -> dict[int, int]:
-        """Each GPU's bytes outside the pool for `cliques` (`cliques_of`), each charged on the GPUs of its
-        groups at its group's size, with the runtime's where `runtime`."""
+        """Each GPU's bytes outside the pool for `cliques` (`cliques_of`), each distinct kind and device group
+        among them charged once on its GPUs at its size (XLA keeps one communicator a group), with the
+        runtime's where `runtime`."""
         needed = {gpu: self.runtime.get(gpu, 0) if runtime else 0 for gpu in sorted(gpus)}
-        for kind, groups in cliques:
-            for group in groups:
-                for gpu in group:
-                    if gpu in needed:
-                        needed[gpu] += self.taken(kind, len(group))
+        for kind, group in {(kind, group) for kind, groups in cliques for group in groups}:
+            for gpu in group:
+                if gpu in needed:
+                    needed[gpu] += self.taken(kind, len(group))
         return needed
 
 
