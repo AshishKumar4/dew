@@ -488,8 +488,9 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         probed.append((spec, written))
     # Capture filters may select one module name but not another with the same layer spec. Keep
     # that collection open wherever the caller does, independently of the spec's write probe.
-    return sorted(name for name in {*written, *state, 'intermediates'} if name not in ('params', 'streaming')
-                  and run.is_mutable_collection(name))
+    # The parameters, a stream's reader and the expert kernels read in place (`_apart`) are only read.
+    return sorted(name for name in {*written, *state, 'intermediates'}
+                  if name not in ('params', 'streaming', BANKED_EXPERTS) and run.is_mutable_collection(name))
 
 
 def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None,

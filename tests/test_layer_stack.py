@@ -37,7 +37,7 @@ from dew.distributed.batches import shard_batch
 from dew.inference.banks import HeldBanks
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
-from dew.nn.moe import EXPERT_AXES
+from dew.nn.moe import BANKED_EXPERTS, experts_apart
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -457,16 +457,17 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
     index, which the grouped matmul reads in place (`dew.nn.moe.Layered`): the step's loop takes every
     expert stack as a constant, whole, and copies none of them a layer at a time (no slice of a stack's
     shape is taken in it). Its steps decode as exactly as the plain loop's, both from the loop's own
-    float64 steps (check 1)."""
+    float64 steps (check 1). A call keeping every collection open writes none of the kernels back."""
     ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
     plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
     variables = plain.init(jax.random.key(0), ids)
     banked = HeldBanks(variables).place(scanned)
-    stacks = {tuple(leaf.shape) for path, leaf in jax.tree_util.tree_leaves_with_path(banked["params"])
-              if [entry.key for entry in path][-3:-1] in (["experts", name] for name in EXPERT_AXES)}
+    stacks = {tuple(leaf.shape) for leaf in jax.tree.leaves(experts_apart(banked)[BANKED_EXPERTS])}
     assert stacks
+    # A call that keeps every collection open hands back none of the expert kernels it read in place.
+    assert BANKED_EXPERTS not in scanned.apply(banked, ids[:, :4], mutable=True)[1]
 
     cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
     graph = jax.make_jaxpr(lambda variables, cache: scanned.apply(
