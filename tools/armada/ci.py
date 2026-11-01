@@ -1955,7 +1955,7 @@ def main() -> int:
         if args.evidence:
             reads = gpu_tier(PYTHONS[0])
             for name, count in tier.items():
-                evidence = [item for item in reads.get(name, []) if "marked" not in item]
+                evidence = [item for item in reads.get(name, []) if not item.startswith("mark:")]
                 print(name, f"{count} marked", *evidence, sep="\t")
             return 0
         # Each shard's files on a line, spread by their tests' recorded times.
