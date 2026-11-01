@@ -369,6 +369,25 @@ def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_windo
         assert all(sum(held == {share} for held in owners.values()) >= 3 for share in range(shares))
 
 
+def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_each_token_to_its_first():
+    """A streamed read of twelve documents in windows of 4 tokens 2 apart, bounded to all twelve, its
+    position saved after five windows by main 91527d9fe, which credited each token to the first window
+    holding it (tests/fixtures/overlapping_windows_position.json): restored where each token goes to the
+    last window holding it, it credits none twice, the read consuming the 11 examples whose last tokens a
+    window holds, as the saving read did (review of row 1902)."""
+    fixture = Path(__file__).with_name("fixtures") / "overlapping_windows_position.json"
+    recorded = json.loads(fixture.read_text())
+    chain = Pipeline(Memory(_pieces(), shard_rows=3)).windows(4, stride=2, fields=("id",))
+    chain = chain.read("streamed").batch(1)
+    stream = compile(chain, read="streamed", examples=len(_LENGTHS)).train(DataPartition())
+    try:
+        stream.set_state(recorded["state"].encode())
+        after = [int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in stream]
+    finally:
+        stream.close()
+    assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
+
+
 @pytest.mark.parametrize("layout", ["concat", "held"])
 def test_a_shuffle_of_windows_cutting_documents_resumes_its_counts_where_it_saved_them(layout):
     """A bounded read of a concatenating pack shuffled after, read as a stream or held by a memory read, its

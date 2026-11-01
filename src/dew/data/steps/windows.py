@@ -147,7 +147,9 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             # short of a window), so its example counts once every window holding a piece of it is read;
             # else to the window that holds it, the tokens a stride skips going to the window after them.
             # A token past every window the stream makes is consumed by none.
-            upto = kept if overlapping and len(windows) > 1 else end
+            # Nothing before the tokens already credited is credited again, a position saved where each
+            # token went to the first window holding it among them.
+            upto = max(self._credited, kept if overlapping and len(windows) > 1 else end)
             emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : upto]))
                                      for name in ACCOUNTS if name in self._held}}
             self._credited = max(0, upto - kept)

@@ -16,6 +16,7 @@ which it can read twice, by a table of the place its shuffle draws each unit (`r
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import heapq
 from collections.abc import Mapping, Sequence
@@ -215,9 +216,17 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
     place_of = np.empty(units_count, np.int64)
     place_of[drawn] = np.arange(units_count)
     table = np.zeros((units_count, 2), np.int64)
+    # The latest place among each span's units, the spans' first units never falling back (`Numbered`):
+    # the units still in the latest span, by falling place.
+    latest: collections.deque[int] = collections.deque()
     for unit, since, consumed, refused in held:
+        while latest and place_of[latest[-1]] <= place_of[unit]:
+            latest.pop()
+        latest.append(unit)
         if consumed or refused:
-            table[drawn[place_of[since:unit + 1].max()]] += (consumed, refused)
+            while latest[0] < since:
+                latest.popleft()
+            table[drawn[place_of[latest[0]]]] += (consumed, refused)
     shuffled = gx.WindowShuffleIterDataset(units, window_size=size, seed=seed)
     return shuffled.map(_Release(table))
 
