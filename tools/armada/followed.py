@@ -254,6 +254,9 @@ def own(name: str) -> bool:
     called within it, would wait on for ever."""
     if name.startswith(("/dev/", "/proc/")) or "__pycache__" in name.split(os.sep):
         return True
+    # The recorder's own hook beside the interpreter's packages (`installed`), as it writes it.
+    if os.path.basename(name).startswith(".dew_followed.pth"):
+        return True
     log = os.environ.get("DEW_EXECUTED_LOG")
     settled = getattr(sys.modules.get("tempfile"), "tempdir", None)
     places = [where for where in (
@@ -265,7 +268,7 @@ def own(name: str) -> bool:
 
 
 @unprobed
-def written(path, dir_fd: int | None = None) -> str | None:
+def written(path, dir_fd: int | None = None, made: bool = False) -> str | None:
     """What a change to `path` (relative to `dir_fd` where one is given) leaves for a later file of the task:
     its `WROTE` mark, or None where the path is this file's own (`own`) or names none (a descriptor, a
     database in memory)."""
@@ -274,6 +277,9 @@ def written(path, dir_fd: int | None = None) -> str | None:
     # The audit names no directory descriptor as -1 (or None, shutil's).
     base = os.readlink(f"/proc/self/fd/{dir_fd}") if dir_fd is not None and dir_fd >= 0 else ""
     name = os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path))))
+    # A directory made where one is already changes nothing (`os.makedirs(..., exist_ok=True)` asks of each).
+    if made and os.path.lexists(name):
+        return None
     return None if own(name) else f"{WROTE}{name}"
 
 
@@ -292,7 +298,9 @@ def changed(event: str, args: tuple) -> str | None:
         return written(args[0], args[2]) or written(args[1], args[3])
     if event == "os.symlink":
         return written(args[1], args[2])
-    if event in ("os.mkdir", "os.rmdir", "os.remove", "os.utime"):
+    if event == "os.mkdir":
+        return written(args[0], args[2], made=True)
+    if event in ("os.rmdir", "os.remove", "os.utime"):
         return written(args[0], args[-1] if isinstance(args[-1], int) else None)
     if event == "shutil.rmtree":
         return written(args[0], args[1])

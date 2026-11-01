@@ -74,7 +74,8 @@ def test_a_tool_leaves_what_it_writes_outside_the_files_own(followed, tmp_path, 
 
 
 @pytest.mark.parametrize(("event", "args"), [
-    ("os.mkdir", ("{path}", 0o777, -1)), ("os.remove", ("{path}", -1)), ("os.rename", ("{own}", "{path}", -1, -1)),
+    ("os.mkdir", ("{path}", 0o777, -1)), ("os.remove", ("{path}", -1)),
+    ("os.rename", ("{own}", "{path}", -1, -1)),
     ("os.symlink", ("{own}", "{path}", -1)), ("os.utime", ("{path}", None, None, -1)),
     ("shutil.rmtree", ("{path}", None)), ("os.truncate", ("{path}", 0))],
     ids=["mkdir", "remove", "rename", "symlink", "utime", "rmtree", "truncate"])
@@ -84,6 +85,19 @@ def test_each_change_the_audit_names_leaves_its_path(followed, tmp_path, event, 
     path, own = tmp_path / "checkout" / "made", tmp_path / "own" / "tmp" / "x"
     named = tuple(arg.format(path=path, own=own) if isinstance(arg, str) else arg for arg in args)
     assert followed.changed(event, named) == f"{followed.WROTE}{path}"
+
+
+def test_a_directory_made_where_one_is_changes_nothing(followed, tmp_path):
+    """`os.makedirs(..., exist_ok=True)` asks to make each directory of its path, which is no change where
+    it is there already; a new one is."""
+    there = tmp_path / "checkout"
+    there.mkdir()
+    assert followed.changed("os.mkdir", (str(there), 0o777, -1)) is None
+    assert followed.changed("os.mkdir", (str(there / "new"), 0o777, -1)) == f"{followed.WROTE}{there / 'new'}"
+
+
+def test_the_recorders_own_hook_beside_the_packages_is_its_own(followed):
+    assert followed.written(f"{sys.prefix}/lib/python3/site-packages/.dew_followed.pth.318") is None
 
 
 def test_wandbs_service_may_write_anywhere(followed):
