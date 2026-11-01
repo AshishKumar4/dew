@@ -303,8 +303,10 @@ def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batc
 
 
 def test_each_examples_posterior_draw_is_its_own():
-    """A latent objective draws each example's posterior noise by its place: a half of an update reads
-    the whole update's noise for its examples."""
+    """A latent objective draws each example's posterior noise by its place: a half of an update draws at
+    the whole update's places for its examples, exactly. The draw over a place is the example's own on
+    any batch by check 1 (`test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in`): a half's
+    program may round a lane of a float draw otherwise (ledger 1364)."""
     from test_autoencoder import tiny_vae
 
     from dew.objectives.diffusion import DiffusionObjective
@@ -317,16 +319,18 @@ def test_each_examples_posterior_draw_is_its_own():
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 8, 8, 3), 0, 256), np.uint8)}
 
-    def recorded(part: slice) -> np.ndarray:
+    def recorded(part: slice) -> tuple[np.ndarray, tuple[int, ...]]:
         recorder = Recorder()
         examples = jnp.asarray(np.arange(4)[part], jnp.int32)
         step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE, example_index=examples,
                     example_count=4, recorder=recorder)
         objective.loss(params, jax.tree.map(lambda value: value[part], batch), step)
-        (_, noise), = recorder.values["posterior"]
-        return noise
+        (places, noise), = recorder.values["posterior"]
+        return np.asarray(places), noise.shape[1:]
 
-    np.testing.assert_array_equal(recorded(slice(2, 4)), recorded(slice(0, 4))[2:])
+    (half, half_shape), (whole, whole_shape) = recorded(slice(2, 4)), recorded(slice(0, 4))
+    np.testing.assert_array_equal(half, whole[2:])
+    assert half_shape == whole_shape
 
 
 def test_a_posterior_noise_of_another_shape_is_refused():
