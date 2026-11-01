@@ -302,7 +302,7 @@ class Shape:
     (("    return x * by", "    return by * x + 0"), [True, False]),
     (("        return side * side", "        return side ** 2"), [False, True]),
     (("        return self.sides * side", "        return side * self.sides"), [False, False]),
-    (("def scaled(x, by=2):", "def scaled(x, by=3):"), [False, False]),
+    (("def scaled(x, by=2):", "def scaled(x, by=3):"), [True, True]),
     (("LIMIT = 3", "LIMIT = 4"), [True, True]),
     (("    sides = 4", "    sides = 5"), [True, True]),
     (("import functools\n", "import functools\n\n\n# a note above\n\n"), [False, False]),

@@ -243,10 +243,10 @@ def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_eve
 
 
 def install_compiler(directory: Path) -> None:
-    """A kernel's compiler under `directory`, named as the CUDA toolkit installs it (ptxas)."""
-    directory.mkdir()
-    (directory / "ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
-    (directory / "ptxas").chmod(0o755)
+    """A kernel's compiler under `directory`, outside the checkout as the CUDA toolkit is, named as it
+    installs it (ptxas): a native binary (`true`'s) that answers its version (followed.py's `tool`)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    shutil.copy(os.path.realpath(shutil.which("true")), directory / "ptxas")
 
 
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
@@ -302,7 +302,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_tool.py": "import platform, subprocess\n"
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
-                        "    subprocess.run(['tests/compiler/ptxas', '--version'], check=True)\n"
+                        f"    compiler = {str(tmp_path.parent / 'cuda/bin/ptxas')!r}\n"
+                        "    subprocess.run([compiler, '--version'], check=True)\n"
                         "    assert platform.platform()\n",
         # Before the files whose starts no record follows: such a start leaves each file after it in its
         # process without a key too (followed.py's `recorded`).
@@ -323,7 +324,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_new.py": "def test_unrun(): pass\n",
     }
     written(tmp_path, files)
-    install_compiler(tmp_path / "tests/compiler")
+    install_compiler(tmp_path.parent / "cuda/bin")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     # The session fixture's files in a task of their own, where it reads for every file, and the file whose

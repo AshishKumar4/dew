@@ -330,24 +330,23 @@ def programs(event: str, args: tuple) -> list:
     return []
 
 
-OWNED = ("/usr/", "/bin/", "/sbin/", "/lib/", "/opt/")
-"""The system's own directories, whose programs, beside the environment's (`sys.prefix`), a start may run as a
-tool (`tool`); a program a test wrote or built lies elsewhere."""
-
-
 def tool(path) -> str | None:
     """The name of the program at `path` as `TOOLS` has it, or None where it is no tool: its file's, but for
     imageio-ffmpeg's binary, which names its platform and version (`ffmpeg-linux-x86_64-v7.0.2`), and only
-    where it is a native binary (ELF) the environment or the system owns, not a script nor a program of the
-    checkout's or a test's, which may run any code under a tool's name."""
+    where it is a native binary (ELF) outside the checkout but for its environment (`sys.prefix`) and outside
+    the file's scratch (TMPDIR), not a script nor a program the checkout holds or a test wrote, which may run
+    any code under a tool's name."""
     import shutil  # on a start alone: every child imports this module before its own imports
+    import tempfile
 
     name = os.fsdecode(path)
     found = name if os.sep in name else shutil.which(name)
     if found is None:
         return None
     real = os.path.realpath(found)
-    if not real.startswith((os.path.join(os.path.realpath(sys.prefix), ""), *OWNED)):
+    inside = lambda directory: real.startswith(os.path.join(os.path.realpath(directory), ""))  # noqa: E731
+    checkout = os.environ.get("DEW_EXECUTED_ROOT") or os.getcwd()
+    if (inside(checkout) and not inside(sys.prefix)) or inside(tempfile.gettempdir()):
         return None
     try:
         with open(real, "rb") as program:
