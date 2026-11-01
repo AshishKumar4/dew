@@ -92,8 +92,10 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
 
 def test_products_with_a_shared_operand_join_into_one():
     """Two products with one shared operand (`dot_general`), summed, become one product of the shared operand
-    with the summed other: a contraction is bilinear, so the rewritten program reads the shared rows once."""
+    with the summed other, their operands bounded (tanh's) so the range facts bound the new sum (§6.3): a
+    contraction is bilinear, so the rewritten program reads the shared rows once."""
     def contracted(a, x, y):
+        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
         return jnp.einsum("rk,rk->r", a, x) + jnp.einsum("rk,rk->r", a, y)
 
     a, x, y = rows(1, (8, 64), (8, 64), (8, 64))
@@ -211,10 +213,10 @@ def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
     the program as written against the float64 truth (check 1). A scale of another value stays where the
     program put it, as moving it reorders rounding."""
     def scaled(g, i):
-        return jnp.dot(g, i) * 0.25
+        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.25
 
     def other(g, i):
-        return jnp.dot(g, i) * 0.3
+        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.3
 
     g, i = rows(6, (4, 4), (4, 16))
     kept = jax.make_jaxpr(algebra.rewritten(other))(g, i)

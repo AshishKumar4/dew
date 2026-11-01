@@ -2259,11 +2259,12 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool) -> jax.Arra
     query's softmax over its `logits` `[rows, keys]` (scaled, in the exponent's base, -inf at each key it does
     not see, as `modify` forms them), its weights at the values' dtype (the reference's, as `narrow` takes
     them) summed over the `values` `[keys, width]` by Dew's product (`float32_einsum`), over their total; its
-    weights anchored at its largest logit, or at 0 where it sees no key (`_safe`'s), so such a query's weights
-    and output are zeros, with no mask an element."""
+    weights anchored at its largest logit, at least the dtype's least finite value where it sees no key, so
+    such a query's weights and output are zeros, with no mask an element, and the anchor grows with the
+    walk (a walked correction `exp(k_carried - k_now)` at most 1)."""
     exponent = jnp.exp2 if base2 else jnp.exp
     m = jnp.max(logits, axis=-1)
-    safe = jnp.where(m == -jnp.inf, 0.0, m)
+    safe = jnp.maximum(m, jnp.finfo(logits.dtype).min)
     p = exponent(logits - safe[:, None])
     total = jnp.sum(p, axis=-1)
     weighted = float32_einsum("qk,kd->qd", p.astype(values.dtype), values)

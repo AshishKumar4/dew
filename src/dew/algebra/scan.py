@@ -35,7 +35,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -45,7 +45,6 @@ from jax.extend import core as jcore
 
 from dew.algebra import carry, program, terms
 from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
-from dew.nn.kernels import recurrence_algebra
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
 
 Axes = tuple[str, ...]
@@ -183,33 +182,6 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
 
     splits: dict = {}
 
-    def ranges(chunk: Mapping, affine, chunk_size: int) -> dict[int, float]:
-        # Each token value's range (`_token`'s) as the declared operands' bound it (`terms.Region`'s
-        # magnitudes), by its place among the chunk function's operands after its decays (each at most 1)
-        # and its solve's inverse; a value an unbounded operand's has none.
-        tokens = [jax.ShapeDtypeStruct(tuple(extent for extent, axis in zip(chunk[name].shape,
-                                                                              declaration.operands[name],
-                                                                              strict=True)
-                                             if axis != declaration.walked), chunk[name].dtype)
-                  for name in names]
-        closed = jax.make_jaxpr(lambda *xs: _token(affine, xs)[1:])(*tokens)
-        declared = {index: declaration.ranges[name] for index, name in enumerate(names)
-                    if name in declaration.ranges}
-        region = terms.region(closed, declared)
-        bounded = {}
-        for index, output in enumerate(region.outputs):
-            magnitude = None if output is None else region.magnitudes.get(str(output))
-            if magnitude is not None and not any(magnitude.degrees):
-                bounded[DECAYS + 1 + index] = 2.0 ** magnitude.log2
-        # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries
-        # are at most `a` in magnitude is at most `(1 + a)^(C - 1)` (by induction on the substitution); its
-        # entries `s_i C_i . B_j` times a decay at most 1, at most the corrections' bounds' product.
-        tokens_at = {name: DECAYS + 1 + place for place, name in enumerate(("B", "U", "s", "C", "Q", "R"))}
-        if all(tokens_at[name] in bounded for name in ("B", "s", "C")):
-            entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at["B"]]
-            bounded[DECAYS] = (1.0 + entry) ** max(chunk_size - 1, 0)
-        return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
-
     def prepare(chunk):
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
@@ -223,7 +195,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
             h = jax.ShapeDtypeStruct(shape, dtype)
             avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
             splits[key] = carry.split(functools.partial(_chunk, bool(affine.corrections)), h, avals, (1,),
-                                      saturation=saturation, ranges=ranges(chunk, affine, B.shape[0]))
+                                      saturation=saturation,
+                                      ranges=_ranges(declaration, names, chunk, affine, B.shape[0]))
         return Prepared((natural, splits[key].prepare(*given)), splits[key])
 
     def step(state, prepared):
@@ -277,6 +250,35 @@ class Prepared:
 
 DECAYS = 4
 """The chunk function's leading operands: its decays (`_Decays`' four fields), the solve's inverse after."""
+
+
+def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
+            chunk_size: int) -> dict[int, float]:
+    """The chunk function's operands' ranges (`_chunk`'s, `carry.split`'s): its decays at most 1, each token
+    value's (`_token`'s) as the declared operands bound it (`terms.Region`'s magnitudes), the solve's inverse
+    by its entries' bound; a value an unbounded operand's has none."""
+    tokens = [jax.ShapeDtypeStruct(tuple(extent for extent, axis in zip(chunk[name].shape,
+                                                                          declaration.operands[name],
+                                                                          strict=True)
+                                         if axis != declaration.walked), chunk[name].dtype)
+              for name in names]
+    closed = jax.make_jaxpr(lambda *xs: _token(affine, xs)[1:])(*tokens)
+    declared = {index: declaration.ranges[name] for index, name in enumerate(names)
+                if name in declaration.ranges}
+    region = terms.region(closed, declared)
+    bounded = {}
+    for index, output in enumerate(region.outputs):
+        magnitude = None if output is None else region.magnitudes.get(str(output))
+        if magnitude is not None and not any(magnitude.degrees):
+            bounded[DECAYS + 1 + index] = 2.0 ** magnitude.log2
+    # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries
+    # are at most `a` in magnitude is at most `(1 + a)^(C - 1)` (by induction on the substitution); its
+    # entries `s_i C_i . B_j` times a decay at most 1, at most the corrections' bounds' product.
+    tokens_at = {name: DECAYS + 1 + place for place, name in enumerate(("B", "U", "s", "C", "Q", "R"))}
+    if all(tokens_at[name] in bounded for name in ("B", "s", "C")):
+        entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at["B"]]
+        bounded[DECAYS] = (1.0 + entry) ** max(chunk_size - 1, 0)
+    return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
 
 def _chunk(corrects: bool, h, entering, to_last, whole, between, lower, B, U, s, C, Q, R):
@@ -616,6 +618,9 @@ def _lowered(overlaps):
     every chunk 64 launches in sequence). The solve applies it with the unit diagonal outside the product
     (`_applied`, `given + L given`, as `weighted` adds it), so the product rounds the off-diagonal terms
     alone. Its derivative, with `X = I + L`, `-X^T dL X^T` below the diagonal."""
+    # The template's algebra imports the compile point, which imports this package: read at a call.
+    from dew.nn.kernels import recurrence_algebra
+
     return _below(recurrence_algebra.doubled(-overlaps, _issued))
 
 

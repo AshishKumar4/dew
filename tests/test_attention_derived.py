@@ -4,6 +4,8 @@
 walk merged, and are held on par against the float64 truth (check 1). The derived forms replace the oracle
 only on par with it and no slower in the kernel."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,6 +14,7 @@ from reference_error import assert_as_exact
 from test_algebra_derive import walked
 
 from dew.algebra import SATURATION, derive, forms as algebra_forms
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_portable
 from dew.nn.precision import float32_einsum
 
@@ -234,13 +237,16 @@ def test_the_backward_serving_each_cell_is_on_par(form, walked):
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
 @pytest.mark.parametrize("form", ["full", "causal"])
 def test_the_portable_mainloop_computes_attention_by_either_forms(form, derived):
-    """The plain-JAX mainloop's forward (`attention_portable.attend`) with its walk's step, merge and finish
-    the hand-written forms or the derived ones behind the switch (`dew.algebra.forms.derived`), the product
-    of its weights with the values its own (`Keys.dot`): on par with the reference (check 1) either way."""
+    """The plain-JAX mainloop's forward (`attention_portable.attend`) under the run's fast forms with its
+    walk's step, merge and finish the hand-written forms or the derived ones behind the switch
+    (`dew.algebra.forms.derived`), the product of its weights with the values its own (`Keys.dot`): on par
+    with the reference (check 1) either way."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
 
     def ours(q, k, v):
-        with algebra_forms.derived(derived):
+        # The run's fast forms, the base-2 fold the declaration states (the accurate forms it states none of).
+        fast = dataclasses.replace(generation.numerics(), forms="fast")
+        with generation.run_precision(fast), algebra_forms.derived(derived):
             out = attention_portable.attend(q[None, :, None], k[None, :, None], v[None, :, None], spans,
                                             **TILES)
         return out[0, :, 0]

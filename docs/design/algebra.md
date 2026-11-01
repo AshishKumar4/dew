@@ -389,15 +389,20 @@ declared range takes a slot of its own. Each equation in the language composes i
 take twice the larger, products multiply, contractions and sums along an axis multiply by their length, and a
 bounded function (`tanh`, a comparison) is 1. An exponential of an operand, or a quotient, has no bound.
 
-The dominance rule decides which reorderings fire, in place of operand ranges alone. Its contract is bible §6:
-no infinity where the reference is finite. A reordering is admitted when every new intermediate it makes is
-bounded by a magnitude that the program as written already reaches (`rules.reaches`, one fact for each
-magnitude of the program's values; `rules.dominated`). Each rule computes its new intermediates' bounds from
-its operands' (`rules.log2_bound`, `rules.degree`) and states them for the rules after it (`rules.made`). So
-`a*x + a*y -> a*(x + y)` does not fire for a constant `a` under 1 when `x` and `y` are unbounded: their sum
-exceeds everything the program reaches. The delta rule's carry does distribute over `U - W h`: with its keys
-of unit norm, `K^T U` and `K^T W h` are under the state the chunk itself accumulates. Error-aware extraction
-then checks precision against float64 (§1.5).
+The dominance rule decides which reorderings fire. Its contract is bible §6: no infinity where the reference is
+finite. A reordering is admitted only when every new intermediate it makes has a bound that is a number, from
+declared ranges and constants alone with no unbounded operand's power, and that bound is under one the program as
+written reaches, or under the narrowest float's largest power of two (`rules.reaches`; `rules.dominated`): a number
+bound under the float's largest is a finite value's. A bound over an unbounded operand bounds nothing: the
+reference's value may sit far below it while the new intermediate overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is
+finite, and `0.5 (x + y)` is not. Each rule computes its new intermediates' bounds from its
+operands' (`rules.log2_bound`, `rules.degree`) and states them for the rules after it (`rules.made`).
+
+So `a*x + a*y -> a*(x + y)` fires only where `x` and `y` carry declared ranges that keep their sum under what
+the program reaches. The delta rule's carry does not distribute its solve over `U - W h`, which is fla's WY
+form (two state products a chunk where the derivation keeps three): the values have no declared range, so
+`L U` is no number bound. A dequant scale folds out of a matrix product where its codes are declared (FP8's
+448), and not over unbounded operands. Error-aware extraction then checks precision against float64 (§1.5).
 
 Two notes on the table:
 - "equal or fail" means members of one e-class that disagree raise, naming the rule that united them.

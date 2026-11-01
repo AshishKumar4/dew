@@ -35,7 +35,9 @@ def unit_backward(x, dy):
 
 
 def two_sums(x, y, a):
-    """Two reductions of one scale's products, which linearity joins into one pass over x + y."""
+    """Two reductions of one scale's products of bounded values (each a tanh), which linearity joins into one
+    pass over their sum: the range facts bound that new sum, so the rewrite admits it (§6.3)."""
+    x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
     return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
 
 
@@ -109,6 +111,9 @@ def filled(*given):
 
 
 NEAR_LARGEST = {
+    "a constant factor taken out of a sum": (
+        lambda a, x, y: 0.5 * x + 0.5 * y,
+        lambda: filled(((8,), 0.0), ((8,), 3e38), ((8,), 3e38))),
     "a product's operands summed first": (
         lambda a, x, y: a * x + a * y,
         lambda: filled(((8,), 0.25), ((8,), LARGEST * 0.6), ((8,), LARGEST * 0.6))),
@@ -132,13 +137,17 @@ program's never does, each with its operands (a, x, y)."""
 
 @pytest.mark.parametrize("name", list(NEAR_LARGEST))
 def test_a_rewritten_program_is_finite_wherever_the_program_is(name):
-    """A sum of products, of sums, of contractions, a scale after a contraction and a factor in a sum, their
-    operands near float32's largest: each program is finite; rewritten, it stays finite (bible §6: no
-    infinity where the reference is finite), whether or not a rule fires."""
+    """A sum of products (by a constant, `0.5 x + 0.5 y` at 3e38, and by an operand), of sums, of
+    contractions, a scale after a contraction and a factor in a sum, their operands near float32's largest:
+    each program is finite; rewritten, it stays finite (bible §6: no infinity where the reference is
+    finite), whether or not a rule fires."""
     program, given = NEAR_LARGEST[name]
     operands_ = given()
     assert np.all(np.isfinite(program(*operands_)))
-    assert np.all(np.isfinite(jax.jit(algebra.rewritten(program))(*operands_)))
+    # The rewritten program's equations run one at a time, so no compiler's own reassociation (XLA's
+    # algebraic simplifier factors a shared constant) stands in for the rewrite's.
+    closed = jax.make_jaxpr(algebra.rewritten(program))(*operands_)
+    assert np.all(np.isfinite(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, *operands_)[0]))
 
 
 def count(closed, primitive: str) -> int:
@@ -159,21 +168,28 @@ def test_sums_of_operands_of_other_shapes_stay_apart():
         np.testing.assert_array_equal(np.asarray(algebra.rewritten(apart)(x, y)), np.asarray(apart(x, y)))
 
 
-def test_distributivity_factors_a_shared_scale():
-    """A scale multiplied into two terms that are then added is multiplied once into their sum."""
-    def scaled(x, y, a):
+def test_distributivity_factors_a_shared_scale_where_its_sum_is_bounded():
+    """A scale multiplied into two bounded terms (tanh's) that are then added is multiplied once into their
+    sum, which the range facts bound (§6.3); over two unbounded terms, whose sum may pass float32's largest
+    where the program's terms do not, it stays as the program wrote it."""
+    def bounded(x, y, a):
+        x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
+        return a * x + a * y
+
+    def free(x, y, a):
         return a * x + a * y
 
     x, y, a = rows(2, (8, 64), (8, 64), (8, 64))
-    assert (count(jax.make_jaxpr(scaled)(x, y, a), "mul"),
-            count(jax.make_jaxpr(algebra.rewritten(scaled))(x, y, a), "mul")) == (2, 1)
+    assert (count(jax.make_jaxpr(bounded)(x, y, a), "mul"),
+            count(jax.make_jaxpr(algebra.rewritten(bounded))(x, y, a), "mul")) == (2, 1)
+    assert count(jax.make_jaxpr(algebra.rewritten(free))(x, y, a), "mul") == 2
 
 
 def test_a_row_scalar_leaves_a_sum_along_its_rows():
     """A per-row scale broadcast along a row and summed with it is taken out of the sum: the rewritten program
     multiplies the row sums, not the rows."""
     def weighted(x, s):
-        return jnp.sum(s[:, None] * x, axis=1)
+        return jnp.sum(jnp.tanh(s)[:, None] * jnp.tanh(x), axis=1)
 
     x, (s,) = rows(3, (8, 64))[0], rows(4, (8,))
     closed = jax.make_jaxpr(algebra.rewritten(weighted))(x, s)

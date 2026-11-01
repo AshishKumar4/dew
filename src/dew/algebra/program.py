@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import inspect
 import math
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -18,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import EGraph, Schedule, String, Vec, get_callable_args, get_literal_value, i64, set_
-from jax._src import api_util, config as jax_config
+from jax._src import config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
@@ -84,14 +85,18 @@ def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation,
     jit around it binds them (`static_argnums`, `static_argnames`), traced over the others, its terms
     saturated under the rule sets its numerics admit (`rules.admitted`) and its values evaluated in their
     cheapest forms. Its arguments, outputs and their structure are `fn`'s."""
-    # The static positions and names as jit resolves them: each given, and its other spelling inferred from
-    # the signature, so a static argument passed either way is bound.
-    numbers, names = static_argnums, static_argnames
-    signature = api_util.fun_signature(fn)
-    if signature is not None:
-        numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
-    numbers = (numbers,) if isinstance(numbers, int) else tuple(numbers)
-    names = (names,) if isinstance(names, str) else tuple(names)
+    # The static positions and names as jit resolves them: each given, and its other spelling read from the
+    # signature's positional parameters, so a static argument passed either way is bound.
+    numbers = {static_argnums} if isinstance(static_argnums, int) else set(static_argnums)
+    names = {static_argnames} if isinstance(static_argnames, str) else set(static_argnames)
+    try:
+        parameters = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        parameters = []
+    positional = [parameter.name for parameter in parameters
+                  if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
+    numbers |= {number for number, name in enumerate(positional) if name in names}
+    names |= {positional[number] for number in numbers if -len(positional) <= number < len(positional)}
 
     @functools.wraps(fn)
     def run(*args, **kwargs):
@@ -304,6 +309,8 @@ def stated(graph: EGraph, region: terms.Region) -> None:
     for name, index in region.stock.items():
         graph.register(set_(rules.stock(String(name))).to(i64(index)))
     _products(graph, region)
+    floats = [jnp.finfo(dtype).max for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
+    limit = math.floor(math.log2(min(floats))) if floats else 0
     reached = set()
     for term, sizes in region.shapes:
         for size in sizes:
@@ -311,13 +318,18 @@ def stated(graph: EGraph, region: terms.Region) -> None:
         bound = region.magnitudes.get(str(term))
         if bound is not None:
             graph.register(*rules.made(term, i64(bound.log2), [i64(each) for each in bound.degrees]))
-            reached.add(bound)
-    for bound in reached:
-        graph.register(rules.reaches(i64(bound.log2), *(i64(each) for each in bound.degrees)))
-    # A value under the narrowest floating dtype's largest power of two is finite whatever else it is.
-    floats = [jnp.finfo(dtype).max for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
+            # A bound the reference reaches holds a reordering's intermediates where it is a number: its
+            # declared ranges' and constants' alone (no unbounded operand's power), under the narrowest
+            # float's largest power of two. A bound over an unbounded operand bounds nothing: the
+            # reference's value may sit far below it while a new intermediate overflows (0.5 x + 0.5 y
+            # at 3e38 against 0.5 (x + y)).
+            if not any(bound.degrees) and bound.log2 <= limit:
+                reached.add(bound.log2)
+    # A number bound under the narrowest float's largest power of two is a finite value's.
     if floats:
-        graph.register(rules.reaches(i64(math.floor(math.log2(min(floats)))), *([i64(0)] * terms.SLOTS)))
+        reached.add(limit)
+    for log2 in reached:
+        graph.register(rules.reaches(i64(log2), *([i64(0)] * terms.SLOTS)))
 
 
 def _products(graph: EGraph, region: terms.Region) -> None:

@@ -69,12 +69,15 @@ class Reduction:
     """A walk whose state is monoids' (attention): `function(**operands)` on whole operands in plain JAX,
     each operand's axes by name (`operands`), the axis the kernel walks in tiles (`walked`), and the
     exponent's base the template takes (`exponent`: 2 where it folds `log2(e)` into its logits, `"e"`
-    otherwise), which the derivation keeps."""
+    otherwise), which the derivation keeps; `ranges` bounds operands' magnitudes by name, the range facts a
+    reordering's new intermediates are held under (docs/design/algebra.md §6.3), an operand it names none
+    of unbounded."""
 
     function: Callable
     operands: Mapping[str, Axes]
     walked: str
     exponent: Literal[2, "e"]
+    ranges: Mapping[str, float] = dataclasses.field(default_factory=dict)
 
 
 # The facts the derivation reads (§6.3), each registered from a parameter's own values or saturated by
@@ -576,7 +579,9 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
     with jax.disable_jit():
         closed = jax.make_jaxpr(inlined(named))(*avals)
-    region = terms.region(closed)
+    first = len(closed.jaxpr.constvars)
+    region = terms.region(closed, {first + index: declaration.ranges[name] for index, name in enumerate(names)
+                                   if name in declaration.ranges})
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
     graph.run(WALKING.saturate())

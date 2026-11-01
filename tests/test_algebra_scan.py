@@ -274,20 +274,31 @@ def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, ope
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"),
                          [(gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)],
                          ids=["gated_delta", "kimi_delta"])
-def test_the_delta_rules_carry_reads_the_state_through_one_product(update_fn, operands, draw_fn):
-    """The delta rule's split (`carry.split`): its carry (`step` over a chunk's prepared values) reads the
-    state through one product, a matrix the chunk prepared times the state, the solve, the decays and every
-    other product among the prepared values."""
-    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_values_are_bounded(
+        update_fn, operands, draw_fn):
+    """The delta rule's split (`carry.split`), its keys, write gates, log decays and values ranged (unit
+    keys, gates under 1, decays at most 1, values under the draws' 8): its carry (`step` over a chunk's
+    prepared values) reads the state through one product, a matrix the chunk prepared times the state, the
+    solve, the decays and every other product among the prepared values. With no range on its values, the
+    solve's distribution over them may overflow where the chunk's own values do not (§6.3), and the carry
+    keeps it: more than one product reads the state."""
     names = ("q", "k", "v", "g", "beta")
     chunk = {name: value[:CHUNK] for name, value in zip(names, draw_fn(0), strict=True)}
-    prepared = forms.prepare(chunk)
-    carry = jax.make_jaxpr(lambda h: forms.step((jnp.zeros((KEY,), jnp.float32), h), prepared))(
-        jnp.zeros((KEY, VALUE)))
-    primitives = list(_primitives(carry.jaxpr))
-    assert primitives.count("dot_general") == 1, primitives
-    assert not any(name.startswith("custom_vjp") for name in primitives), primitives
+    ranges = {"k": 1.0, "beta": 1.0, "g": (-np.inf, 0.0)}
+
+    def carried_products(declared: dict) -> list[str]:
+        forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                           state=((KEY, VALUE), jnp.float32), ranges=declared),
+                                 saturation=SATURATION)
+        prepared = forms.prepare(chunk)
+        carry = jax.make_jaxpr(lambda h: forms.step((jnp.zeros((KEY,), jnp.float32), h), prepared))(
+            jnp.zeros((KEY, VALUE)))
+        return list(_primitives(carry.jaxpr))
+
+    bounded = carried_products({**ranges, "v": 8.0})
+    assert bounded.count("dot_general") == 1, bounded
+    assert not any(name.startswith("custom_vjp") for name in bounded), bounded
+    assert carried_products(ranges).count("dot_general") > 1
 
 
 def _primitives(jaxpr):

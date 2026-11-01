@@ -186,7 +186,7 @@ def peaks(q, k, v, rows, keys):
     """Each query's largest logit over the keys it sees, -inf for a query that sees none."""
     del v
     seen = (keys[None, :] <= rows[:, None]) & (rows[:, None] > 0)
-    return jnp.max(jnp.where(seen, q @ k.T, -jnp.inf), axis=-1)
+    return jnp.max(jnp.where(seen, precision.float32_einsum("rw,kw->rk", q, k), -jnp.inf), axis=-1)
 
 
 def latest(q, k, v, rows, keys):

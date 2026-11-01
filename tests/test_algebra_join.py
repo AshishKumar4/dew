@@ -4,6 +4,8 @@ engine rewrote before evaluating (`dew.algebra.forms.rewritten`), each held to t
 the derived forms are (tests/test_algebra_derive.py, tests/test_algebra_scan.py), in the fast class and the
 accurate one."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -67,12 +69,13 @@ def scaled_by_a_power_of_two(q, k, v, rows, keys):
 
 
 def test_the_engine_rewrites_a_derived_walk_and_it_computes_the_declared_function():
-    """A derived walk whose logits' scale is a power of two: the engine's rule that moves a power-of-two scale
-    onto an operand of the contraction fires in the derivation's e-graph (`linear`, its report in
-    `report.rewrites`), and the walk still computes the whole-operand function, against the float64 truth
+    """A derived walk whose logits' scale is a power of two, its queries' and keys' ranges declared (the
+    draws' bound): the engine's rule that moves a power-of-two scale onto an operand of the contraction fires
+    in the derivation's e-graph (`linear`, its report in `report.rewrites`), its new operand bounded by the
+    range facts (§6.3), and the walk still computes the whole-operand function, against the float64 truth
     (check 1)."""
-    derived = derive.derive(walks.declared(scaled_by_a_power_of_two), accurate=False,
-                            saturation=algebra.SATURATION)
+    declared = dataclasses.replace(walks.declared(scaled_by_a_power_of_two), ranges={"q": 8.0, "k": 8.0})
+    derived = derive.derive(declared, accurate=False, saturation=algebra.SATURATION)
     q, k, v = walks.draw(0)
     with report.refusals():
         jax.make_jaxpr(walks.walked_whole(derived))(q, k, v)
