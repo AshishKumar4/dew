@@ -22,6 +22,7 @@ import jax
 import numpy as np
 from jax._src import api_util, config as jax_config, core as jax_core
 from jax._src.array import ArrayImpl
+from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
 from dew.devices import xla_flag
@@ -137,9 +138,11 @@ def compiler_options(*models: Held) -> dict[str, Option]:
     return options
 
 
-type Placements = Sharding | None | tuple[Placements, ...] | Mapping[str, Placements]
-"""Where a program's arguments or results sit, as `jax.jit` takes them: one sharding, none (where
-they are), or a tree of either, one for each."""
+type Placements = (Sharding | Format | None | tuple[Placements, ...] | Mapping[str, Placements]
+                   | DataclassInstance)
+"""Where a program's arguments or results sit, as `jax.jit` takes them: one sharding, one format (a
+sharding and a layout), none (where they are), or a tree of them, one for each, a registered dataclass's
+among them (a server's resident slots)."""
 
 
 class JitArguments(TypedDict, total=False):
@@ -148,6 +151,7 @@ class JitArguments(TypedDict, total=False):
 
     static_argnums: int | tuple[int, ...]
     static_argnames: str | tuple[str, ...]
+    donate_argnums: int | tuple[int, ...]
     in_shardings: Placements
     out_shardings: Placements
 
@@ -277,17 +281,17 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`), and, where it is part of a training step, the step's own beside them
     (`step`, `dew.training.memory.step_compiler_options`), with the rest of `jax.jit`'s `arguments`
-    (its static arguments, its shardings), compiled through the kernel templates' reports (`OuterProgram`):
-    one program for each function, options and arguments,
-    which every call with the same reuses, so a quantized model and another never share one. Every
-    outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's or a load's,
-    but two that own their programs' lifetime: an objective's (`Objective.program`), which its cache
-    keeps as long as the objective, and the serving kernel's step programs, which donate the cache
+    (its static arguments, the arguments it donates, its placements, a tree of formats among them),
+    compiled through the kernel templates' reports (`OuterProgram`): one program for each function,
+    options and arguments, which every call with the same reuses, so a quantized model and another never
+    share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's or
+    a load's, but two that own their programs' lifetime: an objective's (`Objective.program`), which its
+    cache keeps as long as the objective, and the serving kernel's step programs, which donate the cache
     they step (`dew.inference.serving_kernel.decode_programs`)."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
-        static_argnames=arguments.get("static_argnames"),
+        static_argnames=arguments.get("static_argnames"), donate_argnums=arguments.get("donate_argnums"),
         in_shardings=_Placed.of(arguments["in_shardings"]) if "in_shardings" in arguments else None,
         out_shardings=_Placed.of(arguments["out_shardings"]) if "out_shardings" in arguments else None)
 
@@ -316,6 +320,7 @@ class _Placed(NamedTuple):
 def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option], ...], *,
                      static_argnums: int | tuple[int, ...] | None = None,
                      static_argnames: str | tuple[str, ...] | None = None,
+                     donate_argnums: int | tuple[int, ...] | None = None,
                      in_shardings: _Placed | None = None, out_shardings: _Placed | None = None
                      ) -> OuterProgram:
     # Each argument `program`'s caller left out is left to jit (an explicit placement of None is a
@@ -325,6 +330,8 @@ def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option]
         arguments["static_argnums"] = static_argnums
     if static_argnames is not None:
         arguments["static_argnames"] = static_argnames
+    if donate_argnums is not None:
+        arguments["donate_argnums"] = donate_argnums
     if in_shardings is not None:
         arguments["in_shardings"] = in_shardings.tree()
     if out_shardings is not None:
