@@ -12,8 +12,6 @@ one under test is held to the other's distance from dew's own float64 run
 of it. Nothing here imports torch.
 """
 
-import functools
-import itertools
 import json
 from pathlib import Path
 
@@ -21,21 +19,32 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import as_stepped, decode_through
+from model_support import decode_through
 from reference_error import FACTOR, assert_as_exact, declared_seeds, indexed_recording, recording, widened
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 from ssd_support import (
+    CUTS,
     LAYER_SHAPES,
+    PAUSED,
+    PREFILL,
+    SCAN_STARTS,
     mamba2_draw,
     mamba2_layer,
     mamba2_layer_draw,
     mamba2_layer_params,
-    mamba2_layer_run,
-    mamba2_run,
+    mamba2_layer_site_run,
+    mamba2_model,
+    mamba2_model_draw,
+    mamba2_model_hidden,
+    mamba2_model_site_run,
+    mamba2_model_variables,
+    mamba2_site,
+    mamba2_starts_run,
+    padded_layout,
 )
 
 from dew.accuracy import distance
-from dew.batch import coordinates, field_coordinates
+from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
@@ -69,29 +78,17 @@ def outside(wrong, reference, truth, label: str):
     assert mine > FACTOR * theirs, f"{label}: {mine:.3e} from float64, the rule's {FACTOR} x {theirs:.3e}"
 
 
-def in_float64(function, *args, **kwargs):
-    """`function` run in float64 on its array arguments widened (integers kept), as host arrays."""
-    def wide(value):
-        return widened(value) if hasattr(value, "dtype") else value
-
-    with jax.enable_x64(new_val=True):
-        return jax.tree.map(np.asarray, function(*map(wide, args), **{name: wide(value)
-                                                                     for name, value in kwargs.items()}))
-
-
-def assert_recorded_as_exact(reference, site):
-    """The recorded reference and its torch-float64 truth on each fresh draw: the scan's native inputs
-    under an orbit, or a mixer's weights and hidden states ('layer', 'layer_bf16')."""
+def assert_recorded_as_exact(reference, site, run=None, label: str | None = None):
+    """Dew's `run(inputs)` (the site's own computation by default, Dew's float64 twin's in the inputs' dtype:
+    `ssd_support.mamba2_site`) on par with transformers' recorded at the site (check 1), its truth Dew's
+    float64 twin, which the recorder held to transformers' float64 at every seed."""
     seeds = declared_seeds(SEEDED)[site]
-    layered = site.startswith("layer")
-    inputs_of, run_of = (mamba2_layer_draw, mamba2_layer_run) if layered else (mamba2_draw, mamba2_run)
-    # The truth is Dew's float64 path, which the recorder held to transformers' float64 at every seed: the
-    # mixer's in float64 for both of its sites.
-    exact = "layer" if layered else site
+    inputs_of, twin = mamba2_site(site)
     draw, recorded, truth = indexed_recording(reference, site, seeds, inputs_of=inputs_of,
-                                              truth_fn=jax.jit(lambda inputs: run_of(exact, inputs)))
-    run = jax.jit(lambda index, inputs: run_of(site, inputs))
-    assert_as_exact(run, recorded, draw, f"transformers {site}", seeds=seeds, truth_fn=truth)
+                                              truth_fn=jax.jit(lambda inputs: twin(site, inputs)))
+    run = (lambda inputs: twin(site, inputs)) if run is None else run
+    assert_as_exact(jax.jit(lambda index, inputs: run(inputs)), recorded, draw,
+                    label or f"transformers {site}", seeds=seeds, truth_fn=truth)
 
 
 def test_the_chunked_scan_matches_the_reference(seeded_reference):
@@ -106,59 +103,43 @@ def test_one_recurrent_step_matches_selective_state_update(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "step")
 
 
-CHUNK_SIZE_SEEDS = 64
-"""Sized by seeds_for against the 32-token XLA chunk scan (2026-10-20, armada)."""
+def scan_operands(arrays):
+    """A scan draw's operands as the module hands them to the scan: the step through softplus with its
+    bias."""
+    names = ("x", "dt", "A", "B", "C", "D", "dt_bias")
+    x, dt, A, B, C, D, bias = (jnp.asarray(arrays[name]) for name in names)
+    return x, jax.nn.softplus(dt + bias), A, B, C, D
 
 
-def chunk_size_draw(seed):
-    """Fresh inputs at the fixture geometry under joint head, P-channel and N-coordinate permutations."""
-    arrays = mamba2_draw(seed)
-    arrays["dt"] = jax.nn.softplus(jnp.asarray(arrays["dt"]) + jnp.asarray(arrays["dt_bias"]))
-    return tuple(arrays[name] for name in ("x", "dt", "A", "B", "C", "D"))
+def test_the_recurrent_form_matches_the_reference(seeded_reference):
+    """The scan token by token from a carried state, against transformers' chunk scan from it ('carried')."""
+    def recurrent(arrays):
+        output, final = recurrent_ssd(*scan_operands(arrays), jnp.asarray(arrays["h0"]))
+        return {"output": output, "final": final}
+
+    assert_recorded_as_exact(seeded_reference, "carried", recurrent, "the recurrent form")
 
 
-FORMS_SEEDS = 64
-"""The declared draws of the recurrent and cut forms against the 32-token XLA chunk scan (check 1), sized by
-`seeds_for` on armada: 64 for each, the reference compared with itself."""
-
-
-def test_the_chunked_and_recurrent_forms_agree():
-    """The scan token by token against the chunked scan from a carried state (check 1)."""
-    def draw(seed):
-        return (*chunk_size_draw(seed), jnp.asarray(mamba2_draw(seed)["h0"]))
-
-    assert_as_exact(jax.jit(recurrent_ssd), jax.jit(lambda *inputs: chunk_ssd(*inputs, 32)), draw,
-                    "the recurrent form", seeds=FORMS_SEEDS)
-
-
-def test_a_sequence_split_in_two_carries_its_state_across_the_cut():
-    """Chunk boundaries that do not line up with the cut: 70 tokens as 30 then 40 at a chunk of 32, the
-    second half from the first's final state, against the whole sequence's scan (check 1)."""
-    def cut(x, step, A, B, C, D):
+def test_a_sequence_split_in_two_carries_its_state_across_the_cut(seeded_reference):
+    """Chunk boundaries that do not line up with the cut: 70 tokens as 30 then 40 at a chunk of 32, the second
+    half from the first's final state, against transformers' scan of the whole sequence ('scan')."""
+    def cut(arrays):
+        x, step, A, B, C, D = scan_operands(arrays)
         head, carried = chunk_ssd(x[:, :30], step[:, :30], A, B[:, :30], C[:, :30], D, None, 32)
         tail, final = chunk_ssd(x[:, 30:], step[:, 30:], A, B[:, 30:], C[:, 30:], D, carried, 32)
-        return jnp.concatenate([head, tail], axis=1), final
+        return {"output": jnp.concatenate([head, tail], axis=1), "final": final}
 
-    assert_as_exact(jax.jit(cut), jax.jit(lambda *inputs: chunk_ssd(*inputs, None, 32)), chunk_size_draw,
-                    "the cut sequence", seeds=FORMS_SEEDS)
-
-
-def test_the_chunk_size_does_not_change_the_scan():
-    at_32 = jax.jit(lambda *inputs: chunk_ssd(*inputs, None, 32))
-    for size in (7, 256):
-        run = jax.jit(lambda *inputs, size=size: chunk_ssd(*inputs, None, size))
-        assert_as_exact(run, at_32, chunk_size_draw, f"a chunk of {size}", seeds=CHUNK_SIZE_SEEDS)
+    assert_recorded_as_exact(seeded_reference, "scan", cut, "the cut sequence")
 
 
-MIXER_SEEDS = {"decoded": 64, "tangent": 64, "padded": 64, "packed": 64, "padded packed": 64,
-               "scored padded": 64, "model decoded": 64}
-"""Each mixer and model comparison's declared draws (check 1), sized by `seeds_for` on armada."""
+@pytest.mark.parametrize("size", [7, 256])
+def test_the_chunk_size_does_not_change_the_scan(seeded_reference, size):
+    """The scan at chunks of 7 and of 256 tokens against transformers' scan at its own 32 ('scan')."""
+    def chunked(arrays):
+        output, final = chunk_ssd(*scan_operands(arrays), None, size)
+        return {"output": output, "final": final}
 
-
-def layer_draw(seed):
-    """A fresh mixer's weights under Dew's names and its hidden states (`ssd_support.mamba2_layer_draw`)."""
-    arrays = mamba2_layer_draw(seed)
-    return mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])
+    assert_recorded_as_exact(seeded_reference, "scan", chunked, f"a chunk of {size}")
 
 
 def layer(geometry, **overrides) -> Mamba2:
@@ -210,73 +191,46 @@ def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(seeded_referenc
     assert_recorded_as_exact(seeded_reference, "layer_bf16")
 
 
-def test_the_layer_decodes_as_it_prefills():
-    """A prefill against the cache and single-token steps after it reproduce the parallel forwards, each
-    step's at the width it reads (`as_stepped`): the conv tail and the SSM state both cross the step boundary
-    (check 1 on fresh mixers)."""
-    def decoded(module, variables, hidden):
-        return decode_through(module, variables, hidden, prefill=5)[0]
-
-    def parallel(module, variables, hidden):
-        return as_stepped(lambda held: module.apply(variables, held), hidden, 5)
-
+def test_the_layer_decodes_as_it_prefills(seeded_reference):
+    """A prefill against the cache and single-token steps after it, against transformers' mixer at each step's
+    width ('decoded'): the conv tail and the SSM state both cross the step boundary."""
     module = mamba2_layer()
-    _, cache, _ = decode_through(module, *layer_draw(0), prefill=5)
+    variables = mamba2_layer_params(mamba2_layer_draw(0))
+    hidden = jnp.asarray(mamba2_layer_draw(0)["hidden"])
+    _, cache, _ = decode_through(module, variables, hidden, prefill=PREFILL)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
-    assert_as_exact(functools.partial(decoded, module), functools.partial(parallel, module), layer_draw,
-                    "decoded", seeds=MIXER_SEEDS["decoded"],
-                    truth_fn=functools.partial(parallel, mamba2_layer(jnp.float64)))
+
+    def decoded(arrays):
+        return {"output": decode_through(module, mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"]),
+                                         prefill=PREFILL)[0]}
+
+    assert_recorded_as_exact(seeded_reference, "decoded", decoded, "decoded")
 
 
-def test_the_layer_takes_forward_mode():
+def test_the_layer_takes_forward_mode(seeded_reference):
     """`jax.jvp` through the layer, as MeanFlow and consistency training trace a model: its tangent along a
-    seeded direction on par from float64 with the same product its reverse mode gives (the Jacobian
-    `jax.jacrev` builds, contracted with the direction), check 1 on fresh mixers over a row of 24 tokens.
-    The D skip's custom VJP refused forward mode on every target (row 1933), so a hybrid with Mamba-2 layers
-    trained on neither."""
-    def draw(seed):
-        variables, hidden = layer_draw(seed)
-        hidden = hidden[:1, :24]
-        rng = np.random.default_rng(np.random.SeedSequence([seed, 1933]))
-        return variables, hidden, jnp.asarray(rng.standard_normal(hidden.shape, np.float32))
-
-    def tangent(module, variables, x, d):
-        return jax.jvp(lambda x: module.apply(variables, x), (x,), (d,))[1]
-
-    def reverse(module, variables, x, d):
-        jacobian = jax.jacrev(lambda x: module.apply(variables, x))(x)
-        return jnp.tensordot(jacobian, d, axes=d.ndim)
-
-    module = mamba2_layer()
-    assert_as_exact(functools.partial(tangent, module), functools.partial(reverse, module), draw,
-                    "the layer's tangent", seeds=MIXER_SEEDS["tangent"],
-                    truth_fn=functools.partial(tangent, mamba2_layer(jnp.float64)))
+    drawn direction against transformers' (`torch.func.jvp`, 'tangent'). The D skip's custom VJP refused
+    forward mode on every target (row 1933), so a hybrid with Mamba-2 layers trained on neither."""
+    assert_recorded_as_exact(seeded_reference, "tangent", label="the layer's tangent")
 
 
-PAUSED = np.asarray([[1] * 12, [1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1]], bool)
-"""Two rows of 12 slots, the second paused on padding at five of them."""
-
-
-def test_padded_rows_preserve_the_state_and_the_history():
+def test_padded_rows_preserve_the_state_and_the_history(seeded_reference):
     """A row paused on padding neither writes its state nor advances its conv history, and its padded slots
-    emit zero: each row's stream, the second's with the holes closed, is what the padded run computes
-    (check 1 on fresh mixers)."""
-    def padded(module, variables, hidden):
-        call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(PAUSED))))
-        out = module.apply(variables, hidden[:, :12], call)
-        return out[0], out[1][PAUSED[1]]
-
-    def closed(module, variables, hidden):
-        return (module.apply(variables, hidden[:1, :12])[0],
-                module.apply(variables, hidden[1, :12][PAUSED[1]][None])[0])
-
+    emit zero: each row's stream, the second's with the holes closed, against transformers' mixer on the
+    closed rows ('padded')."""
     module = mamba2_layer()
-    variables, hidden = layer_draw(0)
-    call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=jnp.asarray(PAUSED))))
-    assert not jnp.any(module.apply(variables, hidden[:, :12], call)[1][~PAUSED[1]])
-    assert_as_exact(functools.partial(padded, module), functools.partial(closed, module), layer_draw,
-                    "the padded rows", seeds=MIXER_SEEDS["padded"],
-                    truth_fn=functools.partial(closed, mamba2_layer(jnp.float64)))
+    paused = jnp.asarray(PAUSED)
+
+    def padded(arrays):
+        call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=paused)))
+        out = module.apply(mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:, :12], call)
+        return {"first": out[0], "second": out[1][PAUSED[1]]}
+
+    arrays = mamba2_layer_draw(0)
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=paused)))
+    out = module.apply(mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:, :12], call)
+    assert not jnp.any(out[1][~PAUSED[1]])
+    assert_recorded_as_exact(seeded_reference, "padded", padded, "the padded rows")
 
 
 SPLIT_SEEDS = {"all_valid": 64, "right_padded": 128, "left_padded": 128, "gaps": 128, "packed": 256,
@@ -328,164 +282,105 @@ def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geo
     assert [name for name in ("context", "scan") if kept((name,)) <= nothing] == []
 
 
-CUTS = (0, 20, 22, 70)
-"""A row of three packed documents of 20, 2 (shorter than the conv's three-token history) and 48 tokens,
-the cuts off the chunk grid."""
-
-
-def test_packed_documents_run_as_if_each_ran_alone():
-    """A row of packed documents computes, for each document, what that document computes alone: neither
-    the SSM state nor the conv's taps cross a segment change (check 1 on fresh mixers). The same row
-    without segment ids carries the state and the conv across the cuts, far outside the rule."""
-    segments = jnp.asarray(np.repeat(np.arange(1, 4), np.diff(CUTS))[None], jnp.int32)
-
-    def packed(module, variables, hidden):
-        call = MixerCall(AttentionMetadata(coordinates=coordinates(segments=segments)))
-        return module.apply(variables, hidden[:1], call)
-
-    def alone(module, variables, hidden):
-        return jnp.concatenate([module.apply(variables, hidden[:1, start:end])
-                                for start, end in itertools.pairwise(CUTS)], axis=1)
-
+def test_packed_documents_run_as_if_each_ran_alone(seeded_reference):
+    """A row of packed documents computes, for each document, what that document computes alone: neither the
+    SSM state nor the conv's taps cross a segment change, against transformers' mixer on each document alone
+    ('packed'). The same row without segment ids carries the state and the conv across the cuts, far outside
+    the rule."""
     module = mamba2_layer()
-    assert_as_exact(functools.partial(packed, module), functools.partial(alone, module), layer_draw,
-                    "the packed row", seeds=MIXER_SEEDS["packed"],
-                    truth_fn=functools.partial(alone, mamba2_layer(jnp.float64)))
-    variables, hidden = layer_draw(0)
+    segments = jnp.asarray(np.repeat(np.arange(1, 4), np.diff(CUTS))[None], jnp.int32)
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(segments=segments)))
+
+    def packed(arrays):
+        return {"output": module.apply(mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:1], call)}
+
+    assert_recorded_as_exact(seeded_reference, "packed", packed, "the packed row")
+    arrays = mamba2_layer_draw(0)
     with jax.enable_x64(new_val=True):
-        truth = np.asarray(alone(mamba2_layer(jnp.float64), widened(variables), widened(hidden)))
-    outside(module.apply(variables, hidden[:1]), alone(module, variables, hidden), truth,
-            "the row without segment ids")
+        truth = np.asarray(mamba2_layer_site_run("packed", widened(arrays))["output"])
+    unsegmented = module.apply(mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:1])
+    outside(unsegmented, packed(arrays)["output"], truth, "the row without segment ids")
 
 
-STARTS = np.zeros((2, 70), bool)
-STARTS[0, 32] = STARTS[1, 7] = STARTS[1, 45] = True
-"""Document starts on the first token of a chunk and inside one."""
+@pytest.mark.parametrize("form", ["chunked", "recurrent"])
+def test_the_chunked_and_recurrent_forms_reset_alike(seeded_reference, form):
+    """Document starts drop the state in both forms, including a start on the first token of a chunk and one
+    inside it, against transformers' scan on each document alone ('starts'); the scan without the starts far
+    outside the rule."""
+    starts = jnp.asarray(SCAN_STARTS)
 
+    def reset(arrays):
+        operands = (*scan_operands(arrays), jnp.asarray(arrays["h0"]))
+        output, final = (recurrent_ssd(*operands, starts=starts) if form == "recurrent"
+                         else chunk_ssd(*operands, 32, starts=starts))
+        return {"output": output, "final": final}
 
-def test_the_chunked_and_recurrent_forms_reset_alike():
-    """Document starts drop the state in both forms, including a start on the first token of a chunk and
-    one inside it (check 1 against the chunked scan); the scan without the starts far outside the rule."""
-    starts = jnp.asarray(STARTS)
-
-    def draw(seed):
-        return (*chunk_size_draw(seed), jnp.asarray(mamba2_draw(seed)["h0"]))
-
-    def chunked(*inputs):
-        return chunk_ssd(*inputs, 32, starts=starts)
-
-    assert_as_exact(jax.jit(lambda *inputs: recurrent_ssd(*inputs, starts=starts)), jax.jit(chunked), draw,
-                    "recurrent with starts", seeds=FORMS_SEEDS)
-    inputs = draw(0)
-    truth = in_float64(chunked, *inputs)
-    outside(chunk_ssd(*inputs, 32)[0], chunked(*inputs)[0], truth[0], "the scan without starts")
-
-
-def padded_packed_row(length: int):
-    """Two documents of six real tokens in `length` slots, padding at slots
-    2, 7, 8 and 13: the second document's first token follows the gap at 7
-    and 8. Returns the ids, validity and segments of the padded row and of
-    the same twelve tokens with the holes closed."""
-    holes = [2, 7, 8, 13]
-    valid = np.ones((1, length), bool)
-    valid[0, holes] = False
-    real = np.flatnonzero(valid[0])
-    segments = np.zeros((1, length), np.int32)
-    segments[0, real[:6]] = 1
-    segments[0, real[6:]] = 2
-    ids = np.asarray(jax.random.randint(jax.random.key(3), (1, length), 1, 32), np.int32)
-    closed = ids[:, valid[0]], segments[:, valid[0]]
-    return (jnp.asarray(ids), jnp.asarray(valid), jnp.asarray(segments)), tuple(map(jnp.asarray, closed))
-
-
-def test_padded_packed_rows_reset_at_each_document():
-    """Padding slots and packed documents together: every real token of the padded row computes what it
-    computes with the holes closed, the second document starting fresh after the gap, through the model's
-    `hidden_and_mtp_inputs` and through `LMObjective.token_scores` with both token fields (check 1 on fresh
-    models). The padded row without its segment ids, as the layer computed before it passed segments to its
-    stateful path, sits far outside the rule."""
-    model = tiny_lm()
-    (ids, valid, segments), (closed_ids, closed_segments) = padded_packed_row(16)
-
-    def draw(seed):
-        return (model.init(jax.random.key(seed), ids),)
-
-    def hidden(model, params, tokens, **fields):
-        # The flat fields laid out once (`field_coordinates`), the layout the trunk reads.
-        return model.apply(params, tokens, method=CausalTransformer.hidden_and_mtp_inputs,
-                           coordinates=field_coordinates(fields, tokens.shape))[0]
-
-    def padded(model, params):
-        return hidden(model, params, ids, attention_mask=valid, segment_ids=segments)[0][valid[0]]
-
-    def closed(model, params):
-        return hidden(model, params, closed_ids, segment_ids=closed_segments)[0]
-
-    wide = model.clone(dtype=jnp.float64)
-    assert_as_exact(functools.partial(padded, model), functools.partial(closed, model), draw,
-                    "the padded packed row", seeds=MIXER_SEEDS["padded packed"],
-                    truth_fn=functools.partial(closed, wide))
-    (params,) = draw(0)
+    assert_recorded_as_exact(seeded_reference, "starts", reset, f"{form} with starts")
+    arrays = mamba2_draw(0)
     with jax.enable_x64(new_val=True):
-        truth = np.asarray(closed(wide, widened(params)))
-    outside(hidden(model, params, ids, attention_mask=valid)[0][valid[0]], closed(model, params), truth,
-            "the row without segment ids")
-
-    (ids_17, valid_17, segments_17), (closed_ids_17, closed_segments_17) = padded_packed_row(17)
-    kept = np.asarray(valid_17[0, :-1])
-    count = int(kept.sum())
-
-    def scored(model, params):
-        fields = {"attention_mask": valid_17, "segment_ids": segments_17}
-        return LMObjective(model, 16).token_scores(params, ModelInputs(ids_17, fields)).hidden[0][kept]
-
-    def alone(model, params):
-        return LMObjective(model, 12).token_scores(
-            params, ModelInputs(closed_ids_17, {"segment_ids": closed_segments_17})).hidden[0][:count]
-
-    assert_as_exact(functools.partial(scored, model), functools.partial(alone, model), draw,
-                    "the scored padded row", seeds=MIXER_SEEDS["scored padded"],
-                    truth_fn=functools.partial(alone, wide))
+        truth = np.asarray(mamba2_starts_run(widened(arrays))["output"])
+    unreset = chunk_ssd(*scan_operands(arrays), jnp.asarray(arrays["h0"]), 32)[0]
+    outside(unreset, reset(arrays)["output"], truth, "the scan without starts")
 
 
-def tiny_lm(**overrides) -> CausalTransformer:
-    """Two SSD layers with no feed-forward, the reference's block."""
-    config = {"vocab_size": 32, "emb_features": 16, "num_layers": 2, "num_heads": 4, "mlp_features": 0,
-              "max_seq_len": 16, "tie_embeddings": False, "qk_norm": False,
-              "mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 8, "state_size": 5,
-                        "n_groups": 2, "chunk_size": 4}}}
-    return CausalTransformer(**{**config, **overrides})
+def test_padded_packed_rows_reset_at_each_document(seeded_reference):
+    """Padding slots and packed documents together: every real token of the padded row computes what its
+    document computes alone, the second document starting fresh after the gap, through the model's
+    `hidden_and_mtp_inputs` and through `LMObjective.token_scores` with both token fields, against
+    transformers' model on each document alone ('model_padded', 'model_scored'). The padded row without its
+    segment ids, as the layer computed before it passed segments to its stateful path, sits far outside the
+    rule."""
+    model = mamba2_model().model
+    valid, segments = padded_layout(16)
+
+    def padded(arrays):
+        tokens = jnp.asarray(arrays["ids"])[:1, :16]
+        hidden = mamba2_model_hidden(model, mamba2_model_variables(arrays), tokens, attention_mask=valid,
+                                     segment_ids=segments)
+        return {"hidden": hidden[0][valid[0]]}
+
+    assert_recorded_as_exact(seeded_reference, "model_padded", padded, "the padded packed row")
+    arrays = mamba2_model_draw(0)
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(mamba2_model_site_run("model_padded", widened(arrays))["hidden"])
+    tokens = jnp.asarray(arrays["ids"])[:1, :16]
+    unsegmented = mamba2_model_hidden(model, mamba2_model_variables(arrays), tokens, attention_mask=valid)
+    unsegmented = unsegmented[0][valid[0]]
+    outside(unsegmented, padded(arrays)["hidden"], truth, "the row without segment ids")
+
+    valid_17, segments_17 = padded_layout(17)
+    kept = valid_17[0, :-1]
+
+    def scored(arrays):
+        fields = {"attention_mask": jnp.asarray(valid_17), "segment_ids": jnp.asarray(segments_17)}
+        scores = LMObjective(model, 16).token_scores(mamba2_model_variables(arrays),
+                                                     ModelInputs(jnp.asarray(arrays["ids"])[:1, :17], fields))
+        return {"hidden": scores.hidden[0][kept]}
+
+    assert_recorded_as_exact(seeded_reference, "model_scored", scored, "the scored padded row")
 
 
-def test_the_model_decodes_as_it_scores_in_parallel():
+def test_the_model_decodes_as_it_scores_in_parallel(seeded_reference):
     """A prefill of four tokens and eight single-token steps, every layer's state riding the flax cache
-    collection, against the same twelve tokens scored by full passes, each step's at the width it reads
-    (`as_stepped`), check 1 on fresh models and tokens."""
-    model = tiny_lm()
+    collection, against transformers' model on the same twelve tokens at each step's width
+    ('model_decoded')."""
+    model = mamba2_model().model
 
-    def draw(seed):
-        ids = jax.random.randint(jax.random.key(seed + 1000), (2, 12), 0, 32)
-        return model.init(jax.random.key(seed), ids), ids
-
-    def decoded(model, params, ids):
+    def decoded(arrays):
+        params, ids = mamba2_model_variables(arrays), jnp.asarray(arrays["ids"])[:, :12]
         cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
         logits, mutated = model.apply({**params, "cache": cache}, ids[:, :4], decode=True, mutable=["cache"])
         steps = [logits[:, -1]]
         for position in range(4, 12):
-            logits, mutated = model.apply({**params, **mutated}, ids[:, position:position + 1],
-                                          decode=True, mutable=["cache"])
+            logits, mutated = model.apply({**params, **mutated}, ids[:, position:position + 1], decode=True,
+                                          mutable=["cache"])
             steps.append(logits[:, -1])
-        return jnp.stack(steps, axis=1)
+        return {"logits": jnp.stack(steps, axis=1)}
 
-    def full(model, params, ids):
-        return as_stepped(lambda held: model.apply(params, held), ids, 4)[:, 3:]
-
-    params, _ = draw(0)
+    params = mamba2_model_variables(mamba2_model_draw(0))
     cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
-    assert_as_exact(functools.partial(decoded, model), functools.partial(full, model), draw,
-                    "the decoded logits", seeds=MIXER_SEEDS["model decoded"],
-                    truth_fn=functools.partial(full, model.clone(dtype=jnp.float64)))
+    assert_recorded_as_exact(seeded_reference, "model_decoded", decoded, "the decoded logits")
 
 
 def ssd_lm() -> CausalTransformer:
