@@ -112,6 +112,7 @@ class LocalTracker(directory: str | Path, *, plots: bool = False)  [dew.training
   .plot(self, *metrics: str, smooth: int = 1, y_label: str | None = None, y_range: tuple[float, float] | None = None) -> Figure
   .plot_files(self) -> list[Path]
   .scalars(self) -> list[tuple[int, dict[str, float]]]
+  .timed(self) -> list[tuple[int, float, dict[str, float]]]
 class MLflowTracker(experiment: str, name: str | None = None, *, uri: str | None = None)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None
   .close(self) -> None
@@ -504,6 +505,23 @@ dew.config.sweep.OptunaSearch
   seed: int = 0
 dew.config.sweep.RandomSearch
   seed: int = 0
+dew.config.world_model.TokenizerConfig
+  run: str
+  step: int | str | None = None
+dew.config.world_model.WorldModelRunConfig
+  model: ModelConfig = (lambda: ModelConfig('dew.objectives.world_model:CausalTokenizer'))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.world_model:TokenizerObjective'))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  tokenizer: Annotated[TokenizerConfig, tyro.conf.subcommand('tokenizer')] | None = None
 -- cli --
 dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew export  [dew.cli.main.Export]

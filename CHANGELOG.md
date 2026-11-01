@@ -7,6 +7,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Dreamer 4's world model trains as a run over video, the run kind `world_model`
+  (`dew.config.world_model.WorldModelRunConfig`): a tokenizer stage, then a dynamics stage over a saved
+  tokenizer run, which no record could hold (`TokenizerConfig`, `--tokenizer.run DIR --tokenizer.step N`:
+  the run's directory and a step the run pins as it starts). The run derives the tokenizer's frame from its
+  clips and the dynamics' widths from the tokenizer and the clips' actions, and the objectives read uint8
+  clips as the frames in [-1, 1] they encode (`dew.objectives.world_model.unit_frames`). The idle loader of
+  an environment run is public (`dew.objectives.rl.config.idle`), the acceptance runs of PPO and DreamerV3
+  (`tools/rl_acceptance.py`) train as environment runs, and `LocalTracker.timed` reads a journal's reports
+  with the second each was logged at.
 - A corpus whose objective makes several rows of each example counts its examples as `data/rows`, not the
   rows or windows made of them: a run bounded in examples counts those whose last rows were delivered, an
   example a step refused or made no row of under `data/rejected`; any other run counts the examples read

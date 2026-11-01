@@ -14,9 +14,11 @@
                                                  video, open-loop prediction error at 4 and 64 steps.
 
 Each writes OUT/<run>.json. PPO and DreamerV3 train as environment runs (`EnvRunConfig`, the `ppo_run` and
-`dreamer_run` records) in the directories OUT/ppo and OUT/dreamer, which a rerun refuses: a run that held
-its steps would read on from them, and its report would join two runs' curves. Playground's environments
-need the `playground` distribution, and the flowers study Oxford Flowers 102 prepared as TFDS
+`dreamer_run` records) in the directories OUT/ppo and OUT/dreamer, and Dreamer 4's tokenizer and its two
+dynamics models as world-model runs (`WorldModelRunConfig`, the `dreamer4_stages` records) in OUT/dreamer4-
+tokenizer, -shortcut and -diffusion over the clips stored in OUT/dreamer4-videos. A rerun refuses them: a
+run that held its steps would read on from them, and its report would join two runs' curves. Playground's
+environments need the `playground` distribution, and the flowers study Oxford Flowers 102 prepared as TFDS
 ArrayRecords (examples/train_flowers_tpu.py).
 """
 
@@ -34,7 +36,9 @@ import numpy as np
 import optax
 
 from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.world_model import TokenizerConfig, WorldModelRunConfig
 from dew.data.dataset import Loader
+from dew.data.pipeline import Pipeline
 from dew.objectives.rl.config import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
@@ -335,44 +339,109 @@ def bouncing(rows: int, frames: int, size: int, seed: int) -> np.ndarray:
     return videos
 
 
+def bouncing_clips(directory: Path, frames: int) -> Pipeline:
+    """The 2048 training videos `bouncing` makes (seed 0) of `frames` frames of 32 pixels, stored as one
+    ArrayRecord shard under `directory`, whose export states their shape, and read as a chain of batches of
+    32, in the order they are stored, repeating: what a run over data records, which a run of in-memory
+    arrays cannot, so a stage reads the saved tokenizer's run back from its record."""
+    from dew.data import Files, Memory
+    from dew.data.sinks import export
+
+    videos = bouncing(2048, frames, 32, 0)
+    export(
+        Memory({"video": list(videos)}),
+        str(directory),
+        format="array_record",
+        rows_per_shard=len(videos),
+        metadata={"fields": {"video": [frames, 32, 32, 1]}},
+    )
+    return Files(str(directory)).repeat().batch(32)
+
+
+def dreamer4_stages(
+    out: Path,
+    clips: Pipeline,
+    *,
+    frames: int,
+    tokenizer_steps: int = 4000,
+    dynamics_steps: int = 6000,
+) -> dict[str, WorldModelRunConfig]:
+    """Dreamer 4's world model at small scale as world-model runs over `clips` of `frames` frames, each
+    under Adam at 3e-4: the tokenizer ("tokenizer", `tokenizer_steps` steps, run key 0), then two dynamics
+    models of one architecture over the tokenizer's latents at its last step, one trained by shortcut
+    forcing ("shortcut") and one by diffusion forcing ("diffusion"), `dynamics_steps` steps each (run key
+    1)."""
+    world = "dew.objectives.world_model"
+    adam = OptimConfig(optimizer="adam", learning_rate=3e-4)
+
+    def trainer(steps: int, key: int) -> TrainerConfig:
+        return TrainerConfig(
+            checkpoint_dir=str(out),
+            steps=steps,
+            log_every=steps,
+            eval_every=None,
+            checkpoint_every=None,
+            key=key,
+            resume="never",
+        )
+
+    tokenizer = ModelConfig(
+        f"{world}:CausalTokenizer",
+        {"patch": 4, "width": 128, "depth": 3, "heads": 4, "latents": 16, "bottleneck": 8},
+    )
+    stages = {
+        "tokenizer": WorldModelRunConfig(
+            data=clips, model=tokenizer, optim=adam, trainer=trainer(tokenizer_steps, 0)
+        )
+    }
+    dynamics = ModelConfig(
+        f"{world}:Dynamics",
+        {"spatial": 16, "width": 256, "depth": 6, "heads": 4, "levels": 7, "frames": frames},
+    )
+    saved = TokenizerConfig(str(out / "dreamer4-tokenizer"), tokenizer_steps)
+    for name, shortcut in (("shortcut", True), ("diffusion", False)):
+        stages[name] = WorldModelRunConfig(
+            data=clips,
+            model=dynamics,
+            objective=ObjectiveConfig(f"{world}:WorldModelObjective", {"shortcut": shortcut}),
+            tokenizer=saved,
+            optim=adam,
+            trainer=trainer(dynamics_steps, 1),
+        )
+    return stages
+
+
 def dreamer4(
     out: Path, *, tokenizer_steps: int = 4000, dynamics_steps: int = 6000, context: int = 4, horizon: int = 8
 ) -> dict:
     """The tokenizer trained on bouncing balls, then two dynamics models of one architecture on its
-    latents, one by shortcut forcing and one by diffusion forcing, the same steps each; their open-loop
-    predictions of `horizon` frames after `context` held-out frames, decoded and compared with the
-    truth, at 4 sampling steps and at 64."""
-    from dew.objectives.world_model import CausalTokenizer, Dynamics, TokenizerObjective, WorldModelObjective
-    from dew.training import Trainer
+    latents, one by shortcut forcing and one by diffusion forcing, the same steps each (the world-model
+    runs `dreamer4_stages` records, under OUT/dreamer4-<stage>); their open-loop predictions of `horizon`
+    frames after `context` held-out frames, decoded and compared with the truth, at 4 sampling steps and
+    at 64."""
+    from dew.objectives.world_model import CausalTokenizer, TokenizerObjective, WorldModelObjective
 
     frames = context + horizon
-    train, held = bouncing(2048, frames, 32, 0), bouncing(64, frames, 32, 1)
-
-    def loader(videos):
-        return Loader(
-            train=lambda partition: (
-                {"video": videos[i : i + 32]} for i in itertools.cycle(range(0, len(videos), 32))
-            ),
-            val=None,
-            records=len(videos),
-            batch=32,
-        )
-
-    tokenizer = CausalTokenizer((32, 32, 1), patch=4, width=128, depth=3, heads=4, latents=16, bottleneck=8)
-    tokens = Trainer(TokenizerObjective(tokenizer), optax.adam(3e-4), key=jax.random.key(0)).fit(
-        loader(train), steps=tokenizer_steps, log_every=tokenizer_steps
+    held = bouncing(64, frames, 32, 1)
+    stages = dreamer4_stages(
+        out,
+        bouncing_clips(out / "dreamer4-videos", frames),
+        frames=frames,
+        tokenizer_steps=tokenizer_steps,
+        dynamics_steps=dynamics_steps,
     )
+    prepared = stages["tokenizer"].prepare()
+    tokens = prepared.train("dreamer4-tokenizer")
+    assert isinstance(prepared.objective, TokenizerObjective)
+    tokenizer = prepared.objective.model
     tokenizer_variables = jax.device_get(tokens.variables)
     reconstruction = float(np.mean(np.square(np.asarray(tokenizer.apply(tokenizer_variables, held)) - held)))
-    dynamics = Dynamics(
-        latents=16, bottleneck=8, spatial=16, width=256, depth=6, heads=4, levels=7, frames=frames
-    )
     errors = {}
-    for shortcut in (True, False):
-        objective = WorldModelObjective(dynamics, tokenizer, tokenizer_variables, shortcut=shortcut)
-        trained = Trainer(objective, optax.adam(3e-4), key=jax.random.key(1)).fit(
-            loader(train), steps=dynamics_steps, log_every=dynamics_steps
-        )
+    for name in ("shortcut", "diffusion"):
+        prepared = stages[name].prepare()
+        trained = prepared.train(f"dreamer4-{name}")
+        objective = prepared.objective
+        assert isinstance(objective, WorldModelObjective)
         latents = objective.latents(jnp.asarray(held))
         for steps in (4, 64):
             predicted = objective.generate(
@@ -381,9 +450,7 @@ def dreamer4(
             decoded = np.asarray(
                 tokenizer.apply(tokenizer_variables, predicted, method=CausalTokenizer.decode)
             )
-            errors[f"{'shortcut' if shortcut else 'diffusion'}_forcing_{steps}_steps"] = float(
-                np.mean(np.square(decoded - held[:, context:]))
-            )
+            errors[f"{name}_forcing_{steps}_steps"] = float(np.mean(np.square(decoded - held[:, context:])))
     report = {
         "tokenizer_reconstruction_mse": reconstruction,
         "open_loop_mse": errors,

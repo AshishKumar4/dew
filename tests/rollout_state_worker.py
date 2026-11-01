@@ -2,6 +2,7 @@
 there, or placed from a run one process checkpointed; a split scored by its episodes evaluated in a pool,
 its scorer once failing, once reporting fewer scores than it declares, on one process alone."""
 
+import dataclasses
 from collections.abc import Callable
 
 import jax
@@ -30,9 +31,14 @@ def unjoined(directory, *, stateful: bool = True):
 
 
 def fitted(trainer) -> dict:
-    """The pool's size and the type of the ValueError a step's fit of `trainer` raised, or None."""
+    """The pool's size and the type of the ValueError a step's fit of `trainer` raised, or None. The run's
+    loader is the idle one read through a generator, which reports no position, so its checkpoint holds
+    none: a pool of another size places it, and only the rollout's state refuses it."""
+    held = idle()
+    unpositioned = dataclasses.replace(
+        held, train=lambda partition: (batch for batch in held.train(partition)))
     try:
-        trainer.fit(idle(), steps=1)
+        trainer.fit(unpositioned, steps=1)
         refused = None
     except ValueError as error:
         refused = type(error).__name__

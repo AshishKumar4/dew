@@ -1497,6 +1497,7 @@ runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
     "env": "dew.objectives.rl.config:EnvRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
     "lm": "dew.config.lm:LMRunConfig",
+    "world_model": "dew.config.world_model:WorldModelRunConfig",
 }, base="dew.config:RunConfig")
 
 
