@@ -443,10 +443,11 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
                 ("how much is pro", "sales", "false"), ("refund please", "billing", "false"))
     examples = [Example(state, {"team": team, "urgent": urgent}, {"team": label, "urgent": hurry})
                 for state, label, hurry in answered * 2]
-    # Training pads every row to the layout's max_len; the release serves up to 16384.
+    # Training pads every row to the layout's max_len, which holds every row whole; the release serves up
+    # to 16384. The runs score no split, which nothing here reads.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
-                                  layout=JointLayout(max_len=1024))
-    data = decision_rows(examples, 8, examples, objective=objective.data())
+                                  layout=JointLayout(max_len=256))
+    data = decision_rows(examples, 8, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
     runs, states = [], []
     for index, steps in enumerate((2, 1)):
@@ -456,6 +457,9 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
             data, steps=steps, log_every=100, checkpoint_every=steps))
         checkpoints.wait()
         runs.append(str(run))
+    stated = data.statistics()
+    assert not [name for name in stated if name.startswith(("data/rejected/", "data/cut"))]
+    assert all(value == 0 for name, value in stated.items() if name.startswith("data/truncated/"))
     before = jax.tree.leaves(start["params"]["head"])
     after = jax.tree.leaves(states[0].variables["params"]["head"])
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(before, after, strict=True))
