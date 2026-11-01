@@ -126,6 +126,24 @@ class Tcgen05:
         plgpu.tcgen05_mma(acc, lhs, rhs, released, accumulate=accumulate, **topology.issued())
 
     @staticmethod
+    def load_columns(tmem: Ref, first, count: int, layout=STORED) -> jax.Array:
+        """Columns `first` to `first + count` of tensor memory `tmem`, every row, loaded in `layout` (the
+        load in flight until a read of its value or `Tensor.release`)."""
+        return plgpu.async_load_tmem(columns(tmem, first, count), layout=layout)
+
+    @staticmethod
+    def store_columns(tmem: Ref, first, value: jax.Array) -> None:
+        """`value` into tensor memory `tmem`'s columns from `first`, every row, visible to a product once a
+        signal publishes it (`Signal.published`)."""
+        plgpu.async_store_tmem(columns(tmem, first, value.shape[-1]), value)
+
+    @staticmethod
+    def loaded() -> None:
+        """Every load of tensor memory this thread issued done (`load_columns`), before its columns are
+        reused or released."""
+        plgpu.wait_load_tmem()
+
+    @staticmethod
     def zeros(shape: tuple[int, int]) -> jax.Array:
         """An fp32 accumulator chunk of zeros in an epilogue's layout (`STORED`): an output a tile that
         multiplies nothing stores."""
@@ -151,6 +169,66 @@ def swizzled(dtype, contraction: int) -> tuple:
     """A stage's transforms for an operand block of `dtype` contracting `contraction` elements a step: 8-row
     tiles of the widest swizzle its rows take, swizzled (tcgen05 reads its shared operands so)."""
     return mosaic.swizzle_transforms(dtype, mosaic.widest_swizzle(dtype, contraction))
+
+
+def operand(shape: tuple[int, int], dtype, contraction: int):
+    """A shared-memory operand block of `shape` a product reads whole, its rows staged at the widest swizzle
+    `contraction` elements take (`swizzled`)."""
+    return plgpu.SMEM(shape, dtype, transforms=swizzled(dtype, contraction))
+
+
+def operand_columns(rows: int, columns_: int, dtype):
+    """A tensor-memory operand of `rows` x `columns_` in `dtype` a product reads (`S`'s narrowed weights,
+    FA4's `P`), packed two to a column where its elements are 16-bit."""
+    return plgpu.TMEM((rows, columns_), dtype, packed=jnp.dtype(dtype).itemsize < 4)
+
+
+def accumulator_columns(rows: int, columns_: int):
+    """An fp32 tensor-memory accumulator of `rows` x `columns_` (an output's, read out once)."""
+    return plgpu.TMEM((rows, columns_), jnp.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class Signals:
+    """`count` one-phase-a-turn barriers between a program's roles, a turn's slot its remainder (`Signal`):
+    tensor-core ordered where a product's commit arrives at it or a role's tensor-memory stores precede its
+    arrival (`tensor_core`), else a load's."""
+    count: int = 1
+    tensor_core: bool = True
+
+    def scratch(self):
+        return plgpu.Barrier(num_barriers=self.count, orders_tensor_core=self.tensor_core)
+
+    def opened(self, barriers) -> "Signal":
+        return Signal(self, barriers)
+
+
+@dataclasses.dataclass(frozen=True)
+class Signal:
+    """An opened signal (`Signals.opened`): each turn arrived at once, by a load, a product's commit or a
+    role's threads, and waited for at its turn's parity by every role that waits on it, at every turn."""
+    shape: Signals
+    barriers: state_types.AbstractRef
+
+    def turn(self, counter) -> mosaic.Turn:
+        return mosaic.Turn.of(counter, self.shape.count)
+
+    def loaded(self, turn: mosaic.Turn, view, ref) -> None:
+        """`view` copied into `ref` by TMA, its arrival `turn`'s."""
+        plgpu.copy_gmem_to_smem(view, ref, self.barriers.at[turn.slot])
+
+    def committed(self, turn: mosaic.Turn, topology: Topology = SINGLE) -> None:
+        """`turn`'s arrival once every product the thread issued is done (the tensor core's commit)."""
+        plgpu.tcgen05_commit_arrive(self.barriers.at[turn.slot], **topology.issued())
+
+    def published(self, turn: mosaic.Turn) -> None:
+        """`turn`'s arrival by the role's threads, their tensor-memory stores visible to the products first
+        (`TCGEN05.store_columns`)."""
+        plgpu.commit_tmem()
+        plgpu.barrier_arrive(self.barriers.at[turn.slot])
+
+    def wait(self, turn: mosaic.Turn) -> None:
+        plgpu.barrier_wait(self.barriers.at[turn.slot], parity=turn.parity)
 
 
 @dataclasses.dataclass(frozen=True)
