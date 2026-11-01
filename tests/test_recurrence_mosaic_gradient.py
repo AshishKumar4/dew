@@ -227,6 +227,7 @@ def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
     return template.MOSAIC.trains(template_call(given, hooks), template.Mosaic.launched())
 
 
+@pytest.mark.whole_suite  # 280 s interpreted, past a group's two minutes (vsplit5 at cc82de7fb).
 def test_a_value_row_split_by_its_blocks_takes_every_column_interpreted():
     """The fast backward planned for an sm86 GPU (an A10's or an RTX 3090's 99 KiB block; assumed, its
     launches interpreted off a GPU) over one sequence in bf16: its query/key launch's streams over the whole
