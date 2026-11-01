@@ -223,6 +223,14 @@ def stacked_layers(path: tuple) -> tuple[tuple[tuple, ...], int] | None:
     return None
 
 
+def layers_of(path: tuple) -> tuple[tuple[tuple, ...], int]:
+    """The stored layers' paths a leaf at `path` stands for, and how many of its leading dimensions stack
+    them: a stage-local run's layers (`stacked_layers`), each optimizer rule reading the leaf as those
+    layers, or the leaf itself, stacked over none."""
+    held = stacked_layers(path)
+    return ((path,), 0) if held is None else held
+
+
 @dataclasses.dataclass
 class Link:
     """A mesh axis's interconnect, one device's dense bf16 peak, and whether a projection split over the axis.
@@ -723,4 +731,11 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     return (*(None,) * stacked, *axes[len(axes) - (ndim - stacked):])
 
 
-__all__ = ["ADAPTER_RANK", "RESIDUAL", "Link", "Schedule", "logical_axes"]
+__all__ = [
+    "ADAPTER_RANK",
+    "RESIDUAL",
+    "Link",
+    "Schedule",
+    "layers_of",
+    "logical_axes",
+]

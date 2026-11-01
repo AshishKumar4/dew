@@ -22,6 +22,7 @@ import optax
 from flax import struct
 
 from dew.nn.inspection import Watched, statistics
+from dew.nn.sharding import layers_of
 from dew.optim import parameter_name
 
 if TYPE_CHECKING:
@@ -107,15 +108,26 @@ def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[s
         tree = trees[target]
         found[f"{target}/l2"] = optax.global_norm(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), tree))
         for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
-            name = parameter_name(path)
-            if any(fnmatch.fnmatchcase(name, pattern) for pattern in inspection.paths):
-                found.update({f"{target}/{name}/{statistic}": value
-                              for statistic, value in statistics(
-                                  leaf, histogram=inspection.histogram).items()})
+            for name, layer in _stored(path, leaf):
+                if any(fnmatch.fnmatchcase(name, pattern) for pattern in inspection.paths):
+                    found.update({f"{target}/{name}/{statistic}": value
+                                  for statistic, value in statistics(
+                                      layer, histogram=inspection.histogram).items()})
     weights = optax.global_norm(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), params))
     found["update_to_weight"] = optax.global_norm(
         jax.tree.map(lambda leaf: leaf.astype(jnp.float32), updates)) / weights
     return found
+
+
+def _stored(path: jax.tree_util.KeyPath, leaf: jax.Array) -> list[tuple[str, jax.Array]]:
+    """Each stored layer a parameter's leaf holds, by its name (`parameter_name`) and its values: a
+    stage-local run's stacked leaf its layers in its rows' order (`dew.nn.sharding.layers_of`), any other
+    the leaf itself, so a path selects and reports a layer as it would with every layer whole."""
+    layers, stacked = layers_of(path)
+    if not stacked:
+        return [(parameter_name(path), leaf)]
+    rows = leaf.reshape((-1, *leaf.shape[stacked:]))
+    return [(parameter_name(layer), rows[index]) for index, layer in enumerate(layers)]
 
 
 @struct.dataclass

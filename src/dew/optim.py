@@ -33,8 +33,8 @@ import numpy as np
 import optax
 import tyro
 
-from dew._hashing import fmix32
-from dew._moments import bias_corrected
+from dew._moments import QuantizedMoments, bf16_moments, int8_moments, scale_by_adam
+from dew._records import share
 from dew.held_updates import refuse_untold, update_applied
 from dew.laprop import laprop
 from dew.mesh import LogicalAxes
@@ -49,10 +49,9 @@ from dew.newton_schulz import (
     orthogonalized,
     polar_express,
 )
-from dew.nn.precision import at_least_fp32, stochastic_bf16
-from dew.nn.sharding import declarations, declared_axes, stacked_layers
+from dew.nn.precision import at_least_fp32
+from dew.nn.sharding import declarations, declared_axes, layers_of
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
-from dew.schedules import ScheduleBase
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -108,21 +107,13 @@ at a base rate of 5e-6 learned on every seed from 5e-5 to 5e-4 under AdamW with 
 did not learn (ledger 2419). This is the middle of the rates both held on every seed."""
 
 
-def _layers_of(path: jax.tree_util.KeyPath) -> tuple[tuple[jax.tree_util.KeyPath, ...], int]:
-    """The stored layers' paths a leaf at `path` stands for, and how many of its leading dimensions
-    stack them: a stage-local run's layers (`stacked_layers`), each rule here reading the leaf as those
-    layers, or the leaf itself, stacked over none."""
-    held = stacked_layers(path)
-    return ((path,), 0) if held is None else held
-
-
 def weight_decay_mask(params):
     """Mark every parameter but the biases and the vectors, which weight decay spares by default:
     nanoGPT's split (model.py, `GPT.configure_optimizers`), with Megatron Core's and timm's `bias`
     of any rank (core/optimizer/__init__.py, optim/_param_groups.py), a per-head one included. A
-    stage-local run's leaf is read as a layer of it (`_layers_of`)."""
+    stage-local run's leaf is read as a layer of it (`layers_of`)."""
     def decays(path: jax.tree_util.KeyPath, param) -> bool:
-        return param.ndim - _layers_of(path)[1] >= 2 and not (
+        return param.ndim - layers_of(path)[1] >= 2 and not (
             isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "bias")
     return jax.tree_util.tree_map_with_path(decays, params)
 
@@ -189,10 +180,10 @@ def _placements(params) -> dict[jax.tree_util.KeyPath, tuple[optax.contrib.MuonD
 def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
                declared) -> tuple[optax.contrib.MuonDimensionNumbers | None, str]:
     """A parameter's Muon dimension numbers or None for AdamW, and why; a stage-local run's leaf read as
-    each of its stored layers, its stacked leading dimensions Muon's batch axes (`_layers_of`)."""
+    each of its stored layers, its stacked leading dimensions Muon's batch axes (`layers_of`)."""
     if not decays:
         return None, "adamw: a bias or of rank below two"
-    stacked = _layers_of(path)[1]
+    stacked = layers_of(path)[1]
     rank = param.ndim - stacked
     declared_all = declared_axes(path, param.ndim, declared)
     axes = None if declared_all is None else declared_all[stacked:]
@@ -300,9 +291,9 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
                                     eps, preconditioning, algorithm, head_widths(mu_hat, per_head))
         if adaptive:
             # The orthogonal update scaled by the dual norm of the momentum's (arXiv 2409.20325), each
-            # stored layer's its own, summed over its own axes alone (`_layers_of`).
+            # stored layer's its own, summed over its own axes alone (`layers_of`).
             def dual(path, moment, update):
-                axes = tuple(range(_layers_of(path)[1], update.ndim))
+                axes = tuple(range(layers_of(path)[1], update.ndim))
                 return jnp.sum(moment.conj() * update, axis=axes, keepdims=True) * update
             orthogonal = jax.tree_util.tree_map_with_path(dual, mu_hat, orthogonal)
         return orthogonal, optax.contrib.MuonState(count, optax.tree.cast(mu, mu_dtype), state.ns_coeffs)
@@ -350,14 +341,14 @@ def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | 
 def head_widths(updates, per_head: Mapping[str, int] | None):
     """Each update's head width where `per_head` names its parameter by a pattern (`parameter_name`), the
     first that matches, else None: a tree of the updates' shape. A stage-local run's leaf takes its stored
-    layers' width, which they must agree on (`_layers_of`)."""
+    layers' width, which they must agree on (`layers_of`)."""
     def named(path: jax.tree_util.KeyPath) -> int | None:
         name = parameter_name(path)
         return next((given for pattern, given in (per_head or {}).items()
                      if fnmatch.fnmatchcase(name, pattern)), None)
 
     def width(path: jax.tree_util.KeyPath, _) -> int | None:
-        widths = {named(layer) for layer in _layers_of(path)[0]}
+        widths = {named(layer) for layer in layers_of(path)[0]}
         if len(widths) > 1:
             raise ValueError(
                 f"the layers {jax.tree_util.keystr(path)} stacks by stage take unlike head widths "
@@ -383,9 +374,9 @@ def scale_by_neuron_norm(beta2: float = 0.95, eps: float = 1e-10, per_head: Mapp
 
     def init_fn(params):
         # Each leaf's moment a row a matrix, its stage-local layers' stacking dimensions kept ahead of them
-        # (`_layers_of`), so the stage boundary converts it as the parameter it mirrors.
+        # (`layers_of`), so the stage boundary converts it as the parameter it mirrors.
         def moment(path: jax.tree_util.KeyPath, leaf: jax.Array, matrices: jax.Array) -> jax.Array:
-            layers = leaf.shape[:_layers_of(path)[1]]
+            layers = leaf.shape[:layers_of(path)[1]]
             return jnp.zeros((*layers, matrices.shape[0] // math.prod(layers), matrices.shape[2]),
                              jnp.float32)
         held = jax.tree_util.tree_flatten_with_path(params)[0]
@@ -495,10 +486,10 @@ def _mla_key_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
 def _qk_normed(params) -> set[tuple[str, ...]]:
     """The layers whose parameters hold a query or key norm (`q_norm`,
     `k_norm`), read off the tree's paths, a stage-local run's as its stored
-    layers (`_layers_of`)."""
+    layers (`layers_of`)."""
     layers = set()
     for path, _ in jax.tree_util.tree_leaves_with_path(params):
-        for held in _layers_of(path)[0]:
+        for held in layers_of(path)[0]:
             names = _dict_names(held)
             if len(names) >= 2 and names[-2] in ('q_norm', 'k_norm'):
                 layers.add(names[:-2])
@@ -597,7 +588,7 @@ class QKClipState(NamedTuple):
     part in, `steps`, and each query and key leaf's factor a column of its last axis by its path,
     every factor one before the first update or where no maxima were sown, so the state keeps one
     structure. A stage-local run's leaf holds one entry a stored layer, by the layer's path
-    (`_layers_of`), as an unstacked tree holds it."""
+    (`layers_of`), as an unstacked tree holds it."""
 
     steps: jax.Array
     rescales: Mapping[str, jax.Array]
@@ -659,7 +650,7 @@ def _rescales(params, qk_stats, tau: float) -> dict[str, jax.Array]:
         if len(names) < 2 or names[-1] not in ('kernel', 'bias') or names[-2] not in QK_PROJECTIONS:
             continue
         # A stage-local run's leaf is its stored layers', each clipped by its own layer's maxima.
-        for layer in _layers_of(path)[0]:
+        for layer in layers_of(path)[0]:
             held[jax.tree_util.keystr(layer)] = (
                 jnp.ones(param.shape[-1], at_least_fp32(param.dtype)) if qk_stats is None
                 else _clip_leaf(qk_stats, tau, normed, layer, param))
@@ -689,10 +680,10 @@ def stepped(params, updates, before, after):
         return moved
     paths, leaves = zip(*jax.tree_util.tree_leaves_with_path(moved), strict=True)
     held = dict(zip(map(jax.tree_util.keystr, paths), leaves, strict=True))
-    # Each leaf's entries in the effects' states, by the stored layers it stands for (`_layers_of`).
+    # Each leaf's entries in the effects' states, by the stored layers it stands for (`layers_of`).
     entries = {}
     for path in paths:
-        layers, stacked = _layers_of(path)
+        layers, stacked = layers_of(path)
         entries[jax.tree_util.keystr(path)] = ([jax.tree_util.keystr(layer) for layer in layers], stacked)
     for previous, current in pairs:
         taken = current.steps != previous.steps
@@ -738,6 +729,12 @@ class M3State(NamedTuple):
     slow_direction: optax.Updates
 
 
+class M3GivenState(M3State):
+    """`scale_by_m3`'s state where its caller gave its matrices' dimension numbers, which may name a stored
+    layer's axes or a stacked leaf's as written: a stage-local run keeps every layer whole on every stage
+    for it (outside `STACKED_STATES`), where M3's own default reads each stored layer."""
+
+
 def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: float, frequency: int,
                 ns_steps: int = 5, weight_dimension_numbers=None,
                 ns_precision: jax.lax.DotAlgorithmPreset | str | None = None) -> optax.GradientTransformation:
@@ -766,18 +763,20 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
                    else weight_dimension_numbers(moment) if callable(weight_dimension_numbers)
                    else weight_dimension_numbers)
         # A leaf with none is one matrix a stored layer, its rows the reduction: MuonDimensionNumbers' own
-        # default, past a stage-local run's stacking dimensions (`_layers_of`), which batch its layers.
+        # default, past a stage-local run's stacking dimensions (`layers_of`), which batch its layers.
         held = jax.tree_util.tree_flatten_with_path(moment)[0]
         given = jax.tree.leaves(numbers, is_leaf=lambda node: node is None or muon_leaf(node))
         numbers = jax.tree.unflatten(jax.tree.structure(moment), [
-            _shifted(optax.contrib.MuonDimensionNumbers(), _layers_of(path)[1]) if shape is None else shape
+            _shifted(optax.contrib.MuonDimensionNumbers(), layers_of(path)[1]) if shape is None else shape
             for (path, _), shape in zip(held, given, strict=True)])
         return orthogonalized(moment, numbers, jnp.asarray(NEWTON_SCHULZ), ns_steps, 1e-8,
                               algorithm=dot_algorithm(ns_precision))
 
+    state = M3State if weight_dimension_numbers is None else M3GivenState
+
     def init_fn(params) -> M3State:
         zeros = jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)
-        return M3State(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
+        return state(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
 
     def update_fn(updates, state, params=None):
         del params
@@ -797,7 +796,7 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
         # The slow momentum and its orthogonalization run once a chunk, not every update.
         slow, chunk, slow_direction = jax.lax.cond(
             count % frequency == 0, closed, lambda chunk: (state.slow, chunk, state.slow_direction), chunk)
-        return direction, M3State(count, fast, second, slow, chunk, slow_direction)
+        return direction, state(count, fast, second, slow, chunk, slow_direction)
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -852,293 +851,6 @@ def delta_gradient_descent(learning_rate: float | optax.Schedule) -> optax.Gradi
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
-def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
-    """`x` rounded to bf16 up or down with the probability of its distance to
-    each, from a hash of `seed` and each element's flat index.
-
-    Adding 16 uniform bits below the kept mantissa and truncating rounds up
-    exactly when the discarded bits plus the noise carry, which is the
-    discarded fraction's probability. The noise is a counter-based hash, so a
-    step's rounding is a pure function of the seed and the position: no key
-    is split or carried, and nothing is read from memory. jax.random.bits
-    (threefry) made the whole update 1.75x slower than fp32 state on a TPU
-    v6e and 1.05x on an L4; this costs a few integer ops per element. NaN
-    stays NaN (`precision.stochastic_bf16`, its rounding).
-    """
-    x = x.astype(jnp.float32)
-    index = jax.lax.iota(jnp.uint32, x.size).reshape(x.shape)
-    return stochastic_bf16(x, fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)))
-
-
-def moment_dtype(param, dtype):
-    """The dtype a first moment of `param` is stored in under a requested `dtype`: the parameter's own
-    where None, and for a complex parameter the complex type that holds `dtype`'s values in each
-    component (complex64 for float32 or narrower), so its imaginary part is never dropped."""
-    if dtype is None:
-        return None
-    if jnp.issubdtype(jnp.asarray(param).dtype, jnp.complexfloating):
-        return jnp.promote_types(dtype, jnp.complex64)
-    return dtype
-
-
-def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
-                  nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
-    """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
-    (`bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
-    composed from optax's public tree math. `nu_dtype` stores the second moment as `mu_dtype` does
-    the first, each the parameter's dtype where None; a gradient narrower than its moment is
-    widened before either reads it, so an fp16 gradient's square does not underflow first."""
-    mu_dtype = None if mu_dtype is None else jax.dtypes.canonicalize_dtype(mu_dtype)
-    nu_dtype = None if nu_dtype is None else jax.dtypes.canonicalize_dtype(nu_dtype)
-
-    def init_fn(params):
-        # A complex parameter's first moment keeps both components (`moment_dtype`); its second, of the
-        # gradient's squared magnitude, is real.
-        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
-                                      mu=jax.tree.map(lambda p: jnp.zeros_like(p, moment_dtype(p, mu_dtype)),
-                                                      params),
-                                      nu=optax.tree.zeros_like(params, dtype=nu_dtype))
-
-    def update_fn(updates, state, params=None):
-        del params  # Adam reads only the gradients
-        updates = jax.tree.map(lambda update, moment: None if update is None else update.astype(
-            jnp.promote_types(update.dtype, moment.dtype)), updates, state.nu,
-            is_leaf=lambda leaf: leaf is None)
-        mu = optax.tree.update_moment(updates, state.mu, b1, 1)
-        nu = optax.tree.update_moment_per_elem_norm(updates, state.nu, b2, 2)
-        count = optax.safe_increment(state.count)
-        if nesterov:
-            mu_hat = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g,
-                                  bias_corrected(mu, b1, optax.safe_increment(count)),
-                                  bias_corrected(updates, b1, count))
-        else:
-            mu_hat = bias_corrected(mu, b1, count)
-        nu_hat = bias_corrected(nu, b2, count)
-        scaled = jax.tree.map(lambda m, v: None if m is None else m / (jnp.sqrt(v + eps_root) + eps),
-                              mu_hat, nu_hat, is_leaf=lambda leaf: leaf is None)
-        # A requested dtype is each leaf's own (`moment_dtype`): a complex leaf's first moment stays
-        # complex. None keeps the promoted moment, as Optax's does.
-        mu = mu if mu_dtype is None else optax.tree.cast_like(mu, state.mu)
-        return scaled, optax.ScaleByAdamState(count=count, mu=mu, nu=optax.tree.cast_like(nu, state.nu))
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Store:
-    """How `_stored_moments` keeps Adam's moments: `zeros(params, signed)` a moment's stored zeros (the signed
-    one Adam's first); `parts(structure, moment)` its stored leaves in the gradient's order; `decoded(part,
-    signed)` one as float32; `encoded(moment, part, signed, salt)` a float32 one stored as `part` is, `salt` a
-    uint32 of the step, the leaf and the moment; `whole(structure, parts)` the moment from its leaves."""
-    zeros: Callable
-    parts: Callable
-    decoded: Callable
-    encoded: Callable
-    whole: Callable
-
-
-def _stored_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bool,
-                    store: _Store) -> optax.GradientTransformation:
-    """`scale_by_adam` with both moments kept as `store` keeps them. Each update runs optax's own update one
-    leaf at a time, on that leaf's moments decoded to fp32, and stores the new ones: the step is optax's,
-    only the storage is Dew's. Leaf by leaf keeps one leaf's fp32 moments live at a time; widening a bf16
-    state whole first held all of them and raised the update's peak from 4.49 to 7.37 GB on the lm-dense
-    tree (RTX 4080). The state keeps optax's `ScaleByAdamState`, its moments in `store`'s form."""
-    inner = scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root, nesterov=nesterov)
-
-    def init_fn(params):
-        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=store.zeros(params, signed=True),
-                                      nu=store.zeros(params, signed=False))
-
-    def update_fn(updates, state, params=None):
-        del params  # scale_by_adam reads none
-        step = fmix32(jnp.asarray(state.count).astype(jnp.uint32) * jnp.uint32(0x27D4EB2F))
-        leaves, structure = jax.tree.flatten(updates)
-        mus, nus = store.parts(structure, state.mu), store.parts(structure, state.nu)
-        scaled, new_mu, new_nu, count = [], [], [], state.count
-        for index, (gradient, mu, nu) in enumerate(zip(leaves, mus, nus, strict=True)):
-            # One array is a pytree of one leaf, so optax updates the leaf alone.
-            update, one = inner.update(gradient, optax.ScaleByAdamState(
-                count=state.count, mu=store.decoded(mu, signed=True), nu=store.decoded(nu, signed=False)))
-            if not isinstance(one, optax.ScaleByAdamState):
-                raise TypeError(f"scale_by_adam returned {type(one).__name__}")
-            count = one.count
-            salt = fmix32(step + jnp.uint32(2 * index + 1) * jnp.uint32(0x165667B1))
-            scaled.append(update)
-            new_mu.append(store.encoded(jnp.asarray(one.mu), mu, signed=True, salt=salt))
-            new_nu.append(store.encoded(jnp.asarray(one.nu), nu, signed=False,
-                                        salt=fmix32(salt + jnp.uint32(0x9E3779B9))))
-        return structure.unflatten(scaled), optax.ScaleByAdamState(
-            count=count, mu=store.whole(structure, new_mu), nu=store.whole(structure, new_nu))
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
-                 nesterov: bool) -> optax.GradientTransformation:
-    """`scale_by_adam` with both moments stored in bf16 (`_stored_moments`), written back stochastically
-    rounded (`stochastic_round_bf16`), seeded by the step count, the leaf and the moment. Round to nearest
-    would lose every increment of the second moment smaller than half its bf16 spacing, which at b2 =
-    0.999 is most of them; a stochastic rounding keeps each one in expectation. The moments are trees of
-    the parameters' shapes, so sharding and checkpoints read them as they read fp32 state."""
-    def zeros(params, signed: bool):
-        # A complex parameter's first moment is kept whole (`_complex_moment`).
-        return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, _complex_moment(leaf, signed) or jnp.bfloat16),
-                            params)
-
-    def encoded(moment, part, signed, salt):
-        return moment.astype(part.dtype) if _is_complex(part) else stochastic_round_bf16(moment, salt)
-
-    return _stored_moments(b1, b2, eps, eps_root, nesterov, _Store(
-        zeros=zeros,
-        parts=lambda structure, moment: structure.flatten_up_to(moment),
-        decoded=lambda part, signed: part if _is_complex(part) else part.astype(jnp.float32),
-        encoded=encoded,
-        whole=lambda structure, parts: structure.unflatten(parts)))
-
-
-def _is_complex(leaf) -> bool:
-    return jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.complexfloating)
-
-
-def _complex_moment(leaf, signed: bool):
-    """complex64 for a complex parameter's first moment (`signed`), whose imaginary part a real store would
-    drop, kept whole by every reduced store; None otherwise. Its second moment, of the gradient's squared
-    magnitude, is real and stored as any."""
-    return jnp.complex64 if signed and _is_complex(leaf) else None
-
-
-def dynamic_map(*, signed: bool) -> np.ndarray:
-    """The 256 values an 8-bit moment's codes stand for, ascending: Dettmers' dynamic tree map
-    (arXiv 1511.04561), bitsandbytes' and torchao's `create_dynamic_map(signed)` at 7 exponent bits, the
-    signed one for Adam's first moment and the unsigned one for its second. Each decade from 1e-6 to 1
-    holds a fraction's midpoints, more the larger the decade, beside 0 and 1."""
-    values, exponent_bits, fraction_bits = [], 7, 7
-    for exponent in range(exponent_bits):
-        count = 2 ** (exponent + fraction_bits - exponent_bits + (0 if signed else 1)) + 1
-        bounds = np.linspace(0.1, 1, count, dtype=np.float32)
-        means = (bounds[:-1] + bounds[1:]) / np.float32(2)
-        decade = np.float32(10.0 ** (exponent - exponent_bits + 1))
-        values += list(decade * means) + (list(-decade * means) if signed else [])
-    values += [0.0, 1.0]
-    assert len(values) == 256
-    return np.sort(np.asarray(values, np.float32))
-
-
-class QuantizedMoments(NamedTuple):
-    """A moment of an optimizer's state in 8 bits (`int8_moments`), as two trees of the parameters' own
-    paths, so each leaf is placed as its parameter is: `codes`, each value's code, the index of its nearest
-    `dynamic_map` value, in the parameter's shape (a parameter `int8_moments` keeps whole, its float32
-    moment), and `scales`, each block's largest magnitude along the last axis, which the codes' values are
-    fractions of (None where the moment is kept whole)."""
-    codes: object
-    scales: object
-
-
-QUANTIZED_SIZE = 4096
-"""The fewest values a moment holds in 8 bits (`int8_moments`), bitsandbytes' and torchao's: a smaller
-one's scales cost more than its codes save, and it stays float32."""
-
-
-def int8_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bool,
-                 block: int = 256) -> optax.GradientTransformation:
-    """`scale_by_adam` with both moments stored in 8 bits, blockwise (Dettmers et al., arXiv 2110.02861, as
-    torchao's `AdamW8bit` stores them, through `_stored_moments`): each block of `block` values along a
-    leaf's last axis keeps its largest magnitude in float32 and each value the code of the nearest
-    `dynamic_map` value to its fraction of it (`quantized`), the first moment's map signed and the
-    second's unsigned. A leaf of fewer than `QUANTIZED_SIZE` values, or whose last axis `block` does not
-    divide, keeps float32 moments. A moment's bytes fall from 4 a value to 1 and its block's share of a
-    float32 scale, 1/64 a value at the default block."""
-    maps = {signed: jnp.asarray(dynamic_map(signed=signed)) for signed in (True, False)}
-
-    def held(path: jax.tree_util.KeyPath, leaf) -> bool:
-        # A stage-local run's leaf is held as each of its stored layers would be (`_layers_of`); a complex
-        # parameter's moments are kept whole (`_complex_moment`).
-        layers, stacked = _layers_of(path)
-        return (leaf.size // len(layers) >= QUANTIZED_SIZE and leaf.ndim > stacked
-                and leaf.shape[-1] % block == 0 and not _is_complex(leaf))
-
-    def zeros(params, signed: bool) -> QuantizedMoments:
-        zero = _zero_code(dynamic_map(signed=signed))
-        return QuantizedMoments(
-            jax.tree_util.tree_map_with_path(
-                lambda path, leaf: jnp.full(leaf.shape, zero, jnp.uint8) if held(path, leaf)
-                else jnp.zeros(leaf.shape, _complex_moment(leaf, signed) or jnp.float32), params),
-            jax.tree_util.tree_map_with_path(
-                lambda path, leaf: jnp.zeros((*leaf.shape[:-1], leaf.shape[-1] // block), jnp.float32)
-                if held(path, leaf) else None, params))
-
-    def encoded(moment, part, signed, salt):
-        return (moment, None) if part[1] is None else quantized(moment, block, signed=signed)
-
-    return _stored_moments(b1, b2, eps, eps_root, nesterov, _Store(
-        zeros=zeros,
-        parts=lambda structure, moment: list(zip(structure.flatten_up_to(moment.codes),
-                                                 structure.flatten_up_to(moment.scales), strict=True)),
-        decoded=lambda part, signed: (part[0] if part[1] is None
-                                      else dequantized(part[0], part[1], maps[signed], block)),
-        encoded=encoded,
-        whole=lambda structure, parts: QuantizedMoments(structure.unflatten([part[0] for part in parts]),
-                                                        structure.unflatten([part[1] for part in parts]))))
-
-
-def _zero_code(values: np.ndarray) -> int:
-    """The code of 0 in a `dynamic_map`."""
-    return int(np.flatnonzero(values == 0)[0])
-
-
-def dequantized(codes: jax.Array, scales: jax.Array, values: jax.Array, block: int) -> jax.Array:
-    """A moment stored in 8 bits as float32: its `codes`' `values` times their blocks' `scales`."""
-    fractions = values[codes.astype(jnp.int32)]
-    blocked = fractions.reshape(*fractions.shape[:-1], -1, block)
-    return (blocked * scales[..., None]).reshape(fractions.shape)
-
-
-CODE_WINDOW = 6
-"""The codes around a value's estimated one (`_estimated_codes`) that `quantized` compares it with: the
-estimate is within two of the code below the value, whose search they settle."""
-
-
-def _estimated_codes(fractions: jax.Array, *, signed: bool) -> jax.Array:
-    """Where each of `fractions` falls in `dynamic_map(signed=signed)`, to within two codes: its decade
-    by its base-10 logarithm, and its place among the decade's evenly spaced values, the map's own
-    layout (a decade `e` of 0 to 6 holds `2 ** e` values each side of 0, `2 ** (e + 1)` unsigned, the
-    means of as many even steps from a tenth of the decade's top to its top)."""
-    magnitude = jnp.abs(fractions)
-    decade = jnp.clip(jnp.floor(jnp.log10(magnitude)) + 7, 0, 6).astype(jnp.int32)
-    count = jnp.left_shift(1, decade + (0 if signed else 1))
-    top = jnp.power(jnp.float32(10), (decade - 6).astype(jnp.float32))
-    step = jnp.float32(0.9) / count.astype(jnp.float32)
-    place = jnp.clip(jnp.floor((magnitude / top - jnp.float32(0.1)) / step), 0, count - 1).astype(jnp.int32)
-    if not signed:
-        return count - 1 + place  # past 0 and the 2 ** (e + 1) - 2 values of the decades below
-    # 0 is code 127, each decade's positive values follow the 2 ** e - 1 of the decades below it, and
-    # its negative values mirror them below 0.
-    return jnp.where(fractions < 0, 127 - count - place, 127 + count + place)
-
-
-def quantized(moment: jax.Array, block: int, *, signed: bool) -> tuple[jax.Array, jax.Array]:
-    """`moment` in 8 bits, its codes and its blocks' scales: each block of `block` values along its last
-    axis scaled by its largest magnitude (at least 1e-12), and each value coded by the nearest value of
-    `dynamic_map(signed=signed)`, a value halfway between two taking the larger, as torchao's
-    `quantize_8bit_with_qmap` does. The code below each value is found among the `CODE_WINDOW` around
-    its estimate (`_estimated_codes`), each compared apart from the others: a search of the whole map
-    ran its eight halvings one after another (docs/performance.md)."""
-    values = jnp.asarray(dynamic_map(signed=signed))
-    last = values.shape[0] - 1
-    blocked = moment.reshape(*moment.shape[:-1], -1, block)
-    scales = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1), 1e-12)
-    fractions = (blocked / scales[..., None]).reshape(moment.shape)
-    # The codes at most each value: those of the window's that are, past the codes below it. One code at
-    # a time, the comparisons fuse with the coding; a window axis held six of each value's at once.
-    first = _estimated_codes(fractions, signed=signed) - CODE_WINDOW // 2 - 1
-    below = first
-    for code in (first + offset for offset in range(1, CODE_WINDOW + 1)):
-        below = below + ((code < 0) | ((code <= last) & (values[jnp.clip(code, 0, last)] <= fractions)))
-    below = jnp.clip(below, 0, last)
-    above = jnp.minimum(below + 1, last)
-    nearest = jnp.where(fractions - values[below] >= (values[above] - values[below]) * 0.5, above, below)
-    return nearest.astype(jnp.uint8), scales
 
 
 def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float,
@@ -1254,7 +966,7 @@ def power_profiles(solver: optax.GradientTransformation,
 def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
                          eps: float = 0.0) -> optax.GradientTransformation:
     """optax's `scale_by_trust_ratio`, LAMB's (You et al., arXiv 1904.00962), each stored layer's
-    own: a stage-local run's leaf takes one ratio a layer, of that layer's norms (`_layers_of`), and
+    own: a stage-local run's leaf takes one ratio a layer, of that layer's norms (`layers_of`), and
     any other leaf its own, as optax's does."""
     def update_fn(updates, state, params=None):
         if params is None:
@@ -1268,7 +980,7 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
             return held.reshape((*leaf.shape[:stacked], *(1,) * (leaf.ndim - stacked)))
 
         def scaled(path, update, param):
-            stacked = _layers_of(path)[1]
+            stacked = layers_of(path)[1]
             param_norm, update_norm = norm(param, stacked), norm(update, stacked)
             ratio = trust_coefficient * param_norm / (update_norm + eps)
             # A layer whose parameters or update are zero would never move: it keeps its update.
@@ -1606,7 +1318,7 @@ def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
     def init_fn(params) -> BoundsState:
         return BoundsState(jnp.zeros([], jnp.int32), {
             jax.tree_util.keystr(layer): jnp.asarray([lower, upper], leaf.dtype)
-            for path, leaf in jax.tree_util.tree_leaves_with_path(params) for layer in _layers_of(path)[0]})
+            for path, leaf in jax.tree_util.tree_leaves_with_path(params) for layer in layers_of(path)[0]})
 
     def update_fn(updates, state, params=None):
         del params
@@ -1739,7 +1451,7 @@ def param_labels(groups: Sequence[ParamGroup]):
 
         def label(path: jax.tree_util.KeyPath, _) -> str:
             # A stage-local run's leaf is its stored layers', which one solver steps together.
-            layers = _layers_of(path)[0]
+            layers = layers_of(path)[0]
             found = {named(layer) for layer in layers}
             if len(found) > 1:
                 raise ValueError(
@@ -1749,6 +1461,553 @@ def param_labels(groups: Sequence[ParamGroup]):
             return found.pop()
         return jax.tree_util.tree_map_with_path(label, params)
     return labels
+
+
+def power_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, a: jax.typing.ArrayLike, b: float,
+                   c: float = 1.0,
+                   decay_start: int | None = None, decay_end: int | None = None,
+                   end_value: jax.typing.ArrayLike = 0.0) -> optax.Schedule:
+    """lm-engine's power scheduler (optimization/lr_scheduler/power.py at
+    45b6b57b) with an optional linear tail.
+
+    Past the warmup the rate is `min(peak, a * (step * c) ** b)`: the power
+    law of the batch size and step, arXiv 2408.13359, capped at `peak` (the
+    optimizer's own rate there). The warmup rises linearly from zero to that
+    value at `warmup_steps`. `decay_start` set follows the law to that step
+    and then decays linearly to `end_value` at `decay_end`, which is how
+    Rigel ends its run; lm-engine's scheduler has no tail.
+    """
+    law = power_law(peak, a, b, c)
+    warm = law(warmup_steps) if warmup_steps else peak
+    pieces = [optax.linear_schedule(0.0, warm, warmup_steps)] if warmup_steps else []
+    pieces.append(lambda count: law(count + warmup_steps))
+    boundaries = [warmup_steps] if warmup_steps else []
+    if decay_start is not None:
+        if decay_end is None or not warmup_steps <= decay_start < decay_end:
+            raise ValueError(
+                f"the linear tail runs from decay_start past the warmup to a later "
+                f"decay_end, got {decay_start} to {decay_end} after {warmup_steps} warmup steps")
+        pieces.append(optax.linear_schedule(law(decay_start), end_value,
+                                            decay_end - decay_start))
+        boundaries.append(decay_start)
+    return optax.join_schedules(pieces, boundaries) if boundaries else pieces[0]
+
+
+def power_law(peak: jax.typing.ArrayLike, a: jax.typing.ArrayLike, b: float,
+              c: float = 1.0) -> Callable[[jax.typing.ArrayLike], jax.Array]:
+    """The power scheduler's law at a step, `min(peak, a * (step * c) ** b)` with its step in float32
+    (`power_schedule`), as a schedule of steps and one over a run's progress read it (`Power`)."""
+    def law(step: jax.typing.ArrayLike) -> jax.Array:
+        return jnp.minimum(peak, a * (jnp.asarray(step, jnp.float32) * c) ** b)
+
+    return law
+
+
+def anneal(start: jax.Array | float, stop: jax.Array | float, elapsed: jax.Array,
+           span: jax.Array | float) -> jax.Array:
+    """A half cosine from `start` to `stop`, `elapsed` of `span` through it (`OneCycle`): each end weighed
+    by the cosine's halves, `start * c + stop * (1 - c)`, so it lands on each end exactly and takes any two
+    rates, a zero start or ends far apart; torch's form, `stop + (start - stop) / 2 * (cos + 1)`, rounds the
+    difference of the ends in float32. The angle is optax's cosine decay's, `pi * elapsed / span`, in that
+    order: near a phase's end the cosine's halves cancel, so the angle's rounding is most of the rate's."""
+    turned = jnp.cos(jnp.pi * elapsed / span)
+    return start * (0.5 * (1 + turned)) + stop * (0.5 * (1 - turned))
+
+
+def linear_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, decay_start: int | None,
+                    decay_end: int, end_value: jax.typing.ArrayLike = 0.0) -> optax.Schedule:
+    """lm-engine's linear scheduler (lr_scheduler/linear.py at 45b6b57b): from
+    zero to `peak` over the warmup, constant to `decay_start` (None: the
+    warmup's end), then linear to `end_value` at `decay_end`."""
+    start = warmup_steps if decay_start is None else decay_start
+    if not warmup_steps <= start < decay_end:
+        raise ValueError(
+            f"the linear decay runs from past the warmup to a later step, got "
+            f"{start} to {decay_end} after {warmup_steps} warmup steps")
+    return optax.join_schedules([
+        optax.linear_schedule(0.0, peak, warmup_steps),
+        optax.constant_schedule(peak),
+        optax.linear_schedule(peak, end_value, decay_end - start),
+    ], [warmup_steps, start])
+
+
+def _after(progress: jax.Array, start: jax.Array) -> jax.Array:
+    """How far a run at `progress` stands through the piece from `start` to its end, 0 to 1."""
+    return jnp.clip((progress - start) / jnp.maximum(1.0 - start, jnp.finfo(progress.dtype).tiny), 0.0, 1.0)
+
+
+type Rates = Mapping[str, jax.Array | float]
+"""A schedule's rate-valued fields by path (`ScheduleBase.rates`): the configured values, or a solver's
+operands for them (`RateState`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduleBase:
+    """The base of the schedule records, each of which holds its own fields
+    and builds an optax schedule.
+
+    A run's record names the schedule's class and holds only the fields that
+    schedule reads; `dew.registry.schedules` holds the short aliases. A
+    subclass builds its values in `values`; `schedule` reads them. The fields
+    it marks `metadata={'rate': True}` are its rates (`rates`), which a solver
+    holds as operands (`scheduled_solver`) and `values` reads from `rates`, so
+    a run's program does not depend on them; a subclass that marks none
+    implements `values(steps)` alone.
+    """
+
+    every: int = dataclasses.field(default=1, kw_only=True)
+    """The updates each of the schedule's own steps lasts.
+
+    torch recipes step a scheduler once an epoch, and with `every` set to the
+    updates of an epoch this one holds each value through an epoch as torch's
+    does. A run of `steps` updates is then `steps // every` of the
+    schedule's own steps, and every field that counts steps (`warmup_steps`,
+    `decay_steps`) counts those.
+    """
+
+    def __post_init__(self):
+        if self.every < 1:
+            raise ValueError(f"a schedule advances once every 1 or more updates, not {self.every}")
+
+    def rates(self) -> dict[str, float]:
+        """Each rate-valued field's value (`metadata={'rate': True}`) by its dotted path, nested
+        records such as PowerTail's too, a None field's derived default resolved where the schedule
+        derives one (OneCycle's) and left out otherwise."""
+        def walked(record, prefix):
+            for field in dataclasses.fields(record):
+                value = getattr(record, field.name)
+                if field.metadata.get('rate') and value is not None:
+                    yield prefix + field.name, value
+                elif dataclasses.is_dataclass(value):
+                    yield from walked(value, f"{prefix}{field.name}.")
+        return dict(walked(self, ""))
+
+    def schedule(self, steps: int | None, rates: Rates | None = None
+                 ) -> optax.Schedule:
+        """Return the value at each update of a run of `steps` updates, as an optax schedule, its
+        rate-valued fields `rates`' (`rates()` by default): operands in a solver's state, or the
+        configured values."""
+        held = self.rates() if rates is None else rates
+
+        def built(own):
+            return self.values(own, held) if held else self.values(own)
+
+        if self.every == 1:
+            return built(steps)
+        own = None if steps is None else steps // self.every
+        if own is not None and own < 1:
+            raise ValueError(f"a run of {steps} updates never advances a schedule that steps once "
+                             f"every {self.every}")
+        values, every = built(own), self.every
+        return lambda count: values(jnp.asarray(count) // every)
+
+    def _horizon(self, steps: int | None, field: str) -> int:
+        """Resolve a decay's step horizon, which a token budget cannot supply."""
+        if steps is None:
+            raise ValueError(f"{type(self).__name__} needs {field} or trainer.steps as its step horizon")
+        return steps
+
+    def warmup(self, steps: int | None) -> int | None:
+        """Its warmup in its own steps over a run of `steps` updates, its share of the run resolved
+        (`_warmup`), as a run's plan records it; None for a schedule with no warmup of steps."""
+        return None
+
+    def _warmup(self, written: int | str, steps: int | None, horizon: int | None = None) -> int:
+        """A warmup of `written` steps in its own steps over a run of `steps` of them: as written, or a
+        share of the run such as `5%` (`dew._records.share`), the whole steps nearest it, of the run's
+        steps or, where the run has none, of the schedule's own `horizon`."""
+        if not isinstance(written, str):
+            return written
+        return round(share(written) * self._horizon(steps if steps is not None else horizon, "warmup_steps"))
+
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        """Return the value at each of the schedule's own steps, over `steps` of them, from its
+        rate-valued fields `rates` (`rates()`). A value derived from the rates alone, as a ratio of
+        two, is the configured fields', which a solver's operands keep: they differ from them by
+        one factor, a param group's multiplier."""
+        raise NotImplementedError
+
+    def peak(self) -> float:
+        """The highest value the schedule takes: its largest rate-valued field, a warmup's or decay's
+        ends, where its formula reaches no higher."""
+        return max(self.rates().values(), default=1.0)
+
+    def run_relative(self) -> bool:
+        """Whether its horizon is the run's, so a run that counts no updates ahead (one bounded in
+        examples) reads it over the run's progress (`progressed`); a schedule whose every horizon is its
+        own reads its updates there as anywhere."""
+        return False
+
+    def written_warmup(self) -> int | str | float | None:
+        """Its warmup as written, in its own steps or as a share of the run, which a run that counts no
+        updates ahead records as it is (`OptimConfig.warmups`); None where it has none."""
+        return None
+
+    def marks(self) -> dict[str, int]:
+        """The update counts its law on a run's progress starts a piece at (`progressed`), by name: the
+        end of a warmup counted in updates, say. The run records where its progress stood as its updates
+        reached each (`ProgressState.marks`)."""
+        return {}
+
+    def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
+                   marks: Mapping[str, jax.Array]) -> jax.Array:
+        """Its value where a run that counts no updates ahead stands: at `progress`, the share of the
+        run's bound it has consumed (`dew.state.TrainState.consumed`), after `updates` updates, the
+        progress it stood at as it reached each count it `marks`. Each piece written in updates (a
+        warmup of 1000) reads the updates, and each that lasts to the run's end reads the progress from
+        where it starts, its law kept: a share of the run (`5%`) is that share of the progress, and the
+        run's end its whole. A schedule's own steps (`every`) step its updates alone."""
+        raise NotImplementedError(f"{type(self).__name__} reads its run's horizon and states no law on the "
+                                  "run's progress")
+
+    def _counted(self, updates: jax.Array) -> jax.Array:
+        """`updates` in its own steps (`every`)."""
+        return jnp.asarray(updates) // self.every
+
+    def _warm(self, written: int | str, progress: jax.Array, updates: jax.Array,
+              marks: Mapping[str, jax.Array]) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """A warmup of `written` on a run's progress: how far through it the run stands, 0 to 1 (`in`),
+        whether it is over, and the progress it ended at, its law's next piece's start: written in
+        updates, of its own steps and its end marked (`marks['warmup']`); a share of the run, of the
+        progress."""
+        if isinstance(written, str):
+            span = share(written)
+            through = jnp.clip(progress / span, 0.0, 1.0) if span else jnp.ones_like(progress)
+            return through, progress >= span, jnp.asarray(span, progress.dtype)
+        count = self._counted(updates)
+        through = (jnp.clip(count.astype(progress.dtype) / written, 0.0, 1.0) if written
+                   else jnp.ones_like(progress))
+        return through, count >= written, marks.get("warmup", jnp.zeros([], progress.dtype))
+
+
+@dataclasses.dataclass(frozen=True)
+class Cosine(ScheduleBase):
+    """A linear warmup from `init_value` to `peak_value`, then a cosine decay to `end_value` at
+    step `decay_steps`, or at the run's end when that is None.
+
+    It is `optax.warmup_cosine_decay_schedule`.
+    `warmup_steps` must be smaller than the decay horizon in schedule steps.
+    """
+
+    peak_value: float = dataclasses.field(metadata={'rate': True})
+    warmup_steps: int | str
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`): stated,
+    as `optax.warmup_cosine_decay_schedule` takes it, which has no default either."""
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    decay_steps: int | None = None
+
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, self.decay_steps)
+
+    def run_relative(self) -> bool:
+        return self.decay_steps is None
+
+    def written_warmup(self) -> int | str | float | None:
+        return self.warmup_steps
+
+    def marks(self) -> dict[str, int]:
+        warmup = self.warmup_steps
+        return {"warmup": warmup * self.every} if isinstance(warmup, int) and warmup else {}
+
+    def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
+                   marks: Mapping[str, jax.Array]) -> jax.Array:
+        """Its warmup, then its cosine decay from where the warmup ended to the run's end."""
+        if isinstance(self.warmup_steps, str) and share(self.warmup_steps) >= 1:
+            raise ValueError(f"Cosine's warmup of {self.warmup_steps} leaves its run no decay")
+        through, over, start = self._warm(self.warmup_steps, progress, updates, marks)
+        alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
+        # `values`' optax pieces, each read at the fraction of its own span the run stands through.
+        warm = optax.linear_schedule(rates['init_value'], rates['peak_value'], 1)(through)
+        decayed = optax.cosine_decay_schedule(rates['peak_value'], 1, alpha)(_after(progress, start))
+        return jnp.where(over, decayed, warm)
+
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
+        decay_steps = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
+        warmup = self.warmup(steps)
+        if warmup >= decay_steps:
+            raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
+                             f"decay_steps={decay_steps}")
+        # `optax.warmup_cosine_decay_schedule`'s own pieces, joined as it joins them; it forms the
+        # floor's ratio by branching on the peak, so the ratio is the configured fields' (`values`).
+        alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
+        return optax.join_schedules([
+            optax.linear_schedule(rates['init_value'], rates['peak_value'], warmup),
+            optax.cosine_decay_schedule(rates['peak_value'], decay_steps - warmup, alpha),
+        ], [warmup])
+
+
+@dataclasses.dataclass(frozen=True)
+class PowerTail:
+    """The linear tail of a power schedule, from the power law's rate at step
+    `start` to `end_value` at step `steps`, or at the run's end when that is None."""
+
+    start: int
+    steps: int | None = None
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
+
+
+@dataclasses.dataclass(frozen=True)
+class Power(ScheduleBase):
+    """lm-engine's power schedule (`power_schedule`), a power law of the step after a linear warmup.
+
+    After the warmup, the rate is min(peak_value, a * (step * c) ** b). With a
+    `tail`, a linear decay follows the power law, as in the last 29% of
+    Rigel's run. lm-engine's examples set `a` to 4 * batch size and `c` to
+    the tokens per step.
+    """
+
+    peak_value: float = dataclasses.field(metadata={'rate': True})
+    warmup_steps: int | str
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
+    a: float = dataclasses.field(metadata={'rate': True})
+    b: float = -0.51
+    c: float = 1.0
+    tail: PowerTail | None = None
+
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, None if self.tail is None else self.tail.steps)
+
+    def peak(self) -> float:
+        """`peak_value`, the cap the power law climbs to."""
+        return self.peak_value
+
+    def run_relative(self) -> bool:
+        return isinstance(self.warmup_steps, str) or (self.tail is not None and self.tail.steps is None)
+
+    def written_warmup(self) -> int | str | float | None:
+        return self.warmup_steps
+
+    def marks(self) -> dict[str, int]:
+        tail = self.tail
+        return {"tail": tail.start * self.every} if tail is not None and tail.steps is None else {}
+
+    def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
+                   marks: Mapping[str, jax.Array]) -> jax.Array:
+        """Its power law of its updates after its warmup, and its tail from `tail.start` to the run's end.
+        A warmup written as a share of the run rises over that share of the progress to the law's value
+        at the update it reaches, the law scaled by how far through it the run stands."""
+        count = self._counted(updates)
+        law = power_law(rates['peak_value'], rates['a'], self.b, self.c)
+        written = self.warmup_steps
+        if isinstance(written, str):
+            through, _, _ = self._warm(written, progress, updates, marks)
+            value = law(jnp.maximum(count, 1)) * through
+        elif written:
+            value = jnp.where(count < written, optax.linear_schedule(0.0, law(written), written)(count),
+                              law(count))
+        else:
+            value = law(count)
+        tail = self.tail
+        if tail is None:
+            return value
+        start = law(tail.start)
+        if tail.steps is None:
+            through_tail = _after(progress, marks["tail"])
+            decayed = optax.linear_schedule(start, rates['tail.end_value'], 1)(through_tail)
+        else:
+            decayed = optax.linear_schedule(start, rates['tail.end_value'], tail.steps - tail.start)(
+                count - tail.start)
+        return jnp.where(count >= tail.start, decayed, value)
+
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
+        tail = self.tail
+        warmup = self.warmup(steps)
+        if tail is None:
+            return power_schedule(rates['peak_value'], warmup, rates['a'], self.b, self.c)
+        return power_schedule(
+            rates['peak_value'], warmup, rates['a'], self.b, self.c, decay_start=tail.start,
+            decay_end=self._horizon(steps if tail.steps is None else tail.steps, "tail.steps"),
+            end_value=rates['tail.end_value'])
+
+
+@dataclasses.dataclass(frozen=True)
+class Linear(ScheduleBase):
+    """lm-engine's linear schedule (`linear_schedule`), with a warmup, a constant rate and a linear decay.
+
+    The rate warms up from zero to `peak_value`, stays constant until
+    `decay_start` (the end of the warmup when None), then falls linearly to
+    `end_value` at `decay_steps` (the run's end when None).
+    """
+
+    peak_value: float = dataclasses.field(metadata={'rate': True})
+    warmup_steps: int | str = 0
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
+    decay_start: int | None = None
+    decay_steps: int | None = None
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
+
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, self.decay_steps)
+
+    def run_relative(self) -> bool:
+        return self.decay_steps is None
+
+    def written_warmup(self) -> int | str | float | None:
+        return self.warmup_steps
+
+    def marks(self) -> dict[str, int]:
+        warmup, start = self.warmup_steps, self.decay_start
+        return {**({"warmup": warmup * self.every} if isinstance(warmup, int) and warmup else {}),
+                **({"decay_start": start * self.every} if start is not None else {})}
+
+    def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
+                   marks: Mapping[str, jax.Array]) -> jax.Array:
+        """Its warmup, its constant rate to `decay_start` (the warmup's end where None), and its linear
+        decay from there to the run's end."""
+        through, over, start = self._warm(self.warmup_steps, progress, updates, marks)
+        decaying = over
+        if self.decay_start is not None:
+            decaying, start = self._counted(updates) >= self.decay_start, marks["decay_start"]
+        peak = rates['peak_value']
+        # `linear_schedule`'s optax pieces, each read at the fraction of its own span the run stands through.
+        decayed = optax.linear_schedule(peak, rates['end_value'], 1)(_after(progress, start))
+        warm = optax.linear_schedule(0.0, peak, 1)(through)
+        return jnp.where(decaying, decayed, jnp.where(over, peak, warm))
+
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
+        return linear_schedule(rates['peak_value'], self.warmup(steps), self.decay_start,
+                               self._horizon(steps if self.decay_steps is None else self.decay_steps,
+                                             "decay_steps"),
+                               end_value=rates['end_value'])
+
+
+@dataclasses.dataclass(frozen=True)
+class OneCycle(ScheduleBase):
+    """torch's `OneCycleLR` with its default two phases and cosine annealing.
+
+    The value follows a half cosine from `init_value` to `peak_value` at step
+    `warmup_fraction * steps - 1`, then another to `end_value` at the run's last
+    step, `steps - 1`, and holds `end_value` after it, where torch raises. `init_value`
+    is torch's `max_lr / div_factor` (`peak_value / 25` when None) and `end_value` its
+    `init_value / final_div_factor` (`init_value / 1e4` when None). Adam's momentum cycle
+    under `cycle_momentum=True` is `OneCycle(peak_value=0.85, init_value=0.95,
+    end_value=0.95)` as a group's `b1`.
+
+    optax's `cosine_onecycle_schedule` places its phase boundaries at
+    `pct_start * steps` and `steps`, one step later than torch's
+    (torch/optim/lr_scheduler.py, `OneCycleLR.__init__`), so its rate peaks
+    one step late and it cannot reproduce a torch run.
+    """
+
+    peak_value: float = dataclasses.field(metadata={'rate': True})
+    init_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
+    end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
+    warmup_fraction: float | str = 0.3
+    """The share of the run its rise lasts, torch's `pct_start`: a fraction, or a share such as `30%`."""
+
+    def rates(self) -> dict[str, float]:
+        """The peak, and the init and end values with torch's derived defaults resolved."""
+        init = self.peak_value / 25 if self.init_value is None else self.init_value
+        return {'peak_value': self.peak_value, 'init_value': init,
+                'end_value': init / 1e4 if self.end_value is None else self.end_value}
+
+    def _rise(self, steps: int) -> float:
+        """The step its rate peaks at over a run of `steps`, torch's phase end, kept a float as torch
+        keeps it."""
+        fraction = self.warmup_fraction
+        return (share(fraction) if isinstance(fraction, str) else fraction) * steps - 1
+
+    def warmup(self, steps: int | None) -> int:
+        """The steps of its rise, to the whole step its rate peaks at (`_rise`)."""
+        return round(self._rise(self._horizon(steps, "trainer.steps")))
+
+    def run_relative(self) -> bool:
+        return True
+
+    def written_warmup(self) -> int | str | float | None:
+        return self.warmup_fraction
+
+    def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
+                   marks: Mapping[str, jax.Array]) -> jax.Array:
+        """Its rise over `warmup_fraction` of the run's progress, then its fall to the run's end, each a
+        half cosine as over a run of steps; torch's peak a step before the share's end and its last
+        value a step before the run's are the share's and the run's ends here."""
+        fraction = self.warmup_fraction
+        rise = share(fraction) if isinstance(fraction, str) else fraction
+        if not 0 < rise < 1:
+            raise ValueError(f"a one-cycle schedule with warmup fraction {fraction} has no rise or no fall")
+
+        at = jnp.clip(progress, 0.0, 1.0)
+        return jnp.where(at <= rise, anneal(rates['init_value'], rates['peak_value'], at, rise),
+                         anneal(rates['peak_value'], rates['end_value'], at - rise, 1 - rise))
+
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
+        steps = self._horizon(steps, "trainer.steps")
+        rise, last = self._rise(steps), steps - 1
+        if not 0 < rise < last:
+            raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
+                             f"{self.warmup_fraction} has no rise or no fall; give it more steps")
+        # Each phase a half cosine (`anneal`); torch's own form put the run's first rate 25 times further
+        # from float64 than optax's cosine decay.
+        def value(count) -> jax.Array:
+            # The default float: float32 in a run, float64 where a test reads the definition under x64.
+            step = jnp.minimum(jnp.asarray(count, float), last)
+            return jnp.where(step <= rise, anneal(rates['init_value'], rates['peak_value'], step, rise),
+                             anneal(rates['peak_value'], rates['end_value'], step - rise, last - rise))
+
+        return value
+
+
+@dataclasses.dataclass(frozen=True)
+class Exponential(ScheduleBase):
+    """A geometric decay from `offset + init_value` to `offset + end_value` over
+    `decay_steps` steps (the run's when None), then constant.
+
+    Up to `decay_steps`, the value at step t is
+    `offset + init_value * (end_value / init_value) ** (t / decay_steps)`. That is torch's
+    `ExponentialLR` with `gamma = (end_value / init_value) ** (1 / decay_steps)`, stepped
+    `decay_steps` times and then no more, plus `offset`. It is
+    `optax.exponential_decay` with `end_value` as its bound. SNN-delays anneals
+    DCLS's kernel width this way, the raw width decaying and a constant
+    added to it.
+    """
+
+    init_value: float = dataclasses.field(metadata={'rate': True})
+    end_value: float = dataclasses.field(metadata={'rate': True})
+    decay_steps: int | None = None
+    offset: float = dataclasses.field(default=0.0, metadata={'rate': True})
+
+    def peak(self) -> float:
+        """Its higher end, `offset` added."""
+        return self.offset + max(self.init_value, self.end_value)
+
+    def run_relative(self) -> bool:
+        return self.decay_steps is None
+
+    def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
+                   marks: Mapping[str, jax.Array]) -> jax.Array:
+        """Its geometric decay over the run's progress: `init_value * (end_value / init_value) ** progress`,
+        plus `offset`."""
+        if self.init_value <= 0 or self.end_value <= 0:
+            raise ValueError(f"an exponential decay needs positive init_value and end_value, got "
+                             f"{self.init_value} and {self.end_value}")
+        ratio = self.end_value / self.init_value
+        return rates['offset'] + rates['init_value'] * ratio ** jnp.clip(progress, 0.0, 1.0)
+
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
+        span = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
+        if span <= 0 or self.init_value <= 0 or self.end_value <= 0:
+            raise ValueError(f"an exponential decay needs positive steps, init_value and end_value, got "
+                             f"{span}, {self.init_value} and {self.end_value}")
+        # optax branches on the decay rate, so it is the configured fields' ratio (`values`).
+        decay = optax.exponential_decay(rates['init_value'], span,
+                                        self.end_value / self.init_value,
+                                        end_value=rates['end_value'])
+        if not self.offset:
+            return decay
+        return lambda count: rates['offset'] + decay(count)
 
 
 if TYPE_CHECKING:
@@ -1832,9 +2091,9 @@ class OptimConfig:
     float32 stores adam's and adamw's two moments, and Muon's momentum, in
     float32 whatever the parameters' dtype, so bfloat16 or float16 weights
     train on full-precision moments. bfloat16 stores both with stochastic
-    rounding (`dew.optim.bf16_moments`), for adam and adamw only. That halves
+    rounding (`dew._moments.bf16_moments`), for adam and adamw only. That halves
     the optimizer state and reduces the update's memory traffic. int8 stores
-    both blockwise in 8 bits (`dew.optim.int8_moments`, bitsandbytes' and
+    both blockwise in 8 bits (`dew._moments.int8_moments`, bitsandbytes' and
     torchao's 8-bit Adam), for adam and adamw only: a quarter of float32's,
     about 2 bytes a parameter for the two.
     """
@@ -2001,12 +2260,32 @@ STACKED_STATES: frozenset[type] = frozenset({
     QKClipState, BoundsState, M3State, RateState, PowerProfilesState, QuantizedMoments})
 """The optimizer states whose transforms step a stage-local run's stacked leaf as they step its layers
 one by one (`dew.training.stages.whole_reading`): optax's that act a number at a time, or read every
-leaf together, and Dew's own, whose rules read a stacked leaf as its layers (`_layers_of`). The masks
+leaf together, and Dew's own, whose rules read a stacked leaf as its layers (`layers_of`). The masks
 and labels a transform holds as functions are its caller's, which Dew cannot read."""
 
 
 __all__ = [
-    "NEWTON_SCHULZ", "STACKED_STATES", "BoundsState", "DeltaState", "M3State", "OptimConfig",
-    "ParamGroup", "PowerProfilesState", "QKClipState", "ScheduleSpec", "delta_gradient_descent",
-    "laprop", "scale_by_m3", "scale_by_trust_ratio", "stepped",
+    "NEWTON_SCHULZ",
+    "STACKED_STATES",
+    "BoundsState",
+    "Cosine",
+    "DeltaState",
+    "Exponential",
+    "Linear",
+    "M3GivenState",
+    "M3State",
+    "OneCycle",
+    "OptimConfig",
+    "ParamGroup",
+    "Power",
+    "PowerProfilesState",
+    "PowerTail",
+    "QKClipState",
+    "ScheduleBase",
+    "ScheduleSpec",
+    "delta_gradient_descent",
+    "laprop",
+    "scale_by_m3",
+    "scale_by_trust_ratio",
+    "stepped",
 ]

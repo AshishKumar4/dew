@@ -114,7 +114,7 @@ def stochastic_bf16(x, noise):
     exactly with that probability. It does not saturate: a value past bf16's largest finite rounds to
     infinity with its dropped bits' probability, as rounding to nearest would. NaN stays NaN. The noise is
     its caller's policy: a hash of the state's own bits and the token (`recurrence.round_to_bf16`), of the
-    step's seed and the element's index (`optim.stochastic_round_bf16`)."""
+    step's seed and the element's index (`dew._moments.stochastic_round_bf16`)."""
     bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
     rounded = jax.lax.bitcast_convert_type((bits + (noise & jnp.uint32(0xFFFF))) & jnp.uint32(0xFFFF0000),
                                            jnp.float32)

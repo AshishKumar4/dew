@@ -12,9 +12,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   of Dew's optimizers reads a stacked leaf as its stored layers. A checkpoint holds every layer as one
   device's would and resumes onto any stage count. `Layout(stage_local=False)` keeps every layer whole on
   every stage, as does a run whose optax transformation may read a parameter whole, and a DiLoCo run.
-- The learning-rate schedules (`ScheduleBase`, `Cosine`, `Linear`, `OneCycle`, `Exponential`, `Power`,
-  `PowerTail` and the functions that compute them) moved from `dew.optim` to their own module,
-  `dew.schedules`; a run's record names them by their alias, as before.
 - Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md).
   egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
   (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
