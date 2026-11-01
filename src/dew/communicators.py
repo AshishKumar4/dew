@@ -197,7 +197,7 @@ def configuration() -> dict:
             "xla_nccl": [setting for setting in flags if "nccl" in setting], "jax": jax.__version__}
 
 
-FORM = 4
+FORM = 5
 """The form of the measurement Dew keeps, which names its place in the cache: a change to what the child
 measures or how it writes it takes the next, so a host measures afresh rather than read an earlier one."""
 
@@ -444,17 +444,21 @@ def peer_costs(runs: Sequence[Run]) -> tuple[int, dict[tuple[int, int], tuple[in
     connecting each directed pair of it in turn, the first making the communicator. NCCL picks each peer's
     transport apart and may route one through a third GPU, whose buffers it then holds
     (`P2P_INTERMEDIATE`), so each later pair keeps its bytes on its source, on its target and the most on
-    any other GPU. The base is the most a GPU gave in the first run, which holds that pair's own
-    connection, so the first pair costs that clique nothing more."""
-    (_, _, first), *later = runs
+    any other GPU. The first pair's own connection is its reverse's, a transport's buffers being the same
+    both ways, and the base is the most a GPU took in the first run beside it, so the clique's runs are
+    charged what they took in all."""
+    (source, target, first), *later = runs
 
     def beside(source: int, target: int, gave: Mapping[int, int]) -> int:
         return max((given for gpu, given in gave.items() if gpu not in (source, target)), default=0)
 
-    connections = {(source, target): (max(0, gave.get(source, 0)), max(0, gave.get(target, 0)),
-                                      max(0, beside(source, target, gave)))
-                   for source, target, gave in later}
-    return max(0, *first.values()), connections
+    connections = {(sender, receiver): (max(0, gave.get(sender, 0)), max(0, gave.get(receiver, 0)),
+                                        max(0, beside(sender, receiver, gave)))
+                   for sender, receiver, gave in later}
+    connections[(source, target)] = own = connections.get((target, source), (0, 0, 0))
+    base = max(first[source] - own[0], first[target] - own[1],
+               *(given - own[2] for gpu, given in first.items() if gpu not in (source, target)))
+    return max(0, base), connections
 
 
 def measured_connections(cliques: Iterable[Sequence[Run]]
@@ -462,8 +466,7 @@ def measured_connections(cliques: Iterable[Sequence[Run]]
     """The permute communicators' bases by clique size and each directed pair's connection, the most of
     every clique the child measured it in (`peer_costs`): the cliques of the host's first GPUs and each pair
     of GPUs alone, where NCCL routes the pair directly, as it must in a clique that holds no GPU to route
-    it through. A pair alone's first run is its communicator's, so it takes its reverse's direct route: a
-    direct transport's buffers are the same both ways."""
+    it through."""
     bases: dict[int, int] = {}
     connections: dict[tuple[int, int], tuple[int, int, int]] = {}
 
@@ -477,9 +480,6 @@ def measured_connections(cliques: Iterable[Sequence[Run]]
         bases[size] = max(bases.get(size, 0), base)
         for pair, costs in measured.items():
             kept(pair, costs)
-        if size == 2:
-            (source, target, _), *_ = runs
-            kept((source, target), connections.get((target, source), (0, 0, 0)))
     return bases, connections
 
 
