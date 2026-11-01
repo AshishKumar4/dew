@@ -448,8 +448,8 @@ class FitRun:
         def read() -> Batch | None:
             assert self.train is not None
             asked = time.perf_counter()
-            batch = (agreed_next("rollout read", iter(self.train.read_held, None)) if self.agrees(first=False)
-                     else self.train.read_held())
+            held = iter(self.train.read_held, None)
+            batch = agreed_next("rollout read", held) if self.agrees(first=False) else next(held, None)
             interval.waited += time.perf_counter() - asked
             return batch
 
