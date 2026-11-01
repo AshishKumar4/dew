@@ -970,9 +970,10 @@ def key_memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, gates:
                                         emit=functools.partial(emit, "dv"))
     for c in range(columns):
         found = {}
-        system, beta_terms = key_memory_block(
+        d_system, beta_terms = key_memory_block(
             queries(c), keys(c), gates(c), last(c), out_grads, corrected, value_grads,
-            functools.partial(entered, c), functools.partial(leaving, c), blocks, lower, betas, scale, dtype,
+            functools.partial(entered, c), functools.partial(leaving, c), blocks, lower, betas, d_system,
+            scale, dtype,
             issue, lambda products: _summed(issue(*product) for product in products),
             emit=lambda kind, grad, c=c, found=found: found.__setitem__(kind, grad)
             if kind == "dg" else emit(kind, c, grad))
@@ -980,7 +981,7 @@ def key_memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, gates:
         at_last = _summed(key_memory_decay(entered(c, j).value(), leaving(c, j).value())
                           for j in range(blocks)) * raised(*last(c))
         emit("dg", c, found["dg"] + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0))
-        d_system, d_betas = d_system + system, d_betas + beta_terms
+        d_betas = d_betas + beta_terms
     return key_system_back(d_system, lower, dtype, issue), d_betas
 
 
@@ -1017,7 +1018,7 @@ def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower:
 
 def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grads: TileLoad,
                      corrected: TileLoad, value_grads: TileLoad, entered: TileLoad, leaving: TileLoad,
-                     blocks: int, lower: Tile, betas, scale: float, dtype, issue: Issue,
+                     blocks: int, lower: Tile, betas, system, scale: float, dtype, issue: Issue,
                      summed: Callable[[list], jax.Array], *, emit: Callable[[str, jax.Array], None],
                      columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of `key_memory_gradients`, its queries `query` and keys `key` `[C, BK]`, their
@@ -1026,8 +1027,10 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the
     weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw'); then `d(kg beta) = (I + L)^T dw`
     ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log decay's terms `emit('dg', ...)` `[C,
-    BK]` fp32, the chunk's last prefix's `sum(k dk)` on its last token, and `(dA, dbeta)`, the inverse's
-    gradient's part `dw (kg beta)^T` `[C, C]` and the write gates' `sum(kg d(kg beta))`, fp32. The last
+    BK]` fp32, the chunk's last prefix's `sum(k dk)` on its last token, and `(dA, dbeta)`: the inverse's
+    gradient over the key blocks so far `system` `[C, C]` with this block's part `-dw (kg beta)^T` added as
+    its product forms, so the part is held no longer, and the write gates' `sum(kg d(kg beta))`, fp32. The
+    last
     prefix's other term, the memory's decay across the chunk (`key_memory_decay`), is the caller's: a key
     block's memory tiles' rows met the keys' columns here, which Mosaic GPU's layout inference ran out of
     fuel laying (kda-lower5-sm90 at 6e03eb57e). Each sum over the value blocks issued into one accumulator
@@ -1037,28 +1040,31 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     decays = raised(*gates)
     to_last = range_decay(*(half[None, :] for half in last), *gates)
     # Each sum in turn, the log decay's terms gathered as each one's term is formed, so one sum and its
-    # terms are live at a time: the three sums at once, beside the terms every one fed, spilled 240 bytes a
-    # thread on an H100 (kda-gate5 at db546905d).
-    d_query = summed([("memory_dq", out_grads(j), entered(j).T) for j in range(blocks)]) * decays * scale
-    emit("dq", d_query)
-    d_decay = query.value().astype(jnp.float32) * d_query
+    # terms are live at a time, the weights' first, whose merge holds the system's `[C, C]` product: the
+    # three sums at once, beside the terms every one fed, spilled 240 bytes a thread on an H100 (kda-gate5 at
+    # db546905d); the queries' first, their log decay's terms held through the merge spilled 52 on an A100
+    # (kda-gate7 at e96e0978b; 224 registers needed without them, kda-ablate2).
     keys = key.value().astype(jnp.float32)
+    gated = keys * decays
+    d_weight = summed([("memory_dw", value_grads(j), entered(j).T) for j in range(blocks)])
+    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`.
+    d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
+    gated_rows = Transposed((gated * betas[:, None]).astype(dtype))
+    system = system - issue("weights_merge", d_weight.astype(dtype), gated_rows)
     d_key = summed([("memory_dk", corrected(j), leaving(j).T) for j in range(blocks)]) * to_last
+    emit("dk", d_key + d_gated * decays * betas[:, None])
     # The chunk's last prefix's term on its last token through the gated keys' `exp2(g_last - g)` every
     # token's.
     keyed = keys * d_key
     at_last = jnp.sum(keyed, axis=0) if columns is None else columns(keyed)
     rows, _ = _grid(d_key.shape)
-    d_decay = d_decay - keyed + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0)
-    d_weight = summed([("memory_dw", value_grads(j), entered(j).T) for j in range(blocks)])
-    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`.
-    d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
-    emit("dk", d_key + d_gated * decays * betas[:, None])
-    gated = keys * decays
-    gated_rows = Transposed((gated * betas[:, None]).astype(dtype))
-    d_system = -issue("weights_merge", d_weight.astype(dtype), gated_rows)
-    emit("dg", d_decay + gated * d_gated * betas[:, None])
-    return d_system, jnp.sum(d_gated * gated, axis=1)
+    d_decay = (jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0) - keyed
+               + gated * d_gated * betas[:, None])
+    d_betas = jnp.sum(d_gated * gated, axis=1)
+    d_query = summed([("memory_dq", out_grads(j), entered(j).T) for j in range(blocks)]) * decays * scale
+    emit("dq", d_query)
+    emit("dg", d_decay + query.value().astype(jnp.float32) * d_query)
+    return system, d_betas
 
 
 def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:

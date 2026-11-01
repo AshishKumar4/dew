@@ -165,13 +165,13 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, memory, dh, a, beta, taken
             loads = {name: functools.partial(column, name, operand) for name, operand in (
                 ("out", given), ("corrected", held), ("value_grads", grads), ("entered", memories),
                 ("leaving", memories))}
-            system, beta_terms = algebra.key_memory_block(
+            d_system, beta_terms = algebra.key_memory_block(
                 _tile(slots, "queries", given), _tile(slots, "keys", given),
                 (_tile(slots, "gates", gates).value(), _tile(slots, "lows", gates).value()), last_prefix,
                 loads["out"], loads["corrected"], loads["value_grads"], loads["entered"], loads["leaving"],
-                blocks, _tile(slots, "lower", held), betas, scale, held.dtype, issue, issue.summed,
+                blocks, _tile(slots, "lower", held), betas, d_system, scale, held.dtype, issue, issue.summed,
                 emit=stored, columns=_columns(call, scratch))
-            d_system, d_betas = d_system + system, d_betas + beta_terms
+            d_betas = d_betas + beta_terms
 
             # The weights' terms stored once every key block's are in.
             @pl.when(index == steps - 1)
