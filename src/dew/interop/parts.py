@@ -2,9 +2,10 @@
 built from, each read from the source's own modeling code (ledger 1607).
 
 Every module of the source's causal LM is matched to a known part, a class of a registered family's
-transformers 5.16.1 modeling (`KNOWN`), by its code (`same_code`): its forward is the known class's own,
-inherited, or the same syntax tree under the source's names, which may differ from the known class's in
-the model's class-name prefix and in a one-to-one renaming of the attributes the code reads off `self`.
+transformers 5.16.1 modeling (`KNOWN`), by its code (`dew.interop.code_identity.same_code`): its
+forward is the known class's own, inherited, or the same syntax tree under the source's names, which may
+differ from the known class's in the model's class-name prefix and in a one-to-one renaming of the
+attributes the code reads off `self`.
 The known part then reads, off the instance, the values that code reads (a head width, a norm's epsilon,
 an activation, a router's top-k, whether the head is the embedding's own parameter), so a part's
 semantics are the source's own, never a guess from its names or shapes. A module no known part matches,
@@ -17,344 +18,27 @@ an assembly on its shrunken probe before any weight downloads.
 
 from __future__ import annotations
 
-import ast
 import functools
 import inspect
-import linecache
-import textwrap
-from collections import ChainMap
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cache
-from types import FunctionType, MethodType, NoneType
+from types import FunctionType, MethodType
 from typing import TYPE_CHECKING
 
 from dew import _records
-from dew.interop import decoder_parts
+from dew.interop import decoder_parts, sources
+from dew.interop.code_identity import Renaming, matched_class, same_code
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.mla import MultiHeadLatentAttention
 
 if TYPE_CHECKING:
     import torch
     from transformers import PreTrainedModel
-
-
-# --- code identity ---------------------------------------------------------------------------------
-
-_POSITIONS = frozenset({'lineno', 'col_offset', 'end_lineno', 'end_col_offset', 'type_comment'})
-_ANNOTATIONS = frozenset({'annotation', 'returns', 'type_params'})
-"""Syntax fields that do not change what a function computes: positions, and annotations (which name
-the model's own classes)."""
-
-
-class _Unannotated(ast.NodeTransformer):
-    """A function's statements with their annotations dropped: `x: T = v` is `x = v`, and a bare
-    `x: T` states nothing."""
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST | None:
-        if node.value is None:
-            return None
-        return ast.copy_location(ast.Assign(targets=[node.target], value=node.value), node)
-
-
-def _source_tree(function: FunctionType) -> ast.FunctionDef | None:
-    """`function`'s definition without its docstring or annotations, or None where its module's loader
-    holds no source for it."""
-    if not linecache.getlines(function.__code__.co_filename, function.__globals__):
-        return None
-    node = ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
-    if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-        return None
-    body = node.body
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
-            and isinstance(body[0].value.value, str):
-        node.body = body[1:]
-    return _Unannotated().visit(node)
-
-
-_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp,
-           ast.DictComp, ast.GeneratorExp)
-"""The nodes that open a scope of their own inside a function."""
-
-
-def _bound(node: ast.FunctionDef) -> tuple[set[str], set[str]]:
-    """The names a function binds in its own scope (its arguments and the names its body stores, past
-    any `global` or `nonlocal` it declares), and the names a scope nested in it binds (a
-    comprehension's targets, a lambda's or an inner function's arguments and locals)."""
-    arguments = node.args
-    own = {argument.arg for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)}
-    own |= {argument.arg for argument in (arguments.vararg, arguments.kwarg) if argument is not None}
-    nested: set[str] = set()
-    declared: set[str] = set()
-
-    def visit(child: ast.AST, names: set[str]) -> None:
-        if isinstance(child, ast.Global | ast.Nonlocal):
-            declared.update(child.names)
-        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store | ast.Del):
-            names.add(child.id)
-        elif isinstance(child, ast.ExceptHandler) and child.name:
-            names.add(child.name)
-        elif isinstance(child, ast.alias):
-            names.add(child.asname or child.name.split('.')[0])
-        elif isinstance(child, _SCOPES):
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-                names.add(child.name)
-            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-                inner = child.args
-                nested.update(argument.arg for argument in
-                              (*inner.posonlyargs, *inner.args, *inner.kwonlyargs, inner.vararg, inner.kwarg)
-                              if argument is not None)
-            for grandchild in ast.iter_child_nodes(child):
-                visit(grandchild, nested)
-            return
-        for grandchild in ast.iter_child_nodes(child):
-            visit(grandchild, names)
-
-    for statement in node.body:
-        visit(statement, own)
-    return own - declared, nested - own
-
-
-def prefixes(candidate: str, known: str) -> tuple[str, str]:
-    """The model-name prefixes of two class names that share their part's name: `MixedDecoderLayer`
-    and `LlamaDecoderLayer` give ('Mixed', 'Llama'); identical names give empty ones."""
-    shared = 0
-    while shared < min(len(candidate), len(known)) and candidate[-1 - shared] == known[-1 - shared]:
-        shared += 1
-    # The shared part starts at a capital, as a class name's parts do.
-    while shared and not candidate[len(candidate) - shared].isupper():
-        shared -= 1
-    return candidate[:len(candidate) - shared], known[:len(known) - shared]
-
-
-@dataclass
-class Renaming:
-    """What two functions' code differs by: the source's attribute names off `self` against the known
-    class's (`attributes`, one to one), and the model-name prefixes of their class names."""
-    candidate_prefix: str = ''
-    known_prefix: str = ''
-    attributes: dict[str, str] = field(default_factory=dict)
-    """The source's attribute name by the known class's."""
-
-    def attribute(self, candidate: str, known: str) -> bool:
-        if self.attributes.get(known, candidate) != candidate:
-            return False
-        if any(theirs == candidate and ours != known for ours, theirs in self.attributes.items()):
-            return False
-        self.attributes[known] = candidate
-        return True
-
-    def identifier(self, candidate: str, known: str) -> bool:
-        if candidate == known:
-            return True
-        ours, theirs = self.candidate_prefix, self.known_prefix
-        return bool(ours or theirs) and candidate.startswith(ours) and known.startswith(theirs) \
-            and candidate[len(ours):] == known[len(theirs):]
-
-
-class _Comparison:
-    """Two functions compared node by node (`same_code`), collecting the free names each reads. Their
-    own names (arguments and locals) may differ one to one; a name a nested scope binds is compared as
-    written and its free reading too (`nested`), since outside that scope it is the module's."""
-
-    def __init__(self, renaming: Renaming, candidate: ast.FunctionDef, known: ast.FunctionDef):
-        self.renaming = renaming
-        (ours, ours_nested), (theirs, theirs_nested) = _bound(candidate), _bound(known)
-        self.locals = (ours, theirs)
-        self.nested = (ours_nested, theirs_nested)
-        self.local: dict[str, str] = {}
-        self.names: list[tuple[str, str]] = []
-        self.optional: list[tuple[str, str]] = []
-        """Free names a nested scope binds too: unresolved on both sides is that scope's own."""
-
-    def own(self, a: str, b: str) -> bool:
-        """Whether the local `a` is the local `b`, one to one."""
-        if self.local.get(a, b) != b or any(theirs == b and ours != a for ours, theirs in self.local.items()):
-            return False
-        self.local[a] = b
-        return True
-
-    def same(self, a, b) -> bool:
-        if type(a) is not type(b):
-            return False
-        if isinstance(a, list):
-            return len(a) == len(b) and all(self.same(x, y) for x, y in zip(a, b, strict=True))
-        if not isinstance(a, ast.AST):
-            return a == b
-        if (isinstance(a, ast.Attribute) and isinstance(a.value, ast.Name) and a.value.id == 'self'
-                and isinstance(b.value, ast.Name) and b.value.id == 'self'):
-            return type(a.ctx) is type(b.ctx) and self.renaming.attribute(a.attr, b.attr)
-        if isinstance(a, ast.arg):
-            return self.own(a.arg, b.arg)
-        if isinstance(a, ast.Name):
-            if type(a.ctx) is not type(b.ctx):
-                return False
-            if a.id in self.locals[0] or b.id in self.locals[1]:
-                return a.id in self.locals[0] and b.id in self.locals[1] and self.own(a.id, b.id)
-            if a.id in self.nested[0] or b.id in self.nested[1]:
-                if a.id != b.id:
-                    return False
-                self.optional.append((a.id, b.id))
-                return True
-            if not self.renaming.identifier(a.id, b.id):
-                return False
-            self.names.append((a.id, b.id))
-            return True
-        # A definition's own name is the binding its callers match it by (an attribute off `self`, a
-        # local), already paired where they read it.
-        named = isinstance(a, ast.FunctionDef | ast.AsyncFunctionDef)
-        return all(self.same(getattr(a, name), getattr(b, name)) for name in a._fields
-                   if name not in _POSITIONS and name not in _ANNOTATIONS and not (named and name == 'name'))
-
-
-_MISSING = object()
-"""A free name neither the function's closure, its module nor builtins hold."""
-_WRAPPED = object()
-"""A decorator's wrapper's binding of the function it wraps, which is compared on its own."""
-
-
-def _bindings(function: FunctionType, wrapped: FunctionType | None = None) -> Mapping[str, object]:
-    """Every name `function` reads free, as it holds them when it runs: its closure's cells, over its
-    module's globals, over its own builtins; a wrapper's binding of `wrapped` as `_WRAPPED`."""
-    cells = {name: _WRAPPED if cell.cell_contents is wrapped else cell.cell_contents
-             for name, cell in zip(function.__code__.co_freevars, function.__closure__ or (), strict=True)}
-    return ChainMap(cells, function.__globals__, function.__builtins__)
-
-
-def _wrappers(function: FunctionType) -> tuple[list[tuple[FunctionType, FunctionType]], FunctionType]:
-    """The decorators' wrappers around `function` (`functools.wraps`'s `__wrapped__` chain, which it
-    stores in the wrapper's own attributes), outermost first, each with the function it wraps, and the
-    innermost function, whose source `inspect.getsource` reads."""
-    chain: list[tuple[FunctionType, FunctionType]] = []
-    while isinstance(wrapped := vars(function).get('__wrapped__'), FunctionType):
-        chain.append((function, wrapped))
-        function = wrapped
-    return chain, function
-
-
-def same_code(candidate: FunctionType, known: FunctionType, renaming: Renaming, seen: set | None = None, *,
-              collect: bool = False) -> bool:
-    """Whether `candidate` computes what `known` does by its code: the same function, or the same syntax
-    tree under `renaming` (extended with the attributes off `self` the two read), each free name it
-    reads bound alike (`_same_bindings`). A function whose source is not Python's is the same only as
-    itself. With `collect`, one function compared with itself is still read, so `renaming` holds the
-    attributes it reads."""
-    if candidate is known and not collect:
-        return True
-    seen = set() if seen is None else seen
-    if (id(candidate), id(known)) in seen:
-        return True
-    seen.add((id(candidate), id(known)))
-    unattributed = Renaming(renaming.candidate_prefix, renaming.known_prefix)
-    # Each decorator's wrapper runs the same code over the same bindings, the wrapped function aside.
-    (ours_chain, candidate), (theirs_chain, known) = _wrappers(candidate), _wrappers(known)
-    if len(ours_chain) != len(theirs_chain):
-        return False
-    for (ours, ours_inner), (theirs, theirs_inner) in zip(ours_chain, theirs_chain, strict=True):
-        # Its closure, every global or builtin its code names (an attribute name among them binds
-        # nothing either side), and its defaults.
-        names = [(name, name) for name in (*ours.__code__.co_freevars, *ours.__code__.co_names)]
-        if ours.__code__ is not theirs.__code__ or not _same_bindings(
-                _bindings(ours, ours_inner), _bindings(theirs, theirs_inner), names, unattributed, seen,
-                unbound=True) or not _same_defaults(ours, theirs, unattributed, seen):
-            return False
-    ours_tree, known_tree = _source_tree(candidate), _source_tree(known)
-    if ours_tree is None or known_tree is None:
-        return candidate is known
-    comparison = _Comparison(renaming, ours_tree, known_tree)
-    if not comparison.same(ours_tree, known_tree):
-        return False
-    ours_bound, known_bound = _bindings(candidate), _bindings(known)
-    return (_same_bindings(ours_bound, known_bound, comparison.optional, unattributed, seen, unbound=True)
-            and _same_bindings(ours_bound, known_bound, comparison.names, unattributed, seen)
-            and _same_defaults(candidate, known, unattributed, seen))
-
-
-def _same_defaults(ours: FunctionType, theirs: FunctionType, renaming: Renaming, seen: set) -> bool:
-    """Whether two functions hold alike defaults when they run (`__defaults__`, `__kwdefaults__`),
-    whatever their source writes: a default bound when a factory made the function, or set after."""
-    positional = (ours.__defaults__ or (), theirs.__defaults__ or ())
-    keywords = (ours.__kwdefaults__ or {}, theirs.__kwdefaults__ or {})
-    if len(positional[0]) != len(positional[1]) or keywords[0].keys() != keywords[1].keys():
-        return False
-    held = ({**{str(index): value for index, value in enumerate(positional[0])}, **keywords[0]},
-            {**{str(index): value for index, value in enumerate(positional[1])}, **keywords[1]})
-    return _same_bindings(*held, [(name, name) for name in held[0]], renaming, seen)
-
-
-@cache
-def _grad_modes() -> tuple[type, ...]:
-    """torch's grad-mode context managers, which decorate a function (`torch.no_grad()`) by their
-    attributes alone."""
-    import torch
-
-    return (torch.no_grad, torch.enable_grad, torch.inference_mode, torch.set_grad_enabled)
-
-
-def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], names: Iterable[tuple[str, str]],
-                   renaming: Renaming, seen: set, *, unbound: bool = False) -> bool:
-    """Whether each pair of `names` is bound alike in `ours` and `theirs`: the same object, functions of
-    the same code (`same_code`; a module-level helper reads no `self`, so `renaming` holds no
-    attributes), methods of the same function bound to instances alike, equal constants, or instances
-    of one class whose own state is alike (a decorator's context manager, `torch.no_grad()`). A name
-    neither binds is a NameError when it runs, not evidence of the same code, unless `unbound` (a name
-    a nested scope binds, which reads its own)."""
-    for our_name, their_name in names:
-        a, b = ours.get(our_name, _MISSING), theirs.get(their_name, _MISSING)
-        if a is b and (a is not _MISSING or unbound):
-            continue
-        if isinstance(a, FunctionType) and isinstance(b, FunctionType):
-            if not same_code(a, b, renaming, seen):
-                return False
-        elif isinstance(a, MethodType) and isinstance(b, MethodType):
-            if a.__func__ is not b.__func__ or not _same_bindings(
-                    {'self': a.__self__}, {'self': b.__self__}, [('self', 'self')], renaming, seen):
-                return False
-        elif a is _MISSING or b is _MISSING or type(a) is not type(b) or isinstance(a, type):
-            return False
-        elif isinstance(a, int | float | str | bool | bytes | NoneType):
-            if a != b:
-                return False
-        # A grad-mode decorator keeps its whole state in its instance's attributes; any other object
-        # computes alike only as itself.
-        elif not (isinstance(a, _grad_modes()) and vars(a).keys() == vars(b).keys() and _same_bindings(
-                vars(a), vars(b), [(name, name) for name in vars(a)], renaming, seen)):
-            return False
-    return True
-
-
-def matched_class(candidate: type, known: type, *, whole: bool = False) -> Renaming | None:
-    """The renaming under which `candidate`'s forward computes `known`'s (`same_code`), every method of
-    its own the forward reads off `self` included, or None; with `whole`, every function the known
-    class itself defines, its constructor's included. A subclass that keeps the known forward matches
-    under no renaming."""
-    candidate_prefix, known_prefix = prefixes(candidate.__name__, known.__name__)
-    renaming = Renaming(candidate_prefix, known_prefix)
-    if not same_code(candidate.forward, known.forward, renaming, collect=True):
-        return None
-    if whole:
-        for name, theirs in vars(known).items():
-            theirs = theirs.__func__ if isinstance(theirs, staticmethod | classmethod) else theirs
-            if isinstance(theirs, FunctionType) and name != 'forward':
-                ours = inspect.getattr_static(candidate, renaming.attributes.get(name, name), None)
-                ours = ours.__func__ if isinstance(ours, staticmethod | classmethod) else ours
-                if not (isinstance(ours, FunctionType) and same_code(ours, theirs, renaming, collect=True)):
-                    return None
-    compared: set[str] = set()
-    while pending := [name for name in renaming.attributes if name not in compared]:
-        for name in pending:
-            compared.add(name)
-            theirs = inspect.getattr_static(known, name, None)
-            ours = inspect.getattr_static(candidate, renaming.attributes[name], None)
-            if inspect.isfunction(theirs):
-                if not (inspect.isfunction(ours) and same_code(ours, theirs, renaming, collect=True)):
-                    return None
-            elif inspect.isfunction(ours):
-                return None
-    return renaming
 
 
 # --- the instances, read through the known names --------------------------------------------------
@@ -441,6 +125,21 @@ def _read_causal_lm(view: PartView) -> Mapping[str, object]:
     return {}
 
 
+def _read_scaled_causal_lm(view: PartView) -> Mapping[str, object]:
+    """Granite's head: Llama's, its logits divided by the config's `logits_scaling`."""
+    return {**_read_causal_lm(view), 'logits_scaling': float(view.config.logits_scaling)}
+
+
+def _read_scaled_model(view: PartView) -> Mapping[str, object]:
+    """Granite's model: Llama's, its embeddings times its `embedding_multiplier`."""
+    return {**_read_llama_model(view), 'embedding_multiplier': float(view.embedding_multiplier)}
+
+
+def _read_scaled_layer(view: PartView) -> Mapping[str, object]:
+    """Granite's layer: Llama's, each sublayer's output times its `residual_multiplier` into the residual."""
+    return {'residual_multiplier': float(view.residual_multiplier)}
+
+
 def _read_llama_model(view: PartView) -> Mapping[str, object]:
     layers = len(view.layers)
     if view.config.num_hidden_layers != layers:
@@ -500,6 +199,29 @@ def _read_qk_norm_attention(view: PartView) -> Mapping[str, object]:
     return {**_read_attention(view), 'qk_norm': True}
 
 
+def _read_nope_attention(view: PartView) -> Mapping[str, object]:
+    """SmolLM3's attention: Llama's, rotating its queries and keys only where `use_rope` (each fourth layer
+    attends without positions, `no_rope_layers`), a per-layer fact `assemble` makes a kind of."""
+    return {**_read_attention(view), _LAYER: {'nope': not bool(view.use_rope)}}
+
+
+def _read_projection_qk_norm_attention(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's attention: Llama's with an RMSNorm over the whole query and key projections, before the
+    heads split (`qk_norm_scope='projection'`, OLMo 3's)."""
+    return {**_read_attention(view), 'qk_norm': True, 'qk_norm_scope': 'projection'}
+
+
+def _read_output_normed_layer(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's layer: each sublayer's output normed before it joins the residual, its input not
+    (`sandwich_norms` without `pre_norms`, OLMo 3's)."""
+    return {'sandwich_norms': True, 'pre_norms': False}
+
+
+def _read_scale_first_norm(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's RMSNorm: its weight times the normalized input in float32, cast after."""
+    return {'norm_eps': float(view.variance_epsilon), 'scale_after_cast': False, 'scale_offset': False}
+
+
 def _read_mlp(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), 'mlp_features': view.gate_proj.out_features,
             'mlp_bias': _biased(view.gate_proj, view.up_proj, view.down_proj)}
@@ -516,12 +238,75 @@ def _read_router(view: PartView, *, normalized: bool | None) -> Mapping[str, obj
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': norm}}
 
 
+def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
+    """HY-3's router: sigmoid scores in float32, chosen by score plus the block's correction bias,
+    weighted by score renormalized over the chosen and times `router_scaling_factor` (DeepSeek V3's)."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
+                     'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
+
+
+def _read_grouped_router(view: PartView) -> Mapping[str, object]:
+    """DeepSeek V3's router (GLM-4.7-Flash's): sigmoid scores in float32 plus its correction bias,
+    experts chosen within the `topk_group` best of `num_group` groups (each scored by its two best),
+    weighted by score, renormalized where `norm_topk_prob`, times `routed_scaling_factor`."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
+                     'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
+                     'scaling': float(view.routed_scaling_factor), 'bias': True,
+                     'groups': int(view.num_group), 'groups_per_token': int(view.topk_group)}}
+
+
+def _read_latent_attention(view: PartView) -> Mapping[str, object]:
+    """DeepSeek V3's multi-head latent attention (GLM-4.7-Flash's): queries through a low-rank latent
+    where `q_lora_rank` (whole otherwise), keys and values from one normed latent beside a shared rotated
+    key, each head's query and key a rotated and an unrotated part (the `mla` mixer). Its latents are
+    normed at their own epsilon, which the mixer holds at `MultiHeadLatentAttention.norm_eps`, and its
+    scale takes the yarn ramp's mscale off its config's rope record, the rotary's (`_rope`), as the
+    mixer's does off the layer's."""
+    if not view.is_causal:
+        raise Ambiguous("the attention is not causal")
+    nope, rope = int(view.qk_nope_head_dim), int(view.qk_rope_head_dim)
+    rank = view.q_lora_rank
+    norms = [view.kv_a_layernorm] + ([] if rank is None else [view.q_a_layernorm])
+    epsilon = MultiHeadLatentAttention.norm_eps
+    if any(float(norm.variance_epsilon) != epsilon for norm in norms):
+        raise Ambiguous(f"the latents are normed at an epsilon other than {epsilon}")
+    heads = int(view.num_heads)
+    return {**_rope(view.config), 'num_heads': heads, 'num_kv_heads': heads // int(view.num_key_value_groups),
+            'head_dim': nope + rope, 'qk_norm': False,
+            'attention_bias': view.kv_a_proj_with_mqa.bias is not None,
+            'attention_dropout_rate': float(view.attention_dropout),
+            'mixer': {'class': 'mla', 'fields': {
+                'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
+                'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
+                'rope_interleave': bool(view.config.rope_interleave)}}}
+
+
+def _read_shared_moe(view: PartView) -> Mapping[str, object]:
+    """A routed block beside always-on shared experts (`shared_experts`, an MLP read as `shared`), the two
+    summed: DeepSeek V3's, and HY-3's, whose float32 sum of two values of the compute dtype rounds as
+    their sum there does (`enable_moe_fp32_combine`), so it reads no field."""
+    return {}
+
+
+def _read_shared_mlp(view: PartView) -> Mapping[str, object]:
+    """A routed block's shared experts: Llama's MLP, its width the block's (`Mixture.shared_features`)."""
+    width = int(view.gate_proj.out_features)
+    return {'mlp': gated_activation(view.act_fn), _LAYER: {'shared_features': width}}
+
+
 def _read_experts(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), _LAYER: {'expert_features': int(view.intermediate_dim)}}
 
 
 def _read_rms_norm(view: PartView) -> Mapping[str, object]:
     return {'norm_eps': float(view.variance_epsilon), 'scale_after_cast': True, 'scale_offset': False}
+
+
+def _read_latent_norm(view: PartView) -> Mapping[str, object]:
+    """A latent attention's norm (Llama's RMSNorm): the latent mixer norms at the block norms' rounding
+    (`MLAMixer.build` passes the layer's), so it states that rounding, which the block norms' must agree
+    with; its epsilon the attention's reader holds to the mixer's own."""
+    return {'scale_after_cast': True, 'scale_offset': False}
 
 
 def _read_offset_norm(view: PartView) -> Mapping[str, object]:
@@ -571,6 +356,10 @@ class KnownPart:
     """Whether every method of the known class is compared, its constructor's included: a part whose
     buffers its constructor computes (a rotary's frequencies), which the forward reads and the reader
     takes from the config."""
+    state: Mapping[str, str] = field(default_factory=dict)
+    """The state a checkpoint stores beside its parameters (a router's correction bias, a buffer), by the
+    known class's names, onto its canonical name under the part (HY-3's MoE holds the bias its router
+    reads, which Dew keeps in the router, `gate.e_score_correction_bias`)."""
 
     def known(self) -> type:
         module, _, qualname = self.location.partition(':')
@@ -584,28 +373,56 @@ _QWEN3_MOE = 'transformers.models.qwen3_moe.modeling_qwen3_moe'
 _GEMMA = 'transformers.models.gemma.modeling_gemma'
 _MISTRAL = 'transformers.models.mistral.modeling_mistral'
 _QWEN2 = 'transformers.models.qwen2.modeling_qwen2'
+_GRANITE = 'transformers.models.granite.modeling_granite'
+_SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
+_OLMO2 = 'transformers.models.olmo2.modeling_olmo2'
+_HY_V3 = 'transformers.models.hy_v3.modeling_hy_v3'
+_DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
+_GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
 _LAYER_CHILDREN: Children = {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'input_layernorm': ('norm',),
                              'post_attention_layernorm': ('norm',)}
 _ATTENTION_CHILDREN: Children = dict.fromkeys(('q_proj', 'k_proj', 'v_proj', 'o_proj'), ('linear',))
+_SHARED_MOE_CHILDREN: Children = {'gate': ('router',), 'experts': ('experts',), 'shared_experts': ('shared',)}
+_LATENT_CHILDREN: Children = {
+    **dict.fromkeys(('q_proj', 'q_a_proj', 'q_b_proj', 'kv_a_proj_with_mqa', 'kv_b_proj', 'o_proj'),
+                    ('linear',)),
+    **dict.fromkeys(('q_a_layernorm', 'kv_a_layernorm'), ('latent_norm',))}
 
 KNOWN: tuple[KnownPart, ...] = (
     KnownPart('causal_lm', f'{_LLAMA}:LlamaForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
          _read_causal_lm),
     KnownPart('causal_lm', f'{_MIXTRAL}:MixtralForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
          _read_causal_lm),
+    KnownPart('causal_lm', f'{_GRANITE}:GraniteForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_scaled_causal_lm),
+    KnownPart('causal_lm', f'{_HY_V3}:HYV3ForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_causal_lm),
+    KnownPart('model', f'{_HY_V3}:HYV3Model', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_LLAMA}:LlamaModel', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('model', f'{_GRANITE}:GraniteModel', _MODEL_CHILDREN, _read_scaled_model),
     KnownPart('model', f'{_MIXTRAL}:MixtralModel', _MODEL_CHILDREN, _read_windowed_model),
     KnownPart('model', f'{_GEMMA}:GemmaModel', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_MISTRAL}:MistralModel', _MODEL_CHILDREN, _read_windowed_model),
     KnownPart('model', f'{_QWEN2}:Qwen2Model', _MODEL_CHILDREN, _read_layer_typed_model),
     KnownPart('layer', f'{_LLAMA}:LlamaDecoderLayer', _LAYER_CHILDREN, _read_nothing),
     KnownPart('layer', f'{_MIXTRAL}:MixtralDecoderLayer', _LAYER_CHILDREN, _read_nothing),
+    KnownPart('layer', f'{_GRANITE}:GraniteDecoderLayer', _LAYER_CHILDREN, _read_scaled_layer),
+    KnownPart('layer', f'{_OLMO2}:Olmo2DecoderLayer',
+              {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'post_attention_layernorm': ('norm',),
+               'post_feedforward_layernorm': ('norm',)}, _read_output_normed_layer),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
+    KnownPart('attention', f'{_SMOLLM3}:SmolLM3Attention', _ATTENTION_CHILDREN, _read_nope_attention),
+    KnownPart('attention', f'{_DEEPSEEK_V3}:DeepseekV3Attention', _LATENT_CHILDREN, _read_latent_attention),
+    KnownPart('attention', f'{_HY_V3}:HYV3Attention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
+    KnownPart('attention', f'{_OLMO2}:Olmo2Attention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)},
+              _read_projection_qk_norm_attention),
     KnownPart('attention', f'{_QWEN3}:Qwen3Attention',
          {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
     KnownPart('mlp', f'{_LLAMA}:LlamaMLP', dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)),
@@ -614,6 +431,15 @@ KNOWN: tuple[KnownPart, ...] = (
          _read_mixtral_moe),
     KnownPart('moe', f'{_QWEN3_MOE}:Qwen3MoeSparseMoeBlock', {'gate': ('router',), 'experts': ('experts',)},
          _read_nothing),
+    KnownPart('moe', f'{_HY_V3}:HYV3MoE', _SHARED_MOE_CHILDREN, _read_shared_moe,
+              state={'e_score_correction_bias': 'gate.e_score_correction_bias'}),
+    KnownPart('shared', f'{_LLAMA}:LlamaMLP',
+              dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)), _read_shared_mlp),
+    KnownPart('router', f'{_HY_V3}:HYV3TopKRouter', {}, _read_sigmoid_router, ('weight',)),
+    KnownPart('moe', f'{_DEEPSEEK_V3}:DeepseekV3MoE', _SHARED_MOE_CHILDREN, _read_shared_moe),
+    KnownPart('router', f'{_DEEPSEEK_V3}:DeepseekV3TopkRouter', {}, _read_grouped_router,
+              ('weight',), state={'e_score_correction_bias': 'e_score_correction_bias'}),
+    KnownPart('latent_norm', f'{_LLAMA}:LlamaRMSNorm', {}, _read_latent_norm, ('weight',)),
     KnownPart('router', f'{_MIXTRAL}:MixtralTopKRouter', {}, lambda view: _read_router(view, normalized=True),
          ('weight',)),
     KnownPart('router', f'{_QWEN3_MOE}:Qwen3MoeTopKRouter', {},
@@ -621,15 +447,20 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('experts', f'{_MIXTRAL}:MixtralExperts', {}, _read_experts, ('gate_up_proj', 'down_proj')),
     KnownPart('norm', f'{_LLAMA}:LlamaRMSNorm', {}, _read_rms_norm, ('weight',)),
     KnownPart('norm', f'{_GEMMA}:GemmaRMSNorm', {}, _read_offset_norm, ('weight',)),
+    KnownPart('norm', f'{_OLMO2}:Olmo2RMSNorm', {}, _read_scale_first_norm, ('weight',)),
     KnownPart('rotary', f'{_LLAMA}:LlamaRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('rotary', f'{_QWEN2}:Qwen2RotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('rotary', f'{_OLMO2}:Olmo2RotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('rotary', f'{_GLM4_MOE}:Glm4MoeRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('embedding', 'torch.nn:Embedding', {}, _read_embedding, ('weight',)),
     KnownPart('embedding', f'{_GEMMA}:GemmaTextScaledWordEmbedding', {}, _read_scaled_embedding, ('weight',)),
     KnownPart('linear', 'torch.nn:Linear', {}, _read_nothing, ('weight', 'bias')),
 )
-"""The known parts, the registered families' own classes. A class of another registered family that
-computes one of these by its code (Qwen2's MLP is Llama's, Qwen3-MoE's experts Mixtral's) matches it
-through `same_code`, so each entry stands for every copy of its code."""
+"""The known parts: transformers' classes whose computation Dew's decoder states by the fields their readers
+return, a registered family's or a type's own (Granite's, OLMo 2's), each assembly of them still verified
+against its source's code (`dew.interop.verify`). A class that computes one of these by its code (Qwen2's
+MLP is Llama's, Qwen3-MoE's experts Mixtral's, GLM-4.7-Flash's attention DeepSeek V3's) matches it through
+`same_code`, so each entry stands for every copy of its code."""
 
 
 @cache
@@ -683,20 +514,85 @@ class Assembly:
     dropouts: tuple[tuple[str, str], ...] = ()
     """Each attention module's path and the attribute its code reads its dropout rate from, which a
     deterministic training forward sets to zero (`dew.interop.verify`'s training qualification)."""
+    loaded: Callable[[str], tuple[str, tuple[str, str] | None]] = lambda name: (name, None)
+    """A stored tensor's name as the source's load names it, and for one expert's own tensor, which the
+    load stacks into its experts module's fused one, the expert's index and canonical projection
+    (`_load_names`). It reads stored names alone: a name the model holds (a gradient's) is stored first
+    as `save_pretrained` stores it (`dew.interop.verify.gradient_parity`)."""
+    depths: int = 0
+    """The prediction depths the source's release stores past the trunk (its config's
+    `num_nextn_predict_layers`: GLM-4.7-Flash's `model.layers.47.*`, HY-3's `.80.*`), which its own code
+    builds none of and its load leaves unread (`family`)."""
 
     def canonical(self, name: str) -> str | None:
         """A stored tensor's canonical name: its module's canonical path and its parameter's known
-        name, a part a fused tensor splits into (`_SPLIT`) by its own; None where no part holds it. A
-        checkpoint stored in another layout than the model holds (one transformers converts on load
-        by its model_type) holds names no part does, so it maps to none."""
-        module, _, parameter = name.rpartition('.')
+        name, a part a fused tensor splits into (`_SPLIT`) by its own, one expert's tensor of a
+        checkpoint stored per expert by its index and projection; None where no part holds it."""
+        loaded, expert = self.loaded(name)
+        module, _, parameter = loaded.rpartition('.')
         held = self.names.get(module)
         if held is None:
             return None
         path, parameters = held
         if parameter.startswith(_SPLIT):
             return f'{path}.{parameter.removeprefix(_SPLIT)}'
-        return f'{path}.{parameters[parameter]}' if parameter in parameters else None
+        if parameter not in parameters:
+            return None
+        if expert is not None:
+            index, projection = expert
+            return f'{path}.{index}.{projection}.weight'
+        return f'{path}.{parameters[parameter]}'
+
+
+_PER_EXPERT = {'gate_up_proj': ('gate_proj', 'up_proj'), 'down_proj': ('down_proj',)}
+"""Each fused experts tensor (`_fused_experts`) by the canonical projections a checkpoint stored per expert
+holds it as, in the order the fused one concatenates them."""
+
+
+def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str, str] | None]]:
+    """The name `model`'s load gives a stored tensor (`sources.load_names`: HY-3's `mlp.expert_bias` is its
+    `mlp.e_score_correction_bias`), an expert's own tensor, `{experts}.{index}.{stored}.weight`, named as
+    the fused tensor the load stacks it into, with its index and its canonical projection, the one at its
+    place among the merge's sources (Mixtral's `w1`, `w3` and `w2` are the gate, up and down projections).
+    A merge is read only where it stacks experts on the first axis and concatenates its sources in
+    `_PER_EXPERT`'s order on the second, as the fused tensor `_fused_experts` splits holds them; any other
+    conversion's tensor keeps its stored name, which no part holds. A mapping that renames a key by
+    whether another is stored is `Ambiguous`: no read of one name tells it."""
+    from transformers.core_model_loading import Concatenate, MergeModulelist, WeightConverter
+
+    names = sources.load_names(model)
+    if names is None:
+        raise Ambiguous("its checkpoint conversion renames a key by whether another is stored")
+    prefix = model.base_model_prefix
+
+    def stacked(converter: WeightConverter, fused: str) -> tuple[str, ...]:
+        """The canonical projections of `converter`'s sources, in their order, where it stacks them into
+        `fused` as `_fused_experts` splits it; none otherwise."""
+        projections = _PER_EXPERT.get(fused, ())
+        operations = [(type(operation), operation.dim) for operation in converter.operations
+                      if isinstance(operation, (MergeModulelist, Concatenate))]
+        merges = [(MergeModulelist, 0)] + [(Concatenate, 1)] * (len(projections) > 1)
+        if (len(converter.source_patterns) != len(projections) or len(operations) != len(converter.operations)
+                or operations != merges):
+            return ()
+        return projections
+
+    def loaded(name: str) -> tuple[str, tuple[str, str] | None]:
+        read = names(name)
+        if read.converter is None or read.pattern is None:
+            return read.name, None
+        module, _, fused = read.name.rpartition('.')
+        spellings = (module, module.removeprefix(f'{prefix}.'), f'{prefix}.{module}')
+        tails = [read.renamed.removeprefix(f'{spelled}.') for spelled in spellings
+                 if read.renamed.startswith(f'{spelled}.')]
+        index, _, own = tails[0].removesuffix('.weight').partition('.') if tails else ('', '', '')
+        projections = stacked(read.converter, fused)
+        if not (index.isdigit() and own and '.' not in own and tails[0] == f'{index}.{own}.weight'
+                and projections):
+            return name, None
+        return read.name, (index, projections[read.converter.source_patterns.index(read.pattern)])
+
+    return loaded
 
 
 
@@ -748,8 +644,10 @@ class _Assembler:
         expected = {view.name(name): name for name in part.parameters}
         if held - set(expected):
             raise Ambiguous(f"{path} holds parameters {sorted(held - set(expected))} its code does not read")
-        if held:
-            self.names[path] = (canonical, {name: expected[name] for name in held})
+        stored = {view.name(name): known for name, known in part.state.items()
+                  if view.name(name) in dict(module.named_buffers(recurse=False))}
+        if held or stored:
+            self.names[path] = (canonical, {**{name: expected[name] for name in held}, **stored})
         children = dict(module.named_children())
         claimed = set()
         for known, child_roles in part.children.items():
@@ -780,29 +678,59 @@ def assemble(model: PreTrainedModel) -> Assembly:
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key != 'routed')) for layer in routed}
+                               if key not in ('routed', 'nope'))) for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
         width = _records.integer(mixture['expert_features'], 'expert_features')
-        fields['mixture'] = native_fields(Mixture)(
+        # A router's scores, scaling and correction bias and a block's shared experts, where its parts
+        # state them (DeepSeek's routing, HY-3's).
+        stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
+                                                'groups', 'groups_per_token') if key in mixture}
+        fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
             top_k=_records.integer(mixture['top_k'], 'top_k'),
             norm_topk_prob=bool(mixture['norm_topk_prob']), expert_features=width,
-            layers=None if len(routed) == fields['num_layers'] else tuple(routed))
+            layers=None if len(routed) == fields['num_layers'] else tuple(routed)), **stated}
         fields.setdefault('mlp_features', width)
     for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps',
                      'rope_theta'):
         if required not in fields:
             raise Ambiguous(f"no part states {required}")
+    unrotated = sorted(layer for layer, facts in assembler.layers.items() if facts.get('nope'))
+    fields.update(_without_positions(fields, unrotated))
     capacity, context = decoder_parts.context_lengths(
         {'max_position_embeddings': model.config.to_dict().get('max_position_embeddings')})
     fields.update(max_seq_len=capacity, context_length=context)
     kinds = fields.pop('kinds', {})
     record = native_fields(CausalTransformer)(**fields)
     record['kinds'] = kinds
+    depths = _records.integer(model.config.to_dict().get('num_nextn_predict_layers') or 0,
+                              'num_nextn_predict_layers')
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
-                    tuple(assembler.dropouts))
+                    tuple(assembler.dropouts), _load_names(model), depths)
+
+
+def _without_positions(fields: Mapping[str, object], layers: list[int]) -> Mapping[str, object]:
+    """The layer types and kinds that make each of `layers` (the ones whose attention rotates nothing,
+    SmolLM3's NoPE layers) a kind of its own beside its layer type's, its attention taking no positions,
+    as Llama 4's NoPE layers do."""
+    if not layers:
+        return {}
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    stated_types = fields.get('layer_types')
+    types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
+             else ['full_attention'] * count)
+    kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
+    for layer in layers:
+        stated = types[layer]
+        unrotated = f'{stated}_nope'
+        if unrotated not in kinds:
+            kind = dict(_records.record(kinds.get(stated) or native_fields(LayerKind)(), stated))
+            kind['mixer'] = {'class': 'attention', 'fields': {'nope': True}}
+            kinds[unrotated] = kind
+        types[layer] = unrotated
+    return {'layer_types': tuple(types), 'kinds': kinds}
 
 
 def _fused_experts(module: str, view: PartView) -> tuple[decoder_parts.Packed, ...]:
@@ -825,16 +753,40 @@ _STACKED_EXPERTS: decoder_parts.Leaves = {
 """The canonical experts, each projection one tensor over every expert (`decoder_parts.FUSED_EXPERTS`)."""
 
 
+_PREDICTION_OWN = frozenset({'eh_proj.weight', 'enorm.weight', 'hnorm.weight', 'shared_head.norm.weight',
+                             'final_layernorm.weight'})
+"""A release's prediction depth's own tensors, by their names past `model.layers.{num_layers + d}.`
+(DeepSeek V3's layout, GLM-4.7-Flash's; HY-3 norms its output as `final_layernorm`), which no part of the
+trunk holds."""
+
+
 def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     """The decoder family a type verified from parts loads through (`dew.interop.verify`): `assembly`'s
     fields for its config, every field of which the source's own code read, and each stored tensor at
     the path of its canonical name (`Assembly.canonical`), a fused expert tensor split as Mixtral's
-    first (`DecoderFamily.packed`), so an export writes each back under its stored name."""
+    first (`DecoderFamily.packed`), so an export writes each back under its stored name. A tensor of one
+    of the release's prediction depths past the trunk (`Assembly.depths`, by `decoder_parts.layer_depth`)
+    fills no leaf: the source's own code builds no depth and its load leaves them unread, so the decoder
+    assembled from that code has none (`prediction_depths` trims them before any is read). Only a depth's
+    own tensors (`_PREDICTION_OWN`) and its block's, a name a trunk layer's part holds, are so; its
+    copies of the trunk's table and head are the trunk's (`hf_decoders` checks each against it, and an
+    export writes it from the trunk's leaf)."""
     def translated(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
         used.update(hf_config)
         return assembly.fields.copy()
 
     def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+        depth = decoder_parts.layer_depth(name, config)
+        if depth is not None and depth < assembly.depths:
+            tail = name.split('.', 3)[3]
+            head, table = assembly.tied
+            if tail == 'shared_head.head.weight':
+                return weight_path(table if config['tie_embeddings'] else head, config)
+            if tail == 'embed_tokens.weight':
+                return weight_path(table, config)
+            last = _records.integer(config['num_layers'], 'num_layers') - 1
+            if tail in _PREDICTION_OWN or assembly.canonical(f'model.layers.{last}.{tail}') is not None:
+                return None
         canonical = assembly.canonical(name)
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
@@ -843,4 +795,4 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     return decoder_parts.DecoderFamily(
         (model_type,), translated, lambda fields: False, model_type, 'ForCausalLM', lambda model: {},
         preserve_source_layout=True, weight_path=weight_path, packed=assembly.packed,
-        tied_head_names=assembly.tied)
+        tied_head_names=assembly.tied, prediction_depth=decoder_parts.layer_depth)

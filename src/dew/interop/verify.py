@@ -488,6 +488,18 @@ class VerifiedMapping:
             return parts.family(self.model_type, _assembled(source, hf_config))
         return dict(CONVENTIONS)[self.family]
 
+    def record(self, hf_config: Mapping[str, object],
+               entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
+        """The real config's record through `entry` (`entry`'s family by default), its tensor names
+        unchecked: what a load's selection of the checkpoint's tensors (its prediction depths,
+        `DecoderFamily.prediction_depth`) reads before `translate` checks the selection's names."""
+        entry = self.entry(hf_config) if entry is None else entry
+        try:
+            record, _ = _translate(hf_config, self.family, entry)
+        except _Mismatch as error:
+            raise _refuse(self.model_type, str(error)) from error
+        return record
+
     def translate(self, hf_config: Mapping[str, object], tensor_names: Collection[str],
                   entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
         """Translate the real config and check the real tensor names, then warn once.
@@ -497,10 +509,7 @@ class VerifiedMapping:
         `entry` is the family `entry` gave for this config, where the caller holds it.
         """
         entry = self.entry(hf_config) if entry is None else entry
-        try:
-            record, _ = _translate(hf_config, self.family, entry)
-        except _Mismatch as error:
-            raise _refuse(self.model_type, str(error)) from error
+        record = self.record(hf_config, entry)
         unmapped = _unmapped(tensor_names, record, entry)
         if unmapped:
             raise _refuse(self.model_type, f"the tensors {unmapped[:8]} have no path in the {self.family!r} "
@@ -624,19 +633,33 @@ def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndar
     return logits.detach().numpy(), gradients
 
 
+def _as_stored(model: PreTrainedModel, tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """`tensors`, by `model`'s parameter names, as its `save_pretrained` stores them: through the reverse of
+    the checkpoint conversion its load applies (`revert_weight_conversion`; a routed type's fused experts
+    are stored one tensor per expert), so each lands where its parameter's stored tensor does."""
+    import torch
+    from transformers.core_model_loading import revert_weight_conversion
+
+    stored = revert_weight_conversion(model, {name: torch.from_numpy(np.asarray(value))
+                                              for name, value in tensors.items()})
+    return {name: tensor.numpy() for name, tensor in stored.items()}
+
+
 def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFamily,
                     record: decoder_parts.DecoderFields, variables: Variables) -> float:
     """How much farther the source's float32 gradient of a parameter is from the float64 truth than
     Dew's float32 gradient is, the largest over the parameters, each pooled over its elements on the
     probe's draw (the root of the ratio of their summed squared errors, Dew's floored at the half ulp
-    float32 carries of each element of the truth): the source's eval-mode gradients read into Dew's tree
-    as its weights are (`translate_weights`; a gradient rearranges as its parameter does), the truth
+    float32 carries of each element of the truth): the source's eval-mode gradients stored as
+    `save_pretrained` stores its weights (`_as_stored`) and read into Dew's tree as they are
+    (`translate_weights`; a gradient rearranges as its parameter does), the truth
     Dew's decoder of the same record and weights in float64. Per parameter, so a wrong gradient of a
     small one is not hidden by another's rounding."""
     ids = probe_ids(_VOCAB)
     cotangent = np.random.RandomState(11).standard_normal((BATCH, LENGTH, _VOCAB)).astype(np.float32)
     _, theirs = _probe_gradients(reference, ids, cotangent, train=False)
-    their_tree = flax_traverse.flatten_dict(decoders.translate_weights(theirs, record, family)['params'])
+    stored = _as_stored(reference, theirs)
+    their_tree = flax_traverse.flatten_dict(decoders.translate_weights(stored, record, family)['params'])
 
     def gradient(dtype: str) -> dict:
         model = models.build('causal_transformer', {**record, 'dtype': dtype, 'attention_impl': 'reference'})

@@ -39,7 +39,7 @@ QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
 feed their own rings (`mosaic_sm90.FED`). mma.sync's lowers and holds check 1 on an A100 (row 2078,
 ET-2078-A100CHECK3), but its natural, guarded and backward launches spill at every tile its model admits and
-no register fact yet decides them (the toolkit's sm80 matrix), so its calls take FA2 or the frozen Triton
+no register fact yet decides them (the toolkit's sm80 matrix), so its calls take FA2 or the Pallas-Triton
 mainloop by legality."""
 
 

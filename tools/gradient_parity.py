@@ -65,9 +65,9 @@ def measured(model_type: str, built=None) -> float | str:
         return str(ambiguous)
     family = parts.family(model_type, assembly)
     with tempfile.TemporaryDirectory() as folder:
-        # The module's own names, which the assembly reads, not a released format's
-        # (`save_pretrained` writes Mixtral's experts one by one, as its releases stored them).
-        reference.save_pretrained(folder, save_original_format=False)
+        # As a release stores it (Mixtral's experts one by one), which the assembly reads through the
+        # load's conversion, as verify's training qualification does.
+        reference.save_pretrained(folder)
         variables = hf_decoders.translate_weights(sources.load_shards(Path(folder)), assembly.fields, family)
     return verify.gradient_parity(reference, family, assembly.fields, variables)
 
