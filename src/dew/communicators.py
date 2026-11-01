@@ -30,7 +30,6 @@ before it to the room left (`admit`), so a program that would fail to connect is
 
 from __future__ import annotations
 
-import collections
 import dataclasses
 import hashlib
 import itertools
@@ -41,7 +40,6 @@ import subprocess
 import sys
 import threading
 import time
-import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
@@ -333,22 +331,11 @@ class Resident:
 
     def __init__(self) -> None:
         self.held = Collectives()
-        self.loaded: dict[bytes, Loaded] = {}
-        self.owners: collections.Counter[bytes] = collections.Counter()
+        self.loaded: set[bytes] = set()
         self.lock = threading.Lock()
 
-    def release(self, fingerprint: bytes) -> None:
-        """One executable of `fingerprint` released: its code leaves its GPUs once no executable holds it, as
-        XLA unloads a module none holds, while the communicators it made stay made."""
-        with self.lock:
-            self.owners[fingerprint] -= 1
-            if self.owners[fingerprint] <= 0:
-                del self.owners[fingerprint]
-                self.loaded.pop(fingerprint, None)
-
     def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
-              free: Callable[[int], int | None], loaded: Loaded | None = None, owner: object | None = None
-              ) -> None:
+              free: Callable[[int], int | None], loaded: Loaded | None = None) -> None:
         """Admit a compiled program's communicators (`made`), refusing it, naming the bytes, before it runs,
         where they and the process's earlier ones, each counted once, with the runtime's need more than the
         room Dew left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it), or where those it
@@ -358,18 +345,18 @@ class Resident:
         communicator's buffers as its program first runs, which no process can see, so free memory cannot
         tell an earlier program not yet run from one that ran: the room holds every program's together,
         and what is free now refuses a program whose own communicators cannot fit even beside the earlier
-        ones all made. A program's code (`loaded`) is held beside them the same way, each executable's
-        once, for as long as an executable that holds it (`owner`) lives (`release`)."""
+        ones all made. A program's code (`loaded`) loads as it first runs and leaves as its executable is
+        released, which no process can see either, so it is held to what is free now beside the
+        communicators it adds, an executable's the first time it is admitted, and the room holds what stays
+        made."""
         with self.lock:
             held = self.held | made
             new = loaded is not None and loaded.fingerprint not in self.loaded
-            programs = {**self.loaded, **({loaded.fingerprint: loaded} if loaded is not None and new else {})}
             needed = needs.needed(held, room, runtime=True)
             added = needs.needed(made, room, runtime=False, made=self.held)
-            for program in programs.values():
-                for gpu in set(program.gpus) & set(needed):
-                    needed[gpu] += program.code
-                    added[gpu] += program.code if new and program is loaded else 0
+            if loaded is not None and new:
+                for gpu in set(loaded.gpus) & set(added):
+                    added[gpu] += loaded.code
             now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
             short = (any(needed[gpu] > room[gpu] for gpu in room)
                      or any(added[gpu] > now[gpu] for gpu in now))
@@ -381,10 +368,9 @@ class Resident:
                                        "process's, which its GPUs have too little room for outside XLA's "
                                        f"pool; lower {fraction_name()} by the shortfall over the GPU's bytes",
                                        needed, {gpu: min(room[gpu], now.get(gpu, room[gpu])) for gpu in room})
-            self.held, self.loaded = held, programs
-            if loaded is not None and owner is not None:
-                self.owners[loaded.fingerprint] += 1
-                weakref.finalize(owner, self.release, loaded.fingerprint)
+            self.held = held
+            if loaded is not None:
+                self.loaded.add(loaded.fingerprint)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -507,7 +493,7 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
         made = collectives_kept(fingerprint, gpus, lambda: executable.as_text() or "")
         memory = executable.memory_analysis()
         loaded = Loaded(fingerprint, gpus, int(getattr(memory, "generated_code_size_in_bytes", 0) or 0))
-    _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded, owner=executable)
+    _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded)
 
 
 type Run = tuple[int, int, Mapping[int, int]]

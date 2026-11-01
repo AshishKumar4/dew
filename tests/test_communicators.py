@@ -4,7 +4,6 @@ full speed, the run's share its upper bound, and a compiled program whose commun
 Dew left them refused before it runs, never left to stall in a collective. The measurement itself needs two
 GPUs, which a two-GPU run of the check makes; here it is the child's report, as the parent reads it."""
 
-import gc
 import hashlib
 import itertools
 import json
@@ -165,42 +164,21 @@ def test_what_a_gpu_has_spent_already_is_not_charged_to_a_program_again():
     assert resident.held == Collectives(groups=frozenset({(0, 1, 2, 3), (0, 1), (2, 3)}))
 
 
-def test_a_programs_code_is_held_beside_the_communicators_once():
-    """A program's code takes its GPUs' memory outside XLA's pool from its first run on, as its communicators
-    do: a program whose communicators fit the room but not with its code is refused, and a program admitted
-    again (another key compiling the same executable) charges its code once."""
+def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
+    """A program's code takes its GPUs' memory outside XLA's pool as it first runs and leaves as its
+    executable is released, neither of which a process sees: a program whose new communicators fit what its
+    GPUs have free now but not with its code is refused, an executable admitted again is not charged its
+    code again, and the room, which holds what stays made, never holds code."""
     room = dict.fromkeys(range(4), 3 * GIB)
     every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    pair = Collectives(groups=frozenset({(0, 1)}))
     resident = communicators.Resident()
-    loaded = communicators.Loaded(b"step", (0, 1, 2, 3), GIB // 4)
-    resident.admit(every, FOUR, room, lambda gpu: None, loaded)
-    resident.admit(every, FOUR, room, lambda gpu: None, loaded)
-    other = communicators.Loaded(b"other", (0, 1, 2, 3), GIB // 2)
-    with pytest.raises(CommunicatorRoom) as refused:
-        resident.admit(every, FOUR, room, lambda gpu: None, other)
-    assert refused.value.needed == dict.fromkeys(range(4), 2 * GIB + GIB // 2 + GIB // 4 + GIB // 2)
-
-
-def test_a_released_executables_code_is_room_again():
-    """An executable's code leaves its GPUs once the executable is released (XLA unloads a module no
-    executable holds), while the communicators it made stay: a program refused beside a held executable's
-    code is admitted once that executable is gone."""
-    room = dict.fromkeys(range(4), 3 * GIB)
-    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
-    resident = communicators.Resident()
-
-    class Executable:
-        """An executable's stand-in, whose release the admission observes."""
-
-    held = Executable()
-    resident.admit(every, FOUR, room, lambda gpu: None, communicators.Loaded(b"step", (0, 1, 2, 3), GIB // 2),
-                   owner=held)
-    other = communicators.Loaded(b"other", (0, 1, 2, 3), GIB // 2)
+    resident.admit(every, FOUR, room, lambda gpu: 3 * GIB, communicators.Loaded(b"step", (0, 1, 2, 3), GIB))
+    resident.admit(every, FOUR, room, lambda gpu: 0, communicators.Loaded(b"step", (0, 1, 2, 3), GIB))
     with pytest.raises(CommunicatorRoom):
-        resident.admit(every, FOUR, room, lambda gpu: None, other, owner=Executable())
-    del held
-    gc.collect()
-    resident.admit(every, FOUR, room, lambda gpu: None, other, owner=Executable())
+        resident.admit(pair, FOUR, room, lambda gpu: GIB, communicators.Loaded(b"eval", (0, 1), GIB // 2))
+    evaluation = communicators.Loaded(b"eval", (0, 1), GIB // 2)
+    resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
 def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeypatch):
