@@ -56,8 +56,11 @@ class Issuer:
     memory, or a register value the family stages first (`staged`) into its product's `buffers` (by product
     name, a tile a part), an fp32 one as its parts, as many as its buffers (one, a cast to theirs). A product
     whose buffers are a list of such sets keeps each value it stages there for the products after it that
-    take the same value, staging a new one into the set its last product read longest ago. Operands of three
-    parts issue the products whose parts' orders sum under three, smallest first; of two, under two."""
+    take the same value, staging a new one into the set its last product read longest ago. A product whose
+    buffers are a count takes a register left operand in that many parts as they are, staged nowhere, on a
+    family whose products read their operands from registers (`Family.operands_in_registers`,
+    `register_operand`). Operands of three parts issue the products whose parts' orders sum under three,
+    smallest first; of two, under two."""
 
     def __init__(self, call: Issuing, buffers: dict | None = None):
         self.call, self.buffers = call, buffers or {}
@@ -127,6 +130,15 @@ class Issuer:
         shape = (first[1].shape[0], first[2].shape[1]) if shape is None else shape
         return family.summed(shape, issued, interpret)
 
+    def _registered(self, name: str, lhs) -> tuple | None:
+        """`lhs`'s parts in registers where its product takes it there (its buffers a count, `Issuer`'s),
+        else None."""
+        count = self.buffers.get(name)
+        if not isinstance(count, int) or isinstance(lhs, (Parts, product.Exact, product.Transposed)):
+            return None
+        value = lhs() if callable(lhs) else lhs
+        return product.formed(value, count) if count > 1 else (value,)
+
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
         """The product `lhs @ rhs`: its operands' parts' products (`product.terms`), each into its own
         accumulator where an operand takes three parts (an fp32 call's accurate forms, `Family.apart`: a part
@@ -134,10 +146,19 @@ class Issuer:
         forms' (`mainloop.FAST_PARTS`), TF32's precision and past it, which that last bit is far below; apart,
         an fp32 call's solve held its products' accumulators at once, 576 bytes a thread spilled on an H100
         (fast32d-sm90 at 83b47d66f6)."""
-        left = self._operand(lhs, name, rhs)
-        right = self._operand(rhs, name, lhs)
         family, interpret = self.call.family, self.call.interpret
         shape = (lhs.shape[0], rhs.shape[1])
+        registered = self._registered(name, lhs)
+        if registered is not None:
+            (right,) = self._operand(rhs, name, lhs)
+            if len(registered) <= 2:
+                return family.summed(
+                    shape, lambda acc: family.register_products(acc, registered, right, interpret), interpret)
+            # Each part's product its own accumulator, smallest first (`product.terms`), as `Family.apart`.
+            return functools.reduce(jnp.add, (family.registers_product(registered[i], right, interpret)
+                                              for i, _ in product.terms(len(registered), 1)))
+        left = self._operand(lhs, name, rhs)
+        right = self._operand(rhs, name, lhs)
         if max(len(left), len(right)) == 2:
             return family.summed(shape, lambda acc: family.issued(acc, left, right, interpret), interpret)
         return family.apart(shape, left, right, interpret)
