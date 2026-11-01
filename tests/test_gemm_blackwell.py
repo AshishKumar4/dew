@@ -25,8 +25,10 @@ SIZES = (0, 70, 1, 129, 100, 0)
 ROWS, DEPTH, WIDTH = 307, 128, 256
 SEEDS = 8
 """Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
-TILES = (mosaic_blackwell.Tiles(128, 128, 64, 2, 1), mosaic_blackwell.Tiles(128, 256, 64, 4, 2))
-"""A tile of each accumulator width, its two accumulators within the 512 columns of tensor memory."""
+TILES = (mosaic_blackwell.Tiles(128, 128, 64, 2, 1), mosaic_blackwell.Tiles(128, 256, 64, 4, 2),
+         mosaic_blackwell.Tiles(128, 128, 64, 4, 1, cluster=2))
+"""A tile of each accumulator width, its two accumulators within the 512 columns of tensor memory, and a pair
+of CTAs' (256 x 256, each CTA's accumulators 256 columns)."""
 
 
 def biased(acc, bias):
@@ -98,7 +100,7 @@ def _plain(case: str, *, truth: bool = False):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}")
+@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}x{tiles.cluster}")
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_blackwell_gmm_holds_check_1(case, tiles):
     """Each case through the mainloop, interpreted: as exact as the plain program from float64 truth, the
@@ -112,7 +114,7 @@ ON_BLACKWELL = pytest.mark.skipif(generation.device_generation() not in ("sm100"
 
 
 @ON_BLACKWELL
-@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}")
+@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}x{tiles.cluster}")
 @pytest.mark.parametrize("case", list(CASES))
 def the_blackwell_gmm_holds_check_1_on_blackwell(case, tiles):
     """Each case compiled and run on a B200 or a B300, its tiles over every multiprocessor, where the

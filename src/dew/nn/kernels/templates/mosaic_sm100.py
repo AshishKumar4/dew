@@ -42,6 +42,43 @@ WARPGROUPS = 2
 
 
 @dataclasses.dataclass(frozen=True)
+class Topology:
+    """The CTAs one product spans (tcgen05's collective form): one, or a pair of a cluster's
+    (`mosaic.CLUSTER`), whose leader issues each product over both's rows into both's tensor memory, each
+    CTA loading its own rows' block of one operand and its half of the other's, the leader's load barriers
+    tracking both halves and its products' commits arriving at both (CUTLASS's 2-SM UMMA)."""
+    ctas: int = 1
+
+    @property
+    def paired(self) -> bool:
+        return self.ctas == 2
+
+    def index(self):
+        """This CTA's place in the pair (0, the leader, without one)."""
+        return lax.axis_index(mosaic.CLUSTER) if self.paired else 0
+
+    def leads(self):
+        """Whether this CTA issues the products."""
+        return lax.axis_index(mosaic.CLUSTER) == 0 if self.paired else True
+
+    def copied(self, dimension: int) -> dict:
+        """A load's partition across the pair: each CTA its share of the block along `dimension`, tracked
+        by the leader's barrier."""
+        if not self.paired:
+            return {}
+        return {'leader_tracked': plgpu.CopyPartition.PARTITIONED(dimension),
+                'collective_axes': mosaic.CLUSTER}
+
+    def issued(self) -> dict:
+        """A product's or a commit's spread over the pair."""
+        return {'collective_axis': mosaic.CLUSTER} if self.paired else {}
+
+
+SINGLE = Topology()
+"""A product on one CTA."""
+
+
+@dataclasses.dataclass(frozen=True)
 class Tcgen05:
     """The tcgen05 bundle's facts and pieces (the module's account)."""
 
@@ -67,11 +104,12 @@ class Tcgen05:
 
     @staticmethod
     def kernel(entry: Callable, *, out_type, grid: tuple, grid_names: tuple, scratch: tuple,
-               interpret, name: str | None = None) -> Callable:
-        """`entry` as a program of `WARPGROUPS` warpgroups (axis 'wg'), its kernel named `name`."""
+               interpret, name: str | None = None, topology: Topology = SINGLE) -> Callable:
+        """`entry` as a program of `WARPGROUPS` warpgroups (axis 'wg'), its kernel named `name`, `grid` the
+        clusters of `topology`'s CTAs (one each without a pair)."""
         return mosaic.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                              warpgroups=WARPGROUPS, family=Tcgen05.name, scratch=scratch,
-                             interpret=interpret, name=name)
+                             interpret=interpret, name=name, cluster=topology.ctas)
 
     @staticmethod
     def roles(load: Callable[[], None], products: Callable[[], None], read: Callable[[], None]) -> None:
@@ -107,9 +145,12 @@ class Stages:
     """A ring of `stages` operand stages in shared memory, one buffer an operand (`blocks`, each its
     block's shape, dtype and transforms), a load barrier an operand and stage, and a release barrier a
     stage the products arrive at once they have read it (tensor-core ordered). A turn is a step's index
-    over the program's walk; its stage is the turn's remainder."""
+    over the program's walk; its stage is the turn's remainder. Over a pair of CTAs (`topology`), each
+    operand's block splits along its `partitions` dimension between them."""
     stages: int
     blocks: tuple
+    topology: Topology = SINGLE
+    partitions: tuple[int, ...] = ()
 
     def scratch(self) -> tuple:
         """The ring's shared memory and barriers, in `opened`'s order."""
@@ -119,7 +160,7 @@ class Stages:
         return (buffers, loaded, plgpu.Barrier(num_barriers=self.stages, orders_tensor_core=True))
 
     def opened(self, buffers, loaded, consumed) -> "Ring":
-        return Ring(self.stages, buffers, loaded, consumed)
+        return Ring(self.stages, buffers, loaded, consumed, self.topology, self.partitions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,6 +170,8 @@ class Ring:
     buffers: tuple[Ref, ...]
     loaded: tuple[state_types.AbstractRef, ...]
     consumed: state_types.AbstractRef
+    topology: Topology = SINGLE
+    partitions: tuple[int, ...] = ()
 
     def turn(self, counter) -> mosaic.Turn:
         """Step `counter`'s turn of the ring."""
@@ -139,8 +182,10 @@ class Ring:
         have read the stage's last ones (the rotation before, of the other parity)."""
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
             self.consumed.at[turn.slot], parity=turn.freed))
-        for view, buffer, barrier in zip(views, self.buffers, self.loaded, strict=True):
-            plgpu.copy_gmem_to_smem(view, buffer.at[turn.slot], barrier.at[turn.slot])
+        partitions = self.partitions or (0,) * len(views)
+        for view, buffer, barrier, along in zip(views, self.buffers, self.loaded, partitions, strict=True):
+            plgpu.copy_gmem_to_smem(view, buffer.at[turn.slot], barrier.at[turn.slot],
+                                    **self.topology.copied(along))
 
     def acquire(self, turn: mosaic.Turn) -> tuple:
         """The product warp's turn: each operand's stage once loaded, and the barrier its products
@@ -160,17 +205,24 @@ class Accumulators:
     """`count` fp32 accumulators of `rows` x `columns` in tensor memory side by side, a product barrier
     each the product warp commits to once a tile's products are issued and a read barrier each the reading
     warpgroup arrives at once it has read one out (both tensor-core ordered). A turn is a tile's index
-    over the program's tiles that compute; its accumulator is the turn's remainder."""
+    over the program's tiles that compute; its accumulator is the turn's remainder. Over a pair of CTAs
+    (`topology`) each holds its rows' accumulators, allocated together, and an accumulator is free once both
+    CTAs have read theirs out (its read barrier the cluster's)."""
     count: int
     rows: int
     columns: int
+    topology: Topology = SINGLE
 
     def scratch(self, target: generation.GpuTarget) -> tuple:
         if self.count * self.columns > TCGEN05.columns(target):
             raise ValueError(f"{self.count} accumulators of {self.columns} columns exceed tensor memory")
         tensor_core = functools.partial(plgpu.Barrier, orders_tensor_core=True)
-        return (plgpu.TMEM((self.rows, self.count * self.columns), jnp.float32),
-                tensor_core(num_barriers=self.count), tensor_core(num_barriers=self.count))
+        read = (plgpu.ClusterBarrier(collective_axes=(mosaic.CLUSTER,), num_barriers=self.count,
+                                     orders_tensor_core=True)
+                if self.topology.paired else tensor_core(num_barriers=self.count))
+        return (plgpu.TMEM((self.rows, self.count * self.columns), jnp.float32,
+                           collective=self.topology.paired),
+                tensor_core(num_barriers=self.count), read)
 
     def opened(self, tmem, done, read) -> "Tensor":
         return Tensor(self, tmem, done, read)
@@ -197,7 +249,7 @@ class Tensor:
 
     def issued(self, turn: mosaic.Turn) -> None:
         """The product warp's turn's products all issued: the reader may wait on them."""
-        plgpu.tcgen05_commit_arrive(self.done.at[turn.slot])
+        plgpu.tcgen05_commit_arrive(self.done.at[turn.slot], **self.shape.topology.issued())
 
     def read(self, turn: mosaic.Turn, chunk: int, layout=STORED) -> Callable[[int], jax.Array]:
         """The reading warpgroup's turn: once its products are done, each `chunk`-column slice of its
