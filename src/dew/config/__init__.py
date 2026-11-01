@@ -807,7 +807,7 @@ class TrainerConfig:
         resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
-        if dataset.steps_per_epoch is None and dataset.pass_examples is not None:
+        if dataset.steps_per_epoch is None and dataset.epochs is not None and dataset.pass_examples:
             return Counted(dataset.pass_examples, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(

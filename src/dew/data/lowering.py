@@ -2272,6 +2272,37 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     return count if length is None else min(count, length)
 
 
+def _pass_examples(train: Pipeline, build: _Build) -> int | None:
+    """The source examples one pass of a training read with no record count holds (`_epoch_records`,
+    `Loader.pass_examples`): those reaching where a bound in examples stands (`dew.data.compile._bounded`:
+    the first step that packs or windows them or makes several rows of each, else the batch), before any
+    repeat, counted as the lowering builds that prefix in one indexed order, a slice and a limit exactly,
+    a memory read's rows as it holds them; a streamed prefix the rows its shards state; a mixture's, those
+    in which every part it mixes comes round once (`Proportions.covering`). None where a step before that
+    place drops or adds one, or nothing states the count."""
+    if isinstance(train.source, Phases):
+        return None
+    batched = _until(train.stages, (BatchStage, TokenBudget))
+    at = next((index for index, stage in enumerate(train.stages[:batched])
+               if isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)),
+              batched)
+    prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
+    if any(_drops(stage) or isinstance(stage, Native) for stage in prefix):
+        return None
+    if isinstance(train.source, Mixture):
+        sizes = [_pass_examples(child, build.child(index))
+                 for index, child in enumerate(train.source.pipelines)]
+        known = [size for size in sizes if size is not None]
+        return None if len(known) != len(sizes) else Proportions.of(_weights(train.source)).covering(known)
+    with _closing(build.records(dataclasses.replace(train, stages=prefix), DataPartition())) as rows:
+        if isinstance(rows, pygrain.MapDataset):
+            return len(rows)
+    if build.read != "streamed" or any(isinstance(stage, (Limit, Slice)) for stage in prefix):
+        return None
+    stated = [shard.rows for shard in train.source.manifest().shards]
+    return None if any(count is None for count in stated) else sum(stated)
+
+
 def _order_length(train: Pipeline, build: _Build) -> int | None:
     """The records `train`'s order holds before its batch, all its passes, as the lowering builds
     them; None where its read counts none ahead."""

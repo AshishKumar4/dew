@@ -735,16 +735,15 @@ class Loader:
     """The records the training read is bounded to before they are packed (`compile`'s
     `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
     not bounded."""
+    pass_examples: int | None = None
+    """The source examples one pass of a training read with no record count holds (`records` None: an
+    objective makes rows of them, or a pack lays them out, after the order, or a filter cuts it per share),
+    as its read states them (`dew.data.lowering._pass_examples`): an epoch of it; None where nothing
+    states them, or the read has a record count."""
     epochs: int | None = None
-    """The passes over its source examples a training read with no record count (`records` None: an
-    objective makes rows of them, or a pack lays them out, after the order) is bounded to, as a run of
-    that many `epochs` reads it (`dew.data.compile.fitted`), its `examples` their count; None for a read
-    bounded otherwise or not at all."""
-
-    @property
-    def pass_examples(self) -> int | None:
-        """The source examples one of its `epochs` holds, or None where it is not bounded in epochs."""
-        return None if self.epochs is None or self.examples is None else self.examples // self.epochs
+    """The epochs a training read with no record count is bounded to, `examples` their passes over its
+    source examples (`pass_examples`), as a run of that many reads it (`dew.data.compile.fitted`); None
+    for a read bounded otherwise or not at all."""
     bound_ends: bool = True
     """Whether a read bounded in `examples` ends where its bound does, having read every one: no take or
     slice after the bound ends it first, which a run on the examples clock refuses
