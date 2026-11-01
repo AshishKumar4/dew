@@ -1,6 +1,6 @@
 """Host-only run records carried by Tracker.artifact, not training pytrees.
 
-`json_value` here runs the opposite direction from `dew._records`: that module
+`tracker_json` here runs the opposite direction from `dew._records`: that module
 narrows a config field a published file handed over, this one encodes a
 finished record on its way out to a tracker.
 """
@@ -26,11 +26,11 @@ _log = logging.getLogger(__name__)
 
 
 _NONFINITE = {'NaN': math.nan, '+Inf': math.inf, '-Inf': -math.inf}
-"""The spellings `json_value` writes a nonfinite number in, and the number each reads back as."""
+"""The spellings `tracker_json` writes a nonfinite number in, and the number each reads back as."""
 
 
 def reported_number(value: object, key: str) -> float:
-    """A number a report wrote through `json_value`: a JSON number, or the spelling of a nonfinite
+    """A number a report wrote through `tracker_json`: a JSON number, or the spelling of a nonfinite
     one, read back as that float."""
     if isinstance(value, str) and value in _NONFINITE:
         return _NONFINITE[value]
@@ -39,7 +39,7 @@ def reported_number(value: object, key: str) -> float:
     return float(value)
 
 
-def json_value(value: object) -> JSON:
+def tracker_json(value: object) -> JSON:
     """JSON values, with nonfinite numbers encoded as 'NaN', '+Inf', '-Inf'.
 
     These strings preserve valid infinite metrics (for example perfect PSNR)
@@ -51,17 +51,17 @@ def json_value(value: object) -> JSON:
         return value if math.isfinite(value) else ('NaN' if math.isnan(value) else
                                                    '+Inf' if value > 0 else '-Inf')
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {field.name: json_value(getattr(value, field.name))
+        return {field.name: tracker_json(getattr(value, field.name))
                 for field in dataclasses.fields(value)}
     if isinstance(value, Mapping):
         encoded: dict[str, JSON] = {}
         for key, entry in value.items():
             if not isinstance(key, str):
                 raise TypeError('report metadata keys must be strings')
-            encoded[key] = json_value(entry)
+            encoded[key] = tracker_json(entry)
         return encoded
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        return [json_value(entry) for entry in value]
+        return [tracker_json(entry) for entry in value]
     raise TypeError(f'{type(value).__name__} is not JSON reporting metadata')
 
 
