@@ -36,7 +36,7 @@ from dew.nn.inputs import mesh_of
 
 
 @dataclass(frozen=True)
-class Scored[Row, Payload]:
+class ScoringRequest[Row, Payload]:
     """A request as its task admitted it: its rows, each scored in one of the task's passes, and what
     the task's answer reads of it besides their outputs."""
 
@@ -59,7 +59,7 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
     of its own: the server holds them resident, and hands them to every pass, so a task and the weights
     it scores with are one pair the server swaps whole (`ScoringServer.reload`)."""
 
-    def admit(self, request: Request) -> Scored[Row, Payload]:
+    def admit(self, request: Request) -> ScoringRequest[Row, Payload]:
         """`request` laid out as the rows the task's passes read; raises ValueError for a request it
         refuses."""
         ...
@@ -84,7 +84,7 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
 
 
 class _Request[Row, Payload, Output, Answer]:
-    def __init__(self, scored: Scored[Row, Payload], served: tuple[Scoring, Variables]) -> None:
+    def __init__(self, scored: ScoringRequest[Row, Payload], served: tuple[Scoring, Variables]) -> None:
         self.scored = scored
         self.served = served
         """The task that laid the request out, and its weights: the pair that scores it."""

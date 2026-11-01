@@ -41,7 +41,9 @@ def scoping(variables) -> Callable:
     (`SCOPE`) in `variables`, the task's tree, beneath the branch its root was applied over: the one
     subtree of `variables["params"]` whose leaves' paths, shapes and dtypes are the root's own, empty
     where none is (a root over variables of its own). Two branches alike in every leaf cannot be told
-    apart by what a root reads, and are refused rather than merged."""
+    apart by what a root reads, and are refused rather than merged. A lifted transform's inner root
+    (`nn.remat`'s, as every Dew LayerNorm is) is no root of the task's: it holds its outer scope's path
+    and its own variables alone, so it reads beneath the branch of the call that lifted it."""
     branches: dict[frozenset, list[tuple[str, ...]]] = {}
 
     def walk(tree, path: tuple[str, ...]) -> None:
@@ -61,11 +63,21 @@ def scoping(variables) -> Callable:
             raise ValueError(f"a root reads one of the branches {found}, alike in every leaf")
         return found[0]
 
+    lifting: list[tuple[str, ...]] = []
+
     def scoped(next_fun, args, kwargs, context):
         scope = context.module.scope
-        path = () if scope is None else (*branch(scope.root), *scope.path)
-        with jax.named_scope(SCOPE + "|".join(path)):
-            return next_fun(*args, **kwargs)
+        if scope is None:
+            base, path = (), ()
+        else:
+            base = lifting[-1] if scope.root.path and lifting else branch(scope.root)
+            path = (*base, *scope.path)
+        lifting.append(base)
+        try:
+            with jax.named_scope(SCOPE + "|".join(path)):
+                return next_fun(*args, **kwargs)
+        finally:
+            lifting.pop()
 
     return scoped
 

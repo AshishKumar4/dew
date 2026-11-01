@@ -2,7 +2,7 @@
 check 1's draws are tested beside the gate (tests/test_reference_error.py)."""
 
 import pytest
-from map_judge import DRAWS, POOL, RECORDS, PoolRefused, pooled_units, record_units
+from map_judge import DRAWS, POOL, RECORDS, PoolRefused, drawing, pooled_units, record_units
 
 
 def recorded(monkeypatch, tmp_path, ranges, label="units"):
@@ -38,4 +38,14 @@ def test_outside_a_map_task_or_a_judge_nothing_is_recorded_or_pooled(monkeypatch
         monkeypatch.delenv(name, raising=False)
     assert not record_units("units", lambda first, last: [])
     assert pooled_units("units", 9) is None
+    assert not drawing()
     assert not list(tmp_path.iterdir())
+
+
+def test_a_map_task_draws_and_a_judge_does_not(monkeypatch, tmp_path):
+    """Only a map task (DRAWS) is drawing, so a site leaves its judge-only work to the judge (POOL)."""
+    monkeypatch.setenv(DRAWS, "0:2")
+    assert drawing()
+    monkeypatch.delenv(DRAWS)
+    monkeypatch.setenv(POOL, str(tmp_path))
+    assert not drawing()
