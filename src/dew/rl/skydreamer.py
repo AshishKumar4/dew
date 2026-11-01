@@ -90,12 +90,12 @@ class Sky:
     @property
     def centers(self) -> np.ndarray:
         """The gates' centres `[G, 3]`."""
-        return np.asarray([center for center, _ in self.track], np.float32)
+        return np.asarray([center for center, _ in self.track])
 
     @property
     def headings(self) -> np.ndarray:
         """The gates' headings `[G]` (radians)."""
-        return np.deg2rad(np.asarray([heading for _, heading in self.track], np.float32))
+        return np.deg2rad(np.asarray([heading for _, heading in self.track]))
 
 
 @struct.dataclass

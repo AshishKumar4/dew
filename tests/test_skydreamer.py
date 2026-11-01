@@ -174,7 +174,8 @@ def test_a_world_model_reads_its_proprioceptive_entries_beside_its_image():
     proprio = (("rates", 3), ("plan", 5))
     shared = {"image": (16, 16, 3), "reads": "image", "deter": 32, "hidden": 8, "stoch": 4, "classes": 4,
               "units": 16, "conv_depth": 4}
-    images = jnp.asarray(np.random.default_rng(1).integers(0, 255, (2, 16, 16, 3)), jnp.uint8)
+    image = np.random.default_rng(1).integers(0, 255, (16, 16, 3))
+    images = jnp.asarray(np.stack([image, image]), jnp.uint8)
     observed = {"image": images, "rates": jnp.asarray([[0.1, 0.2, 0.3]] * 2),
                 "plan": jnp.asarray([[0.0] * 5, [1.0] * 5])}
     for reading, apart in ((proprio, True), ((), False)):
@@ -202,7 +203,7 @@ def test_the_smoothness_term_is_the_squared_change_of_the_imagined_means():
             (jnp.asarray(mean), jnp.asarray(std)), jnp.asarray(actions), jnp.asarray(advantage),
             jnp.asarray(weight))
     change = np.sum(np.square(mean[:, 1:] - mean[:, :-1]), -1)
-    assert_computes_the_oracle(np.asarray(smoothed) - np.asarray(plain), 0.002 * change, "smoothness",
+    assert_computes_the_oracle(np.asarray(smoothed), np.asarray(plain) + 0.002 * change, "smoothness",
                                roundings=16)
 
 
