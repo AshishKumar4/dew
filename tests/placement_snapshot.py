@@ -48,7 +48,7 @@ def _components() -> dict:
         "NormalAttention+headed": lambda: (
             NormalAttention(32, heads=2, dim_head=8, attention_impl="reference"), (tokens,), {}),
         "GatedMLP+packed": lambda: (GatedMLP(16, 8, activation="geglu", packed=True,
-                                             packed_order=("gate_proj", "down_proj")),
+                                             packed_order=("up_proj", "gate_proj")),
                                     (jnp.zeros((1, 8)),), {}),
         "GatedMLP+ungated": lambda: (GatedMLP(16, 8, activation="gelu"), (jnp.zeros((1, 8)),), {}),
         "GatedMLP+bias": lambda: (GatedMLP(16, 8, use_bias=True), (jnp.zeros((1, 8)),), {}),
