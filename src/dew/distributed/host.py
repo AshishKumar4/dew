@@ -22,6 +22,7 @@ from jax.tree_util import KeyPath
 
 from dew.batch import Variables
 from dew.distributed.placement import Placement
+from dew.nn.kernels.options import program
 
 
 def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
@@ -68,7 +69,7 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
     probe = jax.make_array_from_callback(
         (mesh.size,), placement, lambda _: np.ones((1,), np.int32))
     try:
-        total = jax.jit(jnp.sum)(probe)
+        total = program(jnp.sum)(probe)
         if int(total) != mesh.size:
             raise ValueError("the companion CPU collective did not include every device")
     except RuntimeError as error:
