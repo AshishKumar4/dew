@@ -1199,8 +1199,9 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                 group = f"{test}.draws-{start}-{stop}"
                 task_name = site_task(python, name, test, (start, stop))
                 weight = measured.get(task_name) or (whole * (stop - start) / mark.timed or target)
+                # In a container no task ran in, so its record, which the judge's key covers, keeps its key.
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,
-                             "rows": [row(python, name, group)], "weight": weight})
+                             "rows": [row(python, name, group)], "weight": weight, "fresh": True})
             # The judge, which pools and is kept for reuse, in a container no task ran in (`tested`).
             entries += [*maps, {"name": site_task(python, name, test), "python": python, "tests": name,
                                 "split": test, "after": [each["name"] for each in maps],

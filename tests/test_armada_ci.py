@@ -351,8 +351,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_one.py": ["tests/devices.py:placed"],
         "tests/test_passed.py": ["tests/test_passed.py:chosen"],
         "tests/test_plain.py": ["changed"],
-        "tests/test_forkserver.py": ["changed"],
-        "tests/test_shell.py": ["changed"],
+        # Their records keep no key (a process the recorder could not follow), so are no evidence.
+        "tests/test_forkserver.py": ["unrecorded"],
+        "tests/test_shell.py": ["unrecorded"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
