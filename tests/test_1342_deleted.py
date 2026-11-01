@@ -43,7 +43,8 @@ def test_banked_smoke_serve(release_source):
     placed = banked["params"]["embed_tokens"]["embedding"]
     print("embedding before deletion:", {
         "same_object": embedding is placed,
-        "same_pointer": embedding.unsafe_buffer_pointer() == placed.unsafe_buffer_pointer(),
+        "source_sharding": str(embedding.sharding),
+        "placed_sharding": str(placed.sharding),
         "source_deleted": embedding.is_deleted(),
         "placed_deleted": placed.is_deleted(),
     })
