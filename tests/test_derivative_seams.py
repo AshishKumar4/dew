@@ -100,6 +100,10 @@ CONTRACTED = {
         "test_the_fused_norms_and_products_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::rms_norm.linear_tangent":
         "test_the_fused_norms_and_products_hold_every_order",
+    "src/dew/nn/ngpt.py::stepped.linear_tangent":
+        "test_ngpts_join_and_normed_hidden_hold_every_order",
+    "src/dew/nn/ngpt.py::normed_hidden.linear_tangent":
+        "test_ngpts_join_and_normed_hidden_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::gated_rms_norm.linear_tangent":
         "test_the_fused_norms_and_products_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::swiglu.linear_tangent":
