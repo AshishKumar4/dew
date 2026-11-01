@@ -355,10 +355,11 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
 
             # Each pairs' gradient staged once in the step, its parts read by every product as they are and
             # transposed; the scores' scaled as their pairs were.
-            d_pairs, d_values = [], []
+            d_pairs, d_loads = [], []
             for (name, scaled), buffers in zip((("scores", scale), ("system", 1.0)), squares, strict=True):
                 value = _tile(slots, name, square).value() * scaled
-                d_values.append(value)
+                d_loads.append(functools.partial(
+                    lambda name, scaled: _tile(slots, name, square).value() * scaled, name, scaled))
                 d_pairs.append(Parts([family.staged(part, buffer)
                                       for part, buffer in zip(product.formed(value, parted.parts), buffers,
                                                               strict=True)], jnp.float32))
@@ -388,7 +389,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
                 d_pairs, [lambda c: query, lambda c: key * betas[:, None]], lambda c: key, 1, gated,
                 reference, Issuer(call, {"pairs": list(pairs)}).summed, chunk=CHUNK,
                 emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad),
-                **({} if call.factored else {"shifted": shifted, "lower": lower, "d_values": d_values}))
+                **({} if call.factored else {"shifted": shifted, "lower": lower, "d_loads": d_loads}))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
             for ref, grad in ((dq_ref, d_query), (dk_ref, d_keyed * betas[:, None] + d_key),
                               (dg_ref, query * d_query + key * (d_keyed * betas[:, None] - d_key))):
