@@ -962,13 +962,13 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
     # back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the remainder each
     # part after the first is formed from (`product.formed`): without it the model stated 232 registers
     # where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
-    # Where products read registers, a [C, C] tile more a key block and a value block past two: an A100's
-    # need was 224 registers at keys and values 128 wide, and it spilled 184, 256 and 280 bytes a thread at
-    # keys 128 and values 256, keys 256 and values 128, both 256 (wide-kv at e1f928585, 8 heads), where
-    # the model stated 216 at each.
-    widened = (max(0, width // call.block - 2) + max(0, value_width // call.block - 2)
-               if call.family.operands_in_registers else 0)
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (3 + (group > 1) + (grads.parts > 1) + widened)
+    # Stated short where products read registers past 128-wide keys or values: an A100 spills there, 16
+    # bytes a thread at keys 128 and values 256 and 192 at both 256 with the block sums a loop each
+    # (`algebra.Blocks`; 184 and 280 unrolled, wide-rolled and wide-kv at 12f57a1cf and e1f928585), where the
+    # model states 216. The launch is taken all the same: refused, keys and values 256 wide trained by the
+    # portable math, where the template took 2.86 ms an A100's step against fla's 6.10
+    # (batch-window-a100-b2ad84c61).
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (3 + (group > 1) + (grads.parts > 1))
                                + _held(grads, CHUNK, CHUNK)
                                + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
