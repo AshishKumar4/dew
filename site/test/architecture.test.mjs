@@ -16,7 +16,7 @@ test('the architecture page shows each of its figures inline, so each follows th
 		const label = alt.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 		const [, drawing] = /^<svg[^>]*?(viewBox="[^"]+")/.exec(read(`../docs/assets/${name}.svg`));
 		assert.ok(new RegExp(`<svg aria-label="${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*${drawing}`).test(page),
-			`${name} is not inline in the page`);
+			`${name} is not inline in the page: ${(/.{0,300}viewBox="0 0 760 432".{0,80}/s.exec(page) ?? /.{0,400}architecture-flow.{0,100}/s.exec(page) ?? ['neither'])[0]}`);
 	}
 	assert.ok(!/<img[^>]+architecture-[a-z]+\.svg/.test(page), 'a figure is an <img>, which follows only the system theme');
 });
