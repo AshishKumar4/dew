@@ -135,9 +135,9 @@ _LAYER = '_layer'
 
 
 def _read_causal_lm(view: PartView) -> Mapping[str, object]:
-    if view.lm_head.bias is not None:
-        raise Ambiguous("the head is biased, which this head's code does not add")
-    return {}
+    """Llama's causal LM: its head a Linear, which adds its bias where it holds one (ERNIE 4.5's
+    `use_bias`), as Dew's head adds `head_bias` to the logits."""
+    return {'head_bias': view.lm_head.bias is not None}
 
 
 def _read_scaled_causal_lm(view: PartView) -> Mapping[str, object]:
