@@ -2,14 +2,11 @@
 rollout beside the actions it took (`DreamerRollout(teacher=)`), imitated in their place
 (`DreamerV3Objective(imitates=)`), and a Dreamer agent scored greedy (`DreamerV3Objective.greedy`)."""
 
-import itertools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
-from test_dreamer import HostTarget, Target, demonstrations, dreamer_fit, tiny
+from test_dreamer import HostTarget, Target, demonstrations, dreamer_fit, pretrained_on, tiny
 
 from dew.objectives.base import Step
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective
@@ -120,9 +117,6 @@ def test_an_agent_trained_to_imitate_labels_learns_the_labels_not_the_actions_ta
     """An agent pretrained on targets whose steps took uniformly random actions, each labelled with a pilot's,
     imitating the labels gives the pilot's actions more likelihood than it did, and more than it gives the
     actions taken."""
-    from dew.data.dataset import Loader
-    from dew.training import Trainer
-
     env = Batched(TimeLimit(Target(), episode_length=20), 8)
     seeding = DreamerRollout(DreamerV3Objective(tiny()), env, capacity=400, batch=8, length=16,
                              train_ratio=8.0, prefill=200, teacher=Teacher(pilot, {"gain": jnp.asarray(1.0)}))
@@ -131,13 +125,7 @@ def test_an_agent_trained_to_imitate_labels_learns_the_labels_not_the_actions_ta
     assert isinstance(replay, ReplayBuffer)
     objective = DreamerV3Objective(tiny(), scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0},
                                    imitation=1.0, imitates=LABEL)
-    keys = iter(jax.random.split(jax.random.key(11), 1000))
-    data = Loader(train=lambda partition: (jax.device_get(replay.sample(next(keys), 8, 16))
-                                           for _ in itertools.count()), val=None, records=8, batch=8)
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7))
-    initial = jax.device_get(trainer.place()[0])
-    final = trainer.fit(data, steps=150, log_every=150)
-    windows = jax.device_get(replay.sample(jax.random.key(8), 8, 16))
+    initial, final, windows = pretrained_on(objective, replay)
 
     def imitation(state, field):
         batch = {**windows, LABEL: windows[field]}

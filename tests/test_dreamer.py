@@ -424,25 +424,32 @@ def test_a_demonstration_replay_holds_each_episode_in_the_agents_convention():
         demonstration_replay([{**episodes[0], "terminal": np.asarray([0, 1, 0, 0, 0], bool)}])
 
 
-def test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot():
-    """A world model pretrained from a pilot's demonstrations alone, its actor cloning the pilot and its
-    critic untrained, predicts the demonstrations' observations and rewards better than at the start
-    and gives the pilot's actions more likelihood, on the same windows; imagination is skipped."""
+def pretrained_on(objective, replay):
+    """`objective` trained 150 updates on 8 windows of 16 steps an update drawn from `replay`, as pretraining
+    reads a replay: its state before and after, and 8 windows drawn apart to score both on."""
     from dew.data.dataset import Loader
-    from dew.objectives.base import Step
-    from dew.objectives.rl.dreamer import demonstration_replay
     from dew.training import Trainer
 
-    replay = demonstration_replay(demonstrations(8, 20, 3))
-    objective = DreamerV3Objective(tiny(), scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0},
-                                   imitation=1.0)
     keys = iter(jax.random.split(jax.random.key(11), 1000))
     data = Loader(train=lambda partition: (jax.device_get(replay.sample(next(keys), 8, 16))
                                            for _ in itertools.count()), val=None, records=8, batch=8)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7))
     initial = jax.device_get(trainer.place()[0])
     final = trainer.fit(data, steps=150, log_every=150)
-    windows = jax.device_get(replay.sample(jax.random.key(8), 8, 16))
+    return initial, final, jax.device_get(replay.sample(jax.random.key(8), 8, 16))
+
+
+def test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot():
+    """A world model pretrained from a pilot's demonstrations alone, its actor cloning the pilot and its
+    critic untrained, predicts the demonstrations' observations and rewards better than at the start
+    and gives the pilot's actions more likelihood, on the same windows; imagination is skipped."""
+    from dew.objectives.base import Step
+    from dew.objectives.rl.dreamer import demonstration_replay
+
+    replay = demonstration_replay(demonstrations(8, 20, 3))
+    objective = DreamerV3Objective(tiny(), scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0},
+                                   imitation=1.0)
+    initial, final, windows = pretrained_on(objective, replay)
 
     def losses(state):
         _, aux = objective.loss(state.variables, windows, Step(state.microstep, jax.random.key(9), state.ema))
