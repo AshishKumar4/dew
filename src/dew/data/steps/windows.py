@@ -166,8 +166,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")
         self._skip = skip
-        # A position saved before windows took counts credits none of its carry.
-        self._credited = integer(state.get("credited", 0), "saved causal window credit")
+        self._credited = integer(state["credited"], "saved causal window credit")
 
     def close(self) -> None:
         self._read.close()

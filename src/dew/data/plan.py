@@ -401,11 +401,13 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], JSON]:
     """A per-share read's saved position (its data plan and its Grain iterator's state) as `plan`, this
     run's, reads it: the plan as `earlier_plan` translates it, and the iterator's state, where the plan
-    was written before version 8, with the counts version 8 keeps of what a read delivered (each
-    corpus's `delivered_rows`, which one that counted each row as one example held as `accepted`) and of
-    the examples refused past a held row (a causal window's carry of `_dew_refused`, none, beside its
-    `_dew_consumed`). The position's one translation; carried to 1.0 (ledger 1552)."""
-    from dew.data.mixing import COUNTER
+    was written before version 8, with the counts version 8 keeps that a Dew of version 7 may not have:
+    of what a read delivered (each corpus's `delivered_rows`, which one that counted each row as one
+    example held as `accepted`), of its cuts by kind (`CUT_COUNTS`, none), of the examples its filter
+    held pending (`consumed`, none), and of the examples refused past a held row and those a causal
+    window credited (its carry of `_dew_refused`, none, beside its `_dew_consumed`, and `credited`,
+    none). The position's one translation; carried to 1.0 (ledger 1552)."""
+    from dew.data.mixing import COUNTER, CUT_COUNTS
     from dew.data.pipeline import CONSUMED, REFUSED
 
     written = record(saved.get("dew_data_plan"), "saved data plan")
@@ -421,8 +423,13 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
                 return branch
         match node.get(COUNTER):
             case {"counts": {**counts}} as counter:
-                kept: dict[str, JSON] = {"delivered_rows": counts.get("accepted", 0), **counts}
-                node[COUNTER] = {**counter, "counts": kept}
+                cut: dict[str, JSON] = {name: {} for name in CUT_COUNTS}
+                kept: dict[str, JSON] = {"delivered_rows": counts.get("accepted", 0), **cut, **counts}
+                pending: dict[str, JSON] = {"consumed": 0} if "consecutive" in counter else {}
+                node[COUNTER] = {**pending, **counter, "counts": kept}
+        match node:
+            case {"parent": _, "skip": _, "held": _} if "credited" not in node:
+                node["credited"] = 0
         match node:
             case {"parent": _, "skip": _, "held": {**held}} if CONSUMED in held and REFUSED not in held:
                 match held[CONSUMED]:
