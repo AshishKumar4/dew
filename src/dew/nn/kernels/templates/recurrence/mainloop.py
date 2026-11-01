@@ -57,13 +57,9 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, product, resources
+from dew.nn.kernels.templates import bundles, mosaic, product, resources
 from dew.nn.kernels.templates.gemm import cost
 from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
-
-INTERPRETED = mosaic_sm90.WGMMA
-"""The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
-whose producer role, TMA rings and barriers the interpreter models (its products the dots they compute)."""
 
 
 def bundle_dtype(dtype) -> jnp.dtype:
@@ -532,19 +528,19 @@ so each call traced its own and a hybrid model's step lowered its layers' identi
 Planning (`mainloop_backward.planned`) traces every call, each launch recording itself (`_kernel`)."""
 
 
-def _scope(*allocations, reduces: bool = True, after: tuple = ()) -> resources.Scope:
+def _scope(family: mosaic.Family, streams: dict, staged: tuple, *, reduces: bool = True,
+           after: tuple = ()) -> resources.Scope:
     """A program's allocations by lifetime (`resources.Scope`, whose bytes `resources.shared_bytes` counts as
-    Mosaic GPU's resource estimate does): a pipelined family's streams (`mosaic_sm80.Pipeline`, which
-    `emit_pipeline` allocates in its walk's own scope, each its stages of each tile) its walks, every other
-    tile and barrier the program's, the tiles it scopes `after` its walks (`_final_landing`), and whether it
-    `reduces` across warps: Mosaic GPU reserves the reduction scratch for a kernel with any reduction and none
-    without (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352)."""
-    walks, program = [], []
-    for x in jax.tree.leaves(allocations, is_leaf=lambda x: isinstance(x, mosaic_sm80.Pipeline)):
-        if isinstance(x, mosaic_sm80.Pipeline):
-            walks.append(tuple(plgpu.SMEM((x.stages, *shape), dtype) for shape, dtype in x.blocks.values()))
-        else:
-            program.append(x)
+    Mosaic GPU's resource estimate does): its `streams`' as the family states where they live
+    (`Family.lifetimes`: the program's, or each walk's own), its `staged` tiles and barriers the program's,
+    the tiles it scopes `after` its walks (`_final_landing`), and whether it `reduces` across warps: Mosaic
+    GPU reserves the reduction scratch for a kernel with any reduction and none without (an A100's solve
+    launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352)."""
+    program, walks = list(jax.tree.leaves(staged)), []
+    for allocated in streams.values():
+        held, walked = family.lifetimes(allocated)
+        program += jax.tree.leaves(held)
+        walks += walked
     return resources.Scope(program=tuple(program), walks=tuple(walks), after=tuple(after), reduces=reduces)
 
 
@@ -607,15 +603,16 @@ def _planned_launch(call: _Call, scope: Callable[[int], resources.Scope], regist
 def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
           stages: int | tuple[int, int] | None, consumers: int = 1) -> tuple[resources.LaunchPlan, int]:
     """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
-    holds at once, at most its `tiles`, its rings two deep where they run on (`mosaic.RingFamily`'s) and two
-    deep hold as many programs as one, so a tile's loads go out under the last tile's work: a launch of
+    holds at once, at most its `tiles`, its rings two deep where they run on across its tiles (a family's
+    whose walks do not scope their streams apart, `Family.walks_scoped`) and two deep hold as many programs as
+    one, so a tile's loads go out under the last tile's work: a launch of
     one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
     thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d; an
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
     any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
     most)` pair's."""
     if stages is None:
-        most = 2 if isinstance(call.family, mosaic.RingFamily) else 1
+        most = 1 if call.family.walks_scoped else 2
         found = _planned_launch(call, scope, registers, floor=1, most=most)
         return found, min(tiles, (call.target.multiprocessors or 1) * found.programs)
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
@@ -674,7 +671,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
         return opened
 
     def scope(depth: int) -> resources.Scope:
-        return _scope(allocations(depth), staging, reduces=reduces, after=after)
+        return _scope(family, allocations(depth), staging, reduces=reduces, after=after)
 
     found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
                             consumers=consumers)
@@ -784,18 +781,18 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
 
 
 def _solving(call: _Call) -> mosaic.Family:
-    """The bundle the solve launch issues by: on a GPU of warpgroup MMA its layout without a producer
-    (`bundles.layouts`' last, `mosaic_sm90.FED`), whose consumers hold a program's entry registers and two
-    programs a multiprocessor (`ConsumerFed.programs`), else the call's. The solve's persistent programs walk
-    a chunk at a time on their products' latency, one a multiprocessor beside a producer leaving its tensor
-    cores idle: on an H100 PCIe the 27B gated delta net's took 0.235 ms on it against 0.356 beside a
-    producer, Qwen3-Next's 0.156 against 0.240, where the states launch's walk took 0.187 beside a producer
-    against 0.202 to 0.243 without one (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's
-    (`INTERPRETED`)."""
+    """The bundle the solve launch issues by: of the layouts the call's device takes (`bundles.layouts`), the
+    first whose programs a multiprocessor holds most (`Family.programs`, a consumer role's), the call's own
+    where none holds more. The solve's persistent programs walk a chunk at a time on their products'
+    latency, one a multiprocessor beside a producer leaving its tensor cores idle: on an H100 PCIe the 27B
+    gated delta net's took 0.235 ms on warpgroup MMA's layout without a producer (`mosaic_sm90.FED`, two
+    programs a multiprocessor) against 0.356 beside a producer, Qwen3-Next's 0.156 against 0.240, where the
+    states launch's walk took 0.187 beside a producer against 0.202 to 0.243 without one
+    (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's (`bundles.INTERPRETED`)."""
     if call.interpret:
         return call.family
     layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype))
-    return layouts[-1] if layouts and call.family is layouts[0] else call.family
+    return max((call.family, *layouts), key=lambda layout: layout.programs(1))
 
 
 @_lowered_once

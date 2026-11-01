@@ -27,7 +27,7 @@ from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
 INTERPRETED_GENERATION = "sm90"
 """The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
-interpreted bundle's (`mainloop.INTERPRETED`, wgmma's)."""
+interpreted bundle's (`bundles.INTERPRETED`, wgmma's)."""
 
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family) -> tuple[int, int, jnp.dtype]:

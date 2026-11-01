@@ -957,7 +957,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their common
     dtype and beta with them, the decay and the memory fp32, on one device, by the bundle of its instruction
     family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter,
-    `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
+    `bundles.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
     (`mainloop_backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
     (`mainloop_backward.backward_holds`); it takes no other call's, which raises NotImplementedError as the
     gradient is traced: the delta rule's selector gives a training call it refuses another kernel
@@ -969,11 +969,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     chunk inverse's `bound` its form proves, its solve at fp32's range where it proves none
     (`template.ranged`); a `rounded` call takes the run's fast forms' numbers (`fast_rounding`,
     `mainloop.forward`)."""
+    from .templates import bundles
     from .templates.recurrence import mainloop, mainloop_backward, template
 
     dtype = jnp.result_type(query, key, value)
     device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
-    issuing = family or device or mainloop.INTERPRETED
+    issuing = family or device or bundles.INTERPRETED
     query, key, value = (x.astype(dtype) for x in (query, key, value))
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
     # call's own, as the portable math takes it (Mamba-2's fp32 `dt`).
@@ -1505,11 +1506,11 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
     serve every channel, so the channels stay whole); or `portable(x, dt, A, B, C, D, state, starts)`,
     the portable math."""
     from .templates import bundles
-    from .templates.recurrence import mainloop, selective
+    from .templates.recurrence import selective
 
     def template(x, dt, A, B, C, D, state, *starts):
         interpret = generation.backend() != 'gpu'
-        family = (mainloop.INTERPRETED if interpret
+        family = (bundles.INTERPRETED if interpret
                   else bundles.of(generation.device_generation(), jnp.result_type(x)))
         assert family is not None, "a bundle claims the device's family (`selective_kernel`)"
         return selective.selective_scan(x, dt, A, B, C, D, state, *(starts or (None,)), family=family,
