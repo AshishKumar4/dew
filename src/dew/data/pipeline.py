@@ -35,6 +35,10 @@ class Rejected:
     consumed: int = 0
     """The source examples a rejected row was the last of (`CONSUMED`), which the next row its corpus keeps
     carries on (`dew.data.mixing.Accepted`)."""
+    carried: int = 0
+    """The source examples it was the last of that a row kept after it in a loading worker's group carries
+    on already (`dew.data.lowering._consumed_forward`), which its corpus counts as carried
+    (`dew.data.mixing.CorpusCounts.carried`)."""
     cut: Mapping[str, int] = dataclasses.field(default_factory=dict)
     """The tokens the cuts of the refused rows removed, by what each cut, which its corpus counts beside
     the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""

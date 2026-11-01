@@ -537,7 +537,8 @@ def _consumed_forward(elements: Sequence[Record]) -> list[Record]:
     """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
     to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that
     holds its markers apart from its rows (`_Grouped`) moves none to an earlier row: only a marker no row
-    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows."""
+    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows, and a marker
+    whose count moved states it (`Rejected.carried`)."""
     carried: list[Record] = []
     markers: list[int] = []
     owed = Owed()
@@ -550,7 +551,7 @@ def _consumed_forward(elements: Sequence[Record]) -> list[Record]:
             for at in markers:
                 marker = carried[at]
                 assert isinstance(marker, Rejected)
-                carried[at] = dataclasses.replace(marker, consumed=0)
+                carried[at] = dataclasses.replace(marker, consumed=0, carried=marker.consumed)
             element, markers = owed.paid(element), []
         carried.append(element)
     return carried
