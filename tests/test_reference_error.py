@@ -366,7 +366,8 @@ def test_a_sharded_sites_map_tasks_size_its_cancelling_rows_and_its_judge_runs_n
     truths = []
 
     def counted(x, w):
-        truths.append(1)
+        # Each run of the truth, compiled or not, on the host (a trace alone counts nothing).
+        jax.debug.callback(lambda: truths.append(1))
         return cancelling(split=False)(x, w)
 
     def judged(dew, label):
