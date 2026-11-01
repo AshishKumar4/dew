@@ -127,7 +127,20 @@ def pytest_collection_modifyitems_markers(items):
 
 def pytest_configure(config):
     """A test's or a conftest's read of every registration (`config.getini("markers")`), its owner's input:
-    pytest's own reads of them, at configure and at a mark's first use, are none."""
+    pytest's own reads of them, at configure and at a mark's first use, are none. And each marker a lookup
+    asks for (`pytest.mark.<name>`, which --strict-markers validates as it looks it up), its owner's input
+    whether any test then carries it or not (review: a helper evaluating an unregistered marker it never
+    applies fails its importers' collection once the registration goes)."""
+    if not getattr(pytest.MarkGenerator.__getattr__, "watched", False):
+        looked = pytest.MarkGenerator.__getattr__
+
+        def looking(self, name):
+            if not name.startswith("_"):
+                lifetime.write(lifetime.owner(), f"{MARKER}{name}")
+            return looked(self, name)
+
+        looking.watched = True
+        pytest.MarkGenerator.__getattr__ = looking
     getini = config.getini
 
     def watched(name):

@@ -201,6 +201,25 @@ def test_a_targeted_pytest_runs_a_group_as_its_ci_task_would(ci, tmp_path, monke
     assert sorted(test for test, *_ in ran("")) == ["test_other", "test_site"]
 
 
+def test_armadas_word_that_a_container_is_fresh_reaches_no_process_its_task_starts(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """`main` takes armada's ARMADA_FRESH out of the environment as it starts the task, so no process the task
+    starts (pytest, a test's own `ci.py task`) inherits a word true of the container only before any file ran
+    (review of the reuse-keys head); the task itself still keys its first file."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    written(tmp_path, {"test_env.py": "import os\ndef test_env():\n"
+                                      "    assert 'ARMADA_FRESH' not in os.environ\n"})
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", "--tests=tests/test_env.py",
+                                      "--split=", f"--out={out}", "--cache=on"])
+    assert ci.main() == 0
+    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0]
+    assert ci.reused("3.12", "tests/test_env.py", "", ci.shared("3.12")) is not None
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an
@@ -373,9 +392,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     out = tmp_path / "verdict.json"
     # Each file a fresh task of its own, as the plan runs a file the cache lacks.
     ran = [f"tests/{name}" for name in files if name.startswith("test_") and name != "test_new.py"]
-    monkeypatch.setenv("ARMADA_FRESH", "1")
     for name in ran:
-        ci.task("3.12", [name], "", out, 600.0)
+        ci.task("3.12", [name], "", out, 600.0, fresh=True)
         rows = json.loads(out.read_text())["rows"]
         assert {row["name"]: row["exitCode"] for row in rows} == {f"3.12:{name}": 0}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
@@ -606,7 +624,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert [share for share, *_ in ran("test_spawner")] == ["0.5", measured[0][0]]
     assert overlapping([*measured, ran("test_spawner")[-1]]) >= 2, "a followed spawner packs with the rest"
     gib, budget = 2 ** 30, 40 * 2 ** 30
-    assert ci.gpu_needs({"depends": None, "peak": 4 * gib}, budget) == (budget, budget)
+    assert ci.gpu_needs({"depends": None, "peak": None}, budget) == (budget, budget), "no peak: all of it"
+    assert ci.gpu_needs({"depends": None, "peak": 4 * gib}, budget)[0] < budget, "a keyless record packs"
     held = {"depends": [], "peak": 4 * gib, "shares": 2, "pools": gib}
     assert ci.gpu_needs(held, budget) == (6 * gib, 19 * gib), "6 GiB, twice more for its children, and 1 GiB"
     assert ci.gpu_lane("3.12", [], out, cache="on", processes=4, deadline=600.0) == 0
@@ -618,6 +637,31 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # a CPU task's keyed record says otherwise.
     tier = ci.gpu_tier("3.12")
     assert {name: tier.get(name) for name in names} == {name: ["unrecorded"] for name in names}
+
+
+def test_a_gpu_lane_runs_a_file_whose_green_row_the_cache_holds_and_keeps_no_key(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A GPU lane's files share the device, which no container keeps apart, so a lane never reuses a row: a
+    file whose green row the cache holds for exactly these inputs on the lane's class runs again, and its
+    record keeps no key (Main, 2026-11-01)."""
+    url, stored, _ = cache_worker
+    [name] = gpu_lane_at(tmp_path, monkeypatch, url, 1)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    common = ci.lane_inputs("3.12")
+    key = ci.cache_key(common, name, "", [name])
+    green = {"name": ci.row("3.12", name, ""), "exitCode": 0, "seconds": 1.0, "output": "", "tests": {}}
+    body = json.dumps({"key": key, "depends": [name], "row": green, "reads": [], "peak": 2 ** 30, "shares": 0,
+                       "pools": 0}).encode()
+    for at in (ci.record_key("3.12", green["name"], ci.device_class(), common),
+               ci.green_key("3.12", green["name"], ci.device_class(), key)):
+        stored["/" + at] = body
+    assert ci.reused("3.12", name, "", common) is not None, "the cache holds a valid green row"
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", [name], out, cache="on", processes=1, deadline=600.0) == 0
+    assert len(lane_runs(tmp_path, Path(name).stem)) == 1, "the lane ran the file"
+    kept = stored["/" + ci.record_key("3.12", green["name"], ci.device_class(), common)]
+    assert json.loads(kept)["key"] is None, "its record keeps no key"
 
 
 def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
@@ -1480,9 +1524,8 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     out = tmp_path / "verdict.json"
 
     def run():
-        monkeypatch.setenv("ARMADA_FRESH", "1")
         for name in ("uses", "lone"):
-            ci.task("3.12", [f"tests/test_{name}.py"], "", out, 600.0)
+            ci.task("3.12", [f"tests/test_{name}.py"], "", out, 600.0, fresh=True)
             assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0]
         return [len((tmp_path / f"runs-{name}").read_text()) for name in ("uses", "lone")]
 
@@ -1936,15 +1979,25 @@ def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_d
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
 
 
-def test_a_kept_task_reuses_each_files_own_row_where_files_that_ran_in_one_process_share_a_key(
+def test_a_kept_task_reuses_each_files_own_row_where_files_share_every_input_and_so_a_key(
         ci, tmp_path, monkeypatch, cache_worker):
-    """Files one task ran in one process share what it executed before them, so their keys are one: a kept
-    task still reuses each file's own green row, and names every file once (2026-10-30: a kept task reported
-    one file's row for six files, and a verdict was not graded)."""
+    """Files whose runs read the same inputs, each importing the others, share a key: a kept task still
+    reuses each file's own green row (`green_key`, kept at the row's place), and names every file once
+    (2026-10-30: a kept task reported one file's row for six files, and a verdict was not graded)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_{name}.py::test_{name}": 50.0 for name in "abc"}))
+    head = "import sys\nfrom pathlib import Path\nsys.path.insert(0, 'tests')\n"
+
+    def body(name: str) -> str:
+        others = "".join(f"import test_{other}\n" for other in "abc" if other != name)
+        ran = f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
+        return head + others + f"def test_{name}():\n" + ran
+
+    written(tmp_path, {f"test_{name}.py": body(name) for name in "abc"})
     armada_task(ci, monkeypatch, verdict)
+    common = ci.shared("3.12")
+    keys = {ci.recorded(ci.record_key("3.12", f"3.12:tests/test_{name}.py", ci.device_class(), common),
+                        "token")["key"] for name in "abc"}
+    assert len(keys) == 1 and None not in keys, "the three share every input, and so one key"
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",

@@ -11,9 +11,10 @@
     python3 tools/armada/ci.py coverage report DIR
     python3 tools/armada/ci.py gangs
 
-The plan prints a task matrix for each Python CI proves. Whole test files are
-packed heaviest first into the lightest of the tasks, each near `target`
-seconds, so a task imports only its own modules. A file heavier than that runs
+The plan prints a task matrix for each Python CI proves. The files the test
+cache holds share tasks of lookups; each other file runs in a task of its own,
+in a container no task ran in (armada's `fresh`), so its run can be kept for
+reuse. A file heavier than `target` seconds runs
 as groups of its tests (`session.groups`, tools/armada/split.py): runs of consecutive
 tests in node-id order, each as light as that many runs let it be, a heavier
 test alone. Each group also pays the file's setup (its module's fixtures,
@@ -63,8 +64,11 @@ recomputes each of its files' keys from the record made on its own class
 (`device_class`: float32 results differ by CPU microarchitecture, and by GPU)
 and reports the recorded green row
 instead of running a file whose key matches, which ran green on exactly these
-inputs there. A file that started another Python process is never reused, since
-no event saw that process's code. The records live in the dew-xla-cache Worker
+inputs there. A run is kept with a key only where it executed first in a container no task had run in, from
+the state its environment's snapshot left, and left every input it read as it found it (`tested`): what any
+earlier run left behind can then reach none, whatever wrote it. A file whose Python children the recorder
+followed keys their code too; one that started a process it did not follow keeps no key. The records live in
+the dew-xla-cache Worker
 under `CACHE_PREFIX`. With DEW_TEST_CACHE=off where the plan runs, which its
 entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
@@ -73,10 +77,11 @@ A row's record also says where its tests read the backend and which are
 marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
 files marked to run on a GPU, a day's and a batch's alike: the behavioural flows
 (tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452). A GPU
-node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
-recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--network`, a GPU node that
-reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
-their own, recorded on a class of their own, so each train reruns only the files whose inputs changed.
+node runs them with `gpu-lane`, each as a task of a CUDA lane. A lane's files share the device, whose
+allocations and state no container keeps apart, so each runs every time: its record keeps no key, only the
+peak the lane packs it by. With `--network`, a GPU node that reaches the Hub runs every file's
+network-marked tests, which every other task sets aside, as one lane of their own, recorded on a class of
+their own.
 
 `coverage` measures src/dew's branch coverage over the suite, on demand and never
 per batch: `items` prints the plan's tasks for the oldest Python as armada map
@@ -99,6 +104,7 @@ import argparse
 import ast
 import collections
 import concurrent.futures
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -516,6 +522,77 @@ class Reading:
             self.modules[module] = units(module)
         found = self.modules[module]
         return found.get(executed, b"missing") if isinstance(found, dict) else found
+
+
+@dataclasses.dataclass(frozen=True)
+class Standing:
+    """The checkout as a run found it (`standing`): each file's change time (its ctime, which no process sets
+    back) and each directory's entries as a key lists them (`visible`), but a hidden directory's
+    (`HIDDEN_INPUTS` aside) and a build's (`built`)."""
+
+    changed: Mapping[str, int]
+    entries: Mapping[str, tuple[str, ...]]
+
+
+def visible(path: Path) -> tuple[str, ...]:
+    """Directory `path`'s entries as a key lists them (`contents`): but its hidden ones and a build's."""
+    return tuple(sorted(entry.name for entry in path.iterdir()
+                        if not entry.name.startswith(".") and not built(entry)))
+
+
+def standing() -> Standing:
+    """The checkout as it stands (`Standing`), from its root, the working directory."""
+    changed, entries = {}, {}
+    for directory, folders, files in os.walk("."):
+        here = Path(directory)
+        folders[:] = [folder for folder in folders if not built(here / folder) and (
+            not folder.startswith(".") or str((here / folder).relative_to(".")) in followed.HIDDEN_INPUTS)]
+        entries[str(here.relative_to("."))] = visible(here)
+        for file in files:
+            path = here / file
+            with contextlib.suppress(FileNotFoundError):
+                changed[str(path.relative_to("."))] = path.lstat().st_ctime_ns
+    return Standing(changed, entries)
+
+
+def standing_paths(entry: str) -> list[str]:
+    """The checkout's paths input `entry` (`inputs`) reads, as `contents` reads it: a unit's or a probe's
+    file, a fetched payload's manifest, a marker's registration (pyproject.toml), the directories an import
+    searched; none for a host's limit."""
+    if entry.startswith("limit:"):
+        return []
+    if entry.startswith(MARKER):
+        return ["pyproject.toml"]
+    if entry.startswith("import:"):
+        module, searched, roots = entry.removeprefix("import:").partition(followed.ROOTS)
+        if searched:
+            return [root for root in roots.split(os.pathsep) if root]
+        *parents, _ = module.split(".")
+        return [str(Path(root, *parents)) for root in ("src", "tools")] if parents else ["tests"]
+    path = Path(entry.removeprefix("probe:").partition(followed.CODE)[0])
+    manifest = path.parent / (path.name + FETCHED)
+    return [str(manifest if path.name and manifest.is_file() else path)]
+
+
+def moved(name: str, depends: list[str], before: Standing) -> bool:
+    """Whether an input test file `name`'s run read (`inputs`) no longer stands as it did `before` the run: a
+    file changed, made or removed, or a directory's entries other. A run that rewrote, made or removed its
+    own input read what no key of the checkout now holds (review: a test reads a fixture, overwrites it and
+    asserts on what it read), so it keeps no key."""
+    for entry in inputs(name, depends):
+        for path in standing_paths(entry):
+            found = Path(path)
+            if found.is_dir() or path in before.entries:
+                if before.entries.get(path) != (visible(found) if found.is_dir() else None):
+                    return True
+                continue
+            try:
+                now = found.lstat().st_ctime_ns
+            except FileNotFoundError:
+                now = None
+            if before.changed.get(path) != now:
+                return True
+    return False
 
 
 def cache_key(common: str, name: str, split: str, depends: list[str],
@@ -1399,7 +1476,7 @@ def ynn_switched(cases) -> list[dict]:
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
-         release: str = "") -> int:
+         release: str = "", fresh: bool = False) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -1407,33 +1484,41 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     time: the plan weighs a file by what it costs a container (its import, its collection, the container's
     pace), which pytest's case times leave out. Weighed by case times, tasks planned at 300 seconds ran a
     median of 392. With `coverage`, pytest runs under coverage.py, whose data file goes there
-    (`coverage_items`)."""
-    # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
-    # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
-    # their green run is not found there.
+    (`coverage_items`). `fresh`: the task runs in a container no task ran in (armada's ARMADA_FRESH, which
+    `main` takes, so no process the task starts inherits it), where its first file to execute may keep a
+    key."""
     began = time.monotonic()
     # The task's start, one for every call below (a heavy file's kept groups run after its whole files): a
     # program made since is no tool (followed.py's `tool`). One container for every call: only its first file
     # to execute may keep a key (`Container`).
     started = {followed.STARTED_AT: str(time.time())}
-    container = Container()
+    container = Container(fresh=fresh)
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
+    groups = [(name, group, at) for (name, group), at in kept.items() if group]
+    # Every row the cache holds, the whole files' and the kept groups', looked up from one reading before any
+    # file runs: a run may change the checkout a later lookup would read (review).
+    reading = Reading()
+    found = looked_up(python, names, split, common, whole_files, cache, release, reading)
+    held = {(name, group): looked_up(python, [name], group, common, {name: at}, cache, release, reading)
+            for name, group, at in groups}
     code = tested(python, names, split, out, deadline, cache, grace, common, started, coverage, whole=whole,
-                  release=release, kept=whole_files, container=container)
+                  release=release, kept=whole_files, container=container, found=found)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = SITE.fullmatch(split)
     if site and site["start"] is not None and any(found["exitCode"]
                                                   for found in json.loads(out.read_text())["rows"]):
         return 1
-    groups = [(name, group, at) for (name, group), at in kept.items() if group]
     if not groups:
         return code
     rows = json.loads(out.read_text())["rows"]
     for index, (name, group, at) in enumerate(groups, start=1):
         remaining = deadline - (time.monotonic() - began)
+        if held[(name, group)]:
+            rows += held[(name, group)]
+            continue
         if remaining <= 0:
             # The task's deadline spent on the rows before it: this group is neither read nor run, and is red
             # as a row its task's deadline cut off is (review).
@@ -1445,7 +1530,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, remaining, cache, grace, common, started,
                                 coverage, whole=whole, release=release, kept={name: at},
-                                container=container))
+                                container=container, found=[]))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return code
@@ -1483,12 +1568,13 @@ def site_environment(site: re.Match | None) -> dict[str, str]:
 
 
 def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool,
-                kept: Mapping[str, tuple[str, str]] | None = None) -> list[dict]:
+                kept: Mapping[str, tuple[str, str]] | None = None,
+                reading: Reading | None = None) -> list[dict]:
     """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), those
     its plan kept read where it found them (`kept`), said. They are looked up before any test runs, from one
     reading of the checkout (`Reading`)."""
     kept = kept or {}
-    reading = Reading()
+    reading = Reading() if reading is None else reading
     rows = [found for name in tests
             if (found := reused(python, name, group, common, network, kept.get(name), reading))]
     if rows:
@@ -1515,17 +1601,18 @@ def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselect
 
 @dataclasses.dataclass
 class Container:
-    """What a task's container has run (`tested`): whether it started fresh (armada's ARMADA_FRESH: no other
-    task ran in it), and whether a file of this task has executed in it since."""
+    """What a task's container has run (`tested`): whether it started fresh (no other task ran in it:
+    armada's ARMADA_FRESH, `task`'s `fresh`), and whether a file of this task has executed in it since."""
 
-    fresh: bool = dataclasses.field(default_factory=lambda: os.environ.get("ARMADA_FRESH") == "1")
+    fresh: bool = False
     executed: bool = False
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
-           kept: Mapping[str, tuple[str, str]] | None = None, container: Container | None = None) -> int:
+           kept: Mapping[str, tuple[str, str]] | None = None, container: Container | None = None,
+           found: list[dict] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
@@ -1536,13 +1623,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     (`Container`), from the state its environment's snapshot left: what no key holds then is the same for
     every run (Main, 2026-11-01). A run not kept so is still recorded, keyed by nothing, for what the GPU
     tier and lane read of it (its reads of the backend, its peak). A reused row runs nothing, so every row the
-    cache holds is reused first."""
+    cache holds is reused first: `found`, where the caller looked them up before any of its calls ran a file
+    (`task`)."""
     began = time.monotonic()
     container = Container() if container is None else container
     group = split or (f"{RELEASE}{release}" if release else "")
     site = SITE.fullmatch(group)
-    rows = ([] if cache == "off" or release or (site is not None and site["start"] is not None)
-            else reused_rows(python, tests, group, common, network, kept))
+    rows = list(found) if found is not None else looked_up(python, tests, group, common, kept, cache,
+                                                           release, network=network)
     tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
@@ -1555,7 +1643,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = {followed.STARTED_AT: str(time.time()), **environ}
     for index, name in enumerate(tests):
         left = deadline - (time.monotonic() - began)
-        clean = container.fresh and not container.executed
+        # The checkout as a run that may keep its key finds it, as its inputs must stand after (`moved`).
+        before = standing() if container.fresh and not container.executed else None
         alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
                        coverage, network, whole, release, site) if left > 0 else None
         container.executed = container.executed or alone_ is not None
@@ -1567,8 +1656,19 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         if coverage is None and not release:
             # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which
             # runs under its requirement's overlay and on the whole suite's run alone.
-            record(python, rows[-1:], alone_.log, common, network, alone_.opened if clean else None)
+            record(python, rows[-1:], alone_.log, common, network, alone_.opened, before)
     return 0
+
+
+def looked_up(python: str, tests: list[str], group: str, common: str,
+              kept: Mapping[str, tuple[str, str]] | None, cache: str, release: str,
+              reading: Reading | None = None, network: bool = False) -> list[dict]:
+    """The rows of `tests` in `group` the cache holds for these inputs (`reused_rows`), none where the policy
+    is off, for a release check's, or for a check-1 site's map task, whose draws its judge reads."""
+    site = SITE.fullmatch(group)
+    if cache == "off" or release or (site is not None and site["start"] is not None):
+        return []
+    return reused_rows(python, tests, group, common, network, kept, reading)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1759,11 +1859,12 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
 
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
-           opened: set[str] | None = None) -> None:
+           opened: set[str] | None = None, before: Standing | None = None) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
-    processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
-    they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
-    reads, `gpu_needs` the memory. A green row keeps its key too, which `reused` reads it back by; a red
+    processes opened (`opened`, the task's watch: None where it was blind), where they read the backend and
+    its peak memory on a GPU and its children's pools: `gpu_tier` reads the reads, `gpu_needs` the memory. A
+    green row keeps its key too, which `reused` reads it back by, where its run may (`tested`: `opened` and
+    the checkout as the run found it, `before`, given) and left every input as it found it (`moved`); a red
     row has none, so a later run never reuses an earlier green row of its file. A check-1 site's judge keeps
     its map tasks' inputs with its own (`site_inputs`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
@@ -1779,7 +1880,8 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
         if ran["depends"] is not None:
-            ran = {**ran, "depends": None if opened is None else sorted({*ran["depends"], *opened})}
+            depends = None if opened is None or before is None else sorted({*ran["depends"], *opened})
+            ran = {**ran, "depends": None if depends is None or moved(name, depends, before) else depends}
         ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
         if row_["exitCode"] == 0 and name not in executed:
             continue
@@ -1928,8 +2030,9 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     `gpu_peak`, or a child's that took its fraction, the larger) and `GPU_HEADROOM`: a child that took
     the share's fraction holds one more share, and one that named its own fraction the pool it held.
     A file no run measured, one that started a process it did not follow, and one whose last run left
-    no report take all of `budget`."""
-    if recorded is None or recorded["depends"] is None or recorded["peak"] is None:
+    no report take all of `budget`: each records no peak (followed.py's `recorded`). A record without a key,
+    as every GPU lane's is, measures its peak as well as a keyed one."""
+    if recorded is None or recorded["peak"] is None:
         return budget, budget
     factor, slack = GPU_HEADROOM
     share = min(recorded["peak"] * factor + slack, budget)
@@ -1983,7 +2086,7 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     borrowed: dict[str, tuple[str, dict]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         for name, kind, found in pool.map(read, keys):
-            if found is None or found.get("depends") is None or found.get("peak") is None:
+            if found is None or found.get("peak") is None:
                 continue
             if name not in borrowed or holds(found) > holds(borrowed[name][1]):
                 borrowed[name] = (kind, found)
@@ -2442,8 +2545,10 @@ def main() -> int:
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
+    # armada's word that this task's container is fresh, taken so no process the task starts inherits it.
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, whole=args.whole == "1")
+                coverage=args.coverage, whole=args.whole == "1",
+                fresh=os.environ.pop("ARMADA_FRESH", "0") == "1")
 
 
 def pinned(argv: list[str]) -> None:

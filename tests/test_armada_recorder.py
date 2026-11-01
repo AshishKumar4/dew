@@ -78,7 +78,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     (tmp_path / "notes/page.md").write_text("page\n")
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    fresh_tasks(ci, monkeypatch, tests, tmp_path)
+    fresh_tasks(ci, tests, tmp_path)
 
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
@@ -145,7 +145,7 @@ def test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs
     (tmp_path / "notes/page.md").write_text("page\n")
     interpreter(tmp_path, "3.12")
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    fresh_tasks(ci, monkeypatch, tests, tmp_path)
+    fresh_tasks(ci, tests, tmp_path)
 
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
@@ -195,7 +195,7 @@ def test_a_native_media_binary_keeps_its_files_key_and_what_it_opened_is_that_ke
                                 "                   capture_output=True)\n"})
     interpreter(tmp_path, "3.12")
     tests = ["tests/test_media.py", "tests/test_shell_script.py"]
-    fresh_tasks(ci, monkeypatch, tests, tmp_path)
+    fresh_tasks(ci, tests, tmp_path)
     assert reusable_now(ci, tests) == [True, False]
     (tmp_path / "tests/clip.bin").write_text("more frames\n")
     assert reusable_now(ci, tests) == [False, False]
@@ -416,7 +416,7 @@ def test_a_module_imported_from_its_bytecode_alone_is_its_files_input(ci, tmp_pa
         source.unlink()
 
     placed(1)
-    fresh_tasks(ci, monkeypatch, ["tests/test_bytecode.py"], tmp_path)
+    fresh_tasks(ci, ["tests/test_bytecode.py"], tmp_path)
     assert reusable_now(ci, ["tests/test_bytecode.py"]) == [True]
     placed(2)
     assert reusable_now(ci, ["tests/test_bytecode.py"]) == [False]
@@ -533,18 +533,14 @@ def test_a_marker_registered_in_pyproject_reruns_the_files_that_use_it_and_its_o
 
 
 def one_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str], fresh: bool):
-    """`files` under tests/ written and run as one 3.12 task, in one container, fresh (ARMADA_FRESH, no task
+    """`files` under tests/ written and run as one 3.12 task, in one container, fresh (`fresh`, no task
     ran in it) or not, with the test cache on: whether each test file's row is reused now, in order."""
     url, _, _ = cache_worker
     cached(monkeypatch, url)
     written(tmp_path, files)
     interpreter(tmp_path, "3.12")
-    if fresh:
-        monkeypatch.setenv("ARMADA_FRESH", "1")
-    else:
-        monkeypatch.delenv("ARMADA_FRESH", raising=False)
     tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0, fresh=fresh)
     rows = json.loads((tmp_path / "verdict.json").read_text())["rows"]
     assert all(row["exitCode"] == 0 for row in rows), rows
     return lambda: reusable_now(ci, tests)
@@ -584,7 +580,7 @@ def test_a_reused_row_runs_nothing_so_the_first_file_to_execute_after_it_keeps_i
     keyed = one_task(ci, tmp_path, monkeypatch, cache_worker, {"test_a.py": PASSING["test_a.py"]}, fresh=True)
     assert keyed() == [True]
     written(tmp_path, {"test_b.py": PASSING["test_b.py"]})
-    ci.task("3.12", ["tests/test_a.py", "tests/test_b.py"], "", tmp_path / "verdict.json", 600.0)
+    ci.task("3.12", ["tests/test_a.py", "tests/test_b.py"], "", tmp_path / "verdict.json", 600.0, fresh=True)
     assert reusable_now(ci, ["tests/test_a.py", "tests/test_b.py"]) == [True, True]
 
 
@@ -599,6 +595,38 @@ def test_a_marker_a_deselected_test_carries_is_its_files_input(ci, tmp_path, mon
         "helpers_marks.py": "import pytest\ntidy = pytest.mark.tidy\n",
         "test_mixed.py": "from helpers_marks import tidy\ndef test_plain():\n    pass\n"
                          "@tidy\ndef test_tidy():\n    pass\n"}, {})
+    assert reused() == [True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
+    assert reused() == [False]
+
+
+def test_a_run_that_rewrites_its_own_input_keeps_no_key(ci, tmp_path, monkeypatch, cache_worker):
+    """A run that rewrites an input it read keeps no key, as its key would hash what it left, not what it
+    read (review of the reuse-keys head: a test reads a fixture, overwrites it and asserts on what it read; a
+    later checkout holding the overwrite would reuse a run that never saw it). A run that left its inputs as
+    it found them, the same fixture among them, keeps its key."""
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    (tmp_path / "tests/fixtures/value.txt").write_text("good")
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_rewrites.py": "from pathlib import Path\ndef test_rewrites():\n"
+                            "    found = Path('tests/fixtures/value.txt')\n    read = found.read_text()\n"
+                            "    found.write_text('bad')\n    assert read == 'good'\n",
+        "test_reads.py": "from pathlib import Path\ndef test_reads():\n"
+                         "    assert Path('tests/fixtures/value.txt').read_text()\n"}, {})
+    assert reused() == [False, True]
+
+
+def test_a_marker_a_helper_looks_up_and_no_test_carries_is_its_importers_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A marker a helper looks up but never applies is its importer's input (review of the reuse-keys head):
+    with --strict-markers the lookup fails once the registration goes, failing the importer's collection,
+    though no test carries the marker; so the importer's row reruns when the registration changes."""
+    project = ("[project]\nname = 'x'\n\n[tool.pytest.ini_options]\n"
+               "addopts = \"--strict-markers\"\nmarkers = [\"tidy: {}\"]\n")
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "helpers_marks.py": "import pytest\nunused = pytest.mark.tidy\n",
+        "test_plain.py": "import helpers_marks\ndef test_plain():\n    assert helpers_marks.unused\n"}, {})
     assert reused() == [True]
     (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
     assert reused() == [False]
