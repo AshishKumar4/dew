@@ -795,8 +795,8 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down(monkeypa
         return grads.query, grads.key, grads.value
 
     def lowered():
-        # A function of its own each lowering, as a run's relowering takes (`options.OuterProgram._jitted`): JAX
-        # keeps a function's trace.
+        # A function of its own each lowering, as a run's relowering takes (`OuterProgram._jitted`): JAX keeps
+        # a function's trace.
         def fresh(*operands):
             return backward(*operands)
 
@@ -807,8 +807,7 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down(monkeypa
         report.kept(lowered(), relower=lowered)
         misses = [miss for miss in report.misses() if miss.shared is not None]
         refused = [config for _, config, _ in report.refused_launches()]
-    assert [(miss.kernel, miss.shared, miss.stepped) for miss in misses] == [
-        ("attention_forward_headroom", 114688, True)], misses
+    assert [(miss.op, miss.shared, miss.stepped) for miss in misses] == [("TritonForward", 114688, True)], misses
     assert refused == [attention_triton.Tiles(32, 64, 4, 2)], refused
 
 

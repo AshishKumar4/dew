@@ -373,7 +373,8 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
 
 
 def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:
-    """A Triton launch's shared-memory miss recorded and logged (`_unblocked`)."""
+    """A Triton launch's shared-memory miss recorded and logged (`_unblocked`), under its first kernel's
+    name: XLA's refusal names none."""
     _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked))
     _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
                  kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
