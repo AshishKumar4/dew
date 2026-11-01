@@ -210,6 +210,38 @@ def test_a_token_exports_index_first_read_by_many_threads_at_once_reads_its_own_
     assert found == [True] * 240
 
 
+def test_an_index_whose_lease_waits_holds_no_other_index_back(tmp_path):
+    """An index whose first read waits on its lease (a declared file a slow mirror is fetching) keeps no
+    other index from mapping its own values meanwhile: each index takes its lease under a lock of its own
+    (row 3199)."""
+    import numpy as np
+
+    from dew.data.sources.index import ArrayIndex
+
+    np.save(tmp_path / "quick.npy", np.arange(8))
+    started, release = threading.Event(), threading.Event()
+
+    class Fetching:
+        """A declared file whose check waits until the test releases it."""
+
+        def leased(self):
+            started.set()
+            release.wait(60)
+            return str(tmp_path / "quick.npy"), None
+
+    slow, quick = ArrayIndex("slow", None, Fetching()), ArrayIndex(str(tmp_path / "quick.npy"))
+    waiting = threading.Thread(target=lambda: slow.values)
+    waiting.start()
+    started.wait(60)
+    read = []
+    reader = threading.Thread(target=lambda: read.append(quick.values.tolist()))
+    reader.start()
+    reader.join(10)
+    release.set()
+    waiting.join(60)
+    assert read == [list(range(8))]
+
+
 def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is_read():
     """An offset index read under facts its publisher declared (its bytes and digest), replaced by
     another valid index of as many records, is refused (`Replaced`) where an indexed read opens it."""
