@@ -50,7 +50,7 @@ class Observe:
             raise ValueError(f"an observer observes every so many steps, at least one, not {self.every}")
 
     def opened(self, step: int, state: TrainState, *, complete: bool,
-               view: Callable[[TrainState], TrainState] = lambda state: state) -> None:
+               view: Callable[[TrainState], TrainState]) -> None:
         """A fit begins at `step`, restored or fresh: agree the cadence and forget later values; `call`
         reads the fit's state as `view` lends it, every layer of a stage-local run whole, a view made only
         where the cadence observes. A fit with nothing to train, its run `complete` at `step`, observes the
