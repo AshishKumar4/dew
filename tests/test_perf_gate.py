@@ -211,18 +211,15 @@ def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmea
     failing a claim, which requires the references alone."""
     import dataclasses
 
-    import optax
-
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    step, models = load("benchmark_step"), load("benchmark_models")
+    step = load("benchmark_step")
     declared = {field.name for field in dataclasses.fields(CausalTransformer)}
     h100, a100 = "NVIDIA H100 80GB HBM3", "NVIDIA A100-SXM4-40GB"
     for name, device, other in (("step finetune-4b 1x2048", h100, a100),
                                 ("step finetune-1.7b 1x2048", a100, h100)):
         [case] = step.cases_from_json(json.dumps([gate.STEP_CASES[name]]))
         assert case.optimizer == "adamw" and set(case.config) <= declared
-        assert models.OPTIMIZERS[case.optimizer] is optax.adamw
         rows = [row for row in gate.BATTERY if row.name.endswith(name.removeprefix("step "))]
         assert len(rows) == 4
         for row in rows:
@@ -231,6 +228,37 @@ def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmea
             unmeasured = gate.hardware_status(row, other)
             assert unmeasured.startswith("not measured on this hardware")
             assert gate.verdict(row, [unmeasured] * 3, [unmeasured] * 3)[0] == "not measured on this hardware"
+
+
+def test_a_step_row_times_the_optimizer_a_dew_train_run_of_its_case_steps():
+    """A step row's trainer steps the update `dew train` steps for its case's optimizer at the row's rate
+    (`OptimConfig(optimizer=..., learning_rate=1e-4)`): Dew's AdamW, whose weight decay spares biases and a
+    norm's scale, not Optax's, which decays every leaf, so the fine-tune rows gate the program a run executes
+    (row 2756)."""
+    import dataclasses
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from dew.optim import OptimConfig
+
+    cases, models = load("benchmark_cases"), load("benchmark_models")
+    [case] = [case for case in cases.cpu_smoke_cases() if case.architecture == "causal_transformer"]
+    case = dataclasses.replace(case, optimizer="adamw")
+    params = {"dense": {"kernel": jnp.full((4, 3), 0.5), "bias": jnp.full((3,), 0.5)},
+              "norm": {"scale": jnp.full((3,), 2.0)}}
+    grads = jax.tree.map(lambda leaf: jnp.full_like(leaf, 0.25), params)
+
+    def stepped(optimizer):
+        updates, _ = optimizer.update(grads, optimizer.init(params), params)
+        return updates
+
+    timed = stepped(models.build_trainer(case).optimizer)
+    run = stepped(OptimConfig(optimizer="adamw", learning_rate=1e-4).build(None))
+    assert jax.tree.structure(timed) == jax.tree.structure(run)
+    for mine, theirs in zip(jax.tree.leaves(timed), jax.tree.leaves(run), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
 def standing_in_environments(gate, monkeypatch) -> tuple[list, list]:
