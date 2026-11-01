@@ -29,6 +29,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost, product, report, resources
 from dew.nn.sharding import per_shard
 
@@ -141,8 +142,9 @@ def dependent(entry: Callable, interpret) -> Callable:
     launch as without it while the next launch's start overlaps its tail. A launch whose programs all begin
     at once (Dew's persistent and cluster launches) gives no multiprocessor to a dependent before its own
     programs run. Mosaic marks the launch (`mosaic_gpu.uses_pdl`) and the runtime launches it with
-    programmatic stream serialization. Interpreted, `entry` as it is."""
-    if interpreted(interpret):
+    programmatic stream serialization. Interpreted, or on a GPU without grid dependency control
+    (`generation.Architecture.dependent_launch`, sm_90 on), `entry` as it is."""
+    if interpreted(interpret) or not generation.gpu_target().architecture.dependent_launch:
         return entry
 
     def body(*refs):
