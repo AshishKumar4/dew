@@ -100,7 +100,13 @@ def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: b
 def serve() -> None:
     """The torch side: each request a line naming a site's inputs (an npz), its dtype, rule and scale, and
     where to write fla's outputs and the reference's (`<path>.reference.npz`, `<path>.truth.npz`),
-    answered with a line `done`."""
+    answered with a line `done` on the process's own stdout, which the libraries' prints (stdout taken to
+    stderr) never reach: a line tilelang or fla printed was read as a request's answer, and the recorder
+    waited on a live process's exit for 4.5 hours (fla-record4-h100-6369564ae)."""
+    import os
+
+    answers = os.fdopen(os.dup(sys.stdout.fileno()), "w")
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     import torch
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
@@ -115,7 +121,7 @@ def serve() -> None:
     # On Hopper fla-core 0.5.2 refuses its Triton backward under Triton below 3.7.1 (fla #640, wrong results
     # in chunk_bwd_dqkwg) and takes tilelang's there: the cohort's torch 2.8.0 carries Triton 3.4.
     found = f"fla-core-{version('fla-core')}+tilelang-{version('tilelang')}"
-    print(f"ready {found} {torch.cuda.get_device_name()}", flush=True)
+    print(f"ready {found} {torch.cuda.get_device_name()}", file=answers, flush=True)
     for line in sys.stdin:
         path, dtype, kind, scale = line.split()
         kda = kind == "kda"
@@ -129,7 +135,7 @@ def serve() -> None:
             naive = naive_recurrent_kda if kda else naive_recurrent_gated_delta_rule
             np.savez(f"{path}.truth.npz", **run(arrays, kda=kda, scale=float(scale), rule=naive,
                                                 dtype=torch.float64, device="cpu", per_sequence=True))
-        print("done", flush=True)
+        print("done", file=answers, flush=True)
 
 
 class Worker:
@@ -149,12 +155,15 @@ class Worker:
         return self.started
 
     def ask(self, line: str) -> None:
-        """`line` answered, the process started once more where it died on it (its exit code printed)."""
+        """`line` answered, the process started once more where it died on it (its exit code printed): any
+        other line it answers is printed, the request still waited on."""
         for attempt in range(2):
             self.process.stdin.write(f"{line}\n")
             self.process.stdin.flush()
-            if self.process.stdout.readline().strip() == "done":
-                return
+            for answer in iter(self.process.stdout.readline, ""):
+                if answer.strip() == "done":
+                    return
+                print(f"the torch process: {answer.rstrip()}", flush=True)
             print(f"the torch process died on a request (exit {self.process.wait()}), attempt {attempt + 1}",
                   flush=True)
             self.start()

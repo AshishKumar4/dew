@@ -333,10 +333,11 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
                             smem=landing["row"])
 
             # The local scores once, staged for every value block's product with the output's gradient.
+            issue = Issuer(call, {"local_dv": [local]})
             algebra.local_gradient(
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
                 gate, low, lambda j: _tile(slots, "out", given, columns=pl.ds(j * vb, vb)), value_width // vb,
-                scale, given.dtype, Issuer(call, {"local_dv": [local]}), emit=stored, laid=laid)
+                scale, given.dtype, issue, issue.summed, emit=stored, laid=laid)
             return carry, accumulators
 
         _walk(streams, views, step, call, prologue=None if streamed else lambda: read(None))

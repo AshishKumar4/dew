@@ -364,11 +364,15 @@ def _merged(call: _Call) -> _Operand:
 
 
 def _summing(call: _Call) -> tuple:
-    """`algebra.summed_back`'s staging: the fp32 operand's three bf16 parts and the triangle's one
-    (`product.Exact`) its 'summed' product takes, and the scratch its columns' sums across warps take
-    (`_columns`)."""
-    return (*_staging(_Operand(CHUNK, PARTS, jnp.dtype(jnp.float32)), (CHUNK, CHUNK)),
-            (plgpu.SMEM((CHUNK, CHUNK), jnp.bfloat16),), _column_scratch(call))
+    """`algebra.summed_back`'s staging: the fp32 operand's three bf16 parts its 'summed' product takes,
+    staged, none where the family's products read their left operands from registers
+    (`Family.operands_in_registers`, `_summed`: `Issuer`'s register operand), the triangle's one part
+    (`product.Exact`), and the scratch its columns' sums across warps take (`_columns`). Staged on an A100,
+    the parts' 24 KB put the scores' backward at keys 256 wide past its block (174080 bytes against 166912,
+    wide-bwd at b3de8f293)."""
+    staged = (() if call.family.operands_in_registers
+              else _staging(_Operand(CHUNK, PARTS, jnp.dtype(jnp.float32)), (CHUNK, CHUNK)))
+    return (*staged, (plgpu.SMEM((CHUNK, CHUNK), jnp.bfloat16),), _column_scratch(call))
 
 
 def _column_scratch(call: _Call) -> tuple:
@@ -385,8 +389,10 @@ def _columns(call: _Call, reserved: tuple):
 
 
 def _summed(staging: tuple, call: _Call) -> tuple:
-    """`algebra.summed_back`'s issuer and column sums on `_summing`'s staging."""
-    parts, exact, scratch = staging
+    """`algebra.summed_back`'s issuer and column sums on `_summing`'s staging: its fp32 operand's parts
+    staged, or held in registers where the family's products read them there."""
+    *staged, exact, scratch = staging
+    parts = PARTS if call.family.operands_in_registers else staged[0]
     return Issuer(call, {"summed": parts, "summed.exact": exact}), _columns(call, scratch)
 
 
