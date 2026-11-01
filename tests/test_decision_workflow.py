@@ -46,10 +46,10 @@ past their fourteenth token."""
 
 LONG = Choice("Which intent does the customer's message express? " + "Read the message whole. " * 2000,
               list(INTENTS[:2]))
-"""A question that alone passes either layout's `MAX_LEN`, which no row holds."""
+"""A question that alone passes `MAX_LEN`, which no row holds."""
 
-MAX_LEN = {"joint": 4096, "question": 2048, "letters": 2048}
-"""Each head's window: a joint row lays both questions' options out in one schema, a question row one."""
+MAX_LEN = 2048
+"""Every head's window, which a joint row of both questions' options holds as a question row holds one's."""
 
 OPTION_TOKENS, BATCH = 10, 8
 CONTEXT_LAYERS = "0"
@@ -154,7 +154,7 @@ def run_of(cell: Cell, backbone: Path, root: Path) -> DecisionRunConfig:
                 .loading(Loading(workers=0)))
     return DecisionRunConfig(
         pretrained=str(backbone), model=ModelConfig("causal_transformer", {"dtype": "float32"}),
-        head=HEADS[cell.head], max_len=MAX_LEN[cell.head],
+        head=HEADS[cell.head], max_len=MAX_LEN,
         option_tokens=None if cell.joint else OPTION_TOKENS,
         objective=ObjectiveConfig("decision", {"consistency": cell.consistency}), calibrate=False,
         data=read(TRAIN[0], "train"), validation=read(HELD[0], "held"))
@@ -216,8 +216,11 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
     if cell.bound == "examples":
         assert consumed == kept(cell)
     else:
+        clock = [int(logged[step]["train/examples_consumed"]) for step in sorted(logged)
+                 if "train/examples_consumed" in logged[step]]
+        stride = max(later - earlier for earlier, later in zip([0, *clock], clock, strict=False))
         wanted = math.ceil(SHARE * kept(cell))
-        assert wanted <= consumed < wanted + BATCH
+        assert wanted <= consumed < wanted + stride
     # Every training example is trained or reported under the reason the layout refuses it for, never both:
     # the corpus counts the kept ones its bound consumed (all of them, or as far as a share's reading ahead
     # went) apart from the refused ones.
@@ -230,10 +233,13 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
         assert delivered + sum(refused.values()) == len(TRAIN[0])
     else:
         assert consumed <= delivered <= kept(cell)
-    # The held-out examples are each evaluated or reported under the reason they are refused for.
-    [evaluated] = [int(values["evaluation/counts/val/records"]) for values in logged.values()
-                   if "evaluation/counts/val/records" in values]
-    assert evaluated + sum(refused_in(cell, HELD[1]).values()) == len(HELD[0])
+    # The held-out examples are each scored or refused, every question of each scored one: the run's final
+    # validation, which a share pauses before, scores alike options as a server answers them, so it refuses
+    # only an example no window holds.
+    if cell.bound == "examples":
+        [scored] = [int(value) for values in logged.values() for key, value in values.items()
+                    if key.endswith("scored_questions")]
+        assert scored == sum(len(each.questions) for each in HELD[0] if HELD[1].get(each.state) != "unfit")
     # The saved task holds each axis the cell sets, and answers over every option its data asks.
     assert isinstance(task.model.head, HEAD_KINDS[cell.head])
     assert (task.context_length is not None) == cell.context
