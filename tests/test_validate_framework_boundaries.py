@@ -35,6 +35,8 @@ def function(x, scale=1):
 
 devices = jax.devices("cpu")
 assert len(devices) == 4, devices
+# Finish lazy imports and registration of trace-context config slots before measuring keys.
+OuterProgram(lambda x: x + 1)(np.zeros(1, dtype=np.float32)).block_until_ready()
 meshes = [Mesh(np.asarray(devices[start:start + 2]), ("x",), axis_types=(AxisType.Auto,))
           for start in (0, 2)]
 assert meshes[0].abstract_mesh == meshes[1].abstract_mesh
@@ -66,6 +68,7 @@ print(json.dumps({"jax": jax.__version__, "mesh_key": mesh_key, "static": static
                   "observed": observed}), flush=True)
 assert [row["jax_jit"] for row in observed] == [row["expected"] for row in observed]
 assert [row["jax_cache"] for row in observed] == [1, 2]
+assert (keys[0] != keys[1]) == bool(mesh_key)
 assert [row["dew"] for row in observed] == [row["expected"] for row in observed]
 assert executables[0] is not executables[1]
 """
@@ -82,7 +85,8 @@ def test_mesh_assignment_specializes_the_executable(mesh_key, static):
     result = subprocess.run([sys.executable, "-c", MESH_PROBE, str(int(mesh_key)), str(int(static))],
                             capture_output=True, text=True, env=environment)
     print(result.stdout, flush=True)
-    assert result.returncode == 0, result.stdout + result.stderr
+    if result.returncode:
+        pytest.fail(result.stdout + result.stderr, pytrace=False)
 
 
 @pytest.mark.parametrize("mode", ["flat-original-red", "flat-boxed-control-green", "headed-control-green"])
