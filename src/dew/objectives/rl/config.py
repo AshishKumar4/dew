@@ -150,10 +150,13 @@ class EpisodesConfig:
     """A validation split scored by flying the agent (`dew.training.Episodes` over
     `dew.rl.evaluation.episodes`): its greedy policy flown `steps` steps from fresh episodes of `env`, the
     run's own where None, each environment's first episode scored, logged as `episodes/return` and
-    `episodes/steps`. A JAX `Env`'s alone; a `Simulator`'s steps leave the jitted program."""
+    `episodes/steps`, and for each observation view in `reached` its mean at each first episode's last step
+    (a race's gates `passed`), `episodes/<view>`. A JAX `Env`'s alone; a `Simulator`'s steps leave the
+    jitted program."""
 
     steps: int
     env: EnvConfig | None = None
+    reached: tuple[str, ...] = ()
 
     def split(self, objective: Agent, env: Env | Simulator) -> Episodes:
         """The split of `objective`'s flights, in `env` where the record names no environment of its own."""
@@ -162,10 +165,12 @@ class EpisodesConfig:
             raise ValueError("a run's episodes are flown in one jitted program, and a Simulator steps from "
                              "the host; name a JAX Env for them (episodes.env)")
         if isinstance(objective, DreamerV3Objective):
-            score = episodes(objective.greedy, Driven(flown), self.steps, memory=objective.memory)
+            score = episodes(objective.greedy, Driven(flown), self.steps, memory=objective.memory,
+                             reached=self.reached)
         else:
-            score = episodes(objective.greedy, flown, self.steps)
-        return Episodes(score, {"return": Shown(better="higher"), "steps": Shown()})
+            score = episodes(objective.greedy, flown, self.steps, reached=self.reached)
+        reached = {view: Shown(better="higher") for view in self.reached}
+        return Episodes(score, {"return": Shown(better="higher"), "steps": Shown(), **reached})
 
 
 @dataclasses.dataclass(frozen=True)

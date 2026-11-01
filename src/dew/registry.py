@@ -1506,6 +1506,7 @@ envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
     "flight": "dew.rl.flight:FlightEnv",
     "gate_race": "dew.rl.flight:GateRace",
     "playground": "dew.rl.playground:Playground.load",
+    "skydreamer": "dew.rl.skydreamer:SkyRace",
 }, base="dew.rl.env:Env")
 """The environments an environment run names (`dew.objectives.rl.config.EnvConfig`): a JAX `Env` class, a
 host `Simulator` class, or a function or classmethod that returns one; any other by its import path."""

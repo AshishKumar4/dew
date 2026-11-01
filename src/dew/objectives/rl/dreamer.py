@@ -210,6 +210,11 @@ class WorldModel(nn.Module):
     reads: str | None = None
     """Where observations are dicts, the entry the encoder reads and the decoder rebuilds (FlyDreamer's
     `image`); the others are privileged, read by the `auxiliary` heads alone."""
+    proprio: tuple[tuple[str, int], ...] = ()
+    """Vector entries the encoder reads beside the image, each `(entry, width)`, symlogged, concatenated and
+    through an MLP beside the convolutions (DreamerV3's encoder over `mlp_keys`, nets.py; SkyDreamer's body
+    rates, motor speeds and flight plan, arXiv 2510.14783 Fig 3): sensed, so the policy reads them; decoding
+    them is the auxiliary heads'."""
     auxiliary: tuple[tuple[str, int, int], ...] = ()
     """Privileged entries the latent learns to predict, each `(entry, width, units)`: two layers of
     `units` then a linear map to the entry's `width`, its squared error summed (FlyDreamer's
@@ -247,6 +252,8 @@ class WorldModel(nn.Module):
             self.encoder = ConvEncoder(self.conv_depth, dtype=self.dtype)
             self.image_decoder = ConvDecoder(self.image, self.conv_depth, self.units, blocks=self.blocks,
                                              dtype=self.dtype)
+            if self.proprio:
+                self.proprio_encoder = layers(self.units, 3)
         self.dynamics_in = [dense(self.hidden) for _ in range(3)]
         self.dynamics_norms = [norm() for _ in range(3)]
         self.dynamics_hidden = _BlockLinear(self.deter, self.blocks, self.dtype)
@@ -267,7 +274,7 @@ class WorldModel(nn.Module):
         self.auxiliary_heads = {name: (layers(units, 2), dense(width))
                                 for name, width, units in self.auxiliary}
 
-    def __call__(self, observation: jax.Array, action: jax.Array) -> jax.Array:
+    def __call__(self, observation: jax.Array | dict[str, jax.Array], action: jax.Array) -> jax.Array:
         """Every network once, for initialization: a step from a zero latent."""
         tokens = self.embed(observation)
         deter, stoch = self.initial(action.shape[:-1])
@@ -283,9 +290,15 @@ class WorldModel(nn.Module):
         return (self.decode(deter, stoch).sum() + self.reward(feature).sum() + self.continue_(feature).sum()
                 + mean.sum() + self.value(feature).sum() + prior.sum() + predicted)
 
-    @property
-    def observation_shape(self) -> tuple[int, ...]:
-        return (self.observation_size,) if self.image is None else self.image
+    def example(self, batch: int) -> jax.Array | dict[str, jax.Array]:
+        """`batch` zero observations as the encoder reads them (`seen`): a vector, an image, or an image
+        beside its proprioceptive entries."""
+        if self.image is None:
+            return jnp.zeros((batch, self.observation_size))
+        image = jnp.zeros((batch, *self.image), jnp.uint8)
+        if not self.proprio:
+            return image
+        return {"image": image, "proprio": jnp.zeros((batch, sum(width for _, width in self.proprio)))}
 
     def initial(self, batch: tuple[int, ...]) -> tuple[jax.Array, jax.Array]:
         if self.dynamics is not None:
@@ -293,18 +306,27 @@ class WorldModel(nn.Module):
             return jnp.zeros((*batch, held.width)), jnp.zeros((*batch, held.stoch, held.classes))
         return jnp.zeros((*batch, self.deter)), jnp.zeros((*batch, self.stoch, self.classes))
 
-    def seen(self, observation: Observation) -> jax.Array:
-        """What the encoder reads of an observation: its `reads` view, or the observation whole."""
-        return view(observation, self.reads)
+    def seen(self, observation: Observation) -> jax.Array | dict[str, jax.Array]:
+        """What the encoder reads of an observation: its `reads` view, or the observation whole; beside an
+        image, its `proprio` entries concatenated (`example`'s structure)."""
+        read = view(observation, self.reads)
+        if not self.proprio:
+            return read
+        widths = [jnp.asarray(view(observation, name), jnp.float32) for name, _ in self.proprio]
+        return {"image": read, "proprio": jnp.concatenate(widths, -1)}
 
     def predicted(self, name: str, feature: jax.Array) -> jax.Array:
         """The auxiliary head `name`'s prediction of its privileged entry."""
         hidden, out = self.auxiliary_heads[name]
         return out(hidden(feature)).astype(jnp.float32)
 
-    def embed(self, observation: jax.Array) -> jax.Array:
-        """The encoder's tokens of an observation: a vector's symlogged first (rssm.py:218), an image's
-        pixels through the convolutions."""
+    def embed(self, observation: jax.Array | dict[str, jax.Array]) -> jax.Array:
+        """The encoder's tokens of an observation (`seen`): a vector's symlogged first (rssm.py:218), an
+        image's pixels through the convolutions, its proprioceptive entries symlogged through an MLP and
+        joined to them."""
+        if isinstance(observation, dict):
+            return jnp.concatenate([self.encoder(observation["image"]),
+                                    self.proprio_encoder(symlog(observation["proprio"]))], -1)
         return self.encoder(symlog(observation) if self.image is None else observation)
 
     def core(self, deter: jax.Array, stoch: jax.Array, action: jax.Array) -> jax.Array:
@@ -354,9 +376,13 @@ class WorldModel(nn.Module):
             return self.decoded(self.vector_decoder(self.feature(deter, stoch)))
         return self.image_decoder(deter, stoch)
 
-    def reconstruction(self, deter: jax.Array, stoch: jax.Array, observation: jax.Array) -> jax.Array:
+    def reconstruction(self, deter: jax.Array, stoch: jax.Array,
+                       observation: jax.Array | dict[str, jax.Array]) -> jax.Array:
         """The decoder's squared error, summed over the observation: against a vector's symlog, or an
-        image's pixels over 255 (rssm.py:345-355, outs.MSE summed over the image's axes)."""
+        image's pixels over 255 (rssm.py:345-355, outs.MSE summed over the image's axes); the
+        proprioceptive entries are the auxiliary heads' to decode."""
+        if isinstance(observation, dict):
+            observation = observation["image"]
         decoded = self.decode(deter, stoch).astype(jnp.float32)
         if self.image is None:
             return jnp.sum(jnp.square(decoded - symlog(observation)), -1)
@@ -492,7 +518,11 @@ class DreamerV3Objective(Objective[Ratio]):
     losses (configs.yaml `loss_scales`); `horizon` sets the continue target's discount, 1 - 1/333;
     `imagination` is the imagined steps from each replayed state, `lam` the lambda-returns' lambda,
     `entropy` the actor's bonus, `slow_decay` the slow critic's EMA and `return_rate` the rate of
-    the returns' percentile EMA. The slow critic is the EMA slot over the critic alone."""
+    the returns' percentile EMA. The slow critic is the EMA slot over the critic alone; with
+    `slow_targets` the imagined returns bootstrap from it (configs.yaml `slowtar`, as SkyDreamer sets it).
+    `smoothness` weighs the squared change of the policy's mean between imagined steps, added to the
+    policy's loss (SkyDreamer, arXiv 2510.14783 Eq 11, its 0.002: on the mean alone, so the entropy bonus
+    is untouched)."""
 
     shown: Mapping[str, Shown] = {"loss": Shown(), "episode_return": Shown(better="higher")}
     scales: Mapping[str, float] = {"decoder": 1.0, "reward": 1.0, "continue": 1.0, "dynamics": 1.0,
@@ -502,7 +532,7 @@ class DreamerV3Objective(Objective[Ratio]):
                  lam: float = 0.95, entropy: float = 3e-4, free_nats: float = 1.0, slow_decay: float = 0.98,
                  return_rate: float = 0.01, variables: Variables | None = None,
                  scales: Mapping[str, float] | None = None, imitation: float = 0.0,
-                 imitates: str = "action"):
+                 imitates: str = "action", slow_targets: bool = False, smoothness: float = 0.0):
         """`scales` overrides the losses' weights by name, each auxiliary head's its entry's name
         (`AUXILIARY_SCALE` unless set; pretraining from demonstrations sets `policy`, `value` and
         `replay_value` to 0, and imagination is then skipped); `imitation` weighs
@@ -513,6 +543,8 @@ class DreamerV3Objective(Objective[Ratio]):
         loss's place."""
         if imagination < 1 or not 0 <= lam <= 1 or horizon <= 1:
             raise ValueError("imagination must be positive, lam in [0, 1] and the horizon past one step")
+        if smoothness < 0:
+            raise ValueError("smoothness weighs at least 0")
         if imitates != "action" and not imitation:
             raise ValueError(f"imitates names the field imitation reads ({imitates!r}), and imitation "
                              "weighs 0")
@@ -530,6 +562,7 @@ class DreamerV3Objective(Objective[Ratio]):
         self.horizon, self.imagination, self.lam = horizon, imagination, lam
         self.entropy, self.free_nats, self.return_rate = entropy, free_nats, return_rate
         self.variables, self.imitates = variables, imitates
+        self.slow_targets, self.smoothness = slow_targets, smoothness
         self.ema = EMASpec(optax.constant_schedule(slow_decay), under("params", "value"))
         self.bins = twohot_bins(model.bins)
 
@@ -538,9 +571,7 @@ class DreamerV3Objective(Objective[Ratio]):
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         params_key, latent = jax.random.split(key)
-        observation = jnp.zeros((1, *self.model.observation_shape),
-                                jnp.float32 if self.model.image is None else jnp.uint8)
-        inputs = observation, jnp.zeros((1, self.model.action_size))
+        inputs = self.model.example(1), jnp.zeros((1, self.model.action_size))
         tree = self.model.init({"params": params_key, "latent": latent}, *inputs)
         # The returns' 5th and 95th percentiles, an EMA from zero (utils.py:16-72, debias off).
         return {**tree, "returns": {"low": jnp.zeros(()), "high": jnp.zeros(())}}
@@ -549,7 +580,7 @@ class DreamerV3Objective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return "DreamerV3 scores its agent by its episodes' returns, not a validation loss"
 
-    def observe(self, model: WorldModel, deter: jax.Array, stoch: jax.Array, observation: jax.Array,
+    def observe(self, model: WorldModel, deter: jax.Array, stoch: jax.Array, observation: Observation,
                 previous: jax.Array, first: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         """One posterior step: the latent and action masked where an episode starts, the GRU, then
         the posterior's draw; the new latent, beside the posterior's log-probabilities."""
@@ -560,7 +591,7 @@ class DreamerV3Objective(Objective[Ratio]):
         posterior = model.posterior(deter, model.embed(observation))
         return deter, model.categorical(posterior), posterior
 
-    def observed(self, variables: Variables, observation: jax.Array, previous: jax.Array, first: jax.Array,
+    def observed(self, variables: Variables, observation: Observation, previous: jax.Array, first: jax.Array,
                  key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         """The posterior latents over windows `[B, T, ...]` from a zero latent: each step's
         deterministic state, drawn categoricals and posterior log-probabilities, each step drawing from
@@ -584,7 +615,7 @@ class DreamerV3Objective(Objective[Ratio]):
             deter, stoch, posterior = self.observe(at, deter, stoch, observation, previous, first)
             return (deter, stoch), (deter, stoch, posterior)
 
-        steps = (*(jnp.swapaxes(x, 0, 1) for x in (observation, previous, first)),
+        steps = (*jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), (observation, previous, first)),
                  jax.random.split(key, length))
         _, found = jax.lax.scan(step, self.model.initial((rows,)), steps)
         deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in found)
@@ -715,16 +746,15 @@ class DreamerV3Objective(Objective[Ratio]):
                                else held)
         slow_values = twohot_mean(slow.value(features), self.bins)
         weight = jax.lax.stop_gradient(jnp.cumprod(cont, 1))
-        returns = jax.lax.stop_gradient(lambda_return(jnp.zeros_like(cont), 1 - cont, rewards, values, values,
+        boot = slow_values if self.slow_targets else values
+        returns = jax.lax.stop_gradient(lambda_return(jnp.zeros_like(cont), 1 - cont, rewards, boot, boot,
                                                       1.0, self.lam))
         rate, held_returns = self.return_rate, variables["returns"]
         low = (1 - rate) * held_returns["low"] + rate * jnp.percentile(returns, 5)
         high = (1 - rate) * held_returns["high"] + rate * jnp.percentile(returns, 95)
         scale = jnp.maximum(1.0, high - low)
         advantage = jax.lax.stop_gradient((returns - values[:, :-1]) / scale)
-        mean, std = model.policy(features)
-        log_pi = normal_log_prob(jax.lax.stop_gradient(actions), mean, std)[:, :-1]
-        imagined_policy = weight[:, :-1] * -(log_pi * advantage + self.entropy * normal_entropy(std)[:, :-1])
+        imagined_policy = self._imagined_policy(model.policy(features), actions, advantage, weight)
         value_logits = model.value(features)
         targets = jnp.concatenate([returns, jnp.zeros_like(returns[:, -1:])], 1)
         imagined_value = weight[:, :-1] * (twohot_loss(value_logits, targets, self.bins)
@@ -749,6 +779,18 @@ class DreamerV3Objective(Objective[Ratio]):
         metrics.update(return_scale=scale, imagined_return=jnp.mean(returns))
         stats = {"returns": {"low": jax.lax.stop_gradient(low), "high": jax.lax.stop_gradient(high)}}
         return Ratio(total, jnp.ones(())), Aux(metrics, variables=stats)
+
+    def _imagined_policy(self, policy: tuple[jax.Array, jax.Array], actions: jax.Array, advantage: jax.Array,
+                         weight: jax.Array) -> jax.Array:
+        """The actor's loss at each imagined step `[B*T, H]`: REINFORCE on the advantage with the entropy
+        bonus (agent.py:420-440), and where `smoothness` weighs it each step's mean against the one before
+        it (SkyDreamer Eq 11, on the mean alone)."""
+        mean, std = policy
+        log_pi = normal_log_prob(jax.lax.stop_gradient(actions), mean, std)[:, :-1]
+        loss = weight[:, :-1] * -(log_pi * advantage + self.entropy * normal_entropy(std)[:, :-1])
+        if self.smoothness:
+            loss = loss + self.smoothness * jnp.sum(jnp.square(mean[:, 1:] - mean[:, :-1]), -1)
+        return loss
 
 
 class Saved(TypedDict):

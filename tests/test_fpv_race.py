@@ -53,13 +53,3 @@ def test_each_world_stage_is_a_record_that_reads_back_as_itself(tmp_path, stage)
     assert harder == world.run(stage, 0.5)
     index = fpv_race.STAGES.index(stage)
     assert run.pretrained == (None if index == 0 else str(tmp_path / fpv_race.STAGES[index - 1]))
-
-
-@pytest.mark.parametrize("stage", fpv_race.BASE_STAGES)
-def test_each_base_stage_is_a_record_that_reads_back_as_itself(tmp_path, stage):
-    """Each of the base check's stages (`Base.run`) reads back from its record as itself, and the gate
-    starts from the hover."""
-    check = fpv_race.Base(tmp_path, tmp_path / "assets")
-    run = check.run(stage, 0.0)
-    assert EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))) == run
-    assert run.pretrained == (None if stage == "hover" else str(tmp_path / "hover"))

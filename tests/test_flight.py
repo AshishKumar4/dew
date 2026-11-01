@@ -330,35 +330,33 @@ def test_a_pillar_is_struck_where_the_drone_meets_it(pillar, crashes):
     assert bool(crashed) == crashes
 
 
-@pytest.mark.parametrize("latency", [RACING.latency, (0.0, 0.0)])
-def test_commands_carry_each_drones_throttle_rates_and_latency(latency):
+def test_commands_carry_each_drones_throttle_rates_and_latency():
     """Ten steps of drawn actions as the flight controller's commands, held to the race's rules in float64
     loops: the collective thrust a share of the drone's hover below zero and of the span to the nominal
     drone's full thrust above, the rates their share of the drone's rate limit, each command sent after the
-    drone's latency, the drone hovering until its first arrives; at a latency of none, each in its step."""
+    drone's latency, the drone hovering until its first arrives."""
     rng = np.random.default_rng([532, 6])
-    racing = dataclasses.replace(RACING, latency=latency)
     with jax.enable_x64(new_val=True):
-        race = races(racing, 1, 64)
+        race = races(RACING, 1, 64)
         actions = rng.uniform(-1.3, 1.3, (10, 64, 4))
-        step = jax.jit(jax.vmap(lambda race, action: commanded(racing, race, action)))
+        step = jax.jit(jax.vmap(lambda race, action: commanded(RACING, race, action)))
         sent = []
         for action in actions:
             race, collective, rates = step(race, jnp.asarray(action))
             sent.append(np.c_[np.asarray(collective), np.asarray(rates)])
         kept = numpy_of(race)
-        full = racing.quadrotor.nominal_thrust
+        full = RACING.quadrotor.nominal_thrust
         expected = np.zeros((10, 64, 4))
         for drone in range(64):
             hover = kept.body.mass[drone] * GRAVITY
-            queue = [np.asarray([hover, 0.0, 0.0, 0.0])] * (racing.delays[1] + 1)
+            queue = [np.asarray([hover, 0.0, 0.0, 0.0])] * (RACING.delays[1] + 1)
             for index, action in enumerate(np.clip(actions[:, drone], -1, 1)):
                 collective = hover + action[0] * ((full - hover) if action[0] >= 0 else hover)
                 queue = [np.r_[collective, action[1:] * kept.rate_limit[drone]], *queue[:-1]]
                 expected[index, drone] = queue[kept.delay[drone]]
         roundings = chain_roundings(jax.make_jaxpr(step)(race, jnp.asarray(actions[0])))
         assert_computes_the_oracle(np.stack(sent), expected, "the commands", roundings=roundings)
-    assert set(np.unique(kept.delay)) == set(range(racing.delays[0], racing.delays[1] + 1))
+    assert set(np.unique(kept.delay)) == set(range(RACING.delays[0], RACING.delays[1] + 1))
 
 
 def test_a_camera_is_hyperdrones_of_its_mounted_frame():
@@ -603,17 +601,11 @@ def written_figure8(draw: dict) -> np.ndarray:
     return np.stack([c * x - s * y, s * x + c * y, 3.0 + draw["lift"] * (0.5 + 0.5 * np.sin(t))], -1)
 
 
-def written_single(draw: dict) -> np.ndarray:
-    """The one gate, 2 m up at the origin, whatever was drawn."""
-    return np.asarray([[0.0, 0.0, 2.0]])
-
-
 def written_pillars(racing: Racing, difficulty: float, draw: dict, gates: np.ndarray,
                     events: collections.Counter) -> np.ndarray:
     """A course's pillars `[O, 4]` (x, y, radius, height): each at its draw's point along a segment between
     gates, on the line or beside it, its height its radius times its draw's aspect; as many stand as the
-    difficulty and its draw allow, but for those within CLEARANCE and their radius of a gate, and none on a
-    course of one gate, which has no segment."""
+    difficulty and its draw allow, but for those within CLEARANCE and their radius of a gate."""
     begin, end = gates[draw["segment"]], gates[(draw["segment"] + 1) % len(gates)]
     point = begin + draw["along_segment"][:, None] * (end - begin)
     heading = np.arctan2(end[:, 1] - begin[:, 1], end[:, 0] - begin[:, 0])
@@ -621,8 +613,7 @@ def written_pillars(racing: Racing, difficulty: float, draw: dict, gates: np.nda
     xy = point[:, :2] + aside[:, None] * np.stack([-np.sin(heading), np.cos(heading)], -1)
     radius, height = draw["radius"], draw["radius"] * np.asarray(ASPECTS)[draw["aspect"]]
     near = np.hypot(xy[:, None, 0] - gates[None, :, 0], xy[:, None, 1] - gates[None, :, 1]).min(-1)
-    drawn = np.arange(OBSTACLES) < np.floor(difficulty * racing.obstacles * draw["share"])
-    allowed = drawn & (len(gates) > 1)
+    allowed = np.arange(OBSTACLES) < np.floor(difficulty * racing.obstacles * draw["share"])
     clear = near > CLEARANCE + radius
     events["dropped"] += (allowed & ~clear).sum()
     return np.c_[xy, np.where(allowed & clear, radius, 0.0), height]
@@ -632,9 +623,9 @@ def written_pillars(racing: Racing, difficulty: float, draw: dict, gates: np.nda
 def test_courses_are_their_families_generators_written_out(difficulty):
     """4096 courses drawn at a difficulty from every family, in float64, each held to the generator of its
     family written out over the draws it makes (a published layout moved by the jitter, a loop about an
-    ellipse, a chain of primitives whose crowded gates are lifted, a figure-eight, one gate, and pillars
-    dropped near a gate): every gate and standing pillar to float64 rounding, each count and which pillars
-    stand exactly; no gate of a chain crowded by an earlier one in the end; and, at a difficulty above none, a
+    ellipse, a chain of primitives whose crowded gates are lifted, a figure-eight, and pillars dropped near
+    a gate): every gate and standing pillar to float64 rounding, each count and which pillars stand
+    exactly; no gate of a chain crowded by an earlier one in the end; and, at a difficulty above none, a
     split-S, a dive, a lifted gate and a dropped pillar each drawn among them."""
     keys = jax.random.split(jax.random.key(6), COURSES)
     with jax.enable_x64(new_val=True):
@@ -648,8 +639,7 @@ def test_courses_are_their_families_generators_written_out(difficulty):
     events = collections.Counter()
     written = {"layout": partial(written_layout, EVERY_FAMILY, difficulty),
                "loop": partial(written_loop, difficulty),
-               "chain": partial(written_chain, difficulty, events=events), "figure8": written_figure8,
-               "single": written_single}
+               "chain": partial(written_chain, difficulty, events=events), "figure8": written_figure8}
     each_draw = [{name: value[row] for name, value in draws.items()} for row in range(COURSES)]
     gates = [written[name](draw) for name, draw in zip(family, each_draw, strict=True)]
     np.testing.assert_array_equal(courses.count, [len(course) for course in gates])
@@ -674,19 +664,17 @@ def test_courses_are_their_families_generators_written_out(difficulty):
 @pytest.mark.parametrize("difficulty", [0.0, 0.5, 1.0])
 def test_courses_keep_their_families_shapes(difficulty):
     """4096 courses drawn at a difficulty from every family, in the dtype a race runs in: each loop and
-    figure-eight closed and each chain and single gate open; a layout course the size of a published layout,
-    a loop 6 to 12 gates, a chain 8 to 16, a figure-eight 8 to 12 and a single gate one, every size in each
-    range drawn; a chain's gates between 1 and 20 m high; each pillar's height its radius times one of the
-    aspects, and no pillar beside a single gate."""
+    figure-eight closed and each chain open; a layout course the size of a published layout, a loop 6 to 12
+    gates, a chain 8 to 16 and a figure-eight 8 to 12, every size in each range drawn; a chain's gates
+    between 1 and 20 m high; each pillar's height its radius times one of the aspects."""
     keys = jax.random.split(jax.random.key(6), COURSES)
     courses = jax.tree.map(np.asarray, jax.jit(jax.vmap(
         lambda key: drawn_course(EVERY_FAMILY, key, jnp.asarray(difficulty))))(keys))
     family = np.asarray(FAMILIES)[courses.family]
-    np.testing.assert_array_equal(courses.closed, ~np.isin(family, ["chain", "single"]))
+    np.testing.assert_array_equal(courses.closed, family != "chain")
     counts = {name: set(courses.count[family == name]) for name in FAMILIES}
     assert counts == {"layout": {len(layout) for layout in PUBLISHED}, "loop": set(range(6, 13)),
-                      "chain": set(range(8, GATES + 1)), "figure8": set(range(8, 13)), "single": {1}}
-    assert not (courses.obstacles[family == "single", :, 2] > 0).any()
+                      "chain": set(range(8, GATES + 1)), "figure8": set(range(8, 13))}
     chained = np.concatenate([courses.center[row, :courses.count[row], 2]
                               for row in np.flatnonzero(family == "chain")])
     assert np.all((chained >= 1) & (chained <= 20))
@@ -780,37 +768,6 @@ def test_a_drone_whose_drag_and_disturbances_are_off_shows_them_neutral():
     np.testing.assert_array_equal(shown[:, 7:11], np.ones((64, 4), shown.dtype))
     np.testing.assert_array_equal(shown[:, 14:], np.zeros((64, 6), shown.dtype))
     assert np.isfinite(shown).all()
-
-
-def test_a_race_at_no_randomization_flies_the_nominal_drone_through_a_neutral_camera():
-    """Drones started at no randomization (ramp 0), whatever their keys: every body is the nominal
-    quadrotor's (its mass, inertia, coefficients, top speed, motor lag, drags, ground effect, charge and
-    resistance, and no disturbance), every rate limit the nominal one, every camera the race's one fixed
-    geometry with a neutral image (exposure, white balance and gamma 1, no noise, no shutter) and the scene's
-    first looks."""
-    count, q = 64, RACING.quadrotor
-    keys = jax.random.split(jax.random.key(11), count)
-    race = jax.vmap(lambda key: started(RACING, key, jnp.asarray(0.0), jnp.asarray(0.0)))(keys)
-    body = jax.tree.map(np.asarray, race.body)
-    nominal = {"mass": q.mass, "inertia": q.inertia, "thrust_coefficient": q.thrust_coefficient,
-               "drag_coefficient": q.drag_coefficient, "top_speed": q.top_speed,
-               "motor_lag": sum(q.motor_lag) / 2, "rotor_drag": q.rotor_drag,
-               "quadratic_drag": q.quadratic_drag, "vertical_drag": q.vertical_drag,
-               "ground_effect": q.ground_effect[1], "charged": q.full_voltage, "resistance": q.resistance[0],
-               "force": (0.0, 0.0, 0.0), "moment": (0.0, 0.0, 0.0)}
-    assert set(nominal) == set(vars(body))
-    for name, value in nominal.items():
-        drawn = getattr(body, name)
-        np.testing.assert_array_equal(drawn, np.broadcast_to(np.asarray(value, drawn.dtype), drawn.shape),
-                                      err_msg=name)
-    np.testing.assert_array_equal(np.asarray(race.rate_limit), np.full(count, RACING.rate_limit, np.float32))
-    camera = jax.tree.map(np.asarray, race.camera)
-    for name in ("uptilt", "fov", "mount"):
-        np.testing.assert_array_equal(getattr(camera, name), np.broadcast_to(getattr(camera, name)[:1],
-                                                                             getattr(camera, name).shape))
-    for name, neutral in (("exposure", 1.0), ("white_balance", 1.0), ("gamma", 1.0), ("noise", 0.0),
-                          ("shutter", 0.0), ("look", 0)):
-        np.testing.assert_array_equal(getattr(camera, name), np.full_like(getattr(camera, name), neutral))
 
 
 def test_a_race_whose_gates_its_renderer_does_not_draw_is_refused():

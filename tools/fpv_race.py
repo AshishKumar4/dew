@@ -26,9 +26,6 @@ from, beside a JSON report.
                                                           the agent flying and the teacher labelling its steps
                                                           (DAgger); online, at FlyDreamer's train ratio. The
                                                           teacher and each stage's agent scored alike.
-    python tools/fpv_race.py base OUT --assets A          The base check (`Base`): DreamerV3 online from
-              [--hover-updates N] [--gate-updates N]      scratch on the camera alone over one fixed gate, no
-                                                          latency or randomization: hover, then the gate.
 
 `--hz` sets the control rate (60 by default). The world model's windows and imagination span the same
 seconds at any rate: 64 steps and 15 imagined at 30 Hz, 128 and 30 at 60. `--assets` is the folder
@@ -78,8 +75,6 @@ VIEWS = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed"
 """What the world phase's races show: the camera's image, which the agent reads, and the privileged views."""
 TEACHER_RUN, STAGES = "teacher", ("pretrain", "dagger", "online")
 """The runs under OUT: the teacher's, and the world phase's stages, each started from the one before."""
-BASE_STAGES = ("hover", "gate")
-"""The base check's stages (`Base`), the second started from the first."""
 SCORED_EVERY = 10
 """The teacher's collections between its scores."""
 
@@ -428,16 +423,15 @@ class World:
         return dataclasses.replace(run, model=ModelConfig(f"{DREAMER}:WorldModel", model))
 
 
-def _staged(world: World | Base, stage: str, updates: int, every: int | None, report: dict, judge,
-            races: tuple, level: float, *, written: Path, top: float = 1.0):
-    """A phase's `stage` (`World.run`, `Base.run`) trained to `updates` updates under OUT/<stage>, going on
-    from its checkpoints, its replay made again; with `every`, in chunks of that many updates, each chunk's
-    agent scored (`judge`) into report[stage], written to `written`, and its curriculum raised from `level` as
-    the teacher's was, up a tenth, to `top`, at each score whose crashes fall under a third, the stage's race
-    and `races` drawn at it. The
+def _staged(world: World, stage: str, updates: int, every: int | None, report: dict, judge, races: tuple,
+            level: float):
+    """The world phase's `stage` (`World.run`) trained to `updates` updates under OUT/<stage>, going on from
+    its checkpoints, its replay made again; with `every`, in chunks of that many updates, each chunk's agent
+    scored (`judge`) into report[stage] and its curriculum raised from `level` as the teacher's was, up a
+    tenth, to 1, at each score whose crashes fall under a third, the stage's race and `races` drawn at it. The
     stage is prepared once and each chunk trains it on, its rollout's environments and replay kept between
     them. A chunk's checkpoint is written as it ends, then its score and the level the next chunk trains at
-    (the report's `level`), where a stopped stage goes on; one stopped between the two is restored at that
+    (world.json's `level`), where a stopped stage goes on; one stopped between the two is restored at that
     checkpoint and scored before the next chunk trains. Returns the stage's last state, its agent and the
     level it ended at."""
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
@@ -467,13 +461,13 @@ def _staged(world: World | Base, stage: str, updates: int, every: int | None, re
         points.append(point)
         report[stage] = points
         print(json.dumps(point), flush=True)
-        if point["crashed"] < 1 / 3 and level < top:
-            level = round(min(top, level + 0.1), 1)
+        if point["crashed"] < 1 / 3 and level < 1.0:
+            level = round(min(1.0, level + 0.1), 1)
             for raced in (rollout.env, *races):
                 raced.difficulty = raced.ramp = level
         # The level the next chunk trains at, beside the score that earned it: a resumed stage goes on there.
         report["level"] = level
-        _written(written, json.dumps(report, indent=1))
+        _written(world.out / "world.json", json.dumps(report, indent=1))
     return state, agent, level
 
 
@@ -521,8 +515,7 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
     filmed = {"pretrain": "cloned.npz", "dagger": "dagger.npz", "online": "video.npz"}
     for stage, updates, every in zip(STAGES, (pretrain_updates, dagger_updates, online), (None, 2000, 10_000),
                                      strict=True):
-        state, agent, level = _staged(world, stage, updates, every, report, judge, (judged, held_out), level,
-                                      written=path)
+        state, agent, level = _staged(world, stage, updates, every, report, judge, (judged, held_out), level)
         report["level"] = level
         report[f"{stage}_agent"] = judge(agent.greedy, state.variables, agent.memory(world.drones),
                                          jax.random.key(7 + STAGES.index(stage)),
@@ -533,94 +526,10 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
     return report
 
 
-@dataclasses.dataclass(frozen=True)
-class Base:
-    """The base check of the pipeline: DreamerV3 learning online from scratch, from the camera alone, with no
-    teacher, demonstrations or imitation, at FlyDreamer's 30 Hz and its RSSM world model, on the simplest race
-    the simulator holds, with none of the departures from the published pixel-based work (Dream to Fly, arXiv
-    2501.14377; SkyDreamer, arXiv 2510.14783) that this race adds: one gate (`single`), the same every
-    episode; no command latency and no randomization (level 0: the nominal drone, a neutral image, the
-    scene's first looks), the camera 30 degrees up and 100 across. Its stages
-    (`BASE_STAGES`): `hover`, the gate's progress and bonus off and every start hovering, so the drone earns
-    by staying up looking at the gate (the perception reward) and loses by crashing; then `gate`, from the
-    hover's weights, flying through it (half the starts already flying). Races of `drones` drones over
-    `assets`; the replay holds `capacity_seconds` a drone, and each update replays `train_ratio` steps for
-    each taken."""
-
-    out: Path
-    assets: Path
-    drones: int = 16
-    hz: float = 30.0
-    train_ratio: float = 32.0
-    capacity_seconds: float = 600.0
-    saved_every: int = 2000
-
-    @property
-    def length(self) -> int:
-        """The windows' steps, 64 at 30 Hz (FlyDreamer's)."""
-        return round(64 * self.hz / 30)
-
-    def racing(self, stage: str) -> dict:
-        """The stage's race (`dew.rl.flight.Racing`'s arguments): one gate, no latency, 10 s episodes, the
-        camera's one fixed geometry (`Racing`'s), every other randomization off with the level at 0; the
-        hover's without the gate's progress and bonus, every start hovering."""
-        hovering = {"progress_scale": 0.0, "gate_bonus": 0.0, "flying_share": 0.0} if stage == "hover" else {}
-        return {**racing_record(self.hz, (("single", 1.0),)), "latency": [0.0, 0.0], "episode_seconds": 10.0,
-                **hovering}
-
-    def race(self, stage: str):
-        """A race of the stage's own, for scoring: its run's environment built from its record again."""
-        env = self.run(stage, 0.0).env
-        assert env is not None
-        return env.build()
-
-    def run(self, stage: str, level: float) -> EnvRunConfig:
-        """The stage's run (`BASE_STAGES`): FlyDreamer's RSSM sizes over the image alone, DreamerV3's losses
-        and actor-critic, at `level` (0, which the check holds)."""
-        renderer = {"class": "dew.rl.hyperlux:HyperLuxRenderer",
-                    "fields": {"count": self.drones, "assets": str(self.assets)}}
-        race = {"renderer": renderer, "racing": self.racing(stage), "views": ["image", "passed"],
-                "difficulty": level, "ramp": level}
-        rollout = {"batch": 16, "length": self.length, "train_ratio": self.train_ratio,
-                   "prefill": self.length, "capacity": round(self.capacity_seconds * self.hz)}
-        run = EnvRunConfig(
-            env=EnvConfig("gate_race", race), objective=ObjectiveConfig(f"{DREAMER}:DreamerV3Objective"),
-            rollout=RolloutConfig("dreamer", rollout), optim=OptimConfig(optimizer="laprop"),
-            trainer=TrainerConfig(checkpoint_dir=str(self.out), key=BASE_STAGES.index(stage), log_every=500,
-                                  eval_every=None, checkpoint_every=self.saved_every, keep=Keep(latest=1)))
-        if stage != BASE_STAGES[0]:
-            return dataclasses.replace(run, pretrained=str(self.out / BASE_STAGES[0]))
-        # FlyDreamer's RSSM (its configs.yaml `rssm`) and its encoder's and heads' widths.
-        model = {"reads": "image", "deter": 4096, "hidden": 512, "stoch": 16, "classes": 32, "blocks": 8,
-                 "units": 1024, "conv_depth": 64, "dtype": "bfloat16"}
-        return dataclasses.replace(run, model=ModelConfig(f"{DREAMER}:WorldModel", model))
-
-
-def base(check: Base, *, hover_updates: int = 8000, gate_updates: int = 12_000) -> dict:
-    """The base check's stages (`Base`) in turn, each going on from its checkpoints and scored every 2,000
-    updates (base.json), its agent flying greedy on a race of its own, the level held at 0."""
-    path = check.out / "base.json"
-    report = json.loads(path.read_text()) if path.exists() else {"drones": check.drones, "hz": check.hz,
-                                                                  "level": 0.0}
-    for stage, updates in zip(BASE_STAGES, (hover_updates, gate_updates), strict=True):
-        judged = check.race(stage)
-
-        def judge(policy, params, memory, key, judged=judged):
-            return scored(judged, policy, params, memory, key, judged.racing.max_steps)
-
-        state, agent, _ = _staged(check, stage, updates, 2000, report, judge, (judged,), 0.0, written=path,
-                                  top=0.0)
-        report[f"{stage}_agent"] = judge(agent.greedy, state.variables, agent.memory(check.drones),
-                                         jax.random.key(7 + BASE_STAGES.index(stage)))
-        print(json.dumps({stage: report[f"{stage}_agent"]}), flush=True)
-        _written(path, json.dumps(report, indent=1))
-    return report
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("phase", choices=("check", "teacher", "wrap", "world", "base"))
+    parser.add_argument("phase", choices=("check", "teacher", "wrap", "world"))
     parser.add_argument("out", type=Path)
     parser.add_argument("--hz", type=float, default=60.0)
     parser.add_argument("--seconds", type=float, default=6600.0)
@@ -636,8 +545,6 @@ def main() -> None:
     parser.add_argument("--dagger-updates", type=int, default=10_000)
     parser.add_argument("--dagger-ratio", type=float, default=64.0)
     parser.add_argument("--environment-seconds", type=float, default=33_333.0)
-    parser.add_argument("--hover-updates", type=int, default=8000)
-    parser.add_argument("--gate-updates", type=int, default=12_000)
     arguments = parser.parse_args()
     arguments.out.mkdir(parents=True, exist_ok=True)
     if arguments.phase == "check":
@@ -645,9 +552,6 @@ def main() -> None:
     elif arguments.phase == "teacher":
         report = teacher(arguments.out, seconds=arguments.seconds, hz=arguments.hz, warm=arguments.warm,
                          level=0.2 if arguments.level is None else arguments.level)
-    elif arguments.phase == "base":
-        report = base(Base(arguments.out, arguments.assets), hover_updates=arguments.hover_updates,
-                      gate_updates=arguments.gate_updates)
     elif arguments.phase == "wrap":
         report = wrap(arguments.out, weights=arguments.teacher, hz=arguments.hz,
                       level=1.0 if arguments.level is None else arguments.level)
