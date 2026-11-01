@@ -11,6 +11,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
   (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
   traitlets) and ipywidgets, jupyterlab-widgets, widgetsnbextension and comm.
+- On a host of two or more GPUs, XLA's pool leaves NCCL's communicators their measured full-speed room:
+  the share the run names (`dew.devices.pool_bound`) is the pool's upper bound, a child process measures
+  the communicators, all-to-all and permute connections once per configuration into Dew's cache, and a
+  program whose communicators need more than the room left is refused at Dew's one compile point, naming
+  the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
+  through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
+- Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md),
+  and through it on black, graphviz, anywidget and opentelemetry-api.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
   mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
   outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.

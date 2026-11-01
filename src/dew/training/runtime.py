@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import jax
 from jax.experimental import multihost_utils
 
+from dew import communicators
 from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.cache import enable_compilation_cache, persist_compilations
 from dew.devices import (
@@ -99,7 +100,7 @@ def prepare_process(wandb: Wandb | None = None,
     device per local accelerator, which the trainer checks on its own mesh
     (`dew.distributed.host.companion_mesh`).
     """
-    _set_environment(wandb, xla_flags, compilation_cache_dir)
+    _set_environment(wandb, xla_flags, compilation_cache_dir, multi_host)
     _raise_limits()
     _join_process_pool(multi_host)
     ready_process()
@@ -139,10 +140,11 @@ def ready_process() -> None:
 
 
 def _set_environment(wandb: Wandb | None, xla_flags: str | None,
-                     compilation_cache_dir: str | None) -> None:
+                     compilation_cache_dir: str | None, multi_host: bool | None = None) -> None:
     """The env vars wandb and the tokenizers read, the run's XLA flags and
-    Dew's defaults beside them, and the compilation cache: everything read
-    before a backend opens."""
+    Dew's defaults beside them, the GPU pool's share sized to leave its
+    communicators room (`dew.communicators`, a process of one host
+    alone), and the compilation cache: everything read before a backend opens."""
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
     # HF tokenizers fork a thread pool, and grain's workers fork the process, which deadlocks a pool
@@ -160,6 +162,8 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
                      "whose XLA may have parsed its flags since: they are unproven. Set XLA_FLAGS before "
                      "the process starts, as `dew train` does, to make them certain", xla_flags)
     preallocate_gpu_pool()
+    if not joins_pool(multi_host, pool_cluster(multi_host)):
+        communicators.hold(communicators.sized_pool())
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 

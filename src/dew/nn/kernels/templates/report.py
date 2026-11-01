@@ -24,6 +24,7 @@ from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
 from jax.extend.mlir import ir
 
+from dew import communicators
 from dew.nn.kernels import generation
 
 LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
@@ -268,6 +269,15 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
              relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
+    """`lowered` compiled (`kept`), its communicators admitted against the room the process's pool left
+    them before it runs (`dew.communicators.admit`): every program Dew compiles passes here."""
+    executable = kept(lowered, options, relower=relower)
+    communicators.admit(executable)
+    return executable
+
+
+def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
+         relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
     """`lowered` compiled, read through its kernels' binaries (`binaries`): where a kernel of a template's
     launch spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
     program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
