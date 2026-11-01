@@ -125,14 +125,13 @@ class WorldModelRunConfig(RunConfig):
                              f"{labels!r}")
         return (time, height, width, channels), labels[1]
 
-    def trains(self, kind: type[Objective], model: ModelConfig | None = None) -> None:
+    def trains(self, kind: type[Objective]) -> None:
         """Refuse a model of a class other than the one `kind`'s constructor declares for its `model`."""
-        named = self.model if model is None else model
         parameter, owner = parameters(kind)[0]["model"]
         declared = parameter_type(owner, parameter.name)
-        if isinstance(declared, type) and not issubclass(models[named.name], declared):
+        if isinstance(declared, type) and not issubclass(models[self.model.name], declared):
             raise ValueError(f"{kind.__name__} trains a {declared.__name__}, and the run's model is "
-                             f"{named.name}")
+                             f"{self.model.name}")
 
     def derived(self, widths: Mapping[str, Configured]) -> dict[str, Configured]:
         """The `widths` the model's class declares, which the data or the tokenizer state; refused where the
