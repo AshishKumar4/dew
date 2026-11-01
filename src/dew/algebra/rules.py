@@ -61,14 +61,20 @@ class Rules:
 
 
 def _facts() -> Ruleset:
-    """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, a
-    layout-keeping one its operand's, a sum along one axis its operand's without that axis."""
+    """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, or over
+    an operand and a scalar the operand's, a layout-keeping one its operand's, a sum along one axis its
+    operand's without that axis."""
     term, x, y = vars_("term x y", Term)
     shaped, axes = vars_("shaped axes", Vec[i64])
     name = var("name", String)
     params = var("params", i64)
+    scalar = Vec[i64].empty()
     return ruleset(
         rule(eq(term).to(x.binary(name, y, params)), eq(shaped).to(shape(x)), eq(shape(y)).to(shaped)).then(
+            set_(shape(term)).to(shaped)),
+        rule(eq(term).to(x.binary(name, y, params)), eq(shaped).to(shape(x)), eq(shape(y)).to(scalar)).then(
+            set_(shape(term)).to(shaped)),
+        rule(eq(term).to(x.binary(name, y, params)), eq(shape(x)).to(scalar), eq(shaped).to(shape(y))).then(
             set_(shape(term)).to(shaped)),
         rule(eq(term).to(x.unary(name, params)), eq(shaped).to(shape(x))).then(set_(shape(term)).to(shaped)),
         rule(eq(term).to(x.convert(params)), eq(shaped).to(shape(x))).then(set_(shape(term)).to(shaped)),
