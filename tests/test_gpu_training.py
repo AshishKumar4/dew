@@ -79,9 +79,9 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(run_option_matrix.an_lm_run_measures_its_kernel_launches_as_set, "launches")),
         Cell("a clocked run with a cooldown trains from its step compiled ahead, compiling no other",
              in_own(clocked, "clocked")),
-        # A fast form is a fast kernel on sm90 alone: on sm80 the default route computes IEEE fp32.
         Cell("a program on this GPU is admitted against the room its pool left",
              in_own(admitted, "admitted")),
+        # A fast form is a fast kernel on sm90 alone: on sm80 the default route computes IEEE fp32.
         Cell("the attention forms a run names reach its step",
              in_own(option_witness.the_attention_forms_a_run_names_reach_its_step, "forms"),
              generation="sm90"),
