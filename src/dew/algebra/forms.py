@@ -137,8 +137,10 @@ def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturatio
 
 def inlined(function: Callable) -> Callable:
     """`function` with each choice by the platform a program lowers for (`lax.platform_dependent`, a `cond` on
-    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, so its product
-    enters the e-graph as one; a form evaluates products as Dew's (`evaluated`)."""
+    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, and each call
+    of a jitted function traced inline (Dew's product under a wide CPU arithmetic is a jitted choice), so its
+    product enters the e-graph as one whatever the platform; a form evaluates products as Dew's
+    (`evaluated`)."""
     def run(*values):
         closed = jax.make_jaxpr(function)(*values)
         outputs = evaluated_inline(closed.jaxpr, closed.consts, values)
@@ -165,6 +167,9 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
             default = branches[-1]
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
+        elif equation.primitive.name in ("jit", "pjit", "closed_call"):
+            called = equation.params.get("jaxpr") or equation.params["call_jaxpr"]
+            outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
         else:
             outs = bound(equation, map(read, equation.invars))
         env.update(zip(equation.outvars, outs, strict=True))
