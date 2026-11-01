@@ -65,6 +65,7 @@ def test_a_rewrite_met_by_an_entry_added_beside_it_stops_on_a_conflict(tmp_path,
 
 
 def test_entries_both_sides_add_at_the_head_of_unreleased_are_both_kept(tmp_path):
+    """As lanes add theirs side by side, and main's automatic merge into base/kernels then stops on none."""
     ours = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- Main's new entry.\n")
     theirs = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- A head's new entry.\n")
     merge, root = merged(tmp_path, ours, theirs)
