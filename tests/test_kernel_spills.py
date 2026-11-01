@@ -329,7 +329,8 @@ def test_a_program_donates_its_state_and_places_it_by_a_tree_of_formats():
                   jax.device_put(jnp.ones((2, 3)), formats.columns))
     assert "input_output_alias" in run.executable(slots, 2.0).as_text()
     stepped_slots = run(slots, 2.0)
-    assert stepped_slots.columns.format == formats.columns
+    assert [leaf.format.layout.major_to_minor for leaf in (stepped_slots.rows, stepped_slots.columns)] == [
+        (0, 1), (1, 0)]
     np.testing.assert_array_equal(np.asarray(stepped_slots.rows), np.full((2, 3), 3.0))
 
 
