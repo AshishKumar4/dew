@@ -104,7 +104,6 @@ import argparse
 import ast
 import collections
 import concurrent.futures
-import contextlib
 import dataclasses
 import fnmatch
 import functools
@@ -116,6 +115,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -529,11 +529,11 @@ class Reading:
 
 @dataclasses.dataclass(frozen=True)
 class Standing:
-    """The checkout as a run found it (`standing`): each file's change time (its ctime, which no process sets
-    back) and each directory's entries as a key lists them (`visible`), but a hidden directory's at its top
-    (`HIDDEN_INPUTS` aside) and a build's (`built`), which are no input."""
+    """The checkout as a run found it (`standing`): each file's change times (`changed_at`) and each
+    directory's entries as a key lists them (`visible`), but a hidden directory's at its top (`HIDDEN_INPUTS`
+    aside) and a build's (`built`), which are no input."""
 
-    changed: Mapping[str, int]
+    changed: Mapping[str, tuple[int, int | None]]
     entries: Mapping[str, tuple[str, ...]]
 
     def exists(self, path: Path) -> bool:
@@ -550,6 +550,22 @@ def visible(path: Path) -> tuple[str, ...]:
                         if not entry.name.startswith(".") and not built(entry)))
 
 
+def changed_at(path: Path) -> tuple[int, int | None] | None:
+    """File `path`'s change time (its ctime, which no process sets back) and, for a link, its referent's,
+    which a key reads through (`contents`), so a run that rewrites what a link names moved its input (review);
+    None where there is no file."""
+    try:
+        link = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(link.st_mode):
+        return link.st_ctime_ns, None
+    try:
+        return link.st_ctime_ns, path.stat().st_ctime_ns
+    except (FileNotFoundError, RuntimeError):
+        return link.st_ctime_ns, None
+
+
 def standing() -> Standing:
     """The checkout as it stands (`Standing`), from its root, the working directory."""
     changed, entries = {}, {}
@@ -560,9 +576,8 @@ def standing() -> Standing:
             here != Path(".") or not folder.startswith(".") or folder in followed.HIDDEN_INPUTS)]
         entries[str(here.relative_to("."))] = visible(here)
         for file in files:
-            path = here / file
-            with contextlib.suppress(FileNotFoundError):
-                changed[str(path.relative_to("."))] = path.lstat().st_ctime_ns
+            if (times := changed_at(here / file)) is not None:
+                changed[str((here / file).relative_to("."))] = times
     return Standing(changed, entries)
 
 
@@ -570,7 +585,8 @@ def stood(entry: str, before: Standing | None) -> object:
     """What of the checkout input `entry` (`inputs`) is keyed by (`contents`), as it stood `before` a run, or
     as it stands now where `before` is None: where an import looks, what is there; a probed directory, that it
     is one; a directory, its entries; a file (a unit's, a marker's registration in pyproject.toml, a fetched
-    payload's manifest), its change time; nothing for a host's limit."""
+    payload's manifest), its change times, a link's referent's among them (`changed_at`); nothing for a host's
+    limit."""
     if entry.startswith("limit:"):
         return None
     if entry.startswith("import:"):
@@ -584,11 +600,7 @@ def stood(entry: str, before: Standing | None) -> object:
     manifest = path.parent / (path.name + FETCHED)
     if path.name and (manifest.is_file() if before is None else before.exists(manifest)):
         path = manifest
-    if before is not None:
-        return before.changed.get(str(path))
-    with contextlib.suppress(FileNotFoundError):
-        return path.lstat().st_ctime_ns
-    return None
+    return changed_at(path) if before is None else before.changed.get(str(path))
 
 
 def moved(name: str, depends: list[str], before: Standing) -> bool:
@@ -1507,7 +1519,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     found = looked_up(python, names, split, common, whole_files, cache, release, reading)
     held = {(name, group): looked_up(python, [name], group, common, {name: at}, cache, release, reading)
             for name, group, at in groups}
-    code = tested(python, names, split, out, deadline, cache, grace, common, started, coverage, whole=whole,
+    # The files run in what the lookups left of the deadline, as each group after them does (review).
+    left = deadline - (time.monotonic() - began)
+    code = tested(python, names, split, out, left, cache, grace, common, started, coverage, whole=whole,
                   release=release, kept=whole_files, container=container, found=found)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).

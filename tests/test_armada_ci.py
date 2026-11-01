@@ -1,6 +1,7 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
 import functools
+import http.server
 import itertools
 import json
 import os
@@ -8,7 +9,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
@@ -643,8 +646,9 @@ def test_a_gpu_lane_runs_a_file_whose_green_row_the_cache_holds_and_keeps_no_key
         ci, tmp_path, monkeypatch, cache_worker):
     """A GPU lane's files share the device, which no container keeps apart, so a lane never reuses a row: a
     file whose green row the cache holds for exactly these inputs on the lane's class runs again, and its
-    record keeps no key (Main, 2026-11-01)."""
+    record keeps no key (Main, 2026-11-01), armada's word that its container is fresh notwithstanding."""
     url, stored, _ = cache_worker
+    monkeypatch.setenv("ARMADA_FRESH", "1")
     [name] = gpu_lane_at(tmp_path, monkeypatch, url, 1)
     interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
@@ -1941,6 +1945,98 @@ def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_run
     # Every group was looked up before the first ran.
     assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
         True, True, True]
+
+
+def slowed(url: str, seconds: float) -> str:
+    """The test cache at `url` behind a link that answers each request `seconds` late, as a slow network
+    does: a proxy at the cache's own HTTP boundary."""
+
+    class Late(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def forward(self, method: str) -> None:
+            time.sleep(seconds)
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0))) or None
+            request = urllib.request.Request(url + self.path, data=body, method=method, headers={
+                name: value for name, value in self.headers.items()
+                if name in ("Authorization", "User-Agent")})
+            try:
+                with urllib.request.urlopen(request) as answer:
+                    status, payload = answer.status, answer.read()
+            except urllib.error.HTTPError as refused:
+                status, payload = refused.code, b""
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            self.forward("GET")
+
+        def do_PUT(self):
+            self.forward("PUT")
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Late)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def test_a_kept_task_whose_lookups_spend_its_deadline_starts_no_file_and_returns_its_hits(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A kept task's lookups count against its deadline: where a slow cache spends it, the file it must run
+    whole starts not at all and is red as its deadline cut it off, while the kept group the cache held comes
+    back green (review: a whole file got the task's whole deadline afresh after the lookups)."""
+    url, _, _ = cache_worker
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    runs = "from pathlib import Path\ndef test_a():\n    Path('runs-a').write_text('x')\n"
+    passes = "".join(f"def test_{name}():\n    pass\n" for name in "cde")
+    written(tmp_path, {"test_a.py": runs, "test_c.py": passes})
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_c.py::test_{name}": 250.0 for name in "cde"}))
+    held = "tests/test_c.py#1/3"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={held}",
+                                      f"--out={verdict}", "--cache=on", "--deadline=600"])
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    assert ci.main() == 0
+    [green] = json.loads(verdict.read_text())["rows"]
+    assert green["exitCode"] == 0
+    common = ci.shared("3.12")
+    token = ci.recorded(ci.record_key("3.12", green["name"], ci.device_class(), common), "token")["key"]
+    assert token is not None, "a fresh container's green group keeps its key"
+    cached(monkeypatch, slowed(url, 1.5))
+    tests = f"tests/test_a.py@GenuineIntel-6-143:0000 {held}@GenuineIntel-6-143:{token}"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={tests}",
+                                      f"--out={verdict}", "--cache=on", "--deadline=2"])
+    ci.main()
+    rows = {row["name"]: row for row in json.loads(verdict.read_text())["rows"]}
+    assert not (tmp_path / "runs-a").exists(), rows
+    assert (rows["3.12:tests/test_a.py"]["exitCode"], rows["3.12:tests/test_a.py"]["kind"]) == (1, "deadline")
+    assert rows["3.12:tests/test_c.py#1/3"]["exitCode"] == 0
+
+
+def test_in_a_fresh_task_of_several_misses_only_the_first_row_run_keeps_its_key(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A fresh container's task whose whole file and two kept groups all miss runs the three, and only the
+    first row it runs keeps a key: the rows after it ran in a container a run had already changed (Main,
+    2026-11-01; review: no task mixed a whole file's miss with several groups')."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    passes = "".join(f"def test_{name}():\n    pass\n" for name in "cde")
+    written(tmp_path, {"test_a.py": "def test_a():\n    pass\n", "test_c.py": passes})
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_c.py::test_{name}": 250.0 for name in "cde"}))
+    at = "@GenuineIntel-6-143:0000"
+    tests = f"tests/test_a.py{at} tests/test_c.py#1/3{at} tests/test_c.py#2/3{at}"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={tests}",
+                                      f"--out={verdict}", "--cache=on", "--deadline=600"])
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    assert ci.main() == 0
+    rows = json.loads(verdict.read_text())["rows"]
+    assert [(row["name"], row["exitCode"]) for row in rows] == [
+        ("3.12:tests/test_a.py", 0), ("3.12:tests/test_c.py#1/3", 0), ("3.12:tests/test_c.py#2/3", 0)]
+    common = ci.shared("3.12")
+    keys = [ci.recorded(ci.record_key("3.12", row["name"], ci.device_class(), common), "token")["key"]
+            for row in rows]
+    assert [key is not None for key in keys] == [True, False, False]
 
 
 def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(
