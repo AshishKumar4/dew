@@ -1923,9 +1923,10 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
 
 def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_runs_none_past_it(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A kept task that must run a kept group whose green run it cannot read, past its deadline, reads and
-    runs no group after it: each is a red row its task's deadline cut off, and the task writes every row
-    (review: each later group was still read and run, a fresh grace and settle each, past the deadline)."""
+    """A kept task that must run a kept group whose green run it cannot read, past its deadline, runs no group
+    after it: each is a red row its task's deadline cut off, and the task writes every row (review: each later
+    group was still run, a fresh grace and settle each, past the deadline). Every group's green run is looked
+    up once, before any group runs, as a run may change what a later lookup reads."""
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     _, _, seen = cache_worker
     names = "cde"
@@ -1942,10 +1943,12 @@ def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_run
     rows = json.loads(verdict.read_text())["rows"]
     assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
         (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
-    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False]
-    # The groups past the deadline were never looked up.
+    outputs = [row["output"] for row in rows]
+    assert all("before this group was read or run" in output for output in outputs[1:]), outputs
+    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False], outputs
+    # Every group was looked up before the first ran.
     assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
-        True, False, False]
+        True, True, True]
 
 
 def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(
