@@ -82,3 +82,26 @@ def model(device: Device, bytes_per_element: int = 4) -> DagCostModel:
         return Seconds(0.0)
 
     return DagCostModel(marginal_cost=marginal, identity=Seconds(0.0))
+
+
+RISK = {"log": 1.0, "sub": 1e-3}
+"""What a node of the stable proposal (`stable`) costs beside its time: a logarithm whose value is rounded
+into what follows it, a difference that may cancel its operands' digits. A proposal, not a choice: dev time
+measures every candidate's error (`dew.algebra.error.choose`)."""
+
+
+def stable(device: Device, bytes_per_element: int = 4) -> DagCostModel:
+    """The program model (`model`) with each node of a rounding risk priced up (`RISK`), so its cheapest
+    forms are the ones the stable rules wrote: the candidate dev time proposes for its accuracy."""
+    timed = model(device, bytes_per_element)
+
+    def marginal(graph: EGraph, node) -> Seconds:
+        for constructor in (Term.unary, Term.binary):
+            if (args := get_callable_args(node, constructor)) is not None:
+                # Each operation's name follows its first operand.
+                name = get_literal_value(args[1])
+                risk = RISK.get(name if isinstance(name, str) else "", 0.0)
+                return Seconds(timed.marginal_cost(graph, node) + risk)
+        return timed.marginal_cost(graph, node)
+
+    return DagCostModel(marginal_cost=marginal, identity=Seconds(0.0))
