@@ -3,7 +3,8 @@ Mamba-2's state-space dual (a scalar decay, a rank-one input, a contraction read
 delta rule (a decayed, corrected state: the compact WY form) and Kimi's delta attention (its decay each key's
 own), each stated token by token, walked in chunks
 through its derived step and outputs (and Mamba-2's two walks merged), each held to the float64 truth
-(check 1) against the token-by-token scan; and updates no chunk form here holds, refused."""
+(check 1) against the token-by-token scan, with packed documents' resets too (`Scan.reset`), across which no
+gradient flows; and updates no chunk form here holds, refused."""
 
 import jax
 import jax.numpy as jnp
@@ -309,3 +310,117 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
 
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents,
                     f"{update_fn.__name__} adjoint", seeds=16)
+
+
+RESETTING = {
+    "ssd": (update, readout, OPERANDS, (STATE, WIDTH), draw, ("x", "dt", "B", "C"),
+            {"rate": RATE, "skip": SKIP}),
+    "gated_delta": (gated_delta, gated_readout, GATED, (KEY, VALUE), gated_draw, tuple(GATED), {}),
+    "kimi_delta": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw, tuple(GATED), {}),
+}
+"""Each rule a reset walk is derived for: its update and readout, operands, state, draw, token operands and
+constants."""
+
+
+def resets_of(seed) -> jax.Array:
+    """Each token a document's first with probability 1/6, and so the first token of the second chunk and two
+    consecutive tokens inside it: up to several resets a chunk, its partials' sum many times `RESET_DECAY`."""
+    first = np.random.default_rng(seed + 11).uniform(size=TOKENS) < 1 / 6
+    first[[CHUNK, CHUNK + 9, CHUNK + 10]] = True
+    return jnp.asarray(first)
+
+
+def resetting(rule: str):
+    """`rule`'s chunk forms with a reset operand (`first`), its token scan whose state each reset token zeroes
+    before its update, and each as a function of the resets and the token operands."""
+    update_fn, readout_fn, declared, shape, _, names, constants = RESETTING[rule]
+    operands = {**declared, "first": ("time",)}
+    forms = scan.derive_scan(scan.Scan(update_fn, readout_fn, operands, walked="time",
+                                       state=(shape, jnp.float32), reset="first"))
+
+    def values(first, tokens):
+        return {**dict(zip(names, tokens, strict=True)), **constants, "first": first}
+
+    def chunked(given, index):
+        return {name: value[index * CHUNK:(index + 1) * CHUNK] if operands[name][:1] == ("time",) else value
+                for name, value in given.items()}
+
+    def tokens_run(first, *tokens):
+        def one(h, token):
+            first_t, *xs = token
+            named = {**dict(zip(names, xs, strict=True)), **constants}
+            h = update_fn(jnp.where(first_t, jnp.zeros((), h.dtype), h), **named)
+            return h, readout_fn(h, **named)
+
+        final, outputs = jax.lax.scan(one, jnp.zeros(shape, tokens[0].dtype), (first, *tokens))
+        return outputs, final
+
+    return forms, values, chunked, tokens_run
+
+
+@pytest.mark.parametrize("rule", RESETTING)
+def test_a_reset_walk_in_chunks_computes_the_token_scan_of_each_document(rule):
+    """A walk whose resets (`Scan.reset`) fall on a chunk's first token, inside chunks and back to back, its
+    chunks through the derived step and outputs: on par with the token scan that zeroes the state at each,
+    outputs and final state, against the float64 truth (check 1). A chunk's exponents sum several resets, so
+    each decay within a document is a difference of two partials past `-3e4`: a plain prefix held it to about
+    `3e4 * 6e-8`, an error of 2e-3 in each decay."""
+    forms, values, chunked, tokens_run = resetting(rule)
+
+    def derived(first, *tokens):
+        given = values(first, tokens)
+        state, outputs = forms.init({}), []
+        for index in range(TOKENS // CHUNK):
+            chunk = chunked(given, index)
+            outputs.append(forms.mapped(chunk, state))
+            state = forms.step(state, chunk)
+        return jnp.concatenate(outputs), forms.finish(state, given)
+
+    assert_as_exact(jax.jit(derived), jax.jit(tokens_run),
+                    lambda seed: (resets_of(seed), *RESETTING[rule][4](seed)), f"{rule} reset walk", seeds=16)
+
+
+@pytest.mark.parametrize("rule", RESETTING)
+def test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient(rule):
+    """The chunk adjoint of a walk with resets as the forward test's (`resets_of`), walked back: each token
+    operand's gradient on par with the token scan's against the float64 truth (check 1)."""
+    forms, values, chunked, tokens_run = resetting(rule)
+    names = RESETTING[rule][5]
+    derived = adjoint(forms, chunked, TOKENS // CHUNK)
+    width = RESETTING[rule][3][1]
+
+    def draws(seed):
+        return (resets_of(seed), *RESETTING[rule][4](seed), *cotangents_of(seed, (TOKENS, width),
+                                                                           RESETTING[rule][3]))
+
+    def as_derived(first, *drawn):
+        *tokens, d_out, d_final = drawn
+        grads = derived(values(first, tokens), (d_out, d_final))
+        return tuple(grads[name] for name in names)
+
+    def as_tokens(first, *drawn):
+        *tokens, d_out, d_final = drawn
+        _, pullback = jax.vjp(lambda *xs: tokens_run(first, *xs), *tokens)
+        return pullback((d_out, d_final))
+
+    assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draws, f"{rule} reset adjoint", seeds=16)
+
+
+@pytest.mark.parametrize("rule", RESETTING)
+def test_no_gradient_crosses_a_reset(rule):
+    """A walk with one reset inside its second chunk, the loss reading only the outputs from it on and the
+    final state: the chunk adjoint gives every operand of every token before it, and the reset token's own
+    decay where it is an operand of its own (the delta rules' `g`; Mamba-2's `dt` writes its token too), a
+    gradient of exactly zero (every decay spanning it `exp(RESET_DECAY)`, 0 in fp32)."""
+    forms, values, chunked, _ = resetting(rule)
+    names, (rows, width) = RESETTING[rule][5], RESETTING[rule][3]
+    reset = CHUNK + 9
+    first = jnp.zeros(TOKENS, bool).at[reset].set(True)
+    d_out, d_final = cotangents_of(0, (TOKENS, width), (rows, width))
+    d_out = d_out.at[:reset].set(0.0)
+    run = jax.jit(adjoint(forms, chunked, TOKENS // CHUNK))
+    grads = run(values(first, RESETTING[rule][4](0)), (d_out, d_final))
+    for name in names:
+        assert not np.any(np.asarray(grads[name][:reset])), f"{rule}: {name}'s gradient crosses the reset"
+    if "g" in grads:
+        assert not np.any(np.asarray(grads["g"][reset])), f"{rule}: the reset token's own decay has a gradient"
