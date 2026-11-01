@@ -58,10 +58,12 @@ def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
 
 
 def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
-               marked: Callable[[Batch], Batch], interval: Interval, run: FitRun) -> Batch:
-    """`batch` sampled through `rollout`, its host preparation `marked` and placed on `mesh`
-    (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
-    (`FitRun.held`); without a rollout, the batch as it is.
+               marked: Callable[[Batch], Batch], interval: Interval, run: FitRun, *,
+               view: Callable[[TrainState], TrainState]) -> Batch:
+    """`batch` sampled through `rollout` from `state` as a model outside the mesh reads it (`view`,
+    `StageLocal.outside`), its host preparation `marked` and placed on `mesh` (`shard_batch`), its
+    seconds counted in `interval`, `run`'s stream placing nothing meanwhile (`FitRun.held`); without a
+    rollout, the batch as it is, the view never read.
 
     Host-side and untraceable: sampling, scoring, advantages. The key folds the
     step key once more, keeping the rollout's draws off the step's stream; both
@@ -76,7 +78,7 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
     further = {"further": run.further(interval)} if _draws_further(rollout) else {}
     with run.held():
-        batch = shard_batch(mesh, marked(rollout(state, batch, key, **further)))
+        batch = shard_batch(mesh, marked(rollout(view(state), batch, key, **further)))
     interval.rollout_seconds += time.perf_counter() - began
     return batch
 

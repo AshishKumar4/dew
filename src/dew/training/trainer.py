@@ -99,7 +99,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import held_rates, scaled_rates, settable_rates, with_rates
+from dew.optim import OPTIMIZER_MAP, held_rates, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -491,24 +491,27 @@ class Trainer(Generic[Loss, Effects]):
 
     def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
         """The optimizer's state of `params`, Muon's grouping reading the axes modules boxed on
-        them in `initialized`, each rule a stage-local run's leaves as its layers (`StageLocal.refused`)."""
+        them in `initialized`, each rule a stage-local run's leaves as its layers (`StageLocal.held`)."""
         with self.staging.held(boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules))):
-            return self.staging.refused(self.optimizer.init(params))
+            return self.optimizer.init(params)
 
     @functools.cached_property
     def staging(self) -> StageLocal:
         """Where the state keeps each pipelined run stacked by stage (`dew.training.stages`), as the objective
-        declares it over its tree; a CPU-owned state, which streams its stack's banks, keeps none."""
+        declares it over its tree; a CPU-owned state, which streams its stack's banks, keeps none, nor a
+        DiLoCo run, whose groups' inner copies stack on an axis of their own. Dew's own optimizers step a
+        stacked run as its layers; an import path's is read as a transform given (`StageLocal.of`)."""
         tree = {} if self.host_master else jax.eval_shape(self.objective.initializer, jax.random.key(0))
-        return StageLocal.of(self.objective, tree, self.device_mesh, built=self._config is not None,
-                             local=self.layout.stage_local)
+        built = self._config is not None and self._config.optimizer in OPTIMIZER_MAP
+        return StageLocal.of(self.objective, tree, self.device_mesh, local=self.layout.stage_local
+                             and self.diloco is None, optimizer=None if built else self.optimizer)
 
     def _groups(self, state: TrainState) -> dict[str, str] | None:
         """Where the optimizer's split sent each parameter (`OptimConfig.groups`), read under the axes the
         modules boxed, as `_boxed_init` initialized its state; None for an optimizer given built."""
         if self._config is None:
             return None
-        with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+        with self.staging.held(boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))):
             return self._config.groups(state.variables["params"])
 
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -1468,8 +1471,8 @@ class Trainer(Generic[Loss, Effects]):
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
                 batch, ahead = run.closing(interval, batch, self._examples)
-                batch = rolled_out(self.rollout, self.staging.outside(state), batch, self.device_mesh,
-                                   self._marked, interval, run)
+                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval, run,
+                                   view=self.staging.outside)
                 device, _ = split_fields(batch)
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
@@ -1595,7 +1598,7 @@ class Trainer(Generic[Loss, Effects]):
             # run reads its data afresh: a clock of examples starts at none consumed, a run on another clock
             # keeps none, and its schedules take the run's own form (`reclocked`).
             initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
-            with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+            with self.staging.held(boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))):
                 initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
                                  self._examples)
             supplied, shardings = self.staging.supplied(initial, lambda staged: self._validated(staged)[0])
@@ -1918,8 +1921,8 @@ class Trainer(Generic[Loss, Effects]):
                                         phase="cooldown read")
                     if batch is None:
                         break
-                    batch = rolled_out(self.rollout, self.staging.outside(cooled), batch, self.device_mesh,
-                                       self._marked, counted, branched)
+                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
+                                       branched, view=self.staging.outside)
                     device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)

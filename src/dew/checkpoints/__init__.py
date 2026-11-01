@@ -397,16 +397,12 @@ def _host_marks(leaf: np.ndarray, chunk: int = 1 << 24) -> np.ndarray:
 
 
 def _digest(tree) -> str:
-    """The SHA-256 of `tree`'s paths, shapes, dtypes and each leaf's marks
-    (`_marks`), taken of the bytes as stored, whatever dtypes JAX allows now.
-
-    The device leaves are marked in one call for each set of devices they sit on
-    (a stage-local run's rows sit on their own stage's, `dew.training.stages`).
-    A host array is marked on the host, so a float64 leaf restored with x64 off
-    has the digest it was saved with. A device leaf in host memory is marked on
-    the devices one leaf at a time, so no more than one is copied off the host
-    at once.
-    """
+    """The SHA-256 of `tree`'s paths, shapes, dtypes and each leaf's marks (`_marks`), taken of the bytes as
+    stored, whatever dtypes JAX allows now. The device leaves are marked in one call a set of devices they
+    sit on (a stage-local run's rows sit on their own stage's, `dew.training.stages`). A host array is
+    marked on the host, so a float64 leaf restored with x64 off has the digest it was saved with. A device
+    leaf in host memory is marked on the devices one leaf at a time, so no more than one is copied off the
+    host at once."""
     flat = jax.tree_util.tree_flatten_with_path(tree)[0]
     on_device: dict[frozenset, list[int]] = {}
     for index, (_, leaf) in enumerate(flat):

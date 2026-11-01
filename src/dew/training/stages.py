@@ -24,8 +24,9 @@ Invariants:
   reads it as the stored layers it stacks (`dew.nn.sharding.stacked_layers`): Dew's
   weight-decay mask, Muon's matrix axes, a param group's patterns, int8 moments' size threshold,
   LAMB's trust ratio and QK-Clip's per-layer maxima each give what they give unstacked. An optax
-  transformation given as it is runs over the stacked leaf, so one whose state names a transform Dew
-  does not know to act a number at a time is refused by name (`StageLocal.refused`); a stateless one
+  transformation given as it is runs over the stacked leaf, so where its state names a transform Dew
+  does not know to act a number at a time, the run keeps every layer whole on every stage, the
+  replicated layout's memory, which trains it exactly (`StageLocal.of`); a stateless one
   (`optax.EmptyState`) that reduces over a whole leaf cannot be told apart, and the docs say so.
 
 Rejected: the stage axis as one more axis the state splits over, as fsdp splits it, which keeps each
@@ -39,12 +40,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import logging
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, overload
 
 import jax
 import numpy as np
+import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.inference.banks import in_namespace
@@ -61,6 +64,8 @@ if TYPE_CHECKING:
     from dew.nn.protocols import ProjectionGroup
     from dew.nn.sharding import Schedule
     from dew.state import TrainState
+
+_log = logging.getLogger(__name__)
 
 
 def _walked(tree, sites: Sequence[DecoderBank], convert: Callable[[DecoderBank, str, Mapping], Mapping],
@@ -84,11 +89,9 @@ def _walked(tree, sites: Sequence[DecoderBank], convert: Callable[[DecoderBank, 
                                  for where, child in children])
 
 
-def _key(where: tuple) -> str:
-    """The name of a mapping's child from its one-step key path (`jax.tree_util.DictKey`'s key, or a
-    record's field)."""
-    (step,) = where
-    return str(getattr(step, "key", getattr(step, "name", step)))
+def _key(where: jax.tree_util.KeyPath) -> str:
+    """The name of a mapping's child from its one-step key path: a dict's key, or a record's field."""
+    return jax.tree_util.keystr(where, simple=True)
 
 
 def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
@@ -113,23 +116,31 @@ class StageLocal:
 
     sites: tuple[DecoderBank, ...]
     mesh: Mesh
-    built: bool = True
-    """Whether the run's optimizer is Dew's (`OptimConfig`), whose rules read a stacked leaf as its
-    layers, rather than an optax transformation given as it is (`refused`)."""
 
     @classmethod
-    def of(cls, objective, variables, mesh: Mesh, *, built: bool, local: bool = True) -> StageLocal:
+    def of(cls, objective, variables, mesh: Mesh, *, local: bool = True,
+           optimizer: optax.GradientTransformation | None = None) -> StageLocal:
         """How a trainer over `mesh` keeps `objective`'s pipelined runs, from `variables` (their shapes
-        or the arrays), its optimizer Dew's where `built`: no run where the mesh has no stage axis, the
-        objective declares none (`Objective.stage_sites`) or the layout keeps every layer whole on every
-        stage (not `local`, `Layout.stage_local`)."""
+        or the arrays): no run where the mesh has no stage axis, the objective declares none
+        (`Objective.stage_sites`), the layout keeps every layer whole on every stage (not `local`,
+        `Layout.stage_local`), or `optimizer`, a transformation Dew does not build, holds a transform
+        that may read a parameter whole (`whole_reading`): no per-layer view of a transform whose
+        reductions only its own code knows is exact short of each layer a leaf of its own, which one
+        program holds on every stage alone, so the run keeps every layer whole on every stage, as
+        `Layout(stage_local=False)` does. Dew's own optimizers read a stacked leaf as its layers."""
         stages = mesh.shape.get(STAGE_AXIS, 1)
         shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype), variables)
-        declared = objective.stage_sites(shapes, stages) if local and stages > 1 and variables else ()
+        whole = whole_reading(optimizer, shapes.get("params", {})) if local and stages > 1 else ()
+        if whole:
+            _log.info("the optimizer holds %s, transforms that may read a parameter whole, so each pipelined "
+                      "run keeps every layer whole on every stage, without stage-local storage's 1/%d of "
+                      "the run a device", whole, stages)
+        declared = (objective.stage_sites(shapes, stages) if local and stages > 1 and variables and not whole
+                    else ())
         # A run a collection holds in part (a stack frozen by layer index) stays on its stored layers in
         # every collection, which the pipeline restacks as it would any stored layers.
         return cls(tuple(site for site in declared if not any(
-            site.view.splits(tree) for tree in in_namespace(shapes, site.namespace).values())), mesh, built)
+            site.view.splits(tree) for tree in in_namespace(shapes, site.namespace).values())), mesh)
 
     @property
     def stages(self) -> int:
@@ -158,10 +169,11 @@ class StageLocal:
 
     @overload
     @staticmethod
-    def state(state: Mapping[str, object], convert: Callable) -> dict[str, object]: ...
+    def state(state: Mapping[str, object], convert: Callable) -> Mapping[str, object]: ...
 
     @staticmethod
-    def state(state: TrainState | Mapping[str, object], convert: Callable) -> TrainState | dict[str, object]:
+    def state(state: TrainState | Mapping[str, object], convert: Callable
+              ) -> TrainState | Mapping[str, object]:
         """`state` (a `TrainState`, its shapes, its placement, or a mapping of some of its fields) with
         `convert` applied to every field that holds or mirrors the variables: the variables, the
         optimizer state, the EMA, the narrow copies and the accumulated gradient."""
@@ -228,7 +240,6 @@ class StageLocal:
                  ) -> tuple[TrainState, TrainState]:
         """A state given whole, its runs stacked by stage onto the placement `validated` gives the
         stacked state's shapes, and that placement."""
-        self.refused(state.opt_state)
         stack = functools.partial(self.state, convert=self.staged)
         placement = validated(jax.eval_shape(stack, state))
         return (jax.jit(stack, out_shardings=placement)(state) if self.sites
@@ -242,12 +253,12 @@ class StageLocal:
     @overload
     def restore(self, checkpoints: Checkpoints, template: Mapping[str, object], step: int | str | None,
                 share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()
-                ) -> tuple[dict[str, object], bytes | None]: ...
+                ) -> tuple[Mapping[str, object], bytes | None]: ...
 
     def restore(self, checkpoints: Checkpoints, template: TrainState | Mapping[str, object],
                 step: int | str | None, share: DataPartition | None = None,
                 served: Sequence[ProjectionGroup] = ()
-                ) -> tuple[TrainState | dict[str, object], bytes | None]:
+                ) -> tuple[TrainState | Mapping[str, object], bytes | None]:
         """`checkpoints.restore` of `template`, a state or some of its fields, each stacked run's
         layers read onto their own stage's devices (`checkpointed`) and stacked there (`restored`);
         `served` as the checkpoints read it."""
@@ -331,22 +342,6 @@ class StageLocal:
         placement = self.rows_placement(jax.tree.map(lambda leaf: leaf.sharding, variables))
         return program(_layered_arrays, static_argnums=0, out_shardings=placement)(self, variables)
 
-    def refused(self, opt_state):
-        """`opt_state`, once its transforms are known to step a stacked run as its layers: a Dew-built
-        optimizer's (`built`) always are; an optax transformation given as it is is refused where its
-        state names a transform outside `dew.optim.STACKED_STATES`."""
-        if self.sites and not self.built:
-            kinds = {type(node) for node in _states(opt_state)}
-            unknown = sorted(kind.__name__ for kind in kinds - STACKED_STATES)
-            if unknown:
-                raise LayoutRefused(
-                    f"the optimizer's state holds {unknown}, transforms that may read a parameter whole, "
-                    f"and a stage axis holds each pipelined run's layers stacked in one; build the "
-                    f"optimizer from an OptimConfig, whose rules read a stacked parameter as its layers, "
-                    f"or from transforms that act a number at a time, or keep every layer whole on every "
-                    f"stage (Layout(stage_local=False)), which trains the same steps")
-        return opt_state
-
 
 _MIRRORS = ("variables", "opt_state", "ema", "compute")
 """The train-state fields that hold or mirror the variables, which a stage-local state stacks alike."""
@@ -364,6 +359,15 @@ def _stacked_piece(rows: list[jax.Array], *, within: tuple[int, ...]) -> jax.Arr
 
 def _layered_arrays(local: StageLocal, tree):
     return local.layered(tree)
+
+
+def whole_reading(optimizer: optax.GradientTransformation | None, params) -> list[str]:
+    """The kinds of transform `optimizer`'s state over `params` (their shapes) holds outside
+    `dew.optim.STACKED_STATES`, each of which may read a parameter whole; none for Dew's own (None)."""
+    if optimizer is None or not params:
+        return []
+    kinds = {type(node) for node in _states(jax.eval_shape(optimizer.init, params))}
+    return sorted(kind.__name__ for kind in kinds - STACKED_STATES)
 
 
 def _states(node) -> list:
