@@ -23,7 +23,6 @@ from dew.nn.kernels.templates import (
     bundles,
     layout,
     mosaic,
-    mosaic_sm80,
     mosaic_sm90,
     resources,
 )
@@ -43,10 +42,11 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name, mosaic_sm80.Mma.name})
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`), and mma.sync's (an A100's: row 2078, check 1 held there,
-ET-2078-A100CHECK3; every launch it derives compiled spill-free, the resource gate's sm80 cases)."""
+feed their own rings (`mosaic_sm90.FED`). mma.sync's (an A100's) joins once every launch it derives
+compiles spill-free (the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
+ET-2078-A100CHECK3)."""
 
 
 def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
