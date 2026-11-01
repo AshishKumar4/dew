@@ -784,7 +784,7 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
     objective's step that makes 24 rows of them (`Questioned`): the corpus's rows (data/rows) are its 12
     source examples, counted before the step makes rows of them, and not its rows again after (row 1944)."""
     ids = np.arange(1, 13, dtype=np.int32)
-    chain = Pipeline(Memory({"id": ids}, shard_rows=4).named("asked"))
+    chain = Memory({"id": ids}, shard_rows=4).named("asked")
     chain = chain.shuffle(seed=3, window=12) if read == "streamed" else chain.shuffle(seed=3)
     data = compile(chain.batch(2), objective=ObjectiveData(train=(Questioned(),)), read=read, loading=READ,
                    examples=12)
