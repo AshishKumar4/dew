@@ -11,14 +11,11 @@ import sys
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
-import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec
 
-from dew.nn.kernels import options
-from dew.training import communicators
-from dew.training.communicators import Collectives, CommunicatorRoom, Needs
+from dew import communicators
+from dew.communicators import Collectives, CommunicatorRoom, Needs
+from dew.devices import pool_bound
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30
@@ -35,14 +32,6 @@ all-to-all's connections to every peer, and a permute's to every peer."""
 
 MEMORY = {0: (79 * GIB, 80 * GIB), 1: (76 * GIB, 80 * GIB)}
 """Each GPU's free and total bytes before the backend opens: 79 and 76 of 80 GiB free."""
-
-
-@pytest.fixture
-def unsized(monkeypatch):
-    """The module's sized pool and resident communicators, put back as they were after the test."""
-    monkeypatch.setattr(communicators, "NEEDS", None)
-    monkeypatch.setattr(communicators, "SIZED", None)
-    monkeypatch.setattr(communicators, "RESIDENT", communicators.Resident())
 
 
 def test_the_pool_takes_at_most_the_runs_share_and_leaves_the_communicators_room():
@@ -75,8 +64,8 @@ def test_one_owner_reads_the_pools_bound_from_how_the_run_named_it(named, bound,
         monkeypatch.delenv(name, raising=False)
     for name, value in named.items():
         monkeypatch.setenv(name, value)
-    assert communicators.pool_bound(cuda=True) == bound
-    assert communicators.pool_bound(cuda=False) is None
+    assert pool_bound(cuda=True) == bound
+    assert pool_bound(cuda=False) is None
 
 
 def test_a_programs_communicators_are_charged_by_their_groups_exchanges_and_peers():
@@ -132,32 +121,52 @@ def test_a_processs_communicators_are_held_together_to_the_room_dew_left_outside
     assert resident.held == Collectives(groups=frozenset({every, (0, 1), (2, 3)}))
 
 
-def test_every_program_dew_compiles_is_admitted_where_it_sized_the_pool(unsized, monkeypatch):
-    """A program compiled through Dew's one compile point (`dew.nn.kernels.templates.report.compiled`, which
-    every outer program, step and evaluation passes) is admitted against the room Dew left; a pool it never
-    sized admits nothing."""
-    mesh = Mesh(np.array(jax.devices()[:2]), ("pair",))
-    summed = jax.shard_map(lambda part: jax.lax.psum(part, "pair"), mesh=mesh,
-                           in_specs=PartitionSpec("pair"), out_specs=PartitionSpec())
-    ids = tuple(communicators.ordinal(device) for device in mesh.devices.flat)
-    tight = Needs(collective={2: GIB}, exchanged={}, permuted={}, runtime=dict.fromkeys(ids, 0), seconds=1.0)
+ADMITTED = """
+import jax, jax.numpy as jnp, numpy as np
+from jax.sharding import Mesh, PartitionSpec
+from dew import communicators
+from dew.communicators import CommunicatorRoom, Needs, Sizing
+from dew.nn.kernels import options
+
+mesh = Mesh(np.array(jax.devices()[:2]), ("pair",))
+summed = jax.shard_map(lambda part: jax.lax.psum(part, "pair"), mesh=mesh, in_specs=PartitionSpec("pair"),
+                       out_specs=PartitionSpec())
+ids = [communicators.ordinal(device) for device in mesh.devices.flat]
+options.program(summed).compiled(jnp.ones(4))
+tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, runtime=dict.fromkeys(ids, 0), seconds=1.0)
+communicators.hold(Sizing(tight, 0.95, 0.9, dict.fromkeys(ids, 2**30), dict.fromkeys(ids, 2**29)))
+try:
     options.program(summed).compiled(jnp.ones(4))
-    monkeypatch.setattr(communicators, "NEEDS", tight)
-    monkeypatch.setattr(communicators, "SIZED", {"room": dict.fromkeys(ids, GIB // 2)})
-    with pytest.raises(CommunicatorRoom):
-        options.program(summed).compiled(jnp.ones(4))
+except CommunicatorRoom as refused:
+    print(sorted(refused.needed.values()))
+"""
+"""A fresh process of two CPU devices compiling one all-reduce through `options.program`, then holding a
+sizing that left too little room for its communicator and compiling it again."""
 
 
-def test_the_sized_pool_is_recorded_with_what_it_left_room_for(unsized, monkeypatch):
-    """A pool Dew sized is recorded as the run's bound, the share it took and each GPU's room it left, which
-    the fit check's record carries into the run record."""
+def test_every_program_dew_compiles_is_admitted_where_it_sized_the_pool():
+    """A program compiled through Dew's one compile point (`dew.nn.kernels.templates.report.compiled`, which
+    every outer program, step and evaluation passes) is admitted against the room the process's sizing left,
+    refused before it runs where its communicator needs more, naming the bytes; a process that holds no
+    sizing admits every program."""
+    done = subprocess.run([sys.executable, "-c", ADMITTED], capture_output=True, text=True, check=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE),
+                               "XLA_FLAGS": "--xla_force_host_platform_device_count=2"})
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == [GIB, GIB]
+
+
+def test_the_sized_pool_is_recorded_with_what_it_left_room_for(monkeypatch):
+    """A pool Dew sized states the run's bound, the share it took, each GPU's bytes its communicators need
+    and the room it left them, which the fit check's record carries into the run record; the pool's share
+    goes to XLA through the environment."""
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.97")
     monkeypatch.delenv("XLA_PYTHON_CLIENT_PREALLOCATE", raising=False)
-    communicators.sized_pool(measure=lambda: NEEDS, memories=lambda: MEMORY, cuda=True, opened=False)
-    sized = communicators.SIZED
-    assert sized is not None and sized["bound"] == 0.97
-    assert float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) == sized["share"] < 0.97
-    assert sized["needed"] == NEEDS.needed(EVERY, MEMORY, runtime=True)
+    sized = communicators.sized_pool(measure=lambda: NEEDS, memories=lambda: MEMORY, cuda=True, opened=False)
+    assert sized is not None and sized.bound == 0.97
+    assert float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) == sized.share < 0.97
+    assert sized.needed == NEEDS.needed(EVERY, MEMORY, runtime=True)
+    assert sized.room == {gpu: free - int(sized.share * total) for gpu, (free, total) in MEMORY.items()}
+    assert sized.record()["room"] == {str(gpu): room for gpu, room in sized.room.items()}
 
 
 def test_a_measurement_is_paid_once_per_configuration(tmp_path, monkeypatch):
@@ -191,7 +200,7 @@ def test_a_configuration_names_the_xla_nccl_flags_the_build_and_the_gpus_places(
     monkeypatch.setenv("NCCL_NVLS_ENABLE", "0")
     configured = communicators.configuration()
     assert configured["xla_nccl"] == ["--xla_gpu_nccl_collective_max_nchannels=4"]
-    assert configured["nccl_env"] == {"NCCL_NVLS_ENABLE": "0"}
+    assert configured["nccl_env"]["NCCL_NVLS_ENABLE"] == "0"
     assert configured["jax"] == jax.__version__
 
 
