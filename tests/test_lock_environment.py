@@ -28,7 +28,8 @@ def test_every_package_dews_index_serves_resolves_undated(tmp_path, monkeypatch)
     (site / "index.html").write_text('<!DOCTYPE html>\n<html><body><h1>Simple index</h1>\n'
                                      '<a href="jax/">jax</a><br>\n<a href="qwix/">qwix</a><br>\n'
                                      '<a href="newfork/">newfork</a><br>\n'
-                                     '<a href="jax-cuda12-plugin/">jax-cuda12-plugin</a><br>\n</body></html>\n')
+                                     '<a href="jax-cuda12-plugin/">jax-cuda12-plugin</a><br>\n'
+                                     '</body></html>\n')
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path / "site"))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -55,7 +56,7 @@ def test_every_package_dews_index_serves_resolves_undated(tmp_path, monkeypatch)
     calls = (tmp_path / "calls").read_text().splitlines()
     assert calls and all(f"--exclude-newer-package {name}=false" in call
                          for call in calls for name in ("jax", "qwix", "newfork", "jax-cuda12-plugin")), calls
-    # A package the index serves takes no date of a dated list either: both flags at once filtered every version
-    # of the CUDA plugin the index took (2026-10-31, ledger 3116: every lane's lock check failed).
+    # A package the index serves takes no date of a dated list either: both flags at once filtered every
+    # version of the CUDA plugin the index took (2026-10-31, ledger 3116: every lane's lock check failed).
     assert not any("--exclude-newer-package jax-cuda12-plugin=20" in call for call in calls), calls
     assert all("--exclude-newer-package jax-cuda13-plugin=20" in call for call in calls), calls
