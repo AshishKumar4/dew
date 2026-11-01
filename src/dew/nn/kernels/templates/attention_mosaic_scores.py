@@ -119,7 +119,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
                                                      functools.partial(scores, masked=True))
     else:
         exponentials, weights, cotangents = scores(masked=masked)
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+    part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
+                                                         accurate=False))
     return algebra.value_weights(exponentials, weights, do_slot.dtype), part
 
 

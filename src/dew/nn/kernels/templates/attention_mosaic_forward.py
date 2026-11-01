@@ -64,6 +64,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     approximate,
     bundle_of,
     extents,
+    issued_into,
     reducing,
     refused,
     score_places,
@@ -567,7 +568,7 @@ def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
     after its factor where the step gives one (`Family.rescaled_products`)."""
     def accumulate(acc, scale, parts, value):
         if scale is None:
-            return family.register_products(acc, parts, value, interpret)
+            return issued_into(family, acc, parts, value, interpret)
         return family.rescaled_products(acc, scale, parts, value, interpret)
 
     return accumulate

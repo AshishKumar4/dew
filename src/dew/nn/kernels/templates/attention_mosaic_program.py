@@ -18,7 +18,14 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    bundles,
+    layout,
+    mosaic,
+    mosaic_sm90,
+    operands,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -168,6 +175,21 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
     return whole(power_of_two(width), family.column_unit(dtype))
 
 
+class _Issuing(NamedTuple):
+    """What an `operands.Issuer` reads of a launch: its family and whether it interprets."""
+
+    family: mosaic.Family
+    interpret: bool
+
+
+def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
+    """`acc` with each of `parts`' products with `rhs` issued into it in place (`operands.Issuer`'s carried
+    accumulator), each part's left operand in registers and formed as it is taken
+    (`algebra.formed_parts`)."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1})
+    return issuer.summed((("part", part, rhs) for part in parts), into=acc)
+
+
 def _block(config: Tiles | BackwardTiles) -> int:
     """The block a launch at `config` pads a call's queries and keys to: whole programs of query blocks and
     key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs)."""
@@ -185,8 +207,7 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 def _parts(accurate: bool, dtype) -> int:
     """The parts a backward tile's score cotangents take to their products in the form `accurate` names
     (`algebra.cotangent_parts`: one in the fast form's bf16, three in the accurate form's)."""
-    tile = jax.ShapeDtypeStruct((1, 1), jnp.float32)
-    return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
+    return len(algebra.cotangent_parts(jnp.zeros((1, 1), jnp.float32), dtype, accurate=accurate))
 
 
 DROPPING = Refusal('dropout_places',

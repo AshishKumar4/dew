@@ -21,6 +21,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    issued_into,
     reducing,
     stated,
 )
@@ -135,18 +136,19 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
-    dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
+    dv_acc = issued_into(family, dv_acc, (narrowed,), do_columns, walk.interpret)
     if add_dq is None:
         # Each part formed as its product is issued (`algebra.formed_parts`).
         parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
-        dk_acc = family.register_products(dk_acc, parts, q_columns, walk.interpret)
+        dk_acc = issued_into(family, dk_acc, parts, q_columns, walk.interpret)
     else:
         # The fused launch's (the fast form's one part): dK's left operand from the registers, and staged,
         # its transpose dQ's (`algebra.cotangent_product`'s `a @ b`), the tile's dQ added into dQ, the
         # query tile's other key blocks adding theirs; a consumer's share of a 128-query slot is 64 rows,
         # warpgroup MMA's least (`MosaicBackward.legal`).
-        ((part_tile, _),) = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=False)
-        dk_acc = family.register_products(dk_acc, ((part_tile, None),), q_columns, walk.interpret)
+        part_tile = mosaic.unscaled_part(*algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype,
+                                                                  accurate=False))
+        dk_acc = issued_into(family, dk_acc, (part_tile,), q_columns, walk.interpret)
         staged_part, dq_stage = add_dq
         family.staged(part_tile, staged_part)
         dq_stage(q_first, family.product(staged_part.transpose((1, 0)), k_smem, (count, k_smem.shape[-1])))

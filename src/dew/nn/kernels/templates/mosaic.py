@@ -1842,12 +1842,13 @@ def summed_across(value, scratch: dict, wg, consumers: int, store: Callable) -> 
 
 
 def unscaled(parts) -> None:
-    """A product's parts issued in place take no power of two back (bf16's, `cotangent_parts`)."""
-    if any(exponent is not None for _, exponent in parts):
+    """A product's parts issued in place take no power of two back (bf16's, `cotangent_parts`): none a
+    `product.Scaled`."""
+    if any(isinstance(part, product.Scaled) for part in parts):
         raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
 
 
-def unscaled_part(part: tuple) -> jax.Array:
+def unscaled_part(part) -> jax.Array:
     """`unscaled` of one part taken as it is formed: its operand."""
     unscaled((part,))
-    return part[0]
+    return part
