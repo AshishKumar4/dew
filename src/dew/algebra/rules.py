@@ -80,14 +80,23 @@ def _facts() -> Ruleset:
 def _linear() -> Ruleset:
     """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
     distributivity over operands of one shape, a product's bilinearity (two products sharing an operand, one
-    product of the summed others), each over arithmetic in its operands' dtype (`plain`), and a
+    product of the summed others, and a scalar scale of the product on either operand instead), each over
+    arithmetic in its operands' dtype (`plain`), and a
     value a broadcast lays along every axis but a sum's
     taken out of the sum where the other factor has the product's shape (the broadcast's extent along the axis
     the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
     x, y, a = vars_("x y a", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
+    scalar = Vec[i64].empty()
     return ruleset(
+        # A contraction scaled by a scalar: the scale on either operand, the product linear in each.
+        rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
+            x.binary("mul", a, multiplied).dot(y, params), eq(shape(a)).to(scalar), plain(params),
+            plain(multiplied)),
+        rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
+            x.dot(y.binary("mul", a, multiplied), params), eq(shape(a)).to(scalar), plain(params),
+            plain(multiplied)),
         rewrite(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)).to(
             x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y)), plain(added)),
         rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
@@ -130,10 +139,11 @@ register(Rules("identities", "exact", _identities(), receipt="docs/design/algebr
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
 
 
-HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"})}
+HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
+         "mul": frozenset({"dot_general"})}
 """What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
-products or two contractions of one kind (`linear`), or a reduction of a product. Commutativity alone
-(`identities`) leaves every price as it was."""
+products or two contractions of one kind (`linear`), a reduction of a product, or a contraction scaled.
+Commutativity alone (`identities`) leaves every price as it was."""
 
 
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
