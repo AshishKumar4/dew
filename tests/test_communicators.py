@@ -187,6 +187,20 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
+def test_a_programs_communicators_kept_in_an_earlier_form_are_read_again(tmp_path, monkeypatch):
+    """A program's communicators kept by an earlier Dew, whose reading of a program's text may differ, are
+    not taken as this one's: the program's text is read again."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    earlier = tmp_path / "dew" / "communicators" / "programs" / f"{b'step'.hex()}.json"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_text(json.dumps(Collectives(groups=frozenset({(0, 1, 2, 3)})).to_json()))
+    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+               "  %x = f32[8] parameter(0)\n"
+               "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+    assert communicators.collectives_kept(b"step", (0, 1, 2, 3), lambda: program) == Collectives(
+        groups=frozenset({(0, 1), (2, 3)}))
+
+
 def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeypatch):
     """A program's communicators are read from its text once per executable, kept in Dew's cache by its
     fingerprint as positions in its device assignment, so a warm start that loads it from the compilation
