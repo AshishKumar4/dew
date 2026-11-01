@@ -27,7 +27,9 @@ def examples_clock(args) -> dict:
     each; `shards`, physical shards of SHARD_ROWS rows and a last short one, each share its own, the
     objective making rows likewise. Its mesh puts `--tensor` processes on each share; `--pause` pauses it
     there (`Pause`) and resumes it; `--cooldown` branches it to a cooldown from the step before the first
-    share's stream ends to the step the last one's does, across the steps they end apart at. Reports the
+    share's stream ends to the step the last one's does, across the steps they end apart at; `--further`
+    steps it through a rollout that draws a batch past each step's and steps the step's (`Rollout`'s
+    `draws_further`), the drawn batch's examples consumed with it. Reports the
     step it ends at, the examples its state consumed, the examples each log read, each id's examples its
     steps trained on (each step's real rows by id over the rows each example makes, the objective's aux,
     which the pool's first process logs), each id's examples the pool's shares read apart (every share's
@@ -65,6 +67,13 @@ def examples_clock(args) -> dict:
         def data(self):
             return ObjectiveData(train=(Questioned(),)) if expands else ObjectiveData()
 
+    class DrawingFurther:
+        draws_further = True
+
+        def __call__(self, state, batch, key, further):
+            further()
+            return batch
+
     class Logged:
         def __init__(self):
             self.scalars: list[dict] = []
@@ -85,7 +94,8 @@ def examples_clock(args) -> dict:
     optim = OptimConfig(optimizer="optax:sgd", learning_rate=Linear(peak_value=1e-2, end_value=0.0))
     checkpoints = Checkpoints(str(args.out.parent / "run")) if args.pause else None
     trainer = Trainer(Pulled(), optim, key=jax.random.key(0), mesh=MeshSpec(tensor=args.tensor),
-                      tracker=tracker, checkpoints=checkpoints)
+                      tracker=tracker, checkpoints=checkpoints,
+                      rollout=DrawingFurther() if args.further else None)
     # The examples each share's stream deals it and the batches it reads, read as the run's loader reads
     # them, apart from the run.
     loader, _ = fitted(chain, None, objective=Pulled().data(), examples=args.examples)
@@ -133,6 +143,7 @@ def main(argv=None) -> None:
     parser.add_argument("--tensor", type=int, default=1)
     parser.add_argument("--pause", type=float, default=0.0)
     parser.add_argument("--cooldown", action="store_true")
+    parser.add_argument("--further", action="store_true")
     serve_mode(MODES, parser.parse_args(argv))
 
 
