@@ -292,11 +292,11 @@ def test_a_deep_release_verifies_at_its_probes_cut_depth_as_at_its_own():
     probe's widths, and verifies as Qwen2's convention there as at full depth: the probe holds the
     candidate's logits to the float64 truth on par with the source's (`verify.logits_parity`), which
     rounding meets at any depth and width, where a fixed rounding per layer measured on narrow fixtures
-    refused it at two layers."""
-    from dew.interop.verify import VerifiedMapping, verify_mapping
+    refused it at two layers. The load's route reads it so (`source_route`), before any weight downloads."""
+    from dew.interop.pretrained import VerifiedRoute, source_route
 
-    verified = verify_mapping(SEED_OSS)
-    assert isinstance(verified, VerifiedMapping) and verified.family == "qwen2"
+    route = source_route(SEED_OSS)
+    assert isinstance(route, VerifiedRoute) and route.verified.family == "qwen2"
 
 
 def test_a_probe_keeps_the_depth_of_code_not_transformers_own():
