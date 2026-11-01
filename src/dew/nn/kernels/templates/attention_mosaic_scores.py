@@ -22,9 +22,10 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 
 def split_queries(family: mosaic.Family) -> bool:
     """Whether the dK/dV program's consumers share one key block and split each slot's queries between them:
-    on a layout whose consumers feed their own rings (`mosaic.ConsumerFed`), each consumer's step its share
-    of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own keys."""
-    return isinstance(family, mosaic.ConsumerFed)
+    on a layout whose consumers feed their own rings (`Transport.feeds_itself`), each consumer's step its
+    share of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own
+    keys."""
+    return family.feeds_itself
 
 @dataclasses.dataclass(frozen=True)
 class _Backward:
@@ -119,7 +120,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
                                                      functools.partial(scores, masked=True))
     else:
         exponentials, weights, cotangents = scores(masked=masked)
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+    part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
+                                                         accurate=False))
     return algebra.value_weights(exponentials, weights, do_slot.dtype), part
 
 
@@ -144,7 +146,11 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
         return coords.queries(read(x), s) if coords.keys_first else read(x)
 
     inverse_total = per_query(algebra.inverse(read(total)))
-    exponentials, weights = algebra.normalized(logits, per_query(peak), inverse_total, how)
+    # The fast form's exponent unclamped, its maximum safe where a query saw no key (`algebra.safe_peak`, a
+    # row's select in place of each entry's clamp).
+    fast = not walk.accurate
+    peaks = per_query(algebra.safe_peak(read(peak)) if fast else peak)
+    exponentials, weights = algebra.normalized(logits, peaks, inverse_total, how, safe=fast)
     # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
     # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
     # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
@@ -152,7 +158,7 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
-                                     inverse_total, multiplier=multiplier)
+                                     inverse_total, multiplier=multiplier, weights=weights if fast else None)
     return exponentials, weights, cotangents, slopes, seen
 
 def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:

@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product
-from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
+from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
     _PLANNED,
     CHUNK,
