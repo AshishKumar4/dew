@@ -1283,6 +1283,9 @@ in fp32."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     "num_kv_heads": lambda model: model.kv_heads,
+    # Each layer's width, which an unstated width (four times the residual's) and its export state alike
+    # (ledger 3065).
+    "mlp_features": lambda model: model.mlp_widths,
     "head_dim": lambda model: model.features_per_head,
     "layer_types": lambda model: model.per_layer_types,
     "kinds": lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
@@ -1346,6 +1349,20 @@ def bundles(config: Mapping[str, object]) -> bool:
     model_type = config.get("model_type")
     return (isinstance(model_type, str) and _bundled(model_type) is not None
             and config.get("vision_config") is not None)
+
+
+def decoder_config(config: Mapping[str, object]) -> Mapping[str, object]:
+    """A checkpoint's config as its decoder reads it, as a load of its language model reads it
+    (`Pretrained.load(..., text_only=True)`): a media bundle its own family reads whole, without its
+    vision_config (`bundle_text_config`); another wrapper's language model as its text family states it,
+    the wrapper's head policy, dtype and overrides over its text_config (`language_model_config`); and
+    any other config, a registered family's that reads its whole record among them (kimi_k25's), as it
+    is. A tool that builds a checkpoint's decoder from its config reads it here (ledger 3006)."""
+    if bundles(config):
+        return bundle_text_config(config)
+    if config.get("model_type") in families() or "text_config" not in config:
+        return config
+    return language_model_config(config)
 
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:

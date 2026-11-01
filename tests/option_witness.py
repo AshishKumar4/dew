@@ -442,15 +442,20 @@ def accepted(saved, name: str, value) -> bool:
     return True
 
 
+EVERY = slice(None)
+"""Every alternative of an option (`witnessed_by`'s `part`)."""
+
+
 def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]],
-                 consumed) -> dict[str, list[str]]:
+                 consumed, part: slice = EVERY) -> dict[str, list[str]]:
     """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
     task holds differs from the run that sets none by it alone, at each alternative in turn until one is
-    consumed (`consumed`: why the saved settings and the loaded task do not witness it, or None). Why
-    each alternative failed, for each option none witnesses."""
+    consumed (`consumed`: why the saved settings and the loaded task do not witness it, or None); of its
+    alternatives `part` alone, each named by its place among them all. Why each alternative failed, for
+    each option none witnesses."""
     failed: dict[str, list[str]] = {}
     for name, values in queued.items():
-        for index, value in enumerate(values):
+        for index, value in [*enumerate(values)][part]:
             try:
                 saved, task = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
             except ValueError as error:  # A reader refused it, which names what refused it: the next.
@@ -465,15 +470,28 @@ def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict
     return failed
 
 
-def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere: frozenset[str] = frozenset()
-                 ) -> tuple[dict[str, Option], dict[str, str], bool]:
+class Witnessed(typing.NamedTuple):
+    """What a run witnessed (`witnessed_on`): the options it set (`chosen`'s, or all it holds), why each it
+    did not witness was not, whether it exported, and every option it holds."""
+
+    options: dict[str, Option]
+    failures: dict[str, str]
+    exports: bool
+    held: frozenset[str]
+
+
+def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere: frozenset[str] = frozenset(),
+                 chosen: frozenset[str] | None = None, part: slice = EVERY) -> Witnessed:
     """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
     witness is not: one with no path its settings do not declare derived, or derived from data the run
     leaves unfilled; one set alone to each alternative in turn (`witnessed_by`) none of which trains, saves
     it and has its loaded task consume it: hold it where it held another before (`held`) and answer apart
     from the same task with what it held before in its place, the consumer's work, not its record
     (`unread`), a released task's export too (`dew export`), where the run exports, which it says. An
-    option another run witnessed already (`elsewhere`) is not set again here."""
+    option another run witnessed already (`elsewhere`) is not set again here. Where `chosen` names some, it
+    witnesses those of its options alone, so its options' witnesses can run apart (each beside the run's
+    own unset save); it holds the rest as ever. Of each option's alternatives it sets `part` alone, so an
+    option of several can run its alternatives apart too (`witnessed_by`)."""
     import dew
     from dew.objectives.base import ReleasedTask
 
@@ -487,6 +505,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
     # layers its checkpoint keeps alone): its witnesses' exports then hold them too.
     exports = released and exported(root / "runs" / "unset", root / "exported" / "unset")
     options = {option.name: option for option in options_of(run, objective, settings, base)}
+    holding = frozenset(options)
+    options = {name: option for name, option in options.items() if chosen is None or name in chosen}
     failures = {}
     for name, option in options.items():
         if option.found is None and "derived" not in option.field.metadata:
@@ -526,9 +546,9 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
             missed = unread(dew.pipeline(str(destination)), before, option)
             return None if missed is None else f"its export: {missed}"
         return missed
-    witnessing = witnessed_by(run, root, settings, flags, queued, consumed)
+    witnessing = witnessed_by(run, root, settings, flags, queued, consumed, part)
     failures.update({name: f"no alternative witnesses it: {why}" for name, why in witnessing.items()})
-    return options, failures, exports
+    return Witnessed(options, failures, exports, holding)
 
 
 UNHELD = ("states a layout's window, budgets and option layout alone",
@@ -584,13 +604,21 @@ def the_attention_forms_a_run_names_reach_its_step(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py): the attention forms a run's numerics name on the
     command line (`--set trainer.precision`, `Numerics.forms`) reach its step through the default route: a
     step in the accurate forms (IEEE fp32 products) and one in the fast (a GPU's TF32), the model's
-    compute float32 in both, score its batch apart, so the route reads the run's forms, not its record
-    alone (ledger 2350). A CPU multiplies fp32 one way in both, so only a GPU tells them apart."""
-    from process_support import logged_losses
-
+    compute float32 in both, differentiate its batch apart, so the route reads the run's forms, not its
+    record alone (ledger 2350). Their gradients' summaries tell them apart where the loss cannot: one step
+    from a fresh model scores every batch near the log of its vocabulary, and Adam's first update is the
+    rate times the gradient's sign, both blind to a product's last bits (ledger 3153). A CPU multiplies
+    fp32 one way in both, so only a GPU tells them apart."""
     from dew.nn.precision import Numerics
+    from dew.training import Inspection, LocalTracker
 
     run = lm(tmp_path, drawn=False)
-    losses = {forms: logged_losses(trained_by_cli(run, tmp_path, forms, {
-        "trainer.precision": flag(Numerics(forms=forms), Numerics)})) for forms in ("fast", "accurate")}
-    assert losses["fast"] and losses["fast"] != losses["accurate"]
+    watched = flag(Inspection(targets=("grads",), every=1), Inspection)
+    gradients = {}
+    for forms in ("fast", "accurate"):
+        trained = trained_by_cli(run, tmp_path, forms, {
+            "trainer.precision": flag(Numerics(forms=forms), Numerics), "trainer.inspection": watched})
+        gradients[forms] = {name: value for _, values in LocalTracker(trained / "tracking").scalars()
+                            for name, value in values.items() if name.startswith("inspect/grads/")}
+    assert gradients["fast"] and gradients["fast"].keys() == gradients["accurate"].keys()
+    assert gradients["fast"] != gradients["accurate"]

@@ -4,7 +4,8 @@ A `PreferencePair` step reads records of
 `chosen` and `rejected` token ids, lists or one-dimensional arrays, with
 `chosen_mask` and `rejected_mask` marking the completion tokens. Each batch stacks them in
 TRL's layout: chosen rows over rejected rows, padded to the longest row,
-with `completion_mask` alongside the ids. A mask must run as long as its
+with `completion_mask` alongside the ids and `real_mask` marking each row's
+ids apart from its padding. A mask must run as long as its
 ids; anything else fails naming the row.
 """
 
@@ -29,6 +30,9 @@ IDS_KEY = "input_ids"
 
 MASK_KEY = "completion_mask"
 """Batch key holding the `[B, 2, S]` completion marks, 1 on completion tokens."""
+
+REAL_KEY = "real_mask"
+"""Batch key holding the `[B, 2, S]` marks of each half's ids, 1 on its tokens and 0 on its padding."""
 
 FIELDS = ("chosen", "rejected", "chosen_mask", "rejected_mask")
 
@@ -64,15 +68,17 @@ class PreferencePair(grain.MapTransform):
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """A chosen and a rejected row of `seq_len` ids and their completion mask, in place of the
         completions."""
-        rows = shaped(unshaped(facts, *FIELDS), IDS_KEY, [2, self.seq_len])
-        return {**shaped(rows, MASK_KEY, [2, self.seq_len]), "seq_len": self.seq_len}
+        rows = unshaped(facts, *FIELDS)
+        for key in (IDS_KEY, MASK_KEY, REAL_KEY):
+            rows = shaped(rows, key, [2, self.seq_len])
+        return {**rows, "seq_len": self.seq_len}
 
     def map(self, element: Batch) -> Batch:
         element = record(element, "preference row")
         if "chosen" not in element or "rejected" not in element:
             raise ValueError("a preference pair needs both chosen and rejected ids")
         ids = np.full((2, self.seq_len), self.pad_id, np.int32)
-        mask = np.zeros((2, self.seq_len), np.int32)
+        mask, real = np.zeros((2, self.seq_len), np.int32), np.zeros((2, self.seq_len), np.int32)
         for row, name in enumerate(("chosen", "rejected")):
             tokens = token_ids(element.get(name), where=f"preference: {name}")
             if len(tokens) > self.seq_len:
@@ -81,5 +87,6 @@ class PreferencePair(grain.MapTransform):
                 element.get(f"{name}_mask", [1] * len(tokens)), f"{name}_mask", len(tokens), "preference"
             )
             ids[row, : len(tokens)], mask[row, : len(tokens)] = tokens, completion
+            real[row, : len(tokens)] = 1
         kept = {key: value for key, value in element.items() if key not in FIELDS}
-        return {**kept, IDS_KEY: ids, MASK_KEY: mask}
+        return {**kept, IDS_KEY: ids, MASK_KEY: mask, REAL_KEY: real}

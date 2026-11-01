@@ -148,14 +148,16 @@ class Architecture:
     multiprocessor a clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise
     its limit to (`vmem_bytes`), and a grid step's fixed seconds. `tma`: JAX's Mosaic GPU pipelines move
     a block into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline`
-    and `copy_gmem_to_smem`), where below it they copy by cp.async. A family of None is no template's:
-    its devices' facts serve the rest of Dew (MFU's peaks)."""
+    and `copy_gmem_to_smem`), where below it they copy by cp.async. `dependent_launch`: PTX's grid
+    dependency control (`griddepcontrol`, programmatic dependent launch), sm_90 on. A family of None is
+    no template's: its devices' facts serve the rest of Dew (MFU's peaks)."""
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     resident_threads: int = 1536
     wgmma: bool = False
     tma: bool = False
+    dependent_launch: bool = False
     tmem_columns: int | None = None
     load_latency: float | None = None
     l2_bytes_per_clock: float | None = None
@@ -185,16 +187,16 @@ _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32':
 _TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024, load_latency=541.5,
                        l2_bytes_per_clock=38.8)
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, resident_threads=2048,
-                       wgmma=True, tma=True,
+                       wgmma=True, tma=True, dependent_launch=True,
                        load_latency=478.8, l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, resident_threads=2048,
-                          tmem_columns=512, tma=True,
+                          tmem_columns=512, tma=True, dependent_launch=True,
                           load_latency=478.8, l2_bytes_per_clock=54.6)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates
 # and measured values.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, tma=True,
-                                   load_latency=541.5, l2_bytes_per_clock=38.8)
+                                   dependent_launch=True, load_latency=541.5, l2_bytes_per_clock=38.8)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072), the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's),
 # and a grid step's fixed seconds, the slope of time over 1 to 65536 Pallas grid steps each issuing one
@@ -760,9 +762,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
     policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
     import jax
-    import jax.numpy as jnp
-    import numpy as np
-    from jax.custom_derivatives import SymbolicZero
+    from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
     @jax.custom_jvp
     def produced(*operands):
@@ -772,13 +772,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def _(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(tangent_zero, saved))
-
-    def tangent_zero(leaf):
-        # A leaf with no tangent space (a bool mask, an index) takes float0's zero, as JAX requires of it.
-        if jnp.issubdtype(leaf.dtype, jnp.inexact):
-            return jnp.zeros_like(leaf)
-        return np.zeros(leaf.shape, jax.dtypes.float0)
+        return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
     @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
     def pulled(saved, operands, cotangent, live):
@@ -808,14 +802,11 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         live = [index for index, direction in enumerate(directions)
                 if not isinstance(direction, SymbolicZero)]
         if not live:
-            return output, jax.tree.map(jnp.zeros_like, output)
+            return output, zero_from_primal(output)
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            # An operand with no tangent space (an index, a length) takes float0's zero.
-            whole = [jnp.zeros_like(operand) if jnp.issubdtype(operand.dtype, jnp.inexact)
-                     else np.zeros(operand.shape, jax.dtypes.float0)
-                     for operand in jax.tree.leaves(operands)]
+            whole = [zero_from_primal(operand) for operand in jax.tree.leaves(operands)]
             for index, value in zip(live, moving, strict=True):
                 whole[index] = value
             return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
@@ -828,26 +819,32 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             return [pulled_back[index] for index in live]
 
         moving = [directions[index] for index in live]
-        return output, linear_map(tangent, transposed, (primals, saved), moving)
+        # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
+        # tangent, every reverse pass traced the portable math's forward mode for its type alone (a gated
+        # delta net layer's training step's trace on an H100's lowering, row 3142).
+        typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
+        return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
 
     bounded.defjvp(bounded_jvp, symbolic_zeros=True)
     return bounded
 
 
-def linear_map(apply: Callable, pullback: Callable, residuals, moving):
+def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
     or `jax.linear_transpose` transposes, and under `jax.vmap` too, where the map is one of `apply` and
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
-    derivative in `residuals` (a higher order's)."""
+    derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
+    avals like it), which `apply` is then traced for only where forward mode runs it."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
     # (`jax.eval_shape`'s) drop an explicit axis's, and reverse mode would hand the pullback its cotangent
     # unsharded (row 1759).
-    traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
-    out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
+    if out_aval is None:
+        traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
+        out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
     return _linear_primitive()(apply, pullback, in_avals, out_aval)(residuals, moving)
 

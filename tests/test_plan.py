@@ -45,7 +45,15 @@ from dew.state import TrainState, apart
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
-from dew.training.memory import climb_to, recompute_more, rung_record
+from dew.training.memory import (
+    FirstRunFailed,
+    climb_to,
+    first_run,
+    local_devices,
+    memory_record,
+    recompute_more,
+    rung_record,
+)
 from dew.training.planning import Trials, planned, splits
 
 ROWS, SEQ = 32, 16
@@ -493,7 +501,7 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
     fit(tmp_path / "window")
     # A step after the window logged while its export waited, which the run's end waited for in turn.
     assert tracker.stepped == [5] and stalled.released
-    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
     (capture,) = (tmp_path / "window").glob("capture-*")
     assert window.steps == 3 and traced_steps(capture) == (1, 2, 3)
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
@@ -531,7 +539,7 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
     with pytest.raises(LaterStepFailed):
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
                     observe=Observe(1, failing))
-    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
     (capture,) = tmp_path.glob("capture-*")
     assert window.steps == 2
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
@@ -859,6 +867,37 @@ def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monke
     trainer.compile(state, BATCH, trials)
     assert_searched(asked(trainer), (4, None), 2)
     assert all(remat is None for _, remat, _ in asked(trainer))
+
+
+def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():
+    """A newly compiled step whose first run fails on its devices is raised as the step's, from the
+    devices' own error, with the record of the check that said it fits and what each device holds now,
+    each GPU's bytes free outside XLA's pool among it: a collective's communicators (NCCL) take their
+    buffers there, beside cuBLAS's workspaces and the kernels loaded (row 2901). A first run that
+    succeeds tells each GPU's free bytes there at the check and after it."""
+    class Refused:
+        """A step's loss whose run the devices refused, as a GPU reports it once it is awaited."""
+
+        def block_until_ready(self):
+            raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: the devices refused the step")
+
+    mesh = MeshSpec().build(jax.devices()[:1])
+    devices = local_devices(mesh)
+    gpus = [device.id for device in devices if device.platform == "gpu"]
+    compiled = jax.jit(lambda value: value * 2).lower(jnp.float32(0)).compile()
+    record = memory_record(compiled, devices, 0, fits=True)
+    assert [device["id"] for device in record["devices"] if device["outside"] is not None] == gpus
+    loss = compiled(jnp.float32(1))
+    observed = first_run(loss, 0, record, mesh)
+    assert observed["checked"] == {device["id"]: device["outside"] for device in record["devices"]
+                                   if device["outside"] is not None}
+    assert list(observed["now"]) == gpus and all(free >= 0 for free in observed["now"].values())
+    with pytest.raises(FirstRunFailed) as raised:
+        first_run(Refused(), 0, record, mesh)
+    assert isinstance(raised.value.__cause__, jax.errors.JaxRuntimeError)
+    assert raised.value.fitted == record
+    assert [(device["id"], device["outside"] is not None) for device in raised.value.now] == [
+        (device.id, device.id in gpus) for device in devices]
 
 
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])

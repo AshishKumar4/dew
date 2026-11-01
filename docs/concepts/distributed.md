@@ -59,6 +59,7 @@ Each `MeshSpec` field sets how many devices one axis gets, and the `data` axis g
 
 | Axis | `MeshSpec` field | Splits |
 |---|---|---|
+| `diloco` | `diloco` | DiLoCo's replica groups (`Trainer(diloco=DiLoCo(every))`): each group trains its own copy of the model on its own batch rows, and the groups average every `every` updates |
 | `data` | (the remainder) | Batch rows; parameters are replicated over it |
 | `expert` | `expert` | The expert dimension of mixture-of-experts layers, and batch rows |
 | `fsdp` | `fsdp` | Parameter dimensions the layout assigns to it, and batch rows |
@@ -75,9 +76,9 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 ```
 
 ```text
-{'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
+{'diloco': 1, 'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
 ```
 
 `MeshSpec` also has `replicas` (host groups the data axis spans; see [Multiple hosts](../guides/multi-node.md)).
@@ -185,6 +186,30 @@ Host-parameter placement works only for decoder stack variables. Dew rejects a s
 Every host-resident weight you select is copied to the device on each forward pass, including every decode step, so PCIe transfers can take most of the time per token. `tools/benchmark_host_offload.py` reports local addressable-shard bytes, the device and host compiled-memory fields, process RSS and execution times. Its bytes per token divided by the decode latency is an end-to-end effective rate, not a measurement of PCIe bandwidth alone.
 
 An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_layers=8`) reported 18.74 GiB final RSS and 37.9 GiB peak RSS. The saved load probe synchronized every bank, so a backlog of asynchronous work alone cannot explain that peak. The numbers do not separate temporary storage, allocator reservation and duplicate driver mappings. There is no completed result yet for generating on a GPU with a model larger than device memory, and no throughput result. Looking further into the allocator needs a small process tree with a hard memory cap, swap accounting and RSS/PSS measurements. The earlier oversized runs with an RSS watchdog are not a safe way to do it.
+
+## GPU memory outside XLA's pool
+
+XLA preallocates a share of each GPU's memory as its pool. A step's collectives also allocate NCCL communicators, and those buffers live outside the pool: NCCL takes no allocator from its caller. cuBLAS's workspaces and the loaded kernels sit outside the pool as well. XLA keys a communicator by its devices and its kind, so a step whose collectives use another device grouping, or a collective-permute beside an all-gather, makes another communicator over the same GPUs.
+
+`import dew` sets `NCCL_RUNTIME_CONNECT=0` unless you set it yourself. NCCL then connects a communicator's rings, trees and NVLS peers, and allocates their buffers, as it creates the communicator, where XLA returns a failure to every rank as an error. Under NCCL's own default since 2.22, those peers connect at a collective's first launch. There, a GPU that fails to allocate leaves its peer waiting inside XLA's first-call rendezvous, and XLA ends the process after 40 seconds. Connecting at creation allocates those buffers at once, even for a collective the program never runs, and it takes longer to create the communicator. Point-to-point connections, which an all-to-all and a collective-permute make, still connect when a peer is first sent to, whatever the setting, so Dew leaves room for them as well.
+
+On a host of two or more GPUs, before the backend opens, `prepare_process` sizes the pool to leave the communicators their room at NCCL's full speed:
+
+1. A child process (`python -m dew.communicators`) measures each group size that divides the host's GPUs. For each size it makes a collective's communicator, connects an all-to-all to every peer, and connects a permute along each directed pair of GPUs in turn, in a communicator of its first GPUs and in one of each pair alone. NCCL picks each peer's transport separately and can route a connection through a third GPU of the communicator, so each pair keeps its bytes on its two GPUs and the most on any other; a communicator is charged a pair's bytes on its ends, and the most beside it on every other member, since NCCL may route the pair through any of them. It reports the bytes each step took on a GPU, and the bytes the runtime took beside its pool.
+2. The answer is kept in Dew's cache under `communicators/`. It is keyed by the GPUs' names and PCI places, the driver, NCCL's version, every `NCCL_*` setting, every XLA flag that sets NCCL's communicators, and the JAX version. A host pays for the measurement once per configuration.
+3. The pool's upper bound is the share your run names, read in one place (`dew.devices.pool_bound`): your `XLA_PYTHON_CLIENT_MEM_FRACTION`; Dew's 95% if you name nothing; or JAX's 75% if you name preallocation or the allocator without a fraction. The pool shrinks below that bound only as far as it must to leave room for a collective's communicator, an all-to-all's peers and a permute's peers over every GPU, plus the runtime's. No NCCL channel or buffer is cut to fit. The pool only has to hold the compiled step, and the fit check holds the step to it as before. Dew logs the share it took once, and the fit check's record carries it into the run record (`pool`).
+4. Every program Dew compiles, steps and evaluations alike, passes one compile point. There, its communicators are read from its program: each device group of its collectives, each all-to-all's group and each GPU's permute peers. Those communicators stay made, so they are held together with those of the programs compiled before. A program that needs more than the room left is refused before it runs, with an error naming the bytes, instead of stalling in a collective.
+
+None of this happens in five cases:
+- a process that joins a pool of processes, whose communicators span hosts and so need network buffers a single host's child does not make;
+- a pool of no fixed share (`XLA_PYTHON_CLIENT_PREALLOCATE=false`, or `XLA_PYTHON_CLIENT_ALLOCATOR=platform`);
+- a host of fewer than two GPUs;
+- a process that asks JAX for no GPU;
+- a process whose backend has already opened.
+
+If a step that fit fails on its first run anyway, Dew raises the failure as the step's (`dew.training.memory.FirstRunFailed`). The error includes each GPU's free bytes outside the pool, labelled `outside`, both at the fit check and after the failure.
+
+An example of the failure this prevents: a LoRA fine-tune of Qwen3.5-9B on two H100s with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.97` left 2,264 MiB free outside the pool on a GPU. Its step's collectives used two communicators, each with 24 collective channels, 32 point-to-point channels per peer and 16 NVLS channels. One GPU entered the first all-to-all, and the other never did.
 
 ## Rematerialization
 

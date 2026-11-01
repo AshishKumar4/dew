@@ -30,6 +30,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
+from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
 from dew.training._lowering import kernel_calls, triton_kernels
@@ -125,6 +126,21 @@ UNIQUIFIED = re.compile(r"__\d+$")
 
 
 @functools.cache
+def staged_copy(shape: tuple[int, ...], dtype):
+    """A Mosaic GPU kernel copying its operand through shared memory by TMA: the least Mosaic kernel a test
+    compiles for a generation."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(source, out, staged, barrier):
+        plgpu.copy_gmem_to_smem(source, staged, barrier.at[0])
+        plgpu.barrier_wait(barrier.at[0])
+        plgpu.copy_smem_to_gmem(staged, out)
+        plgpu.wait_smem_to_gmem(0)
+
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(shape, dtype), num_threads=1, thread_name="wg",
+                        scratch_types=[plgpu.SMEM(shape, dtype), plgpu.Barrier(num_barriers=1)])
+
+
 def _device(generation: str) -> Mesh:
     """A one-device mesh of a compile-only device of `generation`."""
     return Mesh(np.array(compile_only_gpus(generation)), ("data",))
@@ -333,18 +349,20 @@ specified by .target is higher than default SM version assumed', and an sm80 ker
 assembled for sm90). Production compiles for one GPU a process; the gates compile for several."""
 
 
-def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
+def compile_mosaic_kernels(cases, generation: str, *, least: bool = False) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
     own reports printed (`_printed`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
-    or the error. In a process that compiled Mosaic kernels for another capability (`_BINARY_CAPABILITY`)
-    the calling test runs again in a process of its own, and these are its records there."""
+    or the error; with `least`, each kernel's least spill-free cap too (`register_need`, its `least`), a scan
+    of ptxas at each cap. In a process that compiled Mosaic kernels for another capability
+    (`_BINARY_CAPABILITY`) the calling test runs again in a process of its own, and these are its records
+    there."""
     wanted = capability(generation)
     if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and OWN_PROCESS not in os.environ:
         return compiled_apart()
     _BINARY_CAPABILITY[:] = _BINARY_CAPABILITY or [wanted]
-    found = _compiled_here(cases, generation)
+    found = _compiled_here(cases, generation, least=least)
     if OWN_PROCESS in os.environ:
         Path(os.environ[OWN_PROCESS]).write_text(json.dumps(found))
     return found
@@ -396,6 +414,18 @@ NEEDS: dict[str, int | dict | None] = {}
 `COMPILED` keeps its compile: a later compile of the same module prints no PTX."""
 
 
+PTX: dict[str, str] = {}
+"""Each Mosaic GPU module's PTX this process printed, by its module, as `COMPILED` keeps its compile: a later
+compile of the same module prints none, and a least spill-free cap asked of it after (`_least`) reads this."""
+
+
+@functools.cache
+def _least(module: str | None, generation: str) -> int | None:
+    """The least spill-free cap of the kernel `module` names (`register_need`), from its PTX this process
+    printed (`PTX`); None where it printed none."""
+    return None if module not in PTX else register_need(PTX[module], generation)
+
+
 def needed(kernel: dict, needs: dict[str, int | dict | None]) -> dict:
     """`kernel`'s record with its register need: from the PTX its compile printed (`needs`, by its name and
     launch, `report.launch_name`), which this process keeps by its module (`NEEDS`), or, where Mosaic compiled
@@ -434,18 +464,31 @@ def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = N
         "", ENTRY.sub(lambda entry: f"{entry.group(1)}.maxnreg {cap}\n", ptx, count=1))
     if raised is not None:
         capped = RAISE.sub(f"setmaxnreg.inc.sync.aligned.u32 {raised};", capped)
+    text, took = _ptxas_text(capped, generation, relocatable)
+    used = [int(count) for count in REGISTERS.findall(text)]
+    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
+    return max(used, default=0), max(spilled, default=0), took
+
+
+def _ptxas_text(ptx: str, generation: str, relocatable: bool) -> tuple[str, bool]:
+    """ptxas's own report (`-v`) on the kernel `ptx` for the CUDA `generation`, compiled relocatably or
+    whole-program (`_ptxas`), and whether it took the kernel."""
     major, minor = capability(generation) or (0, 0)
     arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
-        source.write(capped)
+        source.write(ptx)
         source.flush()
         relocating = ("--compile-only",) if relocatable else ()
         ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", *relocating, source.name, "-o", os.devnull],
                              capture_output=True, text=True, check=False)
-    text = ran.stdout + ran.stderr
-    used = [int(count) for count in REGISTERS.findall(text)]
-    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
-    return max(used, default=0), max(spilled, default=0), ran.returncode == 0
+    return ran.stdout + ran.stderr, ran.returncode == 0
+
+
+def ptxas_notes(ptx: str, generation: str) -> str:
+    """What ptxas says of the kernel `ptx` as the GPU compiles it (`RELOCATABLE`): its registers and spills,
+    and the notes it makes of the code, a warpgroup MMA's serialization among them ("wgmma.mma_async
+    instructions are serialized"), which the gate's registers and spills do not state."""
+    return _ptxas_text(ptx, generation, RELOCATABLE)[0]
 
 
 def _assembled(ptx: str, generation: str, cap: int, *, honored: bool) -> tuple[int, int, bool]:
@@ -558,7 +601,7 @@ def _needs(directory: str, generation: str,
     return found
 
 
-def _compiled_here(cases, generation: str) -> list[dict]:
+def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process, each kernel's register need beside its
     reports (`register_need`, from the PTX Mosaic prints)."""
     found: list[dict] = []
@@ -582,6 +625,13 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             needs = _needs(directory, generation, modelled)
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited(kernel, compiled), needs) for kernel in kernels]
+            printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
+            for kernel in record["kernels"]:
+                name = report.launch_name(kernel["kernel"], kernel["launch"])
+                if kernel["module"] is not None and name in printed:
+                    PTX[kernel["module"]] = printed[name]
+                if least:
+                    kernel["least"] = _least(kernel["module"], generation)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         record["evidence"] = _register_evidence(record)
         found.append(record)
@@ -772,3 +822,20 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
             text = text if len(text) <= 1600 else f"{text[:800]} ... {text[-800:]}"
             record["error"] = f"{type(error).__name__}: {text}"
     return found
+
+
+class Uncounted(grouped_matmul.MosaicGmm):
+    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
+    registers do not hold: a launch whose model misses. Its first tile is a paired product's widest, 128 x
+    256, two accumulators of 128 registers a thread, which spills in every compile whatever its walk's
+    addresses take (the paired 128 x 128 tile this launch took first spilled 16 bytes in the process's own
+    compile only while its walk held a stage's addresses in registers, and none since the walk forms them
+    where it uses them: `mosaic.opaque`); a narrower tile comes once a compile has refused a tile of its
+    launch (`report.refused_launches`, the relowering's proposals included)."""
+
+    def registers(self, ba, config):
+        return 0
+
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and (
+            config.block_n == 256 or bool(report.refused_launches()))

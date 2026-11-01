@@ -28,6 +28,7 @@ from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
 from dew.inference.tasks import SavedRun
 from dew.registry import objectives
+from dew.training import LocalTracker
 
 CORPUS = Path(__file__).with_name("fixtures") / "saved_runs"
 SAVED = [(recorded.name, kind) for recorded in sorted(CORPUS.iterdir()) if recorded.is_dir()
@@ -145,8 +146,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     resumed = max(index for index, row in enumerate(records) if row["type"] == "FitStarted")
     started = records[resumed]["value"]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
-    scalars = (run / "tracking" / "scalars.jsonl").read_text().splitlines()
-    stepped = [json.loads(line)["step"] for line in scalars]
+    stepped = [step for step, _ in LocalTracker(run / "tracking").scalars()]
     assert max(stepped) > last if clocked else max(stepped) == last + 1
     if seen is not None:
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
@@ -193,6 +193,38 @@ def test_a_packed_projections_products_count_at_each_of_its_members():
     assert unpacked(now, packs) == unpacked(then, packs) == then
     moved = {**then, "layers_0/mlp/up_proj": ["bfloat16"]}
     assert unpacked(moved, packs) != unpacked(now, packs)
+
+
+def test_a_called_product_is_read_at_the_scope_that_called_it(tmp_path):
+    """A product in a called program is read at the scope of the call that runs it, as XLA inlines it: a wide
+    sum's (`precision.accumulated` on a CPU, one private function traced once for its types, its own
+    location naming no scope) at its caller's, and one under a scope of the called program's own at that
+    (row 3193)."""
+    import jax.numpy as jnp
+    from saved_run_products import SCOPE, products
+
+    from dew.nn.precision import accumulated
+
+    @jax.jit
+    def block(x, weight):
+        with jax.named_scope(SCOPE + "layer2|inner"):
+            return x @ weight
+
+    def program(x, first, second):
+        with jax.named_scope(SCOPE + "layer1"):
+            hidden = accumulated(jnp.dot, x, first)
+        with jax.named_scope(SCOPE + "layer2"):
+            return block(hidden.astype(jnp.bfloat16), second)
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        x, w = jnp.ones((4, 8), jnp.float32), jnp.ones((8, 8), jnp.float32)
+        jax.config.update("jax_dump_ir_to", str(tmp_path))
+        try:
+            jax.jit(program)(x, w, w.astype(jnp.bfloat16)).block_until_ready()
+        finally:
+            jax.config.update("jax_dump_ir_to", "")
+    texts = [path.read_text() for path in sorted(tmp_path.glob("*.mlir"))]
+    assert products(texts) == {"layer1": ["float64"], "layer2/inner": ["bfloat16"]}
 
 
 def test_a_requests_products_are_named_by_their_variable_scopes():

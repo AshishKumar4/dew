@@ -122,7 +122,7 @@ Each setting's default is the recipe's own, which can differ from the configurat
 |---|---|
 | `--model.dtype` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
 | `--model.attention-impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
-| `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
+| `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon`, `muonclip` or `laprop`. |
 | `--optim.learning-rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
 | `--optim.state-dtype` | `bfloat16` stores Adam's moments stochastically rounded, and `int8` stores them blockwise in 8 bits, for `adam` and `adamw` only. |
 | `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |
@@ -130,7 +130,7 @@ Each setting's default is the recipe's own, which can differ from the configurat
 | `--trainer.eval-every`, `--trainer.checkpoint-every` | A step interval, `epoch`, or `None`. |
 | `--trainer.checkpoint-dir`, `--trainer.name` | The run's directory is `<checkpoint-dir>/<name>`. |
 | `--trainer.multi-host` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
-| `--trainer.xla-flags` | Extra `XLA_FLAGS`, applied before JAX opens a backend. |
+| `--trainer.xla-flags` | Extra `XLA_FLAGS`, applied before JAX opens a backend. A recipe imports Dew, and with it jaxlib, before it reads its arguments, so they are unproven (`prepare_process` warns). `dew train ... --set trainer.xla_flags=...`, or `XLA_FLAGS` set before the process starts, makes them certain. |
 
 A chain's `workers(n)`, `threads(n)` or `loading(Loading(...))` control how the host reads data; they do not change the batch size on the device. With zero workers the loader starts no worker processes. [Training data](concepts/data.md) covers the loading settings.
 

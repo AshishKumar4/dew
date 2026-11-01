@@ -229,13 +229,14 @@ def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
 
 
 def joint_logits(decide) -> np.ndarray:
-    """Dew's logits of every question the cases lay out, in the fixture's order."""
+    """Dew's logits of every question the cases lay out, in the fixture's order, each case's pass the
+    task's own, as a served request scores it (`Decide.scored`)."""
     found = []
     for request in CASES.values():
         questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
         [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions)
-        scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0)))
-        found += [scores[0, slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
+        [scores] = decide.scored([row])
+        found += [scores[slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
     return np.concatenate(found)
 
 

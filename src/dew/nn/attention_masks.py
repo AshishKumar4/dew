@@ -47,14 +47,12 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     return seen if key_valid is None else seen & jnp.asarray(key_valid, bool)[:, None, None, :]
 
 
-def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
-    """BLOOM/Falcon's per-head linear key-position bias, `[B, H, 1, K]`.
-
-    The slopes follow transformers' `build_alibi_tensor`, including the odd
-    powers appended for a non-power-of-two head count. Dropping the query's
-    position subtracts one constant from every visible logit of that query,
-    which leaves softmax unchanged.
-    """
+def alibi_slopes(num_heads: int) -> np.ndarray:
+    """BLOOM/Falcon's ALiBi slope of each of `num_heads` heads, float32, as transformers'
+    `build_alibi_tensor` computes them: a power-of-two head count's geometric run, and for another
+    count the odd powers of the next one's appended, base and powers taken in float32. Lightning
+    attention's decay rates follow the same schedule in Python doubles (`lightning_slopes`), as
+    MiniMax's source computes them."""
     power = 2 ** math.floor(math.log2(num_heads))
     base = np.float32(2 ** (-(2 ** -(math.log2(power) - 3))))
     slopes = np.power(base, np.arange(1, power + 1, dtype=np.float32))
@@ -62,8 +60,16 @@ def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
         extra = np.float32(2 ** (-(2 ** -(math.log2(2 * power) - 3))))
         slopes = np.concatenate((slopes, np.power(
             extra, np.arange(1, 2 * (num_heads - power), 2, dtype=np.float32))))
+    return slopes
+
+
+def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
+    """BLOOM/Falcon's per-head linear key-position bias, `[B, H, 1, K]`: each head's slope
+    (`alibi_slopes`) times each key's position. Dropping the query's position subtracts one constant
+    from every visible logit of that query, which leaves softmax unchanged.
+    """
     positions = jnp.atleast_2d(key_positions)
-    return (jnp.asarray(slopes)[None, :, None, None]
+    return (jnp.asarray(alibi_slopes(num_heads))[None, :, None, None]
             * positions[:, None, None, :]).astype(dtype)
 
 

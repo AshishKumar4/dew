@@ -89,6 +89,8 @@ anyio==4.15.1
     #   sse-starlette
     #   starlette
     #   watchfiles
+anywidget==0.11.0
+    # via egglog
 appnope==1.0.0 ; sys_platform == 'darwin'
     # via ipykernel
 argon2-cffi==25.1.0
@@ -132,6 +134,8 @@ beautifulsoup4==4.15.0
     # via nbconvert
 bidict==0.24.1
     # via python-socketio
+black==26.10.1
+    # via egglog
 bleach==6.4.0
     # via nbconvert
 blinker==1.9.0
@@ -191,6 +195,7 @@ cheroot==11.1.2
     # via xprof
 click==8.5.0
     # via
+    #   black
     #   cosmic-ray
     #   flask
     #   huggingface-hub
@@ -204,6 +209,7 @@ cloudpathlib==0.26.0
     # via weasel
 cloudpickle==3.1.2
     # via
+    #   egglog
     #   grain
     #   joblib
     #   mlflow-skinny
@@ -334,6 +340,8 @@ e2b==2.55.1
     # via dewml (pyproject.toml)
 e2b-dockerfile-utils==0.1.0
     # via e2b
+egglog==14.0.0
+    # via dewml (pyproject.toml)
 einops==0.8.2
     # via
     #   dewml (pyproject.toml)
@@ -492,6 +500,8 @@ graphql-core==3.2.13
     #   moto
 graphql-relay==3.2.0
     # via graphene
+graphviz==0.21
+    # via egglog
 griffelib==2.3.2
     # via fastmcp-slim
 groovy==0.1.2
@@ -620,7 +630,9 @@ ipython==9.17.1
 ipython-pygments-lexers==1.1.1
     # via ipython
 ipywidgets==8.1.9
-    # via dewml (pyproject.toml)
+    # via
+    #   dewml (pyproject.toml)
+    #   anywidget
 isoduration==20.11.0
     # via jsonschema
 isort==9.0.2
@@ -635,7 +647,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post41
+jax==0.12.0.1.post42
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -648,7 +660,7 @@ jax-cuda12-pjrt==0.12.0.1 ; platform_machine == 'x86_64' and sys_platform == 'li
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda12-plugin
-jax-cuda12-plugin==0.12.0.1 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+jax-cuda12-plugin==0.12.0.1.post42 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1
     # via
@@ -854,7 +866,9 @@ murmurhash==1.0.15
     #   spacy
     #   thinc
 mypy-extensions==1.1.0
-    # via isort
+    # via
+    #   black
+    #   isort
 narwhals==2.27.1
     # via scikit-learn
 nbclient==0.11.0
@@ -966,6 +980,7 @@ openenv==0.9.0
 opentelemetry-api==1.45.1
     # via
     #   daytona
+    #   egglog
     #   fastapi
     #   fastmcp-slim
     #   google-api-core
@@ -1036,6 +1051,7 @@ packaging==26.3
     # via
     #   accelerate
     #   anybadge
+    #   black
     #   datasets
     #   e2b
     #   evaluate
@@ -1078,6 +1094,8 @@ parso==0.8.7
     #   jedi
 pathable==0.6.0
     # via jsonschema-path
+pathspec==1.1.1
+    # via black
 pathvalidate==3.3.1
     # via pytablewriter
 peft==0.21.2
@@ -1096,6 +1114,7 @@ pillow==11.3.0
     #   torchvision
 platformdirs==4.13.0
     # via
+    #   black
     #   fastmcp-slim
     #   jupyter-core
     #   pylint
@@ -1166,6 +1185,8 @@ psutil==7.2.2
     #   peft
     #   portpicker
     #   tensorflow-datasets
+psygnal==0.16.1
+    # via anywidget
 ptyprocess==0.7.0 ; os_name != 'nt' or (sys_platform != 'emscripten' and sys_platform != 'win32')
     # via
     #   pexpect
@@ -1303,6 +1324,8 @@ python-multipart==0.0.32
     #   mcp
 python-socketio==5.17.0
     # via daytona
+pytokens==0.4.1
+    # via black
 pytz==2026.5
     # via
     #   dateparser
@@ -1706,6 +1729,7 @@ typing-extensions==4.16.0
     #   aiosignal
     #   alembic
     #   anyio
+    #   anywidget
     #   beautifulsoup4
     #   cfn-lint
     #   daytona
@@ -1716,6 +1740,7 @@ typing-extensions==4.16.0
     #   daytona-toolbox-api-client
     #   daytona-toolbox-api-client-async
     #   e2b
+    #   egglog
     #   etils
     #   exceptiongroup
     #   fastapi

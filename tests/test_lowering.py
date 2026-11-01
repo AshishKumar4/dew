@@ -546,8 +546,31 @@ def _short_conv_step(rows: int):
                   jax.ShapeDtypeStruct((256, 4), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
 
 
+def _selective_step(rows: int):
+    """A bf16 Mamba layer over `[2, rows / 2, 64]`, one channel block of 128 wide, its scan the template's
+    (`generation.chosen`): its scan runs per shard of rows, B and C every channel's (`manual_map`)."""
+    from dew.nn.mixers.mamba import Mamba
+
+    layer = Mamba(emb_features=64, intermediate_size=128, state_size=16, time_step_rank=8, chunk_size=32,
+                  dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, rows // 2, 64), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    from dew.nn.kernels.generation import chosen
+
+    def loss(variables, x):
+        with chosen(selective_scan="mosaic_gpu"):
+            return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    return loss, (variables, x)
+
+
 PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "swiglu": _swiglu_step,
-                   "short conv": _short_conv_step}
+                   "short conv": _short_conv_step, "selective scan": _selective_step}
+
+UNTAKEN = {("sm80", "selective scan")}
+"""The steps whose template a GPU's kernel refuses whatever a call names: an A100's selective scan, its
+strided channel blocks' untiled copies wrong until the jax fork's post42 (`recurrence_chunk.SELECTIVE`)."""
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
@@ -568,8 +591,9 @@ def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, s
     return calls, lowered.as_text()
 
 
-@pytest.mark.parametrize("op", PER_SHARD_STEPS)
-@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+@pytest.mark.parametrize(("generation", "op"),
+                         [(generation, op) for generation in ("sm80", "sm90") for op in PER_SHARD_STEPS
+                          if (generation, op) not in UNTAKEN])
 def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(generation, op):
     """Bible §7, row 1923: an op's forward and backward, lowered for the GPU on an abstract two-device mesh
     that splits its rows, launches the kernels it launches on one device, each reading fewer elements than
@@ -618,6 +642,56 @@ def _mamba2_lowered(generation: str):
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         return tuning.tune(lower)[0]
+
+
+def _mamba1_lowered(generation_name: str, layers: int = 1):
+    """`layers` bf16 Mamba layers of one shape in series, forward and backward, their selective scans the
+    template's where its selector takes the call (`recurrence_chunk.SELECTIVE`, the template chosen), lowered
+    for `generation_name` after its launches are settled as the trainer settles a step's (`tuning.tune`)."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import chosen
+    from dew.nn.mixers.mamba import Mamba
+
+    layer = Mamba(emb_features=64, intermediate_size=256, state_size=16, time_step_rank=8, chunk_size=32,
+                  dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 128, 64), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        for _ in range(layers):
+            x = layer.apply(variables, x)
+        return jnp.asarray(x).astype(jnp.float32).sum()
+
+    def lower():
+        return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation_name)
+    with assumed(generation_name), jax.sharding.use_abstract_mesh(mesh), chosen(selective_scan="mosaic_gpu"):
+        return tuning.tune(lower)[0]
+
+
+@pytest.mark.parametrize("generation_name", ["sm90"])
+def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation_name):
+    """A Mamba layer, its selective scan the template's and its launches settled as the trainer settles
+    them, lowers on this CPU for each GPU the template takes it on (an H100; an A100's strided copies wait
+    for post42, `UNTAKEN`), forward and backward each a Mosaic GPU launch."""
+    from dew.training._lowering import kernel_calls
+
+    names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))
+             if call.kind == "mosaic_gpu"}
+    assert {"selective_scan", "selective_scan_backward"} <= names, names
+
+
+def test_two_mamba_layers_lower_the_template_scans_launches_once():
+    """Two Mamba layers of one shape, forward and backward, lowered for an H100: each of the selective
+    template's launches is one Mosaic GPU call in the lowered program, which both layers call
+    (`tuning.lowered_once`), as many as one layer's. Built in each call, a model's layers' identical
+    launches were each traced and lowered again (row 2969)."""
+    def launches(layers: int) -> int:
+        return len(_mosaic_calls(_operations(_mamba1_lowered("sm90", layers))))
+
+    one = launches(1)
+    assert one > 0 and launches(2) == one
 
 
 @pytest.mark.parametrize("generation", GPUS)
@@ -1264,10 +1338,13 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
 def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
     """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
     is out of its way (`dew.cache.uncached`): a cache that a program here writes to gains nothing from
-    the topology's compile, and the next program here writes to it again."""
+    the topology's compile, and the next program here writes to it again. The trainer is built before
+    the cache is read, as its key is drawn by a program of this host's, which the cache keeps (ledger
+    3174: alone in its process the test saw that program's entries)."""
     from jax.experimental.compilation_cache import compilation_cache
 
     from dew.cache import enable_compilation_cache
+    from dew.training.ahead import compile_ahead
 
     monkeypatch.setenv("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))
     settings = ("jax_compilation_cache_dir", "jax_enable_compilation_cache",
@@ -1277,10 +1354,12 @@ def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_pa
         jax.config.update("jax_enable_compilation_cache", val=True)
         enable_compilation_cache(str(tmp_path / "cache"))
         compilation_cache.reset_cache()
+        trainer = _topology_trainer("v5e:2x2")
         jax.jit(lambda x: x * 3.0).lower(1.0).compile()
         written = sorted((tmp_path / "cache").iterdir())
         assert written
-        assert _topology_ahead("v5e:2x2").executable
+        rows = np.zeros((trainer.device_mesh.devices.size, 65), np.int32)
+        assert compile_ahead(trainer, {"text": rows}).executable
         assert sorted((tmp_path / "cache").iterdir()) == written
         jax.jit(lambda x: x * 5.0).lower(1.0).compile()
         assert len(list((tmp_path / "cache").iterdir())) > len(written)

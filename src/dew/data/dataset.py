@@ -248,7 +248,8 @@ class Budgeted(Protocol):
 
 
 class Forwarding:
-    """Forwards a stream wrapper's stop signal, stop budget, close, identity and endlessness to its source.
+    """Forwards a stream wrapper's stop signal, stop budget, close, identity, endlessness and whether its
+    shares run out together to its source.
 
     Subclasses keep the source at `_source` and override `close` for their own
     cleanup around `super().close()`.
@@ -287,6 +288,10 @@ class Forwarding:
     @property
     def endless(self) -> bool:
         return stream_endless(self._forwarded())
+
+    @property
+    def together(self) -> bool:
+        return stream_together(self._forwarded())
 
 
 _QUIET_STOP_SECONDS = 5.0
@@ -848,13 +853,25 @@ class Identified(Protocol):
     Each process of a pool opens its own stream, over its own copy of the
     corpus, and `Trainer.fit` refuses a pool whose streams name different
     records before any process reads one. It agrees every read of a stream
-    that may run out, so a process whose stream ran out stops its peers
-    before they step without it; an endless one is agreed at its first read.
+    that may run out on some processes and not others, so a process whose
+    stream ran out stops its peers before they step without it; an endless
+    one, or one whose shares run out together (`Together`), is agreed at its
+    first read.
     """
 
     endless: bool
 
     def identity(self) -> str: ...
+
+
+@runtime_checkable
+class Together(Protocol):
+    """A training stream whose every share runs out at the same read, by construction: one global
+    order cut into shares, each stepping as many batches of it (`GlobalStream`). No read of it after
+    its first can run out on some processes and not others, so a pool agrees none
+    (`dew.training._fit.FitRun.agrees`)."""
+
+    together: bool
 
 
 def batch_digest(batch: Batch) -> str:
@@ -943,6 +960,12 @@ def stream_endless(stream: Iterator[Batch] | None) -> bool:
     """Whether `stream` says it never runs out (`Identified`), as Dew's
     global streams do."""
     return isinstance(stream, Identified) and stream.endless
+
+
+def stream_together(stream: Iterator[Batch] | None) -> bool:
+    """Whether `stream` says its every share runs out at the same read (`Together`), as one global
+    order does."""
+    return isinstance(stream, Together) and stream.together
 
 
 def tapped(stream: Reader, on_batch: Callable[[Batch], None]) -> Reader:
@@ -1221,9 +1244,15 @@ class GlobalStream:
     it and a restore whose plan disagrees is refused (`Plan.check`).
     `dew.position` defines the format that both this class and
     `dew.checkpoints` read.
+
+    Every share steps as many batches of the order, its whole batches where
+    it drops a remainder, and else a share past the order's last batch
+    reading on with batches of no real row (`dew.data.lowering._evened`), so
+    where it ends, the shares run out at the same read (`together`).
     """
 
     endless = True
+    together = True
 
     def __init__(
         self,
@@ -1287,7 +1316,11 @@ class GlobalStream:
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
         if saved.plan is not None:
-            self.manifest_changes = self._plan.check(saved.plan, resume=self._resume)
+            from dew.data.plan import earlier_plan
+
+            # The saved position's one translation (`earlier_plan`), then its check.
+            translated = earlier_plan(saved.plan, self._plan)
+            self.manifest_changes = self._plan.check(translated, resume=self._resume)
         if saved.completed:
             raise ValueError(
                 f"the saved data position is {saved.records} records into a phased run "

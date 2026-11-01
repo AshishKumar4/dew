@@ -25,7 +25,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import parameter_loss
-from reference_error import as_given, assert_as_exact, seeds_for
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, seeds_for
 from scipy import stats
 
 from dew.batch import FROZEN
@@ -535,3 +535,35 @@ def test_a_model_that_maps_its_layers_is_refused():
     batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
     with pytest.raises(ValueError):
         gradient(objective, variables, batch, jax.random.key(0))
+
+
+def test_the_estimates_forward_derivative_is_its_reverse_estimate_transposed():
+    """The estimate's own forward derivative (row 2690), in float64: the loss's tangent along each trained
+    parameter's every coordinate (`jax.jacfwd`) is the reverse estimate's entry there at the same step's
+    draws, one estimated derivative applied forward and transposed."""
+    with jax.enable_x64(new_val=True):
+        objective = Forward(Linear(dtype=jnp.float64), lambda outputs, batch: jnp.sum(
+            jnp.square(outputs - batch["y"]), -1), inputs=InputSpec(Field("x", (3,))), draws=4)
+        variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), objective.init(jax.random.key(0)))
+        batch = {name: jnp.asarray(value, jnp.float64) for name, value in rows((3,)).items()}
+        loss = parameter_loss(objective, variables, batch, Step(jnp.asarray(0), jax.random.key(1), None))
+        forward = jax.tree.leaves(jax.jacfwd(loss)(variables["params"]))
+        reverse = jax.tree.leaves(jax.grad(loss)(variables["params"]))
+    # Each entry sums its 16 rows' rewards over 4 draws, each reward its two outputs' squared errors.
+    assert_computes_the_oracle(np.concatenate([np.ravel(leaf) for leaf in forward]),
+                               np.concatenate([np.ravel(leaf) for leaf in reverse]),
+                               "the estimate's forward derivative", roundings=16 * 4 * 2)
+
+
+def test_a_node_perturbation_estimate_refuses_to_summarize_cotangents():
+    """A node perturbation step, which trains on its estimate of the gradient and backpropagates nothing,
+    refuses to summarize its watched modules' cotangents as it traces (row 2324 review): there is no loss
+    cotangent at a module to summarize, rather than one of no entries."""
+    from dew.nn.inspection import Watched
+    from dew.training.transaction import probed_loss
+
+    objective = Forward(Linear(), squared, inputs=InputSpec(Field("x", (3,))), draws=4)
+    variables = objective.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(1), None, watched=Watched(("Dense",), cotangents=True))
+    with pytest.raises(ValueError):
+        probed_loss(objective, variables, rows((3,)), step)

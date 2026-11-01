@@ -509,15 +509,48 @@ class StreamedBank:
         def read(offset, _dependency):
             position = self.first + int(offset)
             following = position + 1 if int(offset) + 1 < self.count else self.following
-            return self.source.read(position, namespace=self.namespace, following=following)
+            return jax.tree.map(_in_words, self.source.read(position, namespace=self.namespace,
+                                                            following=following))
 
         # Only a scalar is copied to the host. Its data dependence orders a
         # fetch after the preceding layer, while allowing this layer's
         # compute to overlap the next host read and device transfer.
         hidden = dependency.streams if isinstance(dependency, Carried) else dependency
+        shapes = self.shapes()
         with jax.named_scope("ssd_bank_fetch"):
-            return io_callback(read, self.shapes(), index, hidden.reshape(-1)[0],
-                               sharding=self.device, ordered=True)
+            fetched = io_callback(read, jax.tree.map(_word_shape, shapes), index, hidden.reshape(-1)[0],
+                                  sharding=self.device, ordered=True)
+            return jax.tree.map(_from_words, fetched, shapes)
+
+
+def _wide(dtype: np.dtype) -> bool:
+    """Whether `dtype` is a 64-bit float or integer, which a thread without `jax.enable_x64` narrows."""
+    return dtype.kind in "fiu" and dtype.itemsize == 8
+
+
+def _word_shape(shape: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+    """The shape `StreamedBank.fetch` declares for a leaf its callback returns. A 64-bit leaf crosses as
+    its 32-bit words.
+
+    `jax.enable_x64` is thread-local, and JAX narrows a callback's results by it on the thread XLA runs
+    the callback on. XLA runs it on one of its workers where the graph before it is wide, a thread that
+    never set it, and JAX then refuses a float64 row ("Incorrect output dtype for return value", ledger
+    2467). Words are 32-bit on every thread. A program without x64 declares the leaf as it is, which JAX
+    refuses by name.
+    """
+    if jax.config.jax_enable_x64 and _wide(shape.dtype):
+        return jax.ShapeDtypeStruct((*shape.shape, 2), np.uint32)
+    return shape
+
+
+def _in_words(leaf: np.ndarray) -> np.ndarray:
+    """A host leaf as its callback returns it (`_word_shape`). A 64-bit leaf is a view of its bits."""
+    return leaf.reshape(-1).view(np.uint32).reshape(*leaf.shape, 2) if _wide(leaf.dtype) else leaf
+
+
+def _from_words(fetched: jax.Array, shape: jax.ShapeDtypeStruct) -> jax.Array:
+    """A fetched leaf as the layer reads it (`_word_shape`). A 64-bit leaf's words are its numbers again."""
+    return jax.lax.bitcast_convert_type(fetched, shape.dtype) if _wide(shape.dtype) else fetched
 
 
 def bank_sharding(row: NamedSharding, *, memory_kind: str | None) -> NamedSharding:

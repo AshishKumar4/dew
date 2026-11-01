@@ -7,6 +7,7 @@ under one placement, whichever backend compiles it. What it costs and its execut
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import dataclasses
+import itertools
 import json
 
 import jax
@@ -69,6 +70,43 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     ahead.save(destination)
     saved = AheadOfTime.load(destination)
     assert saved.plan == ahead.plan and saved.program == ahead.program
+
+
+def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_fewer_microbatches(
+        tmp_path, monkeypatch):
+    """With its frontier asked, a step compiled ahead on GPUs whose memory its plan needs several
+    microbatches for reports, past the plan it takes and saves, each rung above it that fits at fewer
+    microbatches than every plan before it, at the fewest that fit there (rows 2115, 3108, 3110): the plans
+    a run's speed is chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it
+    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=700_000, frontier=True)
+    plan = record(ahead.plan, "plan")
+    probes = listed(plan["probes"], "probes", read=record, what="probes")
+    frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    splits = [plan["split"], *(entry["split"] for entry in frontier)]
+    assert len(frontier) >= 2 and all(entry["fits"] is True for entry in frontier)
+    assert all(isinstance(more, int) and isinstance(fewer, int) and fewer < more
+               for more, fewer in itertools.pairwise(splits))
+    rungs = [json.dumps({name: entry[name] for name in ("remat", "head_tile", "head_fused")}, sort_keys=True)
+             for entry in (plan, *frontier)]
+    assert len(set(rungs)) == len(rungs)
+    assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+
+
+def test_compiling_ahead_with_its_frontier_on_gpus_of_no_stated_memory_is_refused(tmp_path, monkeypatch):
+    """A frontier asked of compile-only GPUs that state no memory is refused before anything compiles
+    (row 3107): their memory unknown, every rung would fit there, a frontier of the whole ladder."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
+    with Compiles("step") as compiles, pytest.raises(ValueError):
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    assert compiles.count == 0
 
 
 def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):
@@ -156,6 +194,22 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
         loaded.loaded()
 
 
+@pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
+def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
+    """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process
+    that assembles for that generation alone (`compile_mosaic_kernels`): its PTX targets the
+    architecture-specific variant (sm_90a, sm_100a, sm_120a), which the device's capability states, so it
+    assembles. An sm120 stating no feature extension assembled for plain sm_120 and refused its own PTX
+    ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, staged_copy
+
+    kernel = staged_copy((64, 64), jnp.bfloat16)
+    spec = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
+    record, = compile_mosaic_kernels([KernelCase("copy", lambda: (kernel, (spec,)), {})], generation)
+    assert "error" not in record, record["error"]
+
+
 @pytest.mark.mesh(devices=8)
 def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
     """A trainer whose mesh is this host's own devices runs its step here; compiling it ahead is
@@ -215,6 +269,31 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
     assert saved.capacity == 2**30 and saved.plan is not None
     assert not runs.exists()
+
+
+def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
+    """`--trainer.compile-ahead.frontier` (`RunConfig.cli`) asks the step compiled ahead for its frontier,
+    which its saved plan records (rows 3108, 3147): on GPUs of 0.0007 GiB, where the plan needs two
+    microbatches, a rung above it that fits at one."""
+    from run_kinds import lm
+
+    from dew.config.lm import LMRunConfig
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
+                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
+                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
+                           "--trainer.compile-ahead.capacity-gib", "0.0007",
+                           "--trainer.compile-ahead.frontier"],
+                          default=lm(tmp_path, drawn=False))
+    with pytest.raises(CompiledAhead) as ended:
+        run.run()
+    assert ended.value.code == 0
+    plan = record(AheadOfTime.load(path).plan, "plan")
+    frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    assert plan["split"] == 2 and frontier
+    assert all(entry["fits"] is True and entry["split"] < plan["split"] for entry in frontier)
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_stated_links(tmp_path):
@@ -287,7 +366,10 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
 
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
-    stated = ["--trainer.checkpoint-dir", str(runs), "--trainer.examples", "48",
+    # Its tickets stream, of no record count, so its evaluations and checkpoints are counted in steps
+    # (ledger 3153).
+    stated = ["--trainer.checkpoint-dir", str(runs), "--trainer.examples", "48", "--trainer.eval-every", "3",
+              "--trainer.checkpoint-every", "3",
               "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
               "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
               "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']

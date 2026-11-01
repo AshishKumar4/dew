@@ -506,12 +506,30 @@ class Drawing:
         params = {"w": jnp.asarray(.2, jnp.float64 if wide else jnp.float32)}
         batch = {"y": np.arange(4, dtype=np.float32)}
         places = jnp.arange(4, dtype=jnp.int32)
-        fields = {"step": jnp.asarray(0), "key": jax.random.key(3), "ema": None,
-                  "example_key": jax.random.key(4), "example_index": places, "example_count": 4}
-        loss, kinds = tool.recording_loss(self.objective(), {}, fields)
+        from dew.objectives.base import Step
+
+        step = Step(jnp.asarray(0), jax.random.key(3), None, example_key=jax.random.key(4),
+                    example_index=places, example_count=4)
+        loss, kinds = tool.recording_loss(self.objective(), {}, step)
         tool.audited(loss, kinds, params, batch, "drawing", wide=wide)
         _, values = loss(params, batch)
         return tool.witnessed({"values": values, "example_index": places}, "drawing")
+
+
+def test_layout_parity_reads_the_first_step_as_the_trainer_does():
+    """The tool's first step is the trainer's (`first_step`, `attempt_step`, ledger 3057): after updates
+    the run committed, the step its arms and its float64 anchor read states them, as a model reading the
+    run's progress reads them, where a step built by hand stated none and traced the run's end."""
+    import optax
+
+    from dew.training import Trainer
+
+    tool = load("layout_parity")
+    state = Trainer(Drawing().objective(), optax.sgd(0.1), key=jax.random.key(0)).initial_state()
+    state = state.replace(updates=jnp.asarray(5, jnp.int32))
+    batch = {"y": np.arange(4, dtype=np.float32)}
+    step = tool.first_step(state, state.variables, None, batch)
+    assert int(step.committed) == 5 and step.example_count == 4
 
 
 def test_layout_parity_holds_every_arm_to_the_references_sample():
@@ -883,6 +901,40 @@ def test_kernel_sums_preserve_decode_categories_counts_and_overlapping_streams(s
     assert sum(durations.values()) > split["busy"]
 
 
+
+def test_the_shared_image_set_reads_its_shards_in_the_order_given_as_dew_decodes_a_prepared_image(
+        tmp_path, monkeypatch):
+    """tools/reference_runs/image_set.py reads its prepared ArrayRecord shards through Dew's reader in the
+    order its command line names them, each record's pixels as Dew decodes a prepared image
+    (`DecodeImage`, its integers little-endian), and draws its epochs from its seed (row 3030)."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+
+    images = [np.arange(18, dtype=np.uint8).reshape(2, 3, 3) + 20 * value for value in range(5)]
+    shards = [str(tmp_path / f"{name}.array_record") for name in ("b", "a")]
+    for path, held in zip(shards, (images[:3], images[3:]), strict=True):
+        writer = ArrayRecordWriter(path, "group_size:1")
+        for image in held:
+            writer.write(pack_dict_of_byte_arrays({"shape": np.asarray([2, 3], "<i4").tobytes(),
+                                                   "image": image.tobytes(),
+                                                   "label": np.asarray([7], "<i4").tobytes()}))
+        writer.close()
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    tool = load("reference_runs/image_set")
+    out = tmp_path / "set.npz"
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "4", "--epochs", "2",
+                                      "--seed", "3", "--out", str(out)])
+    tool.main()
+    saved = np.load(out)
+    generator = np.random.default_rng(3)
+    np.testing.assert_array_equal(saved["images"], np.stack(images[:4]))
+    np.testing.assert_array_equal(saved["order"], np.stack([generator.permutation(4) for _ in range(2)]))
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "6",
+                                      "--out", str(out)])
+    with pytest.raises(ValueError):
+        tool.main()
+
 # ---------------------------------------------------------------------------
 # tools/reference_runs/scoreboard.py
 # ---------------------------------------------------------------------------
@@ -907,7 +959,7 @@ def test_the_host_offload_benchmark_counts_each_parameter_in_the_memory_space_it
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
 
-def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows():
+def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows(tmp_path):
     """The benchmark's samples are the task's own walk and decode, read back as their real rows: a
     pixel-space model's too, which has no autoencoder, and its twelve prompts once on eight devices,
     which the walk pads to sixteen rows, so quality() scores twelve images against twelve prompts."""
@@ -937,8 +989,15 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
     scaled = TextToImage(Scaled(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
                          InputSpec(Field("image", (2, 2, 1))), {"params": {"scale": jnp.ones(())}}, steps=1,
                          guidance=None, solver=Euler())
-    row = tool.forward(scaled)
+    # The model's program's options reach the timed executable: an option `compiled_with` adds is one of
+    # them, and a bare jit of the step dumps nothing (row 3062); the prompts' own programs dump apart.
+    dumps = tmp_path / "dumps"
+    from dew.nn.kernels import options
+
+    with options.compiled_with({"xla_dump_to": str(dumps)}):
+        row = tool.forward(scaled)
     assert row["forward_ms"] > 0 and row["weights_mib"] >= 0
+    assert any(dumps.glob("*jit_step*.txt"))
 
 
 # ---------------------------------------------------------------------------
@@ -1790,6 +1849,27 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "    return yaml\n"), "SLOP019", (5, 17, 22, 37, 54, 81))
 
 
+def test_a_bare_jit_in_a_package_that_compiles_through_dews_compile_point_is_reported(tmp_path):
+    """SLOP025: in a package whose programs compile through `OuterProgram` (RL's, serving's), a bare
+    `jax.jit` as a decorator, a call, within functools.partial or imported by its own name, is
+    reported; a program that compiles through `OuterProgram` is not, nor a jit in another package."""
+    rollout = ("import functools\n"
+               "import jax\n"
+               "from jax import jit\n"
+               "from dew.nn.kernels.options import OuterProgram\n"
+               "@jax.jit\n"
+               "def acted(x): return x\n"
+               "stepped = jax.jit(acted)\n"
+               "partial = functools.partial(jax.jit, static_argnums=0)\n"
+               "imported = jit(acted)\n"
+               "@OuterProgram\n"
+               "def compiled(x): return x\n")
+    for package in ("rl", "objectives/rl", "inference"):
+        assert_reported(tmp_path / package.replace("/", "-"), f"src/sparx/{package}/rollout.py", rollout,
+                        "SLOP025", (5, 7, 8, 9))
+    assert _linted(tmp_path / "other", {"src/sparx/training/step.py": rollout}) == []
+
+
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
     """SLOP012: a script that replaces or deletes the package's own functions,
     by any assignment or `setattr`, and a library that does so to anything it
@@ -1975,6 +2055,57 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
     next(pictures)
     assert {key: value for key, value in pictures.counts.get().items() if key != "padded_tokens"} == {
         "rows": 2, "tokens": 2, "model_flops": None}
+
+
+def test_the_data_benchmark_rates_its_training_window_over_the_whole_mesh_as_the_trainer_does():
+    """The data benchmark's training window is rated as the trainer's interval rates its steps
+    (`dew.training.interval.throughput`): the objective's work on the host's whole batch over the peak of
+    every device the step's mesh spans, not over one device's, and the compiled work, each device's, a
+    lower bound beside the launches it left out (row 3023)."""
+    from dew.nn.kernels.generation import gpu_target
+    from dew.telemetry.instrumentation import StepFlops
+
+    tool = load("benchmark_data")
+    peak = gpu_target("a100").bf16_peak
+    work, compiled = 3.0e13, StepFlops(2.0e12, 4.0e12)
+    rates = tool.rated(2.0, 2, 16, compiled, work, 8, peak=peak)
+    assert rates["model_mfu_bf16_peak"] == work / 8 / 2 / (2.0 / 2) / peak
+    assert rates["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert rates["unsized_kernels_per_step"] == 0
+    uncounted = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 6.0), None, 8, peak=peak)
+    assert uncounted["model_mfu_bf16_peak"] is None
+    assert uncounted["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert uncounted["unsized_kernels_per_step"] == 3.0
+
+
+@pytest.mark.mesh
+def test_the_data_benchmark_reports_a_steps_uncounted_launches_beside_its_utilization():
+    """A step that runs a launch no count sizes (here LAPACK's Cholesky on a CPU, which no table
+    knows) is reported as the trainer reports it, beside the launches it left out, so its compiled work
+    reads as the lower bound it is, never as a complete count (row 3023)."""
+    import itertools
+
+    from flax import linen as nn
+
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.supervised import Supervised
+
+    class Factored(nn.Module):
+        @nn.compact
+        def __call__(self, image):
+            values = nn.Dense(3)(jnp.mean(image.astype(jnp.float32), axis=(1, 2)))
+            gram = values.T @ values + jnp.eye(3)
+            return values @ jnp.linalg.cholesky(gram)
+
+    tool = load("benchmark_data")
+    worker = tool.Worker("dew", "image", Path("in"), Path("out"),
+                         tool.Measurement(batch=8, image_size=4, warmup=1, train_steps=2))
+    objective = Supervised(Factored(), lambda outputs, batch: jnp.mean(jnp.square(outputs), axis=-1),
+                           inputs=InputSpec(Field("image", (4, 4, 3))))
+    batch = {"image": np.ones((8, 4, 4, 3), np.uint8)}
+    measured = tool.training_measure(lambda: itertools.repeat(batch), objective, worker)
+    assert measured["unsized_kernels_per_step"] >= 1
+    assert measured["model_mfu_bf16_peak"] is None
 
 
 def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypatch):

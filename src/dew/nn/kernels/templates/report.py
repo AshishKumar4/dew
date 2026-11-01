@@ -24,8 +24,12 @@ from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
 from jax.extend.mlir import ir
 
+from dew import communicators
 from dew.nn.kernels import generation
 
+SHARED_REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
+"""XLA's refusal of a program one of whose Triton kernels asks more shared memory than a block holds,
+which names no kernel."""
 LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 """The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
@@ -47,6 +51,8 @@ MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
 SHARED_BYTES = 10
 """The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
+ELF = b"\x7fELF"
+"""A cubin's first bytes."""
 REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
 (EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
@@ -83,6 +89,8 @@ class _Registry:
     kernels that spilled, and each miss."""
     refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
     missed: list["Miss"] = dataclasses.field(default_factory=list)
+    rewritten: list = dataclasses.field(default_factory=list)
+    """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
 
 
 _PROCESS = _Registry()
@@ -105,16 +113,17 @@ class Exhausted(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class Miss:
-    """A kernel a run's compile found spilling (`compiled`): its name, its launch's op and config (None
-    where no launch of this process traced it), its registers and its stack frame's bytes a thread
-    (`Binary.frame`), and whether its launch's config was refused and its program lowered again
-    (`stepped`)."""
+    """A kernel a run's compile found spilling, or a program whose block XLA refused (`compiled`): its
+    kernel's name, its launch's op and config (None where no launch of this process traced it), its
+    registers and its stack frame's bytes a thread (`Binary.frame`) or the shared bytes it asked
+    (`shared`), and whether its launch's config was refused and its program lowered again (`stepped`)."""
     kernel: str
     op: str | None
     config: Hashable | None
     registers: int | None
     frame: int | None
     stepped: bool
+    shared: int | None = None
 
 
 def _identity(op, arguments: tokamax.BoundArguments) -> str:
@@ -226,6 +235,20 @@ def misses() -> tuple[Miss, ...]:
         return tuple(_registry().missed)
 
 
+def record_rewrite(made) -> None:
+    """Record one region the algebra pass rewrote (`dew.algebra.program.AlgebraReport`) beside the kernels'
+    misses, as each program traces."""
+    with _GUARD:
+        _registry().rewritten.append(made)
+
+
+def rewrites() -> tuple:
+    """The regions the algebra pass rewrote as this process's programs traced (`record_rewrite`), for a
+    run's telemetry: a `refusals` scope's own within it."""
+    with _GUARD:
+        return tuple(_registry().rewritten)
+
+
 @contextlib.contextmanager
 def refusals() -> Iterator[None]:
     """Within the block, this context's compiles refuse and record apart from the process's (a test's
@@ -266,6 +289,15 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
              relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
+    """`lowered` compiled (`kept`), its communicators admitted against the room the process's pool left
+    them before it runs (`dew.communicators.admit`): every program Dew compiles passes here."""
+    executable = kept(lowered, options, relower=relower)
+    communicators.admit(executable)
+    return executable
+
+
+def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
+         relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
     """`lowered` compiled, read through its kernels' binaries (`binaries`): where a kernel of a template's
     launch spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
     program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
@@ -273,8 +305,15 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     again, so every process derives the program this compile keeps; a relowering whose derivations find no
     config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
     only when a replacement compiles, so a later process derives the program kept here. A program loaded
-    from the persistent compilation cache carries its kernels' binaries as one compiled here does."""
-    executable, spilling = _compiled_reported(lowered, options)
+    from the persistent compilation cache carries its kernels' binaries as one compiled here does. A
+    program whose block XLA refuses steps one of its Triton launches down (`_unblocked`)."""
+    try:
+        executable, spilling = _compiled_reported(lowered, options)
+    except jax.errors.JaxRuntimeError as error:
+        asked = SHARED_REFUSED.search(str(error))
+        if asked is None:
+            raise
+        return _unblocked(lowered, options, relower, int(asked.group(1)), error)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
     if not refusals:
@@ -295,6 +334,50 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     # them derive a third program, not the one this compile keeps and runs.
     _recorded(_misses_of(spilling), stepped=False)
     return replacement
+
+
+def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+               relower: Callable[[], jax.stages.Lowered], asked: int,
+               error: Exception) -> jax.stages.Compiled:
+    """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled with
+    one of its Triton launches' configs refused, as a spill refuses one (`kept`): XLA's refusal names no
+    kernel, so each launch the program's Triton kernels name (`kernel_of`, their launches' digests) is
+    tried alone, in the program's order, and the first whose step-down compiles is kept, its miss
+    recorded and logged; none compiling, the refusal stands, each a miss not stepped."""
+    from dew.training._lowering import kernel_calls
+
+    tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
+    # Every Triton kernel XLA compiles, a branch no run reaches too (a guarded forward's rewalk).
+    for call in kernel_calls(lowered, unrun=True):
+        kernel, digest = kernel_of(call.name)
+        launch = None if call.kind != "triton" or digest is None else traced(digest)
+        if launch is not None:
+            tried.setdefault((launch.identity, launch.config), (kernel, launch))
+    for refusal, (kernel, launch) in tried.items():
+        try:
+            with _proposing([(refusal, kernel)]):
+                replacement, spilling = _compiled_reported(relower(), options)
+        except Exhausted:
+            continue
+        except jax.errors.JaxRuntimeError as again:
+            if SHARED_REFUSED.search(str(again)) is None:
+                raise
+            continue
+        _record(refusal, None, frozenset({kernel}))
+        _missed_block(kernel, launch, asked, stepped=True)
+        _recorded(_misses_of(spilling), stepped=False)
+        return replacement
+    for kernel, launch in tried.values():
+        _missed_block(kernel, launch, asked, stepped=False)
+    raise error
+
+
+def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:
+    """A Triton launch's shared-memory miss recorded and logged (`_unblocked`), under its first kernel's
+    name: XLA's refusal names none."""
+    _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked))
+    _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
+                 kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
 
 
 def _misses_of(spilling: list["Binary"]) -> list[tuple[tuple[str, Hashable] | None, "Binary", Launch | None]]:
@@ -332,10 +415,11 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
 
 @dataclasses.dataclass(frozen=True)
 class Binary:
-    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name less the launch it
-    carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its stack frame's
-    bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and the dynamic
-    shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto states none."""
+    """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
+    the launch it carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its
+    stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and
+    the dynamic shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto
+    states none."""
     kernel: str
     launch: str | None
     registers: int
@@ -344,13 +428,15 @@ class Binary:
 
 
 def binaries(executable: jax.stages.Compiled) -> list[Binary]:
-    """Every Mosaic GPU kernel binary `executable` carries, read from its own serialized form: XLA keeps each
-    kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this compile ran ptxas for
-    it, another thread's program compiled it first (Mosaic compiles a module once a process), or the
-    executable was loaded from the persistent cache. Nothing is read from or written to the process's
-    environment or disk: a compile that set Mosaic's dump settings around itself handed its directory to
-    every other thread's compile and removed it under them ('Directory not empty', row 2790), and the
-    settings turn on every dump Mosaic has (row 2816)."""
+    """Every Mosaic GPU and Pallas-Triton kernel binary `executable` carries, read from its own serialized
+    form: XLA keeps a Mosaic kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this
+    compile ran ptxas for it, another thread's program compiled it first (Mosaic compiles a module once a
+    process), or the executable was loaded from the persistent cache, and a Pallas-Triton template
+    launch's on its thunk itself (its `binary`, which a Mosaic thunk leaves empty), its kernel naming its
+    launch. Nothing is read from or written to the process's environment or disk: a compile that set
+    Mosaic's dump settings around itself handed its directory to every other thread's compile and removed
+    it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has (row
+    2816)."""
     from jax._src.thunky import thunky
 
     found: list[Binary] = []
@@ -360,7 +446,14 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
 
         def visit(operation: ir.Operation) -> ir.WalkResult:
             if operation.name == "thunky.call_thunk_proto":
-                found.extend(thunk_kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes))
+                attributes = operation.attributes
+                found.extend(thunk_kernels(ir.StringAttr(attributes["thunk_proto"]).value_bytes))
+                elf = ir.StringAttr(attributes["binary"]).value_bytes if "binary" in attributes else b""
+                name = ir.StringAttr(attributes["kernel_name"]).value
+                # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins so too: a template
+                # launch's names its launch (`named`).
+                if elf[:4] == ELF and LAUNCH_SUFFIX.search(name):
+                    found.append(_binary(name, elf))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
@@ -391,7 +484,7 @@ def _kernels(message: bytes) -> tuple[list[Binary], int]:
         fields.setdefault(field.field_number, []).append(field.data)
     binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
-            and isinstance(binary[0], bytes) and binary[0][:4] == b"\x7fELF" and isinstance(name[0], bytes)):
+            and isinstance(binary[0], bytes) and binary[0][:4] == ELF and isinstance(name[0], bytes)):
         stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
         return [dataclasses.replace(_binary(name[0].decode(), binary[0]), shared=stated)], 0
     found, calls = [], 0

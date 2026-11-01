@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, OWN_FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
 
 from dew.interop import torchax_fallback
 from dew.nn import precision
@@ -29,6 +29,29 @@ def test_an_embedding_lookup_holds_every_order(edge):
     (cotangent,) = normal_draw(1871, (2, 4, 6))
     assert_contract(lambda table: table_rows(table, ids, table.dtype), (table,), (direction,), cotangent,
                     f"an embedding lookup {edge}")
+
+
+def test_an_embedding_lookup_over_ids_split_on_an_explicit_axis_takes_every_order():
+    """`blocks.table_rows` over ids split along an Explicit data axis, where the rows are fewer than the
+    table so the backward gathers them whole (row 3150): its gradient, the jvp of its gradient and the
+    gradient of its gradient run and are finite, the ids' zero cotangent typed as the ids arrive, not as
+    the gather holds them."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
+    whole, split = NamedSharding(mesh, P()), NamedSharding(mesh, P("data", None))
+    table, direction = (jax.device_put(jnp.asarray(drawn), whole)
+                        for (drawn,) in (normal_draw(3150, (64, 8)), normal_draw(3151, (64, 8))))
+    with jax.set_mesh(mesh):
+        ids = jax.device_put(jnp.asarray(np.arange(16).reshape(4, 4) * 5 % 64, jnp.int32), split)
+
+        def loss(table):
+            return jnp.sum(table_rows(table, ids, table.dtype) ** 3)
+
+        gradient = jax.grad(loss)
+        orders = (gradient(table), jax.jvp(gradient, (table,), (direction,))[1],
+                  jax.grad(lambda table: jnp.vdot(gradient(table), direction))(table))
+    assert all(np.all(np.isfinite(np.asarray(order))) for order in orders)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -277,15 +300,14 @@ def group_peaks(x, groups: int, features: int):
 
 @pytest.mark.parametrize(("groups", "edge"), list(itertools.product((1, 2), EDGES)))
 def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
-    """A quantized convolution under Qwix's quantized training, one group and two (`quantization`'s grouped
-    convolution, a custom VJP whose backward is the float convolution's transpose at the dequantized
-    operands): every order it takes finite wherever float64 is a normal float32 and the convolution of the
-    operands quantized to int8 and back (each example's scale, each output feature's; a grouped input first
-    over each example's peak in each group, restored on that group's outputs) is, its reverse mode the float
-    convolution's transpose at the dequantized operands, as the seam declares, and a derivative of that
-    through the quantization, the scales' included (`quantized_convolution`); it takes no
-    forward derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient
-    running."""
+    """A quantized convolution under Qwix's quantized training, one group and two (`quantization`'s
+    `quantized_training`, a surrogate whose derivative is the float convolution's at the dequantized
+    operands): every order finite wherever float64 is a normal float32 and the convolution of the operands
+    quantized to int8 and back (each example's scale, each output feature's; a grouped input first over
+    each example's peak in each group, restored on that group's outputs) is, its forward derivative the
+    float convolution's at the dequantized operands, as the seam declares, its reverse mode that
+    derivative's transpose, and a second derivative one of that through the quantization, the scales'
+    included (`quantized_convolution`)."""
     from dew.nn.conv import Conv
     from dew.quantization import Quantization
 
@@ -304,7 +326,7 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
     direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
     (cotangent,) = normal_draw(1136, (1, 6, 6, 8))
     assert_contract(convolved, primals, direction, cotangent, f"a quantized convolution of {groups} {edge}",
-                    truth_fn=plain, plain_fn=plain, without=OWN_FORWARD_ORDERS)
+                    truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)

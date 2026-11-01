@@ -30,7 +30,7 @@ import contextlib
 import dataclasses
 import functools
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import Literal, overload
 
 import jax
@@ -39,6 +39,9 @@ import numpy as np
 from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
+
+from dew.nn.derivatives import surrogate
+from dew.nn.sharding import explicit_spec
 
 __all__ = [
     "ACCURATE",
@@ -199,12 +202,49 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
     arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
     """
-    dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
-    # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
-    # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
-    # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
-    bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + spread(bias, product.shape).astype(dtype)
+    dtype = jnp.result_type(product, bias)
+    # The bias over the product's trailing axes, as flax's layers reshape it, so no rank is promoted
+    # implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds the round trip,
+    # so the product and bias fuse as before) and its gradient sums at fp32 (`broadcast_summed`).
+    leading = product.ndim - bias.ndim
+    spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
+    return product.astype(dtype) + spread_bias
+
+
+def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,
+                     dtype: DTypeLike | None = None) -> jax.Array:
+    """`jax.lax.broadcast_in_dim(value, shape, dimensions)` in `dtype` (the value's where None), whose
+    gradient, the sum of a cotangent over every position the value spread over, sums at fp32 or wider
+    and rounds once to the value's dtype, as torch's autograd sums a bf16 one: the value widened to fp32
+    between exact casts and spread (`spread`), which a CPU running Dew's wide arithmetic sums in
+    float64, then cast to `dtype`, so a cotangent wider than the value sums before it rounds. Every
+    order JAX forms its transpose at takes it, forward mode's included. A bias's spread (`biased`, in
+    the dtype its addition promotes to) and a tier-3 model's broadcasts (`dew.interop.torchax_fallback`)
+    are each this (ledger 3038)."""
+    wide = at_least_fp32(value.dtype)
+    kept = iter(value.shape)
+    placed = tuple(next(kept) if axis in dimensions else 1 for axis in range(len(shape)))
+    spread_value = spread(jnp.reshape(value.astype(wide), placed), shape)
+    return spread_value.astype(value.dtype if dtype is None else dtype)
+
+
+def _doubled(value: jax.Array, shape: tuple[int, ...], axes: tuple[int, ...]) -> jax.Array:
+    """`value` broadcast to `shape` over its size-one `axes` by doubling: along each axis each entry is
+    paired with itself until the axis is covered, then cut to it, so JAX's transpose at any order sums a
+    cotangent over that axis pairwise, neighbours added level by level, and a cotangent split into
+    blocks over devices adds within each until a block is one entry. The broadcast's transpose is
+    XLA's reduction, which a CPU sums in an order up to twice torch's error at a few hundred rows of
+    16 channels (ledger 1698's Z-Image bias); the pairs' tree is under torch's at every size measured,
+    in the reduction's time."""
+    for axis in axes:
+        count = shape[axis]
+        while value.shape[axis] < count:
+            paired = jnp.stack([value, value], axis=axis + 1)
+            # The doubled axis keeps the value's placement, an Explicit axis's on a size-one one among it.
+            doubled = (*value.shape[:axis], 2 * value.shape[axis], *value.shape[axis + 1:])
+            value = jax.lax.reshape(paired, doubled, out_sharding=explicit_spec(value))
+        value = jax.lax.slice_in_dim(value, 0, count, axis=axis)
+    return value
 
 
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
@@ -212,12 +252,23 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
     tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
     broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
-    or where `accumulated` leaves a product its own sum, it is the broadcast, whose transpose JAX
-    sums in the value's dtype."""
+    or where `accumulated` leaves a product its own sum, a CPU spreads a floating value by doubling
+    (`_doubled`), so its transpose sums pairwise in the value's dtype, and an accelerator broadcasts
+    it, whose transpose JAX sums in the value's dtype. A value an Explicit axis places along an axis it
+    spreads over (never a bias, whose leading axes `biased` adds) is broadcast: neither form keeps that
+    placement on a dropped or doubled size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
-    if not axes or not _sums_in_float64(value):
+    placed = explicit_spec(value)
+    if not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes)):
         return jnp.broadcast_to(value, shape)
+    if not _sums_in_float64(value):
+        if not jnp.issubdtype(value.dtype, jnp.floating):
+            return jnp.broadcast_to(value, shape)
+        # A CPU sums the transpose pairwise (`_doubled`); an accelerator's reduction is a tree already.
+        return jax.lax.platform_dependent(
+            value, cpu=functools.partial(_doubled, shape=tuple(shape), axes=axes),
+            default=functools.partial(jnp.broadcast_to, shape=tuple(shape)))
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
@@ -400,11 +451,63 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     products here. A computation that stands for such a target, a reference for a kernel interpreted
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
+    if not _sums_in_float64(*operands):
+        return product(*operands, preferred_element_type=preferred_element_type)
+    if (key := _contraction(product, preferred_element_type)) is not None:
+        return _traced_once(key)(*operands)
+    return _summed_wide(product, preferred_element_type, *operands)
+
+
+CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
+"""The contractions `accumulated` traces once a call (`_contraction`): JAX's own, whose trace states no
+derivative of its own (`_own_backward`) and depends on its operands' types and its arguments alone."""
+
+_JAX_CODE = (jax.lax.dot_general.__code__, jnp.einsum.__code__)
+"""The code of the contractions every other one calls through, as JAX defines it: a library that
+intercepts JAX's products in place (Qwix's `quantize_model` replaces `jax.lax.dot_general`'s and
+`jax.numpy.einsum`'s) changes it, and a trace cached before would skip the library's product."""
+
+
+def _contraction(product: Callable, preferred_element_type) -> tuple | None:
+    """`product` as a key of one of JAX's contractions (`CONTRACTIONS`, each as JAX defines it), bound through
+    plain `functools.partial`s around it (a subclass may call it otherwise) to arguments with no array among
+    them, with the dtype it is asked for: the contraction, the arguments' tree and their leaves; None for any
+    other product."""
+    function, arguments, keywords = product, (), {}
+    while isinstance(function, functools.partial) and type(function) is functools.partial:
+        arguments, keywords = function.args + arguments, {**function.keywords, **keywords}
+        function = function.func
+    intercepted = (jax.lax.dot_general.__code__, jnp.einsum.__code__) != _JAX_CODE
+    if intercepted or not any(function is contraction for contraction in CONTRACTIONS):
+        return None
+    leaves, tree = jax.tree.flatten((arguments, keywords, preferred_element_type))
+    if not all(isinstance(leaf, Hashable) and not isinstance(leaf, jax.Array | np.ndarray)
+               for leaf in leaves):
+        return None
+    return function, tree, tuple(leaves)
+
+
+@functools.lru_cache(maxsize=1024)
+def _traced_once(key: tuple) -> Callable:
+    """`_summed_wide` of the contraction `key` names (`_contraction`) as one program JAX traces once for its
+    operands' types: a gated delta net layer's portable chunked math sums some 64 contractions a call,
+    each traced afresh at about 6.6 ms (the wide sum, its derivative and the narrow one each traced
+    again), 130 s of a decision witness's trace under Dew's test arithmetic (row 3142). Its arithmetic is
+    the product's own, the call a nested program XLA inlines. The most recent 1024 contractions are kept,
+    a model's working set many times over."""
+    function, tree, leaves = key
+    arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
+    product = functools.partial(function, *arguments, **keywords)
+    return jax.jit(functools.partial(_summed_wide, product, preferred_element_type))
+
+
+def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Array:
+    """`accumulated`'s product under Dew's wide CPU arithmetic: its float64 sum where it takes the
+    platform's choice (`platform_dependent`), the plain product where its result is wider than float32 or
+    its library states its derivative."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if not _sums_in_float64(*operands):
-        return narrow(*operands)
     traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
     dtype = shape.dtype
     if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
@@ -711,6 +814,21 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
+PROTECTED = "dew_protected"
+"""The name scope an error-free transform's equations carry, which survives autodiff in each traced equation's
+name stack: `dew.algebra` never rewrites them, as reassociation would cancel the residual they keep."""
+
+
+def _protected(transform: Callable) -> Callable:
+    """`transform` traced under `PROTECTED`'s name scope."""
+    @functools.wraps(transform)
+    def traced(*args, **kwargs):
+        with jax.named_scope(PROTECTED):
+            return transform(*args, **kwargs)
+    return traced
+
+
+@_protected
 def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
     total = left + right
@@ -718,6 +836,7 @@ def two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
+@_protected
 def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
                 rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
@@ -870,6 +989,7 @@ def divided(numerator, rate):
     return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 
+@_protected
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
@@ -884,6 +1004,7 @@ def compensated_add(left, right):
     return two_sum(total, dropped + left_lo + right_lo)
 
 
+@_protected
 def compensated_difference(later, earlier):
     """`later - earlier` of two double-float values, rounded once: the halves'
     differences summed, so the difference of two near values (a range of a
@@ -994,10 +1115,8 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
                          tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
     return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
-def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
-    """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
-    straight-through tangent that is never rounded a second time.
+def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
+    """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
 
     The rounding is the cast itself, subnormals included. The barrier keeps
     `xla_allow_excess_precision` from deleting the round trip under jit, and
@@ -1010,10 +1129,10 @@ def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
-@rounded_operand.defjvp
-def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
-                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
-    return jnp.asarray(rounded_operand(primals[0], dtype)), tangents[0]
+rounded_operand = surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
+                            nondiff_argnums=(1,))
+"""The value `x` takes in `dtype`, held in `x`'s own dtype (`_rounded`), with a straight-through
+derivative (`dew.nn.derivatives.surrogate`): its tangent is `x`'s, never rounded a second time."""
 
 
 def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool:

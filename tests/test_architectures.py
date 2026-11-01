@@ -28,6 +28,7 @@ from architecture_cases import CASES, IDS, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKE
 from diffusion_stubs import StubText
 from diffusion_support import images_of
 from jepa_cases import MASK
+from map_judge import drawing
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -181,8 +182,8 @@ def run_case(case: Case, tmp_path, mesh: MeshSpec, devices=None, state=None, ste
                         metrics=(Spread(seen, artifact),), preview=True, state=state)
 
     assert dict(trainer.device_mesh.shape) == {
-        "data": (devices or jax.device_count()) // (mesh.fsdp * mesh.stage), "expert": 1, "fsdp": mesh.fsdp,
-        "tensor": 1, "sequence": 1, "stage": mesh.stage}
+        "diloco": 1, "data": (devices or jax.device_count()) // (mesh.fsdp * mesh.stage), "expert": 1,
+        "fsdp": mesh.fsdp, "tensor": 1, "sequence": 1, "stage": mesh.stage}
     assert int(state.step) == steps
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == steps and all(np.isfinite(loss) for loss in losses), losses
@@ -391,9 +392,32 @@ LAYOUT_CELLS = [*((case, steps, layout) for index, case in enumerate(CASES)
                 *((case, PIPELINED[case.name], "2x2x2 stage") for case in CASES if case.name in PIPELINED)]
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), LAYOUT_CELLS,
-                         ids=[f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
-                              for case, steps, layout in LAYOUT_CELLS])
+
+
+def cell_ids(cells) -> list[str]:
+    """Each layout cell's test id: its case, its steps and its layout's kind."""
+    return [f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
+            for case, steps, layout in cells]
+
+
+def cells_of(*names: str) -> list:
+    """The layout cells of the cases `names`."""
+    return [cell for cell in LAYOUT_CELLS if cell[0].name in names]
+
+
+THREE_D_UNET_CELLS = cells_of("unet_3d")
+UNET_CELLS = cells_of("unet")
+HIERARCHICAL_MMDIT_CELLS = cells_of("hierarchical_mmdit")
+QWEN35_CELLS = cells_of("causal_transformer+qwen35")
+"""The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
+with the seeds a task draws within 120 s on one core: a map task records its draws alone (70 to 93 s
+fixed, `map_judge.drawing`), its judge runs the cell whole but for them (row 2788)."""
+
+SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *QWEN35_CELLS]
+UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
     replicated, the batch split across every device), 2x4 fsdp (the
@@ -409,6 +433,42 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     orders of magnitude. The steps check 1 draws are `fit`'s own on the
     run's batch, bit for bit, each compiled once for every draw. Adam's two
     moments and its count follow the parameters' placement too."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), THREE_D_UNET_CELLS, ids=cell_ids(THREE_D_UNET_CELLS))
+@pytest.mark.check1_shards(seeds=32, per_task=8)
+def test_a_3d_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the 3D U-Net."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), UNET_CELLS, ids=cell_ids(UNET_CELLS))
+@pytest.mark.check1_shards(seeds=64, per_task=40)
+def test_a_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the U-Net."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), HIERARCHICAL_MMDIT_CELLS,
+                         ids=cell_ids(HIERARCHICAL_MMDIT_CELLS))
+@pytest.mark.check1_shards(seeds=8, per_task=3)
+def test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hierarchical
+    MMDiT."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), QWEN35_CELLS, ids=cell_ids(QWEN35_CELLS))
+@pytest.mark.check1_shards(seeds=64, per_task=16)
+def test_a_qwen35_decoder_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the Qwen3.5 decoder."""
+    assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
+
+
+def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
+    """A cell of `test_architecture_trains_on_every_layout_as_on_one_device`: `case` trained `steps` steps
+    on `layout` as on one device (check 1)."""
     trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
     initial = trainer.initial_state()
 
@@ -440,14 +500,17 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
 
     seeds = LAYOUT_SEEDS[case.name]
     mesh = LAYOUTS[layout]
-    _, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)
-    _, state, _ = run_case(case, tmp_path, mesh, state=copied(), steps=steps)
     drawn = {"one device": drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps),
              layout: drawn_steps(case, tmp_path, mesh, None, initial, steps)}
+    # A map task of a sharded cell (`map_judge.drawing`) records its draws alone: the fits, their bits
+    # and their placement are its judge's, which runs the cell whole but for the draws it pools.
+    fits = () if drawing() else (
+        run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)[1],
+        run_case(case, tmp_path, mesh, state=copied(), steps=steps)[1])
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
-    for fitted, stepped in zip((alone, state), drawn.values(), strict=True):
+    for fitted, stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
         ours = stepped(*own)
         for name, tree in ours.items():
             held = jax.device_get(getattr(fitted, name))
@@ -461,6 +524,9 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
     assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
                     seeds=seeds, truth_fn=truth, orders=orders)
+    if drawing():
+        return
+    state = fits[1]
     if mesh.fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return

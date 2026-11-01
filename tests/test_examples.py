@@ -32,6 +32,7 @@ from dew.diffusion.presets import Flow
 from dew.inference import TextToImage
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
+from dew.training import LocalTracker
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -118,7 +119,8 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
           "--batch-size", "8", "--sequence-length", "12", "--experts", "2", "--top-k", "1",
           smoke_args=False, devices=8)
     record = json.loads((out / "moe-mesh.json").read_text())
-    assert record["mesh"] == {"data": 2, "expert": 2, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}
+    assert record["mesh"] == {"diloco": 1, "data": 2, "expert": 2, "fsdp": 2, "tensor": 1, "sequence": 1,
+                              "stage": 1}
     assert len(record["devices"]) == 8 and record["dispatch"] == "exchange" and record["all_to_all_ops"] > 0
     assert [step["step"] for step in record["steps"]] == [1, 2]
     assert all(np.isfinite(step["loss"]) for step in record["steps"])
@@ -294,8 +296,8 @@ def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_
                  if real]
     assert sorted(captioned) == sorted(ids["test"])
     run = tmp_path / "checkpoints" / "flowers-caption"
-    journal = [json.loads(row) for row in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
-    losses = [row["scalars"]["train/loss"] for row in journal if "train/loss" in row["scalars"]]
+    losses = [values["train/loss"] for _, values in LocalTracker(run / "tracking").scalars()
+              if "train/loss" in values]
     assert len(losses) == 4 and all(math.isfinite(loss) for loss in losses)
     checkpoints = Checkpoints(str(run))
     early, _ = checkpoints.restore(step=2)

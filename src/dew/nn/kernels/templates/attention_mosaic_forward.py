@@ -56,6 +56,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Hooked,
     _hooked_of,
     _param,
+    _products,
     _Program,
     _Spans,
     _spans_of,
@@ -64,9 +65,13 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     approximate,
     bundle_of,
     extents,
+    issued_into,
     reducing,
     refused,
+    score_places,
+    stagings,
     stated,
+    transposed_swizzles,
 )
 
 
@@ -92,7 +97,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     blocks = {"keys": ((block_k, width), dtype)}
     if not peaks:
         blocks["values"] = ((block_k, value_width), dtype)
-    return scoped, family.streams(blocks, stages, consumers)
+    # The logits' product reads the keys transposed.
+    return scoped, family.streams(blocks, stages, consumers, swizzles=transposed_swizzles(tiles, "keys"))
 
 
 def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
@@ -107,26 +113,35 @@ each row's shift, reach, unshifted denominator and liveness), each held by the f
 row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
 
-def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
+def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its query blocks, the
     widest of the family's key extents (`extents`) that divides the plain key tile, so the plain launch's
     padded keys are whole tiles of it, and the most of the plain launch's consumers, whose live set a
     consumer's registers hold (`resources.live_registers`): its shifted and unshifted sums of `columns` value
     columns fp32 and its rows' statistics (`GUARD_ROWS`) carried, beside a step's logits and weights fp32
-    and the two products the step forms (`algebra.stepped`). Uncounted, the statistics left 64 x 64 on two
-    consumers spilling 20 bytes a thread at heads 128 and 256 wide (ptxas, sm90a). None where none fits:
-    the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
+    and the two products the step forms (`algebra.stepped`), their operands' fragments where its family
+    reads them from registers (`_products`: the logits' of `width`-deep queries and keys, the values' of its
+    weights), its keys staged narrowest where the family's own swizzle's do not fit (`stagings`; ET-CENSUS80:
+    the guarded launch at 64 x 64, width 128, spilled 132 bytes on an A100, its IR live set 274, 144 of it
+    fragments). Uncounted, the statistics left 64 x 64 on two consumers spilling 20 bytes a thread at heads
+    128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
+    (`MosaicForward.legal`)."""
     rows = tiles.block_q
     carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
 
-    def held(block: int, consumers: int) -> bool:
-        stepped = [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2
-        return resources.live_registers(family, carried, stepped) <= family.registers(consumers)
+    def held(candidate: Tiles) -> bool:
+        block = candidate.block_k
+        logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
+        fragments = _products(family, dtype, (rows, width, block, logits, False, True),
+                              (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow)
+        live = resources.live_registers(family, carried, logits + sums, *fragments)
+        return live <= family.registers(candidate.consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    candidates = (dataclasses.replace(tiles, block_k=block, consumers=consumers)
-                  for consumers in range(tiles.consumers, 0, -1) for block in blocks)
-    return next((candidate for candidate in candidates if held(candidate.block_k, candidate.consumers)), None)
+    candidates = (dataclasses.replace(tiles, block_k=block, consumers=consumers, narrow=narrow)
+                  for consumers in range(tiles.consumers, 0, -1) for block in blocks
+                  for narrow in stagings(family))
+    return next((candidate for candidate in candidates if held(candidate)), None)
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -171,7 +186,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
-        guarded = guarded_tiles(family, at, unit, v.dtype)
+        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1])
         hooked_blocks = hooks.output_mod is not None
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
@@ -405,12 +420,13 @@ class _Residuals(NamedTuple):
 
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
-            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks) -> tuple:
+            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
-    bit. A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
-    rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering)."""
+    bit; its places read by the walk's dropout where it draws it (`drawn`). A tile every query sees whole
+    takes no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
+    loops, faulted on an H100 under jax 0.11.2's lowering)."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -418,12 +434,33 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     slots.release("keys")
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
-    coords = _coords(family, spans, row, first, k_first, shape,
+    # Its mask chosen at run time (`whole`): the masked tile's reads.
+    read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=drawn,
+                               padded=spec.keys % tiles.block_k != 0)
+    coords = _coords(family, spans, row, first, k_first, shape, read=read,
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head))
     params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
                    for ref, param in zip(hooked.score, hooks.score_params, strict=True))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
     return k_first, coords, logits, products
+
+
+def _initial(family: mosaic.Family, spec: algebra.Forward, hooked: _Hooked, rows: tuple,
+             live: jax.Array | None) -> algebra.Partial:
+    """The call's initial state at a consumer's `rows` (batch row, head, queries) in the family's layouts
+    (`algebra.resumed`), its `live` rows the guard's."""
+    assert hooked.initial is not None
+    m0, total0, acc0 = hooked.initial
+    return algebra.resumed(spec, family.rows_of(m0.at[rows]), family.rows_of(total0.at[rows]),
+                           family.tile_of(acc0.at[rows]), live=live)
+
+
+def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None) -> algebra.Partial:
+    """`algebra.started`'s empty state of a walk's `[bq, Dv]` sums (`shape`) in the family's layouts,
+    headroomed at the guard's `live` rows."""
+    rows = shape[0]
+    start = algebra.Partial(family.zeros(shape), family.full((rows,), -jnp.inf), family.zeros((rows,)))
+    return start if live is None else algebra.headroomed(start, live)
 
 
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
@@ -455,21 +492,18 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
     state_rows = (row, head, pl.ds(first, tiles.block_q))
     live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
-    if hooked.initial is not None:
-        m0, total0, acc0 = hooked.initial
-        start = algebra.resumed(spec, family.rows_of(m0.at[state_rows]),
-                                family.rows_of(total0.at[state_rows]), family.tile_of(acc0.at[state_rows]),
-                                live=live)
-    else:
-        # `algebra.started`'s empty state, in the family's layouts.
-        start = algebra.Partial(family.zeros((tiles.block_q, value_width)),
-                                family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
-        start = start if live is None else algebra.headroomed(start, live)
+
+    # A plain inference walk starts empty and merges the initial state past its keys (`algebra.merge`): read
+    # before the walk, the state's rows held live across it beside its products and the walk spilled 296
+    # bytes at D128's 64 x 128 (the held-term census), where an empty start's are constants.
+    merged = hooked.initial is not None and guard is None and residuals is None
+    start = (_initial(family, spec, hooked, state_rows, live) if hooked.initial is not None and not merged
+             else _empty(family, (tiles.block_q, value_width), live))
     pl.when(consumer == 1)(turn)
 
     def scored(index, slots):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks)
+                       hooks=hooks, drawn=hooked.drop is not None)
 
     def value_of(slots):
         # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
@@ -516,6 +550,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
     state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                      between=lambda: (turn(), turn()))
+    if merged:
+        state = algebra.merge(spec, _initial(family, spec, hooked, state_rows, live), state)
     if residuals is not None:
         # The split sums as the walk left them, shift 0 (`algebra.split_residuals`' plain walk).
         family.stored((state.acc,), (residuals.others,), smem=out_smem)
@@ -545,7 +581,7 @@ def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
     after its factor where the step gives one (`Family.rescaled_products`)."""
     def accumulate(acc, scale, parts, value):
         if scale is None:
-            return family.register_products(acc, parts, value, interpret)
+            return issued_into(family, acc, parts, value, interpret)
         return family.rescaled_products(acc, scale, parts, value, interpret)
 
     return accumulate
@@ -597,8 +633,9 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     pl.when(consumer == 1)(turn)
 
     def step(index, slots, arg, accumulators):
+        # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
-                                       turn, hooks=hooks)
+                                       turn, hooks=hooks, drawn=False)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)

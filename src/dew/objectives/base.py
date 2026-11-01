@@ -17,6 +17,7 @@ import contextlib
 import enum
 import functools
 import math
+import weakref
 import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -48,6 +49,7 @@ from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn import categorical
+from dew.nn.derivatives import surrogate
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
@@ -657,18 +659,17 @@ class ProgramModule(NamedTuple):
     more than a tile (`Objective.unfuse_head`)."""
 
 
-@jax.custom_jvp
-def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
-    """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`)."""
-    return value
-
-
-@_ruled.defjvp
-def _ruled_jvp(primals, tangents):
-    value, rule, _ = primals
+def _ruled_tangent(primals, tangents, _value) -> jax.Array:
+    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent."""
+    _, rule, _ = primals
     moved_value, _, moved = tangents
-    return value, moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
-                                    zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+    return moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
+                             zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+
+
+_ruled = surrogate(lambda value, rule, params: value, _ruled_tangent)
+"""`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
+(`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 
 
 class Objective(ABC, Generic[Loss, Effects]):
@@ -1199,8 +1200,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             loss = self.validation_loss(variables, batch, step)
         else:
             watched = step.watched
-            with (watching(watched.kinds, histogram=watched.histogram) if watched
-                  else contextlib.nullcontext()):
+            with (watching(watched.modules, histogram=watched.histogram, cotangents=watched.cotangents)
+                  if watched else contextlib.nullcontext()):
                 loss = self.loss(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
@@ -1659,6 +1660,37 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     """
     return -categorical.cross_entropy(logits, tokens)
 
+
+_TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (
+    weakref.WeakKeyDictionary())
+
+
+def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tuple[float, float]:
+    """The work of an update of `objective` on `batch` as its traced programs run it, for an objective whose
+    work no closed form counts (`dew.nn.flops.traced_flops`): its loss's forward, and its loss's gradient's
+    program, the forward and the backward as JAX differentiates it, none through a stopped gradient (a world
+    model's imagined rollouts, whose actor learns by REINFORCE). Kept by the batch's shapes, so a run whose
+    batches keep theirs traces once."""
+    from dew.nn.flops import traced_flops
+
+    shapes = jax.eval_shape(lambda batch: batch, batch)
+    signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
+    kept = _TRACED.setdefault(objective, {})
+    if signature not in kept:
+        variables = jax.eval_shape(objective.init, jax.random.key(0))
+        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+        rest = {name: value for name, value in variables.items() if name != "params"}
+
+        def forward(variables: Variables, batch: Batch) -> jax.Array:
+            return objective.scalar_loss(variables, batch, step)[0]
+
+        def gradient(params: Variables, rest: Variables, batch: Batch) -> Variables:
+            return jax.grad(lambda params: forward({**rest, "params": params}, batch))(params)
+
+        kept[signature] = (traced_flops(forward, variables, shapes),
+                           traced_flops(gradient, variables["params"], rest, shapes))
+    return kept[signature]
+
 __all__ = [
     "OMITTED",
     "Aux",
@@ -1677,5 +1709,6 @@ __all__ = [
     "TrainingScalars",
     "joined",
     "model_rngs",
+    "traced_update_flops",
     "training_rngs",
 ]

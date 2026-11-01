@@ -27,6 +27,7 @@ DECODERS = {
     "gpt_neox": ("GPT-NeoX", "Dense decoders"),
     "opt": ("OPT", "Dense decoders"),
     "gpt_neo": ("GPT-Neo", "Dense decoders"),
+    "openai-gpt": ("GPT-1", "Dense decoders"),
     "phi": ("Phi", "Dense decoders"),
     "phi3": ("Phi-3", "Dense decoders"),
     "falcon": ("Falcon", "Dense decoders"),

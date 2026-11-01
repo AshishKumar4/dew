@@ -69,6 +69,7 @@ AVERAGING = Path(__file__).with_name("averaging_worker.py")
 PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
 """The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
+READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pools that run on the examples clock."""
 CLOCKED = 17
 """The examples a pool's run bounded in examples is bounded to: of ten records, seven read twice, and in
@@ -330,7 +331,7 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
         assert report["process_count"] == 2
         assert report["device_count"] == MESH_DEVICES
         assert report["local_device_count"] == MESH_DEVICES // 2
-        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["mesh_shape"] == {"diloco": 1, "data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_devices"] == MESH_DEVICES
         assert report["mesh_process_indices"] == [0, 1]
@@ -353,7 +354,7 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
     for index, report in enumerate(reports):
         assert report["process_index"] == index
         assert report["local_device_count"] == MESH_DEVICES // 4
-        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["mesh_shape"] == {"diloco": 1, "data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
 
@@ -597,6 +598,7 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
         assert report["mesh_shape"] == {
+            "diloco": 1,
             "data": 2,
             "expert": 1,
             "fsdp": 4,
@@ -1515,7 +1517,8 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
 
     for report in reports:
         assert report["process_count"] == 2
-        assert report["image_spec"] == report["token_spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        requests = "P(('diloco', 'data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["image_spec"] == report["token_spec"] == requests
         assert report["image_rows"] == report["rows"] == 3
         assert set(report["rejected"]) == {"prompts", "guidance", "steps", "row_count",
                                            "prepared", "prepared_rows", "request_kind", "budget"}
@@ -1542,7 +1545,7 @@ def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_
 
     for report in reports:
         assert report["process_count"] == 2
-        assert report["spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["spec"] == "P(('diloco', 'data', 'expert', 'fsdp', 'tensor'),)"
         # Four placed prompt rows per process, three of them real, times three
         # continuations: the padded prompt's group stays out of the result.
         assert report["global_rows"] == 24 and report["rows"] == 9
@@ -1782,6 +1785,20 @@ def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_ex
     assert all("profile stop" in (report["failed"] or "") for report in reports), reports
     assert reports[1]["manifests"] == 1
     assert all(report["recovered"] == 2 for report in reports)
+
+
+@pytest.mark.distributed
+def test_a_pools_reads_after_its_first_agree_nothing_where_no_share_can_run_out_alone(tmp_path):
+    """A pool agrees a read of its training stream after the first only where its shares may run out
+    apart: over a finite global order, which every share runs out of at the same read, over arrays
+    handed whole, over a Grain map dataset handed to read without end, and in a cooldown branch of an
+    endless order, a run of twice the steps takes no round more than the shorter one (a read agreed
+    at each step, as every one of these was, takes one a step: 1.4 ms on two loopback processes, 38 ms
+    on eight containers, docs/performance.md)."""
+    reports = run_pool("read_rounds", tmp_path / "rounds", 2, script=READ_ROUNDS, timeout=300, steps=4)
+    for report in reports:
+        assert {kind: longer - shorter for kind, (shorter, longer) in report.items()} == {
+            "global": 0, "whole": 0, "map": 0, "cooldown": 0}, report
 
 
 @pytest.mark.distributed

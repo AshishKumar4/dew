@@ -31,14 +31,15 @@ products. The relocatable compile's needs at sm90 (FS-K01 model2 and CAUSE-VECTO
 cap): a plain mainloop the accumulator and 32 (its step's descriptors too), exact sums two accumulators and
 16, an epilogue with a column vector the accumulator, the vector and 16."""
 
-PRODUCER_REGISTERS = 40
-"""The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`): a
-measured bound, not yet the rule. A producer's rule is the least of setmaxnreg's steps of 8 (its floor 24,
-PTX ISA) holding its own issue code's live set, computed per launch once a liveness model prices the
-producer's branch, beside `Family.held_registers` and `CONTROL_REGISTERS`. The live sets vary (PRODFLOOR3,
-whole-program ptxas 12.9 and 13.4 with the raises honored): 24 holds the recurrence's training kernels' and
-the attention forward's and backward's producers at D64 and D128 but the natural training forward's at D128
-under 13.4, whose spill grows from 52 to 60 bytes below 40."""
+PRODUCER_REGISTERS = 24
+"""The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`):
+setmaxnreg's floor (PTX ISA), two consumers' raise 240 (FlashAttention 3's). A measured bound, not yet the
+rule: a producer's rule is the least of setmaxnreg's steps of 8 holding its own issue code's live set,
+computed per launch once a liveness model prices the producer's branch, beside `Family.held_registers` and
+`CONTROL_REGISTERS`. The live sets vary (PRODFLOOR3, whole-program ptxas 12.9 and 13.4 with the raises
+honored): 24 holds the recurrence's training kernels' and the attention forward's and backward's producers
+at D64 and D128 but the natural training forward's at D128 under 13.4, which spills 60 bytes at it (52 at
+40)."""
 
 
 THREADS = 128
@@ -71,31 +72,35 @@ def allocated(*sizes: int) -> int:
     return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
 
 
-def live_registers(family: "Family", carried, *phases) -> int:
+def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
     """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
     of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
-    32-bit words spread over a role's threads, and what it holds beside them (`Family.held_registers`).
+    32-bit words spread over a role's threads, and what it holds beside them: its scalars and its
+    addresses into the shared tiles it reads and writes itself (`addressed`, each `(shape, dtype)`:
+    `Family.scalar_registers`).
     The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
     a legal config holds within a thread's budget (`base.Template.legal`)."""
     def words(tiles) -> float:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
     phase = max((words(tiles) for tiles in phases), default=0.0)
-    return family.held_registers + int(-(-(words(carried) + phase) // THREADS))
+    return family.scalar_registers(addressed) + int(-(-(words(carried) + phase) // THREADS))
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
-                      rhs_parts: int = 1, rhs_transposed: bool = False) -> list:
+                      rhs_parts: int = 1, rhs_transposed: bool = False,
+                      rhs_swizzle: int | None = None) -> list:
     """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
     products read registers (`Family.operands_in_registers`), none where they read shared memory: its left
-    operand's loaded depth (`Family.lhs_fragment_depth`), its right one's (`Family.rhs_fragment_depth`),
-    each in the warps replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated
-    for its parts (an fp32 operand split into 16-bit parts): GEMM's and recurrence's products'."""
+    operand's loaded depth (`Family.lhs_fragment_depth`), its right one's at its stage's swizzle
+    (`Family.rhs_fragment_depth`; `rhs_swizzle` bytes, the family's default where None), each in the warps
+    replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated for its parts (an
+    fp32 operand split into 16-bit parts): GEMM's, recurrence's and attention's products'."""
     if not family.operands_in_registers:
         return []
     return ([(rows * family.lhs_copies, family.lhs_fragment_depth(depth), lhs)] * lhs_parts
-            + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed),
+            + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed, swizzle=rhs_swizzle),
                 columns * family.rhs_copies, rhs)] * rhs_parts)
 
 
@@ -169,12 +174,14 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
 
 
 RAISES_HONORED = False
-"""Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg). It
-does not today: jaxlib's Mosaic GPU compiles each kernel's PTX through nvJitLink wherever it is installed
-(jaxlib/mosaic/gpu/target.cc, NvJitLinkMode::kAuto; the pip wheels without libnvptxcompiler), which
-compiles it relocatably, and ptxas ignores setmaxnreg there (C7504): every warpgroup of a program holds its
-entry's registers (`entry_registers`). SAMECOMPILE1-h100: two consumers' attention dK/dV spilled 504 bytes
-at 168 registers where a whole-program compile holds its 232."""
+"""Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg): a
+jaxlib with jax-ml/jax f365a65e3a (Mosaic GPU's nvJitLink disabled, jaxlib/mosaic/gpu/target.cc
+NvJitLinkMode::kDisabled; issue 42094) compiles each kernel whole, so a raise holds; it turns true once an
+H100 compile under the pinned jaxlib shows no C7504. The locked post42 still compiles relocatably: the
+raised D256 forward's ptxas, C7504, 168 registers and 476 bytes spilled (ET-HONOR3-h100, jax and its
+cuda13 plugin 0.12.0.1.post42 from the locks). Relocatably ptxas ignores setmaxnreg: SAMECOMPILE1-h100,
+two consumers' attention dK/dV spilled 504 bytes at 168 registers where a whole-program compile holds its
+232."""
 
 
 def entry_registers(warpgroups: int) -> int:

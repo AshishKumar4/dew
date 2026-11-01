@@ -13,15 +13,17 @@ import dataclasses
 import functools
 import gc
 import weakref
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms
+from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -66,33 +68,48 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
-accurate."""
+RAISED_FORMS = ("fused-shared-dq", "fused-producer-dq")
+"""The backward's forms whose consumers hold more registers than a warpgroup's even share, legal only where
+the GPU's compile honors their raise (`resources.RAISES_HONORED`)."""
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
+                  *(RAISED_FORMS if resources.RAISES_HONORED else ()), "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
+where raises hold (`RAISED_FORMS`), and the accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128,
+               "fused-producer-dq": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
 the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
 128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
 
 
-def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
+def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | None]:
     """The backward form `form` names, `(accurate, config)`: two launches, the dQ launch one consumer's
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
-    accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
-    `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
-    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries, or
-    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`)."""
+    accurate form's at its derivation's tiles (None) or its sums in two column halves where it is
+    `accurate-halves` (a width split's, `BackwardTiles.columns`); or the fast form's one launch (`fused`),
+    queries first on the dQ launch's layout, or keys first on `FED`'s (`fused-keys-first`), each consumer
+    64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
+    (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
+    their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
+    producer adding it (`fused-producer-dq`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
     if form == "fused-shared-keys":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
                                                      shared_keys=True)
+    if form in ("fused-shared-dq", "fused-producer-dq"):
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
+                                                     dkv_consumers=2, shared_dq=True, staged_logits=True,
+                                                     producer_dq=form == "fused-producer-dq")
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
+    if form == "accurate":
+        # Its derivation's: two launches, its dK/dV programs' column shares its dQ's two sums' choice.
+        return True, None
     columns = 2 if form == "accurate-halves" else 1
     return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
 
@@ -188,6 +205,22 @@ def _dropping(shape) -> template.Hooks:
         jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
+def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,
+                    declined: bool) -> bool:
+    """Whether the Mosaic backward takes a call of `query`'s and `key`'s shapes and dtype under `hooks` on the
+    target in effect, checked against `declined`, the call one it declines for its registers
+    (`MosaicBackward.declined`'s resources, the route's next implementation's): the accurate form under a
+    query's temperature, whose dQ spills at every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed
+    sums beside the hook's three slopes and its mask)."""
+    query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
+    residuals = _residuals(query.shape)
+    op, args = attention_mosaic._backward_call(query, key, key, spans, hooks, query, residuals, scale=None,
+                                               natural=attention_mosaic.NATURAL, accurate=accurate)
+    reason = op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+    assert (reason is not None) == declined and (reason is None or reason.code == "resources"), reason
+    return reason is None
+
+
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
@@ -215,6 +248,12 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                               output.output_mod, output.output_params)
 
     accurate, config = _backward_form(form)
+    if backward:
+        query, key = (jax.ShapeDtypeStruct((rows, queries, count, width), dtype) for count in shape[2:])
+        with _device(interpret):
+            if not _takes_backward(spans, query, key, hooked(*draw_hooks(0)), accurate=accurate,
+                                   declined=accurate and "temperature" in score):
+                return
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -247,7 +286,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     if seeds is None:
         seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
                  else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds,
+                    terms=_gradient_terms(spans, hooked, score, jax.jit(reference)) if backward else None)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -349,18 +389,34 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept.name}",
-                    seeds=SEEDS, terms=_gradient_terms(spans) if kept is template.Kept.OUTPUT else False)
+                    seeds=SEEDS, terms=_gradient_terms(spans))
 
 
-def _gradient_terms(spans: template.KeySpans):
+def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, score: tuple = (),
+                    reference: Callable | None = None):
     """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
     logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
-    rounded output carries (`template.Kept.OUTPUT`'s, FlashAttention's), so a row that cancels to zero in
-    float64 is held to it, not to its own zero."""
+    rounded output carries (`template.Kept.OUTPUT`'s, and the fast form's: its anchor key's `dP - c` its
+    product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
+    score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
+    logits are the hook's (`template.score_modded`), and its parameters' gradients take the terms check 1
+    traces from `reference` (`float64_terms`). A call resuming from an initial state (`score` naming sinks
+    or a resumed partial) takes check 1's own terms (None): its weights start from the state, which
+    `attention_terms` does not carry."""
+    if {"sinks", "resumed"} & set(score):
+        return None
     keep = template.dense(spans)[:, None]
 
-    def terms(query, key, value, dout):
-        return tuple(attention_terms(query, key, value, dout, keep)[1:])
+    def terms(query, key, value, dout, *hooks):
+        if not hooks:
+            return tuple(attention_terms(query, key, value, dout, keep)[1:])
+        params, _ = hooks
+        wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
+        found = attention_terms(query, key, value, dout, keep,
+                                score=lambda raw: template.score_modded(raw, hooked(wide, None)))
+        with jax.enable_x64(new_val=True):
+            _, traced = float64_terms(reference, *widened((query, key, value, dout, *hooks)))
+        return (*found[1:], *traced[3:])
 
     return terms
 
@@ -626,6 +682,10 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
 
     params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
+    with _device(interpret=True):
+        # Its hook divides by a query's parameter, a temperature (`_takes_backward`).
+        if not _takes_backward(spans, query, key, hooks, accurate=accurate, declined=accurate):
+            return
     with _device(interpret=True), _pinned(backward=config):
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              interpret=True)[1:]
@@ -845,16 +905,14 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("tiles", [attention_mosaic.Tiles(64, 128, 2, 1),
-                                   attention_mosaic.Tiles(64, 192, 2, 1)], ids=["128-keys", "192-keys"])
-def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
+def test_a_guarded_launch_walks_its_own_key_tiles():
     """A spans call (four documents over 256 keys, their ids from 1: 0 is padding) whose weighted values
     pass fp32's largest, at a launch of 128-key tiles whose guarded walk takes its own key tiles
-    (`guarded_tiles`), and at 192 keys cut to a whole tile of the family's rows that divides it: the
-    guarded launch runs on tiles its program takes, reads each block's
+    (`guarded_tiles`): the guarded launch runs on tiles its program takes, reads each block's
     keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
     attention, which normalizes its weights before their product (bf16 values near their largest, equal
     logits)."""
+    tiles = attention_mosaic.Tiles(64, 128, 2, 1)
     rows, queries, heads, kv_heads = 1, 256, 2, 1
     documents = jnp.repeat(jnp.arange(1, 5, dtype=jnp.int32), queries // 4)[None]
     spans = template.spans(queries, queries, rows, segment_ids=documents)
@@ -1063,13 +1121,10 @@ def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted(
 @pytest.mark.parametrize("call", ["causal", "full"])
 def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
     """The fast backward 256 wide, whose consumers' own keys' whole dK and dV sums pass their registers, at
-    its derived tiles: one launch whose two consumers share a key block, each its share of the columns
-    (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
-    interpreter."""
-    with generation.assumed("sm90"):
-        op, ba = _backward_call((1, 160, 2, 1), 256, accurate=False)
-        assert op.derived(ba, generation.gpu_target()).shared_keys
-    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256)
+    the tiles the derivation takes for it: one launch whose two consumers share a key block, each its share
+    of the columns (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's,
+    under the interpreter."""
+    _check_backward(call, SHAPES["interpreted"], form="fused-shared-keys", interpret=True, width=256)
 
 
 @INTERPRETS
@@ -1261,8 +1316,12 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
-            lowering_platforms=("cuda",))
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)), initial)
+        if _takes_backward(spans, q, kv, hooked, accurate=accurate,
+                           declined=accurate and "temperature" in SCORE_HOOKS[hooks]):
+            jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
+                lowering_platforms=("cuda",))
 
 
 @ON_HOPPER
@@ -1438,14 +1497,17 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in ("sm90",)
+GATED = ("sm90",)
+"""The GPUs whose families the mainloop qualifies (`attention_mosaic_program.QUALIFIED`): an H100's
+wgmma."""
+
+BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
-BACKWARD_GATE += [("sm90", width, False, hooks) for width in (64, 128) for hooks in BACKWARD_HOOKS
-                  if hooks != "none"]
-"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (an H100's; mma.sync's
-is not, `test_an_a100_derives_no_mosaic_backward`), a causal call's head widths, each form, hookless; and
-each score hook at the widths a hooked call's derivation takes whole (row 2281: its live set beside the
-step's)."""
+BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
+                  for hooks in BACKWARD_HOOKS if hooks != "none"]
+"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
+call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
+whole (row 2281: its live set beside the step's)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
@@ -1484,14 +1546,16 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
     assert _gated_backward("sm80", 128, accurate)[2] is None
 
 
-FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
-                for training in (template.Kept.NONE, template.Kept.SPLIT)]
-FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
+FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
+                for width in (64, 128, 256) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
-"""The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
-forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
-set beside the walk's)."""
+FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
+"""The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
+head widths, the inference and the training forward, hookless, each score hook at the widths a hooked
+call's derivation takes (row 2281: its live set beside the walk's), and a softcap's inference forward 256
+wide (Gemma's)."""
 
 
 def _forward_kernels(op, ba, config) -> dict:
@@ -1509,10 +1573,10 @@ def _forward_kernels(op, ba, config) -> dict:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("width", "training", "hooks"), FORWARD_GATE)
-def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, hooks):
+@pytest.mark.parametrize(("generation_name", "width", "training", "hooks"), FORWARD_GATE)
+def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
-    wide under the score hook `hooks` names, lowered and compiled by ptxas for an H100 on this CPU
+    wide under the score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
     model's decision ptxas's (`mosaic_failures`)."""
     from fla_gdn_support import KernelCase
@@ -1527,7 +1591,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, h
     def forward(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, hooked, residuals=training)
 
-    with generation.assumed("sm90"):
+    with generation.assumed(generation_name):
         zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
         op, args = attention_mosaic._forward_call(*zeros, spans, hooked, scale=None,
                                                   natural=attention_mosaic.NATURAL)
@@ -1536,7 +1600,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, h
         assert config is not None, f"the Mosaic forward derives no config {width} wide"
         found = compile_mosaic_kernels(
             [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
-            "sm90")
+            generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 

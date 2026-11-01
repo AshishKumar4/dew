@@ -6,9 +6,10 @@ name: CI
 
 on:
   push:
-    # ci/** is where a branch goes for its own run before it lands; base/kernels, where the template lanes push
-    # straight, runs on each push, its reds fixed forward by the lane that pushed (owner, 2026-10-26).
-    branches: [ "main", "ci/**", "base/kernels" ]
+    # ci/** is where a branch goes for its own run before it lands. base/kernels runs on no push while it
+    # consolidates (owner, 2026-11-01): one run there by hand (workflow_dispatch) and one review once it is
+    # declared complete, then its per-push run returns.
+    branches: [ "main", "ci/**" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -30,7 +31,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#95f06182db1b5bfe010339c7fad98665385bcc88
+  ARMADA: github:AshishKumar4/armada#a8b23968a77c9c43d5868f027e43d2a1d245734c
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -95,9 +96,9 @@ jobs:
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
 
-  # What PyPI receives, installed the way a user installs it: the sdist and
-  # wheel build, pass twine, and name no requirement by URL, which PyPI
-  # refuses and twine passes; the wheel installs from PyPI alone into an
+  # What a release attaches and Dew's index serves, installed the way a user
+  # installs it: the sdist and wheel build, pass twine, and name no requirement
+  # by URL, which an index refuses and twine passes; the wheel installs into an
   # empty environment and runs; and the accelerator extras resolve.
   package:
     needs: proven

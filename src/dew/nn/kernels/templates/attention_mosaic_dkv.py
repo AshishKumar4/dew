@@ -21,8 +21,10 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    issued_into,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -52,20 +54,31 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     swizzle = mosaic.swizzle_for(dtype, rows, width, value_width) if split else None
     # Each holder's output stages, where it stores its own sums: the consumers sharing a key block store
     # theirs summed once, in a scope of their own after the walk's (`_summed_stored`).
+    # A shared dQ's (`BackwardTiles.shared_dq`) dK and dV staged a chunk of their columns at a time
+    # (`mosaic.chunked`): its program's one store, the room its block lacks for the whole stage.
+    out_width = (mosaic.staged_columns(width // columns, (jnp.float32,)) if config.shared_dq
+                 else width // columns)
     outputs = [] if split else [
-        plgpu.SMEM((holders, max(block_q, block_k), width // columns), jnp.float32),
+        plgpu.SMEM((holders, max(block_q, block_k), out_width), jnp.float32),
         *([] if value_width == width
           else [plgpu.SMEM((holders, block_k, value_width // columns), jnp.float32)]),
         plgpu.SMEM((holders, block_k), jnp.float32)]
     scoped = [mosaic.staged((holders, block_k, width), dtype, swizzle),
               mosaic.staged((holders, block_k, value_width), dtype, swizzle), *outputs,
               family.load_barriers(holders), family.load_barriers(holders)]
-    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
+    blocks: dict[str, tuple] = {"queries": ((block_q, width), dtype),
+                                "douts": ((block_q, value_width), dtype)}
     if config.fused:
         # A fused launch's (`_dkv_step`'s `add_dq`): each consumer's score cotangents staged for dQ's
-        # product, their transpose its left operand, and its dQ tile's stage for the add.
-        scoped += [plgpu.SMEM((consumers, block_k, rows), dtype),
-                   plgpu.SMEM((consumers, rows, width), jnp.float32)]
+        # product, their transpose its left operand, and its dQ tile's stage for the add; shared
+        # (`BackwardTiles.shared_dq`), every consumer's read by each, its share of dQ's columns staged, and
+        # the exchange's barriers (`Family.exchange`).
+        share = width // consumers if config.shared_dq else width
+        # Its dQ stage the producer's outbox where the producer adds it (`BackwardTiles.producer_dq`).
+        stage = (mosaic.outbox((rows, share), jnp.float32, consumers) if config.producer_dq
+                 else [plgpu.SMEM((consumers, rows, share), jnp.float32)])
+        scoped += [plgpu.SMEM((consumers, block_k, rows), dtype), *stage,
+                   *(family.exchange(consumers) if config.shared_dq else [])]
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
         # and the two turns that order its writes against their products' reads (`_staged_logits`).
@@ -75,8 +88,23 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         blocks["logits"] = ((block_q, width), dtype)
     if tiled:
         scoped.append(plgpu.SMEM((consumers, block_k, rows), jnp.float32))
-    swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
+    if config.shared_dq:
+        # Its queries' statistics streamed beside them, read from their stage where a step uses each
+        # (FlashAttention 3's LSE and dPsum): held a step in registers they took 80 of a consumer's.
+        blocks.update({name: ((block_q,), kept) for name, kept in STATISTICS.items()})
+        blocks["positions"] = ((block_q,), jnp.int32)
+    # Keys first, the logits' and dP's products read their queries (the stream of them by the power where it
+    # has one) and the output cotangents transposed; a launch's own swizzle every stream's.
+    transposed = transposed_swizzles(config, "logits" if "logits" in blocks else "queries", "douts")
+    swizzles = transposed if swizzle is None else dict.fromkeys(blocks, swizzle)
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles)
+
+STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32,
+                               "delta": jnp.float32, "chosen": jnp.int32})
+"""The per-query statistics a dK/dV step reads (`_scores`' `peak`, `total`, `anchor`, `delta` and `chosen`,
+the anchor key's index), in the order of their arrays, and their dtypes: a shared dQ's launch streams each
+beside its queries."""
+
 
 def _holders(family: mosaic.Family, consumers: int) -> int:
     """The key blocks a dK/dV program holds: one its consumers share (`split_queries`), else one each."""
@@ -119,42 +147,96 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
         # Its share of the staged queries read (the product waited): the next step's stage may be written.
         walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
-    params = params_of(q_first, s)
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
-    coords = coords_of(q_first, shape=shape)
-    exponentials, weights, cotangents, slopes, seen = _scores(
-        walk, coords, params, s, dp, *rows_of(q_first, count), masked=True)
-    logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
-    # dV's weights the dropped ones (`algebra.value_operands`); the dQ program's sums take them undropped.
-    multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
-    if multiplier is not None:
-        exponentials, weights = exponentials * multiplier, weights * multiplier
-    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, multiplier is not None)
+    read = walk.places_read(masked=True)
+    fused = add_dq is not None
+    if rows_of is None:
+        # Streamed (a shared dQ's): its queries `CHUNK_QUERIES` at a time, each chunk's statistics and places
+        # read from their stages where it weighs them.
+        chunks = []
+        for start in range(0, count, CHUNK_QUERIES):
+            columns, like = pl.ds(first_row + start, CHUNK_QUERIES), (tiles.block_k, CHUNK_QUERIES)
+
+            def stage_of(name, columns=columns):
+                return family.columns_of(slots[name].at[columns])
+
+            places = lax.broadcast_in_dim(stage_of("positions"), like, (1,))
+            coords = coords_of(q_first + start, shape=like, q_pos=places, read=read)
+            entries = slice(start, start + CHUNK_QUERIES)
+            rows = tuple(functools.partial(stage_of, name) for name in STATISTICS)
+            chunks.append(_weighed(walk, coords, params_of(q_first + start, s[:, entries]), s[:, entries],
+                                   dp[:, entries], rows, (do_slot.dtype, q_slot.dtype), one_part=fused))
+        narrowed, logits, pieces = _joined(chunks, kinds)
+    else:
+        coords = coords_of(q_first, shape=shape, read=read)
+        rows = rows_of(q_first, count)
+        narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s), s, dp, rows,
+                                            (do_slot.dtype, q_slot.dtype), one_part=fused)
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
-    dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_columns, walk.interpret)
-    if add_dq is None:
+    dv_acc = issued_into(family, dv_acc, (narrowed,), do_columns, walk.interpret)
+    if not fused:
         # Each part formed as its product is issued (`algebra.formed_parts`).
         parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
-        dk_acc = family.register_products(dk_acc, parts, q_columns, walk.interpret)
+        dk_acc = issued_into(family, dk_acc, parts, q_columns, walk.interpret)
     else:
-        # The fused launch's (the fast form's one part): dK's left operand from the registers, and staged,
-        # its transpose dQ's (`algebra.cotangent_product`'s `a @ b`), the tile's dQ added into dQ, the
-        # query tile's other key blocks adding theirs; a consumer's share of a 128-query slot is 64 rows,
-        # warpgroup MMA's least (`MosaicBackward.legal`).
-        ((part_tile, _),) = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=False)
-        dk_acc = family.register_products(dk_acc, ((part_tile, None),), q_columns, walk.interpret)
-        staged_part, dq_stage = add_dq
-        family.staged(part_tile, staged_part)
-        dq_stage(q_first, family.product(staged_part.transpose((1, 0)), k_smem, (count, k_smem.shape[-1])))
+        # The fused launch's (the fast form's one part, `_weighed`'s): dK's left operand from the registers,
+        # and staged, its transpose dQ's (`algebra.cotangent_product`'s `a @ b`), the tile's dQ added into
+        # dQ, the query tile's other key blocks adding theirs (`_fused_adds`); a consumer's share of a
+        # 128-query slot is 64 rows, warpgroup MMA's least (`MosaicBackward.legal`).
+        dk_acc = issued_into(family, dk_acc, (logits,), q_columns, walk.interpret)
+        add_dq(logits, q_first)
     if _grading(shares):
         store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
         key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
         carry = tuple(total + piece for total, piece in zip(carry, key_pieces, strict=True))
     return carry, (dk_acc, dv_acc)
+
+CHUNK_QUERIES = 8
+"""The queries a streamed keys-first step weighs at a time (`_dkv_step`, a shared dQ's): its statistics read
+a chunk's at a time, 8 registers each, not the whole slot's 16 loaded together and held across its
+elementwise stage (the shared dQ at 64 x 64, width 128, ptxas 12.9's SASS: 278 registers a consumer whole,
+236 in chunks of 8, ET-SDQDIAG); its places read from a stream too, LLVM hoisting an iota's out of the
+walk."""
+
+
+def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
+             one_part: bool) -> tuple:
+    """A keys-first tile's, or a chunk of its queries': its weights narrowed for dV in the output cotangents'
+    dtype (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them
+    undropped), its pulled score cotangents and its hook's pieces (`algebra.pulled`), from its products `s`
+    and `dp` under its queries' statistics `rows`, its coordinates and its hook's parameters (`_scores`);
+    the cotangents the fast form's one part in the queries' dtype where the launch takes it from the
+    registers (`one_part`, the fused launch's), narrowed as they are formed: a chunk's at a time, the whole
+    tile's fp32 not held to the last chunk."""
+    values, queries = dtypes
+    exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows, masked=True)
+    logits, pieces = algebra.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
+    if one_part:
+        parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
+        logits = mosaic.unscaled_part(*parts)
+    multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+    if multiplier is not None:
+        exponentials, weights = exponentials * multiplier, weights * multiplier
+    return algebra.value_weights(exponentials, weights, values, multiplier is not None), logits, pieces
+
+
+def _joined(chunks: list, kinds: tuple[Kind, ...]) -> tuple:
+    """`_weighed`'s of a step's chunks of its queries joined: its weights, its cotangents and a tile
+    parameter's pieces along the queries, a key parameter's summed over them (the rest the dQ launch's)."""
+    def along(tiles):
+        return tiles[0] if len(tiles) == 1 else jnp.concatenate(tiles, axis=1)
+
+    narrowed, logits, pieces = zip(*chunks, strict=True)
+    joined = []
+    for kind, parts in zip(kinds, zip(*pieces, strict=True), strict=True):
+        joined.append(along(parts) if kind == Kind.TILE else functools.reduce(jnp.add, parts)
+                      if kind == Kind.KEY else None)
+    return along(narrowed), along(logits), joined
+
 
 def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     """A step's logits' queries, the slot `q_slot`'s taken by the call's power, staged in `stage` (its ref,
@@ -174,12 +256,69 @@ def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     first, count = part
     return ref if count == ref.shape[0] else ref.at[pl.ds(first, count)]
 
-def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index) -> tuple | None:
-    """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq`): its score cotangents' stage and
-    its tiles' add into dQ at `place` (`_dq_added`); None where the launch adds none."""
+def _outbox(walk: _Backward, stages: list) -> mosaic.Outbox | None:
+    """A fused launch's dQ outbox where its producer adds its dQ (`BackwardTiles.producer_dq`), compiled;
+    None where its consumers add theirs (interpreted, the interpreter's TMA taking no reduction)."""
+    if not (walk.fused and walk.program.tiles.producer_dq) or walk.interpret:
+        return None
+    return mosaic.Outbox(*stages[1:4])
+
+
+def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_smem, holder):
+    """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq(score cotangents, first query)`),
+    None where the launch adds none: its score cotangents staged (`stages[0]`), their transpose times its
+    keys (`k_smem`, `[holders, bk, D]`, its `holder`'s), the tile's dQ added into dQ at `place`
+    (`_dq_added`); shared
+    (`BackwardTiles.shared_dq`), staged into its slot of the exchanged block (`mosaic.Exchange`), each
+    consumer's share of dQ's columns over every consumer's keys, at static columns (`mosaic.per_role`), staged
+    for the producer's add where it adds them (`_outbox`)."""
     if not walk.fused:
         return None
-    return stages[0].at[index], functools.partial(_dq_added, walk, dq_ref, stages[1], place, index)
+    family, consumers = walk.program.family, walk.consumers
+    staged, out_stage = stages[0], stages[1]
+    box = _outbox(walk, stages)
+
+    def own(part, q_first):
+        family.staged(part, staged.at[index])
+        held = k_smem.at[holder]
+        _dq_added(walk, dq_ref, out_stage, place, index, q_first,
+                  family.product(staged.at[index].transpose((1, 0)), held, (part.shape[1], held.shape[-1])))
+
+    if not walk.program.tiles.shared_dq:
+        return own
+    exchange = mosaic.Exchange(family, stages[-2], stages[-1], consumers)
+    exchange.open()
+
+    def shared(part, q_first):
+        if box is not None:
+            # Its share's stage claimed at the step's start (`mosaic.Outbox`).
+            claim = box.claim
+            mosaic.per_role(index, consumers, lambda role, index: claim(role))
+        exchange.claim()
+        family.staged(part, staged.at[index])
+        exchange.publish()
+        rows, columns = part.shape[1], out_stage.shape[-1]
+
+        def mine(role, index):
+            # Its columns over every consumer's keys, at static columns (`mosaic.per_role`).
+            share = pl.ds(role * columns, columns)
+
+            def issue(acc):
+                for other in range(consumers):
+                    keys = k_smem.at[other].at[:, share]
+                    acc = family.products(acc, staged.at[other].transpose((1, 0)), keys, walk.interpret)
+                return acc
+
+            dq = family.summed((rows, columns), issue, walk.interpret)
+            if box is None:
+                _dq_added(walk, dq_ref, out_stage, place, index, q_first, dq, columns=share)
+            else:
+                box.put(role, dq)
+
+        mosaic.per_role(index, consumers, mine)
+        exchange.release()
+
+    return shared
 
 def _logits_stage(family: mosaic.Family, consumers: int, allocated: list, index) -> tuple | None:
     """Consumer `index`'s staged logits' queries (`_staged_logits`' `stage`) from their `allocated` ref and
@@ -218,7 +357,9 @@ def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, k_first, inde
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index, interpret: bool
                 ) -> None:
     """A dK/dV consumer's dK and dV of its own keys to their `views`, and its key gradients' sums added into
-    theirs (`Family.added`), through its `stages` (dK's output stage, dV's, the key gradients')."""
+    theirs (`Family.added`), or written to its own place where its family adds no vector
+    (`Family.adds_vectors`, `_dkv_launched`), through its `stages` (dK's output stage, dV's, the key
+    gradients')."""
     out_smem, dv_smem, rows_smem = stages
     dk, dv, *key_sums = sums
     dk_view, dv_view, *key_views = views
@@ -230,19 +371,67 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
         family.stored((dv,), (dv_view,), smem=dv_smem.at[index])
     for key_sum, key_view in zip(key_sums, key_views, strict=True):
         # Each key gradient, the walk's row sums, added into its own `[B or 1, H or 1, Kp]`.
-        family.added(key_sum, key_view, interpret, smem=rows_smem.at[index])
+        if family.adds_vectors:
+            family.added(key_sum, key_view, interpret, smem=rows_smem.at[index])
+        else:
+            family.stored((family.as_row(key_sum),), (key_view,), smem=rows_smem.at[index])
 
-def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], *, widths: bool, split: bool, fused: bool
-              ) -> tuple:
+def _grad_buffers(graded: list[Kind], shapes: list, batch: int, heads: int, queries: int, keys_padded: int, *,
+                  adds_vectors: bool) -> list[tuple]:
+    """Each graded parameter's gradient buffer's shape (`_dkv_launched`): its own batch rows and heads
+    (`shapes`, `[B or 1, H or 1, ...]`), or the call's in deterministic mode and for a key's where the
+    launch's family adds no vector (`Family.adds_vectors`), then its keys, and for a tile its queries."""
+    if deterministic_ops_requested():
+        shapes = [(batch, heads)] * len(shapes)
+    elif not adds_vectors:
+        shapes = [(batch, heads) if kind == Kind.KEY else shape
+                  for shape, kind in zip(shapes, graded, strict=True)]
+    return [(*shape[:2], keys_padded) if kind == Kind.KEY else (*shape[:2], keys_padded, queries)
+            for shape, kind in zip(shapes, graded, strict=True)]
+
+def _graded(score_params: tuple, kinds: tuple, shares: tuple, shape: tuple, keys_padded: int, *,
+            adds_vectors: bool) -> tuple[list[Kind], list[tuple], tuple[tuple[int, ...], ...]]:
+    """The kinds of the hook gradients a dK/dV program of `shares` writes (`DKV_GRADS`; none for a later
+    share's), their buffers' shapes (`_grad_buffers`) and the groups of one shape (`_grad_groups`), for a
+    call whose queries are `shape` `[B, Q, H, D]`."""
+    graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
+    graded_shapes = [param.shape for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
+    buffers = _grad_buffers(graded, graded_shapes, shape[0], shape[2], shape[1], keys_padded,
+                            adds_vectors=adds_vectors)
+    return graded, buffers, _grad_groups(buffers)
+
+
+def _grad_groups(buffers: list[tuple]) -> tuple[tuple[int, ...], ...]:
+    """The graded parameters whose gradient buffers share a shape, each group's indices in parameter order: a
+    group's buffers are one ref, as views of it (`_grad_views`), so no two aliased operands of the launch are
+    one value to XLA (`_dkv_launched`)."""
+    groups: dict[tuple, list[int]] = {}
+    for index, shape in enumerate(buffers):
+        groups.setdefault(shape, []).append(index)
+    return tuple(tuple(group) for group in groups.values())
+
+def _grad_views(refs, groups: tuple, count: int) -> list:
+    """Each of `count` graded parameters' gradient view: its place along the leading axis of its group's ref
+    (`refs`, a ref a group, `_grad_groups`)."""
+    views: list = [None] * count
+    for ref, group in zip(refs, groups, strict=True):
+        for place, index in enumerate(group):
+            views[index] = ref.at[place]
+    return views
+
+def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, widths: bool, split: bool,
+              fused: bool) -> tuple:
     """The dK/dV program's refs by role: its nine inputs, its spans' and hook parameters' (`treedef` of
-    `leaves`), a fused launch's dQ and the hook's key and tile gradients, each added into in place
-    (`_dkv_launched`), its dK and dV outputs, and its scoped allocations (`_dkv_scoped`)."""
+    `leaves`), a fused launch's dQ and the hook's key and tile gradients, each added into in place, a ref a
+    group of equal shapes (`_dkv_launched`, `_grad_groups`), its dK and dV outputs, and its scoped
+    allocations (`_dkv_scoped`)."""
     inputs, refs = refs[:9], refs[9:]
     unflattened, refs = treedef.unflatten(refs[:leaves]), refs[leaves:]
     dq_ref, refs = (refs[0], refs[1:]) if fused else (None, refs)
-    grad_refs, refs = refs[:len(graded)], refs[len(graded):]
+    grad_refs, refs = refs[:len(groups)], refs[len(groups):]
+    views = _grad_views(grad_refs, groups, len(graded))
     dk_ref, dv_ref, *refs = refs
-    keyed = tuple([ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == wanted]
+    keyed = tuple([ref for ref, kind in zip(views, graded, strict=True) if kind == wanted]
                   for wanted in (Kind.KEY, Kind.TILE))
     return inputs, unflattened, (dq_ref, dk_ref, dv_ref), _dkv_scoped(refs, widths=widths, split=split), keyed
 
@@ -363,35 +552,40 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     pair, count = (block_k, block_q // consumers) if split else (consumers * block_k, block_q)
     q_steps = queries // block_q
     stages = min(program.tiles.stages, q_steps)
-    graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
+    graded, buffers, groups = _graded(score_params, kinds, shares, query.shape, key.shape[1],
+                                      adds_vectors=family.adds_vectors)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
     staged_logits = program.tiles.staged_logits
+    # A shared dQ's queries' places streamed beside their statistics (`_dkv_step`'s chunks).
+    places = jnp.arange(queries, dtype=jnp.int32) if program.tiles.shared_dq else None
     leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop,
-                                        None if staged_logits else scaled))
+                                        None if staged_logits else scaled, places))
 
     tiled = Kind.TILE in graded
 
     def body(*refs, streams):
         inputs, unflattened, outputs, held, (key_refs, tile_refs) = _dkv_refs(
-            refs, treedef, len(leaves), graded, widths=value_width == width, split=split, fused=walk.fused)
-        (spans_of, score_refs, drop_of, l_ref), (dq_ref, dk_ref, dv_ref) = unflattened, outputs
+            refs, treedef, len(leaves), graded, groups, widths=value_width == width, split=split,
+            fused=walk.fused)
+        spans_of, score_refs, drop_of, l_ref, positions_ref = unflattened
+        dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
         tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
-        fused_stages, logits_stages = (rest[:2], rest[2:]) if walk.fused else ([], rest)
+        tiles = program.tiles
+        fused = 2 + 2 * tiles.shared_dq + 2 * tiles.producer_dq if walk.fused else 0
+        fused_stages, logits_stages = rest[:fused], rest[fused:]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
-        views = _views_of(named, row, head)
+        views = _dkv_views(named, stat_refs, positions_ref, (row, head), shared_dq=tiles.shared_dq)
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         holders = 1 if split else consumers
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(holders)])
 
-        def rows_of(q_first, rows):
-            # `rows` queries' statistics from `q_first` in a column's layout, the tiles' queries its columns.
-            return tuple(family.columns_of(ref.at[row, head, pl.ds(q_first, rows)]) for ref in stat_refs)
+        rows_of = functools.partial(_statistics_of, family, stat_refs, (row, head))
 
         def consumer(index):
             holder = 0 if split else index
@@ -401,7 +595,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                       (v_ref.at[keys_view], v_smem.at[holder], v_loaded.at[holder]))
             # Shared between the consumers (`split_queries`): the first loads them, each waits.
             family.loaded(copies, issued=index == 0 if split else True)
-            lo, hi, _ = program.readers(k_first, q_steps, spans_of, row)
+            # A shared dQ's consumers walk every streamed step in step: each step's exchange takes them all.
+            lo, hi = streamed if tiles.shared_dq else program.readers(k_first, q_steps, spans_of, row)[:2]
             part = (index * count, count) if split else (0, block_q)
 
             store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, (row, head), k_first,
@@ -411,9 +606,10 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index)
+            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder)
             stage = _logits_stage(family, consumers, logits_stages, index)
-            step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
+            statistics = None if program.tiles.shared_dq else rows_of
+            step = functools.partial(_dkv_step, walk, resident, statistics, coords_of, params_of, store_tiles,
                                      shares, part, stage, adds)
             # The tiles its partner reads around its own, or its consumers' own loads of the query stream
             # where they feed it, the one key block's readers (`Family.walk_own`).
@@ -435,9 +631,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                         (out_smem, dv_smem, rows_smem), index, walk.interpret)
             return None
 
-        def producer():
-            family.stream(streams, views, *streamed)
-
+        producer = functools.partial(_dkv_producer, walk, streams, views, streamed, dq_ref, (row, head),
+                                     fused_stages, width)
         return family.roles(consumers, consumer, producer)
 
     scoped, rings = _dkv_allocations(family, program.tiles, width, value_width, query.dtype, stages=stages,
@@ -447,36 +642,73 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
         if summed is not None:
             first = 9 + len(leaves) + walk.fused
-            grads = refs[first:first + len(graded)]
-            outputs = refs[first + len(graded):first + len(graded) + 2]
+            grads = _grad_views(refs[first:first + len(groups)], groups, len(graded))
+            outputs = refs[first + len(groups):first + len(groups) + 2]
             _summed_stored(family, summed, _shared_views(outputs, grads, graded, block_k), consumers,
                            walk.interpret)
 
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    graded_params = [param for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
-    return _dkv_launched(walk, launch, operands, graded, [param.shape for param in graded_params],
-                         key.shape[1])
+    return _dkv_launched(walk, launch, operands, graded, buffers, groups)
 
-def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], shapes: list,
-                  keys_padded: int) -> tuple[jax.Array, ...]:
+def _dkv_views(named: dict, stat_refs: list, positions_ref, place: tuple, *, shared_dq: bool) -> dict:
+    """The streams' views of a dK/dV program's batch row and head (`place`): its queries, output cotangents
+    and logits where staged (`named`), and a shared dQ's queries' statistics and places, a step's block of
+    each (`STATISTICS`)."""
+    views = _views_of(named, *place)
+    if shared_dq:
+        views.update({name: (ref.at[place], lambda j: (j,))
+                      for name, ref in zip(STATISTICS, stat_refs, strict=True)})
+        views["positions"] = (positions_ref, lambda j: (j,))
+    return views
+
+
+def _statistics_of(family: mosaic.Family, stat_refs: list, place: tuple, q_first, rows: int) -> tuple:
+    """`rows` queries' statistics from `q_first` of a batch row and head (`place`) in a column's layout, the
+    tiles' queries its columns."""
+    return tuple(family.columns_of(ref.at[*place, pl.ds(q_first, rows)]) for ref in stat_refs)
+
+
+def _dkv_producer(walk: _Backward, streams, views: dict, streamed: tuple, dq_ref, place: tuple,
+                  fused_stages: list, width: int) -> None:
+    """A dK/dV program's producer: its streams' loads, and a shared dQ's adds where it makes them
+    (`_outbox`), a step's dQ tile a share of its columns each consumer's (`_fused_adds`)."""
+    program, consumers = walk.program, walk.consumers
+    block_q, share = program.tiles.block_q, width // consumers
+    box = _outbox(walk, fused_stages)
+    row, head = place
+
+    def targets(step):
+        rows = dq_ref.at[0, row, pl.ds(step * block_q, block_q), head]
+        return tuple(rows.at[:, pl.ds(index * share, share)] for index in range(consumers))
+
+    program.family.stream(streams, views, *streamed, adds=None if box is None else (box, targets))
+
+
+def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], buffers: list,
+                  groups: tuple) -> tuple[jax.Array, ...]:
     """The dK/dV launch `launch` over `operands`: dK, dV and the hook's key and tile gradients in kind order,
-    each parameter's (of `shapes`, its own batch rows and heads, `[B or 1, H or 1, ...]`) added into zeros in
+    each parameter's (`buffers`, its own batch rows and heads, `[B or 1, H or 1, ...]`) added into zeros in
     place by every program that reads it, the tiles' keys first `[., ., Kp, Qp]` (row 2577: a bias every row
     shares summed in the program, not written a row at a time); in deterministic mode each program's own
     place, the call's `[B, H, ...]`, written once, the shared rows summed in a fixed order after
     (`template.shared_sum`; row 2620: the adds of the programs sharing one place land in no fixed order); a
     fused one's dQ before them, added into zeros too, one copy, or each consumer's own interpreted
-    (`Family.added`)."""
+    (`Family.added`). A key gradient where the launch's family adds no vector (`Family.adds_vectors`) its
+    program's own place too, written, the shared rows summed after (`_grad_buffers`). The gradients of one
+    shape (`groups`) are one ref, a leading axis of them: two refs of equal zeros are one value to XLA,
+    which a dynamic-slice fusion wrapping the launch passes once for both aliased operands, so both
+    gradients were one buffer (row 3180, `_fused_launch`)."""
     batch, queries, heads, _ = operands[0].shape
-    if deterministic_ops_requested():
-        shapes = [(batch, heads)] * len(shapes)
-    grads = [jax.new_ref(jnp.zeros((*shape[:2], keys_padded) if kind == Kind.KEY
-                                   else (*shape[:2], keys_padded, queries), jnp.float32))
-             for shape, kind in zip(shapes, graded, strict=True)]
+    grads = [jax.new_ref(jnp.zeros((len(group), *buffers[group[0]]), jnp.float32)) for group in groups]
     if not walk.fused:
         dk, dv = launch(*operands, *grads)
-        return dk, dv, *_keys_last([jax.freeze(grad) for grad in grads], graded)
+        found: list = [None] * len(graded)
+        for ref, group in zip(grads, groups, strict=True):
+            stacked = jax.freeze(ref)
+            for place, index in enumerate(group):
+                found[index] = stacked[place]
+        return dk, dv, *_keys_last(found, graded)
     width = operands[0].shape[3]
     copies = walk.consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))

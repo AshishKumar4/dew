@@ -56,8 +56,10 @@ from dew.sampling.solvers import EulerAncestral, Solver
 
 if TYPE_CHECKING:
 
+    from dew.data.pipeline import Dataset
     from dew.diffusion.presets import Preset
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
+    from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
     # A kind's `union` imports every aliased class, so the run builds it at
     # the end of the module, where the annotations, read when a command line
@@ -82,10 +84,12 @@ DEFAULT_MODEL_CONFIG = {
 
 @dataclasses.dataclass(frozen=True)
 class FlowRolloutConfig:
-    """A run's Flow-GRPO rollout: `groups` samples of each prompt over `steps` time points, the first
-    `train_steps` transitions trained (all of them when None), each scored by the image metric
-    `reward` names, an alias or an import path, against its own prompt, higher being better
-    (`clip_score`). `build` makes the `FlowRollout` over an objective."""
+    """A run's flow RL rollout: `groups` samples of each prompt over `steps` time points, each scored by
+    the image metric `reward` names, an alias or an import path, against its own prompt, higher being
+    better (`clip_score`). Flow-GRPO trains the first `train_steps` transitions of each trajectory (all
+    of them when None) and DiffusionNFT each clean sample at the first `train_steps` times of its
+    sampler's grid (the released 9 when None). `build` makes the objective's rollout, a `FlowRollout`
+    or an `NFTRollout`."""
 
     reward: str = "clip_score"
     groups: int = 4
@@ -97,11 +101,12 @@ class FlowRolloutConfig:
             raise ValueError(f"reward names {self.reward!r}, which no metric alias names; the aliases are "
                              f"{sorted(metrics)}, or name a metric by its import path")
 
-    def build(self, objective: FlowGRPOObjective) -> FlowRollout:
+    def build(self, objective: FlowGRPOObjective | DiffusionNFTObjective) -> FlowRollout | NFTRollout:
         """The rollout over `objective`, scoring each sample with the metric's per-sample measure."""
         from dew.artifacts import ImageGrid
         from dew.eval.common import ImageMetric
         from dew.objectives.rl.flow import FlowRollout
+        from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
         metric = metrics[self.reward]()
         if not isinstance(metric, ImageMetric):
@@ -111,6 +116,9 @@ class FlowRolloutConfig:
         def reward(images, batch):
             return np.asarray(metric.fn(ImageGrid(images), batch))
 
+        if isinstance(objective, DiffusionNFTObjective):
+            trained = {} if self.train_steps is None else {"train_steps": self.train_steps}
+            return NFTRollout(objective, reward, groups=self.groups, steps=self.steps, **trained)
         return FlowRollout(objective, reward, groups=self.groups, steps=self.steps,
                            train_steps=self.train_steps)
 
@@ -184,12 +192,13 @@ class DiffusionRunConfig(RunConfig):
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
-        flow = issubclass(objectives[self.objective.name], FlowGRPOObjective)
+        flow = issubclass(objectives[self.objective.name], (FlowGRPOObjective, DiffusionNFTObjective))
         if flow and self.rollout is None:
             object.__setattr__(self, "rollout", FlowRolloutConfig())
         if not flow and self.rollout is not None:
-            raise ValueError(f"--rollout configures a Flow-GRPO run's rollout, and --objective "
+            raise ValueError(f"--rollout configures a flow RL run's rollout, and --objective "
                              f"{self.objective.name} trains on its data")
 
         if self.pretrained is not None:
@@ -212,19 +221,6 @@ class DiffusionRunConfig(RunConfig):
         elif self.preset is None:
             raise ValueError("preset None trains on the convention a pretrained pipeline's "
                              "scheduler reads; name a preset or --pretrained")
-        # EDM's sigma draw is the space's: pixels without an autoencoder,
-        # latents with one. A regime or sigmas the preset states win.
-        if (isinstance(self.preset, EDM) and self.preset.regime is None
-                and (self.preset.P_mean is None or self.preset.P_std is None)):
-            latent = self.autoencoder is not None or self.pretrained is not None
-            object.__setattr__(self, "preset", dataclasses.replace(
-                self.preset, regime="latent" if latent else "pixel"))
-        # A resolution shift is the data's: the token count of its images.
-        if (isinstance(self.preset, Flow) and self.preset.resolution_shift is not None
-                and self.preset.resolution_shift.tokens is None and self.data is not None):
-            height, width = self.sample_field().shape[-3:-1]
-            object.__setattr__(self, "preset", dataclasses.replace(
-                self.preset, resolution_shift=self.preset.resolution_shift.at(height, width)))
         if self.audio is not None and self.text is not None:
             raise ValueError(
                 "the models take one context under textcontext, and this run names both "
@@ -234,28 +230,51 @@ class DiffusionRunConfig(RunConfig):
             raise ValueError("audio conditioning reads its clips' audio, and this chain's clips carry none "
                              "(dew.data.presets.clips(sample_rate=))")
 
+    def derived_preset(self) -> Preset | None:
+        """The run's preset as it builds its process, what it leaves to the run derived from the run as it
+        stands, so an override of what it derives from (the images' size, `data.images.size`, or the
+        autoencoder) derives it afresh, where the run records the preset as given: EDM's sigma draw the
+        space's, pixels without an autoencoder and latents with one, and a Flow resolution shift's token
+        count the data's images' (`ResolutionShift.at`). A regime, sigmas or token count the preset states
+        wins, a model whose grid is not the 16-pixel one stating its own."""
+        preset = self.preset
+        # A regime or sigmas the preset states win.
+        if isinstance(preset, EDM) and preset.regime is None and (
+                preset.P_mean is None or preset.P_std is None):
+            latent = self.autoencoder is not None or self.pretrained is not None
+            return dataclasses.replace(preset, regime="latent" if latent else "pixel")
+        shift = preset.resolution_shift if isinstance(preset, Flow) else None
+        if isinstance(preset, Flow) and shift is not None and shift.tokens is None and self.data is not None:
+            height, width = self.sample_field().shape[-3:-1]
+            return dataclasses.replace(preset, resolution_shift=shift.at(height, width))
+        return preset
+
     def sample_field(self) -> Field:
         """Return the batch field the model generates, at the resolution the data comes in
         (`Dataset.facts`): a clip's video, else an image. Raises ValueError for a chain of neither, or
         one whose size varies."""
         return media_field(self.chain(), "diffusion")
 
-    def mask_field(self, sample: Field, wanted: Field) -> Field:
+    def mask_field(self, sample: Field, wanted: Field, chain: Dataset | None = None,
+                   name: str = "the chain") -> Field:
         """The batch field an inpainting pipeline reads its mask from (`wanted`, the pipeline's own): the
-        chain's `wanted.key` at the samples' height and width, one channel, as `dew.data.images.RandomMask`
-        draws one or a dataset's own column decodes one. A chain that carries none is refused, naming
-        RandomMask: an inpainting pipeline paints the region its mask marks, and a plain image chain
-        marks none."""
-        fields = record(self.chain().facts()["fields"], "the chain's fields")
+        chain's `wanted.key` (the run's data, or `chain`, a validation split `name`) at the samples' height
+        and width, one channel, as `dew.data.images.RandomMask` draws one or a dataset's own column decodes
+        one. A chain that carries none is refused, naming RandomMask: an inpainting pipeline paints the
+        region its mask marks, and a plain image chain marks none."""
+        fields = record((self.chain() if chain is None else chain).facts()["fields"], f"{name}'s fields")
         shape = fields.get(wanted.key)
         expected = (*sample.shape[:-1], 1)
         if shape is None:
+            recipe = ("images(..., augment=RandomMask())" if chain is None else
+                      "images(..., augment=RandomMask(), rejects=False), whose random steps draw by each "
+                      "record's own index, which a dropped record would shift")
             raise ValueError(f"{self.pretrained} is an inpainting pipeline, which paints the region a mask "
-                             f"marks in each image; the chain carries no {wanted.key!r} field: draw one per "
-                             f"image with dew.data.images.RandomMask() (images(..., augment=RandomMask())), "
-                             f"or decode a dataset's own into {wanted.key!r}")
+                             f"marks in each image; {name} carries no {wanted.key!r} field: draw one per "
+                             f"image with dew.data.images.RandomMask() ({recipe}), or decode a dataset's "
+                             f"own into {wanted.key!r}")
         if not isinstance(shape, list | tuple) or tuple(shape) != expected:
-            raise ValueError(f"the chain's {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
+            raise ValueError(f"{name}'s {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
                              f"over {sample.key} of {sample.shape} reads a mask of {list(expected)}")
         return Field(wanted.key, expected)
 
@@ -275,8 +294,8 @@ class DiffusionRunConfig(RunConfig):
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
         model = self.model.build(**fields)
-        if isinstance(model, IntervalModel) and self.preset is not None:
-            built = self.preset()
+        if isinstance(model, IntervalModel) and (preset := self.derived_preset()) is not None:
+            built = preset()
             fields["interval"] = isinstance(built, Process) and built.interval
         if (issubclass(objectives[self.objective.name], MeanFlowObjective) and isinstance(model, TimeScaled)
                 and "time_scale" not in self.model.fields):
@@ -390,14 +409,21 @@ class DiffusionRunConfig(RunConfig):
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
         the batches it trains on (`rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
         run = self
         objective = run.build()
+        mask = objective.inputs.mask
+        if mask is not None and run.validation is not None:
+            # Each evaluation scores its splits through their masks, as the run trains through its own.
+            splits = run.validation if isinstance(run.validation, Mapping) else {"validation": run.validation}
+            for name, split in splits.items():
+                run.mask_field(objective.inputs.sample, mask, split, f"the {name!r} split")
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.validation_metrics(validates=bool(held))
         rollout = None
-        if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
+        if isinstance(objective, (FlowGRPOObjective, DiffusionNFTObjective)) and run.rollout is not None:
             rollout = run.rollout.build(objective)
         return Prepared(run, objective, dataset, metrics=metrics, rollout=rollout, validation=held)
 
@@ -481,7 +507,9 @@ class DiffusionRunConfig(RunConfig):
         if self.preset is None:
             assert convention is not None
             return convention
-        process = build_process(self.preset)
+        preset = self.derived_preset()
+        assert preset is not None
+        process = build_process(preset)
         if convention is not None and (
                 type(process.schedule) is not type(convention.schedule)
                 or type(process.prediction) is not type(convention.prediction)):

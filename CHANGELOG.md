@@ -1,21 +1,116 @@
 # Changelog
 
 Dew's releases, newest first. The version is `dew.__version__`, and a
-release's tag is that version with a `v` in front (`v0.1.0`).
+release's tag is that version with a `v` in front (`v0.1.0`). A release's
+notes are frozen once it is cut: its section's sha256 is recorded in
+tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-## 0.2.0
-
-The first release on Dew's own package index, `pip install dewml --extra-index-url
-https://pypi.dewml.dev/simple`, beside Dew's JAX build, which PyPI does not hold. PyPI's `dewml` is a
-pointer from now on: its 0.1.1 installs nothing and names the index.
+- Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md).
+  egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
+  (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
+  traitlets) and ipywidgets, jupyterlab-widgets, widgetsnbextension and comm.
+- On a host of two or more GPUs, XLA's pool leaves NCCL's communicators their measured full-speed room:
+  the share the run names (`dew.devices.pool_bound`) is the pool's upper bound, a child process measures
+  the communicators, all-to-all and permute connections once per configuration into Dew's cache, and a
+  program whose communicators need more than the room left is refused at Dew's one compile point, naming
+  the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
+  through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
+- Dew requires its JAX build 0.12.0.1.post42, and its `cuda12` and `cuda13` extras install Dew's builds of
+  the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
+  (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
+  strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
+  (docs/installation.md lists each fix).
+- DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
+  mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
+  outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.
+- A step that fails on its first run raises `FirstRunFailed`, naming each GPU's bytes free outside XLA's
+  pool, where its collectives' NCCL communicators take their buffers, as the fit check read them and
+  after the failure; a first run that succeeds logs each GPU's free bytes there at the check and after.
+- Dew no longer wraps JAX's `xla_bridge.backends`. XLA parses `XLA_FLAGS` once per runtime it loads,
+  possibly before a backend opens, so a flag holds for certain where `XLA_FLAGS` carried it before the
+  process loaded jaxlib (`dew.devices.flags_hold`). `import dew` sets its own flags before anything it
+  imports loads jaxlib; `dew train`, `dew profile` and `dew inspect` run again from their start with a
+  run's `trainer.xla_flags` set where they do not hold yet; `prepare_process` warns that flags it sets
+  after jaxlib loaded are unproven, and still refuses flags asked for after the backend opened.
+- A float64 `SafetensorsBanks` stream under `jax.enable_x64` no longer depends on the thread XLA runs a
+  layer's fetch on. The setting is thread-local, and JAX narrows a callback's results by it on the thread
+  that runs the callback, so a fetch on one of XLA's workers (a forward with a wide graph runs it there)
+  was refused with "Incorrect output dtype for return value". A 64-bit leaf now crosses the callback as
+  its 32-bit words and is bitcast back on the device.
+- A token export's documents are the records its producer wrote, by its length index, not its tokens'
+  EOS: an EOS a document's own text spells splits nothing, an export without an EOS packs, an empty
+  record is no document, and no `train.documents.npy` is written or read. A plan saved before resumes
+  where it read the same documents; where it read others, the store's fingerprint says how its documents
+  are read now, and the plan is refused.
+- A diffusion run derives its preset's resolution shift and EDM space where it builds its process, so a
+  `data.images.size` or autoencoder override derives them afresh. A JEPA run's predictor computes in its
+  built encoder's dtype and attention kernel.
+- One capture path: `dew.telemetry.profile.CaptureOptions` replaces `capture_options()`, and a
+  `ProfileWindow` holds it as `capture` in place of its `host_tracer_level`, `python_tracer_level` and
+  `activity_cap` (a saved run's are read as its capture's). `Profiler(reports=False)` captures a trace a
+  reader reads alone, with no XProf reports; the benchmarks and PGLE's guided profile capture through
+  it. The fit's trace record is `ProfileTraced`.
+- The step and data benchmarks rate MFU over the whole mesh's peak, as the trainer does, and report
+  their compiled work as a lower bound beside the launches it left out.
+- `from_grain`, `from_iter` and `from_hf` take a source's content version as `identity=`, as
+  `from_torch` does; a saved chain's iterator `name` reads as its identity.
+- A record's remote media path is read from Dew's mirror, refused (`Unmirrored`) where the mirror has no
+  room for it.
 - Muon's and MuonClip's AdamW group, the norms, biases and embeddings, keeps both moments in float32 by
   default (`state_dtype`), as AdamW does: under bfloat16 or float16 weights its second moment no longer
   underflows.
 - A distillation's `teacher_run` is read as its run's task loads it (`dew.inference.SavedRun`): the
   model the run publishes, so a Flow-GRPO run's trained policy and not its KL reference; guidance
   distillation's teacher objective is the run's own sampling task.
+
+- Environments and reinforcement learning for control, in `dew.rl` and `dew.objectives`:
+  - Environments as two pure functions: an `Env`'s `reset` and `step`, batched, cut at a time limit, rolled
+    out by one `lax.scan` (`dew.rl.env`). MuJoCo Playground's environments are Envs (`dew.rl.playground`,
+    the `playground` extra).
+  - Simulators outside JAX, stepped from the host with their arrays crossing by DLPack
+    (`dew.rl.simulator`).
+  - A device replay (`dew.rl.replay`).
+  - Brax's PPO for continuous control (`dew.objectives.rl.control`).
+  - DreamerV3 as its code computes it (`dew.objectives.rl.dreamer`): vector or image observations, bfloat16
+    compute, privileged auxiliary heads, and pretraining from demonstrations with behaviour cloning.
+  - DreamerV3's optimizer, LaProp after adaptive gradient clipping (`dew.laprop`), as the `laprop`
+    optimizer of `dew.optim`, which `OptimConfig.optimizer` names.
+  - TransDreamer's transformer dynamics (`dew.objectives.rl.tssm`).
+  - Dreamer 4's shortcut-forcing world model (`dew.objectives.world_model`).
+  - DiffusionNFT (`dew.objectives.rl.nft`).
+  - `tools/rl_acceptance.py` runs these against their papers. `tutorials/12-world-models.ipynb` acts and
+    imagines in one loop.
+- A first-person drone gate race in JAX (`dew.rl.flight`), flown by a racing quadrotor's physics in JAX
+  (`dew.rl.quadrotor`: a 5-inch racer at 12 times its weight, first-order motors, a Betaflight-form rate
+  loop, rotor, body and vertical drag, ground effect, a LiPo pack's sag, disturbances and noise, each drawn
+  per episode):
+  - Progress-to-gate rewards, gates passed only through their openings, and frames, pillars and the ground
+    solid along each physics step.
+  - Courses of four families (published layouts, loops, Song's chained primitives with split-S and dives,
+    figure-eights) under a difficulty curriculum, the next gate lit for the camera.
+  - Each drone's physics, latency, camera and image randomized.
+  - HyperLux draws its cameras (`dew.rl.hyperlux`, the `hyperlux` extra) over textured grounds, skies,
+    pillars and props (`tools/fpv_assets.py`, CC0 textures).
+  - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
+    DreamerV3 agent on the camera alone.
+- A run's watched activations (`Inspection.modules`) name a module by its class or its path, and a language
+  model's are summarized over its real tokens alone, its scorer's as it prepared them, through a pipelined
+  stack's microbatches too; a preference pair lays out each half's real tokens (`real_mask`).
+- `Inspection(cotangents=True)` logs the loss's cotangent at each watched output (`inspect/cotangents/...`),
+  from a probe's gradient, every objective's model calls carrying the probes.
+- A JEPA run's watched activations are named by the part that runs them, `context_encoder/...` (was
+  `encoder/...`) and `predictor/...`.
+- A step compiled ahead lists, past the plan it takes, each rung that recomputes more and fits at fewer
+  microbatches than every plan before it (`compile_ahead(..., frontier=True)`,
+  `--trainer.compile-ahead.frontier`), the plans `tools/benchmark_step.py` times on the GPUs; a run names
+  the fastest by its remat, `--trainer.split` and `LMObjective.head_tile`.
+## 0.2.0
+
+The first release on Dew's own package index, `pip install dewml --extra-index-url
+https://pypi.dewml.dev/simple`, beside Dew's JAX build, which PyPI does not hold. PyPI's `dewml` is a
+pointer from now on: its 0.1.1 installs nothing and names the index.
 
 - The fit search's derived first candidate counts what its gradient program holds at its peak, as JAX
   lowers it and the GPU's fusion keeps its values (a one-device `shard_map` inline, a Pallas kernel its

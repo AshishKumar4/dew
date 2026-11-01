@@ -1,9 +1,9 @@
 """Attention on the GPU (G14, the owner's rule: no unit tests on GPUs): each attention route whose kernel
 runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's property:
 
-- The frozen Triton template at every config of its forward's and its backward's spaces, bf16, every hook,
-  over causal documents under a window and the irregular calls (test_attention_triton); its default form
-  finite where the reference is at fp32's edges for the families too slow to interpret
+- The Pallas-Triton template at every tile its forward's and its backward's derivations step through, bf16,
+  every hook, over causal documents under a window and the irregular calls (test_attention_triton); its
+  default form finite where the reference is at fp32's edges for the families too slow to interpret
   (test_attention_stability).
 - The Mosaic mainloop's default form, and its backward in two launches, finite where the reference is at
   fp32's edges over every family it takes, on an H100 (test_attention_stability).
@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 import test_attention_accurate_form as accurate_form
 import test_attention_dropout as dropout
+import test_attention_inplace_operands as inplace
 import test_attention_masked_rows as masked_rows
 import test_attention_mosaic as mosaic
 import test_attention_route as route
@@ -41,16 +42,12 @@ import test_attention_triton as triton
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import Cell, cells_of, repeats_bit_for_bit, run_cells, when
+from gpu_flow import BF16_PRODUCTS, Cell, cells_of, repeats_bit_for_bit, run_cells, when
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
 
 pytestmark = pytest.mark.gpu(reason="each route's GPU kernel: Triton, Mosaic, flash and the band")
-
-BF16_PRODUCTS = "needs a GPU whose bf16 products run, sm80 or later"
-"""Why a library kernel's cell skips: flash, cuDNN, tokamax's Triton and the band run wherever bf16 products
-do (`bf16_dot_runs`), an A10 and an L4 among them, whatever Dew's own launches' sizes."""
 
 CASES = ("causal-documents-window", *triton.IRREGULAR)
 """The Triton sweeps' calls (`triton.every_config_on_a_gpu`)."""
@@ -95,9 +92,9 @@ def test_the_attention_kernels_run_on_this_gpu():
     """Every kernel cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together; the Mosaic cells on an H100 alone."""
     run_cells([
-        sweep(triton.every_config_on_a_gpu, triton.attention_triton.SPACE),
-        sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_SPACE),
-        *(Cell(f"the frozen Triton mainloop's default is finite at fp32's edges: {family}",
+        sweep(triton.every_config_on_a_gpu, triton.attention_triton.FORWARD_STEPS),
+        sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_STEPS),
+        *(Cell(f"the Pallas-Triton mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "triton"))
           for family in stability.GPU_TRITON_FAMILIES),
         *(Cell(f"the Mosaic mainloop's default is finite at fp32's edges: {family}",
@@ -181,13 +178,19 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
     ])
 
 
+@pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_mosaic_template_holds_on_an_h100():
     """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
-    long sequence, each one's failure kept and all raised together."""
+    long sequence, each one's failure kept and all raised together, without XLA's deterministic ops: the
+    fused backward forms its cells pin add dQ atomically, which a deterministic run never derives
+    (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's `_repeat_promised`) they
+    failed as unpaired draws (row 3171)."""
     run_cells([
         *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
+        *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
+        *cells_of(inplace.a_routes_hooked_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
     ])
 

@@ -16,6 +16,7 @@ import itertools
 import traceback
 from collections.abc import Callable, Iterable
 
+import lane_environment
 import pytest
 from generation_support import runnable
 
@@ -61,43 +62,39 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
     global _depth
     _depth += 1
-    failed, skipped, passed = [], [], [0]
+    failed: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    passed = 0
     try:
-        _ran(cells, failed, skipped, passed)
+        for cell in cells:
+            if cell.generation is not None and not runnable(cell.generation):
+                skipped.append(cell.label)
+                continue
+            print(f"cell: {cell.label}", flush=True)
+            try:
+                cell.run()
+            except pytest.skip.Exception as skip:
+                print(f"cell skipped: {cell.label}: {skip.msg}", flush=True)
+                skipped.append(cell.label)
+            except (Exception, pytest.fail.Exception) as error:
+                # A cell's failure is any exception, pytest's own among them (`pytest.fail`, and a
+                # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
+                # the flow: kept with its label, and raised with every other cell's after the last.
+                failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
+            else:
+                passed += 1
     finally:
         # Counted however the flow ends, so a flow stopped early still reports what it ran.
         _depth -= 1
         if not _depth:
-            REPORTED.append({"passed": passed[0], "failed": len(failed), "skipped": len(skipped),
+            REPORTED.append({"passed": passed, "failed": len(failed), "skipped": len(skipped),
                              "device": _device()})
-    passed = passed[0]
     print(f"cells: {passed} passed, {len(failed)} failed, {len(skipped)} skipped on this device", flush=True)
     if failed:
         raise CellsFailed(failed)
     if not passed:
         pytest.skip(f"no cell runs on this device ({len(skipped)} skipped)")
     return skipped
-
-
-def _ran(cells: Iterable[Cell], failed: list[tuple[str, str]], skipped: list[str], passed: list[int]) -> None:
-    """Each cell run (`run_cells`), into `failed` (by label and report), `skipped` (labels) and `passed` (its
-    one count): a cell's failure is any exception, pytest's own failures among them (`pytest.fail`, and a
-    `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end the flow."""
-    for cell in cells:
-        if cell.generation is not None and not runnable(cell.generation):
-            skipped.append(cell.label)
-            continue
-        print(f"cell: {cell.label}", flush=True)
-        try:
-            cell.run()
-        except pytest.skip.Exception as skip:
-            print(f"cell skipped: {cell.label}: {skip.msg}", flush=True)
-            skipped.append(cell.label)
-        except (Exception, pytest.fail.Exception) as error:
-            # Kept with its label, and raised with every other cell's after the last.
-            failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
-        else:
-            passed[0] += 1
 
 
 def _skipped(marks, reason_of: str) -> Callable[[], None] | None:
@@ -158,6 +155,11 @@ def cells_of(check, generation: str | None = None, **fixtures) -> list[Cell]:
     return cells
 
 
+BF16_PRODUCTS = "needs a GPU whose bf16 products run, sm80 or later"
+"""Why a library kernel's cell skips (`when`): flash, cuDNN, tokamax's Triton and the band run wherever bf16
+products do (`bf16_dot_runs`), an A10 and an L4 among them, whatever Dew's own launches' sizes."""
+
+
 def when(holds: bool, reason: str, check: Callable[[], None]) -> Callable[[], None]:
     """`check` where `holds`, else skipped for `reason`: a cell gated on a capability (`bf16_dot_runs`, a
     package) rather than on a generation's launch sizes (`Cell.generation`)."""
@@ -176,16 +178,12 @@ def isolated(tmp_path_factory) -> Callable[..., Callable[[], None]]:
     def in_own(check, name: str, *, devices: int = 1, **given) -> Callable[[], None]:
         def run():
             import jax
-            from huggingface_hub import constants
 
             if jax.device_count() < devices:
                 pytest.skip(f"needs {devices} devices; this process has {jax.device_count()}")
             directory = tmp_path_factory.mktemp(name)
             with pytest.MonkeyPatch.context() as patch:
-                patch.setenv("DEW_RUNG_RECORDS", str(directory / "rungs"))
-                patch.setenv("DEW_DATA_CACHE", str(directory / "data-cache"))
-                patch.setenv("DEW_HUB_ANSWERS", str(directory / "hub-answers"))
-                patch.setattr(constants, "HF_HUB_CACHE", str(directory / "hub-cache"))
+                lane_environment.per_test_settings(patch, lambda part: directory / part)
                 fixtures = {"tmp_path": directory, "monkeypatch": patch}
                 taken = inspect.signature(check).parameters
                 check(**{key: value for key, value in fixtures.items() if key in taken}, **given)

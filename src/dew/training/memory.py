@@ -19,7 +19,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
-from dew._records import JSON, integers, json_value
+from dew import communicators
+from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
@@ -149,11 +150,11 @@ def refused_for_memory(code: str, message: str) -> bool:
     7.83 GiB short (node receipt TL-a100-offload-1338-d): the step at a rung that holds less compiles."""
     if code == 'RESOURCE_EXHAUSTED':
         return True
-    listed = AUTOTUNED_FAILURES.search(message)
-    if code != 'NOT_FOUND' or listed is None:
+    failures = AUTOTUNED_FAILURES.search(message)
+    if code != 'NOT_FOUND' or failures is None:
         return False
-    count = int(listed.group(1))
-    return count > 0 and len(EXECUTED_OUT_OF_MEMORY.findall(message, listed.end())) == count
+    count = int(failures.group(1))
+    return count > 0 and len(EXECUTED_OUT_OF_MEMORY.findall(message, failures.end())) == count
 
 
 def split_share(params: Variables) -> float:
@@ -318,17 +319,30 @@ def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int
     in use already; None where a device states no memory. A device that states none, one compiled for and
     absent (`compile_only_gpus`), holds the `capacity` it is stated to, `resident` in it as it would be."""
     memory = [device_memory(device, capacity, resident) for device in devices]
-    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+    if not stated(memory):
         return None
     return min(placeable(m, unclaimed(d, m)) - beside - temporaries * stranding(d, m)
                for d, m in zip(devices, memory, strict=True))
+
+
+def stated(memory: Sequence[Mapping[str, int]]) -> bool:
+    """Whether every device's `memory` (`device_memory`) states its limit and its use, which a fit check
+    reads; a CPU's states none, so no step's headroom on it is known ahead of its run."""
+    return all('bytes_limit' in m and 'bytes_in_use' in m for m in memory)
+
+
+def judged(device) -> bool:
+    """Whether a step's footprint derived for `device` is judged against its memory (`derived_headroom`):
+    a device of this process judges it where it states its memory, which a CPU does not, and a device with
+    none attached (a compile-only GPU, `dew.training.ahead.compile_only_gpus`) against the capacity a plan
+    states for it."""
+    return device not in jax.local_devices() or stated([device_memory(device)])
 
 
 def stranding(device, memory: Mapping[str, int]) -> int:
     """How many times its temporaries a step needs room for on `device`, its allocator stating `memory`:
     2 where it can strand them (`strands_temporaries`), else 1."""
     return 2 if strands_temporaries(device.platform, memory) else 1
-
 
 
 def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
@@ -349,26 +363,63 @@ def local_devices(mesh: Mesh) -> list:
     return [device for device in mesh.devices.flat if device.process_index == process]
 
 
-def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> None:
-    """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's,
-    with the check that said it fits (`fitted`, `memory_record`) and what `mesh`'s devices of this
-    process hold now."""
+class FirstRunFailed(RuntimeError):
+    """A newly compiled step's first run its devices refused: the record of the check that said it fits
+    (`fitted`, `memory_record`) and what this process's devices of its mesh hold now (`now`), each GPU's
+    bytes free outside XLA's pool (`outside_pool`) among it."""
+
+    def __init__(self, step: int, fitted: JSON, now: list[JSON]):
+        self.fitted, self.now = fitted, now
+        super().__init__(
+            f"the training step compiled for step {step} failed on its first run. It was checked to fit: "
+            f"{json.dumps(fitted)}; the devices now hold {json.dumps(now)}. 'outside' is a GPU's bytes free "
+            "outside XLA's pool, whose limit is its bytes_limit (XLA_PYTHON_CLIENT_MEM_FRACTION of the GPU): "
+            "a collective's communicators (NCCL) take their buffers there, beside cuBLAS's workspaces and "
+            "the kernels loaded, and a lower fraction leaves them more")
+
+
+def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str, dict[int, int]]:
+    """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's
+    (`FirstRunFailed`). A first run that succeeds returns, and logs, each GPU's bytes free outside XLA's
+    pool as the fit check read them (`fitted`) and now: what the devices took there since, every
+    process's and a pool's growth counted, the step's collectives' communicators (NCCL) among it."""
+    devices = local_devices(mesh)
     try:
         loss.block_until_ready()
     except jax.errors.JaxRuntimeError as error:
-        now = [{"id": device.id, **{key: value for key, value in (device.memory_stats() or {}).items()
-                                    if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
-               for device in local_devices(mesh)]
-        raise RuntimeError(
-            f"the training step compiled for step {step} failed on its first run. It was checked to "
-            f"fit: {json.dumps(fitted)}; the devices now hold {json.dumps(now)}") from error
+        now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
+                            **{key: value for key, value in (device.memory_stats() or {}).items()
+                               if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+                           for device in devices]
+        raise FirstRunFailed(step, fitted, now) from error
+    read = () if fitted is None else listed(record(fitted, "fitted")["devices"], "devices", read=record,
+                                            what="each device's memory as the fit check read it")
+    checked = {integer(device["id"], "id"): outside for device in read
+               if isinstance(outside := device.get("outside"), int)}
+    current = {device.id: free for device in devices
+               if device.id in checked and (free := outside_pool(device)) is not None}
+    observed = {"checked": {device: checked[device] for device in current}, "now": current}
+    if current:
+        _log.info("the GPUs' free bytes outside XLA's pool: %s as the step's fit check read them, %s after "
+                  "its first run, which takes its collectives' communicators there", observed["checked"],
+                  current)
+    return observed
+
+
+def outside_pool(device) -> int | None:
+    """The bytes free on a GPU of this process outside XLA's pool, as its CUDA driver reports them
+    (`gpu_free_bytes`), every process's allocations counted; None for any other device."""
+    if device.platform != 'gpu' or device not in jax.local_devices():
+        return None
+    return gpu_free_bytes(device.local_hardware_id)
 
 
 def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int, *, fits: bool) -> JSON:
     """What the fit check read for a compiled step, as `step_headroom` reads
     it, and its answer `fits`: XLA's memory analysis of the step, `held`, and
     each of `devices`' allocator stats and free GPU bytes, in bytes. A step
-    the check passed and the devices then refused is read from it."""
+    the check passed and the devices then refused is read from it, with the
+    pool Dew sized for the host's communicators (`dew.communicators.held`)."""
     stats = executable.memory_analysis()
     analysis: JSON = None if stats is None else {
         name: int(getattr(stats, f"{name}_size_in_bytes", 0) or 0)
@@ -379,10 +430,11 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
         reported: dict[str, JSON] = {key: int(memory[key]) for key in MEMORY_STATS if key in memory}
         devices_stats.append({"id": int(device.id), **reported,
                               "unclaimed": None if not memory else unclaimed(device, memory),
+                              "outside": outside_pool(device),
                               "strands": bool(memory) and strands_temporaries(device.platform, memory)})
-    record: dict[str, JSON] = {"analysis": analysis, "held": int(held), "devices": devices_stats,
-                               "fits": fits}
-    return record
+    sizing = communicators.held()
+    return {"analysis": analysis, "held": int(held), "devices": devices_stats, "fits": fits,
+            **({} if sizing is None else {"pool": json_value(sizing.record(), "pool")})}
 
 
 def unclaimed(device, memory: Mapping[str, int]) -> int | None:

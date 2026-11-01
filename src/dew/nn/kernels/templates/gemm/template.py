@@ -33,8 +33,8 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax.typing import PrecisionLike
+from jax.custom_derivatives import zero_from_primal
 from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation, grouped_matmul, selection
@@ -129,7 +129,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                                            prologue_axes, compute, work if not each else None, plain)
                      for place, d_product, matrix, work, each in zip(places, d_products, matrices, works,
                                                                      narrow, strict=True)]
-        leaves = [d_lhs, gradients[0], np.zeros(group_sizes.shape, jax.dtypes.float0),
+        leaves = [d_lhs, gradients[0], zero_from_primal(group_sizes),
                   *(d_prologue or (None,) * len(prologue_arrays)),
                   *(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)),
                   *gradients[1:]]
@@ -171,9 +171,12 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
         wide = at_least_fp32(lhs.dtype)  # an fp64 product's sum in fp64
         # Each group's rows contracted, XLA's ragged dot's own weight gradient (its transpose's form) on the
         # operands as they are: a pullback from a matrix made here would hand a vmapped call (a pipeline
-        # stage's) an unbatched operand, which ragged_dot's batching rule refuses.
+        # stage's) an unbatched operand, which ragged_dot's batching rule refuses. The operands keep their
+        # dtype, summed in `wide`: a bf16 product is exact in fp32 either way, where operands widened first
+        # made the GPU's product an fp32 one (an sm120's 4096-token gate_up weight gradient 5.91 ms against
+        # 2.72 for the bf16 product).
         return jax.lax.ragged_dot_general(
-            lhs.astype(wide), rhs.astype(lhs.dtype).astype(wide), group_sizes, _CONTRACTED_ROWS,
+            lhs, rhs.astype(lhs.dtype), group_sizes, _CONTRACTED_ROWS,
             precision=precision, preferred_element_type=wide).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)

@@ -20,7 +20,6 @@ import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GPT2Config, OPTConfig
 
 from dew.interop import Pretrained
-from dew.interop.verify import _ROUNDING
 from dew.sampling import Sampling, generate
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -60,10 +59,11 @@ def check_checkpoint(checkpoint, output, revision):
     loaded = dataclasses.replace(loaded, model=loaded.model.clone(precision=jax.lax.Precision.HIGHEST))
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
     error = float(np.max(np.abs(expected - actual)))
-    # Twice the largest tiny-family error per layer per logit, in fp32 ulps,
-    # matches Dew's existing verified-mapping bound (verify._ROUNDING).
+    # Twice the largest error per layer per logit in fp32 ulps that the thirteen dense and routed tier-1
+    # tiny fixtures (tests/fixtures/hf) measured, 6.46 (llama31-tiny: 9.89e-06 over two layers, logits up
+    # to 6.43).
     layers = config.num_hidden_layers
-    bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
+    bound = float(2 * 6.46 * np.finfo(np.float32).eps * layers * np.max(np.abs(expected)))
     agreement = bool(np.array_equal(actual.argmax(-1), expected.argmax(-1)))
     ours = np.asarray(generate(loaded.model, loaded.variables, ids, 6, key=0,
                                sampling=Sampling(temperature=0)).tokens)

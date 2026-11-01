@@ -11,7 +11,7 @@ import json
 import logging
 import platform
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.batch import Batch
+    from dew.data.sources.tokens import TokenFiles
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
@@ -397,6 +398,131 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
+def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
+    """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
+    position's one translation, where a reader's `set_state` decodes it. A token store a Dew before row 3028
+    named without saying how its documents are read is named as today's names it where that Dew read the
+    same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
+    source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
+    the saved and current manifests' sources are numbered as their derived facts number them. Carried to
+    1.0 (ledger 1552)."""
+    manifest = record(saved.get("manifest", {}), "saved data manifest")
+    named = _named_as_today(json_value(manifest.get("source", {}), "saved data source"), plan.stores)
+    saved = {**saved, "manifest": {**manifest, "source": named}, **_members_as_today(saved, plan)}
+    saved_sources = record(named, "saved data source").get("sources")
+    sources = record(plan.manifest.semantic().get("source", {}), "data source").get("sources")
+    if not isinstance(saved_sources, list) or not isinstance(sources, list):
+        return saved
+    held = dict(record(saved.get("derived", {}), "saved derived order"))
+    for index, (store, today) in enumerate(zip(saved_sources, sources, strict=False)):
+        name = f"{index}/lengths"
+        if (name not in held and name in plan.derived and store == today and isinstance(today, Mapping)
+                and _unstated_lengths(today)):
+            held[name] = plan.derived[name]
+    return {**saved, "derived": held}
+
+
+def _members_as_today(saved: Mapping[str, object], plan: Plan) -> dict[str, JSON]:
+    """`saved`'s member digests (`Plan.members`), a saved record read at its boundary, each an earlier Dew
+    made of a member `plan` keeps as today's makes it, where it is a digest that Dew made of today's
+    member (`_earlier_digests`); none where `saved` keeps no members."""
+    members = saved.get("members")
+    if not isinstance(members, dict):
+        return {}
+    held: dict[str, JSON] = {}
+    for key, digest in members.items():
+        today = plan.members.get(key)
+        if digest != today and key in plan.earlier_members and digest in _earlier_digests(
+                *plan.earlier_members[key]):
+            digest = today
+        held[key] = digest
+    return {"members": held}
+
+
+def _earlier_digests(manifest: JSON, stores: Sequence[TokenFiles]) -> Iterator[str]:
+    """The digests earlier Dews made of a member whose manifest today is `manifest`, reading `stores`, each
+    only where that Dew read the stores' documents as today's does: one that named a store's reading
+    (`documents`) only where it read others of it, alike ones without (`TokenFiles.read_alike`); and one
+    before row 3028, which named none and stated no lengths of a store without an EOS, where it read
+    every store alike (`_unstated_lengths`)."""
+    yield fingerprint(_documents_where(manifest, stores, lambda store: not store.read_alike()))
+    if all(store.read_alike() for store in stores):
+        named = record(_without_documents(manifest), "member manifest")
+        sources, derived = named.get("sources"), named.get("derived")
+        if isinstance(sources, list) and isinstance(derived, dict):
+            unstated = {f"{index}/lengths" for index, source in enumerate(sources)
+                        if isinstance(source, dict) and _unstated_lengths(source)}
+            named = {**named, "derived": {name: value for name, value in derived.items()
+                                          if name not in unstated}}
+        yield fingerprint(named)
+
+
+def _documents_where(value: JSON, stores: Sequence[TokenFiles], kept: Callable[[TokenFiles], bool]) -> JSON:
+    """`value`, a fingerprint of sources or a manifest holding them, a saved record's form made at its
+    boundary: each token store in it that is one of `stores` named with `documents` only where `kept`
+    holds of it."""
+    if isinstance(value, list):
+        return [_documents_where(part, stores, kept) for part in value]
+    if not isinstance(value, dict):
+        return value
+    if value.get("store") == "tokens" and "documents" in value:
+        bare = {name: part for name, part in value.items() if name != "documents"}
+        for store in stores:
+            before = record(json_value({name: part for name, part in store.fingerprint().items()
+                                        if name != "documents"}, "token store fingerprint"), "token store")
+            if all(bare.get(name) == part for name, part in before.items()):
+                return value if kept(store) else bare
+        return value
+    return {name: _documents_where(part, stores, kept) for name, part in value.items()}
+
+
+def _without_documents(value: JSON) -> JSON:
+    """`value`, a fingerprint of sources or a manifest holding them, a saved record's form made at its
+    boundary: each token store in it named as a Dew before row 3028 named it, without `documents`
+    (`earlier_plan`)."""
+    if isinstance(value, list):
+        return [_without_documents(part) for part in value]
+    if not isinstance(value, dict):
+        return value
+    return {name: _without_documents(part) for name, part in value.items()
+            if not (name == "documents" and value.get("store") == "tokens")}
+
+
+def _named_as_today(value: JSON, stores: Sequence[TokenFiles]) -> JSON:
+    """`value`, a saved plan's fingerprint of its sources or a part of one, a saved record read at its
+    boundary: each token store in it a Dew before row 3028 named without `documents` named with it, as
+    today's names it, where it is one of `stores` and that Dew read its documents as today's does
+    (`TokenFiles.read_alike`, a scan of its tokens only here); a fingerprint that extends a store's with
+    keys of its own (its windows') too. Anything else as it is."""
+    if isinstance(value, list):
+        return [_named_as_today(part, stores) for part in value]
+    if not isinstance(value, dict):
+        return value
+    if value.get("store") == "tokens" and "documents" not in value:
+        for store in stores:
+            before = record(json_value({name: part for name, part in store.fingerprint().items()
+                                        if name != "documents"}, "token store fingerprint"), "token store")
+            if all(value.get(name) == part for name, part in before.items()) and store.read_alike():
+                return {**value, "documents": "records"}
+        return value
+    return {name: _named_as_today(part, stores) for name, part in value.items()}
+
+
+def _unstated_lengths(source: Mapping[str, object]) -> bool:
+    """Whether a Dew before row 3028 stated no lengths for the source fingerprinted `source`: a token store
+    stating no EOS, which it read as one stream, a concatenation holding one, whose lengths are its parts'
+    together, or a slice of records of either, whose lengths are its source's sliced."""
+    if source.get("store") == "tokens":
+        stated = source.get("metadata")
+        return isinstance(stated, Mapping) and stated.get("eos_id") is None
+    sliced = source.get("of")
+    if source.get("selection") == "slice" and isinstance(sliced, Mapping):
+        return _unstated_lengths(sliced)
+    parts = source.get("concatenate")
+    return isinstance(parts, list) and any(isinstance(part, Mapping) and _unstated_lengths(part)
+                                           for part in parts)
+
+
 def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
                  current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
                  ) -> frozenset[tuple[str, str]] | None:
@@ -465,6 +591,13 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
+    stores: tuple[TokenFiles, ...] = dataclasses.field(default=(), compare=False, repr=False)
+    """The token stores beneath the plan's sources, which a plan a Dew before row 3028 saved names
+    otherwise (`earlier_plan`); no part of the plan's record."""
+    earlier_members: Mapping[str, tuple[JSON, tuple[TokenFiles, ...]]] = dataclasses.field(
+        default_factory=dict, compare=False, repr=False)
+    """Each of `members`' manifests, undigested, with the token stores the member reads, from which a
+    resume makes the digests an earlier Dew made of it (`earlier_plan`); no part of the plan's record."""
     version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
@@ -525,7 +658,7 @@ class Plan:
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
                 "data plan contains a step without stable identity or a store given no name "
-                "(from_grain(..., name=), from_iter(..., name=)); resume='non-exact' is required"
+                "(from_grain(..., identity=), from_iter(..., identity=)); resume='non-exact' is required"
             )
         edited = self._edited_members(saved)
         # A mix whose members changed is compared member by member (`_edited_members`): each kept

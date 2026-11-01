@@ -50,11 +50,12 @@ class Export:
 
     def run_command(self) -> int:
         from dew.inference.tasks import SavedRun
-        from dew.interop.saved_sources import export_run
+        from dew.interop.saved_sources import pooled_export
 
         # A task that publishes its own released layout (a decision run's) writes it; any other
         # run writes its model in the source layout its family reads, both at the step pinned here.
-        export_run(SavedRun.pinned(self.run, self.step, self.trust), self.destination, ema=self.ema)
+        # A pool sharing the destination publishes it from its first process (`pooled_export`).
+        pooled_export(SavedRun.pinned(self.run, self.step, self.trust), Path(self.destination), ema=self.ema)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 
@@ -189,6 +190,17 @@ def run_named(named: str, trust: tuple[str, ...]) -> RunConfig:
     return built if built.unrecorded() else RunConfig.read(built.record(), trust=(*trust, path.stem))
 
 
+def run_held(named: str, trust: tuple[str, ...], assigned: tuple[str, ...]) -> RunConfig:
+    """The run `named` names (`run_named`) with its `assigned` fields, its `trainer.xla_flags` held for every
+    runtime XLA loads: where they do not hold, the command runs again from its start with them in XLA_FLAGS
+    (`dew.devices.hold_xla_flags`), as `import dew` loads jaxlib before the run is read."""
+    from dew.devices import hold_xla_flags
+
+    run = run_named(named, trust).assigned(assigned)
+    hold_xla_flags(run.trainer.xla_flags)
+    return run
+
+
 @dataclasses.dataclass(frozen=True)
 class Train:
     """Train a run: the one a Python file builds, or the one a run's `run.json` records."""
@@ -202,7 +214,7 @@ class Train:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        run_named(self.run, self.trust).assigned(self.set).run()
+        run_held(self.run, self.trust, self.set).run()
         return 0
 
 
@@ -226,23 +238,22 @@ class Profile:
     """Packages outside Dew whose modules a `run.json` may import."""
     host_tracer_level: int | None = None
     """The capture's host events: 1 the user's annotations, 2 those and Dew's and JAX's, 3 every host event;
-    unset, `ProfileWindow`'s."""
+    unset, `CaptureOptions`'."""
     python_tracer_level: int | None = None
     """1 traces every Python call, which slows Python-heavy host work several times over; unset,
-    `ProfileWindow`'s (none)."""
+    `CaptureOptions`' (none)."""
     activity_cap: int | None = None
     """The CUDA activity events a GPU capture keeps, CUPTI's cap, past which the capture is cut short; -1
-    keeps every one (XLA's no limit); unset, `ProfileWindow`'s."""
+    keeps every one (XLA's no limit); unset, `CaptureOptions`'."""
 
     def run_command(self) -> int:
-        from dew.training.profiling import ProfileWindow
+        from dew.telemetry.profile import CaptureOptions
 
         given = {"host_tracer_level": self.host_tracer_level, "python_tracer_level": self.python_tracer_level,
                  "activity_cap": self.activity_cap}
-        capture = ProfileWindow("", self.steps,
-                                **{name: value for name, value in given.items() if value is not None})
-        report = run_named(self.run, self.trust).assigned(self.set).profile(self.out, warmup=self.warmup,
-                                                                            steps=self.steps, capture=capture)
+        capture = CaptureOptions(**{name: value for name, value in given.items() if value is not None})
+        report = run_held(self.run, self.trust, self.set).profile(self.out, warmup=self.warmup,
+                                                                  steps=self.steps, capture=capture)
         if report is not None:
             emit(report.text())
         return 0
@@ -262,7 +273,7 @@ class Inspect:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        emit(json.dumps(run_named(self.run, self.trust).assigned(self.set).inspected(), sort_keys=True))
+        emit(json.dumps(run_held(self.run, self.trust, self.set).inspected(), sort_keys=True))
         return 0
 
 

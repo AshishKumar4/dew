@@ -58,6 +58,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.algebra.scan import RESET_DECAY
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
@@ -66,7 +67,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
-from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step

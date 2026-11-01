@@ -18,13 +18,13 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post41; a release sorts below it, so an
+    # first build with every fix is post42; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
     # cuda12, cuda13 and tpu extras name are 0.12.0.1's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post41,<0.12.1",
+    "jax>=0.12.0.1.post42,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -66,6 +66,10 @@ dependencies = [
     # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
     # typeguard==2.13.3, which tyro excludes.
     "tokamax>=0.0.15",
+    # The algebraic rewrite pass docs/design/algebra.md designs saturates an
+    # e-graph of each outer program's jaxpr with egglog's rules; 14.0.0 is the
+    # release it is written against.
+    "egglog==14.0.0",
 ]
 license = "MIT"
 # Third-party code Dew carries keeps its notice: each file translated or
@@ -97,9 +101,12 @@ dew = "dew.cli.main:main"
 # JAX owns its accelerator requirements; the core dependency pins its release.
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an
 # A100 or an Ada GPU; these extras install its wheels on Linux x86_64 and aarch64 (a GH200).
-cuda12 = ["jax[cuda12]",
+# The CUDA plugin is Dew's build of the release jax posts, with Mosaic GPU's fixes (docs/installation.md),
+# which only Dew's package index serves; jaxlib and the PJRT plugin are the release's own. Named here, not
+# through jax's own `cuda12` extra, which pins the release's plugin (jaxlib's version).
+cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post42", "jaxlib==0.12.0.1",
           "dew-flash-attn-cu12~=0.3.6; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
-cuda13 = ["jax[cuda13]",
+cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post42", "jaxlib==0.12.0.1",
           "dew-flash-attn-cu13~=0.3.6; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 tpu = ["libtpu==0.0.50.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
@@ -228,6 +235,10 @@ diffusers = ["diffusers>=0.34.0", "torch"]
 # Wan 2.1's pipelines clean every prompt with ftfy before UMT5 reads it, and so
 # does dew.inputs.diffusion.WanConditioner.
 wan = ["ftfy"]
+# dew.rl.playground: MuJoCo Playground's MJX environments as Envs, its JAX implementation on any backend.
+playground = ["playground==0.2.0"]
+# dew.rl.hyperlux: HyperLux's batch ray tracer drawing the gate race's cameras (an NVIDIA GPU with OptiX).
+hyperlux = ["hyperlux==0.1.10"]
 # GGUF files (Pretrained.load(..., gguf_file=)): llama.cpp's reader and block dequantizers.
 gguf = ["gguf==0.19.0"]
 # Official client transports and native request/result schemas; no model runtime.
@@ -255,7 +266,7 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15
 # too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no accelerator:
 # locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
 # (tools/lock_environment.sh).
-kernel-compile = ["jax-cuda12-plugin==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post42; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "jax-cuda12-pjrt==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -342,6 +353,8 @@ markers = [
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",
     "release_env(requirement): a release's own code checked under a requirement pinned apart from the suite's (2173), which CI runs on the whole suite's run alone, under uv's overlay of it (tools/armada/ci.py `released`)",
     "whole_suite: tests too long for a train's run of what changed, which CI runs on the whole suite's run alone (DEW_WHOLE_SUITE, set on ci/full-whole-* branches) and sets aside on every other run, a policy-off train's too (tools/armada/ci.py)",
+    "check1_shards(seeds, per_task): a check-1 site too long for one task, which CI runs as armada's map and judge: its (1 + REDRAW) times seeds draws sharded across map tasks of per_task each, and one judge that pools them and reports the site's row; written on the test's own decorator, of literal counts, as the plan reads it (tools/armada/ci.py `sites`)",
+    "shards(units, per_task): a test's work of units too long for one task, split as check1_shards splits a check-1 site: its units 0 to units sharded across map tasks of per_task each, given them by the same environment (DEW_CHECK1_DRAWS, DEW_CHECK1_RECORDS, DEW_CHECK1_POOL), and one judge that pools them and reports the test's row; written on the test's own decorator, of literal counts, as the plan reads it (tools/armada/ci.py `sites`)",
     "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands, but for check 1 on the TPU SSD kernel, which no user runs on a GPU",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is
@@ -397,7 +410,7 @@ patch = ["subprocess"]
 concurrency = ["thread", "multiprocessing"]
 
 [tool.setuptools.dynamic]
-version = {attr = "dew.__version__"}
+version = {attr = "dew._version.__version__"}
 
 [tool.setuptools.package-data]
 dew = ["py.typed"]

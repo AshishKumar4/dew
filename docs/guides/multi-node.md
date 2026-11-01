@@ -35,7 +35,7 @@ The launcher prints one `pool:` line with the process count, the devices per pro
 
 Every output line starts with its rank. `--processes-per-host N` runs N processes on each host and splits the GPUs evenly between them, so `--processes-per-host 1` runs one process that holds every GPU. `--devices-per-process N` gives each process N GPUs.
 
-If a pool would need more GPUs than the launcher finds on the first host, it refuses the pool before any rank starts, and the message gives both counts. If it cannot count a host's GPUs, because nvidia-smi is missing there or fails, it says so on stderr and starts the pool without the check. `JAX_PLATFORMS=cpu`, in the environment or through `--env`, stops the launcher from counting GPUs. It counts only NVIDIA GPUs (those in `CUDA_VISIBLE_DEVICES`, when that is set), so on other GPUs, set `--processes-per-host` yourself.
+If a pool would need more GPUs than the launcher finds on the first host, it refuses the pool before any rank starts, and the message gives both counts. It counts the GPUs of the host it runs on through the CUDA driver, and another host's with nvidia-smi over ssh. If it cannot count a host's GPUs, because no driver loads on its own host or nvidia-smi is missing on the other or fails, it says so on stderr and starts the pool without the check. `JAX_PLATFORMS=cpu`, in the environment or through `--env`, stops the launcher from counting GPUs. It counts only NVIDIA GPUs (those in `CUDA_VISIBLE_DEVICES`, when that is set), so on other GPUs, set `--processes-per-host` yourself.
 
 `--env NAME=VALUE` passes a variable to every process. NAME must be a valid shell variable name, as in `--env XLA_FLAGS=--xla_gpu_enable_latency_hiding_scheduler=true`. `--cwd DIR` sets the directory each process starts in. `--dry-run` prints the commands without running them. On a CPU-only machine:
 
@@ -219,7 +219,7 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
 `/tmp/pool.json` records the mesh, the losses and, for every fsdp group, the processes its devices are on:
 
 ```text
-{"processes": 4, "devices": 8, "mesh": {"data": 4, "expert": 1, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}, "fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]], "partition": {"count": 4, "readers": 1}, "placed_whole": false, "losses": [4.891427993774414, 3.6097896099090576, 2.8838775157928467], "loss_steps": [1, 2, 3]}
+{"processes": 4, "devices": 8, "mesh": {"diloco": 1, "data": 4, "expert": 1, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}, "fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]], "partition": {"count": 4, "readers": 1}, "placed_whole": false, "losses": [4.891427993774414, 3.6097896099090576, 2.8838775157928467], "loss_steps": [1, 2, 3]}
 ```
 
 Each fsdp group spans the two hosts of its replica. With `--mesh '{"fsdp": 2}'` and no `replicas`, `jax.make_mesh` gives `"fsdp_groups": [[0], [1], [2], [3]]`. Run as one process with `XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`, the worker records losses of 4.891427993774414, 3.609790086746216 and 2.8838775157928467, within 1e-6 of the pool's.

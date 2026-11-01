@@ -57,10 +57,12 @@ def pictures():
     return TFDS("dew_images", path=str(IMAGES), split="all")
 
 
-def masked_images(batch: int = 8):
-    """The run's captioned images at SIZE with a mask drawn for each (`RandomMask`)."""
+def masked_images(batch: int = 8, *, rejects: bool = True, ratio: float = 1.0):
+    """The run's captioned images at SIZE with a mask drawn for each (`RandomMask`, at most `ratio` of
+    each side): a validation split's keeps every image (`rejects=False`), so its masks are drawn by each
+    record's own index."""
     return pictures().pipe(presets.images, SIZE, batch=batch, caption=image_steps.caption(),
-                           augment=image_steps.RandomMask())
+                           augment=image_steps.RandomMask(ratio), rejects=rejects)
 
 
 def precision() -> ModelConfig:
@@ -195,3 +197,49 @@ def test_an_inpainting_run_over_a_chain_without_masks_is_refused(inpainting):
                              objective=RUNS["diffusion"][1]["objective"])
     with pytest.raises(ValueError):
         run.build()
+
+
+def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpainting, tmp_path):
+    """An inpainting run's validation chain carries its images' masks as its training chain does
+    (`RandomMask`), and `dew train` scores the held-out loss through them at each evaluation, its
+    validation logged beside its training (ledger 2900): two runs alike but for their validation
+    masks' sizes train alike and score their held-out losses apart, each finite. A validation chain
+    without masks is refused as the run is prepared, where an evaluation would meet no mask, and so is
+    a batch without one wherever an evaluation admits it (`InputSpec.check`)."""
+    _, fields = RUNS["diffusion"]
+
+    def validated(name: str, ratio: float) -> list[float]:
+        run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
+                                 data=masked_images(), validation=masked_images(rejects=False, ratio=ratio),
+                                 val_metrics=(), **fields)
+        record = tmp_path / name
+        run.save(str(record))
+        runs = tmp_path / "runs"
+        settings = {"trainer.name": name, "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
+                    "trainer.log_every": "1", "trainer.eval_every": "1", "trainer.checkpoint_final": "False",
+                    "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
+                    "trainer.compilation_cache_dir": "None", "optim.learning_rate": "0.05"}
+        flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
+        assert main(["train", str(record / "run.json"), *flags]) == 0
+        from dew.training import LocalTracker
+
+        rows = [values for _, values in LocalTracker(runs / name / "tracking").scalars()]
+        assert [row["train/loss"] for row in rows if "train/loss" in row]
+        return [value for row in rows for key, value in sorted(row.items())
+                if key.startswith("val/") and key.endswith("loss")]
+
+    whole, smaller = validated("whole", 1.0), validated("smaller", 0.5)
+    assert whole and len(whole) == len(smaller) and all(np.isfinite([*whole, *smaller]))
+    assert all(first != second for first, second in zip(whole, smaller, strict=True)), "masks unread"
+
+    run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
+                             data=masked_images(), val_metrics=(), **fields,
+                             validation=pictures().pipe(presets.images, SIZE, batch=8,
+                                                        caption=image_steps.caption()))
+    with pytest.raises(ValueError):
+        run.prepare()
+    objective = dataclasses.replace(run, validation=None).build()
+    batch = {"image": np.zeros((8, SIZE, SIZE, 3), np.float32), "text": np.asarray(["a"] * 8)}
+    with pytest.raises(ValueError):
+        objective.inputs.check(batch, whole=False)
+

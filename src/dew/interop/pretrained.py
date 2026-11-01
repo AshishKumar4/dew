@@ -75,13 +75,22 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.objectives.base import SavedTask
-from dew.registry import DtypeName, dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
-from dew.sampling.text import Sampling
+from dew.registry import (
+    DtypeName,
+    ModelConfig,
+    dtype_name,
+    from_record,
+    projectors,
+    record_fields,
+    resolve_dtype,
+    towers,
+)
+from dew.sampling.text import Sampling, with_ids_of
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.inference.tasks import SavedRun
+    from dew.inference.tasks import SavedRun, TaskSettings
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
@@ -186,9 +195,10 @@ class Pretrained:
     diffusion pipeline, and `PretrainedFallback` for transformers' own forward run
     through torchax. Every kind saves back to the source's format.
 
-    `model_config` is the record the model was built from, in Dew's own
-    vocabulary with the run's compute dtype and attention kernel, so a caller can
-    log exactly the model it ran.
+    `model_config` is the record the model was built from at its load, in Dew's
+    own vocabulary with the run's compute dtype and attention kernel; `declaration`
+    is the model's record as it is now, an adapter, DEX, cross-attention or a
+    loop it was given since included, which a caller logs to name the model it ran.
     """
 
     model: nn.Module
@@ -256,8 +266,13 @@ class Pretrained:
     (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     numerics: Numerics | None = None
     """The numerics the load was asked for (`load(precision=...)`), whose dtypes it computes and stores
-    in and whose products' precision and forms its tasks trace under (`formed`); None for its dtypes
-    alone."""
+    in and whose products' precision and forms its tasks trace under (`formed`), a saved run's those its
+    step trained in (`SavedRun.precision`); None for its dtypes alone."""
+    settings: TaskSettings | None = None
+    """A saved run's own task declaration (`from_saved`), which its tasks build from as the run's own
+    loader builds them (`TextGeneration.from_settings`: its prefix, policy and budget), where a source
+    read from its files builds them from its generation config, which an export writes as the
+    representation its format's readers read (ledger 3007)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -271,6 +286,14 @@ class Pretrained:
         """The end-of-sequence ids the source's generation stops at, from its generation config or
         its config (`eos_token_id`), none where neither names one."""
         return eos_ids(self.config, self.generation_config)
+    @property
+    def declaration(self) -> ModelConfig:
+        """The record of the model this bundle holds now (`ModelConfig.from_model`): its class, every field
+        and each wrapper it was made in, an extension given since its load included, where `model_config`
+        keeps the record it was loaded as (ledger 3009). A tier-3 model, whose graph holds a live torch
+        module, records nothing more than its load's record, which a caller reads instead."""
+        return ModelConfig.from_model(self.model)
+
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         """This bundle with its variable tree transformed, for placement or a shape-only load.
         Composite bundles apply the same transformation to each component."""
@@ -305,7 +328,7 @@ class Pretrained:
         if self.processor is not None or not isinstance(self.tokenizer, str):
             return self.processor
         from dew.data.text import tokenizer_for
-        from dew.inference.loading import RunProcessor
+        from dew.inference.tasks import RunProcessor
         return RunProcessor(tokenizer_for(self.tokenizer, local_files_only=True))
 
     @classmethod
@@ -379,6 +402,9 @@ class Pretrained:
         if not isinstance(bundle, cls):
             raise TypeError(f"{run.directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
+        # The run's own declaration and numerics, which its tasks build under as the run's loader builds
+        # them, beside the generation config its export writes (ledger 3007).
+        bundle = replace(bundle, settings=task, numerics=run.precision)
         return bundle.bound(model, variables)
 
     def bound(self, model: nn.Module, variables: Variables) -> Self:
@@ -834,7 +860,12 @@ class PretrainedMaskedDecoder(Pretrained):
         sampler (`Unmask`), not its family's own recipe.
         """
         from dew.diffusion.discrete import MDLM
+        from dew.inference.tasks import MaskedSettings
 
+        if isinstance(self.settings, MaskedSettings):
+            # A saved run's own declaration, as its loader builds the task (ledger 3007).
+            return self.formed(MaskedGeneration.from_settings(self.model, self.variables, self.settings,
+                                                              self.text_processor))
         config, generation = self.config, self.generation_config
         mask_id = self.model.mask_token_id
         if mask_id is None:
@@ -868,8 +899,14 @@ class PretrainedBlockDecoder(Pretrained):
         return self.packed().block_generation()
 
     def block_generation(self) -> BlockGeneration:
-        """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
+        """Build the DiffusionGemma canvas task, with the source's sampler config as its default, a
+        saved run's its own declaration (`settings`)."""
+        from dew.inference.tasks import BlockSettings
         from dew.interop import diffusion_gemma
+
+        if isinstance(self.settings, BlockSettings):
+            return self.formed(BlockGeneration.from_settings(self.model, self.variables, self.settings,
+                                                             self.text_processor))
 
         return self.formed(BlockGeneration(
             self.model,
@@ -990,7 +1027,17 @@ class PretrainedFallback(Pretrained):
 
 
 def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGeneration:
-    """The text generation task a causal source describes (`PretrainedDecoder.text_generation`)."""
+    """The text generation task a causal source describes (`PretrainedDecoder.text_generation`): a saved
+    run's from its own declaration (`settings`), as the run's loader builds it, `sampling` replacing
+    its policy where given."""
+    from dew.inference.tasks import TextSettings
+
+    if isinstance(loaded.settings, TextSettings):
+        task = TextGeneration.from_settings(loaded.model, loaded.variables, loaded.settings,
+                                            loaded.text_processor)
+        # A policy given in its place stops and pads where the run's does, where it names no ids.
+        policy = None if sampling is None else with_ids_of(sampling, task.sampling)
+        return loaded.formed(task if policy is None else replace(task, sampling=policy))
     rows = return_sequences(loaded.config, loaded.generation_config)
     policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
                                                sampling)
@@ -1977,7 +2024,7 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
     transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
-    (`decoders.language_model_config`); a route that reads no `overrides` refuses them. `remote` and
+    (`decoders.decoder_config`); a route that reads no `overrides` refuses them. `remote` and
     `pinned` are `source_route`'s. Where `prediction_depths` is given, the config is the checkpoint's
     of that many depths (`_kept_depths`), which the load reads and saves. `inventory` gives the
     checkpoint's tensor names from their headers, which a quantized wrapper's selection patterns are
@@ -1987,19 +2034,17 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
-        # A bundle its own family reads whole states its text checkpoint without its vision_config, its
-        # decoder's names and their codec unchanged; another wrapper's language model is its text family's
-        # checkpoint, a quantized one's module selection renamed with its tensors.
-        if decoders.bundles(config):
-            config = decoders.bundle_text_config(config)
-        elif source_quantization(config) is not None:
+        # The language model's config as its decoder reads it (`decoders.decoder_config`), a quantized
+        # wrapper's module selection renamed with its tensors; a bundle its own family reads whole keeps
+        # its decoder's names and their codec.
+        quantized = not decoders.bundles(config) and source_quantization(config) is not None
+        text = decoders.decoder_config(config)
+        if quantized:
             quantization = decoders.language_model_quantization(config, language, inventory)
-            config = {key: value for key, value in decoders.language_model_config(config).items()
-                      if key != "quantization_config"}
+            text = {key: value for key, value in text.items() if key != "quantization_config"}
             if quantization is not None:
-                config["quantization_config"] = quantization
-        else:
-            config = decoders.language_model_config(config)
+                text["quantization_config"] = quantization
+        config = text
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
         # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).
@@ -2127,8 +2172,9 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
         case WrapperRoute(wrapper=wrapper):
             depth = decoders.wrapper_source_depths(wrapper)
         case VerifiedRoute(verified=verified):
+            # The record alone: the names checked are the kept ones, which the load translates.
             family = verified.entry(config)
-            depth = decoders.source_depths(verified.translate(config, tuple(tensors), family), family)
+            depth = decoders.source_depths(verified.record(config, family), family)
         case _:
             return tensors
     specs = tensor_specs(tensors)

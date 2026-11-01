@@ -27,7 +27,9 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _spans_of,
     approximate,
+    score_places,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -80,7 +82,8 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
                 s = family.product(q, slots["keys"].transpose((1, 0)), shape)
                 dp = family.product(do, slots["values"].transpose((1, 0)), shape)
                 slots.release("values")
-                coords = _coords(family, spans_of, row, first, k_first, shape, draw=draw)
+                coords = _coords(family, spans_of, row, first, k_first, shape, draw=draw,
+                                 read=walk.places_read())
                 params = _score_params(family, score_refs, kinds, row, head, first, s, k_first)
                 # Every entry's visibility, a tile whole too (`algebra.seen` gives None for one no mask cuts).
                 seen = algebra.seen(walk.spec, coords, s)
@@ -118,7 +121,8 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
               family.load_barriers(consumers), family.load_barriers(consumers)]
     rings = family.streams({"keys": ((block_k, width), key.dtype), "values": ((block_k, value.shape[-1]),
                                                                               value.dtype)},
-                           program.stages, consumers)
+                           program.stages, consumers,
+                           swizzles=transposed_swizzles(program.tiles, "keys", "values"))
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
@@ -168,7 +172,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     approx_math = not accurate and approximate(hooks, (tiles.block_q, tiles.block_k), value_width,
                                                differentiated=True)
     walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
-                     approx_math)
+                     approx_math, score_places(hooks), drop is not None)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
     # The queries taken by the call's power: the logits' operand of the two launches (`_dkv_step`).
