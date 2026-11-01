@@ -632,7 +632,8 @@ def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_p
     names, _ = read_file(source / "model.safetensors")
     quantization = {"quant_method": "compressed-tensors", "format": "float-quantized",
                     "config_groups": {"fp8": {
-                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"]}},
+                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"],
+                        "weights": {"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": False}}},
                     "ignore": ["lm_head", "re:.*visual\\.blocks\\.0\\..*", "model.language_model.layers.1"]}
     projected = language_model_quantization({**config, "quantization_config": quantization},
                                             translate_wrapper_config(config), lambda: names.keys())
