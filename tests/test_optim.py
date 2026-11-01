@@ -1179,6 +1179,11 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
     system = {} if optimizer != "gauss_newton" else {"statistics": RowEquations(
         total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(4), jacobian=drawn[:, :-1],
         residual=drawn[:, -1], update=4)}
+    if optimizer == "gauss_newton" and form == "groups":
+        # Its one solve spans every parameter, which groups would split.
+        with pytest.raises(ValueError):
+            config(1e-3).build(10)
+        return
     programs, updates = [], []
     for rate in (1e-3, 4e-3):
         solver = config(rate).build(10)

@@ -2347,6 +2347,10 @@ class OptimConfig:
         elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
             # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
+        if self.param_groups and self.optimizer == 'gauss_newton':
+            raise ValueError("Gauss-Newton solves one system over every trained parameter "
+                             "(dew.gauss_newton), which param_groups would split into a solve per group; "
+                             "train it with one learning rate and no param_groups")
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
