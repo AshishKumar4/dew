@@ -2306,9 +2306,10 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
         count = Proportions.of(_weights(source)).covering(known)
     elif build.read == "streamed" and not _in_memory(source):
         stated = [shard.rows for shard in source.manifest().shards]
-        if any(rows is None for rows in stated):
+        held = [rows for rows in stated if rows is not None]
+        if len(held) != len(stated):
             return None
-        count = sum(stated)
+        count = sum(held)
     else:
         records = source.records(build.read)
         present = _Present.of(records) if _in_memory(source) else None
