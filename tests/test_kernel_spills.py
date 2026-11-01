@@ -329,13 +329,14 @@ def test_a_program_donates_its_state_and_places_it_by_a_tree_of_formats():
                   jax.device_put(jnp.ones((2, 3)), formats.columns))
     stepped_slots = run(slots, 2.0)
     assert slots.rows.is_deleted() and slots.columns.is_deleted()
-    named = program(lambda scale, slots: stepped(slots, scale), donate_argnames="slots", out_shardings=formats)
-    again = named(2.0, slots=stepped_slots)
-    assert stepped_slots.rows.is_deleted()
-    np.testing.assert_array_equal(np.asarray(again.columns), np.full((2, 3), 4.0))
     assert [leaf.format.layout.major_to_minor for leaf in (stepped_slots.rows, stepped_slots.columns)] == [
         (0, 1), (1, 0)]
     np.testing.assert_array_equal(np.asarray(stepped_slots.rows), np.full((2, 3), 3.0))
+    named = program(lambda scale, slots: stepped(slots, scale), donate_argnames="slots",
+                    out_shardings=formats)
+    again = named(2.0, slots=stepped_slots)
+    assert stepped_slots.rows.is_deleted() and stepped_slots.columns.is_deleted()
+    np.testing.assert_array_equal(np.asarray(again.columns), np.full((2, 3), 4.0))
 
 
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
