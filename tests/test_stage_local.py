@@ -296,8 +296,7 @@ def test_what_a_stage_local_run_hands_outside_the_trainer_is_its_stored_state(tm
     the same run's with every layer whole on every stage; an Observe at the last step reads exactly the
     state `fit` returns, which is exactly what the run's last checkpoint holds; that state trains on
     when handed back to `fit`; and its objective's pipeline generates from it off the mesh."""
-    model = decoder()
-    optimizer = OptimConfig(optimizer="adamw", learning_rate=1e-2)
+    model, optimizer = decoder(), optax.adam(1e-2)
     stored = jax.tree.structure(trainer(model, optimizer, STAGED, 8, stage_local=False).initial_state())
     run = trainer(model, optimizer, STAGED, 8, checkpoints=Checkpoints(str(tmp_path)))
     assert jax.tree.structure(run.initial_state()) == stored
@@ -351,19 +350,17 @@ def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_loca
     layers, as an LM's decoder does, and PPO its policy's and its critic's (ledger 3440): the state placed
     over two stages holds each decoder's run as one leaf a stage, where they held every layer whole on
     every stage, silently."""
-    from objective_cases import decoder as small
-
     from dew.data.text import ByteTokenizer
     from dew.decision import DecisionObjective, Specials, StateFirstLayout
     from dew.objectives.rl.ppo import PPOObjective, ValueHead
 
     if kind == "decision":
-        objective = DecisionObjective(small(num_layers=4), tokenizer=ByteTokenizer(),
+        objective = DecisionObjective(decoder(vocab_size=260, max_seq_len=32), tokenizer=ByteTokenizer(),
                                       specials=Specials(None, 10, 0, "\x00", 255),
                                       layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
         decoders = {("backbone",)}
     else:
-        objective = PPOObjective(small(num_layers=4), SEQ, critic=ValueHead(small(num_layers=4)))
+        objective = PPOObjective(decoder(), SEQ, critic=ValueHead(decoder()))
         decoders = {("policy",), ("critic", "backbone")}
     run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=STAGED,
                   layout=Layout(min_shard=TINY_SHARD), tracker=None)
