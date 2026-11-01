@@ -12,6 +12,7 @@ What the recorder logs is everything the process executed, read, imported and st
 writes how collection found each file (`DEW_COLLECTED`), which accounts for a file whose every test the
 selection set aside, and which tests carry the marks a row names (`whole_suite`, `release_env`)."""
 
+import functools
 import json
 import os
 import sys
@@ -125,22 +126,27 @@ def pytest_collection_modifyitems_markers(items):
             lifetime.write(item.nodeid.split("::")[0], f"{MARKER}{name}")
 
 
+@functools.cache
+def marks_watched() -> None:
+    """Each marker a lookup asks for (`pytest.mark.<name>`) written as its owner's input (`pytest_configure`),
+    pytest's lookup wrapped once a process, however many sessions configure in it."""
+    looked = pytest.MarkGenerator.__getattr__
+
+    def looking(self, name):
+        if not name.startswith("_"):
+            lifetime.write(lifetime.owner(), f"{MARKER}{name}")
+        return looked(self, name)
+
+    pytest.MarkGenerator.__getattr__ = looking
+
+
 def pytest_configure(config):
     """A test's or a conftest's read of every registration (`config.getini("markers")`), its owner's input:
     pytest's own reads of them, at configure and at a mark's first use, are none. And each marker a lookup
     asks for (`pytest.mark.<name>`, which --strict-markers validates as it looks it up), its owner's input
     whether any test then carries it or not (review: a helper evaluating an unregistered marker it never
     applies fails its importers' collection once the registration goes)."""
-    if not getattr(pytest.MarkGenerator.__getattr__, "watched", False):
-        looked = pytest.MarkGenerator.__getattr__
-
-        def looking(self, name):
-            if not name.startswith("_"):
-                lifetime.write(lifetime.owner(), f"{MARKER}{name}")
-            return looked(self, name)
-
-        looking.watched = True
-        pytest.MarkGenerator.__getattr__ = looking
+    marks_watched()
     getini = config.getini
 
     def watched(name):
