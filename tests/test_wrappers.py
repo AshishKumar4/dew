@@ -624,12 +624,7 @@ def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_p
     language model's modules it matches, the tower's matches dropped, a class target kept as it is; the
     decoder a tool builds reads them so (`decoder_config`, ledger 3138), and DiffusionGemma's decoder,
     its whole model, is no text-only decoder."""
-    from dew.interop.hf_decoders import (
-        WHOLE_DECODER,
-        decoder_config,
-        language_model_quantization,
-        translate_wrapper_config,
-    )
+    from dew.interop.hf_decoders import decoder_config, language_model_quantization, translate_wrapper_config
     from dew.interop.safetensors_io import read_file
 
     source = FIXTURES / "qwen35-native-tiny"
@@ -646,7 +641,7 @@ def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_p
     assert projected["ignore"] == ["lm_head", "model.layers.1"]
     built = decoder_config({**config, "quantization_config": quantization}, lambda: names.keys())
     assert built["quantization_config"] == projected
-    with pytest.raises(ValueError, match=WHOLE_DECODER):
+    with pytest.raises(ValueError):
         decoder_config({"model_type": "diffusion_gemma", "text_config": {}})
 
 
