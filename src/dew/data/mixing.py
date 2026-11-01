@@ -20,7 +20,7 @@ import numpy as np
 from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import CONSUMED, Owed, Record, Rejected
+from dew.data.pipeline import CONSUMED, REFUSED, Owed, Record, Rejected
 
 _log = logging.getLogger(__name__)
 
@@ -62,10 +62,6 @@ class CorpusCounts:
     """The tokens the cuts of the members delivered rows left out removed, by what each cut
     (`_dew_left_out_cut`), counted with them."""
     declined: Counter[str] = dataclasses.field(default_factory=Counter)
-    carried: int = 0
-    """The source examples of the records it rejected that a row it kept carries on (`Owed`, in the reading
-    process or a loading worker's group, `Rejected.carried`): consumed, and no example of its rows, so a
-    count of the examples its delivered rows complete (`examples`) holds them apart (`rows`)."""
     examples: bool = False
     """Whether these counts are of the corpus's source examples, where an objective's step makes rows of
     them: a run bounded in examples counts each where the last row made of it is delivered, as the row
@@ -77,12 +73,13 @@ class CorpusCounts:
         (`_dew_truncated`), each cut it reports (`_dew_cut`: by what it cut, the rows it shortened and
         the tokens it removed), the members it left out by reason (`_dew_rejected`) and the tokens their
         cuts removed (`_dew_left_out_cut`), and the augmentation a read declines for it, by reason
-        (`_dew_declined`). A counter of source examples counts the examples the row completes
-        (`examples`)."""
+        (`_dew_declined`). A counter of source examples counts the examples the row completes and kept
+        (`examples`): its consumed ones less those it carries for refused ones (`REFUSED`)."""
         if not isinstance(element, Mapping):
             self.accepted += 1
             return
-        completed = integer(element.get(CONSUMED, 1), "a row's consumed examples") if self.examples else 1
+        completed = (integer(element.get(CONSUMED, 1), "a row's consumed examples")
+                     - integer(element.get(REFUSED, 0), "a row's refused examples")) if self.examples else 1
         self.accepted += completed
         self.truncated += int(bool(element.get("_dew_truncated", False)))
         for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
@@ -110,12 +107,6 @@ class CorpusCounts:
             counted.clear()
 
     @property
-    def rows(self) -> int:
-        """The rows it delivered, or the source examples they complete where it counts those
-        (`examples`), the examples of rejected records its rows carry on (`carried`) apart."""
-        return self.accepted - self.carried if self.examples else self.accepted
-
-    @property
     def refused(self) -> Counter[str]:
         """What the corpus left out, by reason: the records it rejected whole and the members its
         delivered rows left out (`left_out`)."""
@@ -132,8 +123,8 @@ class CorpusCounts:
         delivered, its rejections and the augmentation it declined by reason as integers, the share
         of those rows cut short and the chunks per chunked record."""
         return {
-            f"data/rows/{label}": self.rows,
-            f"data/truncated/{label}": self.truncated / max(1, self.rows),
+            f"data/rows/{label}": self.accepted,
+            f"data/truncated/{label}": self.truncated / max(1, self.accepted),
             f"data/chunks_per_record/{label}": self.chunks / max(1, self.chunk_records),
             **{f"data/rejected/{label}/{reason}": count for reason, count in self.refused.items()},
             **{f"data/cut_examples/{label}/{kind}": count for kind, count in self.cut_examples.items()},
@@ -158,7 +149,6 @@ class CorpusCounts:
             "rejected_cut": dict(self.rejected_cut),
             "left_out_cut": dict(self.left_out_cut),
             "declined": dict(self.declined),
-            "carried": self.carried,
             "examples": self.examples,
         }
 
@@ -178,7 +168,6 @@ class CorpusCounts:
                                          for kind, value in record(state.get(name, {}), name).items()}))
         # A position saved before examples were counted apart holds rows' counts.
         self.examples = state.get("examples", False) is True
-        self.carried = integer(state.get("carried", 0), "carried")
 
     def followed(self, reader: CorpusCounts) -> CorpusCounts:
         """These counts of the prefix a memory read ran, followed by `reader`'s of the stages it
@@ -187,7 +176,7 @@ class CorpusCounts:
         return dataclasses.replace(
             reader, attempted=max(self.attempted, reader.attempted), chunks=self.chunks + reader.chunks,
             chunk_records=self.chunk_records + reader.chunk_records, rejected=self.rejected + reader.rejected,
-            rejected_cut=self.rejected_cut + reader.rejected_cut, carried=self.carried + reader.carried)
+            rejected_cut=self.rejected_cut + reader.rejected_cut)
 
     def expanded(self, outputs: Sequence[Record]) -> None:
         """Count one chunked document and its fan-out before later stages can reject chunks."""
@@ -214,7 +203,6 @@ class _KeepAccepted:
         if isinstance(element, Rejected):
             reason = element.reason
             self.owed.owe(element.consumed)
-            self.counts.carried += element.carried
             self.counts.dropped(element)
         else:
             count = None if self.tokens is None else self.tokens(element)
@@ -301,10 +289,8 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         self._predicate = predicate
 
     def __next__(self) -> Batch:
-        kept = next(self._read)
         # The examples the rows rejected before it were the last of are consumed where this row is.
-        self._predicate.counts.carried += self._predicate.owed.examples
-        return self._predicate.owed.paid(kept)
+        return self._predicate.owed.paid(next(self._read))
 
     def _counted(self) -> Mapping[str, object]:
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
@@ -857,7 +843,6 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
         # Members a row left out travel with the row, as its cuts do: the outermost counts them.
         combined.rejected.update(counts.rejected)
         combined.rejected_cut.update(counts.rejected_cut)
-        combined.carried += counts.carried
         if counts.examples and not combined.examples:
             combined.examples = True
             combined.accepted, combined.truncated = counts.accepted, counts.truncated
@@ -873,7 +858,6 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     combined.examples = combined.examples or counts.examples
     combined.attempted += counts.attempted
     combined.accepted += counts.accepted
-    combined.carried += counts.carried
     combined.truncated += counts.truncated
     combined.chunks += counts.chunks
     combined.chunk_records += counts.chunk_records
