@@ -73,8 +73,9 @@ def _facts() -> Ruleset:
 
 def _linear() -> Ruleset:
     """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
-    distributivity over operands of one shape, and a value constant along a sum's axis taken out of it where
-    the other factor has the product's shape: each reorders rounding."""
+    distributivity over operands of one shape, and a value a broadcast lays along every axis but a sum's
+    taken out of the sum where the other factor has the product's shape (the broadcast's extent along the axis
+    the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
     x, y, a = vars_("x y a", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
@@ -87,7 +88,7 @@ def _linear() -> Ruleset:
             "sum", axes, summed)).to(
             a.binary("mul", x.reduce("sum", axes, summed), multiplied), along(laid, axis),
             eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent),
-            eq(shape(a.shaped("broadcast_in_dim", laid))).to(extent)),
+            eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent)),
         name="linear")
 
 
