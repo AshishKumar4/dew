@@ -237,7 +237,8 @@ class Mma(mosaic.Family):
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups
         _one(consumers, clustered=cluster > 1)
-        built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+        built = plgpu.kernel(mosaic.dependent(entry, interpret), out_type=out_type, grid=grid,
+                             grid_names=grid_names,
                              compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                              interpret=mosaic.interpreted(interpret),
                              kernel_name=report.named(name), cost_estimate=cost)
