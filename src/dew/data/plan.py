@@ -446,21 +446,35 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
 
 
 def read_alike_at_8(saved: Mapping[str, object]) -> bool:
-    """Whether version 8 reads a version 7 data plan's order as 7 did (`earlier_plan`). Version 8 reads a
-    streamed order otherwise only where it takes some of it before its loading workers (a `.take`, now
-    taken across them) or bounds it in examples (its manifest's `MarkConsumed` step, now dealt to a pool's
-    shares and its workers): alike where its read is not streamed, one reader reads it, no take reads its
-    order (no `Limit` among its stages, its mixed corpora's orders within it), or its takes are no bound in
-    examples and no loading workers read them, a corpus's own pool among them (`pools`)."""
+    """Whether version 8 reads a version 7 data plan's order as 7 did (`earlier_plan`): where its read is
+    not streamed, one reader reads it, no take reads its order (no `Limit` among its stages, its mixed
+    corpora's orders within it), or its takes are no bound in examples and no loading workers read them, a
+    corpus's own pool among them (`pools`). Otherwise (`read_otherwise_at_8`) it reads another order."""
+    return read_otherwise_at_8(saved) is None
+
+
+def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:
+    """Why version 8 reads a version 7 data plan's streamed order otherwise, None where it reads it alike
+    (`read_alike_at_8`). Version 7 read a take before its loading workers (a `.take`) on each of them, and
+    a run's bound in examples (its manifest's `MarkConsumed` step) whole on each of a pool's shares and their
+    workers; version 8 takes the one across them and deals the other to them. So a position 7 wrote of such
+    a read can go on only as 7 read it, which reads the bound once a reader: the over-read 8 ended."""
     order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
     readers = topology if isinstance(topology, Mapping) else {}
     pools = readers.get("pools", {})
     workers = max([readers.get("workers", 0), *(pools.values() if isinstance(pools, Mapping) else ())])
-    alone = readers.get("shares", 1) == 1 and workers < 2
-    untaken = not _LIMIT.search(json.dumps(order))
+    shares = readers.get("shares", 1)
     steps = json.dumps(record(saved.get("manifest", {}), "saved data manifest").get("steps", []))
-    unbounded = "MarkConsumed" not in steps and workers < 2
-    return order.get("read") != "streamed" or alone or untaken or unbounded
+    bounded = "MarkConsumed" in steps
+    if (order.get("read") != "streamed" or (shares == 1 and workers < 2)
+            or not _LIMIT.search(json.dumps(order)) or (not bounded and workers < 2)):
+        return None
+    if bounded:
+        return (f"version 7 read the run's bound in examples whole on each of its {shares} shares' "
+                f"{max(workers, 1)} loading workers, and version 8 deals the bound across them, so this "
+                "position goes on only as 7 read it, the bound once a reader")
+    return (f"version 7 took the order's `.take` on each of its {workers} loading workers, and version 8 "
+            "takes it across them, so this position goes on only as 7 read it, the take once a worker")
 
 
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
@@ -720,10 +734,13 @@ class Plan:
         per-share plan."""
         current = self.record()
         if current["version"] != saved.get("version"):
+            otherwise = read_otherwise_at_8(saved) if saved.get("version") == 7 else None
             raise ValueError(
                 f"the saved data position was written under data plan version {saved.get('version')!r}, "
                 f"and this Dew reads plans by version {current['version']!r}, which makes other rows or "
-                "draws from the same plan; resume with the Dew that wrote it"
+                f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; resume with the Dew "
+                "that wrote it, or go on from its weights as a new run that reads its data afresh: its "
+                "state restored (`Checkpoints.restore`) and given to `fit(state=)`"
             )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
