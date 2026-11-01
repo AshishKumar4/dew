@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Callable
+from typing import Protocol
 
 import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args, get_literal_value
@@ -90,17 +90,15 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4) -> Wor
 class Seconds:
     """A form's work and the seconds its schedule gives it, as extraction adds and compares it (egglog's
     `ComparableAdd`): the work summed, compared by the seconds the schedule gives the sum, ties broken by
-    the schedule's `tiebreak` where it states one (`Walk`'s: its units' seconds in series), held as `key`;
+    the schedule's `tiebreak` (`Walk`'s: its units' seconds in series; `Fused`'s none), held as `key`;
     two works of one key are equal, so every pair compares."""
 
     key: tuple[float, float] = dataclasses.field(init=False, repr=False)
     work: Work = dataclasses.field(compare=False)
-    schedule: Callable[[Work], float] = dataclasses.field(compare=False, repr=False)
+    schedule: Schedule = dataclasses.field(compare=False, repr=False)
 
     def __post_init__(self):
-        tiebreak = getattr(self.schedule, "tiebreak", None)
-        object.__setattr__(self, "key", (self.schedule(self.work),
-                                         0.0 if tiebreak is None else tiebreak(self.work)))
+        object.__setattr__(self, "key", (self.schedule(self.work), self.schedule.tiebreak(self.work)))
 
     @property
     def value(self) -> float:
@@ -110,23 +108,49 @@ class Seconds:
         return Seconds(self.work + other.work, self.schedule)
 
 
-def fused(facts: generation.GpuTarget) -> Callable[[Work], float]:
+class Schedule(Protocol):
+    """A schedule (the module's account): the seconds it gives a work, and what tells two works of one
+    time apart."""
+
+    def __call__(self, done: Work) -> float: ...
+
+    def tiebreak(self, done: Work) -> float: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Fused:
     """XLA's schedule (the compile-time pass's): a reduction or a product reads its operands in one pass over
     device memory and elementwise work fuses into its consumer, costing its units' work alone, each at the
-    whole device's rate, in series."""
-    multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
-    tensor, operations = facts.tensor_rate("16bit"), facts.tensor_rate("fp32")
-    if not (multiprocessors and clock and bandwidth and tensor and operations):
-        raise ValueError(f"{facts.device_kind}: no multiprocessors, clock, bandwidth or rates to price a "
-                         "form by")
-    each = multiprocessors * clock
+    whole device's rate, in series; no tie to break. Its rates per second, the device's (`of`)."""
 
-    def seconds(done: Work) -> float:
-        return (done.flops / (tensor * each) + (done.operations + done.conversions) / (operations * each)
-                + done.exponentials / (kernel_cost.EXPONENTIALS_PER_CLOCK * each)
-                + done.device_bytes / bandwidth)
+    tensor: float
+    operations: float
+    exponentials: float
+    bandwidth: float
 
-    return seconds
+    @classmethod
+    def of(cls, facts: generation.GpuTarget) -> Fused:
+        """The schedule of `facts`, raising where it states none of its rates."""
+        multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
+        tensor, operations = facts.tensor_rate("16bit"), facts.tensor_rate("fp32")
+        if not (multiprocessors and clock and bandwidth and tensor and operations):
+            raise ValueError(f"{facts.device_kind}: no multiprocessors, clock, bandwidth or rates to price a "
+                             "form by")
+        each = multiprocessors * clock
+        return cls(tensor * each, operations * each, kernel_cost.EXPONENTIALS_PER_CLOCK * each, bandwidth)
+
+    def __call__(self, done: Work) -> float:
+        return (done.flops / self.tensor + (done.operations + done.conversions) / self.operations
+                + done.exponentials / self.exponentials + done.device_bytes / self.bandwidth)
+
+    def tiebreak(self, done: Work) -> float:
+        del done
+        return 0.0
+
+
+def fused(facts: generation.GpuTarget) -> Fused:
+    """XLA's schedule over `facts` (`Fused`)."""
+    return Fused.of(facts)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,7 +166,7 @@ class Walk:
         return kernel_cost.walked(dataclasses.replace(done, device_bytes=0.0), self.facts)
 
     def tiebreak(self, done: Work) -> float:
-        return fused(self.facts)(dataclasses.replace(done, device_bytes=0.0))
+        return Fused.of(self.facts)(dataclasses.replace(done, device_bytes=0.0))
 
 
 def walk(facts: generation.GpuTarget) -> Walk:
@@ -150,7 +174,7 @@ def walk(facts: generation.GpuTarget) -> Walk:
     return Walk(facts)
 
 
-def model(region: Region, schedule: Callable[[Work], float], bytes_per_element: int = 4) -> DagCostModel:
+def model(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel:
     """Each node's work (`work`) under `schedule`; extraction adds them, once a shared node. A node is priced
     from its operands' shapes, the e-classes the extractor hands its callback, and its parameters
     (`region`'s)."""
@@ -166,7 +190,7 @@ is rounded into what follows it, a difference that may cancel its operands' digi
 dev time measures every candidate's error (`dew.algebra.error.choose`)."""
 
 
-def stable(region: Region, schedule: Callable[[Work], float], bytes_per_element: int = 4) -> DagCostModel:
+def stable(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel:
     """The program's model (`model`) with each node of a rounding risk priced up (`RISK`), so its cheapest
     forms are the ones the stable rules wrote: the candidate dev time proposes for its accuracy."""
     def marginal(graph: EGraph, node) -> Seconds:
@@ -183,6 +207,6 @@ def stable(region: Region, schedule: Callable[[Work], float], bytes_per_element:
     return DagCostModel(marginal_cost=marginal, identity=Seconds(Work(), schedule))
 
 
-def _per_second(schedule: Callable[[Work], float]) -> float:
+def _per_second(schedule: Schedule) -> float:
     """The CUDA-core operations `schedule` takes a second over."""
     return 1.0 / schedule(Work(operations=1.0))
