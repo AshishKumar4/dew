@@ -668,21 +668,14 @@ def _measure(
             for branch, scored in zip(branches, held, strict=True)
         )
     # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
-    # a count set once it holds them (`_staged`). What it holds is what it runs: its steps configured for
-    # their source bound as it binds them to run them, so a map bound so keys a cache after it.
-    configured = any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch))
-    ahead = None
-    if epochs is not None and training:
-        first = branches[0]
-        if configured and read == "memory":
-            first = _configured(first, _metadata(branches, read), read, "source")
-        ahead = _held_ahead(first, read)
+    # a count set once it holds them (`_staged`).
+    ahead = None if epochs is None or not training else _held_ahead(branches[0], read)
     examples = _UNCOUNTED if ahead is not None else examples
     if examples is not None and training:
         branches = (_bounded(branches[0], examples), *branches[1:])
         if ahead == "layout":
             branches = (_rebound(branches[0], _UNCOUNTED, epochs), *branches[1:])
-    if configured:
+    if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
 
@@ -961,9 +954,10 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     None for any other read, whose pass is counted once it is prepared (`_staged`)."""
     if read != "memory" or isinstance(train.source, (Mixture, Phases)):
         return None
-    # The steps the read runs as it holds its rows, as the analysis places them (after a cache it fills),
-    # and a configured step's after them, which binds to such a step unless it draws (a random map).
-    eager = _analyzed(train, read).eager
+    # The steps the read runs as it holds its rows, as the analysis places them once its configured steps
+    # bind (after a cache it fills), and a configured step's after them, which binds to such a step unless
+    # it draws (a random map).
+    eager = _analyzed(train, read, bound=True).eager
     while eager < len(train.stages) and (isinstance(train.stages[eager], _EAGER) or (
             isinstance(train.stages[eager], Configured) and not train.stages[eager].random)):
         eager += 1

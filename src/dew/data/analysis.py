@@ -856,13 +856,16 @@ def reach(stages: Sequence[Stage], unending: bool) -> tuple[bool, bool]:
 
 
 def _analyzed(
-    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False
+    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False, bound: bool = False
 ) -> _Lowering:
     """The analysis of `pipeline` at `read`, a scored branch with
     `validation`. A token split in a training order cut per share is refused
     once the steps are bound, since an unbound configured step may still be
     one a memory read runs eagerly; a scored branch reads its whole order in
-    one canonical pass, so its split is whole."""
+    one canonical pass, so its split is whole. With `bound`, a cache after
+    configured steps is analyzed as it is once they bind: each binds to the
+    step its declaration states (`_bind`), and a prefix no cache can key is
+    refused, so the cache holds what they make."""
     source = pipeline.source
     nested = children(pipeline)
     if isinstance(source, Mixture):
@@ -876,7 +879,8 @@ def _analyzed(
     ancestry = tuple(stage for child in nested for stage in _steps(child))
     stages = pipeline.stages
     cache = _at(stages, Artifact)
-    if nested or (cache is not None and any(isinstance(stage, Configured) for stage in stages[:cache])):
+    if nested or (cache is not None and not bound
+                  and any(isinstance(stage, Configured) for stage in stages[:cache])):
         cache = None
     # A view of the inputs before a cache leaves the cache to the lowering, which reads it by input
     # as an indexed read does; a memory read runs the steps before the first view over the whole
