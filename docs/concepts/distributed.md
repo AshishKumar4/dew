@@ -189,11 +189,26 @@ An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_
 
 ## GPU memory outside XLA's pool
 
-XLA preallocates a share of each GPU's memory as its pool. A Dew training process takes 95% unless `XLA_PYTHON_CLIENT_MEM_FRACTION` names another share. A step's collectives allocate their NCCL communicators outside that pool, on the step's first run. cuBLAS's workspaces and the loaded kernels are also allocated there. Each communicator takes its channels' buffers. The plan's fit check covers the pool alone, so a share that leaves too little room outside the pool fails the first run on more than one GPU.
+XLA preallocates a share of each GPU's memory as its pool. A step's collectives also allocate NCCL communicators, and those buffers live outside the pool: NCCL takes no allocator from its caller. cuBLAS's workspaces and the loaded kernels sit outside the pool as well. XLA keys a communicator by its devices and its kind, so a step whose collectives use another device grouping, or a collective-permute beside an all-gather, makes another communicator over the same GPUs.
 
-When that failure surfaces as an error, Dew raises it as the step's (`dew.training.memory.FirstRunFailed`). The error includes each GPU's free bytes outside the pool, labelled `outside`, both at the fit check and after the failure. When a GPU instead stalls before it joins the collective, XLA ends the process after waiting 40 seconds for its peers. A first run that succeeds logs each GPU's free bytes outside the pool at the fit check and after the run. The CUDA driver reports that figure for the whole device, so the change counts every process's allocations and a growing pool's growth, as well as the step's communicators.
+`import dew` sets `NCCL_RUNTIME_CONNECT=0` unless you set it yourself. NCCL then connects every peer, and allocates every peer's buffers, as it creates a communicator, where XLA returns a failure to every rank as an error. Under NCCL's own default since 2.22, peers connect at a collective's first launch. There, a GPU that fails to allocate leaves its peer waiting inside XLA's first-call rendezvous, and XLA ends the process after 40 seconds. Connecting at creation costs every peer's buffers at once, even for peers the program never sends to, and it takes longer to create the communicator.
 
-For example, a LoRA fine-tune of Qwen3.5-9B on two H100s with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.97` left 2,264 MiB free outside the pool on a GPU. Its step's collectives used two communicators, each with 24 collective channels, 32 point-to-point channels per peer and 16 NVLS channels. That did not fit: the first run failed. A full fine-tune of Qwen3.5-4B used one communicator and ran. JAX's documentation gives the remedy: lowering the preallocated share fixes out-of-memory errors at program start.
+On a host of two or more GPUs, before the backend opens, `prepare_process` sizes the pool to leave the communicators their room at NCCL's full speed:
+
+1. A child process (`python -m dew.training.communicators`) creates a communicator of each kind over each group size that divides the host's GPUs. It reports the bytes each one took, and the bytes the runtime took beside its pool.
+2. The answer is kept in Dew's cache under `communicators/`, keyed by the GPUs' names, the driver, NCCL's version and every `NCCL_*` setting. A host pays for the measurement once per configuration.
+3. The pool takes your `XLA_PYTHON_CLIENT_MEM_FRACTION` (95% if you name none) as an upper bound. It shrinks below that bound only as far as it must to leave the room for a collective's communicator and a permute's over every GPU, plus the runtime's. No NCCL channel or buffer is cut to fit. The pool only has to hold the compiled step, and the fit check holds the step to it as before. Dew logs the share it took once, and the fit check's record carries it into the run record (`pool`).
+4. Once the step compiles, its own communicators are read from its program by kind and device grouping. A step that needs more than the room left for them is refused before it runs, with an error naming the bytes, instead of stalling in a collective.
+
+None of this happens in four cases:
+- a process that joins a pool of processes, whose communicators span hosts and so need network buffers a single host's child does not make;
+- a pool that grows (`XLA_PYTHON_CLIENT_PREALLOCATE=false`);
+- a host of fewer than two GPUs;
+- a process whose backend has already opened.
+
+If a step that fit fails on its first run anyway, Dew raises the failure as the step's (`dew.training.memory.FirstRunFailed`). The error includes each GPU's free bytes outside the pool, labelled `outside`, both at the fit check and after the failure.
+
+An example of the failure this prevents: a LoRA fine-tune of Qwen3.5-9B on two H100s with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.97` left 2,264 MiB free outside the pool on a GPU. Its step's collectives used two communicators, each with 24 collective channels, 32 point-to-point channels per peer and 16 NVLS channels. One GPU entered the first all-to-all, and the other never did.
 
 ## Rematerialization
 

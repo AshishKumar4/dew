@@ -436,7 +436,9 @@ def gpu_name(ordinal: int) -> str | None:
 def nccl_version() -> int | None:
     """The version of the NCCL library this process would load (`ncclGetVersion`: 23203 for 2.32.3), from the
     nvidia-nccl wheel JAX's CUDA plugin depends on, or the loader's path; None where none loads."""
-    spec = importlib.util.find_spec("nvidia.nccl")
+    # The wheel's directory, where its namespace package is installed, found without importing it.
+    namespace = importlib.util.find_spec("nvidia")
+    spec = importlib.util.find_spec("nvidia.nccl") if namespace is not None else None
     places = [os.path.join(place, "lib", "libnccl.so.2") for place in (spec.submodule_search_locations or [])
               ] if spec is not None else []
     for place in [*places, "libnccl.so.2"]:

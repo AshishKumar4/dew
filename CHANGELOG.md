@@ -7,6 +7,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- On a host of two or more GPUs, XLA's pool leaves NCCL's communicators their measured full-speed room:
+  `XLA_PYTHON_CLIENT_MEM_FRACTION` (95% unset) is the pool's upper bound, a child process measures the
+  communicators once per configuration into Dew's cache, and a compiled step whose communicators need
+  more than the room left is refused naming the bytes. `import dew` sets `NCCL_RUNTIME_CONNECT=0`.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
   mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
   outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.
