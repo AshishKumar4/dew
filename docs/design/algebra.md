@@ -23,7 +23,7 @@ advance: the autodiff output of the program a user composed. Nothing runs at run
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate`, run by a developer when a declaration or a rule changes | declarations: template algebra (attention's reduction, a recurrence's update), stable numeric forms, surrogate gradients' bodies | every set, with sampled error estimates (§1.5) | Python modules and their tests, checked in and reviewed like hand-written code |
-| Compile time | the program pass, once per compiled program (§2) | the traced jaxpr of a program Dew compiles, its backward included | `linear`, `identities`, `reuse`: small and fast, priced statically | the rewritten jaxpr, compiled under the program's own options |
+| Compile time | the program pass, once per compiled program that differentiates (§2) | the traced jaxpr of a training step or a gradient phase, its backward included | `linear`, `identities`, `reuse`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
 - **Dev time** covers everything whose code Dew knows in advance: a template's forward and backward tiled forms,
@@ -34,9 +34,12 @@ advance: the autodiff output of the program a user composed. Nothing runs at run
   CI regenerates them and fails when the checked-in output differs (`generate --check`), so a rule change shows up
   as a reviewed diff of generated code, never as a silent change in behavior.
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
-  optimizer make, and the backward JAX's autodiff traces for it. Its rule sets are the ones whose saturation is
-  fast and whose rounding class is static, so its cost is bounded by the program's size (§6.6) and it needs no
-  sampling.
+  optimizer make, and the backward JAX's autodiff traces for it. It runs on the programs that differentiate (the
+  resident training step and the host-master gradient phase) and on nothing else: an evaluation, rollout,
+  sampling or serving program is a forward of Dew's own bodies, which dev time has already generated. Inside a
+  step, the bodies Dew owns are marked (§6.10) and stay as they are; the pass rewrites the composition and its
+  autodiff output around them. Its rule sets are the ones whose saturation is fast and whose rounding class is
+  static, so its cost is bounded by the program's size (§6.6) and it needs no sampling.
 - **Runtime** runs nothing of the engine: a compiled program is ordinary XLA, and a generated module is ordinary
   Python.
 
@@ -117,26 +120,30 @@ inferred. A bare custom derivative in `src/dew` fails a slop check, not a defaul
   - **linear scans** and **error-free transforms** (dev time; §6.9).
 - **Rounding:** a rewrite that rounds identically (`exact`) always applies. One that reorders rounding (`reorders`:
   linearity, hoisting, distributivity) applies at compile time under default numerics and never under
-  `--precision accurate`, because the compile-time pass estimates no error. At dev time a reordering form is
-  admitted under accurate numerics only where its sampled error meets the declared accuracy (§1.5), and it lands
-  as reviewed code.
+  `--precision accurate`. The compile-time pass estimates no error per program: a `reorders` rule is admitted
+  under default numerics on the strength of its own gate, the default form's contract for its rounding class
+  (§3), and a program's error is otherwise unknown, so nothing at compile time compares it to a parity. At dev
+  time a reordering form is admitted under accurate numerics only where its sampled error meets the declared
+  accuracy (§1.5), and it lands as reviewed code.
 
 ### 1.5 Error-aware extraction
 
 Extraction picks the cheapest form whose error meets the precision policy's declared accuracy, as Herbie does for
 floating-point expressions:
 
-- **Each form carries an error estimate,** joined on its e-class (§6.3):
-  - at dev time, sampled: the form evaluated in its dtype against the declaration at float64 on the gate's drawn
-    and adversarial families (cancellation, wide ranges, near-equal operands, one-key rows), as check 1 measures
-    error;
-  - at compile time, static: the rounding class of the rules that made it, and a condition bound where its `range`
-    fact gives one.
+- **Error is a property of a candidate, not of an e-class.** The forms an e-class holds are equal in ℝ and differ
+  in error, and a form's error depends on which form of each operand it reads, so the estimate belongs to a
+  concrete candidate: an extracted DAG, every child chosen. Extraction proposes candidates in order of price, and
+  each is measured before it is admitted (§6.5). Error is never an e-class fact.
+- **Dev time measures each candidate** by sampling: the candidate evaluated in its dtype against the declaration
+  at float64 on the gate's drawn and adversarial families (cancellation, wide ranges, near-equal operands, one-key
+  rows), as check 1 measures error.
 - **The declared accuracy** is the precision policy's (`dew.nn.precision`), read once:
-  - default numerics: within check 1's parity (1.5) of the form as written;
-  - `--precision accurate`: within check 1's parity of the most accurate form the e-graph holds.
-- **Among the forms that meet it,** extraction takes the cheapest by time (§1.6). A form that misses it is never
-  extracted, however cheap.
+  - default numerics: check 1 at the gate's parity (§3) against the form as written;
+  - `--precision accurate`: check 1 at the gate's parity against the most accurate candidate measured.
+- **Among the candidates that meet it,** the generator takes the cheapest by time (§1.6). A candidate that
+  misses it is never chosen, however cheap.
+- **At compile time no candidate is measured;** admission is by rounding class alone (§1.4).
 - **Stable rewrites** come mostly from dev time: `log(1 + x)` to `log1p(x)`, a KL in log space, a compensated or
   widened sum, `a − b` rearranged where `a` and `b` are near-equal sums. Two equal forms whose choice is decided by
   error alone, from the derived attention backward (feat/attention-derived 12f9398ba, check 1 against float64):
@@ -165,24 +172,23 @@ fitted to them, and a rule set ships only with measured receipts.
 
 ## 2. Where it applies
 
-- **Programs (compile time):** the pass runs where a function is jitted, so lowering, tracing, compiling and
-  relowering all read one program:
-  - `OuterProgram._jitted` jits `dew.algebra.rewritten(fn)` (`dew.nn.kernels.options`). Every outer program Dew
-    builds through it gets the pass: `options.program` for evaluation and loads, `Objective.program` for the
-    host-master step's forward and the evaluation, rollout and sample programs, and the serving kernel's step and
-    decode programs, whose tuner lowers and compiles the same function.
-  - The resident training step, `Trainer._jitted`'s `jax.jit(step, …)` (`dew.training.trainer`), which every default
-    `dew train` runs and the planner compiles through `compiled_if_it_fits`, jits the rewritten step the same way.
-  - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
-    `dreamer`) jit theirs the same way.
+- **Programs (compile time):** the pass runs where a program that differentiates is jitted, so lowering, tracing,
+  compiling and relowering all read one program:
+  - the resident training step, `Trainer._jitted`'s `jax.jit(step, …)` (`dew.training.trainer`), which every
+    default `dew train` runs and the planner compiles through `compiled_if_it_fits`, jits
+    `dew.algebra.rewritten(step)`, and so does every objective's step it builds, an RL update's included;
+  - the host-master gradient phase (`dew.training.transaction`) jits its rewritten function the same way;
+  - evaluation, rollout, sampling and serving programs (`options.program`, `Objective.program`'s, the serving
+    kernel's) are forwards of Dew's own bodies and get no pass, per the owner's scope (§1.1).
   - The traced jaxpr already holds the backward, since autodiff runs at trace time.
   - Rewrites stay within checkpoint (remat) regions and never change what a step saves.
   - The planner's gradient trace (`dew.training.footprint`) traces the same rewritten function before it prices
     the program, so the planner prices what it compiles.
   - `dew.algebra.rewritten(fn)` is a public transform, and the seam's switch (`dew.algebra.passes`, §6.7) lets the
     accuracy gate run Dew's own programs with the pass on or off per arm (§3).
-- **Template hooks (compile time):** they are jaxprs, so the same pass simplifies them before the Pallas fuser
-  places them in a kernel.
+- **Template hooks (compile time):** a hook is user code Dew cannot know in advance, so its derivative, the
+  autodiff output of a hook a step differentiates, passes through the same pass before the Pallas fuser places it
+  in a kernel.
 - **Template algebra (dev time):** a template's online, tiled and combine forms, forward and backward, are
   generated from a declaration (§6.9):
   - attention's score function, mask and reduction;
@@ -336,6 +342,10 @@ class Term(Expr):
   - every value the region reads but does not compute becomes an `input`.
 - `terms.rebuilt(roots, leaves) -> jax.extend.core.Jaxpr` converts an extracted term back to equations, and drops the
   markers, which lower to nothing.
+- A surviving custom-derivative call (`custom_jvp_call`, `custom_vjp_call`, in a program no transform has traced
+  through) is a region of its own: its `call_jaxpr` is rewritten in place by its marked kind, and the call, its
+  rules and their derivative programs are rebuilt as they were, so the custom derivative stays the site's. Its
+  rules are rewritten where autodiff materializes them, as marked bodies (§6.10).
 - A region is a maximal set of equations of the language. It never crosses:
   - a checkpoint (remat) boundary;
   - an opaque equation;
@@ -359,12 +369,11 @@ derive it from its arguments' facts.
 | `structure(t)` | `String` (a state update's `A_t`: `scalar`, `diagonal`, `rank_one_correction`) | equal or fail | the linear-scan rules |
 | `range(t)` | `Pair[f64, f64]` (bounds, where cheap) | intersect | a stable correction (exp arguments at most 0); a condition bound |
 | `rounding(t)` | `String` (`exact`, `reorders`, `bounded`) | the worse | the compile-time admission of a set |
-| `error(t)` | `f64`: the form's error estimate, as check 1's pooled RMS distance relative to the declaration's at float64 (dev time, sampled) or a static bound (compile time) | the form's own, per e-node | error-aware extraction (§6.5) |
 
 Two notes on the table:
 - "equal or fail" means members of one e-class that disagree raise, naming the rule that united them.
-- `error` is a fact of each e-node, not of its class: the forms of one class are equal in ℝ and differ in error,
-  which is what extraction chooses by.
+- Every fact is invariant under equality, as congruence requires. Error is not: it is measured per candidate
+  (§1.5, §6.5).
 - The inputs' facts come from the traced avals, their shardings, and a declaration's roles (§6.9).
 
 Monoids are an open registry, so a reduction, a prefix and a derived form's merge all name one:
@@ -406,7 +415,7 @@ def admitted(numerics, mode: Mode) -> tuple[Rules, ...]   # the sets a mode and 
 
 - A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
 - Each rule's check 1 site names the rule (§3).
-- A rewrite's result carries its rounding class and its error estimate (§6.3).
+- A rewrite's result carries its rounding class (§6.3).
 - At compile time, under default numerics, the compile-time sets are admitted; under `--precision accurate`, only
   the `exact` ones, since the pass estimates no error.
 - At dev time every set is admitted, and the declared accuracy (§1.5) decides which forms extraction may take.
@@ -423,7 +432,6 @@ class Terms:                          # a node's, or a chosen DAG's, composed
 
 @dataclass(frozen=True)
 class Price:
-    error: float                      # the form's error estimate (§6.3)
     seconds: float                    # CostModel.seconds of its composed terms
     terms: Terms
 
@@ -431,21 +439,28 @@ class CostModel(Protocol):
     def terms(self, node: Node, facts: Facts) -> Terms: ...         # the node alone
     def seconds(self, terms: Terms) -> float: ...                     # once per region, from its composed terms
 
-def extracted(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel, accuracy: float) -> Extraction: ...
+def candidates(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel) -> Iterator[Extraction]: ...
+    # concrete DAGs, every child chosen, in order of price
+
+def extracted(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel,
+              admits: Callable[[Extraction], bool]) -> Extraction: ...   # the cheapest candidate admitted
 
 @dataclass(frozen=True)
 class Extraction:
     roots: tuple[Term, ...]
     price: Price                      # the region's, each shared value priced once
     fired: Mapping[str, int]          # rule set name: the extracted nodes it introduced
+    error: float | None = None        # dev time: the candidate's sampled check 1 statistic; None at compile time
 ```
 
 - A cost model gives a node's terms alone. Extraction composes them over the chosen DAG: `bytes`, `flops` and
   `collective_bytes` add up with each shared e-class counted once, and `depth` is the longest path of
   reductions. `seconds` is computed once from the composed terms, as `templates.cost` combines a launch's, so a
   longest path stays a latency and never becomes a count.
-- `accuracy` is the declared accuracy (§1.5) as a bound on `error`. Extraction takes the cheapest DAG whose
-  roots' error meets it; a form that misses it is never chosen.
+- `admits` decides a candidate: at compile time, whether every rule set it drew on is admitted (§6.4); at dev
+  time, whether its sampled error meets the declared accuracy (§1.5), which `dew.algebra.error` measures on the
+  candidate itself. The candidates come cheapest first, so the first admitted is the answer; the form as written
+  is always a candidate, so one is always admitted.
 - Extraction reads the e-graph through egglog's serialization. A DAG extractor prices each shared e-class once.
   egglog's `greedy-dag` is the baseline it has to beat.
 - Ties break by node order in the serialization, which is deterministic with one thread.
@@ -488,15 +503,19 @@ def limits(region, saturation: Saturation) -> tuple[int, int]: ...   # (nodes, i
 def rewritten_jaxpr(closed: jax.extend.core.ClosedJaxpr, *, numerics, cost: CostModel,
                     saturation: Saturation) -> Rewrite: ...
 
-def rewritten(fn: Callable) -> Callable: ...   # public: fn traced, rewritten as the seam would, and evaluated
+def rewritten(fn: Callable, *, static_argnums=(), static_argnames=()) -> Callable: ...
+    # public: fn traced over its dynamic arguments, its static ones bound first as jit binds them, rewritten as
+    # the seam would, and evaluated, its outputs' pytree as fn's
 
 @dataclass(frozen=True)
 class Passes:
     on: bool                          # the pass runs
     target: str | None                # the GpuTarget whose facts it prices for; None: the process's own
 
+PASSES = jax.make_user_context(Passes(on=True, target=None))   # in JAX's trace context, as dew.cache's are
+
 @contextlib.contextmanager
-def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # held per thread, like compiled_with
+def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets PASSES
 
 @dataclass(frozen=True)
 class Rewrite:
@@ -504,18 +523,24 @@ class Rewrite:
     report: AlgebraReport
 ```
 
-- `rewritten(fn)` traces `fn` with `jax.make_jaxpr`, rewrites the result with the compile-time sets, and returns
-  a function that evaluates the rewritten jaxpr (`jax.extend.core` and `eval_jaxpr`). Where it is jitted, the jit
-  options and shardings stay the program's own.
-- The pass sits where a function is jitted (§2): `OuterProgram._jitted` jits `rewritten(fn)`, so `lower`, `trace`,
-  `compiled` and every relowering read one program; `Trainer._jitted` jits the rewritten step, the host-master
-  phases and the rollouts theirs. `footprint`'s `make_jaxpr` traces the same rewritten function.
-- `passes` is the seam's switch, read where the pass runs. The gate opens it per arm: off for the reference and
-  the float64 truth, on for the candidate, priced at a named target (§3). Outside any `passes`, the pass is on
-  and prices for the process's own GPU.
-- The admitted set names and the switch's state key the program beside its compiler options, never inside them
-  (XLA refuses a key it does not know): in `options._program`'s cache key, `Objective.program`'s key and the
-  trainer's step key, so a rewritten program and an unrewritten one never share an executable.
+- `rewritten(fn)` binds `fn`'s static arguments as the jit around it does (the same `static_argnums` and
+  `static_argnames`), traces it over the dynamic ones with `jax.make_jaxpr`, rewrites the result with the
+  compile-time sets, and returns a function that evaluates the rewritten jaxpr (`jax.extend.core` and
+  `eval_jaxpr`) and rebuilds the output pytree. Where it is jitted, the jit options and shardings stay the
+  program's own; a static argument keeps the program's Python control flow concrete (a rollout's length, a
+  policy's `random`).
+- The pass sits where a differentiating program is jitted (§2): `Trainer._jitted` jits the rewritten step and the
+  host-master gradient phase its rewritten function, so lowering, compiling and every relowering read one
+  program. `footprint`'s `make_jaxpr` traces the same rewritten function.
+- `passes` is the seam's switch. `PASSES` lives in JAX's trace context, so every jit and every executable map
+  that keys on `trace_context` (jit's own, `OuterProgram._keyed`) retraces when it changes: a program already held
+  never runs a form traced under another switch or priced for another target. The gate opens it per arm: off for
+  the reference and the float64 truth, on for the candidate, priced at a named target (§3). Outside any `passes`,
+  the pass is on and prices for the process's own GPU. Tests hold a retained step to a new executable when the
+  switch or the target changes.
+- The admitted set names key the program beside its compiler options, never inside them (XLA refuses a key it
+  does not know): the switch's state is in the trace context, and the sets are fixed per Dew version, so a
+  rewritten program and an unrewritten one never share an executable.
 
 ### 6.8 The report
 
@@ -592,9 +617,9 @@ class KernelGlue: ...                 # a kernel derivative's XLA around its lau
 
 Kind = Protected | Surrogate | KernelGlue
 
-marked_p: jax.extend.core.Primitive   # identity on its operands; params: kind (a Kind instance), span, side
+marked_call_p: jax.extend.core.Primitive   # a call: params jaxpr (a ClosedJaxpr) and kind (a Kind instance)
 
-def marked(kind: Kind, fn: Callable) -> Callable: ...   # fn's inputs and outputs bracketed by marked_p
+def marked(kind: Kind, fn: Callable) -> Callable: ...   # fn traced as one marked_call of its body
 
 def kernel_derivative(fn, fwd, bwd) -> Callable: ...    # custom_vjp with KernelGlue bodies
 def numerics_derivative(fn, fwd, bwd) -> Callable: ...  # custom_vjp with Protected bodies
@@ -604,12 +629,19 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
     # linear in the tangents, so reverse mode transposes it and higher orders differentiate it
 ```
 
-- `marked_p` binds on a span's inputs (`side="enter"`) and outputs (`side="exit"`) with one `span` id. Its
-  abstract evaluation and lowering are the identity, its batching rule maps it over the batch, its JVP brackets
-  the tangent's span with the same kind, and its transpose turns an exit into an enter on the cotangent, so a
-  span's forward, tangent and cotangent each keep their marker through `jax.grad`, `jvp`, `vmap` and remat.
-- The pass reads `kind` as an object (`isinstance`), never a name or a scope string, and `rebuilt` drops every
-  marker, so the compiled program holds none. With the pass off, a marker lowers to nothing.
+- A marked body is one call equation carrying its body's jaxpr and its kind, as `closed_call` carries a body, so
+  it stays atomic through every transform; two sentinel equations would not, since partial evaluation splits a
+  body's primal, residual and tangent parts and dead-code elimination drops an unused end. Its rules are
+  registered through `jax.interpreters`' registries as `closed_call`'s are: its JVP is a marked call of the
+  body's JVP, its partial evaluation splits the body into a known and an unknown marked call of the same kind
+  (the residuals among the known one's outputs), its transpose is a marked call of the transposed body, and its
+  batching rule a marked call of the batched body. Its lowering inlines the body, so a marked call costs nothing
+  with the pass off.
+- A prototype test holds the marker before anything builds on it: a body's forward, tangent and cotangent each
+  arrive as marked calls of their kind through `jax.grad`, `jvp`, `linearize`, `vmap`, `jax.checkpoint` and
+  `shard_map`.
+- The pass reads `kind` as an object (`isinstance`), never a name or a scope string, and `rebuilt` inlines every
+  marked call, so the compiled program holds none.
 - `dew.nn.precision`'s error-free transforms are `marked(Protected(), …)`, replacing the name scope the first cut
   reads.
 - Every custom-derivative site declares itself through one of the four declarations, in place of a bare
@@ -632,15 +664,34 @@ class Generated:
     rules: tuple[str, ...]            # the rule sets and their receipts
     egglog: str                       # the pinned version
 
+@dataclass(frozen=True)
+class Cases:                          # where a declaration is generated and checked
+    operands: tuple[tuple[jax.ShapeDtypeStruct, ...], ...]   # each case's operands, by dtype and shape
+    draw: Callable[[int, tuple[jax.ShapeDtypeStruct, ...]], tuple]   # the gate's drawn and adversarial families
+    seeds: int                        # the declared seeds of its check 1 site
+    policies: tuple[str, ...]         # the precision policies it is generated for: "default", "accurate"
+    targets: tuple[str, ...]          # the GpuTargets it is priced for
+
+@dataclass(frozen=True)
+class StableForm:                     # a numeric function of Dew's own
+    function: Callable                # its math as written: the form as written and, at float64, the truth
+    cases: Cases
+
+@dataclass(frozen=True)
+class SurrogateBodies:                # a surrogate's two bodies (row 3271), each optimized, neither replaced
+    forward: Callable
+    derivative: Callable
+    cases: Cases
+
 DECLARATIONS: Mapping[str, Declaration | StableForm | SurrogateBodies]   # registered by the declaring modules
 
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
-- `python -m dew.algebra.generate [names] [--check]` saturates each registered declaration with every set
-  (`Mode.DEV`), samples each candidate's error on the gate's drawn and adversarial families against the
-  declaration at float64 (`dew.algebra.error`), extracts per §1.5 under each precision policy the declaration
-  names, and writes the module and its tests.
+- `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
+  saturates it with every set (`Mode.DEV`), measures each candidate's error on its cases' draws against the
+  declaration at float64 (`dew.algebra.error`), extracts per §1.5 under each policy the cases name, priced for
+  each target, and writes the module and its tests. `Reduction` and `Scan` carry `cases` as well.
 - The output is ordinary Python: plain JAX functions with no import of `dew.algebra`, formatted, linted and typed
   as any module, and a header naming the declaration, the sets, their receipts and the egglog version. Nothing of
   the engine is imported at runtime.
