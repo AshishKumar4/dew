@@ -43,7 +43,7 @@ from jax import lax
 from jax.extend import core as jcore
 
 from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
-from dew.nn.precision import float32_einsum, float32_matmul, two_sum
+from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
 
 Axes = tuple[str, ...]
 Atom = jcore.Var | jcore.Literal
@@ -159,6 +159,9 @@ def derive_scan(declaration: Scan) -> Derived:
                 if declaration.walked in declaration.operands[name] else None for name in names]
         exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
             *[chunk[name] for name in names])
+        # The exponents summed in float32 at least: a narrower prefix loses a decay's digits to its partials'
+        # magnitude, and float16's overflows past six resets (65504).
+        exponent = exponent.astype(at_least_fp32(exponent.dtype))
         if declaration.reset is not None:
             exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
         return affine, (exponent, *values)
