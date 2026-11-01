@@ -398,7 +398,8 @@ a task on one core, leaves room for eight of its seeds' draws, 5 s each, within 
 
 def cell_ids(cells) -> list[str]:
     """Each layout cell's test id: its case, its steps and its layout's kind."""
-    return [f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}" for case, steps, layout in cells]
+    return [f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
+            for case, steps, layout in cells]
 
 
 UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell[0].name != SHARDED]
