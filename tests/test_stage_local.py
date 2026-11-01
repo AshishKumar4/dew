@@ -16,7 +16,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from model_support import TINY_DECODER
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
 from dew.checkpoints import Checkpoints
@@ -24,7 +24,7 @@ from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
 from dew.lora import LoRA
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig, ParamGroup, scale_by_m3, weight_decay_mask
+from dew.optim import OptimConfig, ParamGroup, parameter_name, scale_by_m3, weight_decay_mask
 from dew.registry import models
 from dew.training import Inspection, Layout, MeshSpec, Trainer
 from dew.training.diloco import DiLoCo
@@ -358,7 +358,8 @@ def test_a_run_without_a_rollout_never_lays_its_state_out_whole():
     def whole(state):
         raise AssertionError("a run without a rollout laid its state out whole")
 
-    assert rolled_out(None, None, batch, None, None, None, None, view=whole) is batch
+    made, position = rolled_out(None, None, batch, None, None, None, None, view=whole)
+    assert made is batch and position is None
 
 
 @pytest.mark.mesh(devices=8)
@@ -378,22 +379,30 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
 def test_a_stage_local_runs_inspection_reports_each_stored_layer_by_its_name():
     """An inspection of a stage-local run selects and summarizes each stored layer its stacked leaves hold,
     by the layer's own name: a path naming one layer reports that layer, and a glob reports each layer it
-    matches apart, the scalars and values the same pipeline with every layer whole on every stage logs."""
+    matches apart, the scalars the same pipeline with every layer whole on every stage logs. Each layer's
+    statistic is its own rows': its sum of squares over its values, which either program reduces in fp32,
+    within fp32's reduction bound of the other's, where another layer's rows would part far beyond it."""
     watched = Inspection(paths=("layers_0/self_attn/q_proj/kernel", "*mlp/up_proj/kernel"),
                          targets=("params",), every=1)
-    logged = []
+    logged, runs = [], []
     for stage_local in (True, False):
         run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer="adamw", learning_rate=1e-2),
                       key=jax.random.key(0), mesh=STAGED, layout=Layout(min_shard=TINY_SHARD,
                                                                          stage_local=stage_local),
                       inspection=watched, tracker=None)
         logged.append(inspected(run, stream().train(None).__next__(), steps=1))
+        runs.append(run)
     local, replicated = logged
     assert sorted(local) == sorted(replicated)
     named = {f"inspect/params/{layer}/kernel/rms"
              for layer in ("layers_0/self_attn/q_proj", "layers_3/mlp/up_proj")}
     assert named <= set(local)
-    assert local == replicated
+    sizes = {parameter_name(path): leaf.size for path, leaf in jax.tree_util.tree_flatten_with_path(
+        runs[1].initial_state().variables["params"])[0]}
+    for name in (name for name in local if name.endswith("/rms")):
+        size = sizes[name.removeprefix("inspect/params/").removesuffix("/rms")]
+        squares = [np.float64(scalars[name]) ** 2 * size for scalars in (local, replicated)]
+        assert_fp32_reduction_bound(squares[0], squares[1], squares[1], size)
 
 
 @pytest.mark.mesh(devices=8)
