@@ -10,12 +10,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import math
 import time
 from collections.abc import Callable, Iterator, Mapping
 
 import jax
+import jax.numpy as jnp
 import numpy as np
-from egglog import EGraph, Schedule, String, Vec, get_callable_args, i64, set_
+from egglog import EGraph, Schedule, String, Vec, get_callable_args, get_literal_value, i64, set_
 from jax._src import api_util, config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
@@ -294,8 +296,6 @@ def stated(graph: EGraph, region: terms.Region) -> None:
     for index, (primitive, params) in enumerate(region.params):
         if primitive in arithmetic and params.get("out_dtype") is None:
             graph.register(rules.plain(i64(index)))
-        if primitive is jax.lax.dot_general_p and params.get("preferred_element_type") is None:
-            graph.register(rules.plain(i64(index)))
         if primitive is jax.lax.broadcast_in_dim_p:
             rank, laid = len(params["shape"]), tuple(params["broadcast_dimensions"])
             missing = [axis for axis in range(rank) if axis not in laid]
@@ -303,6 +303,7 @@ def stated(graph: EGraph, region: terms.Region) -> None:
                 graph.register(rules.along(i64(index), i64(missing[0])))
     for name, index in region.stock.items():
         graph.register(set_(rules.stock(String(name))).to(i64(index)))
+    _products(graph, region)
     reached = set()
     for term, sizes in region.shapes:
         for size in sizes:
@@ -313,6 +314,38 @@ def stated(graph: EGraph, region: terms.Region) -> None:
             reached.add(bound)
     for bound in reached:
         graph.register(rules.reaches(i64(bound.log2), *(i64(each) for each in bound.degrees)))
+    # A value under the narrowest floating dtype's largest power of two is finite whatever else it is.
+    floats = [jnp.finfo(dtype).max for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
+    if floats:
+        graph.register(rules.reaches(i64(math.floor(math.log2(min(floats)))), *([i64(0)] * terms.SLOTS)))
+
+
+def _products(graph: EGraph, region: terms.Region) -> None:
+    """The facts a region's products state: which compute in their operands' dtype (`rules.plain`: no
+    accumulation wider than their operands they round back from), which of those are matrix products
+    (`rules.matrix_product`), which values are matrices (`rules.matrix`), and the broadcasts of a vector to
+    each matrix's extent along either axis (`rules.lifted`), their parameters added to the region's table."""
+    plain_numbers = (((1,), (0,)), ((), ()))
+    for term, extent in region.shapes:
+        if len(extent) == 2:
+            graph.register(rules.matrix(term))
+        if (args := get_callable_args(term, terms.Term.dot)) is None:
+            continue
+        index = int(get_literal_value(args[2]))
+        _, params = region.params[index]
+        wanted = params.get("preferred_element_type")
+        operands = {region.dtypes.get(str(args[0])), region.dtypes.get(str(args[1]))}
+        if wanted is None or operands == {jnp.dtype(wanted)}:
+            graph.register(rules.plain(i64(index)))
+            if jax.tree.map(int, params["dimension_numbers"]) == plain_numbers:
+                graph.register(rules.matrix_product(i64(index)))
+    matrices = {extent for _, extent in region.shapes if len(extent) == 2}
+    for extent in matrices:
+        for axis in (0, 1):
+            region.params.append((jax.lax.broadcast_in_dim_p, {
+                "shape": extent, "broadcast_dimensions": (axis,), "sharding": None}))
+            graph.register(set_(rules.lifted(Vec[i64](*(i64(size) for size in extent)), i64(axis))).to(
+                i64(len(region.params) - 1)))
     for index, value in enumerate(region.literals):
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):

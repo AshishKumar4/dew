@@ -22,12 +22,10 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
-import jax.numpy as jnp
 from egglog import (
     DagCostModel,
     EGraph,
     String,
-    Unit,
     Vec,
     eq,
     function,
@@ -52,19 +50,6 @@ from dew.algebra.terms import Term
 @function(merge=lambda old, new: old)
 def reads(term: Term) -> i64: ...
 """1 for a value that reads the carried state."""
-
-
-@function
-def matrix_product(params: i64) -> Unit: ...
-"""A product's parameters (`Term.dot`) contracting its left operand's last axis with its right's first, no
-batch, in its operands' dtype (no wider accumulation it rounds back from): `x @ y` of matrices
-(`matrix`)."""
-
-
-@function
-def matrix(term: Term) -> Unit: ...
-"""A value of rank two: each operand a rule moves a matrix product past must be one, as a product's
-parameters hold whatever its operands' ranks."""
 
 
 @function(merge=lambda old, new: old)
@@ -94,12 +79,11 @@ def _carrying():
                    for child in children]
     return ruleset(
         *marked,
-        rule(eq(left).to(rules.shape(t)), eq(left.length()).to(i64(2))).then(matrix(t)),
         rule(eq(t).to(x.shaped(String("transpose"), p)), eq(left).to(rules.shape(x)),
              eq(left.length()).to(i64(2))).then(
             set_(rules.shape(t)).to(Vec[i64](left[i64(1)], left[i64(0)]))),
-        rule(eq(t).to(x.dot(y, p)), matrix_product(p), matrix(x), matrix(y), eq(left).to(rules.shape(x)),
-             eq(right).to(rules.shape(y))).then(
+        rule(eq(t).to(x.dot(y, p)), rules.matrix_product(p), rules.matrix(x), rules.matrix(y),
+             eq(left).to(rules.shape(x)), eq(right).to(rules.shape(y))).then(
             set_(rules.shape(t)).to(Vec[i64](left[i64(0)], right[i64(1)]))),
         name="carrying")
 
@@ -123,17 +107,18 @@ def _carried():
     sets = [
         # x^T @ y as transpose(x) @ y, so it associates and factors with plain products; the transpose a
         # layout of x, of its magnitude.
-        rule(eq(t).to(x.dot(y, p)), eq(m).to(plain_of(p)), eq(s).to(swap_of(p)), matrix(x), matrix(y),
-             eq(reads(y)).to(one), *facts).then(
+        rule(eq(t).to(x.dot(y, p)), eq(m).to(plain_of(p)), eq(s).to(swap_of(p)), rules.matrix(x),
+             rules.matrix(y), eq(reads(y)).to(one), *facts).then(
             union(t).with_(transposed.dot(y, m)), *rules.made(transposed, power, degrees)),
     ]
     # x @ (y @ z) as (x @ y) @ z, the state's product last: x @ y new.
     facts, power, degrees = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
-    sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), matrix_product(m), matrix(x), matrix(y), matrix(z),
-                     eq(reads(z)).to(one), *contracted, *facts, *rules.dominated(power, degrees, "new")).then(
+    sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), rules.matrix_product(m), rules.matrix(x),
+                     rules.matrix(y), rules.matrix(z), eq(reads(z)).to(one), *contracted, *facts,
+                     *rules.dominated(power, degrees, "new")).then(
         union(t).with_(x.dot(y, m).dot(z, m)), *rules.made(x.dot(y, m), power, degrees)))
     for combined in ("add", "sub"):
-        plain = (matrix_product(m), rules.plain(q), matrix(x), matrix(y), matrix(z))
+        plain = (rules.matrix_product(m), rules.plain(q), rules.matrix(x), rules.matrix(y), rules.matrix(z))
         # x @ (y +- z) as x @ y +- x @ z: both new.
         with_y = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
         with_z = rules.product_magnitude(rules.magnitude(x, "x2"), rules.magnitude(z, "z"), length)
@@ -217,7 +202,7 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     first = len(closed.jaxpr.constvars)
     graph = EGraph()
     program.stated(graph, region)
-    _products(graph, region, closed)
+    _products(graph, region)
     reading = {first}
     for opaque in region.opaque:
         if any(term is not None and _reads(term, reading) for term in opaque.inputs):
@@ -256,31 +241,26 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     return Split(prepare, reading_forms(carry_forms), reading_forms(emit_forms))
 
 
-def _products(graph: EGraph, region: terms.Region, closed) -> None:
-    """Which of the region's products are plain matrix products (`matrix_product`: in their operands' dtype,
-    each equation of `closed` holding its parameters so), and for each `x^T @ y` the plain product and the
-    transpose its rewrite takes (`plain_of`, `swap_of`), their parameters added to the region's table where it
-    holds none. Each rule asks its operands' ranks of the terms themselves (`matrix`)."""
+def _products(graph: EGraph, region: terms.Region) -> None:
+    """For each `x^T @ y` of the region's (both operands' first axes contracted, in their dtype,
+    `rules.plain`), the plain product and the transpose its rewrite takes (`plain_of`, `swap_of`), their
+    parameters added to the region's table where it holds none; the plain products' facts are the program's
+    (`program.stated`)."""
     plain = (((1,), (0,)), ((), ()))
     transposed = (((0,), (0,)), ((), ()))
-    widening: set[int] = set()
-    for equation in closed.jaxpr.eqns:
-        if equation.primitive is jax.lax.dot_general_p:
-            wanted = equation.params.get("preferred_element_type")
-            dtypes = {jnp.dtype(atom.aval.dtype) for atom in equation.invars}
-            if wanted is not None and dtypes != {jnp.dtype(wanted)}:
-                widening.add(_parameters(region, equation.primitive, equation.params))
-    for index, (primitive, params) in list(enumerate(region.params)):
-        if primitive is not jax.lax.dot_general_p or index in widening:
+    for term, _ in region.shapes:
+        if (args := get_callable_args(term, Term.dot)) is None:
             continue
-        numbers = jax.tree.map(int, params["dimension_numbers"])
-        if numbers == plain:
-            graph.register(matrix_product(i64(index)))
-        elif numbers == transposed:
-            made = _parameters(region, primitive, {**params, "dimension_numbers": plain})
-            swapped = _parameters(region, jax.lax.transpose_p, {"permutation": (1, 0)})
-            graph.register(matrix_product(i64(made)), set_(plain_of(i64(index))).to(i64(made)),
-                           set_(swap_of(i64(index))).to(i64(swapped)))
+        index = int(get_literal_value(args[2]))
+        primitive, params = region.params[index]
+        if jax.tree.map(int, params["dimension_numbers"]) != transposed:
+            continue
+        if not graph.check_bool(rules.plain(i64(index))):
+            continue
+        made = _parameters(region, primitive, {**params, "dimension_numbers": plain})
+        swapped = _parameters(region, jax.lax.transpose_p, {"permutation": (1, 0)})
+        graph.register(rules.plain(i64(made)), rules.matrix_product(i64(made)),
+                       set_(plain_of(i64(index))).to(i64(made)), set_(swap_of(i64(index))).to(i64(swapped)))
 
 
 def _parameters(region: terms.Region, primitive, params) -> int:

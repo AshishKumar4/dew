@@ -47,6 +47,24 @@ def along(params: i64, axis: i64) -> Unit: ...
 
 
 @function
+def matrix_product(params: i64) -> Unit: ...
+"""A product's parameters (`Term.dot`) contracting its left operand's last axis with its right's first, no
+batch, in its operands' dtype (`plain`): `x @ y` of matrices (`matrix`)."""
+
+
+@function
+def matrix(term: Term) -> Unit: ...
+"""A value of rank two (`program.stated`): each operand a rule moves a matrix product past is one, as a
+product's parameters hold whatever its operands' ranks."""
+
+
+@function(merge=lambda old, new: old)
+def lifted(extent: Vec[i64], axis: i64Like) -> i64: ...
+"""The parameters of a broadcast of a vector to a matrix of `extent`, the vector along `axis`
+(`program.stated` states each the region's matrices take)."""
+
+
+@function
 def plain(params: i64) -> Unit: ...
 """Holds where an arithmetic equation's parameters are its defaults (no `out_dtype`): it computes in its
 operands' dtype, so a rule may move it past the arithmetic beside it (`program.rewrite` states it)."""
@@ -201,9 +219,10 @@ def _linear() -> Ruleset:
     product of the summed others, and a power of two's scale of the product on either operand instead), each
     over arithmetic in its operands' dtype (`plain`), and a value a broadcast lays along every axis but a
     sum's taken out of the sum where the other factor has the product's shape (the broadcast's extent along
-    the axis the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding,
-    and each fires only where every intermediate it makes is under a magnitude the program as written reaches
-    (`dominated`, §6.3), each stating its own (`made`)."""
+    the axis the product's or 1, as an elementwise product broadcasts a unit axis), and a matrix product of
+    an operand scaled along its kept axis (a dequant's row or column scale) as the product scaled: each
+    reorders rounding, and each fires only where every intermediate it makes is under a magnitude the program
+    as written reaches (`dominated`, §6.3), each stating its own (`made`)."""
     x, y, a, t = vars_("x y a t", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
@@ -245,6 +264,30 @@ def _linear() -> Ruleset:
         eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent),
         eq(length).to(log2_of(extent[axis])), *facts, *dominated(power + length, degrees, "new")).then(
         union(t).with_(a.binary("mul", sum_of, multiplied)), *made(sum_of, power + length, degrees)))
+    # A matrix product of an operand scaled along its kept axis (a row scale on the left, a column scale on
+    # the right, constant along the contraction) as the product scaled: x@w new.
+    s = var("s", Term)
+    result = var("result", Vec[i64])
+    length2, row_lift, column_lift = vars_("length2 row_lift column_lift", i64)
+    left = var("left", Vec[i64])
+    contracted = (eq(left).to(shape(x)), eq(length2).to(log2_of(left[i64(1)])))
+    facts, power, degrees = product_magnitude(magnitude(x, "x"), magnitude(y, "y"), length2)
+    product = x.dot(y, params)
+    for scaled, laid_axis, lift_axis, lift in (
+            (lambda: x.binary("mul", s.shaped("broadcast_in_dim", laid), multiplied).dot(y, params), 1, 0,
+             row_lift),
+            (lambda: s.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).dot(y, params), 1, 0,
+             row_lift),
+            (lambda: x.dot(y.binary("mul", s.shaped("broadcast_in_dim", laid), multiplied), params), 0, 1,
+             column_lift),
+            (lambda: x.dot(s.shaped("broadcast_in_dim", laid).binary("mul", y, multiplied), params), 0, 1,
+             column_lift)):
+        sets.append(rule(
+            eq(t).to(scaled()), matrix_product(params), plain(multiplied), matrix(x), matrix(y),
+            along(laid, i64(laid_axis)), eq(result).to(shape(t)), eq(lift).to(lifted(result, i64(lift_axis))),
+            *contracted, *facts, *dominated(power, degrees, "new")).then(
+            union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
+            *made(product, power, degrees)))
     return ruleset(*sets, name="linear")
 
 
