@@ -81,14 +81,13 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
 def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
     """`program` as JAX lowers it for the platform `lowering` (`lowering_platform`) and XLA compiles it:
     each `shard_map` over manual axes of one device inline, its body's equations among the rest
-    (`_shard_map_lowering_shardy`, jax/_src/shard_map.py, makes no manual computation of it), and each
+    (`_shard_map_lowering_shardy`, jax/_src/shard_map.py, makes no manual computation of it), each
     `platform_dependent` conditional the branch `lowering` keeps, inline, no conditional around it
     (`_cond_lowering`, jax/_src/lax/control_flow/conditionals.py, keeps the branches whose platforms
-    hold the lowering's, and lowers a sole branch as the computation itself), and each nested `jit` inline,
-    a private function XLA's call inliner runs in its caller (a wide sum's, `precision.accumulated`, traced
-    once for its types: called, its GEMMs were no fusion's of the slices that read them, 10 of
-    test_derived_plan's fits red, row 3193); through every program an equation runs but a native Pallas
-    kernel's, which XLA never sees (`opaque`)."""
+    hold the lowering's, and lowers a sole branch as the computation itself), and each call (`CALLS`)
+    as its program in its caller, a differentiated checkpoint's operands behind its barrier
+    (`prevented`); through every program an equation runs but a native Pallas kernel's,
+    which XLA never sees (`opaque`)."""
     renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
     equations: list[jcore.JaxprEqn] = []
 
@@ -102,8 +101,6 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
         if name == "shard_map" and math.prod(params["mesh"].shape[axis]
                                              for axis in params["newly_manual_axes"]) == 1:
             body = params["jaxpr"]
-        elif name in ("pjit", "jit"):
-            body, consts = params["jaxpr"].jaxpr, params["jaxpr"].consts
         elif name == "pallas_call" and params["interpret"]:
             run = functools.partial(interpreter(params.pop("interpret")), **params)
             traced = jax.make_jaxpr(run)(*(value.aval for value in equation.invars))
@@ -111,6 +108,12 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
         elif name == "cond" and params.get("branches_platforms") is not None:
             branch = params["branches"][platform_branch(params["branches_platforms"], lowering)]
             body, consts, reading = branch.jaxpr, branch.consts, operands[1:]
+        elif name in CALLS and len(called := bodies(equation)) == 1 and (
+                len(called[0].invars), len(called[0].outvars)) == (len(operands), len(equation.outvars)):
+            body, consts = called[0], tuple(called[0].consts)
+            if params.get("differentiated"):
+                barrier, reading = prevented(operands, params.get("prevent_cse", False))
+                equations.extend(barrier)
         if body is not None:
             inner, returned = inlined(compiled(body, lowering), reading, consts)
             equations.extend(inner)
@@ -120,6 +123,33 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
             params = {key: within(value, lowering) for key, value in params.items()}
         equations.append(equation.replace(invars=operands, params=params))
     return program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
+
+
+CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
+                   "custom_vjp_call"})
+"""The primitives that run a program on their operands, one for one, and return its results. A `jit`
+lowers to a call that XLA's `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
+`GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a checkpoint
+(`_remat_lowering`, jax/_src/ad_checkpoint.py) and a custom derivative's primal
+(`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py) lower to their program in the caller, so
+XLA sees no call. A result that is the program's own parameter is its operand's buffer, and one that is a
+cheap value of another is recomputed where it is read, as it would be without the call."""
+
+
+def prevented(operands: Sequence[jcore.Var | jcore.Literal], prevent_cse: bool | Sequence[bool]
+              ) -> tuple[list[jcore.JaxprEqn], list[jcore.Var | jcore.Literal]]:
+    """`operands` as a differentiated checkpoint reads them, and the equations that make them so: those
+    `prevent_cse` selects (each, where it is one flag) through one optimization barrier, which XLA keeps
+    them in buffers behind, the rest as they are (`_remat_lowering`, jax/_src/ad_checkpoint.py)."""
+    chosen = [prevent_cse] * len(operands) if isinstance(prevent_cse, bool) else list(prevent_cse)
+    held = [value for value, kept in zip(operands, chosen, strict=True) if kept]
+    if not held:
+        return [], list(operands)
+    traced = jax.make_jaxpr(lambda *values: jax.lax.optimization_barrier(values))(
+        *(value.aval for value in held))
+    barrier, kept_apart = inlined(traced.jaxpr, held, traced.consts)
+    returned = iter(kept_apart)
+    return barrier, [next(returned) if kept else value for value, kept in zip(operands, chosen, strict=True)]
 
 
 def within(value, lowering: str):
