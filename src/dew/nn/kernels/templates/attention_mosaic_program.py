@@ -18,7 +18,15 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    bundles,
+    layout,
+    mosaic,
+    mosaic_sm80,
+    mosaic_sm90,
+    resources,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -35,12 +43,10 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name, mosaic_sm80.Mma.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`). mma.sync's lowers and holds check 1 on an A100 (row 2078,
-ET-2078-A100CHECK3), but its natural, guarded and backward launches spill at every tile its model admits and
-no register fact yet decides them (the toolkit's sm80 matrix), so its calls take FA2 or the Pallas-Triton
-mainloop by legality."""
+feed their own rings (`mosaic_sm90.FED`), and mma.sync's (an A100's: row 2078, check 1 held there,
+ET-2078-A100CHECK3; every launch it derives compiled spill-free, the resource gate's sm80 cases)."""
 
 
 def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
@@ -73,6 +79,12 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 `MosaicBackward.eligible`)."""
 
 
+def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str, int]:
+    """The swizzles `Family.streams` stages the streams `names` at, which a launch's products read
+    transposed: the narrowest where `tiles` stage them so (`Tiles.narrow`), the family's own otherwise."""
+    return dict.fromkeys(names, mosaic.NARROWEST_SWIZZLE_BYTES) if tiles.narrow else {}
+
+
 @dataclasses.dataclass(frozen=True, order=True)
 class Tiles:
     """A forward launch's config: each consumer's query block (`block_q`), the key tile (`block_k`), the key
@@ -95,6 +107,11 @@ class Tiles:
     relaunch_columns: int | None = None
     natural_form: bool = False
     columns: int | None = None
+    narrow: bool = False
+    """Whether the streams its products read transposed stage at the narrowest swizzle
+    (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
+    of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
+    registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
 
     def __post_init__(self):
         if self.stages < 2:
@@ -136,6 +153,11 @@ class BackwardTiles:
     """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
     each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
     dQ, where a consumer's own keys' whole dK and dV sums pass its registers (width 256's)."""
+    narrow: bool = False
+    """Whether the streams its products read transposed stage at the narrowest swizzle
+    (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
+    of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
+    registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
 
     @property
     def dkv(self) -> "BackwardTiles":
@@ -166,6 +188,33 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
     """A head width as a launch stages it: a power of two (`padded_call`) in whole swizzled rows
     (`Family.column_unit`)."""
     return whole(power_of_two(width), family.column_unit(dtype))
+
+
+def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> list:
+    """The phases a step's products hold where its family's read their operands from registers
+    (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
+    `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
+    `beside` it holds at once (its output, a tile it reads in registers), a left operand in registers
+    (`register_lhs`: the weights, the score cotangents) no fragment of its own, a right one read as the
+    transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
+    stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
+    fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
+    `narrow` (`Tiles.narrow`)."""
+    if not family.operands_in_registers:
+        return []
+    narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
+    return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
+                                                       lhs_parts=0 if register_lhs else 1,
+                                                       rhs_transposed=transposed,
+                                                       rhs_swizzle=narrowest if transposed else None)
+            for rows, depth, columns, beside, register_lhs, transposed in products]
+
+
+def stagings(family: mosaic.Family) -> tuple[bool, ...]:
+    """Whether a launch's transposed streams stage narrowest (`Tiles.narrow`), the stagings a derivation
+    tries in turn: the family's own swizzle first, then the narrowest where its products read their
+    operands from registers (`Family.operands_in_registers`), whose fragments a narrow stage shrinks."""
+    return (False, True) if family.operands_in_registers else (False,)
 
 
 def _block(config: Tiles | BackwardTiles) -> int:

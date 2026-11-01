@@ -23,6 +23,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -75,7 +76,10 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         blocks["logits"] = ((block_q, width), dtype)
     if tiled:
         scoped.append(plgpu.SMEM((consumers, block_k, rows), jnp.float32))
-    swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
+    # Keys first, the logits' and dP's products read their queries (the stream of them by the power where it
+    # has one) and the output cotangents transposed; a launch's own swizzle every stream's.
+    transposed = transposed_swizzles(config, "logits" if "logits" in blocks else "queries", "douts")
+    swizzles = transposed if swizzle is None else dict.fromkeys(blocks, swizzle)
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles)
 
 def _holders(family: mosaic.Family, consumers: int) -> int:
@@ -218,7 +222,9 @@ def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, k_first, inde
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index, interpret: bool
                 ) -> None:
     """A dK/dV consumer's dK and dV of its own keys to their `views`, and its key gradients' sums added into
-    theirs (`Family.added`), through its `stages` (dK's output stage, dV's, the key gradients')."""
+    theirs (`Family.added`), or written to its own place where its family adds no vector
+    (`Family.adds_vectors`, `_dkv_launched`), through its `stages` (dK's output stage, dV's, the key
+    gradients')."""
     out_smem, dv_smem, rows_smem = stages
     dk, dv, *key_sums = sums
     dk_view, dv_view, *key_views = views
@@ -230,7 +236,10 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
         family.stored((dv,), (dv_view,), smem=dv_smem.at[index])
     for key_sum, key_view in zip(key_sums, key_views, strict=True):
         # Each key gradient, the walk's row sums, added into its own `[B or 1, H or 1, Kp]`.
-        family.added(key_sum, key_view, interpret, smem=rows_smem.at[index])
+        if family.adds_vectors:
+            family.added(key_sum, key_view, interpret, smem=rows_smem.at[index])
+        else:
+            family.stored((family.as_row(key_sum),), (key_view,), smem=rows_smem.at[index])
 
 def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], *, widths: bool, split: bool, fused: bool
               ) -> tuple:
@@ -467,10 +476,14 @@ def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], 
     place, the call's `[B, H, ...]`, written once, the shared rows summed in a fixed order after
     (`template.shared_sum`; row 2620: the adds of the programs sharing one place land in no fixed order); a
     fused one's dQ before them, added into zeros too, one copy, or each consumer's own interpreted
-    (`Family.added`)."""
+    (`Family.added`). A key gradient where the launch's family adds no vector (`Family.adds_vectors`) its
+    program's own place too, written, the shared rows summed after."""
     batch, queries, heads, _ = operands[0].shape
     if deterministic_ops_requested():
         shapes = [(batch, heads)] * len(shapes)
+    elif not walk.program.family.adds_vectors:
+        shapes = [(batch, heads) if kind == Kind.KEY else shape
+                  for shape, kind in zip(shapes, graded, strict=True)]
     grads = [jax.new_ref(jnp.zeros((*shape[:2], keys_padded) if kind == Kind.KEY
                                    else (*shape[:2], keys_padded, queries), jnp.float32))
              for shape, kind in zip(shapes, graded, strict=True)]
