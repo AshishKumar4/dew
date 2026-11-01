@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import mosaic, report, resources
@@ -111,6 +112,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     operands_in_registers = True
 
     products_overlap = False
+
+    takes_tf32 = True
+
+    transposes_tf32 = True
 
     def specialized(self, rows: int, columns: int) -> Self:
         # Its warps split `m_warps` along a warpgroup's `rows` and the rest along its `columns` (`MMALayouts`;
@@ -222,7 +227,14 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         (an accumulator's, the fork's relayout) cast."""
         if isinstance(lhs, jax.Array):
             return plgpu.layout_cast(lhs.astype(self.dtype), self.lhs)
-        return plgpu.load(lhs, layout=self.lhs)
+        return plgpu.load(lhs, layout=self.lhs, optimized=self._matrix_loads)
+
+    @property
+    def _matrix_loads(self) -> bool:
+        """Whether its operands load by `ldmatrix`, 16-bit rows of 8: not a 32-bit operand's (TF32's), for
+        which Mosaic GPU's layout inference found no layout (tf32-mini at 9d77b39e7), its threads loading
+        their elements themselves."""
+        return self.dtype.itemsize <= 2
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         out = self.products(self.zeros(shape), lhs, rhs, interpret=False)
@@ -231,6 +243,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return out
 
     def products(self, acc, lhs, rhs, interpret: bool):
+        if jnp.dtype(lhs.dtype) != self.dtype:
+            # Another dtype's operands (fp32's, as TF32) by that dtype's issuer: its fragments' layouts and
+            # depths are its own, its accumulator's the same.
+            return dataclasses.replace(self, dtype=jnp.dtype(lhs.dtype)).products(acc, lhs, rhs, interpret)
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
@@ -250,12 +266,27 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
             if held is None and left_at not in lefts:
                 lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
             if right_at not in rights:
-                rights[right_at] = plgpu.load(rhs.at[pl.ds(right_at, rhs_depth)], layout=self.rhs)
+                rights[right_at] = plgpu.load(rhs.at[pl.ds(right_at, rhs_depth)], layout=self.rhs,
+                                              optimized=self._matrix_loads)
             left = held[:, start:start + instruction] if held is not None else lefts[left_at][
                 :, start - left_at:start - left_at + instruction]
             right = rights[right_at][start - right_at:start - right_at + instruction]
-            acc = plgpu.mma(acc, left, right, m_warps=self.m_warps)
+            acc = self._mma(acc, left, right)
         return acc
+
+    def _mma(self, acc, left, right):
+        """`acc + left @ right` by one mma.sync product of its operands' fragments: fp32's as TF32 through
+        Mosaic GPU's lane-level `mma` (`inline_mgpu`; the fork's TF32 from 0.12.0.1.post42), the dialect's op
+        whose operand types jaxlib fixes naming no fp32; any other dtype's by Pallas's `mma`."""
+        if self.dtype != jnp.float32:
+            return plgpu.mma(acc, left, right, m_warps=self.m_warps)
+        issued: Callable[..., jax.Array] = plgpu.inline_mgpu(
+            arg_types=(self.layout, self.lhs, self.rhs),
+            return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.dtype(jnp.float32), layout=self.layout))(
+            lambda ctx, acc, left, right: mgpu.mma(acc, left, right))
+        # The accumulator laid as the product takes it: a fresh one's splat passed in whole left a cast no
+        # pass lowers (tf32-dump-sm80 at ca3dd0f0a, a splat to the accumulator's registers).
+        return issued(plgpu.layout_cast(acc, self.layout), left, right)
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs, interpret)
