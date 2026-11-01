@@ -1012,7 +1012,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         return tree
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
-                donate_argnames: tuple[str, ...] = (),
                 holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
                 modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
@@ -1023,9 +1022,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         change a tiled head, and `substitute` may quantize it at the same shapes. Argument shapes
         alone cannot identify those programs, nor can they the pipeline's microbatch count, the
         layout's rules or the links a model decides from. `name` names everything else the program
-        fixes. `donate_argnames` are the arguments whose buffers it donates, as a rollout's state it
-        writes in place. `holds` are the objects `function` runs beyond the modules, as the device steps
-        a host step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
+        fixes. `holds` are the objects `function` runs beyond the modules, as the device steps a host
+        step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
         reused only while they are the same objects, and one over others replaces it. `modules` are
         the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
         it as `holds` do, and its options cover them. `step` are the XLA options of the training step
@@ -1054,8 +1052,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             from dew.nn.kernels.options import OuterProgram
 
             # A program jits a fresh callable, so JAX traces it afresh even for the same bound method.
-            held = (kept, OuterProgram(function, static_argnames=static_argnames,
-                                       donate_argnames=donate_argnames, compiler_options=options))
+            held = (kept, OuterProgram(function, static_argnames=static_argnames, compiler_options=options))
             cached[1][key] = held
         return held[1]
 

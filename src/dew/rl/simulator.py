@@ -15,6 +15,7 @@ driver decides when an ended episode restarts: `simulator_rollout` restarts it a
 
 from __future__ import annotations
 
+import functools
 from typing import Protocol, overload, runtime_checkable
 
 import jax
@@ -23,7 +24,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 from typing_extensions import CapsuleType
 
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import OuterProgram
 from dew.rl.env import (
     Carry,
     Env,
@@ -105,9 +106,11 @@ def received(tree: Handed | Tree) -> jax.Array | Tree:
     return jax.tree.map(taken, tree)
 
 
+@functools.partial(OuterProgram, static_argnums=0)
 def _acted(policy: Policy, params: Params, carry: Carry) -> tuple[jax.Array, Tree, Memory, jax.Array]:
-    """A policy's step from a rollout's carry: its action, extras and memory, and the carry's next key;
-    an outer program (`dew.nn.kernels.options.program`), compiled once for each policy."""
+    """A policy's step from a rollout's carry, compiled once for each policy through Dew's one compile
+    point (`OuterProgram`, which admits its communicators): its action, extras and memory, and the
+    carry's next key."""
     key, act_key = jax.random.split(carry.key)
     action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
     return action, extras, memory, key
@@ -139,9 +142,8 @@ def simulator_rollout(simulator: Stepped, policy: Policy, params: Params, carry:
     params, key, memory = jax.device_put((params, carry.key, carry.memory), whole)
     carry = Carry(carry.state, carry.observation, key, memory)
     recorded = []
-    acting = program(_acted, static_argnums=0)
     for _ in range(steps):
-        action, extras, memory, key = acting(policy, params, carry)
+        action, extras, memory, key = _acted(policy, params, carry)
         following = received(simulator.step(action))
         following = TimeStep(following.observation, following.reward, following.terminated.astype(bool),
                              following.truncated.astype(bool))

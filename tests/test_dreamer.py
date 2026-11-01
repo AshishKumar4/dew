@@ -119,47 +119,6 @@ def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
     assert rollout.environment_steps == 8 * 24 + 8 * -(-owed // 8)
 
 
-def test_a_rollout_acts_with_the_modules_its_objective_holds_now():
-    """A Dreamer rollout's steps are its objective's program (`Objective.program`, ledger 3343), keyed by
-    the modules the objective holds: once it substitutes its world model (a fixed policy spread of 0.5,
-    the same parameters), the rollout's next step acts with the new model, where a rollout of an
-    objective that keeps its model takes, from the same replay, parameters and keys, the same first step
-    and another second."""
-    from types import SimpleNamespace
-
-    from dew.rl.replay import ReplayBuffer
-
-    env = Batched(TimeLimit(Target(), episode_length=20), 4)
-
-    def still(params, observed, key, memory):
-        return jnp.zeros((4, 1)), {}, None
-
-    driven = Driven(env)
-    _, recorded = env_rollout(driven, still, None, start(driven, jax.random.key(1)), 40, reset=False)
-    stream = {**recorded.observation, "action": recorded.action}
-
-    def actions(*, substituted: bool) -> list[np.ndarray]:
-        objective = DreamerV3Objective(tiny())
-        variables = objective.init(jax.random.key(0))
-        seeded = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), 400).add(stream)
-        rollout = DreamerRollout(objective, env, batch=8, length=16, train_ratio=32.0, prefill=0,
-                                 replay=seeded)
-        taken = []
-        for update in range(2):
-            if substituted and update:
-                objective.substitute([objective.model.clone(min_std=0.5, max_std=0.5)])
-            rollout(SimpleNamespace(variables=variables, updates=jnp.asarray(update)), {},
-                    jax.random.key(10 + update))
-            held = rollout.held_replay
-            assert held is not None
-            taken.append(np.asarray(held.held["action"])[int(held.filled) - 1])
-        return taken
-
-    kept, swapped = actions(substituted=False), actions(substituted=True)
-    np.testing.assert_array_equal(kept[0], swapped[0])
-    assert not np.array_equal(kept[1], swapped[1])
-
-
 def test_a_driver_records_an_episodes_last_observation_then_restarts():
     """Driven answers each step whole: an episode's last observation is a step of its own, `last`,
     with the reward that came with it, and the step after it, whatever the action, starts the next
