@@ -175,11 +175,15 @@ class _ShardPass[Place](grain.IterDataset):
         return _Passing(limited.__iter__())
 
 
+NOTHING: Mapping[str, object] = {"rows": None}
+"""The position of a share's pass dealt nothing (`_Passing`), which no read of rows holds."""
+
+
 class _Passing(grain.DatasetIterator):
     """A share's rows of its places (`_ShardPass`), or none where it was dealt none, its position its rows'
-    as `rows` or None. Grain saves an unstarted loading worker's position in the reading process, from the
-    share's whole read before the worker takes its slice, so a worker dealt nothing restores a position of
-    rows it never holds: it reads nothing, as it did unstarted."""
+    as they hold it, or `NOTHING` where it holds none. Grain saves an unstarted loading worker's position
+    in the reading process, from the share's whole read before the worker takes its slice, so a worker
+    dealt nothing restores a position of rows it never holds: it reads nothing, as it did unstarted."""
 
     def __init__(self, rows: grain.DatasetIterator | None):
         super().__init__(() if rows is None else rows)
@@ -191,12 +195,11 @@ class _Passing(grain.DatasetIterator):
         return next(self._rows)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"rows": None if self._rows is None else self._rows.get_state()}
+        return NOTHING if self._rows is None else self._rows.get_state()
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        rows = state["rows"]
-        if self._rows is not None and rows is not None:
-            self._rows.set_state(record(rows, "a share's rows"))
+        if self._rows is not None and state != NOTHING:
+            self._rows.set_state(record(state, "a share's rows"))
 
     def close(self) -> None:
         if self._rows is not None:

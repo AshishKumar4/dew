@@ -261,3 +261,31 @@ def test_each_batch_states_the_source_examples_read_by_then_and_a_resumed_read_g
         if isinstance(resumed, Closeable):
             resumed.close()
 
+
+
+class Cut:
+    """An objective's expansion of each record into `id % 3 + 1` rows, each cut short (`_dew_truncated`)
+    by a cut of one row removing two tokens (`_dew_cut`), as a decision layout says of a question it fit
+    by cutting its options."""
+
+    identity = "cut@1"
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question), "_dew_truncated": True,
+                      "_dew_cut": {"options": (1, 2)}} for question in range(int(element["id"]) % 3 + 1))
+
+
+@pytest.mark.parametrize("bounded", [True, False])
+def test_a_corpus_states_the_share_of_its_rows_cut_short_in_rows(bounded):
+    """Twelve examples an objective makes 1 to 3 rows of each, every row cut short, read bounded to them
+    or not: the share of the corpus's rows cut short (data/truncated) is a share of the rows it delivered,
+    all of them, 1.0, and the tokens its cuts removed are its 24 rows' two each, wherever it counts its
+    source examples, one per example's last row or one per example before the step (row 1890's
+    review)."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids}, shard_rows=4)).batch(BATCH), read="streamed",
+                     objective=ObjectiveData(train=(Cut(),)), examples=12 if bounded else None)
+    read_whole(loader, "question")
+    assert counted(loader) == [12]
+    assert counted(loader, "data/truncated/") == [1.0]
+    assert counted(loader, "data/cut_removed/") == [2 * 24]

@@ -406,6 +406,14 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
+    # Version 8 deals a streamed read's examples bound over a pool's shares and its loading workers
+    # together, where 7 took it in every worker: a version 7 plan of a read of one reader, or not streamed,
+    # reads as 8's.
+    order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
+    alone = isinstance(topology, Mapping) and topology.get("shares", 1) == 1 and topology.get(
+        "workers", 0) < 2
+    if saved.get("version") == 7 and plan.version == 8 and (order.get("read") != "streamed" or alone):
+        saved = {**saved, "version": 8}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved

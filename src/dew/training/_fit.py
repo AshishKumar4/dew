@@ -482,15 +482,16 @@ CLOCK_LIMIT = 2 ** 31 - 1
 
 
 def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = False,
-            pooled_draws: bool = False, bound_ends: bool = True) -> int | None:
+            draws_further: bool = False, bound_ends: bool = True) -> int | None:
     """The examples bound of a run that no plan counts steps ahead of, which keeps its progress in the
     examples its batches consume (`TrainState.consumed`), its schedule and cadences reading it; None for
     a run counted otherwise. The transaction hands the run's optimizer that progress, which a custom
     step's update is not handed: one whose schedule reads it (`custom_progress`, a schedule over the
-    whole run) is refused. A rollout's batch consumes what the batches it read did
-    (`dew.training.rollout.clocked_rollout`), but a pool's shares run out apart, and a share that ran
-    out has nothing to draw further from, so a pool's rollout that draws further (`pooled_draws`) is
-    refused. Its progress reaches its end where its read ends at its bound (`Loader.bound_ends`), so a
+    whole run) is refused. A rollout's batch consumes what the batch it read did
+    (`dew.training.rollout.clocked_rollout`); one that draws further batches (`draws_further`) is refused,
+    as the run reads its next batch ahead to know where its stream ends (`FitRun.closing`), which a draw
+    would take past, and the step saves its position before that read. Its progress reaches its end
+    where its read ends at its bound (`Loader.bound_ends`), so a
     take or slice after the bound, which would end it first, is refused, as is a bound past what the
     clock counts."""
     if examples is None or steps is not None:
@@ -500,11 +501,10 @@ def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = 
                          "progress, which a custom step='s update is not handed, and this optimizer's "
                          "schedule decays over the whole run: give the schedule its own decay_steps, or "
                          "give steps=")
-    if pooled_draws:
-        raise ValueError("a pool's run bounded in examples reads on until every share's stream has run out, "
-                         "a share that ran out stepping an emptied batch, which holds nothing a rollout "
-                         "can draw further from: read the data in one global order its plan counts, or "
-                         "give steps=")
+    if draws_further:
+        raise ValueError("a run bounded in examples that no plan counts ahead reads each next batch ahead "
+                         "to know where its stream ends, which a rollout that draws further batches would "
+                         "draw past: read the data in one global order its plan counts, or give steps=")
     if not bound_ends:
         raise ValueError("a run bounded in examples that no plan counts ahead ends where its bound does, "
                          "which its schedule's end reads; a take or slice after the bound would end it "
