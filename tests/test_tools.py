@@ -1872,9 +1872,9 @@ def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
 
 
 def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
-    """SLOP025: the compile point's own class (`COMPILE_POINT`, `OuterProgram`) compiles by a bare jit and no
-    finding is made of it; the same jit in another class of its module, or in the class's name elsewhere,
-    is reported."""
+    """SLOP025: the compile point's own class (`COMPILE_POINT`, `OuterProgram`) and the nested program
+    (`nested`) compile by a bare jit and no finding is made of them; the same jit in another class of the
+    compile point's module, or in the class's name elsewhere, is reported."""
     point = ("import jax\n"
              "class OuterProgram:\n"
              "    def _jitted(self, f):\n"
@@ -1882,7 +1882,9 @@ def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
              "class Other:\n"
              "    def _jitted(self, f):\n"
              "        return jax.jit(f)\n")
-    found = _linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point})
+    nesting = "import jax\ndef nested(f):\n    return jax.jit(f)\n"
+    found = _linted(tmp_path, {"src/sparx/nn/kernels/options.py": point, "src/sparx/training/step.py": point,
+                               "src/sparx/nn/nested.py": nesting})
     assert [finding for finding in found if finding[2] == "SLOP025"] == [
         ("src/sparx/nn/kernels/options.py", 7, "SLOP025"), ("src/sparx/training/step.py", 4, "SLOP025"),
         ("src/sparx/training/step.py", 7, "SLOP025")]

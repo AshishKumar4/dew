@@ -23,7 +23,7 @@ from process_support import fresh
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
-from dew.nn.kernels.options import owned_program, program
+from dew.nn.kernels.options import compiled_with, owned_program, program
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.instrumentation import Compiles
@@ -494,4 +494,13 @@ def test_a_program_its_caller_owns_is_released_with_its_caller():
     gc.collect()
     assert released() is None
     assert program(jnp.sum) is program(jnp.sum)
+
+def test_a_program_within_another_takes_the_enclosing_programs_options():
+    """A program called within another trace (a kernel's own program inside a step) is the enclosing
+    program's part and compiles under its options, as JAX takes compiler options on the outermost jit
+    alone: a program opened with options is called inside another without refusal."""
+    with compiled_with({"xla_cpu_enable_fast_math": False}):
+        inner = owned_program(lambda x: x * 2.0)
+        outer = owned_program(lambda x: inner(x) + 1.0)
+        np.testing.assert_array_equal(np.asarray(outer(jnp.ones(3))), np.full(3, 3.0))
 
