@@ -338,6 +338,7 @@ def decided(objective, variables, batch, segments: int):
 # (BIBLE §8): on armada it took 705 s of CPU, the suite's whole critical path; the others take 187 s and 36 s.
 # The joint arm runs in the models' GPU flow (tests/test_gpu_models.py).
 @pytest.mark.parametrize("arm", ["marker", "parallel"])
+@pytest.mark.check1_shards(seeds=8, per_task=8)
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives alone where its window packed it,

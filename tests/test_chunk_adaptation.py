@@ -270,15 +270,29 @@ def draw(seed: int, rows: int = ROWS, scale: float = 0.5):
 
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize(("window", "rate", "scale"), [
-    (1, 0.5, 0.25), (3, 0.5, 0.5), (3, 0.5, 0.25), (3, 0.1, 0.5), (3, 0.0, 0.5), (32, 0.5, 0.5)])
+    (1, 0.5, 0.25), (3, 0.5, 0.25), (3, 0.1, 0.5), (3, 0.0, 0.5), (32, 0.5, 0.5)])
 def test_the_scan_steps_the_level_as_equation_71(kind, window, rate, scale):
-    """Each target's loss is equation 71's: its window read at the level stepped by every window of
-    its run before it, on par with the literal loop (check 1), at a window of one token (online SGD),
+    """Each target's loss is equation 71's (`scan_as_equation_71`) at a window of one token (online SGD),
     of three, of more than the row (the level as trained), at rates of a half, a tenth and zero, over
-    weights drawn at a half, where a half's step diverges, and at a quarter, where it does not; one
-    document a row, packed rows whose runs each start from the level's start, a number reused after
-    another document's starting a run of its own, and padded rows whose padding reads the open window
-    and splits no run."""
+    weights drawn at a quarter, where a half's step does not diverge, and at a half where the rate or the
+    window keeps it from diverging."""
+    scan_as_equation_71(kind, window, rate, scale)
+
+
+@pytest.mark.parametrize("kind", LAYOUTS)
+@pytest.mark.check1_shards(seeds=128, per_task=128)
+def test_the_scan_steps_the_level_as_equation_71_where_the_inner_step_diverges(kind):
+    """Each target's loss is equation 71's (`scan_as_equation_71`) at the corner, a window of three at a
+    rate of a half over weights drawn at a half, where the inner step diverges (`CORNER_WINDOWS`), its 128
+    seeds drawn by CI's map tasks (`check1_shards`)."""
+    scan_as_equation_71(kind, 3, 0.5, 0.5)
+
+
+def scan_as_equation_71(kind: str, window: int, rate: float, scale: float) -> None:
+    """Each target's loss is equation 71's: its window read at the level stepped by every window of
+    its run before it, on par with the literal loop (check 1); one document a row, packed rows whose runs
+    each start from the level's start, a number reused after another document's starting a run of its
+    own, and padded rows whose padding reads the open window and splits no run."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = ChunkAdaptation(window=window, rate=rate)
 

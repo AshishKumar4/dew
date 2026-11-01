@@ -220,11 +220,15 @@ def test_a_block_run_the_trainer_quantizes_reloads_quantized(tmp_path):
     canvas = jnp.arange(8, 8 + objective.canvas_size, dtype=jnp.int32)[None]
 
     def canvas_logits(model, variables):
-        cache = prefill(model, variables, prompt)
-        return np.asarray(model.apply({**variables, "cache": cache}, canvas))
+        # One compiled forward per model, as a task serves it, in place of hundreds of eager dispatches.
+        @jax.jit
+        def forward(variables):
+            cache = prefill(model, variables, prompt)
+            return model.apply({**variables, "cache": cache}, canvas)
 
-    np.testing.assert_array_equal(canvas_logits(task.model, task.variables),
-                                  canvas_logits(objective.model, state.variables))
+        return np.asarray(forward(variables))
+
+    served = canvas_logits(task.model, task.variables)
+    np.testing.assert_array_equal(served, canvas_logits(objective.model, state.variables))
     plain = rebuilt_with(task.model)
-    assert float(np.max(np.abs(canvas_logits(plain, task.variables)
-                               - canvas_logits(task.model, task.variables)))) > 0
+    assert float(np.max(np.abs(canvas_logits(plain, task.variables) - served))) > 0
