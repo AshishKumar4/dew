@@ -23,6 +23,7 @@ from dew.artifacts import Artifact, Representations
 from dew.batch import Batch
 from dew.eval.common import metric_device
 from dew.nn import categorical
+from dew.nn.kernels.options import program
 from dew.nn.precision import accumulated
 from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
 from dew.optim import OPTIMIZER_MAP
@@ -42,7 +43,7 @@ def _split(embeddings, labels):
     return embeddings[:fit], labels[:fit], embeddings[fit:], labels[fit:]
 
 
-@functools.partial(jax.jit, static_argnames=("num_classes", "steps"))
+@functools.partial(program, static_argnames=("num_classes", "steps"))
 def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100,
                           learning_rate: float = 1e-2, weight_decay: float = 1e-4):
     """Fit a logistic regression on half the batch and score its accuracy on the rest.
