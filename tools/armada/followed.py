@@ -224,12 +224,15 @@ def beneath(name: str, where: str) -> bool:
 def owned(name: str) -> bool:
     """Whether `name` is this process's own to read whoever made it: in this file's own scratch and caches
     (ci.py's `alone`: TMPDIR, `PRIVATE`), the interpreter and its environment, uv's cache of packages by their
-    digests, or compiled bytecode, or a file this process wrote (`CREATED`)."""
+    digests, compiled bytecode, the harness's own record of the file's run (its log, which every process of
+    it appends to, and its collection's account), or a file this process wrote (`CREATED`)."""
     import tempfile
 
     own = [tempfile.gettempdir(), sys.prefix, sys.base_prefix, sys.exec_prefix,
            *(where for where in (os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR")) if where)]
-    return any(beneath(name, where) for where in own) or name in CREATED \
+    harness = {os.path.abspath(path) for path in (os.environ.get("DEW_EXECUTED_LOG"),
+                                                  os.environ.get("DEW_COLLECTED")) if path}
+    return any(beneath(name, where) for where in own) or name in CREATED or name in harness \
         or "__pycache__" in name.split(os.sep)
 
 
