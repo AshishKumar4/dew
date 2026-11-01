@@ -1938,11 +1938,30 @@ def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_run
     monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
                                       f"--out={verdict}", "--cache=on", "--deadline=1"])
     seen.clear()
+    start = time.monotonic()
+    calls = []
+    alone, tested = ci.alone, ci.tested
+
+    def alone_(*args, **kwargs):
+        calls.append(("alone", round(time.monotonic() - start, 3), args[1], args[2], args[4]))
+        result = alone(*args, **kwargs)
+        calls.append(("alone done", round(time.monotonic() - start, 3)))
+        return result
+
+    def tested_(*args, **kwargs):
+        calls.append(("tested", round(time.monotonic() - start, 3), args[1], args[2], args[4]))
+        result = tested(*args, **kwargs)
+        calls.append(("tested done", round(time.monotonic() - start, 3)))
+        return result
+
+    monkeypatch.setattr(ci, "alone", alone_)
+    monkeypatch.setattr(ci, "tested", tested_)
     assert ci.main() == 0
     rows = json.loads(verdict.read_text())["rows"]
     assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
         (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
-    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False]
+    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False], (
+        calls, [row["output"][:300] for row in rows], dict(os.environ))
     # The groups past the deadline were never looked up.
     assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
         True, False, False]
