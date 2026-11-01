@@ -589,7 +589,8 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     def init_fn(params) -> QKClipState:
         return QKClipState(jnp.zeros([], jnp.int32), _rescales(params, None, tau))
 
-    def update_fn(updates, state, params=None, qk_stats=None):
+    def update_fn(updates, state, params=None, qk_stats=None, **extra_args):
+        del extra_args
         if params is None:
             return updates, state
         return updates, state._replace(steps=optax.safe_increment(state.steps),

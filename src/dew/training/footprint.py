@@ -33,6 +33,7 @@ from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
+from dew.gauss_newton import solves_equations
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability
 from dew.objectives.base import Objective
@@ -266,8 +267,12 @@ def leaf_local(optimizer: optax.GradientTransformation, gradients, state) -> boo
     """Whether `optimizer`'s update of `gradients` from `state`, over parameters of their shapes, reads each
     leaf of `gradients` into results that read no other gradient's leaf: no reduction, product or
     concatenation across them. An update taking extra arguments is handed the run's progress and no
-    statistics of attention logits, as a step without them hands it (`Transaction.commit`). An equation
+    statistics of attention logits, as a step without them hands it (`Transaction.commit`); one solving its
+    objective's system (`dew.gauss_newton.solves_equations`) reads every leaf into each result. An equation
     running a program of its own (a call, a loop) is read as reading every operand into each result."""
+    if solves_equations(state):
+        return False
+
     def update(gradients, state, params, progress):
         if isinstance(optimizer, optax.GradientTransformationExtraArgs):
             return optimizer.update(gradients, state, params, qk_stats=None, progress=progress)

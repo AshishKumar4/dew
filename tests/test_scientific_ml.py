@@ -11,12 +11,12 @@ A float64 run keeps float64 through its parameters, optimizer state, loss and ch
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, seeds_for
 
 from dew.data import Memory
+from dew.gauss_newton import gauss_newton
 from dew.nn.fourier import FourierPyramid, interpolated
 from dew.objectives.base import Step
 from dew.objectives.residuals import Residuals
@@ -104,9 +104,9 @@ class Line(nn.Module):
 class LeastSquares(Residuals):
     """The residuals of a line through the batch's rows, `x @ w - y`, one a row."""
 
-    def __init__(self, features: int, damping: float | None, param_dtype=jnp.float32):
+    def __init__(self, features: int, param_dtype=jnp.float32):
         self.model = self.bind_model(Line(features, param_dtype))
-        self.features, self.damping = features, damping
+        self.features = features
 
     def fresh_variables(self, key, held):
         return self.model.init(key, jnp.zeros((1, self.features)))
@@ -137,18 +137,30 @@ def solved(x: np.ndarray, y: np.ndarray, damping: float) -> np.ndarray:
 
 @pytest.mark.parametrize("rows,features", [(64, 8), (8, 64)], ids=["primal", "dual"])
 def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features):
-    """A least-squares objective with damping 1e-3 states, as its gradient at w = 0, the damped
-    Gauss-Newton step: on par with NumPy's float32 solve of the same normal equations (or their Gram
-    form, where the rows are fewer) from its float64 solve (check 1)."""
-    objective = LeastSquares(features, damping=1e-3)
+    """A least-squares objective states its residuals' system where its step asks (`Step.equations`), and
+    Gauss-Newton's update of damping 1e-3 steps by its solve at w = 0: on par with NumPy's float32 solve
+    of the same normal equations (or their Gram form, where the rows are fewer) from its float64 solve
+    (check 1). Its loss is the mean square still, its gradient its own."""
+    objective = LeastSquares(features)
     params = objective.init(jax.random.key(0))["params"]
-    step = Step(jnp.asarray(0), jax.random.key(0), None)
+    step = Step(jnp.asarray(0), jax.random.key(0), None, equations=True)
+    optimizer = gauss_newton(1e-3)
     draw = least_squares_draw(rows, features, 0x6A)
 
     def dews(x, y):
-        gradient = jax.grad(lambda p: objective.scalar_loss({"params": p}, {"x": x, "y": y}, step)[0])(params)
-        return gradient["Dense_0"]["kernel"][:, 0]
+        statistics = objective.loss({"params": params}, {"x": x, "y": y}, step)
+        update, _ = optimizer.update(jax.tree.map(jnp.zeros_like, params), optimizer.init(params), params,
+                                     statistics=statistics)
+        # The weights start at zero, so the update is the solve's step, negated.
+        return -update["Dense_0"]["kernel"][:, 0]
 
+    # No derivative carries the step: the loss's gradient is the mean square's own, stated system or not.
+    x, y = draw(0)
+    gradients = [jax.grad(lambda p, asked=asked: objective.scalar_loss({"params": p}, {"x": x, "y": y},
+                                                                      asked)[0])(params)
+                 for asked in (step, Step(jnp.asarray(0), jax.random.key(0), None))]
+    for stated, plain in zip(jax.tree.leaves(gradients[0]), jax.tree.leaves(gradients[1]), strict=True):
+        np.testing.assert_array_equal(np.asarray(stated), np.asarray(plain))
     numpy = as_given(lambda x, y: solved(x, y, 1e-3))
     exact = as_given(lambda x, y: solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
     label = f"gauss-newton {rows}x{features}"
@@ -159,7 +171,7 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
 def gauss_newton_arm(rows: int, features: int, accumulation: int):
     """One update of a least-squares objective of damping 1e-3, from zero weights, of a draw's `rows`
     rows read in `accumulation` microbatches of an accumulation window: its weights after it."""
-    trainer = Trainer(LeastSquares(features, damping=1e-3), optax.sgd(1.0), key=0, layout=LAYOUT,
+    trainer = Trainer(LeastSquares(features), gauss_newton(1e-3), key=0, layout=LAYOUT,
                       accumulation=accumulation)
     template = jax.tree.map(jnp.copy, trainer.initial_state())
     compiled = []
@@ -207,7 +219,7 @@ def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once(update):
 
 
 def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoints(tmp_path):
-    """Under x64, a least-squares run of float64 weights steps by Gauss-Newton with `optax.sgd(1.0)`, and
+    """Under x64, a least-squares run of float64 weights steps by Gauss-Newton (`gauss_newton`), and
     resumed from its checkpoint, steps on: its parameters and optimizer state stay float64, and its last
     checkpoint restores them bit for bit, float64 still."""
     # A float64 run sets x64 for its process, its data's worker threads among it, as
@@ -218,10 +230,11 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
         x = generator.normal(size=(8, 4))
         y = x @ np.asarray([1.5, -2.0, 0.25, 3.0])
         rows = Memory([{"x": row, "y": target} for row, target in zip(x, y, strict=True)]).repeat().batch(8)
-        objective = LeastSquares(4, damping=1e-12, param_dtype=jnp.float64)
+        objective = LeastSquares(4, param_dtype=jnp.float64)
         checkpoints = Checkpoints(str(tmp_path / "run"))
-        Trainer(objective, optax.sgd(1.0), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows, steps=1)
-        state = Trainer(objective, optax.sgd(1.0), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(
+        Trainer(objective, gauss_newton(1e-12), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows,
+                                                                                                   steps=1)
+        state = Trainer(objective, gauss_newton(1e-12), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(
             rows, steps=3)
         floats = [leaf for leaf in jax.tree.leaves((state.variables, state.opt_state))
                   if jnp.issubdtype(leaf.dtype, jnp.floating)]
