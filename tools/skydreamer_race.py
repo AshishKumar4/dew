@@ -8,12 +8,14 @@ every `--every` updates into OUT/base.json.
 
 The recipe at SkyDreamer's settings (Sec III-A): DreamerV3's size12m model (an RSSM of 2048, 256 hidden, 16
 classes; 16 deep convolutions and 256 units) over a 64 x 64 image beside the body rates, rotor speeds and
-flight plan, decoding the `state` and those three; `train_ratio` 128 over 16 environments, a replay of 10M
-steps, imagined returns bootstrapped from the slow critic (`slowtar`) and the policy's mean smoothed at 0.002
-(Eq 11), LaProp at 4e-5 after a 1000-update warmup. 125,000 updates replay 128 steps for each of 1M taken.
-Not SkyDreamer's: its `replay_context` of 16 (each window here starts its latent afresh), its later phases
-(a batch length of 256 after 8M steps, the entropy and rate lowered after 13M) and the race's departures
-(`dew.rl.skydreamer`: the track, the camera's tilt, the actions, the image)."""
+flight plan, decoding the `state` and those three; `train_ratio` 128 over 16 environments, a replay of
+`REPLAY` steps, imagined returns bootstrapped from the slow critic (`slowtar`) and the policy's mean smoothed
+at 0.002 (Eq 11), LaProp at 4e-5 after a 1000-update warmup. 125,000 updates replay 128 steps for each of 1M
+taken. Not SkyDreamer's: its replay of 10M steps (of 64 x 64 masks, 4 KB a step; this image's 12 KB a step
+holds 2M in 25 GB of the GPU's memory, and 10M would take 123 GB), its `replay_context` of 16 (each window
+here starts its latent afresh), its later phases (a batch length of 256 after 8M steps, the entropy and rate
+lowered after 13M) and the race's departures (`dew.rl.skydreamer`: the track, the camera's tilt, the actions,
+the image)."""
 
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ from dew.objectives.rl.config import EnvConfig, EnvRunConfig, RolloutConfig
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
 
-ENVIRONMENTS, PIXELS = 16, 64
+ENVIRONMENTS, PIXELS, REPLAY = 16, 64, 2_000_000
 SENSED = (("rates", 3), ("motors", 4), ("plan", 24))
 """What the encoder reads beside the image, each entry and its width."""
 DECODED = (("state", 16, 256), *((name, width, 256) for name, width in SENSED))
@@ -54,7 +56,7 @@ def run(out: Path, assets: Path, drones: int = ENVIRONMENTS) -> EnvRunConfig:
         objective=ObjectiveConfig("dew.objectives.rl.dreamer:DreamerV3Objective",
                                   {"slow_targets": True, "smoothness": 0.002}),
         rollout=RolloutConfig("dreamer", {"batch": 16, "length": 64, "train_ratio": 128.0,
-                                          "capacity": 10_000_000 // drones, "prefill": 64}),
+                                          "capacity": REPLAY // drones, "prefill": 64}),
         optim=OptimConfig(optimizer="laprop", learning_rate=Linear(peak_value=4e-5, warmup_steps=1000,
                                                                    end_value=4e-5)),
         trainer=TrainerConfig(checkpoint_dir=str(out), log_every=500, eval_every=None, checkpoint_every=None,
