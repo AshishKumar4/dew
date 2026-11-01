@@ -83,6 +83,16 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
         ...
 
 
+@runtime_checkable
+class Metered(Protocol):
+    """A scoring task that reports what its passes cost (`ScoringServer.metrics`): a `Decide` task's
+    share of its passes' tokens its rows held, per pass shape (`dew.decision.task.PassTokens`)."""
+
+    def metrics(self) -> dict[str, float]:
+        """Its passes' metrics so far, by name; none before a pass."""
+        ...
+
+
 class _Request[Row, Payload, Output, Answer]:
     def __init__(self, scored: ScoringRequest[Row, Payload], served: tuple[Scoring, Variables]) -> None:
         self.scored = scored
@@ -146,6 +156,12 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
     @property
     def variables(self) -> Variables:
         return self._served[1]
+
+    def metrics(self) -> dict[str, float]:
+        """What the task it serves reports of its passes so far (`Metered`), the share of their tokens its
+        rows held among them; none for a task that reports nothing."""
+        task = self.task
+        return task.metrics() if isinstance(task, Metered) else {}
 
     @property
     def queued(self) -> int:

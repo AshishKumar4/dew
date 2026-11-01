@@ -31,12 +31,12 @@ from dew.data.dataset import (
     Checkpointable,
     Closeable,
     DataPartition,
+    Ends,
     Loader,
     PhasedStream,
     Reader,
     rows_of,
-    stream_endless,
-    stream_together,
+    stream_ends,
 )
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
@@ -338,9 +338,8 @@ class FitRun:
     preempted: int | None = None
     paused: int | None = None
     notice: PreemptionNotice | None = None
-    endless: bool = False
-    together: bool = False
-    """Whether every share of the training stream runs out at the same read (`stream_together`)."""
+    ends: Ends = "apart"
+    """Where the training stream ends (`stream_ends`)."""
     taken: Taken | None = None
     writer: LogWriter = dataclasses.field(default_factory=LogWriter)
     """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
@@ -404,10 +403,10 @@ class FitRun:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
         read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
         position the step saves taken before it. A run whose stream is closed (`Trainer._wind_down`)
-        ends on this step without another read, and an endless stream never ends here otherwise."""
+        ends on this step without another read, and a stream that never ends never ends here otherwise."""
         if self.ahead is None and self.train is None:
             return True
-        if self.endless:
+        if self.ends == "never":
             return False
         if self.ahead is None:
             self.ahead = (waited_read(self, interval, agree=self.agrees(first=False)),)
@@ -442,32 +441,35 @@ class FitRun:
     def further(self, interval: Interval) -> Callable[[], Batch | None]:
         """A read of the training stream's next batch for a rollout that draws past its step's
         (`Rollout.draws_further`): from inside the step's hold on placements (`read_held`), agreed as a
-        step's read after its first is (`agrees`), its wait counted in `interval`; None where the stream
-        ran out on every process. Its position is the stream's after it, which the step saves as any
-        read's."""
+        step's read after its first is (`agrees`), or pooled as a pool's step's read is (`pooled_read`), its
+        wait counted in `interval`; None where the stream ran out on every process. Its position is the
+        stream's after it, which the step saves as any read's."""
         def read() -> Batch | None:
             assert self.train is not None
             asked = time.perf_counter()
             held = iter(self.train.read_held, None)
-            batch = agreed_next("rollout read", held) if self.agrees(first=False) else next(held, None)
+            if self.pooled:
+                batch = pooled_read(self, held, phase="rollout read")
+            else:
+                batch = agreed_next("rollout read", held) if self.agrees(first=False) else next(held, None)
             interval.waited += time.perf_counter() - asked
             return batch
 
         return read
 
     def opened(self, source: Iterator[Batch], examples: int | None) -> None:
-        """Take what the training stream `source` says of its reads (`stream_endless`, `stream_together`)
+        """Take where the training stream `source` says it ends (`stream_ends`)
         and whether the run reads it as a pool on the examples clock (`pooled`, bounded to `examples`)."""
-        self.endless, self.together = stream_endless(source), stream_together(source)
+        self.ends = stream_ends(source)
         self.pooled = pooled(examples)
 
     def agrees(self, *, first: bool) -> bool:
         """Whether a read of the training stream is agreed over the pool (`agreed_next`): its `first`,
-        and every read of a stream that may run out on some processes and not others. An endless
-        stream's later reads are not, nor those of one whose every share runs out at the same read
-        (`together`): a read that fails on one process stops its peers by the failure it publishes
+        and every read of a stream that may run out on some processes and not others (`ends`). Later
+        reads of one that never ends, or ends on every share at the same read, are not: a read that
+        fails on one process stops its peers by the failure it publishes
         (`dew._coordination.end_pool_on_failure`), as any error outside an agreement does."""
-        return first or not (self.endless or self.together)
+        return first or self.ends == "apart"
 
     def read(self) -> Batch | None:
         """The training stream's next batch, or None where it ran out, read through this run each
@@ -481,20 +483,25 @@ CLOCK_LIMIT = 2 ** 31 - 1
 """The most examples a clock counts: the devices hold it as int32 (`TrainState.consumed`)."""
 
 
-def clocked(examples: int | None, steps: int | None, *, custom: bool, rollout: bool,
+def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = False,
             bound_ends: bool = True) -> int | None:
     """The examples bound of a run that no plan counts steps ahead of, which keeps its progress in the
     examples its batches consume (`TrainState.consumed`), its schedule and cadences reading it; None for
-    a run counted otherwise. The transaction hands the run's optimizer that progress and the batches
-    carry the count, which a `custom` step or a `rollout`'s batches do not: refused there. Its progress
-    reaches its end where its read ends at its bound (`Loader.bound_ends`), so a take or slice after
-    the bound, which would end it first, is refused, as is a bound past what the clock counts."""
+    a run counted otherwise. The transaction hands the run's optimizer that progress, which a custom
+    step's update is not handed: one whose schedule reads it (`custom_progress`, a schedule over the
+    whole run) is refused. A rollout's batch consumes what the batches it read did
+    (`dew.training.rollout.clocked_rollout`), the run reading ahead for its stream's end after the
+    rollout's last draw. Its progress reaches its end where its read ends at its bound
+    (`Loader.bound_ends`), so a
+    take or slice after the bound, which would end it first, is refused, as is a bound past what the
+    clock counts."""
     if examples is None or steps is not None:
         return None
-    if custom or rollout:
-        raise ValueError("a run bounded in examples that no plan counts ahead reads its progress off the "
-                         "examples its batches consume, which a custom step= or a rollout does not carry; "
-                         "give steps=, or read the data in a global order its plan counts")
+    if custom_progress:
+        raise ValueError("a run bounded in examples that no plan counts ahead hands its optimizer the run's "
+                         "progress, which a custom step='s update is not handed, and this optimizer's "
+                         "schedule decays over the whole run: give the schedule its own decay_steps, or "
+                         "give steps=")
     if not bound_ends:
         raise ValueError("a run bounded in examples that no plan counts ahead ends where its bound does, "
                          "which its schedule's end reads; a take or slice after the bound would end it "
@@ -585,11 +592,12 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
             "or leave eval_every unset")
 
 
-def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
+def consumption_counted(batch: Batch, *, clocked: bool, marks_rows: bool = True) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start, and each marks its real rows (`VALID_ROWS`). A run on another clock, one
-    bounded in examples whose plan counts its steps ahead, keeps no count: none rides to its step."""
+    its start, and each marks its real rows (`VALID_ROWS`) where it `marks_rows`, as a step's batch does;
+    a rollout's read keeps its rows as read. A run on another clock, one bounded in examples whose plan
+    counts its steps ahead, keeps no count: none rides to its step."""
     if not clocked:
         return batch if EXAMPLES_CONSUMED not in batch else {
             name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
@@ -598,7 +606,7 @@ def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
     counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
-    if VALID_ROWS not in batch:
+    if VALID_ROWS not in batch and marks_rows:
         # A clocked read ends at its bound, in a short batch filled and marked: each of its batches marks
         # its real rows, so every one is the same tree, the run's one program.
         counted_batch[VALID_ROWS] = np.ones(len(np.asarray(batch[EXAMPLES_CONSUMED])), bool)

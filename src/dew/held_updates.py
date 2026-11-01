@@ -71,6 +71,13 @@ def _outermost(node) -> list:
     return []
 
 
+def holds_state(opt_state: optax.OptState, kind: type) -> bool:
+    """Whether `opt_state` holds a state of `kind` (a transform's state type), however its optimizer
+    composes the transform: a run reads what that transform asks of its step from it."""
+    return any(isinstance(node, kind) for node in jax.tree.leaves(
+        opt_state, is_leaf=lambda node: isinstance(node, kind)))
+
+
 def holds_back(opt_state: optax.OptState) -> bool:
     """Whether the optimizer whose state is `opt_state` holds its whole update back on some calls."""
     return bool(_outermost(opt_state))

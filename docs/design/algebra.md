@@ -96,8 +96,8 @@ bodies, by the site's declared class:
   are `Protected`. They exist to restructure math for accuracy, often at a cost (the decay prefix costs 4–26% more
   for 3.6–4.5 times less error), so no compile-time rule undoes them. At dev time the generator searches each
   body's alternatives and proposes one only where its sampled error meets the body's own (§1.5).
-- **Surrogate** (`Objective.with_gradients`' rules, node perturbation, the Gauss-Newton step, the quantized
-  convolution's straight-through backward, `rounded_operand`'s straight-through tangent, among them): a declared
+- **Surrogate** (`Objective.with_gradients`' rules, node perturbation, the quantized convolution's
+  straight-through backward, `rounded_operand`'s straight-through tangent, among them): a declared
   form, `surrogate(forward, derivative)` (row 3271), whose derivative is a rule, not the forward's. The engine
   optimizes inside each body (`Surrogate`) and never replaces the rule with autodiff's derivative of the forward,
   nor equates the two.

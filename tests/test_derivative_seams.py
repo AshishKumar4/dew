@@ -104,10 +104,6 @@ CONTRACTED = {
         ("test_the_lm_heads_hold_every_order_of_their_gradient", NUMERICS),
     "src/dew/objectives/lm/chunked.py::_fused.linear_tangent":
         ("test_the_lm_heads_hold_every_order_of_their_gradient", KERNEL),
-    "src/dew/objectives/residuals.py::_pulled":
-        ("test_the_residual_pullbacks_hold_every_order", SURROGATE),
-    "src/dew/objectives/residuals.py::_stepped":
-        ("test_the_residual_pullbacks_hold_every_order", SURROGATE),
     "src/dew/nn/kernels/norm_swiglu.py::stream_rms_norm.linear_tangent":
         ("test_the_fused_norms_and_products_hold_every_order", KERNEL),
     "src/dew/nn/kernels/norm_swiglu.py::rms_norm.linear_tangent":

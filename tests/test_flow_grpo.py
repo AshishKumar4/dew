@@ -504,6 +504,13 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
     np.testing.assert_array_equal(batch["timesteps"], np.broadcast_to(process.times(4)[:2], (6, 2)))
+    # A source row a partly read pool share repeats (`VALID_ROWS`) trains none of its samples' transitions,
+    # whatever their advantages (row 3346's review).
+    from dew.batch import VALID_ROWS
+
+    partial = rollout(state, {**prompts, VALID_ROWS: np.asarray([True, False])}, jax.random.key(23))
+    assert not partial["transition_mask"][3:].any()
+    np.testing.assert_array_equal(partial["transition_mask"][:3], batch["transition_mask"][:3])
 
     def rolled(seed):
         return rollout(state, prompts, jax.random.fold_in(jax.random.key(23), seed))

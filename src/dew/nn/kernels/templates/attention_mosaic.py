@@ -122,6 +122,13 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """The call's spans from its arrays and the op's static form and key count."""
         return KeySpans(start, end, query_ids, key_ids, self.keys, self.form)
 
+    def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
+        """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
+        past the call's (`_padded`, `tuning.KernelOp.padded`): its query and key blocks' tails."""
+        queries, keys = ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]
+        padded_queries, padded_keys = _padded(queries, keys, config)
+        return 1 - queries * keys / (padded_queries * padded_keys)
+
     def register_budget(self, config: Config) -> int:
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
         file (`mosaic.roles`)."""
