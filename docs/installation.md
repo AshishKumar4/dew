@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post43,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post44,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of the same release, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
@@ -134,8 +134,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A Mosaic GPU `mma.sync` multiplies float32 operands as TF32 (`m16n8k8.tf32`), each rounded to nearest first, and transfers 32-bit operands without `ldmatrix`.
 - Mosaic GPU issues scoped and ordered atomics, memory fences and `griddepcontrol` (programmatic dependent launch), and Pallas Mosaic GPU's `barrier_wait` takes an explicit parity, checked by its interpreter.
 - Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
-- Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, preventing the full-band and partial-tail divisors from becoming one runtime divisor.
-- Ragged products differentiate through contracting and batch dimensions at higher orders, preserving explicit sharding, metadata prefixes and the requested accumulation precision; grouped expert products can take reverse-over-reverse derivatives.
+- Ragged products differentiate through contracting and batch dimensions at higher orders, preserving explicit sharding, metadata prefixes and the requested accumulation precision, a named dot algorithm among them; grouped expert products can take reverse-over-reverse derivatives.
 - A reduction's forward derivative keeps a symbolic zero tangent zero instead of materializing it, and Mosaic GPU's warpgroup loads preserve their requested fragment layout.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.

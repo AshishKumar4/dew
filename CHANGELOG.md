@@ -26,7 +26,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
   the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
   through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
-- Dew requires its JAX build 0.12.0.1.post43, and its `cuda12` and `cuda13` extras install Dew's builds of
+- Dew requires its JAX build 0.12.0.1.post44, and its `cuda12` and `cuda13` extras install Dew's builds of
   the CUDA plugins and their PJRT plugins, which Dew's package index serves: Mosaic GPU honours a kernel's
   register raises (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC
   blocks by their strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and
