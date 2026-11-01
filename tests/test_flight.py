@@ -167,7 +167,7 @@ def oracle_step(racing: Racing, race, path, camera):
         axis = optical_axis(race.flight.orientation[drone], camera.mount[drone], camera.uptilt[drone])
         toward = center[target] - position
         angle = np.arctan2(np.linalg.norm(np.cross(axis, toward)), axis @ toward)
-        reward += racing.perception_scale * np.exp(-racing.perception_sharpness * angle**4)
+        reward += racing.perception_scale * np.exp(-racing.perception_sharpness * angle**4) / racing.hz
         reward -= racing.crash_penalty if crashed else 0.0
         rewards.append(reward)
         ends.append(crashed or finished)
