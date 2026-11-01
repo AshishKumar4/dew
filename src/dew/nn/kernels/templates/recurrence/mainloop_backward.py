@@ -80,7 +80,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
             if backward:
                 gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                           max_segments=max_segments, family=family, inverse=inverse, kept=kept, delta=delta,
-                          rounded=rounded, ranged=ranged)
+                          floor=floor, rounded=rounded, ranged=ranged)
         finally:
             _PLANNED.reset(token)
 
@@ -115,7 +115,7 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, shared: int,
                    starts=None, max_segments: int | None = None, delta: bool = True,
-                   rounded: bool = False, ranged: bool = False) -> bool:
+                   floor: float | None = None, rounded: bool = False, ranged: bool = False) -> bool:
     """Whether the fast backward's launches (`gradients`'s, past the forward's) hold on `family`'s bundle at
     `tiles` within a block of `shared` bytes (`holds`); where they do not, the rule's gradient is the
     portable math's."""
@@ -123,17 +123,17 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Fa
                                                                                     starts)]
     *operands, starts = shapes
     forward = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                      delta=delta, rounded=rounded, ranged=ranged)
+                      delta=delta, floor=floor, rounded=rounded, ranged=ranged)
     both = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                   backward=True, delta=delta, rounded=rounded, ranged=ranged)
+                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged)
     return holds(both[len(forward):], family, shared)
 
 
 def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
               max_segments: int | None = None, scale: float | None = None,
               family: mosaic.Family | None = None, interpret: bool = False,
-              inverse=None, kept=None, delta: bool = True, rounded: bool = False, ranged: bool = False,
-              skip=None):
+              inverse=None, kept=None, delta: bool = True, floor: float | None = None, rounded: bool = False,
+              ranged: bool = False, skip=None):
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
     call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
     `(dq, dk, dv, dg, dbeta, dh0)` for the output's and final memory's gradients `do`, `dfinal`, fla's DAG
@@ -152,7 +152,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
                                   "under the run's fast forms, an fp32 call's under them alone")
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                     tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                    firsts=firsts, rounded=rounded, ranged=ranged)
+                    firsts=firsts, floor=floor, rounded=rounded, ranged=ranged)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))

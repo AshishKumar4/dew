@@ -990,8 +990,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
             and mainloop_backward.backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 shared=generation.shared_budget(template.Mosaic.launched()), starts=starts,
-                max_segments=max_segments, delta=delta, rounded=rounded, ranged=run["ranged"]))
-    run_back = {name: value for name, value in run.items() if name != "floor"}
+                max_segments=max_segments, delta=delta, floor=floor, rounded=rounded, ranged=run["ranged"]))
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
@@ -1031,7 +1030,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         grads = mainloop_backward.gradients(query, key, value, g, beta, state, out_grad, final_grad,
                                             starts=starts, firsts=firsts, max_segments=max_segments,
                                             scale=scale, inverse=inverse, kept=kept, delta=delta,
-                                            rounded=rounded, skip=skip, **run_back)
+                                            rounded=rounded, skip=skip, **run)
         return (*grads[:5], None if state is None else grads[5], None, None,
                 None if skip is None else grads[6].astype(skip.dtype))
 
