@@ -708,24 +708,11 @@ def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
     assert items and all(f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
 
 
-def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
-    """A task's wall time split among its files in proportion to their tests'
-    own times, and evenly over its rows where no test recorded one: recorded
-    times whose shares are exact in binary."""
-    assert ci.apportioned({"tests/test_a.py": 0.25, "tests/test_b.py": 0.75}, 2.0, 2) == {
-        "tests/test_a.py": 0.5, "tests/test_b.py": 1.5}
-    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 2) == {
-        "tests/test_a.py": 1.5, "tests/test_b.py": 1.5}
-    # A file named twice is two of the task's rows.
-    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 3) == {
-        "tests/test_a.py": 1.0, "tests/test_b.py": 1.0}
-
-
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     """The plan weighs a file by what a task spends on it, its import and
-    collection included, so a task's rows add up to its wall time, split by
-    their tests' own times (`apportioned`): at least what the tests slept, at
-    most the task's wall time, and the longer sleep the larger row."""
+    collection included: each file's own process's wall time (`alone`), so a
+    task's rows add up to at most its wall time, each at least what its tests
+    slept, and the longer sleep the larger row."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
@@ -1404,20 +1391,17 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     assert run() == 1
 
 
-@pytest.mark.parametrize(("order", "namespace"), [
-    (("lone", "uses"), [[2, 1], [3, 1], [4, 2]]), (("uses", "lone"), [[2, 2], [3, 3], [4, 4]])],
-    ids=["lone first", "lone after uses"])
+@pytest.mark.parametrize("order", [("lone", "uses"), ("uses", "lone")], ids=["lone first", "lone after uses"])
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
-        ci, tmp_path, monkeypatch, cache_worker, order, namespace):
+        ci, tmp_path, monkeypatch, cache_worker, order):
     """A train that loses a head loses the test modules and modules the head added, and its other
     files keep their rows (the land queue's recompose after a pull): a test module, a module in a
     package no test imported, or one beside a module a file's tests executed under a name no run
     tried to import, added or taken away runs no file again (ledger 3220: a listing of every package
     above an executed module keyed 82% of rows, and each added module reran them). An __init__.py
     added to, or taken from, a namespace package on the way to a module a file imported, which that
-    import finds, runs that file again, and that one alone where no file of its process ran it
-    before: a file's key covers what the files before it in its process did, as what ran before it
-    may serve it from a module it left (lifetime.py), so one run after it reruns too; a top-level
+    import finds, runs that file again, and that one alone, whatever its order in the task: each file
+    runs in a process of its own (`alone`), so no file's key holds another's imports; a top-level
     package added under src/, which may shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
@@ -1449,8 +1433,8 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
                ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
                ("src/other/extra.py", None, [1, 1]), ("tests/test_added.py", None, [1, 1]),
-               ("src/pkg/space/__init__.py", "", namespace[0]),
-               ("src/pkg/space/__init__.py", None, namespace[1]), ("src/top/__init__.py", "", namespace[2])]
+               ("src/pkg/space/__init__.py", "", [2, 1]),
+               ("src/pkg/space/__init__.py", None, [3, 1]), ("src/top/__init__.py", "", [4, 2])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
@@ -1461,12 +1445,12 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
         assert run() == runs, path
 
 
-def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
-    """A hang is graded: the task interrupts pytest at its deadline, short of
-    armada's own timeout, kills its process group where the interrupt is not
-    heard, and writes a red row for each of its files, the one that finished
-    first included."""
+def test_a_task_past_its_deadline_is_interrupted_and_the_files_it_held_up_are_red(ci, tmp_path):
+    """A hang is graded: the task interrupts the hanging file's pytest at its deadline, short of armada's own
+    timeout, kills its process group where the interrupt is not heard, and writes a red row for it and for the
+    files whose turn never came; a file that finished in its own process before (`alone`) keeps its row."""
     (tmp_path / "tests/test_quick.py").write_text("def test_ok(): pass\n")
+    (tmp_path / "tests/test_later.py").write_text("def test_ok(): pass\n")
     # A hang that ignores ^C, beside a child that holds pytest's output open:
     # neither may keep the task from writing its verdict.
     (tmp_path / "tests/test_hangs.py").write_text(
@@ -1478,12 +1462,15 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
+    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py", "tests/test_later.py"], "", out, 30.0,
+            grace=2.0)
     # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
-    assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
+    assert time.monotonic() - began < 30.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
-        "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+        "3.12:tests/test_quick.py": 0, "3.12:tests/test_hangs.py": 1, "3.12:tests/test_later.py": 1}
+    assert "interrupted" in rows["3.12:tests/test_hangs.py"]["output"]
+    assert "before its file started" in rows["3.12:tests/test_later.py"]["output"]
 
 
 def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_will_not_reap(monkeypatch):

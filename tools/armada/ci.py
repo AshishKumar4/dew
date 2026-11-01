@@ -1417,14 +1417,6 @@ def ynn_switched(cases) -> list[dict]:
             for site in json.loads(item.get("value") or "[]")]
 
 
-def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
-    """Each file's share of a task's `wall` time, in proportion to its tests' own times (`task`), or an
-    even split over the task's `rows` (a file named twice is two) where no test recorded a time."""
-    total = sum(own_seconds.values())
-    pace = wall / total if total > 0 else 0.0
-    return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
-
-
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
          release: str = "") -> int:
@@ -1546,11 +1538,51 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
+    # Each file in a pytest process of its own (`alone`), one after another: a file's record is what its own
+    # process did, so it keys on the code its tests ran, never a taskmate's collection, tests or caches
+    # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
+    ran = []
+    for index, name in enumerate(tests):
+        left = deadline - (time.monotonic() - began)
+        alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
+                       coverage, network, whole, release, site) if left > 0 else None
+        ran.append(file_row(python, name, group, site, alone_, deadline))
+        if coverage is None and not release and alone_ is not None:
+            # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which
+            # runs under its requirement's overlay and on the whole suite's run alone.
+            record(python, ran[-1:], alone_.log, common, network, alone_.opened)
+    out.write_text(json.dumps({"rows": rows + ran}))
+    return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class Alone:
+    """One test file's pytest process (`alone`): its exit, output, JUnit cases and collection counts, every
+    data file its processes opened (`watched`: None where the watch was blind), whether it ran past its
+    deadline, its wall time, and its recorder's log (lifetime.py)."""
+
+    returncode: int | None
+    output: str
+    reported: bool
+    cases: list[ET.Element]
+    counts: dict
+    opened: set[str] | None
+    expired: bool
+    seconds: float
+    log: Path
+
+
+def alone(python: str, name: str, split: str, base: Path, deadline: float, grace: float,
+          environ: Mapping[str, str], coverage: Path | None, network: bool, whole: bool, release: str,
+          site: re.Match | None) -> Alone:
+    """Test file `name` (`tested`) in a pytest process of its own under `environ`, its files beside `base`,
+    interrupted past `deadline` seconds and its process group killed `grace` seconds after that."""
+    began = time.monotonic()
     # The recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the
     # group has exited (`record`).
-    log = out.with_name(f"{out.name}.lifetime.log")
-    collection = out.with_name(f"{out.name}.collected.json")
-    report = out.with_name(f"{out.name}.junit.xml")
+    log = base.with_name(f"{base.name}.lifetime.log")
+    collection = base.with_name(f"{base.name}.collected.json")
+    report = base.with_name(f"{base.name}.junit.xml")
     for stale in (report, log, collection):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
@@ -1560,7 +1592,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
-    command = pytest_command(run, tests, split, release)
+    command = pytest_command(run, [name], split, release)
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -1569,8 +1601,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    # Every data file the task's processes open, held from before pytest starts until its group stopped
-    # (`watched`): each is the input of every file the task runs.
+    # Every data file the process's group opens, held from before pytest starts until its group stopped
+    # (`watched`): each is the file's input.
     opens = watched.Opens(os.getcwd())
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
@@ -1592,63 +1624,61 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
-    # A process of the group still running may yet open a file: no record of this task keeps a key.
+    # A process of the group still running may yet open a file: no record of this file keeps a key.
     closed = opens.closed()
-    opened = None if left else closed
     reader.join(10)
-    output = "".join(lines)
-    cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
-    # How collection found each file: a file with no row is green only where every test it holds was set aside
+    # How collection found the file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
-    counts = json.loads(collection.read_text()) if collection.is_file() else {}
-    ran = []
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
-                   for name in tests}
-    shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
-    for name in tests:
-        own = [case for case in cases if file_of(case) == name]
-        failed = [(case, kind, node) for case in own for kind in ("failure", "error")
-                  if (node := case.find(kind)) is not None]
-        red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
-               for case, kind, node in failed]
-        skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
-                   f"{node.get('message')}" for case in own for node in case.iter("skipped")
-                   if "could not import" in f"{node.get('message')} {node.text}"]
-        counted = counts.get(name, {})
-        deselected = bool(counted) and counted["collected"] == counted["deselected"]
-        exited = exit_red(done.returncode, cases, own, deselected, name)
-        unaccounted = ([] if exited or (report.is_file() and (own or deselected))
-                       else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
-                                                            else "pytest reported none of its tests, and its "
-                                                                 "collection shows them not all deselected")])
-        red += skipped + exited + unaccounted
-        if expired:
-            red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
-        # A failed case with no class path is a file that did not collect, no test of it.
-        nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
-        whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
-                                                                      for case, _, _ in failed)
-        cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
-                 else red_as("nodes", nodes))
-        seconds = shares[name]
-        # armada times a file at the sum of its rows' timings, a split file's groups together, each
-        # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
-        ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     "output": "\n".join(red + ([output[-4000:]] if red else [])),
-                     # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
-                     # `exhausted` reads.
-                     **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
-                     "tests": {node_of(case): float(case.get("time") or 0) for case in own},
-                     # Its whole_suite cells, every one collected, run or set aside (executed.py).
-                     **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
-                     "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-                     "timings": {row(python, name, group if site else ""): seconds}, **cause})
-    out.write_text(json.dumps({"rows": rows + ran}))
-    if coverage is None and not release:
-        # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
-        # under its requirement's overlay and on the whole suite's run alone.
-        record(python, ran, log, common, network, opened)
-    return 0
+    return Alone(done.returncode, "".join(lines), report.is_file(),
+                 list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else [],
+                 json.loads(collection.read_text()) if collection.is_file() else {},
+                 None if left else closed, expired, time.monotonic() - began, log)
+
+
+def file_row(python: str, name: str, group: str, site: re.Match | None, run: Alone | None,
+             deadline: float) -> dict:
+    """Test file `name`'s verdict row from its process's `run` (`alone`), or, where the task's `deadline` came
+    before its turn (`run` None), red as interrupted."""
+    if run is None:
+        return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
+                "output": f"{INTERRUPTED} of {deadline:.0f} s before its file started", "tests": {},
+                "ynn_switched": [], "cells": {}, "timings": {}, **red_as("deadline", [])}
+    own = [case for case in run.cases if file_of(case) == name]
+    failed = [(case, kind, node) for case in own for kind in ("failure", "error")
+              if (node := case.find(kind)) is not None]
+    red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
+           for case, kind, node in failed]
+    skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
+               f"{node.get('message')}" for case in own for node in case.iter("skipped")
+               if "could not import" in f"{node.get('message')} {node.text}"]
+    counted = run.counts.get(name, {})
+    deselected = bool(counted) and counted["collected"] == counted["deselected"]
+    exited = exit_red(run.returncode, run.cases, own, deselected, name)
+    unaccounted = ([] if exited or (run.reported and (own or deselected))
+                   else [f"no evidence {name} ran: " + ("pytest wrote no report" if not run.reported
+                                                        else "pytest reported none of its tests, and its "
+                                                             "collection shows them not all deselected")])
+    red += skipped + exited + unaccounted
+    if run.expired:
+        red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
+    # A failed case with no class path is a file that did not collect, no test of it.
+    nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
+    whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
+                                                                  for case, _, _ in failed)
+    cause = ({} if not red else red_as("deadline", []) if run.expired else red_as("whole", []) if whole
+             else red_as("nodes", nodes))
+    # armada times a file at the sum of its rows' timings, a split file's groups together, each Python's
+    # apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
+    return {"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": run.seconds,
+            "output": "\n".join(red + ([run.output[-4000:]] if red else [])),
+            # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which `exhausted`
+            # reads.
+            **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
+            "tests": {node_of(case): float(case.get("time") or 0) for case in own},
+            # Its whole_suite cells, every one collected, run or set aside (executed.py).
+            **{key: cells for key, cells in counted.items() if key in MARKED},
+            "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
+            "timings": {row(python, name, group if site else ""): run.seconds}, **cause}
 
 
 def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
