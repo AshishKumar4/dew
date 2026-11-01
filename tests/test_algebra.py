@@ -82,6 +82,22 @@ def test_a_compensated_sum_keeps_its_residual():
     assert float(jax.jit(algebra.rewritten(compensated))(a, b)[0]) == low != 0.0
 
 
+def test_a_complex_programs_literals_are_read_by_the_rules():
+    """A program of complex values, its literals complex (`1 + 0j` a unit, as a complex weight's update
+    writes them), rewritten: the facts its literals state are read whatever their dtype, and it computes
+    what it computes, its sums joined, real and imaginary parts alike."""
+    def complex_sums(x, y, a, u, v, b):
+        xs, ys, scale = x + 1j * u, y + 1j * v, a + 1j * b
+        summed = jnp.sum(scale * xs * (1.0 + 0j), axis=-1) + jnp.sum(scale * ys * (1.0 + 0j), axis=-1)
+        return jnp.stack([summed.real, summed.imag])
+
+    def draw(seed):
+        return rows(seed, *[(8, 64)] * 6)
+
+    assert_as_exact(jax.jit(algebra.rewritten(complex_sums)), jax.jit(complex_sums), draw, "complex sums",
+                    seeds=16)
+
+
 def count(closed, primitive: str) -> int:
     """The equations of `closed` binding `primitive`."""
     return sum(equation.primitive.name == primitive for equation in closed.jaxpr.eqns)
