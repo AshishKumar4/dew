@@ -7,7 +7,7 @@ over one sequence a row and packed documents, value heads over fewer key heads, 
 off a block's width, bf16 and fp32 operands and lengths off the chunks, and every hook combination the
 mainloop takes (a decay a head or none, with and without the delta rule, Mamba2's rated decay, the skip and
 the norm) on the chunked op's own draws (`test_recurrence_chunk`). Off such a GPU the cases run in Mosaic
-GPU's interpreter on the wgmma bundle (`mainloop.INTERPRETED`) at one row of a shorter length
+GPU's interpreter on the wgmma bundle (`bundles.INTERPRETED`) at one row of a shorter length
 (`INTERPRETED_LENGTH`), whose products are the dots they compute: coverage of the mainloop's algebra and its
 roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
@@ -26,11 +27,12 @@ from test_recurrence_chunk import (
     SEEDS as HOOK_SEEDS,
     chunk_on,
     draw as hooked_draw,
+    formed,
     token_by_token,
 )
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, mamba_rounding, mosaic_rule
+from dew.nn.kernels.recurrence_chunk import Chunk, fast_rounding, mosaic_rule
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
@@ -106,11 +108,31 @@ interpreted gradient of one sequence took 300 to 390 s and of packed documents 5
 unresolved within 40 seeds, its extra seeds taking 784 and 934 s."""
 
 
+def case_hooks(case: str) -> recurrence.Hooks:
+    """Case `case`'s rule: the gated delta rule with a decay a head, or a key dimension under `FLOOR` (Kimi
+    delta attention's), its queries scaled by `Dk^-1/2`."""
+    per_key = SHAPES[case].get('per_key')
+    return recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
+                            floor=FLOOR if per_key else None, write_bound=1.0)
+
+
 def geometry(case: str) -> dict:
     """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed off a GPU of a family a bundle
-    claims (`INTERPRETED_LENGTH`, `INTERPRETED_HEADS`)."""
+    claims (`geometry_on`)."""
+    return geometry_on(case, interpreted=mainloop.family_of() is None)
+
+
+def recorded_site(case: str, dtype) -> str:
+    """Case `case`'s site of recorded fla-core in `dtype` at this machine's geometry (`fla_sites`)."""
+    label = {jnp.dtype(value): name for name, value in DTYPES.items()}[jnp.dtype(dtype)]
+    return f"mosaic/{case}/{label}/{'cpu' if mainloop.family_of() is None else 'gpu'}"
+
+
+def geometry_on(case: str, interpreted: bool) -> dict:
+    """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed where `interpreted`
+    (`INTERPRETED_LENGTH`, `INTERPRETED_HEADS`)."""
     shape = SHAPES[case]
-    if mainloop.family_of() is not None:
+    if not interpreted:
         return shape
     return {**shape, 'rows': 1, 'length': min(shape['length'], INTERPRETED_LENGTH),
             **INTERPRETED_HEADS.get(case, {})}
@@ -159,8 +181,8 @@ def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_head
 def template_call(given: Chunk, hooks: recurrence.Hooks):
     """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
     (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
-    hooks', a rated scan's numbers mamba_ssm's under the run's fast forms (`rounded`, as its route resolves
-    it, `recurrence_chunk.mamba_rounding`)."""
+    hooks', its numbers the run's fast forms' where they are its forms (`rounded`, as its route resolves
+    it, `recurrence_chunk.fast_rounding`: a rated scan's mamba_ssm's, an fp32 call's two parts)."""
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
@@ -170,7 +192,7 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
                                 floor=hooks.floor, bound=hooks.inverse_bound,
-                                rounded=hooks.rated and mamba_rounding())
+                                rounded=fast_rounding())
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -197,20 +219,21 @@ REFUSED = (Unfitted, NotImplementedError, KernelRefused)
 named template fails (`selection.KernelRefused`)."""
 
 
-def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
-    """The chunked op on the mainloop for `case`'s calls in `dtype`: through the template's route where it
-    takes them (`chunk_on('mosaic_gpu', ...)`, the template named to the selectors, at its derived tiles);
+def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fast'):
+    """The chunked op on the mainloop for `case`'s calls in `dtype` under the run's `forms` (`formed`):
+    through the template's route where it takes them (`chunk_on('mosaic_gpu', ...)`, the template named to
+    the selectors, at its derived tiles);
     else, the route refusing them (a launch's registers past a thread's), the mainloop's rule at its narrowest
     value block, one chunk in flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where
     the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension
     (`mainloop.per_key_refusal`); and on a GPU where its launches at those tiles pass the device's shared
     memory (an fp32 call's solve on an A100's block), whose arithmetic the CPU interprets."""
     (operands,) = draw(dtype, 0, **geometry(case))
-    if taken(operands, hooks):
-        return functools.partial(chunk_on, 'mosaic_gpu', hooks)
+    if formed(forms, taken)(operands, hooks):
+        return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
-        jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), operands)
-    family = mainloop.family_of() or mainloop.INTERPRETED
+        jax.eval_shape(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)), operands)
+    family = mainloop.family_of() or bundles.INTERPRETED
     if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, hooks.floor):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
@@ -231,7 +254,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     def rule(given: Chunk, max_segments: int | None = None):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                            tiles=narrowest, starts=given.starts, max_segments=max_segments, scale=hooks.scale,
-                           floor=hooks.floor, bound=hooks.inverse_bound)
+                           floor=hooks.floor, bound=hooks.inverse_bound, rounded=forms == 'fast')
 
     return rule
 
@@ -240,22 +263,22 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
 def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     """The mainloop's output and final memory on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time in float64): the gated delta rule with a decay a head or
-    a key dimension (Kimi delta attention's), its queries scaled by `Dk^-1/2`. An fp32 call's reference is the
-    recurrence a token at a time in fp32; a 16-bit call's is the fla port in the call's dtype
-    (`recurrence_chunk.fla_rule`), whose numbers it runs: the values between launches rounded to bf16 put the
-    final memory 1e-3 from float64, which the fp32 recurrence holds to 6e-8. A call the template refuses
-    is checked refused and its arithmetic on the mainloop's rule (`on_the_mainloop`)."""
-    per_key = SHAPES[case].get('per_key')
-    hooks = recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
-                             floor=FLOOR if per_key else None, write_bound=1.0)
+    a key dimension (Kimi delta attention's), its queries scaled by `Dk^-1/2`. An fp32 call's reference
+    under the accurate forms is the recurrence a token at a time in fp32, and under the fast forms, as a
+    16-bit call's, recorded fla-core in the call's dtype (`fla_sites`), whose numbers it runs: the values
+    between launches rounded to bf16 put the final memory 1e-3 from float64, which the fp32 recurrence holds
+    to 6e-8. A call the template refuses is checked refused and its arithmetic on the mainloop's rule
+    (`on_the_mainloop`)."""
+    hooks = case_hooks(case)
+    label = f'the mosaic forward, {case} in {jnp.dtype(dtype).name}'
+    exact = on_the_mainloop(hooks, case, dtype, forms='accurate') if dtype == jnp.float32 else None
+    if exact is not None:
+        truth = jax.jit(functools.partial(token_by_token, hooks))
+        assert_as_exact(jax.jit(exact), truth, functools.partial(draw, dtype, **geometry(case)),
+                        f'{label} under the accurate forms', seeds=SEEDS, truth_fn=truth)
     on = on_the_mainloop(hooks, case, dtype)
-    if on is None:
-        return
-    dew = jax.jit(on)
-    truth = jax.jit(functools.partial(token_by_token, hooks))
-    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk_on, 'fla', hooks))
-    assert_as_exact(dew, reference, functools.partial(draw, dtype, **geometry(case)),
-                    f'the mosaic forward, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+    if on is not None:
+        the_template_is_as_exact_as_fla(on, recorded_site(case, dtype), ('out', 'final'), label)
 
 
 UNSEEN = generation.GpuTarget("sm87", "NVIDIA Jetson AGX Orin", 163 * 1024, multiprocessors=16,
@@ -280,7 +303,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     (operands,) = draw(dtype, 0, **geometry(case))
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
-                                 operands.beta, operands.state, operands.starts)
+                                 operands.beta, operands.state, operands.starts, bound=hooks.inverse_bound)
     budget = generation.shared_budget(UNSEEN)
     if dtype == jnp.float32:
         with generation.assumed(UNSEEN):
@@ -308,12 +331,15 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
                            family=bundles.of('sm80', jnp.bfloat16))
 
     truth = jax.jit(functools.partial(token_by_token, hooks))
-    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk_on, 'fla', hooks))
     # Each variant: its value block and stages change which program computes a value column.
     for tiles in variants:
-        assert_as_exact(jax.jit(functools.partial(dew, tiles=tiles)), reference,
-                        functools.partial(draw, dtype, **geometry(case)),
-                        f'the mosaic forward on an unseen GPU at {tiles}, in {jnp.dtype(dtype).name}',
+        label = f'the mosaic forward on an unseen GPU at {tiles}, in {jnp.dtype(dtype).name}'
+        if dtype != jnp.float32:
+            the_template_is_as_exact_as_fla(functools.partial(dew, tiles=tiles), recorded_site(case, dtype),
+                                            ('out', 'final'), label)
+            continue
+        assert_as_exact(jax.jit(functools.partial(dew, tiles=tiles)), truth,
+                        functools.partial(draw, dtype, **geometry(case)), label,
                         seeds=SEEDS, truth_fn=truth)
 
 
@@ -348,6 +374,34 @@ def test_the_mosaic_launches_state_their_work(training):
     assert launches and all(_stated_flops(line) is not None for line in launches)
     model = delta_flops(np.asarray([length] * rows), value_heads, width, width)
     assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
+
+
+@lowers('sm80')
+@pytest.mark.parametrize('target', ['sm80', 'sm86'])
+def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(target):
+    """A decay a key dimension 16 wide over values 8 wide (the recurrence stability sites' geometry), its
+    floored gradient through the template lowered for an Ampere GPU: the key memory backward copies the
+    entered memory's 8 rows of 64 bf16 columns in with cp.async, one 8-row tile at its rows' 128-byte
+    swizzle, whose copy layout Mosaic GPU refuses ('Number of tiles is not a multiple of 4',
+    stab-floorless-a100-deba5b564); staged at the swizzle the copy tiles it lowers."""
+    rows, length, value_heads, width, value_width = 2, 70, 16, 16, 8
+    operands = [jax.ShapeDtypeStruct((rows, length, 1, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, value_width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, floor=FLOOR, write_bound=1.0)
+
+    def rule(*given):
+        return chunk_on('mosaic_gpu', hooks, Chunk(*given[:3], log_decay=given[3], beta=given[4]))
+
+    def loss(*given):
+        out, final = rule(*given)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    # Abstract devices stating the GPU's capability, which Mosaic GPU lowers cp.async's waits for.
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), target)
+    with generation.assumed(target), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
 def test_each_launch_lowers_once_however_many_layers_call_it():
@@ -402,56 +456,67 @@ def diverging(width: int = 64) -> Chunk:
                  state=jnp.zeros((1, 1, width, width), jnp.float32))
 
 
-def test_a_16bit_delta_rule_whose_form_proves_no_range_takes_another_kernel():
-    """The diverging rule (`diverging`) in a 16-bit call whose form proves no bound on its chunk's inverse
-    (unnormalized keys, no declared write gate): the template's solve, whose fp16 merges gave NaN there
-    where the portable math gave 5.7e29 (row 2381), refuses it (`template.inverse_refusal`), the mainloop's
-    rule named for it too, and the delta rule's selector on an H100 gives it the port, which the same call
-    declaring its bound would not take from the template."""
+def test_a_16bit_delta_rule_whose_form_proves_no_range_solves_at_fp32s_range():
+    """The diverging rule (`diverging`), its keys drawn within 1e-3 of `2 e0`, in a 16-bit call whose form
+    proves no bound on its chunk's inverse (unnormalized keys, no declared write gate): the template's solve,
+    whose fp16 merges gave NaN there where the portable math gave 5.7e29 (row 2381), merges at fp32's range
+    in bf16 parts (`mainloop._merged`): its output on par from float64 with the portable math's, the token
+    recurrence the truth (check 1); and the delta rule's selector on an H100 gives the call the template."""
     from dew.nn.kernels.recurrence_chunk import port_kernel
 
+    hooks = recurrence.Hooks(decay='scalar', scale=diverging().key.shape[-1] ** -0.5)
+
+    def draw(seed):
+        drawn = diverging()
+        noise = 1e-3 * jax.random.normal(jax.random.key(59 + seed), drawn.key.shape)
+        return ((drawn.key.astype(jnp.float32) + noise).astype(jnp.bfloat16),)
+
+    def output(rule):
+        def run(key):
+            drawn = diverging()
+            found = rule(Chunk(key, key, drawn.value.astype(key.dtype), log_decay=drawn.log_decay,
+                               beta=drawn.beta.astype(key.dtype),
+                               state=drawn.state.astype(jnp.promote_types(key.dtype, jnp.float32))))
+            return found[0] if isinstance(found, tuple) else found
+        return run
+
+    assert_as_exact(output(functools.partial(chunk_on, 'mosaic_gpu', hooks)),
+                    output(functools.partial(chunk_on, 'xla', hooks)), draw,
+                    "the template's solve at fp32's range", seeds=SEEDS,
+                    truth_fn=output(functools.partial(token_by_token, hooks)))
     drawn = diverging()
-    hooks = recurrence.Hooks(decay='scalar', scale=drawn.key.shape[-1] ** -0.5)
-    with pytest.raises(REFUSED):
-        jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), drawn)
     operands = (drawn.query, drawn.key, drawn.value, drawn.log_decay, drawn.beta, drawn.state)
     with generation.assumed('sm90'):
-        unproven = port_kernel(*operands, report=False)
-        declared = port_kernel(*operands, bound=1.0, report=False)
-    assert (unproven, declared) == ('fla', 'mosaic_gpu')
+        assert port_kernel(*operands, report=False) == 'mosaic_gpu'
+
+
+NEAR_TWO_HOOKS = recurrence.Hooks(decay='scalar', scale=64 ** -0.5, write_bound=2.0)
+"""The gated delta rule under write gates near two (twice a sigmoid's) on keys 64 wide, no decay."""
+
+
+def near_two(seed: int) -> Chunk:
+    """Unit keys within 1e-3 of one direction over 64 tokens under write gates near two, as queries too, bf16;
+    no decay, no memory entering."""
+    tokens, width = 64, 64
+    keys = jax.random.split(jax.random.key(53 + seed), 4)
+    base = jax.random.normal(keys[0], (1, 1, 1, width))
+    key = base + 1e-3 * jax.random.normal(keys[1], (1, tokens, 1, width))
+    key = (key / jnp.linalg.norm(key, axis=-1, keepdims=True)).astype(jnp.bfloat16)
+    value = jax.random.normal(keys[2], (1, tokens, 1, width)).astype(jnp.bfloat16)
+    beta = (2.0 * jax.nn.sigmoid(6.0 + jax.random.normal(keys[3], (1, tokens, 1)))).astype(jnp.bfloat16)
+    return Chunk(key, key, value, log_decay=jnp.zeros((1, tokens, 1), jnp.float32), beta=beta,
+                 state=jnp.zeros((1, 1, width, width), jnp.float32))
 
 
 def test_the_solve_holds_a_negative_eigenvalue_rules_inverse():
     """Unit keys within 1e-3 of one direction under write gates near two (twice a sigmoid's, the
     negative-eigenvalue delta rule's), declared (`write_bound`): each transition's eigenvalue near -1, the
     chunk's inverse alternating in sign at entries up to two, within fp16's range (`recurrence.Hooks.
-    inverse_bound`). The template's 16-bit call on par from float64 with the port's, whose roundings it
-    takes (`recurrence_chunk.fla_rule`), the token recurrence the truth (check 1): no transition damps
+    inverse_bound`). The template's 16-bit call on par from float64 with recorded fla's (`fla_sites`), the
+    token recurrence the truth (check 1): no transition damps
     them, and the fp32 portable math stays 14 times nearer."""
-    tokens, width = 64, 64
-    hooks = recurrence.Hooks(decay='scalar', scale=width ** -0.5, write_bound=2.0)
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(53 + seed), 4)
-        base = jax.random.normal(keys[0], (1, 1, 1, width))
-        key = base + 1e-3 * jax.random.normal(keys[1], (1, tokens, 1, width))
-        key = (key / jnp.linalg.norm(key, axis=-1, keepdims=True)).astype(jnp.bfloat16)
-        value = jax.random.normal(keys[2], (1, tokens, 1, width)).astype(jnp.bfloat16)
-        beta = (2.0 * jax.nn.sigmoid(6.0 + jax.random.normal(keys[3], (1, tokens, 1)))).astype(jnp.bfloat16)
-        return key, value, beta
-
-    def output(rule):
-        def run(key, value, beta):
-            drawn = Chunk(key, key, value, log_decay=jnp.zeros((1, tokens, 1), key.dtype), beta=beta,
-                          state=jnp.zeros((1, 1, width, width), jnp.promote_types(key.dtype, jnp.float32)))
-            found = rule(drawn)
-            return found[0] if isinstance(found, tuple) else found
-        return run
-
-    assert_as_exact(output(functools.partial(chunk_on, 'mosaic_gpu', hooks)),
-                    output(functools.partial(chunk_on, 'fla', hooks)), draw,
-                    "the template's solve under write gates near two", seeds=SEEDS,
-                    truth_fn=output(functools.partial(token_by_token, hooks)))
+    the_template_is_as_exact_as_fla(functools.partial(chunk_on, 'mosaic_gpu', NEAR_TWO_HOOKS), 'near two',
+                                    ('out',), "the template's solve under write gates near two")
 
 
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
@@ -556,7 +621,7 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     target = 'sm90'
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
-    bound = template.MOSAIC.bind(*args, None, max_segments=None, floor=None)
+    bound = template.MOSAIC.bind(*args, None, max_segments=None, floor=None, bound=1.0)
     with generation.assumed(facts):
         derived, variant = template.MOSAIC.variants(bound)[:2]
 
@@ -596,7 +661,8 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     operands = {length: resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, length) for length in lengths}
     with generation.assumed(facts):
         launches = {length: (bound := template.MOSAIC.bind(*operands[length], None, max_segments=None,
-                                                           floor=None), template.MOSAIC.variants(bound)[0])
+                                                           floor=None, bound=1.0),
+                             template.MOSAIC.variants(bound)[0])
                     for length in lengths}
 
     def both(*flat):
@@ -627,7 +693,7 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     which runs at both; a refusal of the joined tiles once matched none of the rules' candidates, and the
     call found none (`Unfitted`)."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
-    bound = template.MOSAIC.bind(*args, None)
+    bound = template.MOSAIC.bind(*args, None, bound=1.0)
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
@@ -650,11 +716,16 @@ def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.Register
 
 class Unbudgeted(template.Mosaic):
     """The recurrence template with every launch's registers held: its derivation takes the tile it would
-    where only registers refuse one (`compiled_cases`' refused tiles)."""
+    where only registers refuse one (`compiled_cases`' refused tiles), a states launch no multiprocessor
+    holds at its registers (`Launch.resident` zero) one program a multiprocessor, as it would hold were its
+    registers held."""
 
     def _held(self, ba, config) -> bool:
         del ba, config
         return True
+
+    def states_held(self, ba, tiles, target) -> int:
+        return max(super().states_held(ba, tiles, target), 1)
 
 
 NEIGHBOURS = 3
@@ -670,15 +741,17 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                # H100's derived tiles is row 2939's.
                and not (name in RATED and dtype == jnp.float32)
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
+                                                           ('qwen3.5-27b-gdn', jnp.float32),
+                                                           ('kimi-linear-kda', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16)})
                and not (variant is not None and (training or packed or dtype == jnp.float32))]
-"""The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
-every geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the gated delta
-rule's 16-bit training pass (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key
-dimension); one row's 16-bit forward at its derived tiles apart from each of its variants (`variant`, a
-test each: an fp32 forward, which every family refuses, has none). One test compiling them all took 674
-seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three variants 117 on sm80 at
-9e65ee222's gate, each about the forward's 89 (armada)."""
+"""The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
+geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
+gated delta rule in both and of Kimi delta attention and the SSD in 16 bits (Kimi's keys, 128 wide, past what
+an fp32 call takes under a decay a key dimension); one row's 16-bit forward at its derived tiles apart from
+each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none). One test
+compiling them all took 674 seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three
+variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada)."""
 
 
 
@@ -703,8 +776,10 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         per_key = RESOURCE_SHAPES[name][4]
         args = resource_operands(name, dtype, rows, length)
         starts = jax.ShapeDtypeStruct((rows, length), jnp.bool_) if packed else None
+        # A delta rule's layer declares unit keys and sigmoid write gates (`recurrence.Hooks.inverse_bound`).
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
-                                     floor=FLOOR if per_key else None, **form(name, dtype))
+                                     floor=FLOOR if per_key else None, bound=None if name in RATED else 1.0,
+                                     **form(name, dtype))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
             held = Unbudgeted().derived(bound, facts)
@@ -725,8 +800,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
             unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
             if training and not mainloop_backward.backward_holds(
-                    *args, tiles=derived, family=family, shared=shared, starts=starts,
-                    max_segments=8 if packed else None, **unwide):
+                    *args, tiles=derived, family=family, target=facts, starts=starts,
+                    max_segments=8 if packed else None, floor=FLOOR if per_key else None, **unwide):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
@@ -752,9 +827,10 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
 
     def form(name: str, dtype) -> dict:
-        """The call's form beside its operands: a rated scan's without the delta rule, wide for its skip,
-        `rounded` (its fast forms, `mamba_rounding`), as the SSD's route gives it."""
-        return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {}
+        """The call's form beside its operands under the run's fast forms (`rounded`, `fast_rounding`, an fp32
+        call's operands in two parts), as its route gives it: a rated scan's without the delta rule and wide
+        for its skip."""
+        return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
@@ -768,7 +844,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or mainloop_backward.backward_holds(
-                *args, tiles=tiles, family=family, shared=shared, starts=starts, **unwide)
+                *args, tiles=tiles, family=family, target=facts, starts=starts,
+                floor=FLOOR if per_key else None, **unwide)
         if not held:
             # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`,
             # as at the derived tiles): the launches its model refuses held apart (`apart_failures`).
@@ -782,7 +859,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                           array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
             formed = {key: value for key, value in form(name, dtype).items() if key != 'wide' or not training}
             run = functools.partial(mainloop_backward.gradients if training else mainloop.forward, **formed,
-                                    **({} if training else {'floor': FLOOR if per_key else None}))
+                                    floor=FLOOR if per_key else None)
 
             def fn(*operands):
                 *operands, documents = operands if packed else (*operands, None)

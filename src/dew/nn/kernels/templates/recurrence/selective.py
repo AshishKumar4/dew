@@ -13,7 +13,6 @@ backward does."""
 
 import dataclasses
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -21,12 +20,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import tuning
+from dew.nn.kernels import recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import mosaic, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
-
-LOG2E = math.log2(math.e)
-"""`exp(z) = exp2(z log2(e))`: the scan's decays are exp2 of the rate scaled by it."""
 
 RESET_WIDTH = 32
 """The columns a row's resets take in their stream, every column the token's flag: the narrowest an int8 tile
@@ -153,12 +149,13 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
                     def token(t, h):
                         step_ = dts[t, :].astype(jnp.float32)
                         value = xs[t, :].astype(jnp.float32)
-                        written = step_ * value
-                        kept = 1.0 if resets is None else 1.0 - resets[t, 0].astype(jnp.float32)
-                        h = [jnp.exp2(step_ * rates[n]) * kept * h[n] + written * bs[t, n].astype(jnp.float32)
-                             for n in range(states)]
-                        read = _pairwise([cs[t, n].astype(jnp.float32) * h[n] for n in range(states)])
-                        out_smem[t, :] = (read + skip * value).astype(out_smem.dtype)
+                        kept = None if resets is None else 1.0 - resets[t, 0].astype(jnp.float32)
+                        h = algebra.selective_token(
+                            h, [algebra.selective_decay(step_, rates[n], kept) for n in range(states)],
+                            step_ * value, [bs[t, n].astype(jnp.float32) for n in range(states)])
+                        c = [cs[t, n].astype(jnp.float32) for n in range(states)]
+                        read = algebra.selective_read(h, c, skip, value)
+                        out_smem[t, :] = read.astype(out_smem.dtype)
                         return h
 
                     h = lax.fori_loop(0, chunk, token, h, unroll=UNROLLED)
@@ -187,16 +184,6 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
                              name="selective_scan")
     outs = launched(x, dt, b, c, parameters, state, resets)
     return (*outs, None) if not scan.entered else tuple(outs)
-
-
-def _pairwise(terms: list) -> jax.Array:
-    """`terms` summed as a balanced tree, its depth log2 of their count: summed in turn, the readout's 16
-    states put an fp32 scan's output 1.68 times the portable scan's distance from float64 where every decay
-    is near zero, its own write the whole state (the interpreted regime test)."""
-    while len(terms) > 1:
-        paired = [a + b for a, b in zip(terms[::2], terms[1::2], strict=False)]
-        terms = [*paired, *terms[len(terms) // 2 * 2:]]
-    return terms[0]
 
 
 PARTIALS = 32
@@ -276,7 +263,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 dx, ddt = sums
                 rate = parameters_ref[n, channel]
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
-                a = jnp.exp2(dts * rate) if kept is None else jnp.exp2(dts * rate) * kept
+                a = algebra.selective_decay(dts, rate, kept)
                 written = dts * xs * bs
                 entering = entered_ref[row, k, n, channel]
                 before, _ = block_scan.linear_scan(a, written, entering, exchanged, exclusive=True,
@@ -284,19 +271,17 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 read = cs * dys
                 after, carried[0, n] = block_scan.linear_scan(
                     a, a * read, carried[0, n], exchanged, reverse=True, exclusive=True, interpret=interpret)
-                cotangent = read + after
-                through = cotangent * before * a
+                d_value, d_step, d_b, d_c, d_rate = algebra.selective_adjoint(
+                    read + after, before, a, written, dts, xs, bs, dys, rate)
                 # The rate's gradient so far read before the sum's barriers, so no thread reads another's
                 # write of it: read after, an A100's threads added the block's sum twice over (1.6e-2 of
                 # dA from float64 against the rest's 4e-7, mamba1-scan-a100-7d3152837).
                 so_far = carried[1, n]
-                carried[1, n] = so_far + block_scan.summed(through * dts, exchanged, interpret=interpret)
+                carried[1, n] = so_far + block_scan.summed(d_rate, exchanged, interpret=interpret)
                 partial = channel % PARTIALS
-                added(db_ref.at[partial, row, n, span], cotangent * dts * xs)
-                added(dc_ref.at[partial, row, n, span], dys * (a * before + written))
-                # `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times it, in the rate `dt ln(2)`.
-                return (dx + cotangent * bs * dts,
-                        ddt + cotangent * bs * xs + through * (rate * math.log(2.0)))
+                added(db_ref.at[partial, row, n, span], d_b)
+                added(dc_ref.at[partial, row, n, span], d_c)
+                return dx + d_value, ddt + d_step
 
             zeros = jnp.zeros((positions,), jnp.float32)
             dx, ddt = lax.fori_loop(0, states, state, (parameters_ref[states, channel] * dys, zeros))
@@ -367,7 +352,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
 def _parameters(A, D, channels: int):
     """`forward`'s parameter tile: the rates `A log2(e)` transposed, then the skip, padded to the stream's
     rows."""
-    return jnp.concatenate([(A * LOG2E).T, D[None], jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)])
+    padding = jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)
+    return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(8,))

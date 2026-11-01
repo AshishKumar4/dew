@@ -1,14 +1,17 @@
-"""What every derivation shares (`derive`, `scan`): the forms a declaration derives (`Derived`), its refusal
-(`Refused`), and the reading of a declaration's jaxpr: what a value reads, an equation's evaluation, a value's
-array type."""
+"""What every derivation shares (`derive`, `scan`): the forms a declaration derives (`Derived`), those forms
+with their math rewritten by the engine (`rewritten`), its refusal (`Refused`), and the reading of a
+declaration's jaxpr: what a value reads, an equation's evaluation, a value's array type."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
+import jax
 from jax.core import ShapedArray
 from jax.extend import core as jcore
+
+from dew.algebra import program
 
 
 class Derived(NamedTuple):
@@ -82,3 +85,29 @@ def aval(atom) -> ShapedArray:
     if not isinstance(atom.aval, ShapedArray):
         raise Refused(f"a value of no array type ({atom.aval}) in the declaration")
     return atom.aval
+
+
+def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturation) -> Derived:
+    """`derived`'s forms, each traced where it is called and its math rewritten by the engine before it is
+    evaluated (`program.rewrite`: every window a rule reads in its cheapest form under the program's cost,
+    each rewrite in the kernel report): the derivation's forms joined to the e-graph's rules, `accurate`
+    admitting exact rewrites only. The empty state (`init`) takes shapes, not values: as it is. A rewritten
+    form computes its form's values (check 1 holds it, tests/test_algebra_join.py); it is cheaper where a
+    rule found a cheaper form, the form as derived where none did."""
+
+    def through(form: Callable | None) -> Callable | None:
+        if form is None:
+            return None
+
+        def call(*arguments):
+            flat, tree = jax.tree.flatten(arguments)
+            closed, shapes = jax.make_jaxpr(lambda *values: form(*jax.tree.unflatten(tree, list(values))),
+                                            return_shape=True)(*flat)
+            outputs = program.rewrite(closed, flat, accurate=accurate, saturation=saturation)
+            return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
+
+        return call
+
+    return derived._replace(step=through(derived.step), merge=through(derived.merge),
+                            finish=through(derived.finish), mapped=through(derived.mapped),
+                            backward=through(derived.backward))

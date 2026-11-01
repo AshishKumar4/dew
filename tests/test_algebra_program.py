@@ -163,3 +163,50 @@ def test_a_calls_locals_go_when_its_first_program_imports_the_pass():
     done = subprocess.run([sys.executable, "-c", PINNED], capture_output=True, text=True, check=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.stdout.strip().splitlines()[-1] == "True"
+
+def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rules_read():
+    """A program whose math runs four thousand equations deep before two sums the rules join (a step's
+    backward through every layer) is rewritten in a window around those sums, the deep chain read as
+    values from outside it: the sums are joined and the program is on par with the unrewritten one, where
+    holding the whole chain as one term would pass the interpreter's recursion limit."""
+    def deep(x, y, a):
+        for _ in range(4000):
+            x = jnp.sin(x)
+        return two_sums(x, y, a)
+
+    x, y, a = rows(5, (4, 16), (4, 16), (4, 16))
+    assert reductions(jax.make_jaxpr(algebra.rewritten(deep))(x, y, a)) == 1
+
+    def draw(seed):
+        return rows(seed, (4, 16), (4, 16), (4, 16))
+
+    assert_as_exact(jax.jit(algebra.rewritten(deep)), jax.jit(deep), draw, "two sums after a deep chain",
+                    seeds=8)
+
+def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
+    """A contraction's result scaled by a power of two (a derived walk's `ds k * scale`, docs/design/
+    algebra.md §1.4) scales its smaller operand instead, the product being linear in each and the scale
+    rounding nothing: the rewritten program multiplies 4 x 4 values where it multiplied 4 x 16, on par with
+    the program as written against the float64 truth (check 1). A scale of another value stays where the
+    program put it, as moving it reorders rounding."""
+    def scaled(g, i):
+        return jnp.dot(g, i) * 0.25
+
+    def other(g, i):
+        return jnp.dot(g, i) * 0.3
+
+    g, i = rows(6, (4, 4), (4, 16))
+    kept = jax.make_jaxpr(algebra.rewritten(other))(g, i)
+    assert [equation.outvars[0].aval.shape for equation in equations(kept)
+            if equation.primitive.name == "mul"] == [(4, 16)]
+
+    after = jax.make_jaxpr(algebra.rewritten(scaled))(g, i)
+    assert [equation.outvars[0].aval.shape for equation in equations(after)
+            if equation.primitive.name == "mul"] == [(4, 4)]
+
+    def draw(seed):
+        return rows(seed, (4, 4), (4, 16))
+
+    assert_as_exact(jax.jit(algebra.rewritten(scaled)), jax.jit(scaled), draw,
+                    "a scale through a contraction", seeds=16)
+

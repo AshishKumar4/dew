@@ -189,6 +189,30 @@ def region(closed: jcore.Jaxpr) -> Region:
                   max(depths.values(), default=0), len(jaxpr.eqns))
 
 
+def spoken(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` is of the language (`_term` makes a term of it), outside every protected region."""
+    name, arity = equation.primitive.name, len(equation.invars)
+    if len(equation.outvars) != 1 or protected(equation):
+        return False
+    binary = name in BINARY or name in COMPARISONS or name == "dot_general"
+    unary = name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type"
+    return (binary and arity == 2) or (unary and arity == 1) or (name == "select_n" and arity == 3)
+
+
+def form_value(region_: Region, form: Term, values: list) -> jax.Array:
+    """One chosen `form`'s value over `region_`'s leaves' `values` (a region of the language alone, whose
+    leaves are its inputs), each shared term evaluated once."""
+    known: dict[str, jax.Array] = {}
+
+    def value(term: Term) -> jax.Array:
+        key = str(term)
+        if key not in known:
+            known[key] = _value(term, value, region_, values)
+        return known[key]
+
+    return value(form)
+
+
 def _shape(atom) -> tuple[int, ...]:
     """An array value's shape; a value of no shape (a token, a key's) has none the rules read."""
     return tuple(atom.aval.shape) if isinstance(atom.aval, ShapedArray) else ()
@@ -225,35 +249,6 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
             given["preferred_element_type"] = None
         return read(equation.invars[0]).dot(read(equation.invars[1]), param(primitive, given))
     return None
-
-
-def evaluated(region_: Region, chosen: Mapping[str, Term], values: list) -> list[jax.Array]:
-    """The values of `region_`'s outputs over its leaves' `values` (inputs and constants first), each root as
-    extraction `chosen` its form (by the root's text): each equation outside the language bound in program
-    order once its inputs are known, under its protected marker where it had one, each shared term evaluated
-    once."""
-    known: dict[str, jax.Array] = {}
-
-    def value(term: Term) -> jax.Array:
-        key = str(term)
-        if key not in known:
-            known[key] = _value(term, value, region_, values)
-        return known[key]
-
-    for opaque in region_.opaque:
-        operands = [opaque.literals[index] if term is None else value(chosen[str(term)])
-                    for index, term in enumerate(opaque.inputs)]
-        primitive = opaque.equation.primitive
-        given = primitive.get_bind_params(opaque.equation.params)
-        if protected(opaque.equation):
-            with jax.named_scope(PROTECTED):
-                made = primitive.bind(*operands, **given)
-        else:
-            made = primitive.bind(*operands, **given)
-        for leaf, output in zip(opaque.outputs, made if primitive.multiple_results else [made], strict=True):
-            values[leaf] = output
-    return [region_.literal_outputs[index] if root is None else value(chosen[str(root)])
-            for index, root in enumerate(region_.outputs)]
 
 
 def _index(argument) -> int:

@@ -69,6 +69,18 @@ scalar without; one sequence and packed), sized by `seeds_for` on armada (2026-1
 PACKED = (False, True)
 
 
+def formed(forms: str, fn):
+    """`fn` under the run's `forms` (`generation.numerics`): an fp32 call on the template in three parts
+    under the accurate forms, as the portable math holds it, whose bar is the fp32 recurrence's own distance;
+    in two under the fast forms (`mainloop.FAST_PARTS`), held to recorded upstream's instead."""
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)):
+            return fn(*args, **kwargs)
+
+    return run
+
+
 def chunk_on(kernel: str, hooks, *args, **kwargs):
     """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector where it runs it,
     and for the rated scan's where that runs it: the portable math ('xla') and the recurrence template
@@ -182,6 +194,24 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
     dew = jax.jit(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(draw, hooks, packed), f'{hooks} packed={packed}',
+                    seeds=SEEDS[hooks, packed])
+
+
+DERIVED = [hooks for hooks in HOOKS + FORMED if hooks.delta or not hooks.rated]
+"""The hooks the delta rule's op runs (`GATED_DELTA`), which the derived forms take: every one but a rated
+scan without the delta rule (Mamba2's SSD, the scan's own op)."""
+
+
+@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
+@pytest.mark.parametrize('hooks', DERIVED, ids=str)
+def test_the_derived_forms_are_as_exact_as_the_recurrence_token_by_token(hooks, packed):
+    """The forms derived from the token update (`recurrence_chunk.derived_rule`, `dew.algebra.scan`), named
+    for the rule, against the same recurrence a token at a time, output and final memory, on the portable
+    math's draws of one sequence or of packed documents, each document's first token its forms' reset (check
+    1): the accuracy check the derived forms are taken behind."""
+    dew = jax.jit(functools.partial(chunk_on, 'derived', hooks, chunk_size=CHUNK))
+    reference = jax.jit(functools.partial(token_by_token, hooks))
+    assert_as_exact(dew, reference, lambda seed: draw(hooks, packed=packed, seed=seed), f'{hooks} derived',
                     seeds=SEEDS[hooks, packed])
 
 

@@ -26,14 +26,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
+import reference_error as gate
+from fla_sites import LEAVES, RECORDED, the_template_is_as_exact_as_fla
+from reference_error import FEWEST_SEEDS, assert_as_exact, recording, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
 from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
+from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
 
 pytestmark = pytest.mark.kernel
@@ -73,12 +75,12 @@ def fast_backward(operands: Chunk) -> bool:
     the call's derived tiles on the device's bundle, or interpreted, the interpreted one's (`mosaic_rule`)."""
     target = template.Mosaic.launched()
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
-                                 operands.beta, operands.state, operands.starts)
+                                 operands.beta, operands.state, operands.starts, bound=HOOKS.inverse_bound)
     tiles = template.MOSAIC.derived(bound, target)
     return mainloop_backward.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
                                    operands.beta, operands.state, tiles=tiles,
-                                   family=mainloop.family_of() or mainloop.INTERPRETED,
-                                   shared=generation.shared_budget(target), starts=operands.starts)
+                                   family=mainloop.family_of() or bundles.INTERPRETED, target=target,
+                                   starts=operands.starts)
 
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
@@ -93,12 +95,19 @@ def assert_finite(fn, truth, operands, regime: str) -> None:
 
 
 def reference_arm(hooks, forms: str | None):
-    """The arm the template is held against for a form under `forms`, each in the call's dtype: the fla port
-    where it runs it (the delta rule with a decay), the port of mamba_ssm's kernels for the rated scan under
-    the fast forms (its numbers mamba_ssm's), else the portable math."""
+    """The arm the template is held against for a form under `forms`, each in the call's dtype, where it runs
+    here: the fla port for the gated delta net's formed gates, the port of mamba_ssm's kernels for the rated
+    scan under the fast forms (its numbers mamba_ssm's), else the portable math. The delta rule with a decay
+    on its operands as given is held to recorded fla-core (`fla_recorded`)."""
     if hooks.delta and hooks.decay != 'none':
         return functools.partial(chunk_on, 'fla', hooks)
     return functools.partial(chunk_on, 'pallas' if hooks.rated and forms == 'fast' else 'xla', hooks)
+
+
+def fla_recorded(hooks) -> bool:
+    """Whether a form's reference is recorded fla-core (`fla_sites`): the delta rule with a decay on its
+    operands as given, no gates formed in the rule."""
+    return hooks.delta and hooks.decay != 'none' and hooks.gates is None
 
 
 def under(forms: str | None):
@@ -154,8 +163,12 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
         for seed in range(2):
             assert_finite(dew, truth, draws(seed), regime)
-        assert_as_exact(dew, reference, draws, f'the template, {name} under {regime}, its {product}',
-                        seeds=seeds, truth_fn=truth)
+        label = f'the template, {name} under {regime}, its {product}'
+        if fla_recorded(hooks):
+            the_template_is_as_exact_as_fla(mosaic, f"stability/{name}/{regime}/{product}",
+                                            ('out', 'final') if product == 'forward' else LEAVES, label)
+            return
+        assert_as_exact(dew, reference, draws, label, seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize('forms', forms_of(SITES['rated']))
@@ -173,6 +186,21 @@ def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted(form
                         lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
                         f'the template, rated under the decay bound, its forward ({forms} forms)',
                         seeds=FEWEST_SEEDS, truth_fn=functools.partial(token_by_token, hooks))
+
+
+@pytest.mark.parametrize('forms', forms_of(SITES['rated']))
+def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms):
+    """The rated scan's fp32 forward through the template under `forms`, interpreted off a GPU, finite
+    wherever the float64 recurrence's is: its skip added after the walk where the template holds no 16-bit
+    values (an fp32 call's two parts under the fast forms; fused there, its output launch failed the gated
+    keys' check)."""
+    hooks = SITES['rated']
+    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
+    drawn = stressed(hooks, 'the decay bound', 0)
+    with under(forms):
+        assert runs(mosaic, hooks, drawn[0], drawn, 'forward')
+        assert_finite(jax.jit(mosaic), jax.jit(functools.partial(token_by_token, hooks)), drawn,
+                      'the decay bound')
 
 
 @pytest.mark.parametrize('name', SITES)
@@ -200,12 +228,13 @@ def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(r
 
 @pytest.mark.whole_suite  # 130 s interpreted, past a group's two minutes (ledger 2145).
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
-    """The fast backward's log decay gradient, interpreted, as near float64 as the port's under decays near
-    zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop_backward.gradients`), never a
-    token's own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to
-    169 times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
-    0.98 to 1.00 times after), held on one draw by the gate's one-draw rule. On a GPU whose launches do not
-    hold the fast backward the rule refuses the gradient (row 1926)."""
+    """The fast backward's log decay gradient, interpreted, as near float64 as recorded fla-core's
+    (`fla_sites`) under decays near zero on a draw: a chunk's ranges sum each token's terms before it
+    (`mainloop_backward.gradients`), never a token's own order-one term added and taken away, which rounded
+    away the `exp(-30)` terms before it (65 to 169 times the port's distance on three draws, the H100's
+    check 1 140 times, SE-numerics-h100-fd61e11eeb; 0.98 to 1.00 times after), held on one draw by the gate's
+    one-draw rule, pooled (the recording keeps no rows of it). On a GPU whose launches do not hold the fast
+    backward the rule refuses the gradient (row 1926)."""
     regime = 'decays near zero'
     operands, (out, final) = cotangents(HOOKS, regime, 0)
     drawn = (bf16(operands, HOOKS), (out.astype(jnp.bfloat16), final))
@@ -213,12 +242,11 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     if not fast_backward(restarting(lambda given: given, regime)(drawn[0])):
         refuses_its_gradient(template, *drawn)
         return
-    port = with_gradients(functools.partial(chunk_on, 'fla', HOOKS))
     with jax.enable_x64(new_val=True):
         exact = jax.jit(with_gradients(functools.partial(token_by_token, HOOKS)))(*widened(drawn))
-
-    def leaf(fn):
-        return np.asarray(jax.jit(fn)(*drawn)[1].log_decay)
-
-    assert_as_exact_as_the_reference(leaf(template), leaf(port), np.asarray(exact[1].log_decay),
-                                     f'the template, {regime}, its log decay gradient on a draw')
+    mine = gate.distance(np.asarray(jax.jit(template)(*drawn)[1].log_decay), np.asarray(exact[1].log_decay))
+    # fla-core's own distance on the draw, recorded (`fla_sites`): its mean squared error from float64.
+    theirs = float(np.sqrt(recording(RECORDED)[f"stability/scalar delta/{regime}/gradient.mse.dg"][0]))
+    assert gate.within(mine, gate.FACTOR * theirs), (
+        f"the template, {regime}, its log decay gradient on a draw: {mine:.3e} from float64 (rms), recorded "
+        f"fla-core {theirs:.3e} (ratio {mine / theirs:.2f}, allowed {gate.FACTOR})")
