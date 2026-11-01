@@ -474,6 +474,33 @@ def _jittered(metadata):
     return Jittered()
 
 
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_epochs_of_a_concatenating_pack_a_shuffle_draws_count_each_example_once_its_windows_are_drawn(read):
+    """Ten documents a concatenating pack cuts across windows, shuffled after (all of them where a memory
+    read holds the windows, four at a time in a stream) and read through an objective's two rows of each
+    window: an epoch is a pass over the 10 documents, so two epochs bound the run to 20, and its clock
+    counts each once every window holding a piece of it is drawn, at 20 when the run ends (row 1902)."""
+    import optax
+
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+    from dew.training import Trainer
+
+    class Twice:
+        identity = "twice@1"
+
+        def flat_map(self, element):
+            return (element, element)
+
+    documents = [{"id": np.full(index % 5 + 3, index + 1, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents, shard_rows=5)).pack(8, fields=("id",), policy="concat")
+    chain = chain.shuffle(seed=1, window=None if read == "memory" else 4).read(read).batch(4)
+    loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
+    assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
+    state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 20
+
+
 class _KeptWhole:
     """A step that keeps each record as it is."""
 

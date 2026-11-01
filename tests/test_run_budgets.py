@@ -345,6 +345,10 @@ def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_windo
         # Every token of a pack's documents is laid in a window; windows leave the stream's last tokens
         # past every window out.
         assert consumed == len(_LENGTHS)
+    if layout == "held":
+        # Held windows read in one order deal each batch's rows to the shares; through an objective's rows
+        # each share reads its own order, its windows whole examples (`whole_examples`).
+        assert (loader.order_records is None) == expands
     if loader.order_records is None:
         owners = collections.defaultdict(set)
         for share, batches in enumerate(drawn):
