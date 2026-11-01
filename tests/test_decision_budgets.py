@@ -432,14 +432,21 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
 @pytest.mark.parametrize("count", [77, 151])
 def test_a_runs_readout_holds_the_labels_its_datas_questions_ask(backbone, count):
     """A fresh lettered run whose data states its question's options holds as many labels as they are,
-    one more where its objective adds "none of the above", and reports the count and its origin."""
+    one more where its objective adds "none of the above" to them (a floor of options at most theirs),
+    and reports the count and its origin."""
     objective, _, summary = _run(backbone, count, stated=True).prepare().train("x")
     assert summary["capacities"]["labels"] == {"count": count, "from": "data"}
     assert len(objective.model.head.label_ids) == count
-    noted = dataclasses.replace(_run(backbone, count, stated=True), objective=dataclasses.replace(
-        DecisionRunConfig().objective, fields={"none_of_the_above": 0.25}))
-    _, _, augmented = noted.prepare().train("x")
-    assert augmented["capacities"]["labels"] == {"count": count + 1, "from": "data"}
+    def noted(**fields):
+        held = dataclasses.replace(_run(backbone, count, stated=True), objective=dataclasses.replace(
+            DecisionRunConfig().objective, fields={"none_of_the_above": 0.25, **fields}))
+        return held.prepare().train("x")[2]["capacities"]["labels"]
+
+    assert noted() == {"count": count + 1, "from": "data"}
+    # A floor above the data's widest question draws no "none of the above", so it adds no label; one at
+    # it does (row 2937).
+    assert noted(none_of_the_above_options=count + 1) == {"count": count, "from": "data"}
+    assert noted(none_of_the_above_options=count) == {"count": count + 1, "from": "data"}
 
 
 def test_a_runs_readout_takes_every_label_where_a_split_leaves_its_options_unknown(backbone):

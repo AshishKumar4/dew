@@ -44,16 +44,9 @@ import tyro
 from etils import epath
 
 import dew.io
-from dew import registry, training
+from dew import _records, registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import (
-    JSON,
-    duration,
-    earlier_fields,
-    is_share,
-    json_value as field_value,
-    recorded_duration,
-)
+from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -90,7 +83,7 @@ from dew.registry import (
 )
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
-from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
+from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
 from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
@@ -996,8 +989,8 @@ def earlier_chains(record: Mapping[str, object]) -> Mapping[str, object]:
     fields = record.get("fields")
     if not isinstance(fields, Mapping) or not any(name in fields for name in _CHAINS):
         return record
-    return {**record, "fields": {name: _renamed_chain(field_value(value, name)) if name in _CHAINS else value
-                                 for name, value in fields.items()}}
+    return {**record, "fields": {name: _renamed_chain(_records.json_value(value, name)) if name in _CHAINS
+                                 else value for name, value in fields.items()}}
 
 
 def _renamed_chain(chain: JSON) -> JSON:
@@ -1107,7 +1100,7 @@ def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(fields, Mapping) and isinstance(segments, list):
         # A decision run's row of segments, each component in today's fields (`earlier_fields`): the
         # segments alone, where a layout's components are, never a field of data a row holds.
-        migrated = earlier_fields(field_value(segments, "segments"))
+        migrated = earlier_fields(_records.json_value(segments, "segments"))
         assert isinstance(migrated, list)
         fields = {**fields, "segments": migrated}
         record = {**record, "fields": fields}
@@ -1996,8 +1989,8 @@ class RunConfig:
                     display.note(f"Experiment_Name: {name}")
                     display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
-                    tracker.artifact(RunRecord(name, json_value(self.to_dict()),
-                        json_value(summary or {}), steps, packages_installed(),
+                    tracker.artifact(RunRecord(name, tracker_json(self.to_dict()),
+                        tracker_json(summary or {}), steps, packages_installed(),
                         device_kind=jax.devices()[0].device_kind, devices=jax.device_count(),
                         processes=jax.process_count()), 0)
 

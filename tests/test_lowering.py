@@ -567,12 +567,12 @@ def _selective_step(rows: int):
 
 PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "swiglu": _swiglu_step,
                    "short conv": _short_conv_step, "selective scan": _selective_step}
+"""Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
+ops here."""
 
 UNTAKEN = {("sm80", "selective scan")}
 """The steps whose template a GPU's kernel refuses whatever a call names: an A100's selective scan, its
 strided channel blocks' untiled copies wrong until the jax fork's post42 (`recurrence_chunk.SELECTIVE`)."""
-"""Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
-ops here."""
 
 
 def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
