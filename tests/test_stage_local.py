@@ -26,7 +26,7 @@ from dew.lora import LoRA
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig, ParamGroup, parameter_name, scale_by_m3, weight_decay_mask
 from dew.registry import models
-from dew.training import Inspection, Layout, MeshSpec, Trainer
+from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer
 from dew.training.diloco import DiLoCo
 from dew.training.inspection import inspected
 from dew.training.rollout import rolled_out
@@ -287,6 +287,87 @@ def stream():
     def batch_at(step: int) -> dict:
         return token_rows(VOCAB, BATCH, SEQ + 1, seed=step)
     return Loader(train=lambda partition: Replaying(batch_at), val=None, records=None, batch=BATCH)
+
+
+@pytest.mark.mesh(devices=8)
+def test_what_a_stage_local_run_hands_outside_the_trainer_holds_every_layer_whole():
+    """Every state a stage-local run hands its user holds each layer whole, as the same run with every layer
+    whole on every stage hands it (ledger 3438): the state `initial_state` builds, the one an Observe reads
+    at each step, and the one `fit` returns, whose objective's pipeline generates, off the mesh, what the
+    whole-layer run's generates."""
+    model = decoder()
+    handed = []
+    for stage_local in (True, False):
+        run = trainer(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), STAGED, 8,
+                      stage_local=stage_local)
+        start = on_host(run.initial_state().variables)
+        observe = Observe(1, lambda state: on_host(state.variables))
+        trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe)
+        generated = run.objective.pipeline(trained)([[1, 2]], 4, key=0).host()
+        handed.append((start, observe.values, on_host(trained.variables), generated.tokens,
+                       generated.raw_log_probs))
+    local, whole = handed
+    assert jax.tree.structure(local) == jax.tree.structure(whole)
+    for mine, theirs in zip(jax.tree.leaves(local), jax.tree.leaves(whole), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_stage_local_runs_episodes_score_the_model_every_layer_whole():
+    """A split a stage-local run scores by flying its model (`Episodes`) reads its variables with every
+    layer whole, as a policy outside the mesh reads them, and scores what the same run with every layer
+    whole on every stage scores (ledger 3439)."""
+    from recording import RecordingTracker
+
+    from dew.objectives.base import Shown
+    from dew.training import Episodes, EvalSuite
+
+    model = decoder()
+    ids = jnp.asarray(token_rows(VOCAB, 2, SEQ, seed=3439)["text"])
+
+    def flown(variables, key):
+        return {"logit": float(jnp.mean(model.apply({"params": variables["params"]}, ids)))}
+
+    scored = []
+    for stage_local in (True, False):
+        run = trainer(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), STAGED, 8,
+                      stage_local=stage_local)
+        run.tracker = RecordingTracker()
+        run.fit(stream(), steps=STEPS, log_every=1,
+                validation={"flight": EvalSuite(Episodes(flown, {"logit": Shown()}), every=STEPS)})
+        scored.append([(step, values["flight/logit"]) for step, values in run.tracker.scalars
+                       if "flight/logit" in values])
+    assert scored[0] and scored[0] == scored[1]
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("kind", ["decision", "ppo"])
+def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_local(kind):
+    """A decision's headed model keeps its backbone's run stacked by stage, each device its own stage's
+    layers, as an LM's decoder does, and PPO its policy's and its critic's (ledger 3440): the state placed
+    over two stages holds each decoder's run as one leaf a stage, where they held every layer whole on
+    every stage, silently."""
+    from objective_cases import decoder as small
+
+    from dew.data.text import ByteTokenizer
+    from dew.decision import DecisionObjective, Specials, StateFirstLayout
+    from dew.objectives.rl.ppo import PPOObjective, ValueHead
+
+    if kind == "decision":
+        objective = DecisionObjective(small(num_layers=4), tokenizer=ByteTokenizer(),
+                                      specials=Specials(None, 10, 0, "\x00", 255),
+                                      layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
+        decoders = {("backbone",)}
+    else:
+        objective = PPOObjective(small(num_layers=4), SEQ, critic=ValueHead(small(num_layers=4)))
+        decoders = {("policy",), ("critic", "backbone")}
+    run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=STAGED,
+                  layout=Layout(min_shard=TINY_SHARD), tracker=None)
+    state, _, _ = run.place()
+    # Each parameter's path by its keys: the params are dicts throughout.
+    paths = [[entry.key for entry in path]
+             for path, _ in jax.tree_util.tree_leaves_with_path(state.variables["params"])]
+    assert {tuple(keys[:keys.index("stages")]) for keys in paths if "stages" in keys} == decoders
 
 
 @pytest.mark.mesh(devices=8)
