@@ -181,5 +181,5 @@ def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rule
         return rows(seed, (4, 16), (4, 16), (4, 16))
 
     assert_as_exact(jax.jit(algebra.rewritten(deep)), jax.jit(deep), draw, "two sums after a deep chain",
-                    seeds=4)
+                    seeds=8)
 
