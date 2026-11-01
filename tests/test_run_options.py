@@ -211,6 +211,7 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
     from dew.decision.task import DecideSettings
 
     runs = {builder.__name__: (builder, objective) for builder, objective in TASK_RUNS["DecideSettings"]}
+    assert set(WITNESSED_ON["DecideSettings"]) == set(runs), "each run of TASK_RUNS witnesses its options"
 
     def parts(option: str) -> list[slice]:
         count = ALTERNATIVE_UNITS.get(option, 1)
@@ -221,14 +222,14 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
     assert len(units) == 18, "the shards mark counts each option's units"
     label = "the options DecideSettings' runs witness"
 
-    def witness(start: int, stop: int) -> list[tuple[list[str], dict[str, str], bool, list[str]]]:
+    def witness(start: int, stop: int) -> list[tuple[list[str], dict[str, str], bool, list[str], str]]:
         found = []
         for name, option, part in units[start:stop]:
             builder, objective = runs[name]
             options, failures, exports, holding = witnessed_on(
                 builder, objective, DecideSettings, tmp_path / f"{name}-{option}-{part.start}",
                 chosen=frozenset({option}), part=part)
-            found.append((sorted(options), failures, exports, sorted(holding)))
+            found.append((sorted(options), failures, exports, sorted(holding), option))
         return found
 
     if record_units(label, witness):
@@ -236,11 +237,14 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
     pooled = pooled_units(label, len(units))
     witnessed = witness(0, len(units)) if pooled is None else [unit for _, _, payload in pooled
                                                               for unit in payload]
-    held = {option for *_, holding in witnessed for option in holding}
+    held = {option for *_, holding, _ in witnessed for option in holding}
     assigned = {option for _, option, _ in units}
     assert held <= assigned, f"DecideSettings' options no run here is assigned: {sorted(held - assigned)}"
+    # Each unit's option is one its run holds, so it is set and judged there, never dropped unwitnessed.
+    unheld = sorted({option for names, *_, option in witnessed if option not in names})
+    assert not unheld, f"DecideSettings' options assigned to a run that does not hold them: {unheld}"
     assert_every_option_witnessed(DecideSettings, [(names, failures, exports)
-                                                   for names, failures, exports, _ in witnessed])
+                                                   for names, failures, exports, *_ in witnessed])
 
 
 def assert_every_option_witnessed(settings: type, witnessed: list[tuple[list[str], dict[str, str], bool]]):

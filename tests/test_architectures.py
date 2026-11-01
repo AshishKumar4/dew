@@ -392,10 +392,6 @@ LAYOUT_CELLS = [*((case, steps, layout) for index, case in enumerate(CASES)
                 *((case, PIPELINED[case.name], "2x2x2 stage") for case in CASES if case.name in PIPELINED)]
 
 
-SHARDED = ("unet_3d", "unet", "hierarchical_mmdit", "causal_transformer+qwen35")
-"""The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
-with the seeds a task draws within 120 s on one core: a map task records its draws alone (70 to 93 s
-fixed, `map_judge.drawing`), its judge runs the cell whole but for them (row 2788)."""
 
 
 def cell_ids(cells) -> list[str]:
@@ -409,7 +405,16 @@ def cells_of(*names: str) -> list:
     return [cell for cell in LAYOUT_CELLS if cell[0].name in names]
 
 
-UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell[0].name not in SHARDED]
+THREE_D_UNET_CELLS = cells_of("unet_3d")
+UNET_CELLS = cells_of("unet")
+HIERARCHICAL_MMDIT_CELLS = cells_of("hierarchical_mmdit")
+QWEN35_CELLS = cells_of("causal_transformer+qwen35")
+"""The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
+with the seeds a task draws within 120 s on one core: a map task records its draws alone (70 to 93 s
+fixed, `map_judge.drawing`), its judge runs the cell whole but for them (row 2788)."""
+
+SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *QWEN35_CELLS]
+UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
 
 
 @pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
@@ -431,34 +436,33 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), cells_of("unet_3d"), ids=cell_ids(cells_of("unet_3d")))
+@pytest.mark.parametrize(("case", "steps", "layout"), THREE_D_UNET_CELLS, ids=cell_ids(THREE_D_UNET_CELLS))
 @pytest.mark.check1_shards(seeds=32, per_task=8)
 def test_a_3d_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
-    """`test_architecture_trains_on_every_layout_as_on_one_device` over the 3D U-Net (`SHARDED`)."""
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the 3D U-Net."""
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), cells_of("unet"), ids=cell_ids(cells_of("unet")))
+@pytest.mark.parametrize(("case", "steps", "layout"), UNET_CELLS, ids=cell_ids(UNET_CELLS))
 @pytest.mark.check1_shards(seeds=64, per_task=40)
 def test_a_unet_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
-    """`test_architecture_trains_on_every_layout_as_on_one_device` over the U-Net (`SHARDED`)."""
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the U-Net."""
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), cells_of("hierarchical_mmdit"),
-                         ids=cell_ids(cells_of("hierarchical_mmdit")))
+@pytest.mark.parametrize(("case", "steps", "layout"), HIERARCHICAL_MMDIT_CELLS,
+                         ids=cell_ids(HIERARCHICAL_MMDIT_CELLS))
 @pytest.mark.check1_shards(seeds=8, per_task=3)
 def test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
-    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hierarchical MMDiT
-    (`SHARDED`)."""
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the hierarchical
+    MMDiT."""
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), cells_of("causal_transformer+qwen35"),
-                         ids=cell_ids(cells_of("causal_transformer+qwen35")))
+@pytest.mark.parametrize(("case", "steps", "layout"), QWEN35_CELLS, ids=cell_ids(QWEN35_CELLS))
 @pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_a_qwen35_decoder_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
-    """`test_architecture_trains_on_every_layout_as_on_one_device` over the Qwen3.5 decoder (`SHARDED`)."""
+    """`test_architecture_trains_on_every_layout_as_on_one_device` over the Qwen3.5 decoder."""
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
