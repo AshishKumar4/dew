@@ -673,7 +673,8 @@ def released(rings: dict[str, Ring], turn: Turn) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class Walk:
-    """A program's walk of its tile, its steps storing what it computes (no carry or accumulator past them):
+    """A program's walk of its tile, its steps storing what it computes (no accumulator past them, and its
+    `carry`, from its value here, only between them: a per-key memory's gradients across key blocks):
     the family's loads of its streams' `views` (`viewed`) and its consumer's walk of `step` over its `steps`
     steps (one by default), or of its `segments` `(step, lo, hi)` where given (a launch's own walk, a step
     of its own for some of them). Where a `prologue` is given, the consumer runs it before its walk waits on
@@ -686,6 +687,7 @@ class Walk:
     steps: int = 1
     prologue: Callable | None = None
     segments: tuple = ()
+    carry: object = ()
 
     def stepped(self) -> tuple:
         """Its segments, each step given its prologue's value, the prologue run here (in the consumer)."""
@@ -698,7 +700,7 @@ class Walk:
         if self.segments:
             raise ValueError("a persistent tile walks its one step, not segments of its own")
         ((step, _, _),) = self.stepped()
-        walk(step, None, ())
+        walk(step, self.carry, ())
 
 
 class Issuer[Accumulator](abc.ABC):
@@ -1136,7 +1138,8 @@ class Transport[Allocated, Opened](abc.ABC):
         streams = self.opened(allocated, walk.views)
 
         def consumer(wg):
-            self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), (), (), interpret)
+            self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), walk.carry, (),
+                      interpret)
 
         self.roles(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
 
