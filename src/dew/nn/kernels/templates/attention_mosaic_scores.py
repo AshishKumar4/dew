@@ -146,7 +146,11 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
         return coords.queries(read(x), s) if coords.keys_first else read(x)
 
     inverse_total = per_query(algebra.inverse(read(total)))
-    exponentials, weights = algebra.normalized(logits, per_query(peak), inverse_total, how)
+    # The fast form's exponent unclamped, its maximum safe where a query saw no key (`algebra.safe_peak`, a
+    # row's select in place of each entry's clamp).
+    fast = not walk.accurate
+    peaks = per_query(algebra.safe_peak(read(peak)) if fast else peak)
+    exponentials, weights = algebra.normalized(logits, peaks, inverse_total, how, safe=fast)
     # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
     # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
     # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
@@ -154,7 +158,7 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
-                                     inverse_total, multiplier=multiplier)
+                                     inverse_total, multiplier=multiplier, weights=weights if fast else None)
     return exponentials, weights, cotangents, slopes, seen
 
 def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
