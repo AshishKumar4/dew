@@ -70,7 +70,8 @@ from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
-from dew.nn.backbones.layer_plan import LayerKind, group_layers
+from dew.nn.backbones.layer_names import group_layers
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of

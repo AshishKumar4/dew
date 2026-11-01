@@ -33,7 +33,8 @@ from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import DecoderBlock
-from .layer_plan import LayerSpec, group_layers, group_name, run_period
+from .layer_names import group_layers, group_name
+from .layer_plan import LayerSpec, run_period
 
 Block = Callable[[int, str], DecoderBlock]
 """Layer `index`'s block under a module name: what the stack and its stages

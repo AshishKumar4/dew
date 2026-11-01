@@ -39,6 +39,7 @@ import optax
 from flax import linen as nn
 from typing_extensions import TypeVar
 
+from dew._records import UNREAD
 from dew.artifacts import Artifacts
 from dew.batch import Batch, Variables, without
 from dew.nn import categorical
@@ -48,7 +49,6 @@ from dew.nn.protocols import Bounded
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
-    UNREAD,
     Aux,
     EMASpec,
     Objective,

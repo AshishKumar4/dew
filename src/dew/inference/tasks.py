@@ -29,7 +29,15 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
 from dew._coordination import agreed
-from dew._records import earlier_fields, integer, json_value, record as named_fields, strings, text as named
+from dew._records import (
+    UNREAD,
+    earlier_fields,
+    integer,
+    json_value,
+    record as named_fields,
+    strings,
+    text as named,
+)
 from dew.batch import (
     COORDINATES_FIELD,
     PARAMETER_ROOTS,
@@ -52,7 +60,6 @@ from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
-from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
@@ -76,6 +83,7 @@ if TYPE_CHECKING:
     # reads no tokenizer library (tests/test_imports.py's optional backends).
     from dew.data.text import Tokenizer
     from dew.distributed.placement import Layout, MeshSpec
+    from dew.objectives.base import Objective
     from dew.quantization import Quantization
     from dew.registry import ModelConfig
 

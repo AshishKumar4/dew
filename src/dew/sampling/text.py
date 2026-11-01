@@ -55,6 +55,7 @@ from dew.nn.kv_cache import (
     with_rounding_keys_of,
     write_cache,
 )
+from dew.nn.precision import ROUNDING_STREAM
 from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import (
     BlockDenoiser,
@@ -72,7 +73,6 @@ from dew.nn.protocols import (
     refuse_prefix,
 )
 from dew.nn.visibility import with_served_blocks
-from dew.objectives.base import ROUNDING_STREAM
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,

@@ -58,7 +58,7 @@ from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, s
 from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
-from dew.nn.backbones.layer_plan import group_layers
+from dew.nn.backbones.layer_names import group_layers
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (

@@ -49,6 +49,7 @@ __all__ = [
     "L2NORM_EPS",
     "MATMUL_PRECISIONS",
     "NUMERICS_PRESETS",
+    "ROUNDING_STREAM",
     "WIDE_CPU_ARITHMETIC",
     "Dtypes",
     "Numerics",
@@ -544,6 +545,11 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
 
 L2NORM_EPS = 1e-6
 """The epsilon `l2norm` adds under its square root: FLA's, and Dory's `justnorm`'s."""
+
+ROUNDING_STREAM = 0x726F756E
+"""The stream stochastic rounding draws from: what a training step folds its key with
+(`dew.objectives.base.training_rngs`), and what a served row's rounding key starts from
+(`dew.sampling.text.rounding_keys`), apart from dropout's and sampling's."""
 
 
 def span_means(values: jax.Array, spans: jax.Array) -> jax.Array:

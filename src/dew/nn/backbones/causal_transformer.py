@@ -134,7 +134,8 @@ from .decoder_stack import (
     run_stack,
     split_stages,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, run_period, scan_groups
+from .layer_names import layer_index
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, run_period, scan_groups
 from .looping import run_loop
 
 _INTERMEDIATES = "intermediates"

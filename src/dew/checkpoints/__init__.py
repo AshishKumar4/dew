@@ -1912,7 +1912,7 @@ class Checkpoints:
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
         The subtrees at `unread`'s paths are neither placed nor read
-        (`dew.objectives.base.UNREAD`).
+        (`dew._records.UNREAD`).
         """
         from dew.batch import FROZEN, without
         from dew.distributed.placement import (
