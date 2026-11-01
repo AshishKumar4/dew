@@ -1597,8 +1597,15 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    environment = session.pytest_environment({**environ, **site_environment(site),
-                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
+    # A cache directory of the file's own, empty as a cold container's: no record another file's process wrote
+    # beside the compilation cache (a step's rungs, keyed by Dew's source digest, followed.py's `DIGEST`)
+    # serves this file by code its record never held (its bundle of programs fetched into it as before).
+    caches = base.with_name(f"{base.name}.caches")
+    shutil.rmtree(caches, ignore_errors=True)
+    caches.mkdir()
+    environment = session.pytest_environment({
+        **environ, **site_environment(site), "XDG_CACHE_HOME": str(caches), "DEW_EXECUTED_LOG": str(log),
+        "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the process's group opens, held from before pytest starts until its group stopped

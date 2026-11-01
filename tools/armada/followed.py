@@ -149,13 +149,30 @@ def reads_backend(code: types.CodeType) -> bool:
     return decided[code]
 
 
+DIGEST = (os.path.join("src", "dew", "cache.py"), "package_digest")
+"""The code that reads the checkout's source only to digest it (`dew.cache.package_digest`), into the key of a
+record Dew's caches keep beside the compilation cache: CI gives each file's process a cache directory of its
+own (ci.py's `alone`), so a record a file finds there is one its own process wrote, by code its record holds,
+and the digest's reads are no input of it (ledger 3220: they keyed 37-45% of rows on every source file)."""
+
+
+def digesting(frame: types.FrameType | None) -> bool:
+    """Whether `frame`, or a frame it was called from, runs `DIGEST`'s code."""
+    while frame is not None:
+        if frame.f_code.co_name == DIGEST[1] and frame.f_code.co_filename.endswith(DIGEST[0]):
+            return True
+        frame = frame.f_back
+    return False
+
+
 def read(event: str, args: tuple, root: str) -> str | None:
     """The checkout's file or directory, relative to `root`, that a read event names, or None: a file
     opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
     listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
     calls this; nor a module's source or bytecode the import system's loader reads to execute it, whose
-    record is the code it ran (`code_unit`). An open relative to a directory descriptor is `opening`'s to
-    place. The interpreter audits the main script's open from no frame at all."""
+    record is the code it ran (`code_unit`), nor a read of the source to digest it (`digesting`). An open
+    relative to a directory descriptor is `opening`'s to place. The interpreter audits the main script's open
+    from no frame at all."""
     path = args[0]
     if isinstance(path, int):
         return None
@@ -175,6 +192,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
         if compiling and loader.f_code.co_filename == "<frozen importlib._bootstrap_external>":
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
+        return None
+    if digesting(sys._getframe(2)):
         return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
