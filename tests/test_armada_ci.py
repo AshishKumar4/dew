@@ -234,7 +234,8 @@ def test_armadas_word_that_a_container_is_fresh_reaches_no_process_a_gpu_lane_st
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     monkeypatch.setenv("ARMADA_FRESH", "1")
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-lane", f"--tests={name}", f"--out={out}", "--cache=on"])
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-lane", f"--tests={name}", f"--out={out}", "--cache=on",
+                                      "--processes=1"])
     assert ci.main() == 0
     assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0]
 
@@ -2097,14 +2098,16 @@ def test_a_kept_task_reuses_each_files_own_row_where_files_share_a_key_and_names
     every file once (2026-10-30: a kept task reported one file's row for six files, and a verdict was not
     graded)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
-    head = "import sys\nfrom pathlib import Path\nsys.path.insert(0, 'tests')\n"
+    # Each imports the others and collects one shared test, so the three runs execute the same code.
+    head = "import sys\nsys.path.insert(0, 'tests')\n"
 
     def body(name: str) -> str:
         others = "".join(f"import test_{other}\n" for other in "abc" if other != name)
-        ran = f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
-        return head + others + f"def test_{name}():\n" + ran
+        return head + others + "from shared_case import test_shared\n"
 
-    written(tmp_path, {f"test_{name}.py": body(name) for name in "abc"})
+    shared = ("from pathlib import Path\ndef test_shared(request):\n"
+              "    with Path('runs-' + request.module.__name__[-1]).open('a') as runs: runs.write('x')\n")
+    written(tmp_path, {"shared_case.py": shared, **{f"test_{name}.py": body(name) for name in "abc"}})
     armada_task(ci, monkeypatch, verdict)
     # Each read every file, so each key hashes the same inputs: the keys are one, and the rows still three.
     common = ci.shared("3.12")
