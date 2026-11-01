@@ -103,6 +103,7 @@ def test_a_default_changed_on_the_function_a_file_called_reruns_it(ci, tmp_path,
     reused = task(ci, tmp_path, monkeypatch, cache_worker, {"test_pure.py": PURE})
     assert reused() == [True]
     (tmp_path / "src/pkg/pure.py").write_text("def double(x, by=2):\n    return x * by\n")
+    assert reused() == [False]
     assert reused() == [True]
     (tmp_path / "src/pkg/pure.py").write_text("def double(x, by=3):\n    return x * by\n")
     assert reused() == [False]

@@ -1407,12 +1407,13 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
         ci, tmp_path, monkeypatch, cache_worker):
     """A train that loses a head loses the test modules and modules the head added, and its other
-    files keep their rows (the land queue's recompose after a pull): a test module, or a module in a
-    package no test imported, added or taken away runs no other file again. A module added beside
-    one a file's tests executed under src/, which an import there may now find, runs that file
-    again, and only that one, and so does its removal, and so does an __init__.py added to, or taken
-    from, a namespace package on the way to one; a top-level package added under src/, which may
-    shadow any import, runs every file."""
+    files keep their rows (the land queue's recompose after a pull): a test module, a module in a
+    package no test imported, or one beside a module a file's tests executed under a name no run
+    tried to import, added or taken away runs no file again (ledger 3220: a listing of every package
+    above an executed module keyed 82% of rows, and each added module reran them). An __init__.py
+    added to, or taken from, a namespace package on the way to a module a file imported, which that
+    import finds, runs that file again, and only that one; a top-level package added under src/,
+    which may shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
                          "src/pkg/space/sub/used.py": "def value(): return 1\n",
@@ -1441,10 +1442,10 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
 
     changes = [(None, None, [1, 1]), ("tests/test_added.py", "def test_added(): pass\n", [1, 1]),
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
-               ("src/other/extra.py", "def value(): return 4\n", [1, 2]),
-               ("src/other/extra.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
-               ("src/pkg/space/__init__.py", "", [2, 3]), ("src/pkg/space/__init__.py", None, [3, 3]),
-               ("src/top/__init__.py", "", [4, 4])]
+               ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
+               ("src/other/extra.py", None, [1, 1]), ("tests/test_added.py", None, [1, 1]),
+               ("src/pkg/space/__init__.py", "", [2, 1]), ("src/pkg/space/__init__.py", None, [3, 1]),
+               ("src/top/__init__.py", "", [4, 2])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()

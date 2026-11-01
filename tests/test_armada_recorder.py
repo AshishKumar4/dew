@@ -220,19 +220,23 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
 
 
 @pytest.mark.parametrize(("seen", "edit"), [
-    ("assert m.unused.__doc__ == 'Less one.'", ('"""Less one."""', '"""Less two."""')),
+    ("import inspect\n    assert inspect.signature(m.unused) and m.unused.__doc__ == 'Less one.'",
+     ('"""Less one."""', '"""Less two."""')),
     ("import inspect\n    assert inspect.isgeneratorfunction(m.counted)", ("    yield x", "    return x")),
     ("assert 'one' in m.unused.__code__.co_consts", ("    return x, 'one'", "    return x, 'two'")),
     ("namespace = {}\n    exec(m.__spec__.loader.get_source('m'), namespace)\n"
      "    assert namespace['unused'](2) == (2, 'one')", ("    return x, 'one'", "    return x, 'two'")),
     ("pass", ("    return x, 'one'", "    return x, 'one'\n    break")),
-], ids=["a docstring", "a generator's kind", "a function's code", "a module's text it executed itself",
+], ids=["a docstring read beside its signature", "a generator's kind", "a function's code", "a module's text it executed itself",
         "a body that no longer compiles"])
 def test_what_a_run_sees_of_code_it_never_entered_is_its_input(ci, tmp_path, monkeypatch, cache_worker,
                                                                seen, edit):
     """What a run sees of a function it never entered is its input as the code it ran is: the function
-    value's docstring and kind (a generator's), its code object (`__code__`), the module's text it compiled
-    itself, and whether the module still compiles, which a body left out would hide."""
+    value's kind (a generator's), its code object (`__code__`), through which its signature and docstring
+    are read as inspect and the CLI's parser read them, the module's text it compiled itself, and whether the
+    module still compiles, which a body left out would hide. A bare `__doc__` read, which takes no code
+    and no audit sees, is not its input (ledger 3220: a docstring in every importer's key moved 84% of
+    rows on train 395's two docstring edits)."""
     # The body's constant a string, which every Python keeps in co_consts (3.14 loads a small int inline).
     module = ('import sys\n\n\ndef unused(x):\n    """Less one."""\n    return x, \'one\'\n\n\n'
               'def counted(x):\n    yield x\n')

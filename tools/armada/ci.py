@@ -417,9 +417,10 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
     outermost function reduced to what defining it runs (its decorators, and its defaults and annotations
     that evaluate code: `inert`), what compiling a body makes of the code around it (`shapes`): whether a
     function is a generator or a coroutine, and the cells a class body makes for its methods (super()). A
-    function's name, parameters, docstring and body are its own unit's, keyed for the runs that entered it:
-    an edited docstring of one function moved every row that imported its module (ledger 3220: train 395's
-    two docstring edits moved 84% of rows)."""
+    function's name, parameters, docstring and body are its own unit's, keyed for the runs that entered it
+    or took its code (`inspect.signature`, followed.py's `coded`): an edited docstring of one function moved
+    every row that imported its module (ledger 3220: train 395's two docstring edits moved 84% of rows). A
+    bare `__doc__` read, which no audit sees, is no input."""
     code = compiled(source, path)
     if isinstance(code, str):
         return None
