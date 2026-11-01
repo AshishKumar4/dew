@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
-from dew._records import JSON, integer, integers, json_value
+from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
@@ -149,11 +149,11 @@ def refused_for_memory(code: str, message: str) -> bool:
     7.83 GiB short (node receipt TL-a100-offload-1338-d): the step at a rung that holds less compiles."""
     if code == 'RESOURCE_EXHAUSTED':
         return True
-    listed = AUTOTUNED_FAILURES.search(message)
-    if code != 'NOT_FOUND' or listed is None:
+    failures = AUTOTUNED_FAILURES.search(message)
+    if code != 'NOT_FOUND' or failures is None:
         return False
-    count = int(listed.group(1))
-    return count > 0 and len(EXECUTED_OUT_OF_MEMORY.findall(message, listed.end())) == count
+    count = int(failures.group(1))
+    return count > 0 and len(EXECUTED_OUT_OF_MEMORY.findall(message, failures.end())) == count
 
 
 def split_share(params: Variables) -> float:
@@ -391,9 +391,10 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str,
                                if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
                            for device in devices]
         raise FirstRunFailed(step, fitted, now) from error
-    listed = fitted.get("devices") if isinstance(fitted, dict) else None
-    checked = {integer(device["id"], "id"): outside for device in (listed if isinstance(listed, list) else ())
-               if isinstance(device, dict) and isinstance(outside := device.get("outside"), int)}
+    read = () if fitted is None else listed(record(fitted, "fitted")["devices"], "devices", read=record,
+                                            what="each device's memory as the fit check read it")
+    checked = {integer(device["id"], "id"): outside for device in read
+               if isinstance(outside := device.get("outside"), int)}
     current = {device.id: free for device in devices
                if device.id in checked and (free := outside_pool(device)) is not None}
     observed = {"checked": {device: checked[device] for device in current}, "now": current}
@@ -429,9 +430,7 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
                               "unclaimed": None if not memory else unclaimed(device, memory),
                               "outside": outside_pool(device),
                               "strands": bool(memory) and strands_temporaries(device.platform, memory)})
-    record: dict[str, JSON] = {"analysis": analysis, "held": int(held), "devices": devices_stats,
-                               "fits": fits}
-    return record
+    return {"analysis": analysis, "held": int(held), "devices": devices_stats, "fits": fits}
 
 
 def unclaimed(device, memory: Mapping[str, int]) -> int | None:
