@@ -137,22 +137,24 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
 
 
 def dependent(entry: Callable, interpret) -> Callable:
-    """`entry` as a dependent launch (programmatic dependent launch, PTX's `griddepcontrol`): once every
-    program has begun it lets the next such launch in its stream start (`launch_dependents`), whose
-    programs take each multiprocessor this launch's leave, and it waits for the launch before it to finish
-    and its writes to land (`wait`) before any memory access of its own, so it is ordered against any
-    launch as without it while the next launch's start overlaps its tail. A launch whose programs all begin
-    at once (Dew's persistent and cluster launches) gives no multiprocessor to a dependent before its own
-    programs run. Mosaic marks the launch (`mosaic_gpu.uses_pdl`) and the runtime launches it with
-    programmatic stream serialization. Interpreted, or on a GPU without grid dependency control
-    (`generation.Architecture.dependent_launch`, sm_90 on), `entry` as it is."""
+    """`entry` as a dependent launch (programmatic dependent launch, PTX's `griddepcontrol`): it waits for the
+    launch before it in its stream to finish and its writes to land (`wait`) before any memory access of its
+    own, so it is ordered against any launch as without it, and once its own work is done it lets the next
+    such launch start (`launch_dependents`), whose launch and setup then overlap this one's last programs'
+    tails. Triggered at the work's end, not its start: a trigger at entry let a dependent's programs take the
+    multiprocessors this launch's later waves needed, each waiting there on this launch to finish (an H100's
+    recurrence launches: wall time per call 0.6 to 1.0% above no dependent launch, JS bisect2-h100,
+    CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
+    (`mosaic_gpu.uses_pdl`) and the runtime launches it with programmatic stream serialization. Interpreted,
+    or on a GPU without grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on),
+    `entry` as it is."""
     if interpreted(interpret) or not generation.gpu_target().architecture.dependent_launch:
         return entry
 
     def body(*refs):
-        plgpu.griddepcontrol_launch_dependents()
         plgpu.griddepcontrol_wait()
         entry(*refs)
+        plgpu.griddepcontrol_launch_dependents()
 
     return body
 
