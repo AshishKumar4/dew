@@ -178,6 +178,16 @@ def in_group(name: str, group: str) -> bool:
     return name.startswith(BACKWARD_GROUPS[group])
 
 
+def native_rows(inputs: dict) -> list[dict]:
+    """A draw's rows as `ModelInputs` fields (its `native/<row>/` arrays), grouped in one pass over it."""
+    rows: dict[int, dict] = {}
+    for name, value in inputs.items():
+        if name.startswith("native/"):
+            _, row, field = name.split("/", 2)
+            rows.setdefault(int(row), {})[field] = value
+    return [unflatten_dict(rows[row], sep="/") for row in range(inputs["input/input_ids"].shape[0])]
+
+
 def gradient_functions(source, group: str | None = None):
     """Every trainable source parameter and every floating media input, in the native input layout; a
     `group`'s alone where one is named (`BACKWARD_GROUPS`)."""
@@ -231,14 +241,8 @@ def gradient_functions(source, group: str | None = None):
         """Each row's program over its own length (`native_observations`), compiled once a length
         rather than once a window's lengths, and the rows' observations collected on the device, every
         row dispatched before any is read; each row's fields grouped in one pass over the draw."""
-        rows: dict[int, dict] = {}
-        for name, value in inputs.items():
-            if name.startswith("native/"):
-                _, row, field = name.split("/", 2)
-                rows.setdefault(int(row), {})[field] = value
-        observed = [native_observations(ModelInputs(**unflatten_dict(rows[row], sep="/")),
-                                        inputs[f"probe/{row}"])
-                    for row in range(inputs["input/input_ids"].shape[0])]
+        observed = [native_observations(ModelInputs(**fields), inputs[f"probe/{row}"])
+                    for row, fields in enumerate(native_rows(inputs))]
         return collect(observed, jnp)
 
     def theirs(model, given, *, wide=False):
