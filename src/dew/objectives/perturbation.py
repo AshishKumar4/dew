@@ -64,6 +64,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew._distributions import counter_key
 from dew.batch import Batch, Variables, leaves_by_path
 from dew.data.dataset import rows_of
+from dew.nn.derivatives import surrogate
 from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable, RematChoosing, head_table
@@ -199,20 +200,19 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
                              "at a module to summarize; watch its activations without cotangents")
         held = {name: value for name, value in variables.items() if name != "params"}
 
-        @jax.custom_jvp
-        def estimated(params, rest):
+        def value(params, rest):
             others, held_batch, held_step = rest
             return self._objective_loss({**others, "params": params}, held_batch, held_step)
 
-        @estimated.defjvp
-        def _(primals, tangents):
-            params, rest = primals
-            stats, aux = estimated(params, rest)
+        def estimate(primals, tangents, value):
+            stats, aux = value
             # The variables held, the batch and the step move nothing, as their cotangents are none.
             moved = linear_map(functools.partial(self._estimate_transposed, stats), self._estimate_of,
-                               (params, rest), tangents[0])
-            return (stats, aux), (moved, zero_from_primal(aux))
+                               primals, tangents[0])
+            return moved, zero_from_primal(aux)
 
+        # The loss, differentiated as the node-perturbation estimate: a surrogate, no derivative of the loss.
+        estimated = surrogate(value, estimate)
         return estimated(variables["params"], (held, batch, step))
 
     def _estimate_of(self, residuals, cotangent) -> Variables:

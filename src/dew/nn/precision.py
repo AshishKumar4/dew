@@ -40,6 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
+from dew.nn.derivatives import surrogate
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -1114,10 +1115,8 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
                          tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
     return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
-def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
-    """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
-    straight-through tangent that is never rounded a second time.
+def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
+    """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
 
     The rounding is the cast itself, subnormals included. The barrier keeps
     `xla_allow_excess_precision` from deleting the round trip under jit, and
@@ -1130,10 +1129,10 @@ def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
-@rounded_operand.defjvp
-def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
-                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
-    return jnp.asarray(rounded_operand(primals[0], dtype)), tangents[0]
+rounded_operand = surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
+                            nondiff_argnums=(1,))
+"""The value `x` takes in `dtype`, held in `x`'s own dtype (`_rounded`), with a straight-through
+derivative (`dew.nn.derivatives.surrogate`): its tangent is `x`'s, never rounded a second time."""
 
 
 def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool:
