@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 
 _load_lock = threading.Lock()
-_loaded: dict[tuple[str, str | None, bool, str | None], PreTrainedTokenizerBase] = {}
+_loaded: dict[tuple[str, str | None, bool, str | None, str | None], PreTrainedTokenizerBase] = {}
 
 RENAMED_TOKENIZERS: Mapping[str, str] = {
     # Dream-org/Dream-v0-Base-7B's tokenization_dream.py at 6572adb5 is transformers 4.46's
@@ -69,14 +69,15 @@ class PinnedTokenizer:
     snapshot: Mapping[str, object]
     directory: str
 
-    def transformers(self) -> PreTrainedTokenizerBase:
+    def transformers(self, *, cls: str | None = None) -> PreTrainedTokenizerBase:
         """The transformers tokenizer of these files, whose chat template
-        renders conversations. A directory is read where it is, so the load
-        reaches no hub, and it is the one load every reader of these files
-        shares (`load_tokenizer`): keyed by their hashes, so a directory whose
-        files changed since a load loads again."""
+        renders conversations, as transformers' class `cls` where a reader
+        names one (a CLIP tower's slow `CLIPTokenizer`). A directory is read
+        where it is, so the load reaches no hub, and it is the one load every
+        reader of these files shares (`load_tokenizer`): keyed by their hashes,
+        so a directory whose files changed since a load loads again."""
         files = json.dumps(self.snapshot["files"], sort_keys=True).encode()
-        return load_tokenizer(self.directory, contents=hashlib.sha256(files).hexdigest())
+        return load_tokenizer(self.directory, contents=hashlib.sha256(files).hexdigest(), cls=cls)
 
 
 def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokenizer:
@@ -111,21 +112,23 @@ def pin_files(name: str, patterns: Sequence[str], *,
 
 
 def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: bool = False,
-                   contents: str | None = None) -> PreTrainedTokenizerBase:
+                   contents: str | None = None, cls: str | None = None) -> PreTrainedTokenizerBase:
     """The HF tokenizer of a hub repo or local directory, loaded once per process, or once per
     `contents`, the digest of a directory's files where a caller pinned them (`PinnedTokenizer`).
 
     Every Dew path that needs an HF tokenizer loads it here, so one name at
     one revision is one object however many readers share it. A release whose
     tokenizer is a transformers class renamed in its own remote code loads as
-    that class (`RENAMED_TOKENIZERS`).
+    that class (`RENAMED_TOKENIZERS`); a reader that needs one class of
+    transformers' own names it (`cls`, a CLIP tower's slow `CLIPTokenizer`,
+    ledger 3013), a load of its own.
     """
     repo, separator, pinned = name.rpartition("@")
     if separator and not Path(name).exists():
         if revision is not None and revision != pinned:
             raise ValueError(f"tokenizer {name} and revision={revision!r} disagree")
         name, revision = repo, pinned
-    key = (name, revision, local_files_only, contents)
+    key = (name, revision, local_files_only, contents, cls)
     held = _loaded.get(key)
     if held is not None:
         return held
@@ -140,7 +143,7 @@ def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: 
             from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
             stated = get_tokenizer_config(name, revision=revision, local_files_only=local_files_only)
-            renamed = RENAMED_TOKENIZERS.get(str(stated.get("tokenizer_class")))
+            renamed = cls if cls is not None else RENAMED_TOKENIZERS.get(str(stated.get("tokenizer_class")))
             loaded = (AutoTokenizer.from_pretrained(
                 name, revision=revision, local_files_only=local_files_only,
                 config=_untyped_config(name, revision, local_files_only)) if renamed is None
@@ -811,8 +814,11 @@ def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "t
     from dew.data.compile import iterate
     from dew.data.sinks import export
 
-    vocabulary = tokenizer_for(tokenizer)
-    documents = dataset.map(Tokenize(tokenizer, field, eos))
+    # One step, so the manifest describes the resolution of the tokenizer that encoded the rows
+    # (`Tokenize.vocabulary`, ledger 3014).
+    step = Tokenize(tokenizer, field, eos)
+    documents = dataset.map(step)
+    vocabulary = step.vocabulary
     metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
                 "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None}
     return export(iterate(documents, read=read, provision=provision), url, format="array_record",

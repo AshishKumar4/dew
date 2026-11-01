@@ -13,9 +13,11 @@ the same arrays step after step.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Generic
 
 import jax
@@ -361,7 +363,24 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
 
 
-def example_places(slot, split: int, rows: int, column: jax.Array | None = None, part=None) -> jax.Array:
+_GROUPS: contextvars.ContextVar[tuple[int, jax.Array] | None] = contextvars.ContextVar("example_groups",
+                                                                                      default=None)
+
+
+@contextlib.contextmanager
+def example_groups(groups: int, group: jax.Array) -> Iterator[None]:
+    """Within the block, a step's microbatch is group `group`'s share of `groups` equal ones (DiLoCo's,
+    `dew.training.diloco`): its examples are placed and counted among the whole step's (`example_fields`),
+    each group's rows the `group`th share of them, as one run of every row places them."""
+    token = _GROUPS.set((groups, group))
+    try:
+        yield
+    finally:
+        _GROUPS.reset(token)
+
+
+def example_places(slot, split: int, rows: int, column: jax.Array | None = None, part=None,
+                   first: jax.typing.ArrayLike = 0, length: int | None = None) -> jax.Array:
     """The places among an update's examples of the `rows` rows of the microbatch in window slot `slot`,
     of steps read in `split` microbatches each: the step's place in the window times a step's rows, plus
     each row's place among its step's records, its `column` (`EXAMPLE_ROWS`) where the batch holds one,
@@ -376,7 +395,8 @@ def example_places(slot, split: int, rows: int, column: jax.Array | None = None,
     step = slot // split
     if column is None:
         part = slot % split if part is None else part
-        column = part + split * jnp.arange(rows, dtype=jnp.int32)
+        # A group's share (`example_groups`): its `length` rows from the step's row `first`.
+        column = part + split * (first + jnp.arange(rows if length is None else length, dtype=jnp.int32))
     return (step * rows * split + column).astype(jnp.int32)
 
 
@@ -388,9 +408,11 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
     so a window that follows a dropped one draws afresh, each row's place among the update's
     examples (`example_places`), placed as the batch's rows are, so each device draws its own rows'
     examples alone, and how many examples the update pools. A batch with no rows has no examples."""
-    rows = rows_of(batch)
+    rows = local = rows_of(batch)
     if not rows:
         return {}
+    groups, group = _GROUPS.get() or (1, 0)
+    rows *= groups
     key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
                                                 state.updates), rejected)
     if holds_back(state.opt_state):
@@ -400,7 +422,7 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
         # its batch is split.
         accepted = state.microstep if microstep is None else microstep
         key = jax.random.fold_in(key, accepted // slots)
-    index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
+    index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part, group * local, local)
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
 

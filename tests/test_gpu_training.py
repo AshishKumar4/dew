@@ -43,10 +43,11 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
         compile_ahead.a_run_takes_the_saved_offline_split_before_loading_its_executable,
         compile_ahead.a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other,
         compile_ahead.a_watched_run_handed_its_steps_compiled_ahead_compiles_neither)
-    settled, guided, half = (
+    settled, guided, half, failed = (
         plan.a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them,
         plan.a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly,
-        plan.a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further)
+        plan.a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further,
+        plan.test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool)
     repeats, conv = (
         trainer.a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops,
         trainer.a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache)
@@ -62,6 +63,8 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
         Cell("a step guided by its profile is the step the run takes and trains as exactly",
              in_own(guided, "guided")),
         Cell("a split that misses tries the half rung before the batch splits further", in_own(half, "half")),
+        Cell("a step that fails on its first run states the room outside XLA's pool",
+             in_own(failed, "failed")),
         # The test's own grid of dtypes (`cells_of`), each cell in a directory of its own.
         *(dataclasses.replace(cell, run=in_own(cell.run, f"repeats-{index}"))
           for index, cell in enumerate(cells_of(repeats))),

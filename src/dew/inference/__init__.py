@@ -14,7 +14,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.inference.clients import Completion, OllamaCompletion, OpenAICompletion, Usage
     from dew.inference.engine import Engine, Kind, Timed
     from dew.inference.images import DenoisingInputs, Images, TextToImage
-    from dew.inference.loading import RunProcessor, pipeline
+    from dew.inference.loading import pipeline
     from dew.inference.nccl import NCCLPush
     from dew.inference.rollouts import (
         Draw,
@@ -26,9 +26,9 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         SafetensorsReload,
         VLLMGenerateServer,
     )
-    from dew.inference.scoring import Scored, Scoring, ScoringServer
+    from dew.inference.scoring import Scoring, ScoringRequest, ScoringServer
     from dew.inference.serving import Server
-    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, RunProcessor, TextGeneration
 
 _EXPORTS = {
     "CheckpointBanks": "dew.inference.banks", "HeldBanks": "dew.inference.banks",
@@ -38,13 +38,13 @@ _EXPORTS = {
     "Engine": "dew.inference.engine", "Kind": "dew.inference.engine", "Timed": "dew.inference.engine",
     "DenoisingInputs": "dew.inference.images", "Images": "dew.inference.images",
     "TextToImage": "dew.inference.images",
-    "RunProcessor": "dew.inference.loading", "pipeline": "dew.inference.loading",
+    "RunProcessor": "dew.inference.tasks", "pipeline": "dew.inference.loading",
     "NCCLPush": "dew.inference.nccl",
     "Draw": "dew.inference.rollouts", "InfrastructureError": "dew.inference.rollouts",
     "NativeRolloutServer": "dew.inference.rollouts", "OpenAIRolloutServer": "dew.inference.rollouts",
     "Publication": "dew.inference.rollouts", "RolloutServer": "dew.inference.rollouts",
     "SafetensorsReload": "dew.inference.rollouts", "VLLMGenerateServer": "dew.inference.rollouts",
-    "Scored": "dew.inference.scoring", "Scoring": "dew.inference.scoring",
+    "Scoring": "dew.inference.scoring", "ScoringRequest": "dew.inference.scoring",
     "ScoringServer": "dew.inference.scoring",
     "Server": "dew.inference.serving",
     "BlockGeneration": "dew.inference.tasks", "MaskedGeneration": "dew.inference.tasks",
@@ -82,8 +82,8 @@ __all__ = [
     "RunProcessor",
     "SafetensorsBanks",
     "SafetensorsReload",
-    "Scored",
     "Scoring",
+    "ScoringRequest",
     "ScoringServer",
     "Server",
     "TextGeneration",

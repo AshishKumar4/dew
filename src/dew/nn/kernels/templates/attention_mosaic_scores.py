@@ -44,6 +44,17 @@ class _Backward:
     approx_math: bool
     """Whether its launches take the hardware's approximate transcendentals (`approximate`): never in the
     accurate form."""
+    hooked: tuple[bool, bool]
+    """Whether its score hook reads its queries' places and its keys' (`score_places`)."""
+    dropped: bool
+    """Whether the call drops entries (a `Dropout`)."""
+
+    def places_read(self, *, masked: bool | None = None) -> tuple[bool, bool]:
+        """Whether a step surely reads its queries' places and its keys' (`algebra.places_read`), `masked` or
+        not, or either (None: chosen at run time, or every entry's visibility read)."""
+        return algebra.places_read(self.spec, masked=masked is not False, hooked=self.hooked,
+                                   dropped=self.dropped,
+                                   padded=self.spec.keys % self.program.tiles.block_k != 0)
 
     @property
     def how(self) -> algebra.Recompute:
@@ -130,7 +141,11 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
 
     inverse_total = per_query(algebra.inverse(total))
     exponentials, weights = algebra.normalized(logits, per_query(peak), inverse_total, how)
-    at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos)
+    # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
+    # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
+    # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
+    # launch's instructions, ET-CONFLICTS-h100).
+    at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos) if walk.accurate else None
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
                                      inverse_total, multiplier=multiplier)

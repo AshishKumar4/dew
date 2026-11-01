@@ -274,14 +274,13 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
 def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it():
     """Tier 3 observes, on the probe's model, whether every decoder layer asks transformers' attention
     interface for its attention with a mask Dew's visibility reproduces: StableLM's do, though its
-    class declares no attention backend, and run on Dew's; OpenAI GPT's and GPT-NeoX Japanese's compute
-    their own, and keep them, saying why."""
+    class declares no attention backend, and run on Dew's (a StableLM norming each head's queries and keys
+    by a layer norm of its own, which tier 2 does not assemble); GPT-NeoX Japanese's compute their own,
+    and keep it, saying why."""
     from dew.interop.pretrained import source_route
 
-    stablelm = source_route(tiny_config("stablelm").to_dict()).admitted
+    stablelm = source_route(tiny_config("stablelm", qk_layernorm=True).to_dict()).admitted
     assert stablelm.attends and not stablelm.why
-    openai = source_route(tiny_config("openai-gpt").to_dict()).admitted
-    assert not openai.attends and openai.why
     # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: the probe's mask is
     # transformers' eager one, so its attention stays causal and the type is admitted on its own.
     japanese = source_route(tiny_config("gpt_neox_japanese").to_dict()).admitted
@@ -290,7 +289,7 @@ def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for
 
 @pytest.mark.parametrize("spelled", ["its own names", "the standard names"])
 def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
-    """OpenAI-GPT's class reads its width, heads and depth as `n_embd`, `n_head` and `n_layer`, and the
+    """CTRL's class reads its width, heads and depth as `n_embd`, `n_head` and `n_layer`, and the
     standard names as aliases of them: a config spelled either way shrinks to a small model, the
     transformers config built from it as small, and is probed rather than refused for want of a name."""
     from transformers import AutoConfig
@@ -299,14 +298,58 @@ def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
 
     sizes = ({"n_embd": 256, "n_head": 4, "n_layer": 2} if spelled == "its own names"
              else {"hidden_size": 256, "num_attention_heads": 4, "num_hidden_layers": 2})
-    config = {**{key: value for key, value in tiny_config("openai-gpt").to_dict().items()
+    config = {**{key: value for key, value in tiny_config("ctrl").to_dict().items()
                  if key not in ("n_embd", "n_head", "n_layer", "hidden_size", "num_attention_heads",
                                 "num_hidden_layers", "num_key_value_heads", "head_dim")}, **sizes}
     shrunk = verify.shrink(config)
-    rebuilt = AutoConfig.for_model("openai-gpt", **{key: value for key, value in shrunk.items()
-                                                    if key != "model_type"})
+    rebuilt = AutoConfig.for_model("ctrl", **{key: value for key, value in shrunk.items()
+                                              if key != "model_type"})
     assert rebuilt.hidden_size < 256 and rebuilt.num_hidden_layers == 2
     assert isinstance(verify.verify_mapping(config), verify.Unmapped)
+
+
+def test_a_probe_whose_source_builds_no_model_is_unavailable():
+    """A type whose shrunken config builds no causal LM (CWM asking for an attention backend this host
+    does not install) is `ProbeUnavailable`, wherever the probe first builds it, its depth's cut
+    (`verify.shallow`) included."""
+    from dew.interop import verify
+
+    config = {**tiny_config("cwm", sliding_window=4).to_dict(), "attn_implementation": "flash_attention_2"}
+    with pytest.raises(verify.ProbeUnavailable):
+        verify.verify_mapping(config)
+
+
+HY_V3 = {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1, "moe_intermediate_size": 32}
+"""A small HY-3's routing, its first layer dense and the rest routed."""
+
+
+@pytest.mark.parametrize(("model_type", "fields", "depth"), [
+    ("hy_v3", {**HY_V3, "num_hidden_layers": 80}, 2),
+    ("smollm3", {"num_hidden_layers": 36}, 4),
+    ("smollm3", {"num_hidden_layers": 36, "no_rope_layers": [1, 1, 1, 0] * 9}, 4),
+    ("smollm3", {"num_hidden_layers": 12, "no_rope_layers": [1] * 11 + [0]}, 12),
+])
+def test_the_probe_runs_the_first_layers_that_hold_every_kind_its_depth_builds(model_type, fields, depth):
+    """The probe runs a stated depth's fewest first layers that hold every kind of layer it builds
+    (`verify.shallow`), each stated per-layer list cut alike, and the stated depth where the last layer is
+    a kind of its own: HY-3's 80 layers as its dense first and a routed second, SmolLM3's 36 as its
+    first four, the fourth without positions, whether its config states the per-layer list or its class
+    derives it."""
+    from dew.interop import verify
+
+    source = verify.ModelSource(model_type)
+    config = tiny_config(model_type, **fields).to_dict()
+    shrunk = verify.shrink(config, source)
+    cut = verify.shallow(source, shrunk)
+    assert cut["num_hidden_layers"] == depth
+    stated = fields.get("no_rope_layers")
+    assert stated is None or cut["no_rope_layers"] == stated[:depth]
+    built = source.configured(cut)
+    assert built.num_hidden_layers == depth
+    if model_type == "smollm3":
+        assert built.no_rope_layers[depth - 1] == 0 and all(built.no_rope_layers[:depth - 1])
+    else:
+        assert built.mlp_layer_types == ["dense", "sparse"]
 
 
 def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):

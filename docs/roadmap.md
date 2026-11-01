@@ -103,6 +103,10 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Profile first compilation separately through lowering and XLA passes. [629]
 - Let tuning take only the declared resource-exhaustion and profiler-subscription errors for an unusable config. [764]
 
+## Algebraic optimization
+
+Dew derives the cheapest form of its own math ([design](design/algebra.md)): one e-graph engine (`dew.algebra`) rewrites every compiled program at its seam, `OuterProgram`, derives the templates' algebra from declarations, and searches fusions toward generated megakernels; everything built at once, measured together.
+
 ## Data
 
 - Integrate DataTrove once for decontamination and distributed MinHash dedup through publication and snapshots. [201, 203]

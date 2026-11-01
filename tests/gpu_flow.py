@@ -16,6 +16,7 @@ import itertools
 import traceback
 from collections.abc import Callable, Iterable
 
+import lane_environment
 import pytest
 from generation_support import runnable
 
@@ -154,6 +155,11 @@ def cells_of(check, generation: str | None = None, **fixtures) -> list[Cell]:
     return cells
 
 
+BF16_PRODUCTS = "needs a GPU whose bf16 products run, sm80 or later"
+"""Why a library kernel's cell skips (`when`): flash, cuDNN, tokamax's Triton and the band run wherever bf16
+products do (`bf16_dot_runs`), an A10 and an L4 among them, whatever Dew's own launches' sizes."""
+
+
 def when(holds: bool, reason: str, check: Callable[[], None]) -> Callable[[], None]:
     """`check` where `holds`, else skipped for `reason`: a cell gated on a capability (`bf16_dot_runs`, a
     package) rather than on a generation's launch sizes (`Cell.generation`)."""
@@ -172,16 +178,12 @@ def isolated(tmp_path_factory) -> Callable[..., Callable[[], None]]:
     def in_own(check, name: str, *, devices: int = 1, **given) -> Callable[[], None]:
         def run():
             import jax
-            from huggingface_hub import constants
 
             if jax.device_count() < devices:
                 pytest.skip(f"needs {devices} devices; this process has {jax.device_count()}")
             directory = tmp_path_factory.mktemp(name)
             with pytest.MonkeyPatch.context() as patch:
-                patch.setenv("DEW_RUNG_RECORDS", str(directory / "rungs"))
-                patch.setenv("DEW_DATA_CACHE", str(directory / "data-cache"))
-                patch.setenv("DEW_HUB_ANSWERS", str(directory / "hub-answers"))
-                patch.setattr(constants, "HF_HUB_CACHE", str(directory / "hub-cache"))
+                lane_environment.per_test_settings(patch, lambda part: directory / part)
                 fixtures = {"tmp_path": directory, "monkeypatch": patch}
                 taken = inspect.signature(check).parameters
                 check(**{key: value for key, value in fixtures.items() if key in taken}, **given)

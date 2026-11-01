@@ -18,7 +18,7 @@ from test_attention_template import (
     geometry as core_geometry,
 )
 
-from dew.nn.attention_masks import alibi_bias
+from dew.nn.attention_masks import alibi_slopes
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -84,7 +84,7 @@ def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 
 def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> template.Hooks:
     """The hooks `names` asks for: a softcap and ALiBi as one score_mod, sinks as the initial state, an
     output gate."""
-    slopes = alibi_bias(jnp.ones((1, 1)), 4, dtype=jnp.float32).reshape(4)
+    slopes = jnp.asarray(alibi_slopes(4))
 
     def score_mod(s, q_pos, k_pos, *params):
         if "softcap" in names:
@@ -125,7 +125,7 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
-    pin = tuning.pinned({attention_triton.TritonForward: config})
+    pin = {attention_triton.TritonForward: config}
 
     # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), the
     # query's taken by its scale's power of two (`template.prescale`), taken to the reference's natural ones
@@ -141,7 +141,7 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
                                             block_k=config.block_k, pad=attention_triton.BLOCK,
                                             residuals=residuals, natural=natural)
         else:
-            with pin:
+            with tuning.pinned(pin):
                 out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
                                                natural=natural, interpret=not ON_GPU)
         # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
@@ -321,7 +321,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
         streams = jax.random.split(jax.random.fold_in(jax.random.key(77), seed), 6)
         params = []
         if "alibi" in names:
-            params.append(alibi_bias(jnp.ones((1, 1)), heads, dtype=jnp.float32).reshape(heads))
+            params.append(jnp.asarray(alibi_slopes(heads)))
         if "temperature" in names:
             params.append(jax.random.uniform(streams[0], (rows, heads, queries), jnp.float32, 0.5, 1.5))
         if "key" in names:
@@ -373,7 +373,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
         return template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                for value, kind in zip(params, kinds, strict=True)), initial)
 
-    pins = tuning.pinned({attention_triton.TritonBackward: joint(config, dkv_config)})
+    pins = {attention_triton.TritonBackward: joint(config, dkv_config)}
 
     def ours(query, key, value, dout, params, initial):
         if mainloop == "portable":
@@ -382,7 +382,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
                                                 pad=attention_triton.BLOCK, natural=natural,
                                                 accurate=accurate)
         else:
-            with pins:
+            with tuning.pinned(pins):
                 grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
                                                   natural=natural, accurate=accurate, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
@@ -479,11 +479,11 @@ def test_an_integer_parameter_keys_and_runs():
         query, key, value = draw_qkv(seed)
         return query, key, value, jax.random.normal(jax.random.key(seed + 1000), query.shape, jnp.float32)
 
-    pins = tuning.pinned({attention_triton.TritonForward: PINNED[1],
-                          attention_triton.TritonBackward: joint(PINNED[0])})
+    pins = {attention_triton.TritonForward: PINNED[1],
+            attention_triton.TritonBackward: joint(PINNED[0])}
 
     def ours(query, key, value, dout):
-        with pins:
+        with tuning.pinned(pins):
             out = attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
             grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=not ON_GPU)
         return out, grads.query, grads.key, grads.value
@@ -506,10 +506,10 @@ def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
         return o * jnp.arange(32, dtype=o.dtype)
 
     hooks = template.Hooks(output_mod=output_mod)
-    pins = tuning.pinned({attention_triton.TritonForward: PINNED[1]})
+    pins = {attention_triton.TritonForward: PINNED[1]}
 
     def ours(query, key, value):
-        with pins:
+        with tuning.pinned(pins):
             return attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
 
     def xla(query, key, value):

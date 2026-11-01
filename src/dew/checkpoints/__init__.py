@@ -2004,13 +2004,13 @@ class Checkpoints:
         return stored
 
     def accumulation_template(self, step: int):
-        """Return the persisted pending-array shapes, without reading their values."""
+        """Return the persisted pending-array shapes, a DiLoCo run's groups' stacked, without reading them."""
         from dew.state import CHECKPOINTED, OPTIONAL, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
         missing = set(CHECKPOINTED).difference(metadata.keys(), OPTIONAL)
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
-        pending = metadata["accumulation"]
+        pending = metadata["accumulation"] or (metadata.get("inner") or {}).get("accumulation")
         if pending is None:
             return None
         arrays = jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(pending))

@@ -535,8 +535,9 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
 
     @as_given
     def pooled(variables):
-        # The step donates its state: each draw steps a copy of the untouched template.
-        state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.asarray, variables))
+        # The step donates its state: each draw steps a copy of the untouched template and of the draw,
+        # which the other arm reads.
+        state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.copy, variables))
         partial, *_ = run(state, halves[0])
         stepped, *_ = run(partial, halves[1])
         assert int(stepped.updates) == 1
@@ -582,8 +583,10 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
 
         @as_given
         def stepped(variables):
-            # The step donates its state: each draw steps a copy of the untouched template.
-            state = jax.tree.map(jnp.copy, template).replace(variables=jax.device_put(variables, where))
+            # The step donates its state: each draw steps a copy of the untouched template and of the
+            # draw, which the other arm reads.
+            state = jax.tree.map(jnp.copy, template).replace(
+                variables=jax.device_put(variables, where, may_alias=False))
             state, *_ = run(state, batch)
             after = jax.tree.map(np.asarray, state.variables["params"])
             return jax.tree.map(applied, variables["params"], after)

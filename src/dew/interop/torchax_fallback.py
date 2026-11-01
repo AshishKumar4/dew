@@ -60,7 +60,7 @@ from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
-from dew.nn.precision import at_least_fp32, configured_precision, exact_float32, scaled
+from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -1043,11 +1043,8 @@ def _narrow_float(value) -> bool:
 
 def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
     """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype at every
-    order: the broadcast taken in fp32 between two casts, each exact, so its transpose, wherever JAX forms
-    one (a gradient, a gradient's gradient, forward over reverse), widens the cotangent, sums it in fp32
-    and rounds the sum once (ledger 2653). A custom VJP takes no forward mode, and a custom JVP over the
-    plain broadcast would sum its nested derivatives narrow."""
-    return jax.lax.broadcast_in_dim(value.astype(jnp.float32), shape, dimensions).astype(value.dtype)
+    order, as a Dew bias's does (`dew.nn.precision.broadcast_summed`, ledgers 2653 and 3038)."""
+    return broadcast_summed(value, shape, dimensions)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,
@@ -1506,13 +1503,16 @@ def _shapes(leaves: Mapping[str, np.ndarray | SourceLeaf | jax.ShapeDtypeStruct]
 
 
 def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
-    """`_plain_head` of the class `config` builds, at the probe's sizes (`verify.shrink`) with
-    transformers' own initialization: the head's structure, which no size changes."""
+    """`_plain_head` of the class `config` builds, at the probe's sizes and depth (`verify.shrink`,
+    `verify.shallow`) with transformers' own initialization: the head's structure, which no size
+    changes."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    fields = {key: value for key, value in verify.shrink(config).items() if key != "model_type"}
-    stated = AutoConfig.for_model(str(config["model_type"]), **fields)
+    model_type = str(config["model_type"])
+    probed = verify.shallow(verify.ModelSource(model_type), verify.shrink(config))
+    fields = {key: value for key, value in probed.items() if key != "model_type"}
+    stated = AutoConfig.for_model(model_type, **fields)
     model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
     return _plain_head(model.eval(), model.get_output_embeddings())
 
@@ -1578,25 +1578,22 @@ def _built(directory: Path, param_dtype: str, weights: bool
 def _stored_tensors(model: PreTrainedModel, shards: Mapping[str, np.ndarray]) -> dict[str, np.ndarray] | None:
     """A checkpoint's `shards` (`sources.load_shards`, memory-mapped) by the names `model` holds them
     under, as stored, which the load casts to their storage leaf by leaf where it places them
-    (`_in_storage`): each key named as transformers' load names it, by the model's conversion mapping's
-    renamings (`rename_source_key`), a key the model holds nothing under left out, and a tied parameter
-    (an output table that is its input table) under each of its names from the one the checkpoint
-    stores it under. None where a key takes one of the mapping's tensor conversions (a fused expert's
-    merge), which transformers' own load applies."""
-    from transformers.conversion_mapping import get_model_conversion_mapping
-    from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
-
-    transforms = get_model_conversion_mapping(model)
-    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
-    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    (`_in_storage`): each key named as transformers' load names it (`sources.load_names`), a key the model
+    holds nothing under left out, and a tied parameter (an output table that is its input table) under
+    each of its names from the one the checkpoint stores it under. None where a key takes one of the
+    mapping's tensor conversions (a fused expert's merge), or the mapping renames a key by whether
+    another is stored, which transformers' own load applies."""
+    names = sources.load_names(model)
+    if names is None:
+        return None
     held = model.state_dict()
     named: dict[str, np.ndarray] = {}
     for key, tensor in shards.items():
-        name, converted = rename_source_key(key, renamings, converters, model.base_model_prefix, held)
-        if converted is not None:
+        read = names(key)
+        if read.converter is not None:
             return None
-        if name in held:
-            named[name] = tensor
+        if read.name in held:
+            named[read.name] = tensor
     tied: dict[int, list[str]] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
         tied.setdefault(id(parameter), []).append(name)

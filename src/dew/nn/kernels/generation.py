@@ -734,18 +734,6 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     return found
 
 
-def tangent_zero(leaf):
-    """`leaf`'s zero tangent: its own dtype's zeros, or float0's for a leaf with no tangent space (an
-    index, a bool mask, a count), as JAX requires of it."""
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-
-    if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact):
-        return jnp.zeros_like(leaf)
-    return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
-
-
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
                    live_cotangents: bool = False, primal: Callable | None = None,
                    nested: bool = True) -> Callable:
@@ -772,7 +760,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
     policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
     import jax
-    from jax.custom_derivatives import SymbolicZero
+    from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
     @jax.custom_jvp
     def produced(*operands):
@@ -782,7 +770,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def _(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(tangent_zero, saved))
+        return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
     @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
     def pulled(saved, operands, cotangent, live):
@@ -812,11 +800,11 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         live = [index for index, direction in enumerate(directions)
                 if not isinstance(direction, SymbolicZero)]
         if not live:
-            return output, jax.tree.map(tangent_zero, output)
+            return output, zero_from_primal(output)
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            whole = [tangent_zero(operand) for operand in jax.tree.leaves(operands)]
+            whole = [zero_from_primal(operand) for operand in jax.tree.leaves(operands)]
             for index, value in zip(live, moving, strict=True):
                 whole[index] = value
             return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
@@ -829,26 +817,32 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             return [pulled_back[index] for index in live]
 
         moving = [directions[index] for index in live]
-        return output, linear_map(tangent, transposed, (primals, saved), moving)
+        # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
+        # tangent, every reverse pass traced the portable math's forward mode for its type alone (a gated
+        # delta net layer's training step's trace on an H100's lowering, row 3142).
+        typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
+        return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
 
     bounded.defjvp(bounded_jvp, symbolic_zeros=True)
     return bounded
 
 
-def linear_map(apply: Callable, pullback: Callable, residuals, moving):
+def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
     or `jax.linear_transpose` transposes, and under `jax.vmap` too, where the map is one of `apply` and
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
-    derivative in `residuals` (a higher order's)."""
+    derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
+    avals like it), which `apply` is then traced for only where forward mode runs it."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
     # (`jax.eval_shape`'s) drop an explicit axis's, and reverse mode would hand the pullback its cotangent
     # unsharded (row 1759).
-    traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
-    out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
+    if out_aval is None:
+        traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
+        out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
     return _linear_primitive()(apply, pullback, in_avals, out_aval)(residuals, moving)
 

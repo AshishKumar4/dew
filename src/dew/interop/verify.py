@@ -39,6 +39,7 @@ from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from types import NoneType
 from typing import TYPE_CHECKING
 
 import jax
@@ -102,16 +103,6 @@ _CONTEXT = 8
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoder_parts.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
-# fp32 rounding between Dew and transformers on a registered family, in eps
-# per layer per unit of the largest reference logit. The thirteen dense and
-# routed tier-1 tiny fixtures (tests/fixtures/hf, written by
-# tools/hf_reference.py with the probe's weight recipe) measure from 1.44
-# (gemma3-tiny) to 6.46 (llama31-tiny: 9.89e-06 over two layers, logits up
-# to 6.43). The probe's bound is twice the largest, as the
-# released-checkpoint tests derive theirs. A field that changes the
-# computation moves the probe's logits by tenths or more: Granite's
-# multipliers by 4.2, SmolLM3's NoPE layers by 1.7.
-_ROUNDING = 6.46
 # How much farther the source's float32 gradient of any parameter may be from the float64 truth than
 # Dew's own float32 gradient of it is (`gradient_parity`, each parameter's pooled over its elements on
 # the probe's draw). Two float32 roundings of one gradient put the ratio near one: tools/gradient_parity.py
@@ -122,6 +113,18 @@ _ROUNDING = 6.46
 # 2896): a draw's rounding spread stays orders of magnitude below it, and any backward that moves a
 # gradient by more than about 3.5e-4 of itself, the square root of eps, is above it.
 _GRADIENT_PARITY = float(np.finfo(np.float32).eps) ** -0.5
+# How much farther the source's float32 logits on the probe may be from the float64 truth than the
+# candidate's, element by element (`logits_parity`: the largest errors' ratio). Two float32 roundings of
+# one computation measure 0.72 to 3.66: 0.73 to 1.34 over the released configs tier 2 verifies at their
+# probes' cut depths and widths (Hy3, LFM2.5-230M, Seed-OSS-36B, SmolLM3, Hunyuan-A13B, OLMo 2,
+# GLM-4.7-Flash, StableLM, ERNIE 4.5, Granite 4.1, OLMoE, LFM2-24B-A2B), and up to 3.66 over the tests'
+# sources (tests/test_tier2_parts.py's remote composition), whose wide CPU sums put the candidate nearer
+# the truth (armada IGPAR6). The bound is twice the largest. A computation the candidate does not share
+# moves it by its effect over the candidate's own rounding, which grows with the probe as the source's
+# does: logits scaled by 1 + 1e-5 put it at 6.6 to 10.6 and by 1 + 1e-4 at 65 to 111, one logit moved by
+# 1e-4 at 11 to 17 (tools/gradient_parity.py's Seed-OSS, Llama and Qwen3-MoE at logits up to 6.8, armada
+# IGSENS), where a fixed rounding per layer refused Seed-OSS's rounding at a 2-layer cut of its 64 layers.
+_LOGITS_PARITY = 7.31
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
@@ -219,9 +222,10 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
                          else noise * 4.0)
         # DeepSeek's balancing bias is a buffer the checkpoint carries, and
         # the reference selects on it: nonzero, or the load path that reads
-        # it would agree with one that drops it.
+        # it would agree with one that drops it. LFM2-MoE's and AFMoE's hold
+        # it as `expert_bias`.
         for name, tensor in model.named_buffers():
-            if name.endswith("e_score_correction_bias"):
+            if name.endswith(("e_score_correction_bias", "expert_bias")):
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
@@ -308,10 +312,11 @@ class _Sizes:
 def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -> Mapping[str, object]:
     """Return a config with the sizes the convention reads made small and the rest kept.
 
-    The layer count stays: a per-layer field the convention does not read
-    (SmolLM3's `no_rope_layers`, one entry per layer with every fourth
-    layer off) would read as all-on over two layers and hide the difference.
-    The query-to-key-head ratio stays, and so does whether the hidden width
+    The layer count stays here: a per-layer field the convention does not
+    read (SmolLM3's `no_rope_layers`, one entry per layer with every fourth
+    layer off) would read as all-on over two layers and hide the difference,
+    so `shallow` cuts it only to the layers that hold every kind the stated
+    depth builds. The query-to-key-head ratio stays, and so does whether the hidden width
     is the heads' total width; a stated window or chunk, and a rope ramp's
     stated original context, shrink below the probe's length so each acts,
     and a token id past the probe's vocabulary moves inside it. Each standard
@@ -470,9 +475,11 @@ class VerifiedMapping:
     reference: str
     """The transformers class and release the probe ran."""
     error: float
-    """max |Δlogits| between Dew's convention route and the reference, fp32."""
+    """How much farther the reference's fp32 logits on the probe are from the float64 truth than Dew's
+    route's (`logits_parity`)."""
     bound: float
-    """What fp32 rounding alone reaches on the probe (`_ROUNDING`)."""
+    """The ratio past which another computation, not rounding, sets the reference apart
+    (`_LOGITS_PARITY`)."""
     inert: tuple[str, ...]
     """The config fields the convention does not read, which changed nothing on the probe's shrunken
     instance: a field whose effect starts past a context the probe never reaches (one `shrink` does not
@@ -488,6 +495,18 @@ class VerifiedMapping:
             return parts.family(self.model_type, _assembled(source, hf_config))
         return dict(CONVENTIONS)[self.family]
 
+    def record(self, hf_config: Mapping[str, object],
+               entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
+        """The real config's record through `entry` (`entry`'s family by default), its tensor names
+        unchecked: what a load's selection of the checkpoint's tensors (its prediction depths,
+        `DecoderFamily.prediction_depth`) reads before `translate` checks the selection's names."""
+        entry = self.entry(hf_config) if entry is None else entry
+        try:
+            record, _ = _translate(hf_config, self.family, entry)
+        except _Mismatch as error:
+            raise _refuse(self.model_type, str(error)) from error
+        return record
+
     def translate(self, hf_config: Mapping[str, object], tensor_names: Collection[str],
                   entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
         """Translate the real config and check the real tensor names, then warn once.
@@ -497,10 +516,7 @@ class VerifiedMapping:
         `entry` is the family `entry` gave for this config, where the caller holds it.
         """
         entry = self.entry(hf_config) if entry is None else entry
-        try:
-            record, _ = _translate(hf_config, self.family, entry)
-        except _Mismatch as error:
-            raise _refuse(self.model_type, str(error)) from error
+        record = self.record(hf_config, entry)
         unmapped = _unmapped(tensor_names, record, entry)
         if unmapped:
             raise _refuse(self.model_type, f"the tensors {unmapped[:8]} have no path in the {self.family!r} "
@@ -509,8 +525,8 @@ class VerifiedMapping:
                  if self.family == PARTS else f"as the registered {self.family!r} family")
         warnings.warn(
             f"tier 2: verified mapping: model_type {self.model_type!r} loads {loads}; "
-            f"{self.reference} agrees on a random shrunken instance to max "
-            f"|Δlogits| {self.error:.2e} in fp32 (bound {self.bound:.2e}); it does not read the config "
+            f"{self.reference}'s fp32 logits on a random shrunken instance are {self.error:.3g} times as far "
+            f"from the float64 truth as its own (bound {self.bound:.2f}); it does not read the config "
             f"fields {list(self.inert)}, which changed nothing on that instance",
             VerifiedMappingWarning, stacklevel=3)
         return record
@@ -532,10 +548,14 @@ def _assembled(source: ModelSource, hf_config: Mapping[str, object]) -> parts.As
                       f"({error})") from error
 
 
-def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
-    """transformers' config for the type at the probe's sizes, the parameter
-    count of the model it builds (on torch's meta device, so an unshrunk
-    layer allocates nothing), and the class's name and release."""
+_LAYER_INDEXES = frozenset({'layer_idx', 'layer_id', 'layer_index', 'layer_number'})
+"""The attributes a layer's modules hold its own place under, which tell layers apart without telling
+their computations apart."""
+
+
+def _skeleton(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, PreTrainedModel]:
+    """transformers' config for the type at `fields` and the causal LM it builds on torch's meta device, so
+    an unshrunk layer allocates nothing; `ProbeUnavailable` where it builds none."""
     model_type = source.model_type
     try:
         import torch
@@ -548,10 +568,94 @@ def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tupl
     try:
         config = source.configured(fields)
         with torch.device('meta'):
-            skeleton = source.causal_lm(config)
+            return config, source.causal_lm(config)
     except Exception as error:
         raise _unavailable(model_type, f"transformers {__version__} builds no causal LM from its shrunken "
                            f"config ({type(error).__name__}: {error})") from error
+
+
+def _module_kind(path: str, module: torch.nn.Module) -> tuple:
+    """A module's kind: its place under its layer or model, its class, its public scalar attributes (a
+    layer's place aside, `_LAYER_INDEXES`) and its own parameters' and buffers' shapes."""
+    return (path, type(module).__module__, type(module).__qualname__,
+            tuple(sorted((key, value) for key, value in vars(module).items()
+                         if not key.startswith('_') and key not in _LAYER_INDEXES
+                         and isinstance(value, (bool, int, float, str, NoneType)))),
+            tuple((name, tuple(tensor.shape)) for name, tensor in (
+                *module.named_parameters(recurse=False), *module.named_buffers(recurse=False))))
+
+
+def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> tuple[list[tuple], tuple] | None:
+    """The kinds of the model `fields` builds (`_skeleton`): each decoder layer's, its entry in each of the
+    config's per-layer lists (one as long as the depth, stated or derived: SmolLM3's `no_rope_layers`,
+    HY-3's `mlp_layer_types`) and each of its modules' (`_module_kind`) across every module list as long
+    as the depth; and every module's outside those lists (its table, its rotary, its final norm). None
+    where no module list is as long as the depth, or where the model is not built by transformers' own
+    code of transformers' and torch's own classes (a remote source; a config class, or a causal LM class
+    the auto registry resolves it to, registered from elsewhere), whose layers differ only as their kinds
+    show: a source's own code may add what no kind shows (a hook on its later layers, a rotary built by
+    its depth)."""
+    import torch
+
+    config, model = _skeleton(source, fields)
+    depth = _records.integer(config.num_hidden_layers, 'num_hidden_layers')
+    # The code that built the model, a remote class's constructor or a class registered from elsewhere, is
+    # the source's own even where what it returns is transformers' classes.
+    from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
+
+    if source.remote is not None:
+        return None
+    builders = (type(config), MODEL_FOR_CAUSAL_LM_MAPPING[type(config)])
+    own = ('transformers.', 'torch.')
+    if any(not built.__module__.startswith('transformers.') for built in builders) or any(
+            not type(module).__module__.startswith(own) for module in model.modules()):
+        return None
+    stacks = [module for module in model.modules() if isinstance(module, torch.nn.ModuleList)
+              and len(module) == depth]
+    if not stacks:
+        return None
+    lists = sorted((name, tuple(value)) for name, value in vars(config).items()
+                   if isinstance(value, (list, tuple)) and len(value) == depth)
+    inside = {id(module) for stack in stacks for module in stack.modules()}
+    outside = tuple(_module_kind(path, module) for path, module in model.named_modules()
+                    if id(module) not in inside)
+    layers = [(tuple(json.dumps(values[index], sort_keys=True, default=str) for _, values in lists),
+               tuple(tuple(_module_kind(path, module) for path, module in stack[index].named_modules())
+                     for stack in stacks)) for index in range(depth)]
+    return layers, outside
+
+
+def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, object]:
+    """`fields` (`shrink`'s) cut to the fewest first layers that hold every kind of layer its stated depth
+    builds (`_layer_kinds`), at least two, each stated per-layer list cut alike: HY-3's 80 layers probe as
+    its dense first and a routed one, SmolLM3's 36 as its first four, the fourth without positions. The
+    cut holds only where its layers are the deep model's first ones kind for kind and every module
+    outside them is the deep model's; the depth stays otherwise, and where no kind is told
+    (`_layer_kinds` is None)."""
+    deep = _layer_kinds(source, fields)
+    if deep is None:
+        return fields
+    kinds, outside = deep
+    firsts = {}
+    for index, layer in enumerate(kinds):
+        firsts.setdefault(layer, index)
+    count = max(max(firsts.values()) + 1, min(2, len(kinds)))
+    if count == len(kinds):
+        return fields
+    key = _Sizes.of(fields, source).key('num_hidden_layers')
+    cut = {name: (list(value[:count]) if isinstance(value, (list, tuple)) and len(value) == len(kinds)
+                  and name != key else value) for name, value in fields.items()}
+    cut[key] = count
+    return cut if _layer_kinds(source, cut) == (kinds[:count], outside) else fields
+
+
+def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
+    """transformers' config for the type at the probe's sizes, the parameter
+    count of the model it builds (on torch's meta device, so an unshrunk
+    layer allocates nothing), and the class's name and release."""
+    config, skeleton = _skeleton(source, fields)
+    from transformers import __version__
+
     size = sum(parameter.numel() for parameter in skeleton.parameters())
     origin = f"transformers {__version__}'s" if source.remote is None else f"{source.remote.name}'s remote"
     return config, size, f"{origin} {type(skeleton).__name__}"
@@ -572,7 +676,7 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
 
 def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.Module,
                record: decoder_parts.DecoderFields, inert: set[str], name: str, expected: np.ndarray,
-               checkpoint: Path, layers: int, pad: int | None) -> tuple[float, float]:
+               checkpoint: Path, pad: int | None) -> tuple[float, float]:
     """One candidate against the reference's saved checkpoint: its error and
     the bound, or `_Mismatch` naming how it differs. `pad` is the row the
     reference's own table pads (its `padding_idx`, which torch counts from
@@ -595,17 +699,45 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     except (KeyError, ValueError) as error:
         # A candidate's reading of tensors it does not hold disqualifies that candidate alone.
         raise _Mismatch(f"its tensors do not fill {convention}'s model ({error})") from error
-    # `_ROUNDING` was measured at fp32 matmul precision; a GPU's default runs
-    # fp32 matmuls in TF32, which alone misses it.
-    with jax.default_matmul_precision("highest"):
-        actual = np.asarray(model.apply(variables, probe_ids(_VOCAB)))
-    error = float(np.abs(actual - expected).max())
-    bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.abs(expected).max())
-    if not error <= bound:
-        raise _Mismatch(f"{name} and {convention} disagree on a random shrunken instance by max "
-                        f"|Δlogits| {error:.2e} in fp32, over the bound {bound:.2e}, so its config "
-                        f"fields {sorted(inert)} or its modeling compute something {convention} does not")
-    return error, bound
+    parity = logits_parity(expected, model, record, variables, probe_ids(_VOCAB))
+    if not parity <= _LOGITS_PARITY:
+        raise _Mismatch(f"{name}'s fp32 logits on a random shrunken instance are {parity:.3g} times as far "
+                        f"from the float64 truth as {convention}'s, past the {_LOGITS_PARITY:.2f} that tells "
+                        f"rounding from another computation, so its config fields {sorted(inert)} or its "
+                        f"modeling compute something {convention} does not")
+    return parity, _LOGITS_PARITY
+
+
+def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.DecoderFields,
+                  variables: Variables, ids: np.ndarray) -> float:
+    """How much farther the source's float32 logits over `ids` (`expected`) are from the float64 truth
+    than the candidate's float32 logits are, element by element: the source's largest error over the
+    candidate's, the candidate's floored at the half ulp float32 carries of the truth's largest logit,
+    the truth the candidate's decoder of the same record and weights in float64, as `gradient_parity`'s.
+    Two float32 roundings of one computation sit near one, the candidate's rounding growing with the
+    probe's depth and width as the source's does; a computation the candidate does not share puts the
+    source as far from the truth as it moves any logit. A non-finite logit on either side is no
+    rounding: infinite."""
+
+    def logits(dtype: str, network: nn.Module) -> np.ndarray:
+        held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
+        # A GPU's default runs fp32 matmuls in TF32, which is not the float32 the source runs.
+        with jax.default_matmul_precision('highest'):
+            return np.asarray(network.apply(held, ids), np.float64)
+
+    ours = logits('float32', model)
+    with jax.enable_x64(new_val=True):
+        wide = models.build('causal_transformer',
+                            {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
+        truth = logits('float64', wide)
+    expected = np.asarray(expected, np.float64)
+    if not all(np.isfinite(values).all() for values in (expected, ours, truth)):
+        return math.inf
+    eps = float(np.finfo(np.float32).eps)
+    floor = eps / 2 * float(np.abs(truth).max())
+    return float(np.abs(expected - truth).max()) / max(float(np.abs(ours - truth).max()), floor,
+                                                       np.finfo(np.float64).tiny)
+
 
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
@@ -723,9 +855,9 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
     transformers builds its class for the type from `shrink(hf_config)` with
     random weights (`scatter_weights`) and saves it as safetensors; each
     `CONVENTIONS` candidate whose reading takes the real config loads that
-    directory and runs the same ids in fp32. The first whose max |Δlogits|
-    is within twice `_ROUNDING` eps per layer per unit of the reference's
-    largest logit is the mapping. When several read the config and match,
+    directory and runs the same ids in fp32. The first whose logits are as
+    near the float64 truth as the reference's, within `_LOGITS_PARITY`
+    (`logits_parity`), is the mapping. When several read the config and match,
     the `CONVENTIONS` order is the tie-break: each computed the probe's
     logits, so any of them is sound. With none, the type is `Unmapped`, with
     every candidate's reason and the shrunken config. A type transformers has
@@ -821,13 +953,14 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             reasons[convention] = str(error)
     with _quiet():
         try:
-            fields = shrink(hf_config, source)
-            layers = _Sizes.of(hf_config, source).stated('num_hidden_layers')
+            shrunk = shrink(hf_config, source)
+            _Sizes.of(hf_config, source).stated('num_hidden_layers')
         except (KeyError, ValueError) as error:
             # A reader may take a config by its own names or its defaults (OPT's
             # defaults every size); the probe shrinks it by the standard names.
             raise _unavailable(model_type, f"its config states no {error.args[0]!r} the probe shrinks it "
                                "by") from error
+        fields = shallow(source, shrunk)
         config, size, name = _reference_config(source, fields)
         # A candidate that builds another architecture is dismissed on its
         # parameter count before its own model is run.
@@ -880,7 +1013,7 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
                 for convention, family, model, record, inert in sized:
                     try:
                         error, bound = _agreement(convention, family, model, record, inert, name, expected,
-                                                  Path(scratch), layers, pad)
+                                                  Path(scratch), pad)
                         if convention == PARTS:
                             assert assembly is not None
                             _trained(reference, assembly, family, record, name)

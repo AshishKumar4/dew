@@ -28,7 +28,7 @@ CONTRACTED = {
         "test_an_embedding_lookup_holds_every_order",
     "src/dew/nn/precision.py::bf16_dot_general.linear_tangent":
         "test_a_bf16_dot_holds_every_order",
-    "src/dew/nn/precision.py::accumulated.linear_tangent":
+    "src/dew/nn/precision.py::_summed_wide.linear_tangent":
         "test_a_wide_cpu_sum_of_products_holds_every_order",
     "src/dew/nn/kernels/templates/gemm/template.py::gemm.linear_tangent":
         "test_a_grouped_gemm_holds_every_order",

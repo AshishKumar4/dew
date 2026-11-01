@@ -6,11 +6,16 @@ The reward is the one drone-racing RL has converged on: each step, the progress 
 centre (Kaufmann et al., Nature 2023, Swift, Eq 8; Song et al., Sci. Robot. 2023, Eq 5; SkyDreamer, arXiv
 2510.14783, Sec II-C), less a cost on the body rates (Song 2023, b = 0.01 a step at 100 Hz, here 1 a second)
 and on the action's change (Swift's lambda5); a bonus on passing a gate, the more for passing it centred
-(SkyDreamer's r_gate); and a crash's penalty, which ends the episode (Song 2023's -10). A gate counts only
-when its plane is crossed through its opening in its direction; crossing the next gate's plane beside it
-misses it, a crash (SkyDreamer; Ferede et al., arXiv 2504.21586). The ground, the gates' frames and the
-obstacles are solid, the drone's path through each physics step tested against them (`struck`), so a fast
-drone cannot pass through one between two steps. An open track ends, a success, on passing its last gate.
+(SkyDreamer's r_gate); a reward for the camera's optical axis pointing at the next gate's centre (Swift's
+perception term, Eq 8 and Extended Data Table 1a: lambda2 exp(lambda3 delta_cam^4), 0.02 and -10, the angle in
+radians, at Swift's per-step weights), without which a drone flies its yaw where it likes: a teacher of the
+privileged views flew tail first, the next gate out of its camera's view on 95% of its steps (on a G4, 10-31),
+a flight no policy of the camera alone can learn; and a crash's penalty, which ends the episode (Song 2023's
+-10). A gate counts only when its plane is crossed through its opening in its direction; crossing the next
+gate's plane beside it misses it, a crash (SkyDreamer; Ferede et al., arXiv 2504.21586). The ground, the
+gates' frames and the obstacles are solid, the drone's path through each physics step tested against them
+(`struck`), so a fast drone cannot pass through one between two steps. An open track ends, a success, on
+passing its last gate.
 
 Each episode is flown on a course of its own (`drawn_course`), of a `family`:
 - `layout`: a published racing layout (uzh-rpg/agile_flight, MIT: Split-S and its real-world variant,
@@ -116,6 +121,8 @@ class Racing:
     rate_cost: float = 1.0
     smoothness_cost: float = 0.005
     gate_bonus: float = 6.0
+    perception_scale: float = 0.02
+    perception_sharpness: float = 10.0
     crash_penalty: float = 10.0
     miss_radius: float = 3.0
     ceiling: float = 25.0
@@ -581,8 +588,10 @@ def raced(racing: Racing, race: Race, action: jax.Array, path: jax.Array) -> tup
     and the drone's path through the step to its flight after it. The reward is the progress toward the gate
     headed for, its distance before the step less its distance after (times `progress_scale`), less
     `rate_cost` times the body rates' norm over the step, less `smoothness_cost` times the squared change of
-    the action; on passing that gate, `gate_bonus` times one less its offset's share of half the opening, the
-    drone heading for the next; on a crash (`struck`), less `crash_penalty`, which ends the episode. Passing
+    the action; plus `perception_scale` times exp(-`perception_sharpness` delta^4), delta the angle in radians
+    between the camera's optical axis and the centre of the gate headed for after the step (`looking`); on
+    passing that gate, `gate_bonus` times one less its offset's share of half the opening, the drone heading
+    for the next; on a crash (`struck`), less `crash_penalty`, which ends the episode. Passing
     an open track's last gate ends it, a success. An episode is cut after `max_steps` steps."""
     crashed, passed, across = struck(racing, race, path)
     course, flight = race.course, race.flight
@@ -596,12 +605,25 @@ def raced(racing: Racing, race: Race, action: jax.Array, path: jax.Array) -> tup
     finished = passed & ~course.closed & (following >= course.count)
     index = jnp.where(passed & ~finished, following, race.index)
     distance = jnp.linalg.norm(course.center[index] - flight.position)
-    reward = progress + bonus - rate - smoothness - jnp.where(crashed, racing.crash_penalty, 0.0)
+    angle = looking(race, course.center[index])
+    seen = racing.perception_scale * jnp.exp(-racing.perception_sharpness * angle**4)
+    reward = progress + bonus + seen - rate - smoothness - jnp.where(crashed, racing.crash_penalty, 0.0)
     taken = race.steps + 1
     after = dataclasses.replace(race, index=index, distance=distance, steps=taken, action=action,
                                 passed=race.passed + passed)
     ended = crashed | finished
     return after, reward, ended, ~ended & (taken >= racing.max_steps)
+
+
+def looking(race: Race, point: jax.Array) -> jax.Array:
+    """The angle in radians between the drone's camera's optical axis (its forward, the mount tilted up by
+    the camera's uptilt and turned by its roll and yaw, as `cameras` mounts it) and the direction from the
+    drone to `point` (Swift's delta_cam)."""
+    camera, flight = race.camera, race.flight
+    axis = rotation(flight.orientation) @ rotation(quaternion(camera.mount[0], -camera.uptilt,
+                                                              camera.mount[1]))[:, 0]
+    toward = point - flight.position
+    return jnp.arctan2(jnp.linalg.norm(jnp.cross(axis, toward)), jnp.dot(axis, toward))
 
 
 def corners(racing: Racing, race: Race, ahead: int = 2) -> jax.Array:
@@ -650,7 +672,7 @@ def airframe(racing: Racing, race: Race) -> jax.Array:
                       race.camera.uptilt, race.camera.fov])
 
 
-def dynamics(racing: Racing, race: Race) -> jax.Array:
+def physics(racing: Racing, race: Race) -> jax.Array:
     """The drone's physics a teacher is shown and a world model learns to read off `[20]`, each over its
     nominal: its mass, inertia `[3]`, thrust and drag coefficients and top speed; its rotor, quadratic `[2]`
     and vertical drag; its ground effect's strength; its battery's voltage now over full and its charge drawn
@@ -678,11 +700,11 @@ def _over(value: jax.Array, nominal: float | tuple[float, ...] | np.ndarray, off
 
 def privileged(racing: Racing, race: Race) -> dict[str, jax.Array]:
     """The privileged views: the `state` `[13]` (position, velocity, orientation, body rates), the next two
-    `gates`' corners in the body frame `[24]`, the drone's `airframe` `[6]` and `dynamics` `[20]`, the
+    `gates`' corners in the body frame `[24]`, the drone's `airframe` `[6]` and `physics` `[20]`, the
     `obstacles` nearest `[12]`, the gates `passed` so far, whether the gate headed for is an open track's
     last (`finishing`), and the `teacher`'s observation `[80]`: the velocity and the direction of gravity in
     the body frame, the body rates, the corners, the last action and the airframe (the first 43, its
-    interface since FlyDreamer's first race), then the dynamics, the obstacles and the finishing flag, each
+    interface since FlyDreamer's first race), then the physics, the obstacles and the finishing flag, each
     about unit size."""
     flight = race.flight
     world_to_body = rotation(flight.orientation).T
@@ -690,16 +712,16 @@ def privileged(racing: Racing, race: Race) -> dict[str, jax.Array]:
     down = world_to_body @ jnp.asarray([0.0, 0.0, -1.0], velocity.dtype)
     gates = corners(racing, race)
     frame = airframe(racing, race)
-    physics = dynamics(racing, race)
+    drawn = physics(racing, race)
     obstacles = nearest(race)
     course = race.course
     finishing = (~course.closed & (race.index == course.count - 1)).astype(velocity.dtype)
     state = jnp.concatenate([flight.position, flight.velocity, flight.orientation, flight.angular_velocity])
     rates = flight.angular_velocity
     scaled = obstacles / jnp.asarray([10.0, 10.0, 10.0, 1.0] * NEAREST)
-    teacher = jnp.concatenate([velocity / 10, down, rates / 10, gates / 10, race.action, frame, physics,
+    teacher = jnp.concatenate([velocity / 10, down, rates / 10, gates / 10, race.action, frame, drawn,
                                scaled, finishing[None]])
-    return {"state": state, "gates": gates, "airframe": frame, "dynamics": physics, "obstacles": obstacles,
+    return {"state": state, "gates": gates, "airframe": frame, "physics": drawn, "obstacles": obstacles,
             "passed": race.passed, "finishing": finishing, "teacher": teacher}
 
 
@@ -707,7 +729,7 @@ TEACHER = 43 + 20 + 4 * NEAREST + 1
 """The width of the teacher's observation (`privileged`)."""
 INTERFACE = 43
 """The width of the teacher's observation in its first race: its first entries keep their meaning."""
-VIEWS = ("image", "state", "gates", "airframe", "dynamics", "obstacles", "passed", "finishing", "teacher")
+VIEWS = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed", "finishing", "teacher")
 """What a gate race can show: the camera's image, and the privileged views (`privileged`)."""
 
 
@@ -895,5 +917,5 @@ def _scene(racing: Racing, race: Race) -> Scene:
 __all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER",
            "VIEWS", "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene",
            "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
-           "drawn_course", "dynamics", "facings", "nearest", "privileged", "quaternion", "raced",
-           "started", "struck"]
+           "drawn_course", "facings", "looking", "nearest", "physics", "privileged", "quaternion",
+           "raced", "started", "struck"]

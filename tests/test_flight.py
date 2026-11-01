@@ -35,8 +35,8 @@ from dew.rl.flight import (
     corners,
     developed,
     drawn_course,
-    dynamics,
     nearest,
+    physics,
     privileged,
     quaternion,
     raced,
@@ -105,7 +105,19 @@ def pillar_hit(racing: Racing, begin: np.ndarray, end: np.ndarray, pillar: np.nd
     return np.hypot(point[0] - x, point[1] - y) < radius + racing.radius and point[2] < height + racing.radius
 
 
-def oracle_step(racing: Racing, race, path):
+def optical_axis(orientation: np.ndarray, mount: np.ndarray, uptilt: float) -> np.ndarray:
+    """A camera's optical axis in the world: the body's rotation (from its unit quaternion (w, x, y, z)) of
+    the mount's forward, the body's x turned by the mount's yaw after a pitch up by the uptilt (the roll
+    leaves it)."""
+    w, x, y, z = orientation
+    body = np.asarray([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                       [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                       [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+    yaw = mount[1]
+    return body @ np.asarray([np.cos(yaw) * np.cos(uptilt), np.sin(yaw) * np.cos(uptilt), np.sin(uptilt)])
+
+
+def oracle_step(racing: Racing, race, path, camera):
     """One step of the race's rules for each drone, in float64 loops: its reward, whether it ended (a crash
     or an open track's last gate passed), the gate it heads for after, and whether its episode was cut."""
     half, inner = racing.opening / 2, racing.opening / 2 - racing.radius
@@ -152,6 +164,10 @@ def oracle_step(racing: Racing, race, path):
         reward -= racing.rate_cost * np.linalg.norm(race.flight.angular_velocity[drone]) / racing.hz
         reward -= racing.smoothness_cost * np.sum((np.clip(race.action_taken[drone], -1, 1)
                                                     - race.action[drone]) ** 2)
+        axis = optical_axis(race.flight.orientation[drone], camera.mount[drone], camera.uptilt[drone])
+        toward = center[target] - position
+        angle = np.arctan2(np.linalg.norm(np.cross(axis, toward)), axis @ toward)
+        reward += racing.perception_scale * np.exp(-racing.perception_sharpness * angle**4)
         reward -= racing.crash_penalty if crashed else 0.0
         rewards.append(reward)
         ends.append(crashed or finished)
@@ -221,10 +237,10 @@ def drawn_paths(racing: Racing, race, rng: np.random.Generator):
 def test_a_step_pays_passes_ends_and_finishes_as_the_race_rules():
     """Drones on drawn courses flown through their next gate's opening, its frame, beside it within the miss
     radius and far beside it, short of it, down to the ground, alongside its plane near and away from its
-    frame, and into a pillar: each step's reward (progress, the gate's centring bonus, the rates' and the
-    action's costs, a crash's penalty), each end (a crash, or an open track's last gate passed), each gate
-    headed for after the step and each cut held to the race's rules in float64 loops: rewards to float64
-    rounding, the rest exactly."""
+    frame, and into a pillar: each step's reward (progress, the gate's centring bonus, the camera's optical
+    axis's nearness to the next gate's centre, the rates' and the action's costs, a crash's penalty), each
+    end (a crash, or an open track's last gate passed), each gate headed for after the step and each cut
+    held to the race's rules in float64 loops: rewards to float64 rounding, the rest exactly."""
     rng = np.random.default_rng([532, 5])
     with jax.enable_x64(new_val=True):
         racing = Racing(episode_seconds=0.05)
@@ -244,7 +260,7 @@ def test_a_step_pays_passes_ends_and_finishes_as_the_race_rules():
         stepped = jax.jit(jax.vmap(lambda race, action, path: raced(racing, race, action, path)))
         arguments = (jax.tree.map(jnp.asarray, inputs), jnp.asarray(drawn.action_taken), jnp.asarray(path))
         following, reward, ended, truncated = stepped(*arguments)
-        expected, ends, indices, cut = oracle_step(racing, drawn, path)
+        expected, ends, indices, cut = oracle_step(racing, drawn, path, race.camera)
         roundings = chain_roundings(jax.make_jaxpr(stepped)(*arguments))
         assert_computes_the_oracle(np.asarray(reward), expected, "a step's rewards", roundings=roundings)
         np.testing.assert_array_equal(np.asarray(ended), ends)
@@ -742,13 +758,13 @@ def test_an_asset_comes_out_of_hyperluxs_loader_as_it_was_made(tmp_path):
 
 def test_a_drone_whose_drag_and_disturbances_are_off_shows_them_neutral():
     """A quadrotor with its rotor, quadratic and vertical drag and its constant disturbances turned off: every
-    drone's dynamics view holds those terms at their neutral values exactly (each drag at the nominal's, 1;
+    drone's physics view holds those terms at their neutral values exactly (each drag at the nominal's, 1;
     each disturbance 0) and every other entry finite, so a teacher's view and a world model's target are
     numbers."""
     off = Quadrotor(rotor_drag=0.0, quadratic_drag=(0.0, 0.0), vertical_drag=0.0, bias_force=0.0,
                     bias_moment=0.0)
     racing = Racing(quadrotor=off)
-    shown = np.asarray(jax.vmap(lambda race: dynamics(racing, race))(races(racing, 9, 64)))
+    shown = np.asarray(jax.vmap(lambda race: physics(racing, race))(races(racing, 9, 64)))
     np.testing.assert_array_equal(shown[:, 7:11], np.ones((64, 4), shown.dtype))
     np.testing.assert_array_equal(shown[:, 14:], np.zeros((64, 6), shown.dtype))
     assert np.isfinite(shown).all()

@@ -13,15 +13,17 @@ import dataclasses
 import functools
 import gc
 import weakref
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms
+from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -79,13 +81,14 @@ the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a c
 128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
 
 
-def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
+def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | None]:
     """The backward form `form` names, `(accurate, config)`: two launches, the dQ launch one consumer's
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
-    accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
-    `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
-    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries, or
-    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`)."""
+    accurate form's at its derivation's tiles (None) or its sums in two column halves where it is
+    `accurate-halves` (a width split's, `BackwardTiles.columns`); or the fast form's one launch (`fused`),
+    queries first on the dQ launch's layout, or keys first on `FED`'s (`fused-keys-first`), each consumer
+    64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
+    (`fused-shared-keys`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
     if form == "fused-shared-keys":
@@ -93,6 +96,9 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
                                                      shared_keys=True)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
+    if form == "accurate":
+        # Its derivation's: two launches, its dK/dV programs' column shares its dQ's two sums' choice.
+        return True, None
     columns = 2 if form == "accurate-halves" else 1
     return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
 
@@ -188,6 +194,22 @@ def _dropping(shape) -> template.Hooks:
         jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
+def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,
+                    declined: bool) -> bool:
+    """Whether the Mosaic backward takes a call of `query`'s and `key`'s shapes and dtype under `hooks` on the
+    target in effect, checked against `declined`, the call one it declines for its registers
+    (`MosaicBackward.declined`'s resources, the route's next implementation's): the accurate form under a
+    query's temperature, whose dQ spills at every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed
+    sums beside the hook's three slopes and its mask)."""
+    query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
+    residuals = _residuals(query.shape)
+    op, args = attention_mosaic._backward_call(query, key, key, spans, hooks, query, residuals, scale=None,
+                                               natural=attention_mosaic.NATURAL, accurate=accurate)
+    reason = op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+    assert (reason is not None) == declined and (reason is None or reason.code == "resources"), reason
+    return reason is None
+
+
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
@@ -215,6 +237,12 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                               output.output_mod, output.output_params)
 
     accurate, config = _backward_form(form)
+    if backward:
+        query, key = (jax.ShapeDtypeStruct((rows, queries, count, width), dtype) for count in shape[2:])
+        with _device(interpret):
+            if not _takes_backward(spans, query, key, hooked(*draw_hooks(0)), accurate=accurate,
+                                   declined=accurate and "temperature" in score):
+                return
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -247,7 +275,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     if seeds is None:
         seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
                  else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds,
+                    terms=_gradient_terms(spans, hooked, score, jax.jit(reference)) if backward else None)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -349,18 +378,34 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept.name}",
-                    seeds=SEEDS, terms=_gradient_terms(spans) if kept is template.Kept.OUTPUT else False)
+                    seeds=SEEDS, terms=_gradient_terms(spans))
 
 
-def _gradient_terms(spans: template.KeySpans):
+def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, score: tuple = (),
+                    reference: Callable | None = None):
     """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
     logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
-    rounded output carries (`template.Kept.OUTPUT`'s, FlashAttention's), so a row that cancels to zero in
-    float64 is held to it, not to its own zero."""
+    rounded output carries (`template.Kept.OUTPUT`'s, and the fast form's: its anchor key's `dP - c` its
+    product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
+    score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
+    logits are the hook's (`template.score_modded`), and its parameters' gradients take the terms check 1
+    traces from `reference` (`float64_terms`). A call resuming from an initial state (`score` naming sinks
+    or a resumed partial) takes check 1's own terms (None): its weights start from the state, which
+    `attention_terms` does not carry."""
+    if {"sinks", "resumed"} & set(score):
+        return None
     keep = template.dense(spans)[:, None]
 
-    def terms(query, key, value, dout):
-        return tuple(attention_terms(query, key, value, dout, keep)[1:])
+    def terms(query, key, value, dout, *hooks):
+        if not hooks:
+            return tuple(attention_terms(query, key, value, dout, keep)[1:])
+        params, _ = hooks
+        wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
+        found = attention_terms(query, key, value, dout, keep,
+                                score=lambda raw: template.score_modded(raw, hooked(wide, None)))
+        with jax.enable_x64(new_val=True):
+            _, traced = float64_terms(reference, *widened((query, key, value, dout, *hooks)))
+        return (*found[1:], *traced[3:])
 
     return terms
 
@@ -626,6 +671,10 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
 
     params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
+    with _device(interpret=True):
+        # Its hook divides by a query's parameter, a temperature (`_takes_backward`).
+        if not _takes_backward(spans, query, key, hooks, accurate=accurate, declined=accurate):
+            return
     with _device(interpret=True), _pinned(backward=config):
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              interpret=True)[1:]
@@ -1261,8 +1310,12 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
-            lowering_platforms=("cuda",))
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)), initial)
+        if _takes_backward(spans, q, kv, hooked, accurate=accurate,
+                           declined=accurate and "temperature" in SCORE_HOOKS[hooks]):
+            jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
+                lowering_platforms=("cuda",))
 
 
 @ON_HOPPER
@@ -1488,7 +1541,7 @@ FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
                 for training in (template.Kept.NONE, template.Kept.SPLIT)]
 FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
-                 for hooks in BACKWARD_HOOKS if hooks != "none"]
+                 for hooks in BACKWARD_HOOKS if hooks != "none"] + [(256, template.Kept.NONE, "softcap")]
 """The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
 forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
 set beside the walk's)."""

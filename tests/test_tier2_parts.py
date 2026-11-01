@@ -421,41 +421,144 @@ BUILT_IN = {
     "smollm3": {},
     "olmo2": {},
     "hy_v3": {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1,
-              "moe_intermediate_size": 32, "router_scaling_factor": 2.826},
+              "moe_intermediate_size": 32, "router_scaling_factor": 2.826,
+              "num_nextn_predict_layers": 1},
     "glm4_moe_lite": {"head_dim": None, "num_key_value_heads": 4, "n_routed_experts": 8,
                       "num_experts_per_tok": 2, "n_shared_experts": 1, "moe_intermediate_size": 32,
                       "q_lora_rank": 24, "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
-                      "v_head_dim": 16, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 1.8},
+                      "v_head_dim": 16, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 1.8,
+                      "num_nextn_predict_layers": 1},
+    "olmoe": {"num_experts": 8, "num_experts_per_tok": 2},
+    "stablelm": {"head_dim": None, "num_key_value_heads": 4, "use_qkv_bias": True,
+                 "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0,
+                                     "partial_rotary_factor": 0.25}},
+    "stablelm-parallel": {"model_type": "stablelm", "head_dim": None, "use_parallel_residual": True,
+                          "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0,
+                                              "partial_rotary_factor": 0.5}},
+    "hunyuan_v1_moe": {"num_experts": 8, "moe_topk": 2,
+                       "rope_parameters": {"rope_type": "dynamic", "rope_theta": 10000.0, "alpha": 1000.0,
+                                           "factor": 1.0}},
+    "ernie4_5_moe": {"head_dim": None, "moe_num_experts": 8, "moe_k": 2, "moe_intermediate_size": 32,
+                     "moe_num_shared_experts": 1, "moe_layer_start_index": 1},
+    "lfm2": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+             "conv_L_cache": 3, "block_auto_adjust_ff_dim": False},
+    "lfm2_moe": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+                 "conv_L_cache": 3, "num_dense_layers": 1, "num_experts": 8, "num_experts_per_tok": 2,
+                 "moe_intermediate_size": 32, "routed_scaling_factor": 1.7},
 }
 """transformers' own types that no registered family reads, each made of known parts, by their fields beside
 `tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
 output-normed sublayers, HY-3's routed experts beside a shared one, and GLM-4.7-Flash's latent attention
 (DeepSeek V3's, whose `head_dim` names the rotated slice, so it is left to the config) with its grouped
-sigmoid router. Each type's first layer is dense and the others route."""
+sigmoid router, each of these two's first layer dense and the others routed, and stating one prediction
+depth, which their releases store past the trunk (`with_prediction_depth`); OLMoE's every layer routed
+under OLMo 2's whole-projection query and key norms; StableLM's layer-normed blocks turning a part of
+each head, in sequence or (`stablelm-parallel`) beside each other off one norm; and LFM2's gated short
+convolutions between its attention layers, its modules under names of their own (`operator_norm`,
+`feed_forward.w1`, `out_proj`), and LFM2-MoE's, its layers past the first routed by sigmoid scores and a
+balancing bias, renormalized over a sum with its own epsilon; and ERNIE 4.5's routed layers past its
+first, a softmax router selecting with a `[1, experts]` correction bias beside a shared expert, its
+rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared MLP, each head's queries
+and keys normed after their rotation, at its dynamic-alpha base."""
 
-BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8}
+BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
+                  "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
+                  "hunyuan_v1_moe": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
+STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "glm4_moe_lite": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "olmoe": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "lfm2_moe": "model.layers.1.feed_forward.experts.0.w1.weight",
+                 "ernie4_5_moe": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "hunyuan_v1_moe": "model.layers.1.mlp.experts.0.gate_proj.weight"}
+"""A routed type's first stored expert projection, as `save_pretrained` stores its experts one by one."""
 
-@pytest.mark.parametrize("model_type", sorted(BUILT_IN))
-def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, model_type):
-    """A type transformers builds and no registered family reads verifies from parts and loads as a
-    native decoder, its logits holding check 1 against transformers' own. A routed type's checkpoint
-    holds each expert's projections apart, as transformers saves them, which its load stacks into the
-    fused tensors its experts module holds (its conversion mapping): the load reads them as stored."""
+
+def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = ()) -> None:
+    """The checkpoint at `directory` with a prediction depth past its `layers` trunk layers, as
+    GLM-4.7-Flash's and HY-3's releases store one (`model.layers.{layers}.*`): its normed inputs, their
+    projection, its output norm and a block, and GLM-4.7-Flash's copies of the trunk's table and head,
+    beside the trunk the source's own save writes; `extra` names more tensors under it."""
+    from safetensors.torch import load_file, save_file
+
+    path = directory / "model.safetensors"
+    tensors = load_file(path)
+    last, depth = f"model.layers.{layers - 1}.", f"model.layers.{layers}."
+    tensors.update({depth + name.removeprefix(last): tensor.clone() for name, tensor in tensors.items()
+                    if name.startswith(last)})
+    generator = torch.Generator().manual_seed(7)
+    tensors.update({depth + "eh_proj.weight": torch.randn(width, 2 * width, generator=generator),
+                    depth + "enorm.weight": torch.ones(width), depth + "hnorm.weight": torch.ones(width),
+                    depth + "shared_head.norm.weight": torch.ones(width),
+                    depth + "embed_tokens.weight": tensors["model.embed_tokens.weight"].clone(),
+                    depth + "shared_head.head.weight": tensors["lm_head.weight"].clone(),
+                    **{depth + name: torch.ones(width) for name in extra}})
+    save_file(tensors, path, metadata={"format": "pt"})
+
+
+def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_trunk(tmp_path):
+    """GLM-4.7-Flash's release stores a prediction depth past its trunk, which its own code builds none
+    of and its load leaves unread: a load reads the trunk alone, whether it keeps the depth or not
+    (`prediction_depths=0`), and computes the same logits; the depth's copies of the table and head are
+    the trunk's, so a save after the table changes writes the copy that reloads. A tensor under the depth
+    that is none of its own and no block's is refused."""
     from interop_support import tiny_config
     from safetensors import safe_open
     from transformers import AutoModelForCausalLM
 
     torch.manual_seed(0)
-    config = tiny_config(model_type, **BUILT_IN[model_type])
+    config = tiny_config("glm4_moe_lite", **BUILT_IN["glm4_moe_lite"])
+    model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path / "release")
+    with_prediction_depth(tmp_path / "release", config.num_hidden_layers, config.hidden_size)
+    kept = Pretrained.load(tmp_path / "release", dtype="float32", attention_impl="reference")
+    trunk = Pretrained.load(tmp_path / "release", dtype="float32", attention_impl="reference",
+                            prediction_depths=0)
+    ids = np.random.default_rng(0).integers(0, config.vocab_size, (2, 12)).astype(np.int32)
+    np.testing.assert_array_equal(np.asarray(kept.model.apply(kept.variables, ids)),
+                                  np.asarray(trunk.model.apply(trunk.variables, ids)))
+    table = kept.variables["params"]["embed_tokens"]["embedding"]
+    kept.save(tmp_path / "saved", variables={**kept.variables, "params": {
+        **kept.variables["params"], "embed_tokens": {"embedding": np.asarray(table) * 2}}})
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(reloaded.variables["params"]["embed_tokens"]["embedding"]),
+                                  np.asarray(table) * 2)
+    copy = f"model.layers.{config.num_hidden_layers}.embed_tokens.weight"
+    with safe_open(tmp_path / "saved" / "model.safetensors", "np") as stored:
+        np.testing.assert_array_equal(stored.get_tensor(copy), np.asarray(table) * 2)
+    model.save_pretrained(tmp_path / "unknown")
+    with_prediction_depth(tmp_path / "unknown", config.num_hidden_layers, config.hidden_size,
+                          ("unknown.weight",))
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path / "unknown", dtype="float32", attention_impl="reference")
+
+
+@pytest.mark.parametrize("case", sorted(BUILT_IN))
+def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
+    """A type transformers builds and no registered family reads verifies from parts and loads as a
+    native decoder, its logits holding check 1 against transformers' own. A routed type's checkpoint
+    holds each expert's projections apart, as transformers saves them, which its load stacks into the
+    fused tensors its experts module holds (its conversion mapping): the load reads them as stored. A
+    release's prediction depth past the trunk, which the source's own code builds none of and its load
+    leaves unread, is left unread too."""
+    from interop_support import tiny_config
+    from safetensors import safe_open
+    from transformers import AutoModelForCausalLM
+
+    fields = dict(BUILT_IN[case])
+    model_type = fields.pop("model_type", case)
+    torch.manual_seed(0)
+    config = tiny_config(model_type, **fields)
     model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(tmp_path)
+    if fields.get("num_nextn_predict_layers"):
+        with_prediction_depth(tmp_path, config.num_hidden_layers, config.hidden_size)
     with safe_open(tmp_path / "model.safetensors", "pt") as stored:
         names = set(stored.keys())
-    routed = model_type in ("hy_v3", "glm4_moe_lite")
-    assert ("model.layers.1.mlp.experts.0.gate_proj.weight" in names) == routed
+    assert model_type not in STORED_EXPERT or STORED_EXPERT[model_type] in names
     verified = verify_mapping(json.loads((tmp_path / "config.json").read_text()))
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
     loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
@@ -467,10 +570,172 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, model_type):
 
     reference = built(torch.float32)
     wide = float64_twin(reference, lambda: built(torch.float64)).eval()
-    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), model_type)
+    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case)
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
-                    torch_logits(reference), draw, f"{model_type} logits", seeds=BUILT_IN_SEEDS[model_type],
+                    torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
                     truth_fn=torch_logits(wide, float64))
+
+
+def test_an_lfm2_of_convolutions_alone_assembles():
+    """An LFM2 whose layers are all gated short convolutions (Lfm2Config allows no attention layer) states
+    its head geometry through its model's config, as its rotary reads it, so it assembles: every layer a
+    `conv` kind, the head tied. transformers' own forward runs it only without a cache (a cache of
+    convolutions alone has no sequence length), as the probe runs every source."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(tiny_config("lfm2", head_dim=None, conv_L_cache=4,
+                                                             layer_types=["conv"] * 4))
+    fields = parts.assemble(model).fields
+    assert fields["layer_types"] == ("conv",) * 4 and (fields["num_heads"], fields["num_kv_heads"]) == (4, 2)
+
+
+def _aliased(first, second):
+    def compute(x):
+        return x if first is second else -x
+    return compute
+
+
+def test_closures_whose_containers_alias_apart_compute_apart():
+    """Two closures of one body over lists of equal items compute alike only where the lists alias alike
+    (`code_identity._paired`): one binding the same list twice returns its input, one binding two lists
+    negates it; and two kernel-decorated copies of a helper, each holding its own tuple of parameter
+    names and list of child names (LFM2-MoE's of LFM2's convolution), compute alike."""
+    from transformers.models.lfm2.modeling_lfm2 import Lfm2ShortConv
+    from transformers.models.lfm2_moe.modeling_lfm2_moe import Lfm2MoeShortConv
+
+    from dew.interop.code_identity import Renaming, matched_class, same_code
+
+    shared, apart = [], ([], [])
+    assert not same_code(_aliased(shared, shared), _aliased(*apart), Renaming("", ""))
+    assert same_code(_aliased(*apart), _aliased([], []), Renaming("", ""))
+    assert matched_class(Lfm2MoeShortConv, Lfm2ShortConv) is not None
+
+
+def test_a_biased_short_convolution_is_left_to_tier_3():
+    """LFM2's biased convolution zeroes its padded slots before its input projection, so they still convolve
+    their bias terms into the next real tokens' history, which Dew's held convolution keeps empty: tier 2
+    assembles none of it."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(tiny_config("lfm2", head_dim=None, conv_bias=True,
+                                                             layer_types=["conv", "full_attention"] * 2))
+    with pytest.raises(parts.Ambiguous):
+        parts.assemble(model)
+
+
+ERNIE_CLAMP_SEEDS = 8
+"""The clamped router's declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert():
+    """ERNIE 4.5's router picks by score plus its correction bias and divides the chosen scores by their sum
+    clamped below at `moe_norm_min`: where the bias picks an expert of faint score (its logit near -40),
+    the clamp binds. Dew's router as tier 2 reads it (`Router.weight_sum_min`) picks alike, and its
+    weights and their gradient into the tokens are on par with the source's from its float64 twin
+    (check 1)."""
+    import jax.numpy as jnp
+    from transformers import Ernie4_5_MoeConfig
+    from transformers.models.ernie4_5_moe.modeling_ernie4_5_moe import Ernie4_5_MoeTopKRouter
+
+    from dew.nn.moe import EXPERT_BIAS, EXPERT_BIAS_COLLECTION, Router
+
+    config = Ernie4_5_MoeConfig(hidden_size=4, moe_num_experts=2, moe_k=1)
+    source = Ernie4_5_MoeTopKRouter(config)
+    with torch.no_grad():
+        source.weight.copy_(torch.tensor([[0.0, 0.0, 0.0, 0.0], [-40.0, 0.0, 0.0, 0.0]]))
+        source.moe_statics.e_score_correction_bias.copy_(torch.tensor([[0.0, 2.0]]))
+    wide = float64_twin(source, lambda: Ernie4_5_MoeTopKRouter(config))
+    router = Router(num_experts=2, in_features=4, top_k=1, expert_bias=True, weight_sum_epsilon=0.0,
+                    weight_sum_min=float(source.norm_min))
+    variables = {**router.init(jax.random.key(0), jnp.zeros((1, 4))),
+                 "params": {"kernel": jnp.asarray(source.weight.detach().numpy().T)},
+                 EXPERT_BIAS_COLLECTION: {EXPERT_BIAS: jnp.asarray([0.0, 2.0])}}
+
+    def draw(seed):
+        rng = np.random.default_rng([0x3078, seed])
+        tokens = (np.array([1.0, 0.0, 0.0, 0.0]) + 0.05 * rng.standard_normal((6, 4))).astype(np.float32)
+        return tokens, rng.standard_normal((6, 1)).astype(np.float32)
+
+    @as_given
+    def ours(tokens, cotangent):
+        def weighed(tokens):
+            return jnp.sum(router.apply(variables, tokens)[0] * cotangent)
+        return (np.asarray(router.apply(variables, jnp.asarray(tokens))[0]),
+                np.asarray(jax.grad(weighed)(jnp.asarray(tokens))))
+
+    def torch_arm(model, dtype):
+        def run(tokens, cotangent):
+            held = torch.from_numpy(np.asarray(tokens)).to(dtype).requires_grad_()
+            _, weights, chosen = model(held)
+            assert chosen.flatten().tolist() == [1] * len(chosen)
+            (weights * torch.from_numpy(np.asarray(cotangent)).to(dtype)).sum().backward()
+            return weights.detach().numpy(), held.grad.numpy()
+        return run
+
+    def truth(tokens, cotangent):
+        with float64():
+            return torch_arm(wide, torch.float64)(tokens, cotangent)
+
+    assert_as_exact(ours, as_given(torch_arm(source, torch.float32)), draw, "ERNIE clamped router",
+                    seeds=ERNIE_CLAMP_SEEDS, truth_fn=truth)
+
+
+def test_a_biased_ernie_moe_is_left_to_tier_3():
+    """ERNIE 4.5's `use_bias` biases its shared experts beside its unbiased routed ones, which Dew's routed
+    layers do not hold (their gated MLPs are bias-free): tier 2 assembles none of it, saying so."""
+    from interop_support import tiny_config
+
+    config = tiny_config("ernie4_5_moe", head_dim=None, use_bias=True, moe_num_experts=8, moe_k=2,
+                         moe_intermediate_size=32, moe_num_shared_experts=1, moe_layer_start_index=0)
+    verdict = verify_mapping(config.to_dict())
+    assert not isinstance(verdict, VerifiedMapping)
+    assert "shared experts are biased" in verdict.reasons["parts"]
+
+
+def test_attention_fields_join_the_kinds_of_the_layers_that_state_them():
+    """A part's attention fields (`_with_attention_fields`) join each stated layer type's kind beside the
+    fields it holds, a NoPE kind's among them, and leave a convolution layer's kind as it is; layers of
+    one type that state different fields are `Ambiguous`."""
+    nope = {"mixer": {"class": "attention", "fields": {"nope": True}}}
+    conv = {"mixer": {"class": "short_conv", "fields": {"conv_L_cache": 3}}}
+    fields = {"num_layers": 4, "layer_types": ("conv", "full_attention", "conv", "full_attention_nope"),
+              "kinds": {"conv": conv, "full_attention_nope": nope}}
+    pairs = {"rotary_pairs": "adjacent"}
+    joined = parts._with_attention_fields(fields, {1: pairs, 3: pairs})
+    assert joined["kinds"]["conv"] == conv
+    assert joined["kinds"]["full_attention_nope"]["mixer"]["fields"] == {"nope": True, **pairs}
+    assert joined["kinds"]["full_attention"]["mixer"] == {"class": "attention", "fields": pairs}
+    with pytest.raises(parts.Ambiguous):
+        parts._with_attention_fields({**fields, "layer_types": ("conv", "full_attention") * 2}, {1: pairs})
+
+
+def test_a_decoder_norming_its_rotated_heads_decodes_through_its_cache_as_transformers_generates(tmp_path):
+    """Hunyuan's attention norms each head's queries and keys after their rotation, so a cached key is
+    normed as it is written: a cached greedy continuation of a decoder assembled from its parts draws the
+    tokens transformers' own generate draws."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    from dew.sampling import Sampling, generate
+
+    torch.manual_seed(0)
+    config = tiny_config("hunyuan_v1_moe", **BUILT_IN["hunyuan_v1_moe"])
+    model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    source = AutoModelForCausalLM.from_pretrained(tmp_path, dtype=torch.float32, attn_implementation="eager",
+                                                  experts_implementation="eager").eval()
+    ids = torch.as_tensor(np.random.default_rng(0x3078).integers(3, config.vocab_size, (1, 6)))
+    with torch.no_grad():
+        drawn = source.generate(ids, max_new_tokens=8, min_new_tokens=8, do_sample=False)
+    generated = generate(loaded.model, loaded.variables, np.asarray(ids), 8, key=0,
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
 
 
 def test_a_stored_name_reads_as_the_sources_load_reads_it():
@@ -509,23 +774,70 @@ def test_a_remote_causal_lm_over_a_built_in_config_is_its_own(tmp_path):
     assert verified.source is not None and set(verified.source.references) == {"AutoModelForCausalLM"}
 
 
-def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path):
+@pytest.mark.parametrize("layer", [0, -1])
+def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path, layer):
     """A source whose parts are the known ones by their code but whose one query projection's weight
     takes no gradient (a tensor hook zeroing it, in training and evaluation alike) is refused: that
-    one parameter's gradient is far from the truth, however small beside the others'."""
+    one parameter's gradient is far from the truth, however small beside the others'. So it is on the
+    last of four layers, which a probe cut to fewer would not reach: the probe cuts no depth of a
+    source's own code (`verify.shallow`)."""
     def frozen(code):
         changed = code.replace(
             "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n",
             "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n"
-            "        self.model.layers[0].attention.wq.weight.register_hook(\n"
+            f"        self.model.layers[{layer}].attention.wq.weight.register_hook(\n"
             "            lambda gradient: 0 * gradient)\n", 1)
         assert changed != code
         return changed
 
     write_source(tmp_path / "frozen", "renamed", frozen)
-    config = json.loads((tmp_path / "frozen" / "config.json").read_text())
+    config = {**json.loads((tmp_path / "frozen" / "config.json").read_text()), "num_hidden_layers": 4}
     with pytest.raises(ValueError):
         verify_mapping(config, remote=tmp_path / "frozen")
+
+
+FACTORY_CONFIG = """
+from transformers import LlamaConfig
+
+
+class FactoryConfig(LlamaConfig):
+    model_type = "factory"
+"""
+
+FACTORY = """
+from transformers import LlamaForCausalLM, PreTrainedModel
+
+from .configuration_factory import FactoryConfig
+
+
+class FactoryForCausalLM(PreTrainedModel):
+    config_class = FactoryConfig
+
+    def __new__(cls, config, *args, **kwargs):
+        model = LlamaForCausalLM(config)
+        for layer in model.model.layers[2:]:
+            layer.self_attn.q_proj.weight.register_hook(lambda gradient: 0 * gradient)
+        return model
+"""
+"""A remote causal LM whose constructor returns transformers' own Llama, its later layers' query
+projections taking no gradient."""
+
+
+def test_a_remote_constructor_returning_transformers_classes_is_probed_at_its_depth(tmp_path):
+    """A remote source whose constructor returns transformers' own Llama, a hook zeroing the gradient of
+    each query projection past its second layer, is refused: the probe cuts no depth of a model a
+    source's own code built, whatever classes it holds (`verify.shallow`), so its four layers run and
+    the hooked ones show."""
+    directory = tmp_path / "factory"
+    directory.mkdir()
+    (directory / "configuration_factory.py").write_text(FACTORY_CONFIG)
+    (directory / "modeling_factory.py").write_text(FACTORY)
+    config = {**TINY, "num_hidden_layers": 4, "model_type": "factory",
+              "auto_map": {"AutoConfig": "configuration_factory.FactoryConfig",
+                           "AutoModelForCausalLM": "modeling_factory.FactoryForCausalLM"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError):
+        verify_mapping(config, remote=directory)
 
 
 def _slot_release(tmp_path, edit=lambda code: code):

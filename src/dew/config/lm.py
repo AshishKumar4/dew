@@ -242,6 +242,7 @@ class LMRunConfig(DecoderRunConfig):
         else:
             source = self.pretrained_source(written, vocab_size, context)
             source = self.looped(source)
+            # Its fields name the mask id a masked objective reads, which a loop leaves as loaded.
             model, fields = source.model, dict(source.model_config)
         if source is None:
             run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))

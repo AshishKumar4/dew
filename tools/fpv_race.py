@@ -48,7 +48,7 @@ from flax import serialization, traverse_util
 
 from dew.data.dataset import Loader
 
-AUXILIARY = (("state", 13, 512), ("gates", 24, 512), ("airframe", 6, 256), ("dynamics", 20, 256),
+AUXILIARY = (("state", 13, 512), ("gates", 24, 512), ("airframe", 6, 256), ("physics", 20, 256),
              ("obstacles", 12, 256))
 """The world model's auxiliary heads: each privileged view, its width and its head's units."""
 TRAINING = (("loop", 0.4), ("chain", 0.6))
@@ -150,23 +150,53 @@ def _first_episodes(reward: np.ndarray, passed: np.ndarray, terminal: np.ndarray
 
 def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: float) -> dict:
     """`scored` of a teacher's greedy flight in a batched JAX race (`dew.rl.flight.FlightEnv`, its views the
-    teacher's and `passed`), the whole flight one jitted rollout (`dew.rl.env.env_rollout`)."""
+    teacher's, `passed` and `gates`), the whole flight one jitted rollout (`dew.rl.env.env_rollout`); and
+    the share of its first episodes' steps whose next gate lies in the camera's view (`in_view`), which a
+    policy of the camera alone needs of the flights it learns from."""
     from dew.rl.env import env_rollout, start
+    from dew.rl.flight import quaternion
+    from dew.rl.quadrotor import rotation
 
     def rolled(params, key):
-        return env_rollout(env, objective.greedy, params, start(env, key), steps)[1].following
+        carry = start(env, key)
+        camera = carry.state.camera
+        mounts = jax.vmap(lambda roll, uptilt, yaw: rotation(quaternion(roll, -uptilt, yaw)))(
+            camera.mount[:, 0], camera.uptilt, camera.mount[:, 1])
+        return env_rollout(env, objective.greedy, params, carry, steps)[1], mounts, camera.fov
 
-    following = jax.device_get(jax.jit(rolled)(params, key))
-    return _first_episodes(following.reward, following.observation["passed"], following.terminated,
-                           following.terminated | following.truncated, crash_penalty)
+    taken, mounts, fov = jax.device_get(jax.jit(rolled)(params, key))
+    following, last = taken.following, taken.following.terminated | taken.following.truncated
+    alive = np.cumsum(last, 0) - last == 0
+    seen = in_view(taken.observation["gates"], mounts, fov)
+    return {**_first_episodes(following.reward, following.observation["passed"], following.terminated, last,
+                              crash_penalty), "in_view": float(seen[alive].mean())}
 
 
-def teacher_policy(objective):
-    """The teacher's greedy action from a driven step."""
-    def greedy(params, observed, key, memory):
-        return objective.greedy(params, observed["observation"], key, memory)
+def in_view(gates: np.ndarray, mounts: np.ndarray, fov: np.ndarray) -> np.ndarray:
+    """Whether the next gate's centre lies in each drone's camera's field of view `[steps, drones]`, from the
+    `gates` view (its corners in the body frame), each drone's camera mount `[drones, 3, 3]` (its columns
+    the camera's forward, left and up in the body frame, as `dew.rl.flight.cameras` mounts it) and field of
+    view `[drones]` (radians, a square image's): in front of the camera, its angles across and up from the
+    camera's axis within half the field of view. A drone's mount holds through its first episode, the
+    steps this scores."""
+    center = np.asarray(gates, np.float64)[..., :12].reshape(*np.shape(gates)[:-1], 4, 3).mean(-2)
+    local = np.einsum("dji,sdj->sdi", np.asarray(mounts, np.float64), center)
+    depth, half = local[..., 0], np.asarray(fov, np.float64) / 2
+    across = np.arctan2(np.abs(local[..., 1]), np.maximum(depth, 1e-9))
+    rise = np.arctan2(np.abs(local[..., 2]), np.maximum(depth, 1e-9))
+    return (depth > 0) & (across < half) & (rise < half)
 
-    return greedy
+
+def teacher_policy(objective, *, explore: bool = False):
+    """The teacher's action from a driven step: its greedy one, or where it `explore`s a draw from its policy
+    as it trained (tanh of a normal draw)."""
+    acted = objective.act if explore else objective.greedy
+
+    def policy(params, observed, key, memory):
+        action, _, memory = acted(params, observed["observation"], key, memory)
+        return action, {}, memory
+
+    return policy
 
 
 def check(out: Path, *, assets: Path, hz: float = 60.0) -> dict:
@@ -220,7 +250,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         return Batched(flight, drones)
 
     def judged_at(level: float, families) -> Batched:
-        shown = ("teacher", "passed")
+        shown = ("teacher", "passed", "gates")
         return Batched(FlightEnv(racing_at(hz, families), shown, difficulty=level, ramp=level), 1024)
 
     objective = teacher_objective()
@@ -266,8 +296,12 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
 
 
 def demonstrations(simulator, objective, variables, steps: int, capacity: int, chunk: int = 1000):
-    """The teacher's greedy flight from every drone of `simulator` for `steps` steps, recorded in the
-    agent's convention, as a replay of `capacity` steps a drone the online agent goes on writing. The flight
+    """The teacher's flight from every drone of `simulator` for `steps` steps, recorded in the agent's
+    convention, as a replay of `capacity` steps a drone the online agent goes on writing. The teacher flies
+    its policy's draws as it trained, not its greedy action: the demonstrations then hold the states a small
+    error leads to and the teacher's way back from them (DART, Laskey et al., arXiv 1703.09327), where a
+    student cloned from greedy flight alone missed the teacher's actions on fresh flights by three times its
+    training error (on the G4, 10-31) and crashed within two seconds. The flight
     is written `chunk` steps at a time into the replay, which each write updates in place: a whole flight's
     record beside the replay would hold its 96-pixel images several times over (16 drones' 18,000 steps
     took the G4's 96 GB)."""
@@ -278,7 +312,7 @@ def demonstrations(simulator, objective, variables, steps: int, capacity: int, c
     carry, replay = simulator_start(driven, jax.random.key(3)), None
     added = jax.jit(lambda replay, stream: replay.add(stream), donate_argnums=0)
     for start in range(0, steps, chunk):
-        carry, taken = simulator_rollout(driven, teacher_policy(objective), variables, carry,
+        carry, taken = simulator_rollout(driven, teacher_policy(objective, explore=True), variables, carry,
                                          min(chunk, steps - start), reset=False)
         stream = {**taken.observation, "action": taken.action}
         if replay is None:
@@ -391,7 +425,7 @@ def _online(out: Path, report: dict, progress: dict, agent, races: tuple, judge,
 
 
 def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, hz: float = 60.0,
-          demonstration_seconds: float = 300.0, pretrain_updates: int = 50_000,
+          demonstration_seconds: float = 600.0, pretrain_updates: int = 50_000,
           environment_seconds: float = 33_333.0, capacity_seconds: float = 600.0,
           highlight: bool = True, saved_every: int = 2000, level: float = 1.0) -> dict:
     """FlyDreamer's agent at its size (TransDreamer's dynamics, bfloat16) on the image alone: pretrained on
@@ -415,7 +449,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
 
     scale = hz / 30
     length, imagination = round(64 * scale), round(15 * scale)
-    views = ("image", "state", "gates", "airframe", "dynamics", "obstacles", "passed", "finishing", "teacher")
+    views = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed", "finishing", "teacher")
     families = TRAINING if highlight else (("loop", 1.0),)
 
     def raced(families):
