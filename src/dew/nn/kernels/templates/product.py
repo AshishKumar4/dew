@@ -5,7 +5,7 @@ caller asked for, and keeps the declaration through every mainloop and its VJP's
 
 import dataclasses
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -148,3 +148,12 @@ class Scaled:
     @property
     def shape(self) -> tuple:
         return self.value.shape
+
+
+class Blocks:
+    """`count` products named `name` to sum, `left(j) @ right(j)` a block `j` (tiles in memory): one a
+    block, which a mainloop may issue as a loop over `j`, its operands' fragments loaded a block at a time
+    (`operands.Issuer.summed`), where unrolled ptxas held every block's at once."""
+
+    def __init__(self, name: str, left: Callable, right: Callable, count: int):
+        self.name, self.left, self.right, self.count = name, left, right, count
