@@ -781,7 +781,8 @@ class DreamerRollout:
             # The replay is written in place, its buffer donated to the step that writes it: an outer
             # program (`dew.nn.kernels.options.program`), since it runs no module of the objective's.
             recorded = outer_program(_kept, donate_argnames=("replay",))
-            self._roll = functools.partial(self._simulated, driven, recorded)
+            self._roll = functools.partial(self._collected, functools.partial(simulator_rollout, driven),
+                                           recorded)
         else:
             stepped = Driven(env)
             self._begin = functools.partial(start, stepped)
@@ -812,32 +813,25 @@ class DreamerRollout:
     def _policy(self, random: bool) -> Policy:
         return self._uniform if random else self.objective.act
 
-    def _stepped(self, env: Env, variables: Variables, live: _Live, *, steps: int,
-                 random: bool) -> tuple[_Live, jax.Array, jax.Array]:
-        """`live` after `steps` steps of every environment of `env`, one scan, and the ended episodes'
-        returns' sum and count."""
-        carry, recorded = env_rollout(env, self._policy(random), variables, live.carry, steps, reset=False)
-        replay, returns, total, count = _kept(live.replay, live.returns, recorded)
+    def _collected(self, rolled: Callable, kept: Callable, variables: Variables, live: _Live, *,
+                   steps: int, random: bool) -> tuple[_Live, jax.Array, jax.Array]:
+        """`live` after `steps` steps of every environment, `rolled` collecting them (`env_rollout` over
+        a driven environment, one scan; `simulator_rollout` over a simulator, from the host) and `kept`
+        writing them to the replay (`_kept`), and the ended episodes' returns' sum and count."""
+        carry, recorded = rolled(self._policy(random), variables, live.carry, steps, reset=False)
+        replay, returns, total, count = kept(live.replay, live.returns, recorded)
         return _Live(carry, replay, returns), total, count
 
     def _rolled(self, env: Env, variables: Variables, live: _Live, *, steps: int,
                 random: bool) -> tuple[_Live, jax.Array, jax.Array]:
-        """`_stepped` as the objective's program, since it runs the objective's policy (`Objective.program`:
-        its modules key it and its options compile it), `live` donated so the replay is written in place,
-        the environment held so another replaces it."""
-        rollout = self.objective.program("rollout", functools.partial(self._stepped, env),
-                                         static_argnames=("steps", "random"), donate_argnames=("live",),
-                                         holds=(env,))
+        """`_collected` over `env` as the objective's program, since it runs the objective's policy
+        (`Objective.program`: its modules key it and its options compile it), `live` donated so the
+        replay is written in place. It is named by its environment, whose identity stays its own while
+        the program, which holds it, is cached."""
+        collect = functools.partial(self._collected, functools.partial(env_rollout, env), _kept)
+        rollout = self.objective.program(("rollout", id(env)), collect, static_argnames=("steps", "random"),
+                                         donate_argnames=("live",))
         return rollout(variables, live, steps=steps, random=random)
-
-    def _simulated(self, simulator: DrivenSimulator, recorded: Callable, variables: Variables, live: _Live, *,
-                   steps: int, random: bool) -> tuple[_Live, jax.Array, jax.Array]:
-        """`live` after `steps` steps of every environment of `simulator`, stepped from the host, and the
-        ended episodes' returns' sum and count."""
-        carry, steps_taken = simulator_rollout(simulator, self._policy(random), variables, live.carry, steps,
-                                               reset=False)
-        replay, returns, total, count = recorded(live.replay, live.returns, steps_taken)
-        return _Live(carry, replay, returns), total, count
 
     def _started(self, variables: Variables, key: jax.Array) -> _Live:
         """Every environment's first episode begun, and the replay: the one given, or a fresh one the
