@@ -270,6 +270,21 @@ def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_s
     assert int(state.updates) == 1 and solves_equations(state.opt_state)
 
 
+def test_a_capped_gauss_newton_direction_keeps_a_cap_far_below_its_norm():
+    """A float32 solved direction of norm 1e18 capped at 1e-30 (`solved_directions(clip=)`) is the
+    direction scaled to that cap, as Optax's global-norm clip scales a gradient, not a zero underflowed
+    from the cap over the norm (row 3360's review)."""
+    from dew.gauss_newton import NormalEquations, solved_directions
+
+    capped = solved_directions(0.0, clip=1e-30)
+    params = {"w": jnp.zeros((1,), jnp.float32)}
+    system = NormalEquations(total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(1),
+                             pulled=jnp.asarray([1e18], jnp.float32),
+                             normal=jnp.asarray([[1.0]], jnp.float32), update=1)
+    direction, _ = capped.update(params, capped.init(params), params, statistics=system)
+    np.testing.assert_array_equal(np.asarray(direction["w"]), np.asarray([1e-30], np.float32))
+
+
 @pytest.mark.parametrize("clip", [0.0, 0.05])
 @pytest.mark.parametrize("groups", [False, True])
 def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before_it(clip, groups):

@@ -116,8 +116,8 @@ def solved_directions(damping: float = 0.0,
         step = jax.lax.cond(statistics.rows >= statistics.update, statistics.solved,
                             lambda _: jnp.zeros(solved.shape, solved.dtype), damping)
         if clip is not None:
-            norm = jnp.linalg.norm(step)
-            step = step * jnp.minimum(1, clip / jnp.maximum(norm, jnp.finfo(step.dtype).tiny))
+            # Optax's own cap of a global norm, which divides by the norm before it scales.
+            step, _ = optax.clip_by_global_norm(clip).update(step, optax.EmptyState())
         return unravel(step.astype(flat.dtype)), state
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
