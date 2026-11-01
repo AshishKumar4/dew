@@ -103,14 +103,14 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
 
     import openai
-    from transformers import AutoTokenizer
 
+    from dew.data.text import load_tokenizer
     from dew.inference import OpenAICompletion, OpenAIRolloutServer
     from dew.inference.nccl import NCCLPush
     from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
 
-    tokenizer = AutoTokenizer.from_pretrained(args.policy)
+    tokenizer = load_tokenizer(args.policy)
     def asked(text: str) -> tuple[int, ...]:
         """The chat template's ids for one user turn, a list (not Transformers 5's BatchEncoding)."""
         turn = [{"role": "user", "content": text}]

@@ -242,6 +242,10 @@ class Router(nn.Module):
     block_experts: int | None = None
     hash_vocab: int | None = None
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
+    weight_sum_min: float = 0.0
+    """The least a renormalization divides the chosen weights by (ERNIE 4.5's `moe_norm_min`, which
+    clamps their sum from below where a biased selection picks weights that sum to less): above 0, the
+    chosen weights divide by `max(sum + weight_sum_epsilon, weight_sum_min)`, a softmax's too."""
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
@@ -329,13 +333,17 @@ class Router(nn.Module):
             self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.
             self.sow(ROUTER_COLLECTION, ROUTER_LOG_Z, jax.nn.logsumexp(logits, axis=-1))
-        if self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights:
+        if (self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights
+                and not self.weight_sum_min):
             weights = renormalized_softmax(logits, indices)
         else:
             gating = scores + self.bias.value if self.bias_in_weights else scores
             weights = jnp.take_along_axis(gating, indices, axis=-1)
             if self.normalize_weights:
-                weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + self.weight_sum_epsilon)
+                total = jnp.sum(weights, axis=-1, keepdims=True) + self.weight_sum_epsilon
+                if self.weight_sum_min:
+                    total = jnp.maximum(total, self.weight_sum_min)
+                weights = weights / total
         return weights * self.routed_scaling_factor, indices
 
     def _selected(self, scores, tokens, media, blocks):
@@ -1015,6 +1023,7 @@ class SparseMLP(nn.Module):
     block_experts: int | None = None
     hash_vocab: int | None = None
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
+    weight_sum_min: float = 0.0
     swiglu_limit: float | None = None
     scale_inputs: bool = False
     shared: Callable[..., nn.Module] | None = None
@@ -1063,7 +1072,7 @@ class SparseMLP(nn.Module):
                            media_bias=self.media_bias,
                            routing_block=self.routing_block,
                            block_experts=self.block_experts,
-                           weight_sum_epsilon=self.weight_sum_epsilon,
+                           weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
