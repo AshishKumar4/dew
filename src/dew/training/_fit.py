@@ -218,7 +218,7 @@ class FitPlan:
     @staticmethod
     def cadences(loader: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
                  metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
-                 written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
+                 written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
                  checkpoints: Checkpoints | None = None, examples: int | None = None) -> tuple[
                      int | Counted, Cadence, Cadence | datetime.timedelta, Cadence,
                      dict[str, EvalSuite]]:

@@ -71,17 +71,14 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
              validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None, *,
              steps: int | None, epochs: int | None, tokens: int | None, examples: int | None,
              accumulation: int, startup: Startup,
-             ) -> tuple[Loader, Mapping[str, Reader | EvalSuite] | None, int | None, int | None, int | None]:
+             ) -> tuple[Loader, Mapping[str, Reader | EvalSuite] | None, int | None, int | None]:
     """A fit's data and its length: its length named once (`run_length`), the process readied, the data
-    and its validation compiled with the objective's steps (`fitted`), its token budget, its microsteps
-    and its bound in examples, `epochs` of a read with no record count read as passes over its source
-    examples among them (`Loader.pass_examples`) (`run_tokens`, `run_steps`), each long phase reported
-    (`Startup`)."""
+    and its validation compiled with the objective's steps (`fitted`), its token budget and its
+    microsteps (`run_tokens`, `run_steps`), each long phase reported (`Startup`)."""
     run_length(steps, epochs, tokens, examples, required=False)
     ready_process()
     with startup.phase("data", "preparing the data"):
-        loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples,
-                                    epochs=epochs)
+        loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples)
     # The widths the data bound, which a saved run of the objective records.
     objective.bind_widths(loader.widths)
     # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
@@ -89,4 +86,4 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     with startup.phase("count", "counting the steps the run's examples take", when=examples is not None):
         steps = run_steps(loader, steps, epochs, tokens, accumulation, examples)
     count_compilation_cache()
-    return loader, validation, tokens, steps, loader.examples
+    return loader, validation, tokens, steps
