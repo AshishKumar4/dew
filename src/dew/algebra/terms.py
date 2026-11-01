@@ -219,7 +219,7 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
         return read(equation.invars[0]).reduce(REDUCTIONS[name], axes, param(primitive, equation.params))
     if name == "dot_general" and len(equation.invars) == 2:
         given = dict(equation.params)
-        dtypes = {var.aval.dtype for var in equation.invars if isinstance(var.aval, ShapedArray)}
+        dtypes = {var.aval.dtype for var in equation.invars}
         if dtypes == {given.get("preferred_element_type")}:
             # A product accumulating in its operands' own dtype is one of no preferred type (`rules.plain`).
             given["preferred_element_type"] = None
