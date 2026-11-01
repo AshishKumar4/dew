@@ -43,6 +43,12 @@ def drawing() -> bool:
     return bool(os.environ.get(DRAWS))
 
 
+def judging() -> bool:
+    """Whether this process is a sharded site's judge (POOL): its draws are its map tasks' records, so it
+    draws none of its own and sizes nothing they carry already."""
+    return bool(os.environ.get(POOL))
+
+
 def site_id(label: str) -> str:
     """A site's identity across its map tasks and its judge: the Python it runs on, its test's id (pytest's,
     the same test in each task) and its label, so neither two tests' sites of one label nor one site's runs

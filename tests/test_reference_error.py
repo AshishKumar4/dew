@@ -355,6 +355,52 @@ def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
                         terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
 
 
+def test_a_sharded_sites_map_tasks_size_its_cancelling_rows_and_its_judge_runs_no_truth(
+        tmp_path, monkeypatch):
+    """A site whose truth holds a row of float64 zero (`cancelling`) sized by its terms by default
+    (`_cancelling_terms`) is so in each map task (DRAWS), which runs the truth on its first draw to find
+    them, and its records carry each row's size; its judge (POOL) reads them, running no truth at all, and
+    judges as the site does whole: on par admitted, a leaked term refused alike."""
+    from map_judge import DRAWS, POOL, RECORDS
+
+    truths = []
+
+    def counted(x, w):
+        truths.append(1)
+        return cancelling(split=False)(x, w)
+
+    def judged(dew, label):
+        runs = []
+        for index, (start, stop) in enumerate([(0, 40), (40, 80)]):
+            monkeypatch.setenv(DRAWS, f"{start}:{stop}")
+            monkeypatch.setenv(RECORDS, str(tmp_path / label / str(index)))
+            truths.clear()
+            assert_as_exact(dew, cancelling(split=False), cancelling_draw, label, seeds=16,
+                            truth_fn=counted)
+            runs.append(len(truths))
+        monkeypatch.delenv(DRAWS)
+        monkeypatch.delenv(RECORDS)
+        monkeypatch.setenv(POOL, str(tmp_path / label))
+        truths.clear()
+        try:
+            assert_as_exact(dew, cancelling(split=False), cancelling_draw, label, seeds=16,
+                            truth_fn=counted)
+        finally:
+            monkeypatch.delenv(POOL)
+            assert truths == [], "a judge runs no truth"
+        assert all(count >= 1 for count in runs), "each map task sizes its rows from the truth"
+
+    judged(cancelling(split=True), "on par")
+    assert_as_exact(cancelling(split=True), cancelling(split=False), cancelling_draw, "whole", seeds=16,
+                    truth_fn=counted)
+    with pytest.raises(GateFailure) as whole:
+        assert_as_exact(cancelling(split=True, leak=True), cancelling(split=False), cancelling_draw,
+                        "leaked", seeds=16, truth_fn=counted)
+    with pytest.raises(GateFailure) as pooled:
+        judged(cancelling(split=True, leak=True), "leaked")
+    assert str(pooled.value) == str(whole.value)
+
+
 MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
 """A fixed [4, 4] product past `cancelling`'s rows (`mixed`)."""
 

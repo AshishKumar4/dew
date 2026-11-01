@@ -108,7 +108,7 @@ from check1_statistics import (
     shown,
 )
 from float64_terms import float64_terms
-from map_judge import DRAWS, PoolRefused, pooled_units, record_units
+from map_judge import DRAWS, PoolRefused, judging, pooled_units, record_units
 
 from dew.accuracy import distance, reduction_bound, within
 from dew.nn.precision import FP32_SUMS
@@ -1719,7 +1719,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
     truth_program = _truth_program(truth_fn)
-    if terms_fn is None and terms is not False:
+    # A judge's draws are its map tasks' records, each row sized by the terms its task found, so it sizes
+    # none (`map_judge.judging`): no truth runs there.
+    if terms_fn is None and terms is not False and not judging():
         terms_fn = _cancelling_terms(draw, truth_fn if truth_fn is not None else reference_fn,
                                      truth_program if isinstance(truth_program, _Truth) else None)
     narrow_leaves: list[str] = []
@@ -1734,6 +1736,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
     def drawn_for(index: int):
         def drawn(start, stop):
+            assert not judging(), f"{label}: a judge draws nothing of its own, its draws are its pool's"
             if (start, stop) not in ranges:
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
