@@ -7,7 +7,7 @@ The environment is its class and arguments (`EnvConfig`) and the rollout its cla
 defaults as they were recorded, as a run holds its model and its objective. What the environment states,
 the run derives: the agent's action width, the width a policy reads of each observation and the image a
 world model sees. The rollout replaces every batch whole, so the run reads no data, and the trainer is
-handed a loader of empty rows (`_idle`).
+handed a loader of empty rows (`idle`).
 """
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ class EnvRunConfig(RunConfig):
 
     def build_run(self) -> Prepared:
         """The agent the record names, acting in its environment through its rollout, on the loader the
-        rollout replaces (`_idle`), validated by its episodes where it names them."""
+        rollout replaces (`idle`), validated by its episodes where it names them."""
         if self.data is not None or self.validation is not None or self.lora is not None:
             raise ValueError("an environment run trains its whole agent on the batches its rollout collects; "
                              "leave data, validation and lora unset, and score it by its episodes")
@@ -228,7 +228,7 @@ class EnvRunConfig(RunConfig):
         objective = self.agent(env, self.started())
         rollout = self.rollout.build(objective, env, **self.taught(objective, env))
         validation = None if self.episodes is None else {"episodes": self.episodes.split(objective, env)}
-        return Prepared(self, objective, _idle(), rollout=rollout, validation=validation)
+        return Prepared(self, objective, idle(), rollout=rollout, validation=validation)
 
     def trained_model(self) -> ModelConfig:
         """The model the run trains: its own, or where it starts from a saved run that run's."""
@@ -363,12 +363,13 @@ def _seen(observation: Observation, names: tuple[str, ...]) -> tuple[int, ...]:
     return shapes[0] if len(shapes) == 1 else (sum(shape[-1] for shape in shapes),)
 
 
-def _idle() -> Loader:
+def idle() -> Loader:
     """The loader of a run whose rollout makes every batch whole (§14): a batch of no records, one value for
     the step, which any mesh places whole, the same each time it opens (`replayed`), so a resume reads on;
-    with no record count, so no cadence is an epoch of it."""
+    with no record count, so no cadence is an epoch of it. A run composed in Python passes it to
+    `Trainer.fit` as the run kind does."""
     return Loader(train=replayed(lambda partition: itertools.repeat({"step": np.zeros((), np.float32)})),
                   val=None, records=None, batch=1)
 
 
-__all__ = ["EnvConfig", "EnvRunConfig", "EpisodesConfig", "RolloutConfig", "TeacherConfig"]
+__all__ = ["EnvConfig", "EnvRunConfig", "EpisodesConfig", "RolloutConfig", "TeacherConfig", "idle"]

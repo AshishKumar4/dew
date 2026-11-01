@@ -205,7 +205,7 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
     """A few PPO updates of a fresh actor-critic on walks cut at 8 steps, a JAX environment or a simulator
     stepped from the host, raise its greedy policy's mean return above the fresh one's, the collection
     served as two passes of two minibatches."""
-    from dew.data.dataset import Loader
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 64)
@@ -214,8 +214,7 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
     rollout = ControlRollout(objective, env, unroll_length=8, epochs=2, minibatches=2)
     trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout)
     initial = trainer.place()[0]
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    data = idle()
     before = episode_return(objective, env, initial.variables, jax.random.key(6), 8)
     final = trainer.fit(data, steps=60, log_every=60)
     after = episode_return(objective, env, final.variables, jax.random.key(6), 8)
@@ -417,15 +416,14 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
     for bit, the key's as its raw bits; a run whose checkpoints were written without the rollout's state
     resumes to another state, its walks begun again."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.data.dataset import Loader, replayed
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     def walks():
         return Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16)
 
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
-    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
-    data = Loader(train=unread, val=None, records=8, batch=8)
+    data = idle()
 
     def trained(directory, steps, rollout):
         local = {"local_directory": str(directory / "local"), "local_every": 1} if where == "local" else {}
@@ -469,14 +467,13 @@ def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path)
     from recording import preempting
 
     from dew.checkpoints import Checkpoints, Keep
-    from dew.data.dataset import Loader, replayed
+    from dew.objectives.rl.config import idle
     from dew.rl.evaluation import episodes
     from dew.training import Episodes, EvalSuite, Preempted, Trainer
     from dew.training.cooldown import Cooldowns
 
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
-    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
-    data = Loader(train=unread, val=None, records=8, batch=8)
+    data = idle()
     # A cooldown branch is scored by the run's validation: here the walks the greedy policy flies.
     flights = {"flight": EvalSuite(Episodes(episodes(objective.greedy, Batched(TimeLimit(
         Walk(limit=50.0), episode_length=8), 8), 8), {"return": Shown(better="higher"), "steps": Shown()}),
@@ -508,14 +505,13 @@ def test_a_control_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it()
     steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the rollout keeps
     its state and the simulator its own walks (their `branch()`, `dew.rl.simulator.branched`). A simulator
     with no `branch()` is refused the cooldown."""
-    from dew.data.dataset import Loader, replayed
+    from dew.objectives.rl.config import idle
     from dew.rl.evaluation import episodes
     from dew.training import Episodes, EvalSuite, Trainer
     from dew.training.cooldown import Cooldowns
 
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
-    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
-    data = Loader(train=unread, val=None, records=8, batch=8)
+    data = idle()
     flights = {"flight": EvalSuite(Episodes(episodes(objective.greedy, Batched(TimeLimit(
         Walk(limit=50.0), episode_length=8), 8), 8), {"return": Shown(better="higher"), "steps": Shown()}),
         every=8)}
@@ -591,8 +587,8 @@ def test_a_split_scored_by_its_episodes_reports_its_averaged_weights_first_episo
     `flight/steps` and `flight/distance`: what its averaged weights earn flown, from the key the run's key
     gives at its last step, over the walks' first episodes scored by hand; its live weights' flight is
     another. A warming flight before the first step reports nothing."""
-    from dew.data.dataset import Loader, replayed
     from dew.objectives.base import EMASpec
+    from dew.objectives.rl.config import idle
     from dew.rl.evaluation import episodes
     from dew.training import Episodes, EvalSuite, Trainer
     from dew.training.tracker import LocalTracker
@@ -603,8 +599,7 @@ def test_a_split_scored_by_its_episodes_reports_its_averaged_weights_first_episo
     walks = Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 32)
     flown = episodes(objective.greedy, walks, 12, reached=("distance", "push"))
     suite = EvalSuite(Episodes(flown, SHOWN), every=4)
-    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
-    data = Loader(train=unread, val=None, records=8, batch=8)
+    data = idle()
     tracker = LocalTracker(str(tmp_path / "tracked"))
     rollout = ControlRollout(objective, Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 16),
                              unroll_length=8, epochs=2, minibatches=2)
@@ -627,7 +622,7 @@ def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path, se
     very one the run declares), or by that metric where the suite asks for it alone, which logs it alone
     though the episodes report every score they declare."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.data.dataset import Loader, replayed
+    from dew.objectives.rl.config import idle
     from dew.rl.evaluation import episodes
     from dew.training import Best, Episodes, EvalSuite, Trainer
     from dew.training.tracker import LocalTracker
@@ -640,8 +635,7 @@ def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path, se
     asked = split.metrics[:1] if selected == "by its only metric" else ()
     suite = EvalSuite(split, metrics=asked, every=2)
     best = Best("flight/return") if selected == "by name" else Best(split.metrics[0])
-    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
-    data = Loader(train=unread, val=None, records=8, batch=8)
+    data = idle()
     tracker = LocalTracker(str(tmp_path / "tracked"))
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=Keep(latest=1))
     rollout = ControlRollout(objective, Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 16),

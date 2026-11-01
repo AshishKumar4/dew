@@ -108,15 +108,14 @@ def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
     """A Dreamer rollout donates its live state to the steps that advance it, each buffer once, so it runs
     over an environment whose state holds one array in two fields: three updates at a train ratio of 32 over
     windows of 16 in batches of 8 take the prefill and exactly the steps they owe."""
-    from dew.data.dataset import Loader
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     env = Batched(TimeLimit(SharedTarget(), episode_length=20), 8)
     objective = DreamerV3Objective(tiny())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    data = idle()
     trainer.fit(data, steps=3, log_every=3)
     owed = -(-3 * 8 * 16 // 32)
     assert rollout.environment_steps == 8 * 24 + 8 * -(-owed // 8)
@@ -251,8 +250,8 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     dynamics or TransDreamer's, over the walk's position, the walks simulated on the host, or its
     pixels, the pixels' agent predicting the privileged position it never reads better too. Its policy's
     return is the acceptance run's to judge, on a task at the steps the paper reports."""
-    from dew.data.dataset import Loader
     from dew.objectives.base import Step
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     environments, model = AGENTS[agent]
@@ -261,8 +260,7 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
     initial = jax.device_get(trainer.place()[0])
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    data = idle()
     final = trainer.fit(data, steps=150, log_every=150)
     windows = rollout.sample(jax.random.key(8))
 
@@ -372,7 +370,7 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     """A Dreamer rollout started from a replay of recorded steps takes no random prefill: after 12 updates
     at a train ratio of 32 over windows of 16 in batches of 8, its environments have taken exactly the
     steps those updates owe, written after the recorded ones."""
-    from dew.data.dataset import Loader
+    from dew.objectives.rl.config import idle
     from dew.rl.replay import ReplayBuffer
     from dew.training import Trainer
 
@@ -387,8 +385,7 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     seeded = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), 400).add(stream)
     rollout = DreamerRollout(objective, env, batch=8, length=16, train_ratio=32.0, prefill=0, replay=seeded)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    data = idle()
     trainer.fit(data, steps=12, log_every=12)
     owed = -(-12 * 8 * 16 // 32)
     assert rollout.environment_steps == 4 * -(-owed // 4)
@@ -478,11 +475,10 @@ def dreamer_targets(objective, *, checkpointed, replay=None):
 def dreamer_fit(directory, objective, rollout, steps, **options):
     """A Dreamer run of `steps` updates over `rollout`, checkpointed every update to `directory`."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.data.dataset import Loader, replayed
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
-    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
-    data = Loader(train=unread, val=None, records=8, batch=8)
+    data = idle()
     checkpoints = None if directory is None else Checkpoints(str(directory), keep=Keep(latest=8))
     trainer = Trainer(objective, options.pop("optimizer", optax.adam(1e-3)), key=jax.random.key(7),
                       rollout=rollout, checkpoints=checkpoints)
