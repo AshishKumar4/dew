@@ -19,10 +19,11 @@ one GPU entered and the other never did.
 Before the backend opens, a child process on this host's GPUs (`main`) creates a communicator of each kind
 over all of them and reports the bytes each GPU's driver saw go: NCCL's, and the runtime's own beside its
 pool. The answer is kept in Dew's cache per configuration (`configuration`: the GPUs, the driver, NCCL's
-version and settings), so a host pays for it once. Dew's share of each GPU then leaves that room
-(`pool_share`); a share the user set too high for it is refused, naming the bytes. Once the step is compiled,
-its collectives' kinds are read from its program and held to the room its GPUs have outside the pool
-(`checked_room`), so a step that would fail to connect is refused before it runs."""
+version and settings), so a host pays for it once. The pool's share then leaves that room at NCCL's full
+speed, the user's share (or Dew's 95%) its upper bound (`pool_share`): the pool need hold only the compiled
+step, which the fit check holds to it, so no channel or buffer of NCCL's is cut to fit. Once the step is
+compiled, its collectives' kinds are read from its program and held to the room its GPUs have outside the
+pool (`checked_room`), so a step that would fail to connect is refused before it runs."""
 
 from __future__ import annotations
 
@@ -140,20 +141,19 @@ def _child(configured: Mapping) -> Needs:
 
 def pool_share(needs: Needs, memory: Mapping[int, tuple[int, int]], requested: float | None,
                kinds: frozenset[int]) -> float:
-    """The share of each GPU XLA's pool takes: `requested` (the user's XLA_PYTHON_CLIENT_MEM_FRACTION), held
-    to leave each GPU its communicators of `kinds` and the runtime's room outside it, else the largest share
-    that leaves that room, to a thousandth, none above Dew's 0.95. `memory` is each GPU's free and total bytes
-    before the backend opens, every process's allocations counted."""
+    """The share of each GPU XLA's pool takes: the user's (XLA_PYTHON_CLIENT_MEM_FRACTION, `requested`; Dew's
+    0.95 where they named none) as an upper bound, held to leave each GPU its communicators of `kinds` and
+    the runtime's room outside it at NCCL's full speed, the tightest GPU deciding, to a thousandth below.
+    The pool need hold only the compiled step, which the fit check holds to it after. `memory` is each GPU's
+    free and total bytes before the backend opens, every process's allocations counted. A GPU whose
+    communicators leave the pool no room at all is refused, naming the bytes."""
     needed = needs.needed(kinds, runtime=True)
-    if requested is not None:
-        room = {gpu: free - int(requested * total) for gpu, (free, total) in memory.items()}
-        if any(needed.get(gpu, 0) > room[gpu] for gpu in room):
-            raise CommunicatorRoom(f"XLA_PYTHON_CLIENT_MEM_FRACTION={requested} leaves too little of a GPU "
-                                   "for NCCL's communicators and the runtime (measured on this host, "
-                                   "dew.training.communicators)", needed, room)
-        return requested
-    widest = min((free - needed.get(gpu, 0)) / total for gpu, (free, total) in memory.items())
-    return min(0.95, int(widest * 1000) / 1000)
+    free = {gpu: answered[0] for gpu, answered in memory.items()}
+    if any(needed.get(gpu, 0) >= free[gpu] for gpu in free):
+        raise CommunicatorRoom("NCCL's communicators and the runtime leave a GPU no room for XLA's pool "
+                               "(measured on this host, dew.training.communicators)", needed, free)
+    widest = min((free[gpu] - needed.get(gpu, 0)) / total for gpu, (_, total) in memory.items())
+    return min(0.95 if requested is None else requested, int(widest * 1000) / 1000)
 
 
 def kinds_of(program: str) -> frozenset[int]:
@@ -177,23 +177,40 @@ def checked_room(outside: Mapping[int, int | None], needs: Needs, kinds: frozens
 NEEDS: Needs | None = None
 """This process's measurement, where `sized_pool` took one."""
 
+SIZED: dict | None = None
+"""The pool `sized_pool` set: the user's bound (`requested`, None for Dew's own), the `share` it took and
+each GPU's bytes it left for the communicators and the runtime (`needed`), which the fit check records."""
 
-def sized_pool() -> None:
+
+def gpu_memories() -> dict[int, tuple[int, int]]:
+    """Each visible GPU's free and total bytes, by ordinal, as the driver reports them (`gpu_memory`)."""
+    return {ordinal: answered for ordinal in range(gpu_count())
+            if (answered := gpu_memory(ordinal)) is not None}
+
+
+def sized_pool(*, measure: Callable[[], Needs | None] = lambda: needs_of(),
+               memories: Callable[[], Mapping[int, tuple[int, int]]] = gpu_memories) -> None:
     """Size XLA's pool on a host of several GPUs to leave room for its communicators (`pool_share`), before
-    the backend opens: Dew's share where the user named none, the user's held to it where they did. A pool
+    the backend opens, the user's share or Dew's its upper bound. A pool
     that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false) holds no share to size. A pool of processes is not
     measured: its communicators span hosts, whose network buffers one host's child does not make."""
-    global NEEDS
+    global NEEDS, SIZED
     if os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "true").lower() in ("false", "0"):
         return
-    NEEDS = needs_of()
+    NEEDS = measure()
     if NEEDS is None:
         return
-    memory = {ordinal: answered for ordinal in range(gpu_count())
-              if (answered := gpu_memory(ordinal)) is not None}
+    memory = memories()
     named = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")
-    share = pool_share(NEEDS, memory, None if named is None else float(named), frozenset({0}))
+    requested = None if named is None else float(named)
+    # Both kinds' room, as a step's kinds are known only once it compiles: a collective's communicator
+    # and a permute's (KINDS).
+    kinds = frozenset(KINDS)
+    share = pool_share(NEEDS, memory, requested, kinds)
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(share)
+    SIZED = {"requested": requested, "share": share, "needed": NEEDS.needed(kinds, runtime=True)}
+    _log.info("XLA's pool takes %s of each GPU (the user's bound %s), leaving each GPU %s bytes for NCCL's "
+              "communicators at full speed and the runtime", share, requested, SIZED["needed"])
 
 
 def main() -> None:

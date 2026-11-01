@@ -438,7 +438,8 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
         outside = {int(device.local_hardware_id): outside_pool(device) for device in devices}
         communicators.checked_room(outside, communicators.NEEDS,
                                    communicators.kinds_of(executable.as_text() or ""))
-    return {"analysis": analysis, "held": int(held), "devices": devices_stats, "fits": fits}
+    return {"analysis": analysis, "held": int(held), "devices": devices_stats, "fits": fits,
+            **({"pool": json_value(communicators.SIZED, "pool")} if communicators.SIZED is not None else {})}
 
 
 def unclaimed(device, memory: Mapping[str, int]) -> int | None:
