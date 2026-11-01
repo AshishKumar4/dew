@@ -2,7 +2,14 @@
 record keys the file's row in the test cache (tools/armada/ci.py's `cache_key`): the code its run executed,
 read, imported and started, for the process's whole life, and its children's."""
 
+import ast
 import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
 
 import pytest
 from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
@@ -532,6 +539,50 @@ def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
                           f"    assert open({str(shared)!r}).read() == '1'\n",
         "test_reader.py": f"def test_reader():\n    assert open({str(shared)!r}).read() == '1'\n"}, {})
     assert reused() == [True, False]
+
+
+def test_only_what_another_process_of_the_task_made_in_shared_scratch_is_read_outside_the_checkout(
+        ci, tmp_path, monkeypatch):
+    """A file in the machine's shared scratch or the user's home that was there before the task began no
+    process of it left (followed.py's `outside`): the harness's plugins, the venv and its metadata that a
+    task's pytest reads from the checkout the harness is in, which lies in the home as CI's does
+    (/home/ci/work/dew/dew) when these tests run it on a scratch checkout of its own, among them the venv's
+    pyvenv.cfg, which Python 3.12's site reads before it sets sys.prefix to the venv (the recorder runs before
+    the site), and a tool or fixture a test put beside the checkout ahead of the task. A file made since is,
+    and a copy of an old one, which keeps its mtime, is."""
+    monkeypatch.setenv("HOME", str(REPO_ROOT.parent))
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(sys, "exec_prefix", sys.base_exec_prefix)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "scratch"))
+    root = f"{tmp_path}{os.sep}"
+    ahead = tmp_path.parent / f"{tmp_path.name}-ahead.txt"
+    ahead.write_text("1")
+    time.sleep(0.05)
+    monkeypatch.setenv(ci.followed.STARTED_AT, str(time.time()))
+    time.sleep(0.05)
+    read = [path for path in (REPO_ROOT / "tools/armada/executed.py", REPO_ROOT / "tools/armada/followed.py",
+                              Path(sys.executable).parents[1] / "pyvenv.cfg") if path.is_file()]
+    assert len(read) >= 2
+    assert [ci.followed.outside(str(path), root) for path in read] == [False] * len(read)
+    made = tmp_path.parent / f"{tmp_path.name}-made.txt"
+    made.write_text("1")
+    copied = tmp_path.parent / f"{tmp_path.name}-copied.txt"
+    shutil.copy2(ahead, copied)
+    monkeypatch.setenv("HOME", str(made.parent))
+    assert [ci.followed.outside(str(path), root) for path in (ahead, made, copied)] == [False, True, True]
+
+
+@pytest.mark.parametrize("plugin", ["executed", "release", "split"])
+def test_each_hook_a_plugin_of_the_harness_defines_is_one_pytest_registers(plugin):
+    """pytest registers a plugin's function as a hook only where its name starts with `pytest_` (its plugin
+    manager's `parse_hookimpl_opts`), whatever `specname` the hookimpl names: one named otherwise never runs
+    and no other test says so (executed.py's marker hook went unregistered, so a marker a helper gave a test
+    was never keyed)."""
+    source = ast.parse((REPO_ROOT / "tools/armada" / f"{plugin}.py").read_text())
+    unregistered = [function.name for function in source.body if isinstance(function, ast.FunctionDef)
+                    and any("hookimpl" in ast.unparse(each) for each in function.decorator_list)
+                    and not function.name.startswith("pytest_")]
+    assert unregistered == []
 
 
 def test_a_copy_of_the_interpreter_under_a_tools_name_is_no_tool(ci, tmp_path, monkeypatch, cache_worker):

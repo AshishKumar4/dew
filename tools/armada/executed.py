@@ -116,9 +116,10 @@ def pytest_collection_modifyitems(items):
 
 
 @pytest.hookimpl(specname="pytest_collection_modifyitems", trylast=True)
-def markers_carried(items):
+def pytest_collection_modifyitems_markers(items):
     """Every marker each test carries once collection settled them (a helper's alias, a conftest's
-    `add_marker` among them), its file's input: its registration's (ci.py's `registered`)."""
+    `add_marker` among them), its file's input: its registration's (ci.py's `registered`). Named `pytest_...`:
+    pytest registers a plugin's function as a hook only where its name has that prefix, `specname` or not."""
     for item in items:
         for name in sorted({mark.name for mark in item.iter_markers()}):
             lifetime.write(item.nodeid.split("::")[0], f"{MARKER}{name}")
