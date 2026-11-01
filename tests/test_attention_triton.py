@@ -740,6 +740,14 @@ def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_r
         assert staged >= requested > budget
 
 
+def _trained(spans: template.KeySpans):
+    """A training step's backward over `spans` on this mainloop, its forward's residuals its own."""
+    def backward(query, key, value, dout):
+        grads = attention_triton.backward(query, key, value, spans, None, dout, natural=True)
+        return grads.query, grads.key, grads.value
+    return backward
+
+
 @pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
 def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width):
@@ -757,42 +765,33 @@ def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, widt
     def forward(query, key, value):
         return attention_triton.forward(query, key, value, spans, None, natural=True)
 
-    def backward(query, key, value, dout):
-        grads = attention_triton.backward(query, key, value, spans, None, dout, natural=True)
-        return grads.query, grads.key, grads.value
-
     found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
-                             KernelCase("backward", lambda: (backward, (shape,) * 4))], generation_name)
+                             KernelCase("backward", lambda: (_trained(spans), (shape,) * 4))],
+                            generation_name)
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
 
 
-def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down(monkeypatch):
-    """A training step's backward at width 256 on an RTX PRO 6000 (sm120), its forward's shared-memory
-    model blind to the guarded rewalk (`TritonForward.staged_bytes` the plain launch's alone): XLA refuses
-    the program at 32 x 64, whose rewalk asks 114688 bytes of a 99 KB block, naming no kernel; the run's
-    compile (`report.kept`) refuses that forward launch's config, its derivation takes the next, and the
-    program compiles, the miss recorded stepped (compiled for a compile-only device on this CPU)."""
+def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
+    """A training step's backward at width 256 derived for an RTX PRO 6000 (sm120) said to hold an A100's
+    block, and compiled for the GPU's own (a compile-only device on this CPU): XLA refuses the program at
+    the training forward's 32 x 64, whose rewalk asks 114688 bytes of its 99 KB block, naming no kernel;
+    the run's compile (`report.kept`) refuses that forward launch's config, its derivation takes the next,
+    and the program compiles, the miss recorded stepped."""
+    import dataclasses
+
     import kernel_compile
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn.kernels.templates import report
 
-    def plain(self, ba, config, target):
-        del target
-        query, value = ba.arguments["query"], ba.arguments["value"]
-        streamed = (config.stages - 1) * config.block_k * (query.shape[-1] + value.shape[-1]) * 2
-        return streamed + config.block_q * (query.shape[-1] + config.block_k) * 2
-
-    monkeypatch.setattr(attention_triton.TritonForward, "staged_bytes", plain)
+    said = dataclasses.replace(generation.TARGETS["sm120"],
+                               shared_limit=generation.TARGETS["sm80"].shared_limit)
     spans = template.spans(512, 512, 1, causal=True)
     mesh = kernel_compile._device("sm120")
     shape = jax.ShapeDtypeStruct((1, 512, 2, 256), jnp.bfloat16,
                                  sharding=NamedSharding(mesh, PartitionSpec()))
-
-    def backward(query, key, value, dout):
-        grads = attention_triton.backward(query, key, value, spans, None, dout, natural=True)
-        return grads.query, grads.key, grads.value
+    backward = _trained(spans)
 
     def lowered():
         # A function of its own each lowering, as a run's relowering takes (`OuterProgram._jitted`): JAX keeps
@@ -800,7 +799,7 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down(monkeypa
         def fresh(*operands):
             return backward(*operands)
 
-        with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm120")):
+        with generation.assumed(said), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm120")):
             return jax.jit(fresh).trace(*[shape] * 4).lower()
 
     with report.refusals():
