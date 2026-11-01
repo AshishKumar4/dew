@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from placement_snapshot import cases, snapshot
 
-SNAPSHOT = Path(__file__).with_name("fixtures") / "placement" / "snapshot.tsv"
+SNAPSHOT = Path(__file__).with_name("fixtures") / "placement" / "snapshot.txt"
 RECORDED: dict[str, list[str]] = {}
 for line in SNAPSHOT.read_text().splitlines()[1:]:
     RECORDED.setdefault(line.split("\t")[0].removesuffix(":state"), []).append(line)

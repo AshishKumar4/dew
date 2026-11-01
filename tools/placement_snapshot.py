@@ -1,5 +1,5 @@
 """Write where Dew places every parameter of every model it builds (tests/placement_snapshot.py) at this
-checkout, to tests/fixtures/placement/snapshot.tsv, which tests/test_placement_snapshot.py holds each case
+checkout, to tests/fixtures/placement/snapshot.txt, which tests/test_placement_snapshot.py holds each case
 to: one line a leaf, so a change to how axes are declared shows each placement it moves.
 
     python tools/placement_snapshot.py
@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tools")]
-SNAPSHOT = ROOT / "tests" / "fixtures" / "placement" / "snapshot.tsv"
+SNAPSHOT = ROOT / "tests" / "fixtures" / "placement" / "snapshot.txt"
 
 
 def main() -> None:

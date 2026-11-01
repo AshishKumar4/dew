@@ -1,7 +1,7 @@
 """Where Dew places every parameter of every model it builds (T69: rows 1153 and 3453): each case's leaves, by
 path, with their shape, the logical axes their module declares and the partition spec the layout gives them
 over `LAYOUT`, and a trainer's optimizer state and EMA beside its parameters. tools/placement_snapshot.py
-writes the snapshot at a main (tests/fixtures/placement/snapshot.tsv, one line a leaf, so a change to how
+writes the snapshot at a main (tests/fixtures/placement/snapshot.txt, one line a leaf, so a change to how
 axes are declared shows every placement it moves as its own line), and tests/test_placement_snapshot.py holds
 each case to it.
 
