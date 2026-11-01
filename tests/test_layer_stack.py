@@ -452,11 +452,12 @@ BANKED_EXPERT_SEEDS = 8
 
 
 def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop():
-    """A scanned MoE stack decoding over a bank (`HeldBanks.place`, every run's leaves one array) hands
-    each iteration of its step's scan the run's expert kernels whole and the iteration's layer, which
-    the grouped matmul reads in place (`dew.nn.moe.Layered`): no expert stack enters a scan sliced, so
-    no layer's experts are copied out each step. Its steps decode as exactly as the plain loop's, both
-    from the loop's own float64 steps (check 1)."""
+    """A scanned MoE stack decoding over a bank in device memory (`HeldBanks.place`, every run's leaves one
+    array) hands each layer it reads a layer at a time the run's expert kernels whole and the layer's
+    index, which the grouped matmul reads in place (`dew.nn.moe.Layered`): the step's loop takes every
+    expert stack as a constant, whole, and copies none of them a layer at a time (no slice of a stack's
+    shape is taken in it). Its steps decode as exactly as the plain loop's, both from the loop's own
+    float64 steps (check 1)."""
     ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
@@ -470,12 +471,13 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
     cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
     graph = jax.make_jaxpr(lambda variables, cache: scanned.apply(
         {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(banked, cache)
-    handed, sliced = [], []
-    for scan in (equation for equation in equations(graph) if equation.primitive.name == "scan"):
-        consts, _, xs = (list(part) for part in scan.params["ft_in"].update(scan.invars).unpack())
-        handed.append({tuple(operand.aval.shape) for operand in consts})
-        sliced.append({tuple(operand.aval.shape) for operand in xs})
-    assert any(stacks <= whole for whole in handed) and not any(stacks & xs for xs in sliced)
+    loops = [equation for equation in equations(graph) if equation.primitive.name == "scan"]
+    handed = [{tuple(operand.aval.shape) for operand in scan.params["ft_in"].update(scan.invars).unpack()[0]}
+              for scan in loops]
+    slices = {tuple(equation.invars[0].aval.shape) for scan in loops
+              for equation in equations(scan.params["jaxpr"])
+              if equation.primitive.name in ("dynamic_slice", "slice", "gather")}
+    assert any(stacks <= whole for whole in handed) and not stacks & slices
 
     def draw(seed):
         return (np.random.default_rng([0x1342, seed]).integers(0, VOCAB, (2, 8)).astype(np.int32),)

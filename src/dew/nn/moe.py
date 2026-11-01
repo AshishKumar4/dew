@@ -449,16 +449,16 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
 
 
 BANKED_EXPERTS = 'banked_experts'
-"""The collection a scanned decode over a bank hands its experts' kernels in: each `ExpertLinear`'s
-kernel the bank's whole `[layers, experts, in, out]` and the layer the iteration runs
-(`experts_apart`, `at_iteration`), read where it lies (`Layered`)."""
+"""The collection a run over a bank in device memory hands its experts' kernels in: each `ExpertLinear`'s
+kernel the bank's whole `[layers, experts, in, out]` and the layer read (`experts_apart`, `at_iteration`),
+read where it lies (`Layered`)."""
 
 
 class Layered(struct.PyTreeNode):
     """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` and the
-    layer an iteration of its scan runs, which the GEMM template reads where it lies (`template.gemm`'s
-    `layer`) rather than as a slice the loop would copy out each iteration (1.2 GB a layer at
-    Qwen3-30B-A3B's experts, half a decode step on an H100)."""
+    layer read, which the GEMM template reads where it lies (`template.gemm`'s `layer`) rather than as a
+    slice copied out a layer at a time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on
+    an H100)."""
 
     stack: jax.Array
     layer: jax.Array
@@ -478,15 +478,15 @@ def _layered(value) -> bool:
 
 
 def holds_experts(params: Mapping) -> bool:
-    """Whether a scanned run's `params` hold an `ExpertMLP`'s expert kernels (`experts_apart`)."""
+    """Whether a banked run's `params` hold an `ExpertMLP`'s expert kernels (`experts_apart`)."""
     return any(_expert_kernel(tuple(entry.key for entry in path))
                for path, _ in jax.tree_util.tree_leaves_with_path(params))
 
 
 def experts_apart(variables: Mapping[str, Mapping]) -> dict:
-    """A scanned run's `params` and `BANKED_EXPERTS` collections with its experts' kernels moved from the
-    first to the second, at their paths, so the scan slices the rest and hands the kernels whole to every
-    iteration (`at_iteration`)."""
+    """A banked run's `params` and `BANKED_EXPERTS` collections with its experts' kernels moved from the
+    first to the second, at their paths, so the run reads the rest a layer at a time and hands the kernels
+    whole to every layer (`at_iteration`)."""
     params: dict = {}
     moved: dict = {}
     for path, leaf in jax.tree_util.tree_leaves_with_path(variables.get('params', {})):
@@ -499,8 +499,8 @@ def experts_apart(variables: Mapping[str, Mapping]) -> dict:
 
 
 def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
-    """The `BANKED_EXPERTS` collection with `layer`, the iteration's layer of the run, beside each
-    kernel, as its `ExpertLinear` reads them (`Layered`)."""
+    """The `BANKED_EXPERTS` collection with `layer`, the layer of the run read, beside each kernel, as
+    its `ExpertLinear` reads them (`Layered`)."""
     def indexed(tree: Mapping) -> dict:
         if 'kernel' in tree:
             return {**tree, 'layer': layer}

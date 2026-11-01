@@ -22,7 +22,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import DenyList
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import merge
@@ -81,6 +80,27 @@ def on_host(tree) -> bool:
     """Whether any leaf of `tree` sits in host memory."""
     return any(jax.typeof(leaf).memory_space is jax.memory.Space.Host
                for leaf in jax.tree.leaves(tree))
+
+
+def _apart(held: dict) -> tuple[dict, dict]:
+    """A run's read-only variables as its layers read them from their banks: the variables a layer is
+    fetched as, and the expert kernels it reads in place where they sit in device memory (`BANKED_EXPERTS`,
+    each the run's whole stack, `dew.nn.moe.experts_apart`), which fetching would copy out a layer at a
+    time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on an H100). Kernels in host memory
+    are fetched with the rest."""
+    params = held.get('params')
+    if params is None or not holds_experts(params):
+        return held, {}
+    apart = experts_apart({'params': params})
+    if on_host(apart[BANKED_EXPERTS]):
+        return held, {}
+    return {**held, 'params': apart['params']}, {BANKED_EXPERTS: apart[BANKED_EXPERTS]}
+
+
+def _with(read, in_place: dict, index):
+    """A layer's read-only variables: those fetched for it, and the expert kernels it reads in place at
+    its `index` in the run (`dew.nn.moe.at_iteration`)."""
+    return read if not in_place else {**read, **at_iteration(in_place, index)}
 
 
 def _layer_slice(tree, index):
@@ -310,37 +330,15 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 return step(layer, carry, per_layer_input, store)[0], None
 
             repeats = count // len(run.specs) if periodic else count
-            if decode and not train and not fetching and holds_experts(run.variables.get('params', {})):
-                x = _experts_in_place(scanned, run, x, inputs, repeats)
-            else:
-                x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
-                               in_axes=2, length=repeats)(run, x, inputs)
-    return x
-
-
-def _experts_in_place(scanned, run, x, inputs, repeats: int):
-    """A decoding scan of `run` whose experts' kernels each iteration reads in place: the scan slices
-    the run's other variables and hands every iteration the experts' whole stacks with its own index
-    (`dew.nn.moe.experts_apart`, `at_iteration`), so the grouped matmul reads the iteration's layer
-    where it lies. Slicing the stack as a scan does would copy every layer's experts out every step,
-    since the matmul's kernel takes no slice of an operand in place."""
-    def indexed(layer, carried, per_layer_input):
-        carry, index = carried
-        at = nn.map_variables(scanned, BANKED_EXPERTS, trans_in_fn=lambda held: at_iteration(held, index),
-                              init=False, mutable=False)
-        return (at(layer, carry, per_layer_input)[0], index + 1), None
-
-    scan = nn.scan(indexed, variable_axes={DenyList(BANKED_EXPERTS): 0}, variable_broadcast=BANKED_EXPERTS,
-                   split_rngs={True: True}, in_axes=2, length=repeats)
-    apart = nn.map_variables(scan, ('params', BANKED_EXPERTS), trans_in_fn=experts_apart, init=False,
-                             mutable=False)
-    (x, _), _ = apart(run, (x, jnp.zeros((), jnp.int32)), inputs)
+            x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
+                           in_axes=2, length=repeats)(run, x, inputs)
     return x
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
-              kv_store, per_layer_input, attention_metadata=None, periods: Sequence[int] = ()):
+              kv_store, per_layer_input, attention_metadata=None, banked: bool = False,
+              periods: Sequence[int] = ()):
     """Run the layers over `x`, one run at a time as `groups` says.
 
     A run of one is `layers[first]`; a longer run is one block named for its
@@ -351,19 +349,16 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     owning layers get no store, since a Python dict cannot follow writes from
     inside the loop and a provider is always a run of one.
 
-    A run whose parameters sit in host memory or stream from disk
-    (`dew.inference.banks`) is read one layer at a time in `_prefetched_run`:
-    at most two of its layers are on the device, staging crosses run
-    boundaries, and no fetch
+    `banked` says the store holds each run's parameters as one array
+    (`dew.inference.banks`). Those runs, and runs the layout left in host
+    memory, are read one layer at a time in `_prefetched_run`: at most two of a
+    run's layers are on the device, staging crosses run boundaries, and no fetch
     can be hoisted above the layer before it (it is issued inside that layer's
     iteration or ordered by the carry). Training uses the native Linen scan
     instead, with map_variables staging one row under remat, so the backward
     refetches the pinned bank rather than keeping a device copy. Each fetched
     layer binds its variables through Linen's `Module.bind`, which keeps the
-    enclosing call's intermediate-capture policy active. A run banked on the
-    device (its parameters one array a leaf, `layers_3_7`) scans as resident
-    weights do, each iteration reading its layer of the bank where it lies:
-    fetching it first would copy every layer of the bank each call.
+    enclosing call's intermediate-capture policy active.
 
     `periods` is each run's period (`StackView.periods`): a run of a longer
     one repeats its period's layers under the scan (`_run_module`), which
@@ -380,7 +375,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     streaming = any('streaming' in run.variables for run in runs)
     if streaming and train:
         raise ValueError("disk streaming is inference-only")
-    fetching = streaming or any(on_host(run.variables.get('params', {})) for run in runs)
+    fetching = streaming or banked or any(on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
@@ -416,7 +411,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         if reader is not None:
             return reader.fetch(0, dependency)
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
-        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
+        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(_apart(held)[0], 0)
 
     probed: list[tuple[LayerSpec, list[str]]] = []
     staged = first_of(0, x)
@@ -426,7 +421,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         state = held(run)
         cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
         first_slice = None if inputs is None else inputs.layer(0)
-        opened = _opened(run, specs[first], probed, staged, state if count == 1 else _layer_slice(state, 0),
+        in_place = {} if count == 1 else _apart({name: run.variables[name] for name in read_only(run)})[1]
+        opened = _opened(run, specs[first], probed, _with(staged, in_place, 0),
+                         state if count == 1 else _layer_slice(state, 0),
                          cached if count == 1 or cached is None else _layer_slice(cached, 0), x,
                          first_slice, store=store, train=train, decode=decode,
                          attention_metadata=attention_metadata)
@@ -438,11 +435,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             following = first_of(index + 1, x)
             x, changed = layer(staged, state, cached, x, first_slice)
         else:
-            banks = {name: run.variables[name] for name in read_only(run)}
+            banks = _apart({name: run.variables[name] for name in read_only(run)})[0]
             x, changed, following = _prefetched_run(
                 banks, staged, state, cached, x, inputs, layer, count,
                 following=functools.partial(first_of, index + 1),
-                reader=run.variables.get('streaming', {}).get('bank'))
+                reader=run.variables.get('streaming', {}).get('bank'), in_place=in_place)
         staged = following
         for collection, tree in changed.items():
             for name, value in tree.items():
@@ -495,7 +492,8 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
                   and run.is_mutable_collection(name))
 
 
-def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None):
+def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None,
+                    in_place=None):
     """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
     `primed` is layer 0's read-only variables, already on the device. Iteration
@@ -506,13 +504,16 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     flax's scan hands them out. The carry is the hidden state, the staged
     variables and the cache, written in place one layer's slice per iteration
     so a decode step holds one banked cache; a cache the layers create comes
-    out stacked like `state`.
+    out stacked like `state`. `in_place` holds the expert kernels each layer
+    reads where they lie (`_apart`), handed to every iteration whole with its
+    index rather than staged.
     """
+    in_place = in_place or {}
     def body(carry, index):
         hidden, current, held = carry
         staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
-        hidden, changed = layer(current, _layer_slice(state, index),
+        hidden, changed = layer(_with(current, in_place, index), _layer_slice(state, index),
                                 None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
         if held is not None:
@@ -522,7 +523,7 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
     staged = following(x)
-    x, changed = layer(current, _layer_slice(state, last),
+    x, changed = layer(_with(current, in_place, last), _layer_slice(state, last),
                        None if cache is None else _layer_slice(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:

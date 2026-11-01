@@ -1815,9 +1815,9 @@ class CausalTransformer(nn.Module):
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
             groups = self.groups if span is None else spanned
-            # A decode step over resident weights scans by period; weights held as banks keep the runs
-            # their banks hold, as do weights a step reads a layer at a time (streamed from disk or in
-            # host memory), and a layer that leaves what a later one reads (`_provides`) runs alone.
+            # A decode step over resident weights scans by period; weights a step reads a layer at
+            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
+            # and a layer that leaves what a later one reads (`_provides`) runs alone.
             if decode and not (banked or self._provides or 'streaming' in self.variables
                                or on_host(self.variables.get('params', {}))):
                 keys = self.scan_keys[first:end]
@@ -1976,7 +1976,7 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                periods=view.periods)
+                banked='params' in view.banked, periods=view.periods)
         return run_pipeline(
             self,
             view,
