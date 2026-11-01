@@ -20,19 +20,15 @@ import test_kernels as kernels
 import test_lowering as lowering
 import test_rollout_servers as rollout
 import test_sequence_parallel as sequence_parallel
-from gpu_flow import Cell, cells_of, run_cells
+from gpu_flow import Cell, cells_of, isolated, run_cells, when
 
 pytestmark = [pytest.mark.gpu(reason="two CUDA devices: NCCL, a cluster's device pins, sharded cuDNN"),
               pytest.mark.mesh(devices=2)]
 
 
 def on_two(check):
-    """`check` where this process sees two GPUs, else skipped."""
-    def run():
-        if jax.default_backend() != "gpu" or jax.device_count() < 2:
-            pytest.skip("needs two GPUs")
-        check()
-    return run
+    """`check` where this process sees two GPUs, else skipped (`when`)."""
+    return when(jax.default_backend() == "gpu" and jax.device_count() >= 2, "needs two GPUs", check)
 
 
 def test_two_gpus_run_their_collectives_and_shards(tmp_path_factory):
@@ -49,8 +45,8 @@ def test_two_gpus_run_their_collectives_and_shards(tmp_path_factory):
                    rollout.an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu, fixture)))
           for name, fixture in (("bfloat16", rollout.FIXTURE), ("fp8", rollout.FP8))),
         Cell("each process reads the facts of the GPU it sees",
-             on_two(lambda: lowering.each_process_reads_the_facts_of_the_gpu_it_sees(
-                 tmp_path_factory.mktemp("facts")))),
+             on_two(isolated(tmp_path_factory)(
+                 lowering.each_process_reads_the_facts_of_the_gpu_it_sees, "facts"))),
     ])
 
 
@@ -66,6 +62,7 @@ def test_two_gpus_shard_cudnn_attention(tmp_path_factory, without_deterministic_
           for cell in cells_of(kernels.flash_keeps_the_kernel_contract_on_a_mesh,
                                without_deterministic_ops=without_deterministic_ops)),
         Cell("a sharded cuDNN attention compiles once across processes",
-             on_two(lambda: sharded_attention_cells.a_sharded_cudnn_attention_compiles_once_across_processes(
-                 tmp_path_factory.mktemp("sharded"), without_deterministic_ops))),
+             on_two(isolated(tmp_path_factory)(
+                 sharded_attention_cells.a_sharded_cudnn_attention_compiles_once_across_processes, "sharded",
+                 without_deterministic_ops=without_deterministic_ops))),
     ])

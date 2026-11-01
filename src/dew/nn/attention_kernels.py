@@ -17,6 +17,7 @@ from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_gene
 from .kernels.selection import Kernel, Op, Refusal, Requirement
 from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
+from .precision import wide_cpu_arithmetic
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 
@@ -102,8 +103,7 @@ class AttentionCase:
     generic paths take as their mask; `mask` is an arbitrary mask only the generic path takes.
     `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
-    below its query's precision or its process's CPU arithmetic (`_xla_kernel_narrows`,
-    `_xla_kernel_widens_less`), `folds`
+    below its query's precision (`_xla_kernel_narrows`), `folds`
     one of few query positions `folded_attention` reads on a GPU, and `splash_mask` one whose mask
     splash's descriptor describes, formed only where splash may run, under a name that may choose it
     on a TPU (`TPU_BACKEND`), and False elsewhere."""
@@ -388,13 +388,30 @@ XLA_SUPPORTS = (
     _Need('softcap', lambda case: case.softcap is None, "jax.nn's attention has no softcap",
                 row=INHERENT, kind='handoff'),
     _Need('narrows', lambda case: not case.narrows,
-                "jax.nn's xla kernel would compute the call below its query's precision or its process's "
-                "CPU arithmetic",
+                "jax.nn's xla kernel would compute the call below its query's precision",
                 row=INHERENT, kind='handoff'),
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
                 row=INHERENT, kind='handoff'),
     _Need('dropout', lambda case: not case.dropout, "jax.nn's attention takes no probability dropout",
+          row=INHERENT, kind='handoff'),
+    _Need('dtypes', lambda case: case.key_dtype == case.dtype,
+          lambda case: f"jax.nn's attention takes a query of its keys' dtype, not {case.dtype} over "
+                       f"{case.key_dtype} (`dot_product_attention`'s `_check_shape_and_dtype`)",
+          row=INHERENT, kind='handoff'),
+    _Need('wide_cpu', lambda case: not (wide_cpu_arithmetic() and generation.backend() == 'cpu'),
+          "a CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums fp32 products in float64 "
+          "(`precision.accumulated`), where jax.nn's attention sums them in fp32: its reference path keeps "
+          "them, so a run under it records the products it computed (a process without the setting runs "
+          "jax.nn's kernel on a CPU as on any platform)",
+          row=INHERENT, kind='handoff'),
+    _Need('float64', lambda case: case.dtype != np.float64,
+          "jax.nn's attention takes its softmax in float32 whatever its operands' dtype "
+          "(`_dot_product_attention_core`'s `astype(np.float32)`), which a float64 call does not keep",
+          row=INHERENT, kind='handoff'),
+    _Need('cpu_float16', lambda case: not (case.dtype == np.float16 and generation.backend() == 'cpu'),
+          "XLA's CPU compiler has no float16 dot into float32 (F16_F16_F32), the algorithm jax.nn's "
+          "attention names for a float16 query (`_dot_product_attention_core`), past its trace-time fallback",
           row=INHERENT, kind='handoff'),
 )
 """jax.nn's xla attention's requirements: the generic kernel, which hands what it cannot honour to

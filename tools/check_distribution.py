@@ -48,7 +48,8 @@ def main() -> None:
         print(f"{path.name}: {len(lines)} requirements")
         refused += [f"{path.name}: {line}" for line in lines if Requirement(line).url is not None]
     if refused:
-        sys.exit("PyPI refuses a requirement that names a URL:\n  " + "\n  ".join(refused))
+        sys.exit("An index refuses, and an installer will not resolve, a requirement that names a URL:\n  "
+                 + "\n  ".join(refused))
 
 
 if __name__ == "__main__":

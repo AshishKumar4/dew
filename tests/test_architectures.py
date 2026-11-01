@@ -181,8 +181,8 @@ def run_case(case: Case, tmp_path, mesh: MeshSpec, devices=None, state=None, ste
                         metrics=(Spread(seen, artifact),), preview=True, state=state)
 
     assert dict(trainer.device_mesh.shape) == {
-        "data": (devices or jax.device_count()) // (mesh.fsdp * mesh.stage), "expert": 1, "fsdp": mesh.fsdp,
-        "tensor": 1, "sequence": 1, "stage": mesh.stage}
+        "diloco": 1, "data": (devices or jax.device_count()) // (mesh.fsdp * mesh.stage), "expert": 1,
+        "fsdp": mesh.fsdp, "tensor": 1, "sequence": 1, "stage": mesh.stage}
     assert int(state.step) == steps
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == steps and all(np.isfinite(loss) for loss in losses), losses

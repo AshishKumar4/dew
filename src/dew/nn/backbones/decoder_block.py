@@ -41,7 +41,7 @@ from ..hyper_connections import (
 from ..inputs import AttentionMetadata, LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..norms import LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
@@ -145,6 +145,8 @@ class Mixture:
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
     `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
     `routing_block` with `block_experts` is LLaDA2.2's block routing.
+    `weight_sum_epsilon` is the term a renormalization of non-softmax weights
+    adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6).
     """
 
     experts: int
@@ -158,6 +160,7 @@ class Mixture:
     group_score: str = 'top2'
     bias: bool = False
     bias_in_weights: bool = False
+    weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
     routing_block: int | None = None
     block_experts: int | None = None
     scale_inputs: bool = False
@@ -296,6 +299,7 @@ class Mixture:
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
             group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
+            weight_sum_epsilon=self.weight_sum_epsilon,
             media_bias=self.media_bias, routing_block=self.routing_block,
             block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
