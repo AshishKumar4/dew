@@ -197,6 +197,22 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
                     seeds=SEEDS[hooks, packed])
 
 
+DERIVED = [hooks for hooks in HOOKS + FORMED if hooks.delta or not hooks.rated]
+"""The hooks the delta rule's op runs (`GATED_DELTA`), which the derived forms take: every one but a rated
+scan without the delta rule (Mamba2's SSD, the scan's own op)."""
+
+
+@pytest.mark.parametrize('hooks', DERIVED, ids=str)
+def test_the_derived_forms_are_as_exact_as_the_recurrence_token_by_token(hooks):
+    """The forms derived from the token update (`recurrence_chunk.derived_rule`, `dew.algebra.scan`), named
+    for the rule, against the same recurrence a token at a time, output and final memory, on the portable
+    math's draws of one sequence (check 1): the accuracy check the derived forms are taken behind."""
+    dew = jax.jit(functools.partial(chunk_on, 'derived', hooks, chunk_size=CHUNK))
+    reference = jax.jit(functools.partial(token_by_token, hooks))
+    assert_as_exact(dew, reference, functools.partial(draw, hooks, False), f'{hooks} derived',
+                    seeds=SEEDS[hooks, False])
+
+
 ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
                 recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6))]
