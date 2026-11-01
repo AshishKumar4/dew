@@ -28,6 +28,7 @@ from egglog import (
     rule,
     ruleset,
     set_,
+    var,
     vars_,
 )
 
@@ -60,9 +61,9 @@ def _facts() -> Ruleset:
     """The `elements` fact of every term from its operands', or the count it states."""
     term, left, right, operand = vars_("term left right operand", Term)
     count, other, params = vars_("count other params", i64)
-    name = vars_("name", String)[0]
-    axes = vars_("axes", Vec[i64])[0]
-    value = vars_("value", f64)[0]
+    name = var("name", String)
+    axes = var("axes", Vec[i64])
+    value = var("value", f64)
     return ruleset(
         rule(eq(term).to(Term.leaf(params, count))).then(set_(elements(term)).to(count)),
         rule(eq(term).to(Term.literal(value, params))).then(set_(elements(term)).to(i64(1))),
@@ -85,7 +86,7 @@ def _linear() -> Ruleset:
     """Linearity of sums (two sums along one axis, one sum of their terms), distributivity, and a value
     constant along a sum's axis taken out of it: each reorders rounding."""
     x, y, a = vars_("x y a", Term)
-    axes = vars_("axes", Vec[i64])[0]
+    axes = var("axes", Vec[i64])
     params, count, laid, spread, axis = vars_("params count laid spread axis", i64)
     return ruleset(
         rewrite(x.reduce("sum", axes, params, count).binary("add", y.reduce("sum", axes, params, count))).to(

@@ -102,5 +102,6 @@ def rewritten_closed(closed: jcore.ClosedJaxpr, arguments: list, *, accurate: bo
 
 
 def _nodes(graph: EGraph) -> int:
-x
+    """The rows of every table of `graph`, its nodes and its facts' (egglog states no node count of its
+    own)."""
     return sum(size for _, size in graph.all_function_sizes())
