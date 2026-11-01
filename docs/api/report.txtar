@@ -600,6 +600,7 @@ dew.objectives.rl.config.EpisodesConfig
   steps: int
   env: EnvConfig | None = None
   reached: tuple[str, ...] = ()
+  drawn: bool = False
 dew.objectives.rl.config.RolloutConfig
   name: str = 'dreamer'
   fields: JsonDict = builtins.dict()

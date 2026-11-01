@@ -148,16 +148,18 @@ class TeacherConfig:
 @dataclasses.dataclass(frozen=True)
 class EpisodesConfig:
     """A validation split scored by flying the agent (`dew.training.Episodes` over
-    `dew.rl.evaluation.episodes`): its greedy policy flown `steps` steps from fresh episodes of `env`, the
-    run's own where None, each environment's first episode scored, logged as `<split>/return` and
-    `<split>/steps`, and for each observation view in `reached` its mean at each first episode's last step
-    (a race's gates `passed`), `<split>/<view>`. A JAX `Env` is flown in one program; a `Simulator` from the
-    host, and only one the record names for the split: the run's own simulator holds the rollout's
-    environments mid episode, which a flight would move."""
+    `dew.rl.evaluation.episodes`): its greedy policy, or with `drawn` the policy's draws as it acts in
+    training (`act`), flown `steps` steps from fresh episodes of `env`, the run's own where None, each
+    environment's first episode scored, logged as `<split>/return` and `<split>/steps`, and for each
+    observation view in `reached` its mean at each first episode's last step (a race's gates `passed`),
+    `<split>/<view>`. A JAX `Env` is flown in one program; a `Simulator` from the host, and only one the
+    record names for the split: the run's own simulator holds the rollout's environments mid episode,
+    which a flight would move."""
 
     steps: int
     env: EnvConfig | None = None
     reached: tuple[str, ...] = ()
+    drawn: bool = False
 
     def split(self, objective: Agent, env: Env | Simulator) -> Episodes:
         """The split of `objective`'s flights, in `env` where the record names no environment of its own."""
@@ -165,13 +167,13 @@ class EpisodesConfig:
         if isinstance(flown, Simulator) and self.env is None:
             raise ValueError("a run's simulator holds its rollout's environments mid episode, which a flight "
                              "would move; name a simulator of the split's own (env)")
+        policy = objective.act if self.drawn else objective.greedy
         if isinstance(objective, DreamerV3Objective):
             driven = DrivenSimulator(flown) if isinstance(flown, Simulator) else Driven(flown)
-            score = episodes(objective.greedy, driven, self.steps, memory=objective.memory,
-                             reached=self.reached, models=objective.towers())
-        else:
-            score = episodes(objective.greedy, flown, self.steps, reached=self.reached,
+            score = episodes(policy, driven, self.steps, memory=objective.memory, reached=self.reached,
                              models=objective.towers())
+        else:
+            score = episodes(policy, flown, self.steps, reached=self.reached, models=objective.towers())
         reached = {view: Shown(better="higher") for view in self.reached}
         return Episodes(score, {"return": Shown(better="higher"), "steps": Shown(), **reached})
 

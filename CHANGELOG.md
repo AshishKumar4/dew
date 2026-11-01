@@ -13,9 +13,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   the run's directory and a step the run pins as it starts). The run derives the tokenizer's frame from its
   clips and the dynamics' widths from the tokenizer and the clips' actions, and the objectives read uint8
   clips as the frames in [-1, 1] they encode (`dew.objectives.world_model.unit_frames`). The idle loader of
-  an environment run is public (`dew.objectives.rl.config.idle`), the acceptance runs of PPO and DreamerV3
-  (`tools/rl_acceptance.py`) train as environment runs, and `LocalTracker.timed` reads a journal's reports
-  with the second each was logged at.
+  an environment run is public (`dew.objectives.rl.config.idle`), an episodic split flies the policy's draws
+  in place of its mean with `drawn` (`EpisodesConfig`), the acceptance runs of PPO and DreamerV3
+  (`tools/rl_acceptance.py`) train as environment runs, DreamerV3's `return` scored by its draws and its
+  `greedy_return` beside it, and `LocalTracker.timed` reads a journal's reports with the second each was
+  logged at.
 - Every RL program compiles through Dew's compile point with the options its models and the run hold open
   (`compiled_with`, a quantized model's int8 GEMM option): a Dreamer or control rollout over an environment is
   its objective's program (`Objective.program`, which now takes `donate_argnames` and holds the environment it

@@ -5,7 +5,9 @@
                                                  greedy policy's return at the end.
     python tools/rl_acceptance.py dreamer OUT    DreamerV3 on CartpoleBalance at 100K environment
                                                  steps, against the 990 its paper reports at 500K
-                                                 (arXiv 2301.04104v2, "Proprioceptive control scores").
+                                                 (arXiv 2301.04104v2, "Proprioceptive control scores"):
+                                                 the agent's return, its policy's draws, and beside it
+                                                 the greedy policy's.
     python tools/rl_acceptance.py nft OUT        DiffusionNFT against Flow-GRPO under matched
                                                  conditions: one flowers DiT, one reward model (CLIP),
                                                  the same prompts, samples and 500 updates each.
@@ -46,8 +48,9 @@ from dew.training import LocalTracker
 
 CONTROL, DREAMER = "dew.objectives.rl.control", "dew.objectives.rl.dreamer"
 """The modules of the agents' networks and objectives, which a record names by import path."""
-SCORED = "episodes"
-"""The validation split the acceptance runs score their greedy flights on, which logs `episodes/return`."""
+GREEDY, DRAWN = "greedy", "drawn"
+"""The validation splits the acceptance runs score on, which log `greedy/return` and `drawn/return`: the
+policy's mean, and the draws it acts with in training, which a DreamerV3 return is published as."""
 
 
 class _Tracker:
@@ -69,11 +72,11 @@ class _Tracker:
         del value, step
 
 
-def tracked(directory: Path, began: float) -> tuple[list[dict], float]:
+def tracked(directory: Path, began: float, *splits: str) -> tuple[list[dict], tuple[float, ...]]:
     """The training reports of the environment run in `directory`, each its step, the seconds since the
     wall-clock second `began` and its scalars by their own names, `train/` and `rollout/` dropped (a
-    rollout's `episode_return` is logged as `rollout/episode_return`), and the greedy return its one
-    validation at the run's end scored (`episodes/return`)."""
+    rollout's `episode_return` is logged as `rollout/episode_return`), and the return each of `splits`
+    scored once, at the run's end (`<split>/return`)."""
     with LocalTracker(directory / "tracking") as journal:
         reports = journal.timed()
     curve = []
@@ -84,9 +87,11 @@ def tracked(directory: Path, began: float) -> tuple[list[dict], float]:
                 for name, value in scalars.items()
             }
             curve.append({"step": step, "seconds": at - began, **named})
-    returns = [scalars[f"{SCORED}/return"] for _, _, scalars in reports if f"{SCORED}/return" in scalars]
-    (greedy,) = returns
-    return curve, greedy
+    returns = []
+    for split in splits:
+        (scored,) = [scalars[f"{split}/return"] for _, _, scalars in reports if f"{split}/return" in scalars]
+        returns.append(scored)
+    return curve, tuple(returns)
 
 
 def ppo_run(
@@ -117,7 +122,7 @@ def ppo_run(
             resume="never",
         ),
         episodes={
-            SCORED: EpisodesConfig(1000, EnvConfig("playground", playground, count=128, episode_length=1000))
+            GREEDY: EpisodesConfig(1000, EnvConfig("playground", playground, count=128, episode_length=1000))
         },
     )
 
@@ -135,7 +140,7 @@ def ppo(
     prepared = ppo_run(out, task=task, envs=envs, collections=collections).prepare()
     began = time.time()
     prepared.train("ppo")
-    curve, greedy = tracked(out / "ppo", began)
+    curve, (greedy,) = tracked(out / "ppo", began, GREEDY)
     returns = [
         (row["seconds"], row["episode_return"])
         for row in curve
@@ -161,8 +166,8 @@ def dreamer_run(
 ) -> EnvRunConfig:
     """DreamerV3's DM Control proprio preset (configs.yaml `dmc_proprio`): the 1M model, 16
     environments cut after 1000 steps, windows of 64 in batches of 16, a train ratio of 1024, LaProp at
-    4e-5 ramped over the first 1000 updates; scored greedy over 1000 steps of the same environments. It
-    logs every 1000 updates."""
+    4e-5 ramped over the first 1000 updates; scored over 1000 steps of the same environments, by the
+    agent's draws and by its greedy policy. It logs every 1000 updates."""
     rollout = {
         "capacity": environment_steps // envs + 1000,
         "batch": 16,
@@ -187,15 +192,15 @@ def dreamer_run(
             checkpoint_every=None,
             resume="never",
         ),
-        episodes={SCORED: EpisodesConfig(1000)},
+        episodes={DRAWN: EpisodesConfig(1000, drawn=True), GREEDY: EpisodesConfig(1000)},
     )
 
 
 def dreamer(
     out: Path, *, task: str = "CartpoleBalance", envs: int = 16, environment_steps: int = 100_000
 ) -> dict:
-    """`dreamer_run` trained and reported: the greedy agent's return at the end against the paper's, and
-    the training episodes' return along the run."""
+    """`dreamer_run` trained and reported: the agent's return, its draws', against the paper's, the greedy
+    policy's beside it, and the training episodes' return along the run."""
     from dew.objectives.rl.dreamer import DreamerRollout
 
     prepared = dreamer_run(out, task=task, envs=envs, environment_steps=environment_steps).prepare()
@@ -203,14 +208,15 @@ def dreamer(
     assert isinstance(rollout, DreamerRollout)
     began = time.time()
     prepared.train("dreamer")
-    curve, evaluated = tracked(out / "dreamer", began)
+    curve, (drawn, greedy) = tracked(out / "dreamer", began, DRAWN, GREEDY)
     report = {
         "task": task,
         "environment_steps": rollout.environment_steps,
         "updates": prepared.run.trainer.steps,
-        "return": evaluated,
+        "return": drawn,
+        "greedy_return": greedy,
         "paper_return_at_500k": 990,
-        "gap_to_paper": 990 - evaluated,
+        "gap_to_paper": 990 - drawn,
         "training": [
             {key: row[key] for key in ("step", "seconds", "episode_return") if key in row} for row in curve
         ],

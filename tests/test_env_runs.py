@@ -140,14 +140,15 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
     assert_bitwise(state, saved.prepare().train("again"))
 
 
+@pytest.mark.parametrize("drawn", [False, True], ids=["greedy", "drawn"])
 @pytest.mark.parametrize("agent", ["ppo", "dreamer", "dreamer in a simulator"])
-def test_a_runs_episodes_score_its_greedy_flights_from_the_evaluations_key(tmp_path, agent):
+def test_a_runs_episodes_score_its_flights_from_the_evaluations_key(tmp_path, agent, drawn):
     """A run validated by its episodes logs at its end `episodes/return` and `episodes/steps`: the first
-    episodes its greedy policy earns flown 16 steps from the key the run's key gives its last step
-    (`dew.rl.evaluation.episodes`), on its averaged weights where it keeps them; a PPO policy over the
-    race's observation, a Dreamer agent over the driven step (`Driven`) from the memory it starts with, and
-    a Dreamer agent trained in a race a host simulator steps, flown in a race of the split's own
-    (`DrivenSimulator`)."""
+    episodes its greedy policy earns, or with `drawn` the policy's draws as it acts (`act`), flown 16 steps
+    from the key the run's key gives its last step (`dew.rl.evaluation.episodes`), on its averaged weights
+    where it keeps them; a PPO policy over the race's observation, a Dreamer agent over the driven step
+    (`Driven`) from the memory it starts with, and a Dreamer agent trained in a race a host simulator
+    steps, flown in a race of the split's own (`DrivenSimulator`)."""
     from dew.rl.env import Driven
     from dew.rl.simulator import DrivenSimulator
     from dew.training.tracker import LocalTracker
@@ -157,18 +158,19 @@ def test_a_runs_episodes_score_its_greedy_flights_from_the_evaluations_key(tmp_p
     count = 16 if agent == "ppo" else 8
     simulated = {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": count}
     own = EnvConfig("gate_race", simulated) if agent == "dreamer in a simulator" else None
-    split = EpisodesConfig(steps=16, env=own)
+    split = EpisodesConfig(steps=16, env=own, drawn=drawn)
     run = dataclasses.replace(run, episodes={"episodes": split})
     state = run.prepare().train("scored")
     logged = {name: value for _, scalars in LocalTracker(str(tmp_path / "scored" / "tracking")).scalars()
               for name, value in scalars.items() if name.startswith("episodes/")}
+    policy = objective.act if drawn else objective.greedy
     if agent == "ppo":
         race = Batched(FlightEnv(racing(), VIEWS), count)
-        flown = episodes(objective.greedy, race, 16)
+        flown = episodes(policy, race, 16)
     else:
         race = (DrivenSimulator(GateRace(None, racing(), views=VIEWS, count=count)) if own is not None
                 else Driven(Batched(FlightEnv(racing(), VIEWS), count)))
-        flown = episodes(objective.greedy, race, 16, memory=objective.memory)
+        flown = episodes(policy, race, 16, memory=objective.memory)
     with generation.run_precision(run.trainer.precision):
         expected = flown(state.variables if state.ema is None else state.averaged,
                          evaluation_key(state.key, 3))
