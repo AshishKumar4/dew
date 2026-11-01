@@ -543,14 +543,11 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                 grad, dv = algebra.reverse_carried(grad, keys, weights, queries, out.value(), local, gate,
                                                    low, ending, ending_low, scale, held.dtype, issue)
             if gates:
-                values = _tile(slots, "values", given, columns=columns).value().astype(jnp.float32)
-                dv, beta_grad = algebra.gated_values_back(dv, values, family.rows_of(beta_ref.at[h, span]))
-                gated_ref[0].at[column // bv, h, span][...] = beta_grad
-                if skips:
-                    skipped, skip_grad = algebra.skipped_back(out.value().astype(jnp.float32), values,
-                                                              skip_ref[h])
-                    dv = dv + skipped
-                    gated_ref[1].at[column // bv, h, span][...] = skip_grad
+                skip = None if skip_ref is None else skip_ref[h]
+                dv, *terms = _values_gated_back(call, slots, columns, out, dv,
+                                                family.rows_of(beta_ref.at[h, span]), skip)
+                for ref, term in zip(gated_ref, terms, strict=False):
+                    ref.at[column // bv, h, span][...] = term
             before_store()
             grads.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + column, bv, family=family,
                         smem=lands["corrected"], wait=False)
@@ -588,6 +585,17 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                                 k if v is None else v, hi if beta is None else beta,
                                 *(() if skip is None else (skip.astype(jnp.float32),)),
                                 *(() if memory is None else (memory,)))
+
+
+def _values_gated_back(call: _Call, slots, columns, out: Parts, dv, betas, skip) -> tuple:
+    """`_reverse`'s gate on the values its walk holds (`algebra.gated_values_back`) and, with a `skip`, the
+    skip's (`algebra.skipped_back`) on the output's gradient `out`: `(dv, beta's terms)`, then the skip's."""
+    values = _tile(slots, "values", call.given, columns=columns).value().astype(jnp.float32)
+    dv, beta_grad = algebra.gated_values_back(dv, values, betas)
+    if skip is None:
+        return dv, beta_grad
+    skipped, skip_grad = algebra.skipped_back(out.value().astype(jnp.float32), values, skip)
+    return dv + skipped, beta_grad, skip_grad
 
 
 def _query_key_views(call: _Call, keyed: tuple, served: tuple, memory: tuple, *, row, key_columns, first,

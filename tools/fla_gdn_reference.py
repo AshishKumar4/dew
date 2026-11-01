@@ -3,11 +3,13 @@
 `chunk_gated_delta_rule` and `chunk_kda` (its Triton kernels) on a CUDA GPU, forward and every gradient, at
 each site tests/fla_sites.py names, over the tests' own seeded draws.
 
-    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> [site prefix]
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla> <unit> <site>...
+    PYTHONPATH=src:tests:tools python tools/fla_gdn_reference.py --merge <unit>...
 
 on a GPU, Dew's environment recording and a second Python with torch, fla-core and tilelang (`--serve`, the
-"fla" cohort, tools/reference_releases.py) running fla and its reference. What lands is
-tests/fixtures/fla/gdn_seeded.npz, a summary recording (`record_case(..., summary=True)`): per site, seed and
+"fla" cohort, tools/reference_releases.py) running fla and its reference, each run a unit of named sites
+(`--list` names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz, a
+summary recording (`record_case(..., summary=True)`): per site, seed and
 leaf, fla's distance from float64 at the site's inputs, which the test draws again (`Site.arrays`), and the
 truth's sketch, which Dew's float64 token recurrence is held to.
 
@@ -15,12 +17,14 @@ fla runs at its defaults (an fp32 call's products TF32, as the fast forms' bar i
 fla runs them, one flattened row of sequences (`cu_seqlens`), a row's first taking its entering memory
 unless a document starts it. The oracle is fla's own reference, `naive_recurrent_gated_delta_rule` and
 `naive_recurrent_kda` (fla/ops/*/naive.py), on each sequence in torch float64 (`torch_precision.float64`,
-which widens their fp32 casts), held at every seed to Dew's float64 token recurrence.
+which widens their fp32 casts) on the GPU, held at every seed to Dew's float64 token recurrence.
 """
 
 import itertools
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -128,13 +132,19 @@ def serve() -> None:
         with np.load(path) as stored:
             arrays = dict(stored)
         rule = chunk_kda if kda else chunk_gated_delta_rule
+        began = time.perf_counter()
         np.savez(f"{path}.reference.npz", **run(arrays, kda=kda, scale=float(scale), rule=rule,
                                                 dtype=getattr(torch, dtype), device="cuda",
                                                 per_sequence=False))
+        referenced = time.perf_counter()
+        # The truth in float64 on the GPU: on the CPU its token loop and autograd took most of a site's
+        # 1432 s for 320 draws (fla-record3-h100-f8fbb058d, the worker at a core's whole time).
         with float64():
             naive = naive_recurrent_kda if kda else naive_recurrent_gated_delta_rule
             np.savez(f"{path}.truth.npz", **run(arrays, kda=kda, scale=float(scale), rule=naive,
-                                                dtype=torch.float64, device="cpu", per_sequence=True))
+                                                dtype=torch.float64, device="cuda", per_sequence=True))
+        print(f"timed fla {referenced - began:.3f} s truth {time.perf_counter() - referenced:.3f} s",
+              file=sys.stderr, flush=True)
         print("done", file=answers, flush=True)
 
 
@@ -174,25 +184,25 @@ class Worker:
         self.process.wait()
 
 
-def write_seeded(worker: Worker, prefix: str = "") -> None:
-    """Each site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
-    `serve`'s process), recorded as a summary (`record_case`), Dew's portable rule in the site's dtype the
-    sizing proxy and its float64 token recurrence held to fla's reference at every seed."""
+def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
+    """Each named site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
+    `serve`'s process), recorded as a summary (`record_case`) into `out`, Dew's portable rule in the site's
+    dtype the sizing proxy and its float64 token recurrence held to fla's reference at every seed: a unit
+    of the recording, whose units `merged` joins into the fixture."""
     import functools
     import tempfile
 
     import jax
     from fla_sites import ruled, sites
-    from recorded_references import held_to_the_oracle, provenance, record_case, save
+    from recorded_references import held_to_the_oracle, provenance, record_case
     from reference_error import chain_roundings, widened
     from test_recurrence_chunk import chunk_on, token_by_token
 
     version, device = worker.start().split(maxsplit=1)
     requests = tempfile.mkdtemp(prefix="fla-")
     stored = {}
-    for name, site in sites().items():
-        if not name.startswith(prefix):
-            continue
+    for name in names:
+        site, began = sites()[name], time.perf_counter()
         sample = site.arrays(0)
         dtype, kda = str(sample["q"].dtype), sample["g"].ndim == 4
 
@@ -218,24 +228,53 @@ def write_seeded(worker: Worker, prefix: str = "") -> None:
                                                                  arrays), site.hooks)
         stored.update(record_case(name, site.arrays, evaluate, portable, truth_proxy=exact_run,
                                   store_inputs=False, summary=True))
+        print(f"{name}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
     stored["provenance"] = provenance(
         version, version, device.strip(),
-        "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python>",
+        "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> <unit> "
+        "<site>...",
         truth="fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch "
               "float64",
         cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
                     "chain_roundings")
-    written = save(FIXTURE, stored, reference=version, license="MIT")
-    print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
+    np.savez(out, **stored)
+    print(f"wrote {out}: {out.stat().st_size:,} bytes", flush=True)
+
+
+def merged(units: list[Path]) -> Path:
+    """The recording's units (`write_seeded`'s, their sites disjoint) joined and saved as the fixture, its
+    provenance the units' own, which must agree."""
+    from recorded_references import save
+
+    stored: dict[str, np.ndarray] = {}
+    for unit in units:
+        with np.load(unit, allow_pickle=False) as part:
+            for key, value in part.items():
+                if key == "provenance" and key in stored:
+                    if str(stored[key]) != str(value):
+                        raise ValueError(f"{unit} was recorded under another provenance: {value}")
+                elif key in stored:
+                    raise ValueError(f"{unit} records {key} again")
+                stored[key] = value
+    return save(FIXTURE, stored, reference=json.loads(str(stored["provenance"]))["reference"], license="MIT")
 
 
 def main() -> None:
+    """`--serve`: the torch side. `--list`: the sites, a line each. `--merge <units>`: the fixture from the
+    recording's units. Else `<fla python> <out> <site>...`: those sites' unit, written to `out`."""
     if sys.argv[1] == "--serve":
         serve()
-        return
-    worker = Worker(sys.argv[1])
-    write_seeded(worker, *sys.argv[2:3])
-    worker.close()
+    elif sys.argv[1] == "--list":
+        from fla_sites import sites
+
+        print("\n".join(sites()), flush=True)
+    elif sys.argv[1] == "--merge":
+        written = merged([Path(unit) for unit in sys.argv[2:]])
+        print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
+    else:
+        worker = Worker(sys.argv[1])
+        write_seeded(worker, sys.argv[3:], Path(sys.argv[2]))
+        worker.close()
 
 
 if __name__ == "__main__":
