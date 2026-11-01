@@ -68,9 +68,8 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     batch it makes consumes the examples of the batches it read, its step's and each it drew further
     (`clocked_rollout`). Where it `closes` a step of the run bounded to `examples`, the batch is closed
     (`FitRun.closing`) after the rollout's last draw, so the look-ahead that finds the stream's end, and
-    the position the step saves, come after every batch it read; a pool's step closes the batch it read
-    first, as its reads are pooled and a rollout of its draws none further (`clocked`). With the batch,
-    the position the step saves, or None.
+    the position the step saves, come after every batch it read, in a pool each a pooled read
+    (`FitRun.further`). With the batch, the position the step saves, or None.
 
     Host-side and untraceable: sampling, scoring, advantages. The key folds the
     step key once more, keeping the rollout's draws off the step's stream; both
@@ -79,18 +78,16 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     """
     from dew.distributed.batches import shard_batch
 
-    position = None
-    if closes and (rollout is None or run.pooled):
-        batch, position = run.closing(interval, batch, examples)
     if rollout is None:
-        return batch, position
+        return run.closing(interval, batch, examples) if closes else (batch, None)
+    position = None
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
     consumed = _Consumed(batch)
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
         made = clocked_rollout(rollout(state, _unclocked(batch), key, **further), batch, consumed)
-    if closes and not run.pooled:
+    if closes:
         made, position = run.closing(interval, made, examples)
     with run.held():
         prepared = marked(made)

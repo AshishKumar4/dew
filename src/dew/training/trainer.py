@@ -120,7 +120,6 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
-    pooled,
     pooled_first,
     restored,
     stage_reached,
@@ -195,7 +194,7 @@ from dew.training.planning import (
     whole_step,
 )
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
-from dew.training.rollout import Rollout, _branched, _draws_further, _reported, _rollout_metrics, rolled_out
+from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
@@ -466,9 +465,7 @@ class Trainer(Generic[Loss, Effects]):
         self._device, self._prefetch = loader.device, prefetch
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
-                                 custom_progress=self.step is not None and progress,
-                                 pooled_draws=pooled(examples) and self.rollout is not None
-                                 and _draws_further(self.rollout))
+                                 custom_progress=self.step is not None and progress)
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
