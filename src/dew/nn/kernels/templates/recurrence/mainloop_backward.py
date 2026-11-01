@@ -721,7 +721,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
                 functools.partial(column, "value_grads", held) if call.delta else None,
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
-                blocks, ds if splits == 1 else None, gate, low, ending, ending_low, None, scale, issue,
+                blocks, ds if splits == 1 else None, gate, low, ending, ending_low, None, scale, issue.summed,
                 emit=stored, row_scale=family.rows_of(beta_ref.at[h, span]) if call.gated_keys else None)
             if splits > 1 and ds is not None:
                 # The scores' gradient's products the first split's alone, added after its memory products.

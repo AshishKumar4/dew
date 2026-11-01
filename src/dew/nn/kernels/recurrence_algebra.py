@@ -949,8 +949,8 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
 
 def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
                      value_grads: TileLoad | None, entered: TileLoad, leaving: TileLoad, blocks: int, ds,
-                     gate, low, last, last_low, memory_decay, scale: float, issue: Issue,
-                     emit: Callable[[str, int, jax.Array], None],
+                     gate, low, last, last_low, memory_decay, scale: float,
+                     summed: Callable[[list], jax.Array], emit: Callable[[str, int, jax.Array], None],
                      row_scale=None) -> tuple[jax.Array, jax.Array]:
     """The queries', keys' and weights' gradients of a chunk and value head (fla's dqkwg's memory products)
     under a decay a head, given its scores' gradient `ds` (`scores_gradient`'s, a tile its products read as
@@ -964,22 +964,23 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
     summing key blocks apart adds it once). Without the delta rule (`value_grads` None) there are no weights
     and no `dw`. `row_scale` `[C]`, where given, scales each token's row of `dk`'s memory products in fp32:
-    the write gate on the keys' side (`keys_gated_carried`), mamba_ssm's `dB = (x dstates^T) dt`."""
+    the write gate on the keys' side (`keys_gated_carried`), mamba_ssm's `dB = (x dstates^T) dt`. Each sum
+    of products over the value blocks issued into one accumulator (`summed`, the mainloop's: a list of
+    `(name, left, right)`), as `scores_gradient`'s are."""
     row_decay = raised(gate, low)[:, None]
     leaving_decay = range_decay(last, last_low, gate, low)[:, None]
     leaving_terms, after = [], []
     for c in range(columns):
-        dq = _summed(issue("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks))
+        dq = summed([("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks)])
         dq = dq * row_decay * scale
         after.append(jnp.sum(dq * queries(c).value().astype(jnp.float32), axis=1))
-        emit("dq", c, dq if ds is None else dq + issue("scores_dq", ds, keys(c)))
-        dk = _summed(issue("memory_dk", values(j), leaving(c, j).T) for j in range(blocks))
+        emit("dq", c, dq if ds is None else dq + summed([("scores_dq", ds, keys(c))]))
+        dk = summed([("memory_dk", values(j), leaving(c, j).T) for j in range(blocks)])
         dk = dk * leaving_decay if row_scale is None else dk * (leaving_decay * row_scale[:, None])
         leaving_terms.append(jnp.sum(dk * keys(c).value().astype(jnp.float32), axis=1))
-        emit("dk", c, dk if ds is None else dk + issue("scores_dq", Transposed(ds), queries(c)))
+        emit("dk", c, dk if ds is None else dk + summed([("scores_dq", Transposed(ds), queries(c))]))
         if value_grads is not None:
-            emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T)
-                                   for j in range(blocks)))
+            emit("dw", c, -summed([("memory_dw", value_grads(j), entered(c, j).T) for j in range(blocks)]))
     after = _summed(after)
     if memory_decay is not None:
         lag = _lags((after.shape[0],) * 2)
