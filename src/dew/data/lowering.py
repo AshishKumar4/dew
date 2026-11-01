@@ -1731,7 +1731,7 @@ class _Build:
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
         if self.elastic and carried >= 0:
             carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked))
-        ran, counting = consumed, _counts_own_rows(pipeline)
+        ran, counting, examples = consumed, _counts_own_rows(pipeline), False
         # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
         passes: tuple[int, int] | None = None
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
@@ -1752,10 +1752,12 @@ class _Build:
             if isinstance(stage, Workers) and pool is not None:
                 continue
             if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
-                # The corpus's counts are of its source examples: they are taken before an objective's
-                # step makes rows of them (`FlatMap.examples`), and not again after.
-                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
-                counting = False
+                # The corpus's counts are of its source examples (`FlatMap.examples`): a run bounded in
+                # examples counts each where its last row is delivered, as the row says (`CONSUMED`); any
+                # other counts each as the objective's step reads it, and not again after.
+                examples, counting = True, _consumes(pipeline)
+                rows = rows if counting else Accepted(_as_iter(rows, self.loading), _name(pipeline),
+                                                      _label(pipeline), examples=True)
             if isinstance(stage, _RECORD):
                 # The record steps from here run as one operator (`_run`), up to where the workers
                 # hand their rows on.
@@ -1791,7 +1793,8 @@ class _Build:
             rows = self.handed(rows, pipeline, partition, pool,
                                certain_after=_barren_bound(pipeline.stages, passes, carried))
         if not self.global_order and counting:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            examples=examples)
         return rows
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
