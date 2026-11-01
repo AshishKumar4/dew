@@ -263,6 +263,12 @@ def test_held_layout_bounds_take_every_example_whatever_steps_or_windows_stand_a
     single = (Pipeline(Memory(lone)).pack(2, fields=("id",), segments=1).shuffle(seed=1).read("memory")
               .batch(1))
     assert _consumed_of(compile(single, read="memory", examples=2)) == 2
+    # Through an objective's rows, the singleton, whose window holds no target, is consumed and refused.
+    counted = compile(single, read="memory", examples=2, objective=ObjectiveData(train=(Twice(),)))
+    assert _consumed_of(counted) == 2
+    stated = counted.statistics()
+    assert [value for name, value in stated.items() if name.startswith("data/rows/")] == [1]
+    assert [value for name, value in stated.items() if name.endswith("/zero_targets")] == [1]
     whole = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
     twice = ObjectiveData(train=(Twice(),))
     assert _consumed_of(compile(whole, read="memory", examples=10, objective=twice)) == 10

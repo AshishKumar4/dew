@@ -49,6 +49,7 @@ from dew.data.pipeline import (
     Limit,
     Map,
     Mixture,
+    Owed,
     Pack,
     Phases,
     Pipeline,
@@ -351,38 +352,38 @@ def _limited(pipeline: Pipeline, at: int, rows: list[tuple[tuple[int, ...], Reco
     return passes[:count], pipeline
 
 
-def _owed(planned: Mapping[str, np.ndarray], documents: Sequence[Record]) -> list[dict[str, int]]:
-    """For each window a first-fit plan keeps (`accepted`), the counts of the examples ended by the
-    documents of the windows it leaves out before it (`order`, `starts`), the last kept also taking those
-    of the windows it leaves out after every kept one, so the kept windows consume every example. A window
-    holds pieces (`order`), each a slice of one document (`documents`, `offsets`, `sizes`), whose counts
-    stand at its document's last token (`_ConsumedAt`)."""
+def _owed(planned: Mapping[str, np.ndarray], documents: Sequence[Record]) -> list[int]:
+    """For each window a first-fit plan keeps (`accepted`), the examples ended by the documents of the
+    windows it leaves out before it (`order`, `starts`), the last kept also owed those of the windows it
+    leaves out after every kept one, so the kept windows consume every example, each owed one refused
+    (`Owed`). A window holds pieces (`order`), each a slice of one document (`documents`, `offsets`,
+    `sizes`), whose counts stand at its document's last token (`_ConsumedAt`)."""
     kept = [int(window) for window in planned["accepted"]]
     starts, order = planned["starts"], planned["order"]
     pieces, offsets, sizes = planned["documents"], planned["offsets"], planned["sizes"]
-    owed, pending, at = [], dict.fromkeys(ACCOUNTS, 0), 0
+    owed, pending, at = [], 0, 0
     for window in range(len(starts) - 1):
         if at < len(kept) and window == kept[at]:
             owed.append(pending)
-            pending, at = dict.fromkeys(ACCOUNTS, 0), at + 1
+            pending, at = 0, at + 1
             continue
         for piece in order[int(starts[window]):int(starts[window + 1])]:
             document, offset = documents[int(pieces[piece])], int(offsets[piece])
-            for name in ACCOUNTS:
-                pending[name] += int(np.sum(np.asarray(document[name])[offset:offset + int(sizes[piece])]))
+            pending += int(np.sum(np.asarray(document[CONSUMED])[offset:offset + int(sizes[piece])]))
     if owed:
-        owed[-1] = {name: owed[-1][name] + pending[name] for name in ACCOUNTS}
+        owed[-1] += pending
     return owed
 
 
-def _credited(window: Record, owed: Mapping[str, int]) -> Record:
-    """`window` holding `owed` more of each count at its last token (`_owed`)."""
-    if not any(owed.values()):
+def _credited(window: Record, owed: int) -> Record:
+    """`window` owed `owed` more examples, each refused (`_owed`, `Owed`), at its last token, which its
+    sums take (`_targeted`)."""
+    if not owed:
         return window
     credited = dict(window)
     for name in ACCOUNTS:
         held = np.array(window[name], copy=True)
-        held[-1] += owed[name]
+        held[-1] += owed
         credited[name] = held
     return credited
 
@@ -407,27 +408,25 @@ def _targeted(
     their token `field`, each counted by the rule their documents were (`counted_window`),
     and their total, as an indexed or streamed read accepts them. Windows of documents a bound in
     examples marked (`ACCOUNTS`, at each document's last token) hold their sums, one count a window, and
-    a window left out passes its counts to the next kept, the last kept taking what none after holds, so
-    the kept windows consume every example the bound read."""
+    a window left out owes the examples it ends to the next kept, each refused as a row a step drops
+    owes them (`Owed`), the last kept taking what none after holds, so the kept windows consume every
+    example the bound read."""
 
-    kept, total = [], 0
-    owed = dict.fromkeys(ACCOUNTS, 0)
+    kept, total, owed = [], 0, Owed()
     for identifier, value in rows:
         window = counted_window(record(value, "packed window"), rule, field)
         if CONSUMED in window:
-            window = {**window, **{name: int(np.sum(window[name])) + owed[name] for name in ACCOUNTS}}
-            owed = dict.fromkeys(ACCOUNTS, 0)
+            window = {**window, **{name: int(np.sum(window[name])) for name in ACCOUNTS}}
         count = ValidTargets(field)(window)
         if count:
-            kept.append((identifier, window))
+            kept.append((identifier, owed.paid(window) if CONSUMED in window else window))
             total += count
         else:
             counter.rejected["zero_targets"] += 1
-            owed = {name: owed[name] + integer(window.get(name, 0), name) for name in ACCOUNTS}
-    if any(owed.values()) and kept:
+            owed.owe(integer(window.get(CONSUMED, 0), "a window's consumed examples"))
+    if owed.examples and kept:
         identifier, last = kept[-1]
-        kept[-1] = (identifier, {**last, **{name: integer(last[name], name) + owed[name]
-                                            for name in ACCOUNTS}})
+        kept[-1] = (identifier, owed.paid(last))
     return kept, {"valid_targets": total}
 
 

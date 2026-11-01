@@ -951,10 +951,12 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     None for any other read, whose pass is counted once it is prepared (`_staged`)."""
     if read != "memory" or isinstance(train.source, (Mixture, Phases)):
         return None
-    # A configured step binds to one the read runs as it holds its rows unless it draws (a random map).
-    eager = next((index for index, stage in enumerate(train.stages)
-                  if not (isinstance(stage, _EAGER) or (isinstance(stage, Configured) and not stage.random))),
-                 len(train.stages))
+    # The steps the read runs as it holds its rows, as the analysis places them (after a cache it fills),
+    # and a configured step's after them, which binds to such a step unless it draws (a random map).
+    eager = _analyzed(train, read).eager
+    while eager < len(train.stages) and (isinstance(train.stages[eager], _EAGER) or (
+            isinstance(train.stages[eager], Configured) and not train.stages[eager].random)):
+        eager += 1
     batched = _until(train.stages, (BatchStage, TokenBudget))
     at = next((index for index, stage in enumerate(train.stages[:batched])
                if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
@@ -1073,9 +1075,9 @@ def _compiled(
         # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.
         raise ValueError(f"{_name(train)} shuffles the windows a concatenating pack or windows lay its "
                          "examples across, which a run bounded in examples and read in its own order reads "
-                         "in the order they end their examples; shuffle the records before the layout, "
-                         "pack them first-fit or best-fit, which keeps each whole, or read it in a global "
-                         "order")
+                         "in the order they end their examples: pack them first-fit or best-fit, which keeps "
+                         "each whole in one window, shuffle the records before the layout, or read it in a "
+                         "global order its plan counts ahead (a run of steps or epochs over it)")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,
