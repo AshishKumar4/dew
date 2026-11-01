@@ -1049,16 +1049,17 @@ def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
                            gates: Callable[[int], tuple], reference: Callable[[int, int], tuple],
                            issue: Issue, *, chunk: int, emit: Callable[[str, int, int, jax.Array], None],
-                           sub: int = SUB) -> None:
+                           scales: tuple | None = None, sub: int = SUB) -> None:
     """`key_decayed_pairs`' transpose, its sub-chunk factoring the same: for each pairs' gradient
-    `d_pairs[p]` `[C, C]` fp32 (causal or strict as its pairs were) of rows `rows[p](c)` against the same keys
-    `keys(c)` fp32, each key block `c`'s gradients to `emit`: `('rows', p, c, d)` the rows'
-    `sum_j dP_ij k_j exp2(g_i - g_j)` and `('keys', 0, c, d)` the keys', summed over the pairs,
-    `sum_p sum_i dP_ij r_i exp2(g_i - g_j)`, each `[C, BK]` fp32. Each sub-chunk `s` takes its first token's
-    prefix as the common point, as the forward does: its rows' products against the keys gated up from it to
-    its end (`k exp2(g_ref - g)`), each row then gated down by its own sub-chunk's `exp2(g - g_ref)`; the
-    keys' products against the rows of `s` gated down to it, each key then gated up from it, zero past its
-    end, a product a sub-chunk and pairs ('pairs')."""
+    `d_pairs[p]` `[C, C]` (a tile, causal or strict as its pairs were, zero elsewhere) of rows `rows[p](c)`
+    against the same keys `keys(c)` fp32, scaled by `scales[p]`, each key block `c`'s gradients to `emit`:
+    `('rows', p, c, d)` the rows' `sum_j dP_ij k_j exp2(g_i - g_j)` and `('keys', 0, c, d)` the keys',
+    summed over the pairs, `sum_p sum_i dP_ij r_i exp2(g_i - g_j)`, each `[C, BK]` fp32. Each sub-chunk `s`
+    takes its first token's prefix as the common point, as the forward does: `dP` against the keys gated up
+    from it to its end (`k exp2(g_ref - g)`), kept on the rows of `s` and gated down by `exp2(g - g_ref)`;
+    `dP^T` against the rows of `s` gated down to it, each key's then gated up from it, zero past its end,
+    two products a sub-chunk and pairs ('pairs')."""
+    scales = (1.0,) * len(d_pairs) if scales is None else scales
     for c in range(columns):
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
@@ -1069,7 +1070,6 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
                           for half, under in zip(halves, start, strict=True))
         down = between(prefix, start)
         key, gated_rows = keys(c), [row(c) * down for row in rows]
-        pair_rows, _ = _grid(d_pairs[0].shape)
         d_rows = [jnp.zeros(index.shape, jnp.float32) for _ in d_pairs]
         d_keys = jnp.zeros(index.shape, jnp.float32)
         for s in range(chunk // sub):
@@ -1077,15 +1077,14 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
             whole, fraction = separated(*reference(s, c))
             up = jnp.where(index < place + sub, between((whole[None, :], fraction[None, :]), prefix), 0.0)
             within = (index >= place) & (index < place + sub)
-            mine = (pair_rows >= place) & (pair_rows < place + sub)
+            raised_keys = key * up
             summed = jnp.zeros(index.shape, jnp.float32)
             for p, d_pair in enumerate(d_pairs):
-                in_s = jnp.where(mine, d_pair, 0.0)
-                d_rows[p] = d_rows[p] + issue("pairs", in_s, key * up)
-                summed = summed + issue("pairs", Transposed(in_s), jnp.where(within, gated_rows[p], 0.0))
+                d_rows[p] = d_rows[p] + jnp.where(within, issue("pairs", d_pair, raised_keys), 0.0)
+                summed = summed + issue("pairs", d_pair.T, jnp.where(within, gated_rows[p], 0.0)) * scales[p]
             d_keys = d_keys + up * summed
         for p, total in enumerate(d_rows):
-            emit("rows", p, c, total * down)
+            emit("rows", p, c, total * down * scales[p])
         emit("keys", 0, c, d_keys)
 
 
