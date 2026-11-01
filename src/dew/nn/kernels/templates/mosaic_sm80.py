@@ -257,8 +257,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        del interpret
-        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
+        return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs, interpret)
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         for formed in parts:
