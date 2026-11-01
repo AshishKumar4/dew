@@ -384,14 +384,12 @@ def _read_alpha_rotary(view: PartView) -> Mapping[str, object]:
 
 def _read_ernie_router(view: PartView) -> Mapping[str, object]:
     """ERNIE 4.5's router: float32 logits and their softmax over every expert, chosen by score plus the
-    correction bias its `moe_statics` holds, weighted by score renormalized over the chosen (their sum
-    clamped below at `moe_norm_min`, which binds nowhere below `top_k / experts`, the least the chosen
-    can sum to)."""
-    top_k, experts = int(view.top_k), int(view.num_experts)
-    if float(view.norm_min) >= top_k / experts:
-        raise Ambiguous(f"the router clamps its chosen weights' sum at {view.norm_min}, which binds")
-    return {_LAYER: {'top_k': top_k, 'experts': experts, 'norm_topk_prob': True, 'score_function': 'softmax',
-                     'bias': True}}
+    correction bias its `moe_statics` holds, weighted by score over the chosen scores' sum clamped below
+    at `moe_norm_min` (`Router.weight_sum_min`), which binds where the bias picks experts whose scores
+    sum to less."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
+                     'score_function': 'softmax', 'bias': True, 'weight_sum_epsilon': 0.0,
+                     'weight_sum_min': float(view.norm_min)}}
 
 
 def _read_ernie_moe(view: PartView) -> Mapping[str, object]:
@@ -456,7 +454,8 @@ def _read_shared_moe(view: PartView) -> Mapping[str, object]:
 def _read_shared_mlp(view: PartView) -> Mapping[str, object]:
     """A routed block's shared experts: Llama's MLP, its width the block's (`Mixture.shared_features`)."""
     width = int(view.gate_proj.out_features)
-    return {'mlp': gated_activation(view.act_fn), _LAYER: {'shared_features': width}}
+    biased = _biased(view.gate_proj, view.up_proj, view.down_proj)
+    return {'mlp': gated_activation(view.act_fn), 'mlp_bias': biased, _LAYER: {'shared_features': width}}
 
 
 def _read_experts(view: PartView) -> Mapping[str, object]:
@@ -938,8 +937,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
         # A router's scores, scaling and correction bias and a block's shared experts, where its parts
         # state them (DeepSeek's routing, HY-3's).
         stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
-                                                'groups', 'groups_per_token', 'weight_sum_epsilon')
-                  if key in mixture}
+                                                'groups', 'groups_per_token', 'weight_sum_epsilon',
+                                                'weight_sum_min') if key in mixture}
         fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
             top_k=_records.integer(mixture['top_k'], 'top_k'),
@@ -970,24 +969,28 @@ def assemble(model: PreTrainedModel) -> Assembly:
 
 def _with_attention_fields(fields: Mapping[str, object], stated: Mapping[int, object]
                            ) -> Mapping[str, object]:
-    """The kinds that give every layer's attention the mixer fields its part states (`stated`, each
-    layer's): ERNIE 4.5's adjacent rotary pairs, Hunyuan's norm after the rotation; its layer types'
-    kinds otherwise as they are."""
+    """The kinds that give each layer's attention the mixer fields its part states (`stated`, by layer):
+    ERNIE 4.5's adjacent rotary pairs, Hunyuan's norm after the rotation. Each layer type whose layers
+    state them takes them into its kind's attention, beside any it holds (a NoPE kind's); every layer of
+    that type must state the same, and a type whose kind mixes otherwise (a convolution) states none."""
     if not stated:
         return {}
     count = _records.integer(fields['num_layers'], 'num_layers')
-    mixers = [dict(_records.record(mixer, 'attention')) for mixer in stated.values()]
-    if sorted(stated) != list(range(count)) or any(mixer != mixers[0] for mixer in mixers):
-        raise Ambiguous("the layers' attentions compute differently")
     stated_types = fields.get('layer_types')
     types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
              else ['full_attention'] * count)
     kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
-    for name in dict.fromkeys(types):
+    for name in dict.fromkeys(types[layer] for layer in stated):
+        held = [dict(_records.record(stated[layer], 'attention')) if layer in stated else None
+                for layer in range(count) if types[layer] == name]
+        if any(mixer != held[0] for mixer in held):
+            raise Ambiguous(f"the {name} layers' attentions compute differently")
         kind = dict(_records.record(kinds[name], name)) if name in kinds else dict(native_fields(LayerKind)())
-        if kind.get('mixer') is not None:
-            raise Ambiguous(f"the {name} layers' mixer is stated elsewhere")
-        kind['mixer'] = {'class': 'attention', 'fields': mixers[0]}
+        mixer = dict(_records.record(kind.get('mixer') or {'class': 'attention', 'fields': {}}, 'mixer'))
+        if mixer.get('class') != 'attention':
+            raise Ambiguous(f"the {name} layers' mixer is a {mixer.get('class')}, not an attention")
+        kind['mixer'] = {'class': 'attention',
+                         'fields': {**_records.record(mixer.get('fields', {}), 'fields'), **(held[0] or {})}}
         kinds[name] = kind
     return {'layer_types': tuple(types), 'kinds': kinds}
 

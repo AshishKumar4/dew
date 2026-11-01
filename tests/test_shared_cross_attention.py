@@ -508,6 +508,24 @@ def test_an_attention_of_its_own_reads_a_context_through_its_own_projections(kin
     assert len(gates) == 2 and all(np.isfinite(gate).all() and np.all(gate != 0) for gate in gates)
 
 
+def test_a_layer_norming_its_rotated_heads_norms_a_contexts_heads_alike():
+    """A layer that norms each head's queries and keys after their rotation (Hunyuan's,
+    `qk_norm_after_rotary`) reads a context, which it turns by no positions, through the same norms as
+    one that norms them before: its query normed then scaled, the context's keys normed, the same reads
+    bit for bit from the same variables, forward and back."""
+    from dew.nn.mixers.attention import AttentionMixer
+
+    def layer(*, after):
+        return AttentionMixer(qk_norm_after_rotary=after).build(MixerContext(
+            emb_features=CONTEXT_WIDTH, num_heads=2, num_kv_heads=2, head_dim=8, max_seq_len=16,
+            norm_eps=1e-5, attention_scale=0.3))(name="self_attn")
+
+    before, after = layer(after=False), layer(after=True)
+    drawn = context_draw(before)(3)
+    for ours, theirs in zip(context_read(after)(*drawn), context_read(before)(*drawn), strict=True):
+        jax.tree.map(np.testing.assert_array_equal, ours, theirs)
+
+
 HF = Path(__file__).parent / "fixtures" / "hf"
 
 

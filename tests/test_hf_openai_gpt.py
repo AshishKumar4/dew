@@ -38,3 +38,21 @@ def test_a_gpt1_decoder_computes_transformers_logits_and_greedy_continuation(afn
     generated = generate(loaded.model, loaded.variables, np.asarray(ids[:1, :4]), 6, key=0,
                          sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
+
+
+def test_gpt1_scales_by_the_head_width_whatever_its_config_carries(tmp_path):
+    """GPT-1's blocks always scale their attention by the head width (modeling_openai.py builds each with
+    `scale=True`): a config carrying GPT-2's `scale_attn_weights: false` loads with that scale, as
+    transformers runs it, not unscaled."""
+    import json
+
+    import torch
+    from transformers import OpenAIGPTConfig, OpenAIGPTLMHeadModel
+
+    torch.manual_seed(0)
+    OpenAIGPTLMHeadModel(OpenAIGPTConfig(vocab_size=96, n_embd=64, n_layer=2, n_head=4, n_positions=32)
+                         ).eval().save_pretrained(tmp_path)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "scale_attn_weights": False}))
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    assert loaded.model.attention_scale is None

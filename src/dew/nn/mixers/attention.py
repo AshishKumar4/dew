@@ -928,6 +928,9 @@ class CausalSelfAttention(nn.Module):
         for, and placed nowhere: a context has no positions to rotate by, nor a temperature a place
         tunes. With the output gate, None where it gates none."""
         query, gate, _ = self._query(x)
+        if self.qk_norm_after_rotary:
+            # Normed where a rotation would have turned it, before its scale, as the layer's own call.
+            query = self.q_norm(query)
         if self.ctx.attention_scale is not None:
             query = scaled(query, self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
         return query, gate
@@ -943,7 +946,11 @@ class CausalSelfAttention(nn.Module):
         if group is not None and self._packed():
             _, key, value = group.split(self.qkv_proj(context))
             projected = (key, value)
-        return self._projected_kv(context, self._whole_norm, projected)
+        key, value = self._projected_kv(context, self._whole_norm, projected)
+        if self.qk_norm_after_rotary:
+            # Normed where a rotation would have turned them, as the layer's own keys.
+            key = constrain(self.k_norm(key), KV_HEADS)
+        return key, value
 
     def attend_context(self, query, gate, key, value, *, lengths, queries=None, segments=None,
                        max_segments=None, progress=None):

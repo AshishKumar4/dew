@@ -440,6 +440,9 @@ BUILT_IN = {
                                            "factor": 1.0}},
     "ernie4_5_moe": {"head_dim": None, "moe_num_experts": 8, "moe_k": 2, "moe_intermediate_size": 32,
                      "moe_num_shared_experts": 1, "moe_layer_start_index": 1},
+    "ernie4_5_moe-biased": {"model_type": "ernie4_5_moe", "head_dim": None, "use_bias": True,
+                            "moe_num_experts": 8, "moe_k": 2, "moe_intermediate_size": 32,
+                            "moe_num_shared_experts": 1, "moe_layer_start_index": 0},
     "lfm2": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
              "conv_L_cache": 3, "block_auto_adjust_ff_dim": False},
     "lfm2_moe": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
@@ -458,12 +461,13 @@ convolutions between its attention layers, its modules under names of their own 
 `feed_forward.w1`, `out_proj`), and LFM2-MoE's, its layers past the first routed by sigmoid scores and a
 balancing bias, renormalized over a sum with its own epsilon; and ERNIE 4.5's routed layers past its
 first, a softmax router selecting with a `[1, experts]` correction bias beside a shared expert, its
-rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared MLP, each head's queries
+rotary turning adjacent pairs, and (`ernie4_5_moe-biased`) every layer routed, its projections and
+shared expert biased; and Hunyuan's every layer routed beside a shared MLP, each head's queries
 and keys normed after their rotation, at its dynamic-alpha base."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
-                  "hunyuan_v1_moe": 8}
+                  "ernie4_5_moe-biased": 8, "hunyuan_v1_moe": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
@@ -625,6 +629,50 @@ def test_a_biased_short_convolution_is_left_to_tier_3():
                                                              layer_types=["conv", "full_attention"] * 2))
     with pytest.raises(parts.Ambiguous):
         parts.assemble(model)
+
+
+def test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert():
+    """ERNIE 4.5's router picks by score plus its correction bias and divides the chosen scores by their sum
+    clamped below at `moe_norm_min`: where the bias picks an expert of faint score, the clamp binds and its
+    weight stays faint. Dew's router as tier 2 reads it (`Router.weight_sum_min`) picks and weighs alike."""
+    import jax.numpy as jnp
+    from transformers import Ernie4_5_MoeConfig
+    from transformers.models.ernie4_5_moe.modeling_ernie4_5_moe import Ernie4_5_MoeTopKRouter
+
+    from dew.nn.moe import EXPERT_BIAS, EXPERT_BIAS_COLLECTION, Router
+
+    source = Ernie4_5_MoeTopKRouter(Ernie4_5_MoeConfig(hidden_size=4, moe_num_experts=2, moe_k=1))
+    with torch.no_grad():
+        source.weight.copy_(torch.tensor([[0.0, 0.0, 0.0, 0.0], [-40.0, 0.0, 0.0, 0.0]]))
+        source.moe_statics.e_score_correction_bias.copy_(torch.tensor([[0.0, 2.0]]))
+    hidden = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    _, weights, chosen = source(hidden)
+    router = Router(num_experts=2, in_features=4, top_k=1, expert_bias=True, weight_sum_epsilon=0.0,
+                    weight_sum_min=float(source.norm_min))
+    variables = {**router.init(jax.random.key(0), jnp.zeros((1, 4))),
+                 "params": {"kernel": jnp.asarray(source.weight.detach().numpy().T)},
+                 EXPERT_BIAS_COLLECTION: {EXPERT_BIAS: jnp.asarray([0.0, 2.0])}}
+    ours, indices = router.apply(variables, jnp.asarray(hidden.numpy()))
+    np.testing.assert_array_equal(np.asarray(indices), chosen.numpy())
+    # The faint score over the clamp, about 4e-6 either way, where the unclamped quotient is 1.
+    assert all(1e-7 < weight < 1e-5 for weight in (float(ours[0, 0]), float(weights[0, 0])))
+
+
+def test_attention_fields_join_the_kinds_of_the_layers_that_state_them():
+    """A part's attention fields (`_with_attention_fields`) join each stated layer type's kind beside the
+    fields it holds, a NoPE kind's among them, and leave a convolution layer's kind as it is; layers of
+    one type that state different fields are `Ambiguous`."""
+    nope = {"mixer": {"class": "attention", "fields": {"nope": True}}}
+    conv = {"mixer": {"class": "short_conv", "fields": {"conv_L_cache": 3}}}
+    fields = {"num_layers": 4, "layer_types": ("conv", "full_attention", "conv", "full_attention_nope"),
+              "kinds": {"conv": conv, "full_attention_nope": nope}}
+    pairs = {"rotary_pairs": "adjacent"}
+    joined = parts._with_attention_fields(fields, {1: pairs, 3: pairs})
+    assert joined["kinds"]["conv"] == conv
+    assert joined["kinds"]["full_attention_nope"]["mixer"]["fields"] == {"nope": True, **pairs}
+    assert joined["kinds"]["full_attention"]["mixer"] == {"class": "attention", "fields": pairs}
+    with pytest.raises(parts.Ambiguous):
+        parts._with_attention_fields({**fields, "layer_types": ("conv", "full_attention") * 2}, {1: pairs})
 
 
 def test_a_decoder_norming_its_rotated_heads_decodes_through_its_cache_as_transformers_generates(tmp_path):

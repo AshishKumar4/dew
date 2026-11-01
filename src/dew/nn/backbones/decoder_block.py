@@ -146,7 +146,9 @@ class Mixture:
     `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
     `routing_block` with `block_experts` is LLaDA2.2's block routing.
     `weight_sum_epsilon` is the term a renormalization of non-softmax weights
-    adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6).
+    adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6),
+    and `weight_sum_min` the least it divides by (ERNIE 4.5's `moe_norm_min`,
+    `Router.weight_sum_min`).
     """
 
     experts: int
@@ -161,6 +163,7 @@ class Mixture:
     bias: bool = False
     bias_in_weights: bool = False
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
+    weight_sum_min: float = 0.0
     routing_block: int | None = None
     block_experts: int | None = None
     scale_inputs: bool = False
@@ -299,7 +302,7 @@ class Mixture:
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
             group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
-            weight_sum_epsilon=self.weight_sum_epsilon,
+            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
             media_bias=self.media_bias, routing_block=self.routing_block,
             block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,

@@ -299,9 +299,13 @@ def _openai_gpt_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     spelled = {'gelu': 'gelu_new', 'relu': 'relu'}
     if afn not in spelled:
         refuse(f'afn={afn!r}', "GPT-1's MLP reads a tanh GELU ('gelu') or ReLU here")
+    # GPT-1's blocks always scale by the head width and read none of GPT-2's other attention switches
+    # (modeling_openai.py builds each Block with scale=True), whatever a config carries.
     config = gpt2_config({**hf, 'activation_function': spelled[afn], 'n_inner': None,
                           'vocab_size': hf.get('vocab_size', 40478),
-                          'n_positions': hf.get('n_positions', 512)}, used)
+                          'n_positions': hf.get('n_positions', 512), 'scale_attn_weights': True,
+                          'scale_attn_by_inverse_layer_idx': False, 'reorder_and_upcast_attn': False,
+                          'add_cross_attention': False}, used)
     # The original release's `n_special`, which transformers' OpenAI GPT reads nowhere: its vocabulary
     # counts the special tokens.
     used.update(('afn', 'predict_special_tokens', 'n_special'))
