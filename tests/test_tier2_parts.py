@@ -440,9 +440,6 @@ BUILT_IN = {
                                            "factor": 1.0}},
     "ernie4_5_moe": {"head_dim": None, "moe_num_experts": 8, "moe_k": 2, "moe_intermediate_size": 32,
                      "moe_num_shared_experts": 1, "moe_layer_start_index": 1},
-    "ernie4_5_moe-biased": {"model_type": "ernie4_5_moe", "head_dim": None, "use_bias": True,
-                            "moe_num_experts": 8, "moe_k": 2, "moe_intermediate_size": 32,
-                            "moe_num_shared_experts": 1, "moe_layer_start_index": 0},
     "lfm2": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
              "conv_L_cache": 3, "block_auto_adjust_ff_dim": False},
     "lfm2_moe": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
@@ -461,13 +458,12 @@ convolutions between its attention layers, its modules under names of their own 
 `feed_forward.w1`, `out_proj`), and LFM2-MoE's, its layers past the first routed by sigmoid scores and a
 balancing bias, renormalized over a sum with its own epsilon; and ERNIE 4.5's routed layers past its
 first, a softmax router selecting with a `[1, experts]` correction bias beside a shared expert, its
-rotary turning adjacent pairs, and (`ernie4_5_moe-biased`) every layer routed, its projections and
-shared expert biased; and Hunyuan's every layer routed beside a shared MLP, each head's queries
+rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared MLP, each head's queries
 and keys normed after their rotation, at its dynamic-alpha base."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
-                  "ernie4_5_moe-biased": 8, "hunyuan_v1_moe": 8}
+                  "hunyuan_v1_moe": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
@@ -686,6 +682,18 @@ def test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_e
 
     assert_as_exact(ours, as_given(torch_arm(source, torch.float32)), draw, "ERNIE clamped router",
                     seeds=ERNIE_CLAMP_SEEDS, truth_fn=truth)
+
+
+def test_a_biased_ernie_moe_is_left_to_tier_3():
+    """ERNIE 4.5's `use_bias` biases its shared experts beside its unbiased routed ones, which Dew's routed
+    layers do not hold (their gated MLPs are bias-free): tier 2 assembles none of it, saying so."""
+    from interop_support import tiny_config
+
+    config = tiny_config("ernie4_5_moe", head_dim=None, use_bias=True, moe_num_experts=8, moe_k=2,
+                         moe_intermediate_size=32, moe_num_shared_experts=1, moe_layer_start_index=0)
+    verdict = verify_mapping(config.to_dict())
+    assert not isinstance(verdict, VerifiedMapping)
+    assert "shared experts are biased" in verdict.reasons["parts"]
 
 
 def test_attention_fields_join_the_kinds_of_the_layers_that_state_them():

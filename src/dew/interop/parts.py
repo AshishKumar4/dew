@@ -454,8 +454,10 @@ def _read_shared_moe(view: PartView) -> Mapping[str, object]:
 def _read_shared_mlp(view: PartView) -> Mapping[str, object]:
     """A routed block's shared experts: Llama's MLP, its width the block's (`Mixture.shared_features`)."""
     width = int(view.gate_proj.out_features)
-    biased = _biased(view.gate_proj, view.up_proj, view.down_proj)
-    return {'mlp': gated_activation(view.act_fn), 'mlp_bias': biased, _LAYER: {'shared_features': width}}
+    if _biased(view.gate_proj, view.up_proj, view.down_proj):
+        # ERNIE 4.5's `use_bias`: Dew's routed layers hold bias-free gated MLPs alone.
+        raise Ambiguous("the shared experts are biased, which a routed layer's MLPs are not in Dew")
+    return {'mlp': gated_activation(view.act_fn), _LAYER: {'shared_features': width}}
 
 
 def _read_experts(view: PartView) -> Mapping[str, object]:
