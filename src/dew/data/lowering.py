@@ -1764,8 +1764,10 @@ class _Build:
                 continue
             if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
                 # The corpus's counts are of its source examples: they are taken before an objective's
-                # step makes rows of them (`FlatMap.examples`), and not again after.
-                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
+                # step makes rows of them (`FlatMap.examples`), and not again after, nor where a memory
+                # read made rows of them before (`_counts_rows`).
+                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                                rows=_counts_rows(pipeline, index))
                 counting = False
             if isinstance(stage, _RECORD):
                 # The record steps from here run as one operator (`_run`), up to where the workers

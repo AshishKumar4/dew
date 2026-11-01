@@ -308,10 +308,11 @@ def _memory_stages(
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
     # Rows the memory read this one reads on from made of the corpus's source examples (`FlatMap.examples`)
-    # are not the corpus's rows: the count it took of those examples stands (`_counts_rows`).
-    counted = rows if examples is None else examples
+    # are not the corpus's, nor what a step makes of them here: the count it took of those examples
+    # stands (`_counts_rows`).
+    counted = (rows if examples is None else examples) if _counts_rows(pipeline, 0) else None
     return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, documents,
-                         counted=counted if examples is not None or _counts_rows(pipeline, 0) else None)
+                         counted=counted)
 
 
 def _targeted(
