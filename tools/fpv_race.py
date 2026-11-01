@@ -154,15 +154,13 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
     the share of its first episodes' steps whose next gate lies in the camera's view (`in_view`), which a
     policy of the camera alone needs of the flights it learns from."""
     from dew.rl.env import env_rollout, start
-    from dew.rl.flight import quaternion
-    from dew.rl.quadrotor import rotation
+    from dew.rl.flight import mounted
 
     def rolled(params, key):
         carry = start(env, key)
         camera = carry.state.camera
-        mounts = jax.vmap(lambda roll, uptilt, yaw: rotation(quaternion(roll, -uptilt, yaw)))(
-            camera.mount[:, 0], camera.uptilt, camera.mount[:, 1])
-        return env_rollout(env, objective.greedy, params, carry, steps)[1], mounts, camera.fov
+        taken = env_rollout(env, objective.greedy, params, carry, steps)[1]
+        return taken, jax.vmap(mounted)(camera), camera.fov
 
     taken, mounts, fov = jax.device_get(jax.jit(rolled)(params, key))
     following, last = taken.following, taken.following.terminated | taken.following.truncated
@@ -174,9 +172,8 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
 
 def in_view(gates: np.ndarray, mounts: np.ndarray, fov: np.ndarray) -> np.ndarray:
     """Whether the next gate's centre lies in each drone's camera's field of view `[steps, drones]`, from the
-    `gates` view (its corners in the body frame), each drone's camera mount `[drones, 3, 3]` (its columns
-    the camera's forward, left and up in the body frame, as `dew.rl.flight.cameras` mounts it) and field of
-    view `[drones]` (radians, a square image's): in front of the camera, its angles across and up from the
+    `gates` view (its corners in the body frame), each drone's camera mount `[drones, 3, 3]`
+    (`dew.rl.flight.mounted`) and field of view `[drones]` (radians, a square image's): in front of the camera, its angles across and up from the
     camera's axis within half the field of view. A drone's mount holds through its first episode, the
     steps this scores."""
     center = np.asarray(gates, np.float64)[..., :12].reshape(*np.shape(gates)[:-1], 4, 3).mean(-2)
