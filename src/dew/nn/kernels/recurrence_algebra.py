@@ -968,10 +968,15 @@ def key_memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, gates:
     d_system, d_betas = key_values_back(value_grads, values, blocks, lower, betas, dtype, issue,
                                         emit=functools.partial(emit, "dv"))
     for c in range(columns):
+        found = {}
         system, beta_terms = key_memory_block(
             queries(c), keys(c), gates(c), last(c), out_grads, corrected, value_grads,
             functools.partial(entered, c), functools.partial(leaving, c), blocks, lower, betas, scale, dtype,
-            issue, emit=lambda kind, grad, c=c: emit(kind, c, grad))
+            issue, emit=lambda kind, grad, c=c, found=found: found.__setitem__(kind, grad)
+            if kind in ("dg", "dm") else emit(kind, c, grad))
+        rows, _ = _grid(found["dg"].shape)
+        at_last = found["dm"] * raised(*last(c))
+        emit("dg", c, found["dg"] + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0))
         d_system, d_betas = d_system + system, d_betas + beta_terms
     return key_system_back(d_system, lower, dtype, issue), d_betas
 
@@ -1004,22 +1009,24 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     vectors, and each value block `j`'s memory entered `entered(j)` and its gradient leaving `leaving(j)`
     `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the
     weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw') and the memory decay's `sum(h dh)`, a
-    key's row of each, the diagonal of `h dh^T` ('memory_trace'): its column sums lay it as the keys' columns
-    are, which the chunk's last prefix's terms meet;
-    then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log
-    decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's on its last token
-    (`sum(h dh) exp2(g_last) + sum(k dk)`), and `(dA, dbeta)`, the inverse's gradient's part
-    `dw (kg beta)^T` `[C, C]` and the write gates' `sum(kg d(kg beta))`, fp32."""
+    key's row of each; then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk',
+    ...)` and the log decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's `sum(k dk)`
+    on its last token, `emit('dm', ...)` the memory decay's `sum(h dh)` `[BK]` fp32 as the memory's rows lay
+    it, whose term `sum(h dh) exp2(g_last)` on the last token the caller adds (`key_memory_gradients`), and
+    `(dA, dbeta)`, the inverse's gradient's part `dw (kg beta)^T` `[C, C]` and the write gates' `sum(kg
+    d(kg beta))`, fp32. Added here, the memory's rows met the keys' columns, which Mosaic GPU's layout
+    inference ran out of fuel laying (kda-lower5-sm90 at 6e03eb57e; as a product's diagonal, laid as the
+    keys' columns, it laid them, kda-lower6-sm90 at 6cf0b7c5d, but a product of a key block's 32 rows is no
+    warpgroup MMA's)."""
     decays = raised(*gates)
     to_last = range_decay(*(half[None, :] for half in last), *gates)
     products = [(issue("memory_dq", out_grads(j), entered(j).T),
                  issue("memory_dk", corrected(j), leaving(j).T),
                  issue("memory_dw", value_grads(j), entered(j).T),
-                 issue("memory_trace", entered(j), leaving(j).T))
+                 jnp.sum(entered(j).value().astype(jnp.float32) * leaving(j).value(), axis=1))
                 for j in range(blocks)]
-    d_query, d_key, d_weight, traced = (functools.reduce(jnp.add, terms)
-                                        for terms in zip(*products, strict=True))
-    d_memory = jnp.sum(jnp.where(_lags(traced.shape) == 0, traced, 0.0), axis=0)
+    d_query, d_key, d_weight, d_memory = (functools.reduce(jnp.add, terms)
+                                          for terms in zip(*products, strict=True))
     d_query = d_query * decays * scale
     d_key = d_key * to_last
     keys = key.value().astype(jnp.float32)
@@ -1029,13 +1036,14 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     gated_rows = Transposed((gated * betas[:, None]).astype(dtype))
     d_system = -issue("weights_merge", d_weight.astype(dtype), gated_rows)
     rows, _ = _grid(d_query.shape)
-    # The chunk's last prefix's terms on its last token: the memory's decay across the chunk, and the gated
-    # keys' `exp2(g_last - g)` every token's.
-    at_last = d_memory * raised(*last) + jnp.sum(keys * d_key, axis=0)
+    # The chunk's last prefix's term on its last token through the gated keys' `exp2(g_last - g)` every
+    # token's.
+    at_last = jnp.sum(keys * d_key, axis=0)
     emit("dq", d_query)
     emit("dk", d_key + d_gated * decays * betas[:, None])
     emit("dg", query.value().astype(jnp.float32) * d_query - keys * d_key
          + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0) + gated * d_gated * betas[:, None])
+    emit("dm", d_memory)
     return d_system, jnp.sum(d_gated * gated, axis=1)
 
 
