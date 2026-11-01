@@ -1531,16 +1531,16 @@ class Trainer(Generic[Loss, Effects]):
                     run.first_step = time.perf_counter() - run.started
                 stopped, state = self._between_steps(plan, run, interval, state, shardings, position,
                                                      loss, aux, accepted)
-                if stopped:
-                    break
-            # The step row is complete once its scope exits; closing the
-            # window here keeps the last iteration inside the capture.
+            # The step row is complete once its scope exits; closing the window here keeps the last
+            # iteration inside the capture, and counts the run's last step where the window outlives it.
             if run.tracing and profile is not None:
                 run.traced += 1
                 if run.traced == profile.steps:
                     run.tracing = False
                     assert profiler is not None
                     run.close_window(profiler)
+            if stopped:
+                break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
 
     def _closed(self, run: FitRun, primary: BaseException | None,
