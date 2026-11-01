@@ -807,7 +807,8 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down(monkeypa
         report.kept(lowered(), relower=lowered)
         misses = [miss for miss in report.misses() if miss.shared is not None]
         refused = [config for _, config, _ in report.refused_launches()]
-    assert [(miss.op, miss.shared, miss.stepped) for miss in misses] == [("TritonForward", 114688, True)], misses
+    stepped = [(miss.op, miss.shared, miss.stepped) for miss in misses]
+    assert stepped == [("TritonForward", 114688, True)], misses
     assert refused == [attention_triton.Tiles(32, 64, 4, 2)], refused
 
 
