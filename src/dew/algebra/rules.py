@@ -130,6 +130,16 @@ register(Rules("identities", "exact", _identities(), receipt="docs/design/algebr
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
 
 
+def may_rewrite(primitives: Mapping[str, int]) -> bool:
+    """Whether a region holding `primitives` (each primitive's name, how many equations bind it) holds what a
+    rule's left side reads that may lower its price: a sum of two reductions, two products or two
+    contractions (`linear`), or a reduction of a product. Commutativity alone (`identities`) leaves every
+    price as it was, so a region of none is kept as traced, unsaturated."""
+    adds, sums = primitives.get("add", 0), primitives.get("reduce_sum", 0)
+    products, contractions = primitives.get("mul", 0), primitives.get("dot_general", 0)
+    return (adds > 0 and (sums > 1 or products > 1 or contractions > 1)) or (sums > 0 and products > 0)
+
+
 def admitted(accurate: bool) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
     under `--precision accurate`."""

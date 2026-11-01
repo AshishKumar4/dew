@@ -7,6 +7,7 @@ region of its own, and kept bodies, never unrolled. Each rewrite is recorded in 
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -100,16 +101,31 @@ def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation,
         named = {name: value for name, value in kwargs.items() if name not in names}
         closed, shaped = jax.make_jaxpr(bound, return_shape=True)(dynamic, named)
         done = rewrite(closed, jax.tree.leaves((dynamic, named)), accurate=accurate, saturation=saturation)
-        kernel_report.record_rewrite(done.report)
-        return jax.tree.unflatten(jax.tree.structure(shaped), done.outputs)
+        return jax.tree.unflatten(jax.tree.structure(shaped), done)
     return run
 
 
-def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> Rewrite:
+def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> list:
     """The outputs of `closed` (a jaxpr and its constants) over `arguments` (flattened), its bodies rewritten
-    in place first (`_within`), its roots' forms chosen together, with the report of the rewrite."""
-    began = time.perf_counter()
+    in place first (`_within`), then its own math (`_region`) where a rule may lower its price
+    (`rules.may_rewrite`); evaluated as traced where none may."""
     closed = _within(closed, accurate, saturation)
+    if not rules.may_rewrite(_primitives(closed)):
+        return jax.core.eval_jaxpr(closed, closed.consts, *arguments)
+    done = _region(closed, arguments, accurate=accurate, saturation=saturation)
+    kernel_report.record_rewrite(done.report)
+    return done.outputs
+
+
+def _primitives(jaxpr: jcore.Jaxpr) -> collections.Counter[str]:
+    """How many of `jaxpr`'s own equations bind each primitive, by name, its bodies' apart."""
+    return collections.Counter(equation.primitive.name for equation in jaxpr.eqns)
+
+
+def _region(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> Rewrite:
+    """The outputs of `closed`, whose bodies are rewritten, over `arguments`, its roots' forms chosen together
+    from its terms saturated under the admitted rule sets, with the report of the rewrite."""
+    began = time.perf_counter()
     region = terms.region(closed)
     graph = EGraph()
     for term, extent in region.shapes:
@@ -194,16 +210,21 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
+    inner = _within(closed, accurate, saturation)
+    if not rules.may_rewrite(_primitives(inner)):
+        # Nothing of its own a rule may lower: the body as traced, its own bodies rewritten, never traced
+        # again.
+        return inner
     shapes = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
-              for aval in closed.in_avals if isinstance(aval, ShapedArray)]
+              for aval in inner.in_avals if isinstance(aval, ShapedArray)]
 
     def run(*arguments):
-        done = rewrite(closed, list(arguments), accurate=accurate, saturation=saturation)
+        done = _region(inner, list(arguments), accurate=accurate, saturation=saturation)
         kernel_report.record_rewrite(done.report)
         return done.outputs
 
     made = jax.make_jaxpr(run)(*shapes)
-    return closed if made.consts and not closed.consts else made
+    return inner if made.consts and not inner.consts else made
 
 
 def _nodes(graph: EGraph) -> int:
