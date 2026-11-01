@@ -540,7 +540,7 @@ def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float
         x, taps, bias, valid, documents = operands
         dx, dw, db = _backward(x, taps, bias, valid, documents, cotangents, parts, activation, eps, interpret)
         # The masks have no tangent space: float0's zero, as JAX takes it of them.
-        masks = (None if mask is None else np.zeros(mask.shape, jax.dtypes.float0)
+        masks = (None if mask is None else jax.custom_derivatives.zero_from_primal(mask)
                  for mask in (valid, documents))
         return dx, dw, db, *masks
 

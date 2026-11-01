@@ -149,6 +149,22 @@ def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_p
     assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain(then))
 
 
+def test_a_dense_quantized_after_its_plain_call_quantizes():
+    """A Dew Dense (`precision.accumulated`'s product, its trace kept a contraction's types) called plain,
+    then quantized directly at the same shapes (`qwix.quantize_model`, which intercepts JAX's product in
+    place): the quantized call quantizes, its output not the plain one's."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.dense import Dense
+
+    layer = Dense(8)
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
+    variables = layer.init(jax.random.key(0), x)
+    plain = np.asarray(jax.jit(layer.apply)(variables, x))
+    quantized = qwix.quantize_model(layer, qwix.QtProvider(
+        [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+    assert not np.array_equal(np.asarray(jax.jit(quantized.apply)(variables, x)), plain)
+
+
 def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight():
     """Dew keeps no copy of Qwix's calibration grammar: a spec with a method Qwix does not know builds,
     and the first forward that quantizes a matched weight raises, Qwix's own refusal."""

@@ -348,18 +348,20 @@ specified by .target is higher than default SM version assumed', and an sm80 ker
 assembled for sm90). Production compiles for one GPU a process; the gates compile for several."""
 
 
-def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
+def compile_mosaic_kernels(cases, generation: str, *, least: bool = False) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
     own reports printed (`_printed`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
-    or the error. In a process that compiled Mosaic kernels for another capability (`_BINARY_CAPABILITY`)
-    the calling test runs again in a process of its own, and these are its records there."""
+    or the error; with `least`, each kernel's least spill-free cap too (`register_need`, its `least`), a scan
+    of ptxas at each cap. In a process that compiled Mosaic kernels for another capability
+    (`_BINARY_CAPABILITY`) the calling test runs again in a process of its own, and these are its records
+    there."""
     wanted = capability(generation)
     if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and OWN_PROCESS not in os.environ:
         return compiled_apart()
     _BINARY_CAPABILITY[:] = _BINARY_CAPABILITY or [wanted]
-    found = _compiled_here(cases, generation)
+    found = _compiled_here(cases, generation, least=least)
     if OWN_PROCESS in os.environ:
         Path(os.environ[OWN_PROCESS]).write_text(json.dumps(found))
     return found
@@ -409,6 +411,18 @@ def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
 NEEDS: dict[str, int | dict | None] = {}
 """Each Mosaic GPU kernel's register need this process measured (`register_need`), by its module, as
 `COMPILED` keeps its compile: a later compile of the same module prints no PTX."""
+
+
+PTX: dict[str, str] = {}
+"""Each Mosaic GPU module's PTX this process printed, by its module, as `COMPILED` keeps its compile: a later
+compile of the same module prints none, and a least spill-free cap asked of it after (`_least`) reads this."""
+
+
+@functools.cache
+def _least(module: str | None, generation: str) -> int | None:
+    """The least spill-free cap of the kernel `module` names (`register_need`), from its PTX this process
+    printed (`PTX`); None where it printed none."""
+    return None if module not in PTX else register_need(PTX[module], generation)
 
 
 def needed(kernel: dict, needs: dict[str, int | dict | None]) -> dict:
@@ -573,7 +587,7 @@ def _needs(directory: str, generation: str,
     return found
 
 
-def _compiled_here(cases, generation: str) -> list[dict]:
+def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process, each kernel's register need beside its
     reports (`register_need`, from the PTX Mosaic prints)."""
     found: list[dict] = []
@@ -597,6 +611,13 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             needs = _needs(directory, generation, modelled)
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited(kernel, compiled), needs) for kernel in kernels]
+            printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
+            for kernel in record["kernels"]:
+                name = report.launch_name(kernel["kernel"], kernel["launch"])
+                if kernel["module"] is not None and name in printed:
+                    PTX[kernel["module"]] = printed[name]
+                if least:
+                    kernel["least"] = _least(kernel["module"], generation)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         record["evidence"] = _register_evidence(record)
         found.append(record)

@@ -353,3 +353,35 @@ def test_a_narrow_bias_beside_a_wide_product_sums_its_wide_cotangent_before_it_r
     (gradient,) = pull(cotangent)
     assert gradient.dtype == jnp.bfloat16 and float(gradient[0]) == 1 / 256
 
+
+def test_a_contraction_bound_to_any_arguments_sums_as_it_is_called():
+    """A float32 product's wide sum through each way a caller binds it (`accumulated`): dimension numbers
+    given as lists, as JAX takes them, sum as the same numbers given as tuples; a `functools.partial`
+    subclass that calls its product otherwise keeps its own call; a callable no hash holds sums as the
+    contraction it calls, its value and gradients each equal to the plain binding's."""
+    import dataclasses
+    import functools
+
+    lhs = jax.random.normal(jax.random.key(0), (6, 5))
+    rhs = jax.random.normal(jax.random.key(1), (5, 4))
+    numbers = (((1,), (0,)), ((), ()))
+    plain = functools.partial(jax.lax.dot_general, dimension_numbers=numbers)
+
+    class Doubled(functools.partial):
+        def __call__(self, *operands, **options):
+            return 2 * super().__call__(*operands, **options)
+
+    @dataclasses.dataclass
+    class Unhashed:
+        def __call__(self, *operands, **options):
+            return jax.lax.dot_general(*operands, numbers, **options)
+
+    def run(product):
+        return with_gradients(lambda a, b: accumulated(product, a, b))(lhs, rhs, jnp.ones((6, 4)))
+
+    expected = run(plain)
+    listed = functools.partial(jax.lax.dot_general, dimension_numbers=([[1], [0]], [[], []]))
+    for product, factor in ((listed, 1), (Unhashed(), 1), (Doubled(jax.lax.dot_general,
+                                                                    dimension_numbers=numbers), 2)):
+        for found, wanted in zip(jax.tree.leaves(run(product)), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(found), factor * np.asarray(wanted))
