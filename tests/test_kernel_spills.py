@@ -504,3 +504,17 @@ def test_a_program_within_another_takes_the_enclosing_programs_options():
         outer = owned_program(lambda x: inner(x) + 1.0)
         np.testing.assert_array_equal(np.asarray(outer(jnp.ones(3))), np.full(3, 3.0))
 
+def test_a_program_under_an_eager_transformation_compiles_under_its_own_options():
+    """A program called under an eager `jax.vmap` or `jax.grad`, which no enclosing program compiles,
+    compiles under its own options as a direct call does, so an option XLA does not know is refused
+    there too; within another program's trace it is that program's part and takes its options."""
+    with compiled_with({"xla_dew_no_such_option": True}):
+        unknown = owned_program(lambda x: x * 2.0)
+    rows = jnp.ones((2, 3))
+    for called in (lambda: unknown(rows), lambda: jax.vmap(unknown)(rows),
+                   lambda: jax.grad(lambda x: jnp.sum(unknown(x)))(rows)):
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            called()
+    enclosing = owned_program(lambda x: unknown(x) + 1.0)
+    np.testing.assert_array_equal(np.asarray(enclosing(rows)), np.full((2, 3), 3.0))
+
