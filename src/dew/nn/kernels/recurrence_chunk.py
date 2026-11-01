@@ -663,14 +663,18 @@ PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
                "Kimi Linear's delta attention, the template's intra pairs 0.65 ms against the port's intra "
                "rows' 0.65 and its keys' weighted launch 0.25 against the port's 0.17 "
                "(window-h100-c70aaa8-b8109ee)"),
+    ('wgmma', 'training, a decay a key dimension'): (
+        'fla', "on an H100 80GB HBM3, 16-bit, the port's forward and gradient 4.84 ms a call against the "
+               "template's 5.42 (its per-key fast backward, `key_backward`) on Kimi Linear's delta "
+               "attention, wall time over 50 calls (wall-window2-h100-e1f928585)"),
 }
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
 shrinks as the template wins its cells, and no cell is picked or ranked at run time. A gated delta net's
 cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06 ms against
-the port's 8.81 (JS-kdacells-a100-a928ea2b4); its training is the port's by the template's refusal (the fast
-backward takes no decay a key dimension), not a cell. A gated delta net's training is the template's, its
+the port's 8.81 (JS-kdacells-a100-a928ea2b4), and its training, 11.12 ms against 15.92
+(batch-window-a100-b2ad84c61). A gated delta net's training is the template's, its
 keys launch a key block a program and its query/key launch's memory sum a product: its forward and gradient
 on an H100 2.46 ms against the port's 3.12
 on Qwen3.5-27B's gated delta net and 1.92 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an
