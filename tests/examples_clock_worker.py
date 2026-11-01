@@ -29,7 +29,8 @@ def examples_clock(args) -> dict:
     there (`Pause`) and resumes it; `--cooldown` branches it to a cooldown from the step before the first
     share's stream ends to the step the last one's does, across the steps they end apart at; `--further`
     steps it through a rollout that draws a batch past each step's and steps the step's (`Rollout`'s
-    `draws_further`), the drawn batch's examples consumed with it. Reports the
+    `draws_further`), the drawn batch's examples consumed with it; `--refusing` refuses every fifth
+    record's rows after the objective makes them. Reports the
     step it ends at, the examples its state consumed, the examples each log read, each id's examples its
     steps trained on (each step's real rows by id over the rows each example makes, the objective's aux,
     which the pool's first process logs), each id's examples the pool's shares read apart (every share's
@@ -42,7 +43,7 @@ def examples_clock(args) -> dict:
     from dew.data import Memory
     from dew.data.compile import fitted
     from dew.data.dataset import Closeable, DataPartition
-    from dew.data.pipeline import ObjectiveData, Pipeline
+    from dew.data.pipeline import ObjectiveData, Pipeline, Rejected
     from dew.objectives.base import Aux, Objective
     from dew.optim import Linear, OptimConfig
     from dew.training import Checkpoints, Cooldowns, MeshSpec, Pause, Trainer
@@ -65,7 +66,15 @@ def examples_clock(args) -> dict:
                               for record in range(1, RECORDS + 1)})
 
         def data(self):
-            return ObjectiveData(train=(Questioned(),)) if expands else ObjectiveData()
+            refused = (FifthRefused(),) if args.refusing else ()
+            return ObjectiveData(train=(Questioned(), *refused)) if expands else ObjectiveData()
+
+    class FifthRefused:
+        identity = "fifth-refused@1"
+        rejects = True
+
+        def __call__(self, row):
+            return Rejected("fifth") if int(row["id"]) % 5 == 0 else row
 
     class DrawingFurther:
         draws_further = True
@@ -144,6 +153,7 @@ def main(argv=None) -> None:
     parser.add_argument("--pause", type=float, default=0.0)
     parser.add_argument("--cooldown", action="store_true")
     parser.add_argument("--further", action="store_true")
+    parser.add_argument("--refusing", action="store_true")
     serve_mode(MODES, parser.parse_args(argv))
 
 
