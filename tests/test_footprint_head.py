@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from affine_run import Features
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from token_support import token_rows
@@ -18,7 +19,7 @@ from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import compile_ahead, compile_only_gpus
 from dew.training.compiled_program import compiled
-from dew.training.footprint import Workspace, gradient_peak, leaf_local, peak_bytes
+from dew.training.footprint import Workspace, consumed_where_made, gradient_peak, leaf_local, peak_bytes
 
 TOKENS, VOCAB, WIDTH = 256, 4096, 64
 PRODUCT = TOKENS * VOCAB * 4
@@ -210,8 +211,48 @@ def test_a_gradient_is_consumed_where_it_is_made_only_by_an_update_that_reads_it
     params = {"first": jax.ShapeDtypeStruct((16, 64), jnp.float32),
               "second": jax.ShapeDtypeStruct((64, 16), jnp.float32)}
     adam, clipped = optax.adam(1e-3), optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-3))
-    assert leaf_local(adam.update, params, jax.eval_shape(adam.init, params), params)
-    assert not leaf_local(clipped.update, params, jax.eval_shape(clipped.init, params), params)
+    assert leaf_local(adam, params, jax.eval_shape(adam.init, params))
+    assert not leaf_local(clipped, params, jax.eval_shape(clipped.init, params))
+
+    def scaled(updates, state, params=None, *, progress=None, **extra):
+        assert progress is not None, "a schedule on a run's progress is handed it at each update"
+        return jax.tree.map(lambda update: update * progress, updates), state
+
+    # An update on the run's progress is handed it, as the step hands it (`Transaction.commit`).
+    clocked = optax.GradientTransformationExtraArgs(lambda params: optax.EmptyState(), scaled)
+    assert leaf_local(clocked, params, optax.EmptyState())
+
+
+def test_a_step_consumes_a_gradient_where_it_is_made_only_into_device_resident_state():
+    """A step whose optimizer state and EMA are in device memory updates each gradient where it is made;
+    one whose EMA is fetched from the host fetches it behind one barrier over every gradient
+    (`Transaction.past`), which holds them all (`consumed_where_made`)."""
+    def placed(layout):
+        trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout)
+        state, _, _ = trainer.place()
+        return trainer, state
+
+    for layout, consumed in ((Layout(min_shard=1, tolerance=1.0), True),
+                             (Layout(min_shard=1, tolerance=1.0, host=("ema",)), False)):
+        trainer, state = placed(layout)
+        assert consumed_where_made(trainer.optimizer, state, 1) is consumed
+
+
+def test_a_differentiated_checkpoint_keeps_its_operands_behind_its_barrier():
+    """A differentiated checkpoint that prevents CSE lowers its operands through an optimization barrier
+    (`_remat_lowering`, jax/_src/ad_checkpoint.py), which keeps them in a buffer the backward reads: the
+    logits a checkpointed square reads are held, where without the barrier they are recomputed."""
+    weights = jax.ShapeDtypeStruct((WIDTH, VOCAB), jnp.float32)
+
+    def squared(prevent_cse: bool):
+        def loss(weights, rows):
+            square = jax.checkpoint(lambda logits: jnp.sum(logits * logits), prevent_cse=prevent_cse)
+            return square(jnp.sin(rows @ weights)), ()
+        return loss
+
+    kept, free = (gradient_peak(squared(prevent), weights, (HIDDEN,), platform="gpu",
+                                workspace=Workspace(0, 0)).bytes for prevent in (True, False))
+    assert kept >= free + PRODUCT
 
 
 def test_a_whole_head_step_is_derived_at_most_what_xla_compiles_it_to(tmp_path, monkeypatch):
