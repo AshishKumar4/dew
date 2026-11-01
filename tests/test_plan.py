@@ -545,28 +545,29 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
 
 
-def test_a_run_that_ends_inside_its_profile_window_stops_its_capture_and_reports_what_it_traced(tmp_path):
-    """A run that ends before its window's steps have run stops the capture at its end, where a trace left
-    running would take the next one down with it, and reports the window over the steps it traced, its
-    reports written."""
+def test_a_run_that_stops_inside_its_profile_window_stops_its_capture_and_reports_what_it_traced(tmp_path):
+    """A run that stops before its window's steps have run (a pause at half its budget) stops the capture
+    at its end, where a trace left running would take the next one down with it, and reports the window
+    over every step it traced, the step it stopped at among them, its reports written."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     from affine_run import Replaying
     from recording import RecordingTracker
 
     from dew.data.dataset import Loader
-    from dew.training import ProfileWindow
+    from dew.training import Pause, ProfileWindow
     from dew.training.profiling import traced_steps
 
     tracker = RecordingTracker()
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=SEQ)
     trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
-                                 tracker=tracker, profile=ProfileWindow(str(tmp_path), steps=4, warmup=0)))
+                                 tracker=tracker, checkpoints=Checkpoints(str(tmp_path / "run")),
+                                 profile=ProfileWindow(str(tmp_path / "trace"), steps=4, warmup=0)))
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
-    # The window opens past the first step's compile: it holds the run's second and third steps.
-    trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=3, log_every=1)
+    # The window opens past the first step's compile and holds the second and third, where the run pauses.
+    trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1, stop=Pause(0.5))
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
-    (capture,) = tmp_path.glob("capture-*")
+    (capture,) = (tmp_path / "trace").glob("capture-*")
     assert window.steps == 2 and traced_steps(capture) == (1, 2)
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
 
