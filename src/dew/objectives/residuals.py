@@ -47,15 +47,15 @@ class Residuals(Objective[Ratio | NormalEquations | RowEquations]):
         # The update's examples, of which this microbatch's rows are a share (the trainer's geometry).
         update = rows if step.example_count is None else step.example_count
         held = jnp.asarray(rows, jnp.float32)
-        pulled = float32_einsum("rp,r->p", jacobian, residual)
         if size <= update * per_row:
+            pulled = float32_einsum("rp,r->p", jacobian, residual)
             normal = float32_einsum("rp,rq->pq", jacobian, jacobian)
             return NormalEquations(stats.total, stats.mass, held, pulled, normal, update)
         # Each row's residuals at its example's place among the update's.
         places = (step.examples(rows)[:, None] * per_row + jnp.arange(per_row)).reshape(-1)
         placed_jacobian = jnp.zeros((update * per_row, size), jacobian.dtype).at[places].set(jacobian)
         placed_residual = jnp.zeros((update * per_row,), residual.dtype).at[places].set(residual)
-        return RowEquations(stats.total, stats.mass, held, pulled, placed_jacobian, placed_residual, update)
+        return RowEquations(stats.total, stats.mass, held, placed_jacobian, placed_residual, update)
 
     def reduce_loss(self, stats: Ratio | NormalEquations | RowEquations) -> tuple[jax.Array, jax.Array]:
         """The mean squared residual, whatever system the statistics state beside it."""

@@ -11,6 +11,7 @@ A float64 run keeps float64 through its parameters, optimizer state, loss and ch
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, seeds_for
@@ -247,3 +248,14 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
             np.testing.assert_array_equal(left, np.asarray(right))
     finally:
         jax.config.update("jax_enable_x64", val=False)
+
+
+def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():
+    """A Gauss-Newton update inside `optax.MultiSteps`, which hands its inner update no extra arguments and
+    pools no system across the steps it holds, is refused as its step is traced, naming the accumulation
+    that pools the update's system (`Trainer(accumulation=k)`), never stepped by a system it lacks."""
+    held = optax.MultiSteps(gauss_newton(1e-3), every_k_schedule=2).gradient_transformation()
+    trainer = Trainer(LeastSquares(4), held, key=0, layout=LAYOUT)
+    batch = {"x": np.ones((4, 4), np.float32), "y": np.ones(4, np.float32)}
+    with pytest.raises(ValueError, match="Trainer\\(accumulation=k\\)"):
+        trainer.compile(trainer.initial_state(), batch)

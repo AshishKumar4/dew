@@ -53,14 +53,13 @@ class NormalEquations:
 
 @struct.dataclass
 class RowEquations:
-    """A microbatch's part of an update's dual Gauss-Newton system: `total`, `mass`, `rows`, `update` and
-    `pulled` as `NormalEquations` holds them, and its rows of the update's Jacobian and residuals at its
-    examples' places, zero at the rest (`jacobian`, `residual`), so the pooled ones are the update's."""
+    """A microbatch's part of an update's dual Gauss-Newton system: `total`, `mass`, `rows` and `update` as
+    `NormalEquations` holds them, and its rows of the update's Jacobian and residuals at its examples'
+    places, zero at the rest (`jacobian`, `residual`), so the pooled ones are the update's."""
 
     total: jax.Array
     mass: jax.Array
     rows: jax.Array
-    pulled: jax.Array
     jacobian: jax.Array
     residual: jax.Array
     update: int = struct.field(pytree_node=False)
@@ -100,13 +99,19 @@ def gauss_newton(damping: float) -> optax.GradientTransformationExtraArgs:
 
     def update_fn(updates, state, params=None, *, statistics=None, **extra_args):
         del params, extra_args
+        if statistics is None:
+            raise ValueError("a Gauss-Newton update was handed no statistics: a wrapper that hands its inner "
+                             "update no extra arguments (optax.MultiSteps) holds it, which pools no system "
+                             "across the steps it holds; accumulate with Trainer(accumulation=k), which "
+                             "pools the update's system whole")
         if not isinstance(statistics, NormalEquations | RowEquations):
             raise ValueError("a Gauss-Newton update solves its objective's system (NormalEquations or "
                              "RowEquations, dew.objectives.Step.equations), which this run's statistics are "
                              f"not ({type(statistics).__name__}): train a Residuals objective")
         flat, unravel = ravel_pytree(updates)
+        solved = jax.eval_shape(statistics.solved, damping)
         step = jax.lax.cond(statistics.rows >= statistics.update, statistics.solved,
-                            lambda _: jnp.zeros_like(statistics.pulled), damping)
+                            lambda _: jnp.zeros(solved.shape, solved.dtype), damping)
         return jax.tree.map(jnp.negative, unravel(step.astype(flat.dtype))), state
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
