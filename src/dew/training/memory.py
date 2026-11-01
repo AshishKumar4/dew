@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
-from dew._records import JSON, integers, json_value
+from dew._records import JSON, integer, integers, json_value
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
@@ -365,16 +365,39 @@ def local_devices(mesh: Mesh) -> list:
 def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> None:
     """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's,
     with the check that said it fits (`fitted`, `memory_record`) and what `mesh`'s devices of this
-    process hold now."""
+    process hold now, each GPU's bytes free outside XLA's pool (`outside_pool`) among it. A first run
+    that succeeds logs what it took outside the pool on each GPU: its collectives' communicators
+    (NCCL) take their buffers there as it first runs them."""
+    devices = local_devices(mesh)
     try:
         loss.block_until_ready()
     except jax.errors.JaxRuntimeError as error:
-        now = [{"id": device.id, **{key: value for key, value in (device.memory_stats() or {}).items()
-                                    if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
-               for device in local_devices(mesh)]
+        now = [{"id": device.id, "outside": outside_pool(device),
+                **{key: value for key, value in (device.memory_stats() or {}).items()
+                   if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+               for device in devices]
         raise RuntimeError(
             f"the training step compiled for step {step} failed on its first run. It was checked to "
-            f"fit: {json.dumps(fitted)}; the devices now hold {json.dumps(now)}") from error
+            f"fit: {json.dumps(fitted)}; the devices now hold {json.dumps(now)}. 'outside' is a GPU's "
+            "bytes free outside XLA's pool, whose limit is its bytes_limit (XLA_PYTHON_CLIENT_MEM_FRACTION "
+            "of the GPU): a collective's communicators (NCCL) take their buffers there, beside cuBLAS's "
+            "workspaces and the kernels loaded, and a lower fraction leaves them more") from error
+    listed = fitted.get("devices") if isinstance(fitted, dict) else None
+    checked = {integer(device["id"], "id"): outside for device in (listed if isinstance(listed, list) else ())
+               if isinstance(device, dict) and isinstance(outside := device.get("outside"), int)}
+    taken = {device.id: checked[device.id] - free for device in devices
+             if device.id in checked and (free := outside_pool(device)) is not None}
+    if taken:
+        _log.info("the step's first run took %s bytes outside XLA's pool on its GPUs, its collectives' "
+                  "communicators among them", taken)
+
+
+def outside_pool(device) -> int | None:
+    """The bytes free on a GPU of this process outside XLA's pool, as its CUDA driver reports them
+    (`gpu_free_bytes`), every process's allocations counted; None for any other device."""
+    if device.platform != 'gpu' or device not in jax.local_devices():
+        return None
+    return gpu_free_bytes(device.local_hardware_id)
 
 
 def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int, *, fits: bool) -> JSON:
@@ -392,6 +415,7 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
         reported: dict[str, JSON] = {key: int(memory[key]) for key in MEMORY_STATS if key in memory}
         devices_stats.append({"id": int(device.id), **reported,
                               "unclaimed": None if not memory else unclaimed(device, memory),
+                              "outside": outside_pool(device),
                               "strands": bool(memory) and strands_temporaries(device.platform, memory)})
     record: dict[str, JSON] = {"analysis": analysis, "held": int(held), "devices": devices_stats,
                                "fits": fits}

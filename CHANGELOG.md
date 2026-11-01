@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A step that fails on its first run names each GPU's bytes free outside XLA's pool, where its
+  collectives' NCCL communicators take their buffers, as the fit check read them and after the failure,
+  and a first run that succeeds logs what it took there.
 - A token export's documents are the records its producer wrote, by its length index, not its tokens'
   EOS: an EOS a document's own text spells splits nothing, an export without an EOS packs, an empty
   record is no document, and no `train.documents.npy` is written or read. A plan saved before resumes
