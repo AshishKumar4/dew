@@ -778,24 +778,39 @@ class Questioned:
                      for question in range(int(element["id"]) % 3 + 1))
 
 
+class ThirdQuestionRefused:
+    """An objective's step after `Questioned` that refuses each record's third question's row."""
+
+    identity = "third-question-refused@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("third question") if int(row["question"]) == 2 else row
+
+
+@pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read):
-    """A training read bounded to its 12 records, in one order or each share its own, through an
-    objective's step that makes 24 rows of them (`Questioned`): the corpus's rows (data/rows) are its 12
-    source examples, counted before the step makes rows of them, and not its rows again after (row 1944)."""
+def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read, workers):
+    """A training read bounded to its 12 records, in one order or each share its own, read alone or by
+    loading workers, through an objective's step that makes 24 rows of them (`Questioned`) and one that
+    refuses 4 of those (`ThirdQuestionRefused`): the corpus's rows (data/rows) are its 12 source
+    examples, counted before the step makes rows of them, and not the 20 rows it delivers again after,
+    and its rejections are the rows refused after it (row 1944)."""
     ids = np.arange(1, 13, dtype=np.int32)
     chain = Memory({"id": ids}, shard_rows=4).named("asked")
     chain = chain.shuffle(seed=3, window=12) if read == "streamed" else chain.shuffle(seed=3)
-    data = compile(chain.batch(2), objective=ObjectiveData(train=(Questioned(),)), read=read, loading=READ,
-                   examples=12)
+    loading = dataclasses.replace(READ, workers=workers)
+    data = compile(chain.batch(2), objective=ObjectiveData(train=(Questioned(), ThirdQuestionRefused())),
+                   read=read, loading=loading, examples=12)
     stream = data.train(DataPartition())
     try:
         rows = sum(len(batch["id"]) for batch in stream)
         counts = data.statistics()
     finally:
         stream.close()
-    assert rows == sum(int(record) % 3 + 1 for record in ids) == 24
+    assert rows == sum(int(record) % 3 + 1 for record in ids) - 4 == 20
     assert counts["data/rows/asked"] == 12
+    assert counts["data/rejected/asked/third question"] == 4
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
