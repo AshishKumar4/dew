@@ -52,7 +52,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from collections.abc import Iterator
-from functools import partial
 from typing import Protocol
 
 import jax
@@ -764,14 +763,19 @@ class FlightEnv:
         if not self.views or not set(self.views) <= set(VIEWS[1:]):
             raise ValueError(f"a flight env shows some of the privileged views {VIEWS[1:]}, not {self.views}")
 
-    def _observed(self, race: Race) -> dict[str, jax.Array]:
+    def observed(self, race: Race) -> dict[str, jax.Array]:
+        """The privileged views of `race` asked for (`privileged`)."""
         shown = privileged(self.racing, race)
         return {view: shown[view] for view in self.views}
+
+    def scene(self, race: Race) -> Scene:
+        """What a renderer draws of `race` (`_scene`)."""
+        return _scene(self.racing, race)
 
     def reset(self, key: jax.Array) -> tuple[Race, TimeStep]:
         race = started(self.racing, key, jnp.asarray(self.difficulty), jnp.asarray(self.ramp))
         zero = jnp.zeros((), bool)
-        return race, TimeStep(self._observed(race), jnp.zeros(()), zero, zero)
+        return race, TimeStep(self.observed(race), jnp.zeros(()), zero, zero)
 
     def flown(self, race: Race, action: jax.Array) -> tuple[Race, jax.Array]:
         """The race after the drone flies a control step under `action`, and its path through it."""
@@ -784,7 +788,7 @@ class FlightEnv:
     def step(self, race: Race, action: jax.Array) -> tuple[Race, TimeStep]:
         race, path = self.flown(race, action)
         race, reward, terminated, truncated = raced(self.racing, race, action, path)
-        return race, TimeStep(self._observed(race), reward, terminated, truncated)
+        return race, TimeStep(self.observed(race), reward, terminated, truncated)
 
 
 @struct.dataclass
@@ -820,7 +824,7 @@ class Renderer(Protocol):
     def render(self, scene: Scene, cameras: jax.Array, opened: jax.Array) -> Handed: ...
 
 
-def cameras(race: Race, aspect: float, before: float = 0.0) -> jax.Array:
+def cameras(race: Viewed, aspect: float, before: float = 0.0) -> jax.Array:
     """A drone's camera `[12]` as HyperLux takes it (`set_cameras`: the position, the ray to the image's first
     pixel's corner and the rays across a pixel row and down a column), its mount tilted up by the camera's
     uptilt and turned by its mount's roll and yaw, its field of view the camera's: HyperDrone's
@@ -851,16 +855,89 @@ def developed(image: jax.Array, camera: Camera, key: jax.Array) -> jax.Array:
     return jnp.round(jnp.clip(light, 0.0, 1.0) * 255).astype(jnp.uint8)
 
 
-class GateRace:
-    """A batch of `renderer.count` drones racing `racing`'s courses (`FlightEnv`, stepped on device) and seen
-    through `renderer`'s cameras, as a `dew.rl.simulator.Simulator`: actions `[B, 4]` in [-1, 1];
-    observations a dict of the `views` asked for (`VIEWS`), each `[B, ...]`. An episode restarts on a course
-    drawn afresh at the race's curriculum, `difficulty` and `ramp`, which a race starts at and which may
-    change between steps."""
+class Viewed(Protocol):
+    """A drone's state a camera sees from (`cameras`): its `camera` and its `flight`."""
 
-    action_size = 4
+    @property
+    def camera(self) -> Camera: ...
+
+    @property
+    def flight(self) -> Flight: ...
+
+
+class Seen:
+    """A batch of `count` drones of a JAX environment `env` (stepped on device), seen through `renderer`'s
+    cameras, as a `dew.rl.simulator.Simulator`: actions `[B, A]`; observations a dict of the `views` asked
+    for, each `[B, ...]`, `image` the renderer's and the rest `env`'s. `env` steps one drone (`reset`,
+    `step`) and shows its views (`observed`, its states `Viewed`) and its scene (`scene`)."""
+
     _key: jax.Array
-    _races: Race
+    _states: Viewed
+
+    def __init__(self, renderer: Renderer | None, env, views: tuple[str, ...], count: int):
+        if renderer is None and "image" in views:
+            raise ValueError("a race without a renderer shows no image")
+        self.renderer, self.views, self.count = renderer, views, count
+        self.action_size = env.action_size
+        self._env = env
+        self._started = OuterProgram(lambda env, key: jax.vmap(env.reset)(jax.random.split(key, self.count)))
+        self._stepped = OuterProgram(lambda env, states, action: jax.vmap(env.step)(states, action))
+        aspect = 1.0 if renderer is None else renderer.aspect
+        self._shown = OuterProgram(jax.vmap(lambda state, image, key: developed(image, state.camera, key)))
+        self._observe = OuterProgram(lambda env, states: jax.vmap(env.observed)(states))
+        self._scene = OuterProgram(lambda env, states: jax.vmap(env.scene)(states))
+        self._cameras = OuterProgram(jax.vmap(lambda state: (cameras(state, aspect),
+                                                        cameras(state, aspect, state.camera.shutter))))
+
+    def _env_now(self):
+        """The environment the next episodes and steps run in."""
+        return self._env
+
+    def _observed(self, observation: dict[str, jax.Array]) -> dict[str, jax.Array]:
+        shown = dict(observation)
+        if "image" in self.views:
+            renderer = self.renderer
+            if renderer is None:
+                raise ValueError("a race without a renderer shows no image")
+            closed, opened = self._cameras(self._states)
+            image = received(renderer.render(self._scene(self._env_now(), self._states), closed, opened))
+            self._key, key = jax.random.split(self._key)
+            shown["image"] = self._shown(self._states, image, jax.random.split(key, self.count))
+        return {view: shown[view] for view in self.views}
+
+    def reset(self, seed: int) -> dict[str, jax.Array]:
+        self._key, key = jax.random.split(jax.random.key(seed))
+        self._states, step = self._started(self._env_now(), key)
+        return self._observed(step.observation)
+
+    def restart(self, mask: jax.Array) -> dict[str, jax.Array]:
+        mask = jnp.asarray(mask, bool)
+        self._key, key = jax.random.split(self._key)
+        fresh, _ = self._started(self._env_now(), key)
+        self._states = chosen(mask, fresh, self._states)
+        return self._observed(self._observe(self._env_now(), self._states))
+
+    def step(self, action: jax.Array) -> TimeStep:
+        self._states, step = self._stepped(self._env_now(), self._states, jnp.asarray(action))
+        return TimeStep(self._observed(step.observation), step.reward, step.terminated, step.truncated)
+
+    @contextlib.contextmanager
+    def branch(self) -> Iterator[None]:
+        """A cooldown branch's steps (`dew.rl.simulator.branched`), after which every drone's state and the
+        key its images' noise is drawn from stand as the run left them: no step donates them, so keeping
+        them keeps them."""
+        kept = self._states, self._key
+        try:
+            yield
+        finally:
+            self._states, self._key = kept
+
+
+class GateRace(Seen):
+    """A batch of `renderer.count` drones racing `racing`'s courses (`FlightEnv`, stepped on device) and seen
+    through `renderer`'s cameras (`Seen`): actions `[B, 4]` in [-1, 1]; observations a dict of the `views`
+    asked for (`VIEWS`), each `[B, ...]`. An episode restarts on a course drawn afresh at the race's
+    curriculum, `difficulty` and `ramp`, which a race starts at and which may change between steps."""
 
     def __init__(self, renderer: Renderer | None, racing: Racing | None = None,
                  views: tuple[str, ...] = VIEWS, count: int | None = None, difficulty: float = 1.0,
@@ -874,62 +951,13 @@ class GateRace:
             raise ValueError(f"the renderer draws gates of opening, frame and depth {tuple(renderer.gate)}, "
                              f"the race's are {(racing.opening, racing.frame, racing.depth)}: its drones "
                              "would see gates they do not fly through")
-        self.renderer, self.racing, self.views = renderer, racing, views
-        self.count = renderer.count if renderer is not None else int(count or 0)
-        self.difficulty, self.ramp = difficulty, ramp
+        self.racing, self.difficulty, self.ramp = racing, difficulty, ramp
         shown = tuple(view for view in views if view != "image")
-        env = FlightEnv(racing, shown if shown else ("passed",))
-        self._env = env
-        self._started = OuterProgram(lambda env, key: jax.vmap(env.reset)(jax.random.split(key, self.count)))
-        self._stepped = OuterProgram(lambda env, races, action: jax.vmap(env.step)(races, action))
-        aspect = 1.0 if renderer is None else renderer.aspect
-        self._shown = OuterProgram(jax.vmap(lambda race, image, key: developed(image, race.camera, key)))
-        self._observe = OuterProgram(jax.vmap(env._observed))
-        self._scene = OuterProgram(jax.vmap(partial(_scene, racing)))
-        self._cameras = OuterProgram(jax.vmap(lambda race: (cameras(race, aspect),
-                                                       cameras(race, aspect, race.camera.shutter))))
+        count = renderer.count if renderer is not None else int(count or 0)
+        super().__init__(renderer, FlightEnv(racing, shown if shown else ("passed",)), views, count)
 
     def _env_now(self) -> FlightEnv:
         return dataclasses.replace(self._env, difficulty=float(self.difficulty), ramp=float(self.ramp))
-
-    def _observed(self, observation: dict[str, jax.Array]) -> dict[str, jax.Array]:
-        shown = dict(observation)
-        if "image" in self.views:
-            renderer = self.renderer
-            if renderer is None:
-                raise ValueError("a gate race without a renderer shows no image")
-            closed, opened = self._cameras(self._races)
-            image = received(renderer.render(self._scene(self._races), closed, opened))
-            self._key, key = jax.random.split(self._key)
-            shown["image"] = self._shown(self._races, image, jax.random.split(key, self.count))
-        return {view: shown[view] for view in self.views}
-
-    def reset(self, seed: int) -> dict[str, jax.Array]:
-        self._key, key = jax.random.split(jax.random.key(seed))
-        self._races, step = self._started(self._env_now(), key)
-        return self._observed(step.observation)
-
-    def restart(self, mask: jax.Array) -> dict[str, jax.Array]:
-        mask = jnp.asarray(mask, bool)
-        self._key, key = jax.random.split(self._key)
-        fresh, _ = self._started(self._env_now(), key)
-        self._races = chosen(mask, fresh, self._races)
-        return self._observed(self._observe(self._races))
-
-    def step(self, action: jax.Array) -> TimeStep:
-        self._races, step = self._stepped(self._env_now(), self._races, jnp.asarray(action))
-        return TimeStep(self._observed(step.observation), step.reward, step.terminated, step.truncated)
-
-    @contextlib.contextmanager
-    def branch(self) -> Iterator[None]:
-        """A cooldown branch's steps (`dew.rl.simulator.branched`), after which every race and the key its
-        images' noise is drawn from stand as the run left them: no step donates them, so keeping them
-        keeps them."""
-        kept = self._races, self._key
-        try:
-            yield
-        finally:
-            self._races, self._key = kept
 
 
 def _scene(racing: Racing, race: Race) -> Scene:
@@ -939,8 +967,8 @@ def _scene(racing: Racing, race: Race) -> Scene:
     return Scene(course.center, course.facing, course.count, lit, course.obstacles, race.camera.look)
 
 
-__all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER",
-           "VIEWS", "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene",
-           "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
-           "drawn_course", "facings", "looking", "mounted", "nearest", "physics", "privileged",
-           "quaternion", "raced", "started", "struck"]
+__all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER", "VIEWS",
+           "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene", "Seen",
+           "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
+           "drawn_course", "facings", "looking", "mounted", "nearest", "physics", "privileged", "quaternion",
+           "raced", "started", "struck"]

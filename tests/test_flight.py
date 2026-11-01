@@ -705,10 +705,10 @@ def test_a_race_restarts_only_the_drones_it_is_told_to():
     race = GateRace(None, Racing(), views=("state", "passed"), count=16)
     race.reset(0)
     race.step(jnp.zeros((16, 4)))
-    before = race._races
+    before = race._states
     mask = np.arange(16) % 2 == 0
     race.restart(jnp.asarray(mask))
-    after = race._races
+    after = race._states
     np.testing.assert_array_equal(np.asarray(after.steps), np.where(mask, 0, np.asarray(before.steps)))
     kept, held = np.asarray(after.course.center), np.asarray(before.course.center)
     np.testing.assert_array_equal(kept[~mask], held[~mask])

@@ -320,14 +320,15 @@ class WorldModel(nn.Module):
         hidden, out = self.auxiliary_heads[name]
         return out(hidden(feature)).astype(jnp.float32)
 
-    def embed(self, observation: jax.Array | dict[str, jax.Array]) -> jax.Array:
+    def embed(self, observation: Observation) -> jax.Array:
         """The encoder's tokens of an observation (`seen`): a vector's symlogged first (rssm.py:218), an
         image's pixels through the convolutions, its proprioceptive entries symlogged through an MLP and
         joined to them."""
-        if isinstance(observation, dict):
-            return jnp.concatenate([self.encoder(observation["image"]),
-                                    self.proprio_encoder(symlog(observation["proprio"]))], -1)
-        return self.encoder(symlog(observation) if self.image is None else observation)
+        if isinstance(observation, Mapping):
+            image, proprio = view(observation, "image"), view(observation, "proprio")
+            return jnp.concatenate([self.encoder(image), self.proprio_encoder(symlog(proprio))], -1)
+        read = view(observation)
+        return self.encoder(symlog(read) if self.image is None else read)
 
     def core(self, deter: jax.Array, stoch: jax.Array, action: jax.Array) -> jax.Array:
         """The block GRU's next deterministic state (rssm.py:135-158)."""
@@ -381,8 +382,8 @@ class WorldModel(nn.Module):
         """The decoder's squared error, summed over the observation: against a vector's symlog, or an
         image's pixels over 255 (rssm.py:345-355, outs.MSE summed over the image's axes); the
         proprioceptive entries are the auxiliary heads' to decode."""
-        if isinstance(observation, dict):
-            observation = observation["image"]
+        if isinstance(observation, Mapping):
+            observation = view(observation, "image")
         decoded = self.decode(deter, stoch).astype(jnp.float32)
         if self.image is None:
             return jnp.sum(jnp.square(decoded - symlog(observation)), -1)
