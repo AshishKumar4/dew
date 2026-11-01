@@ -130,8 +130,8 @@ def teacher_run(out: Path, *, hz: float, level: float, drones: int = 4096) -> En
                                                   "clip": 0.2, "entropy_cost": 1e-4, "reads": ["teacher"]}),
         rollout=RolloutConfig("control", rollout), optim=OptimConfig(optimizer="adam", learning_rate=3e-4,
                                                                      clip_grads=1.0),
-        trainer=TrainerConfig(checkpoint_dir=str(out), steps=every, log_every=every, keep=Keep(latest=1,
-                                                                                               every=every)))
+        trainer=TrainerConfig(checkpoint_dir=str(out), steps=every, log_every=every, eval_every=None,
+                              checkpoint_every=None, keep=Keep(latest=1, every=every)))
 
 
 def warmed(path: Path, objective):
@@ -407,7 +407,7 @@ class World:
             teacher=TeacherConfig(str(self.teacher), self.teacher_step, demonstrates=True),
             optim=OptimConfig(optimizer="laprop", learning_rate=rate),
             trainer=TrainerConfig(checkpoint_dir=str(self.out), key=STAGES.index(stage), log_every=1000,
-                                  checkpoint_every=self.saved_every, keep=Keep(latest=1)))
+                                  eval_every=None, checkpoint_every=self.saved_every, keep=Keep(latest=1)))
         if stage != STAGES[0]:
             return dataclasses.replace(run, pretrained=str(self.out / STAGES[STAGES.index(stage) - 1]))
         dynamics = {"action_size": 4, "stoch": 32, "classes": 32, "width": 512, "layers": 4, "heads": 8,
