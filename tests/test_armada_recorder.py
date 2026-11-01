@@ -638,16 +638,17 @@ def test_a_run_that_rewrites_its_own_input_keeps_no_key(ci, tmp_path, monkeypatc
 def test_a_run_that_rewrites_what_a_link_it_read_names_keeps_no_key(ci, tmp_path, monkeypatch, cache_worker):
     """A run that rewrites, through a link it read, the file the link names keeps no key, as its key reads the
     link's target (review: the link's own change time stands, so the rewrite went unseen and a later checkout
-    holding the rewrite reused the run). A run that only reads through the link keeps its key."""
-    (tmp_path / "tests/fixtures").mkdir(parents=True)
-    (tmp_path / "tests/fixtures/value.txt").write_text("good")
-    (tmp_path / "tests/fixtures/current.txt").symlink_to("value.txt")
+    holding the rewrite reused the run). A run that only reads through the link keeps its key. The pages sit
+    under docs/, which no watch of tests/ or src/ follows to the link's target."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/value.md").write_text("good")
+    (tmp_path / "docs/current.md").symlink_to("value.md")
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_rewrites.py": "from pathlib import Path\ndef test_rewrites():\n"
-                            "    found = Path('tests/fixtures/current.txt')\n    read = found.read_text()\n"
+                            "    found = Path('docs/current.md')\n    read = found.read_text()\n"
                             "    found.write_text('bad')\n    assert read == 'good'\n",
         "test_reads.py": "from pathlib import Path\ndef test_reads():\n"
-                         "    assert Path('tests/fixtures/current.txt').read_text()\n"}, {})
+                         "    assert Path('docs/current.md').read_text()\n"}, {})
     assert reused() == [False, True]
 
 
