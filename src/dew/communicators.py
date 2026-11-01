@@ -30,6 +30,7 @@ before it to the room left (`admit`), so a program that would fail to connect is
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import hashlib
 import itertools
@@ -40,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
@@ -332,10 +334,21 @@ class Resident:
     def __init__(self) -> None:
         self.held = Collectives()
         self.loaded: dict[bytes, Loaded] = {}
+        self.owners: collections.Counter[bytes] = collections.Counter()
         self.lock = threading.Lock()
 
+    def release(self, fingerprint: bytes) -> None:
+        """One executable of `fingerprint` released: its code leaves its GPUs once no executable holds it, as
+        XLA unloads a module none holds, while the communicators it made stay made."""
+        with self.lock:
+            self.owners[fingerprint] -= 1
+            if self.owners[fingerprint] <= 0:
+                del self.owners[fingerprint]
+                self.loaded.pop(fingerprint, None)
+
     def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
-              free: Callable[[int], int | None], loaded: Loaded | None = None) -> None:
+              free: Callable[[int], int | None], loaded: Loaded | None = None, owner: object | None = None
+              ) -> None:
         """Admit a compiled program's communicators (`made`), refusing it, naming the bytes, before it runs,
         where they and the process's earlier ones, each counted once, with the runtime's need more than the
         room Dew left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it), or where those it
@@ -346,7 +359,7 @@ class Resident:
         tell an earlier program not yet run from one that ran: the room holds every program's together,
         and what is free now refuses a program whose own communicators cannot fit even beside the earlier
         ones all made. A program's code (`loaded`) is held beside them the same way, each executable's
-        once."""
+        once, for as long as an executable that holds it (`owner`) lives (`release`)."""
         with self.lock:
             held = self.held | made
             new = loaded is not None and loaded.fingerprint not in self.loaded
@@ -369,6 +382,9 @@ class Resident:
                                        f"pool; lower {fraction_name()} by the shortfall over the GPU's bytes",
                                        needed, {gpu: min(room[gpu], now.get(gpu, room[gpu])) for gpu in room})
             self.held, self.loaded = held, programs
+            if loaded is not None and owner is not None:
+                self.owners[loaded.fingerprint] += 1
+                weakref.finalize(owner, self.release, loaded.fingerprint)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -468,17 +484,21 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...], text: Callable[[
 
 
 def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = gpu_free_bytes) -> None:
-    """Admit a compiled or loaded program's communicators and code against the room the process's sizing
-    left them and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit
-    before it runs; a process that holds no sizing admits every program, and a program compiled for devices
-    this process has not (`dew.training.ahead.compile_only_gpus`) is never loaded here, so it takes none of
-    this host's room. Every program Dew compiles passes here (`dew.nn.kernels.templates.report`), the RL
-    rollouts' among them (`dew.nn.kernels.options.OuterProgram`), and every executable it loads compiled
-    ahead (`dew.training.ahead`)."""
+    """Admit a compiled or loaded program's communicators and code against the room the process's sizing left
+    them and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit before it
+    runs; a process that holds no sizing admits every program, and a program compiled for devices this process
+    has not (`dew.training.ahead.compile_only_gpus`) is never loaded here, so it takes none of this host's
+    room, as does a program on the host's CPU. Every program Dew compiles passes here
+    (`dew.nn.kernels.templates.report`), the RL rollouts' among them (`dew.nn.kernels.options.OuterProgram`),
+    and every executable it loads compiled ahead (`dew.training.ahead`)."""
     runtime = executable.runtime_executable()
     if _HELD is None or runtime is None or not isinstance(runtime, LoadedExecutable):
         return
-    gpus = assigned(runtime.local_devices())
+    devices = runtime.local_devices()
+    if not devices or any(device.platform != "gpu" for device in devices):
+        # A program on the host's CPU makes no NCCL communicator and holds no GPU code.
+        return
+    gpus = assigned(devices)
     fingerprint = runtime.fingerprint
     if not isinstance(fingerprint, bytes):
         made = collectives_of(executable.as_text() or "", gpus)
@@ -487,7 +507,7 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
         made = collectives_kept(fingerprint, gpus, lambda: executable.as_text() or "")
         memory = executable.memory_analysis()
         loaded = Loaded(fingerprint, gpus, int(getattr(memory, "generated_code_size_in_bytes", 0) or 0))
-    _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded)
+    _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded, owner=executable)
 
 
 type Run = tuple[int, int, Mapping[int, int]]

@@ -4,6 +4,7 @@ full speed, the run's share its upper bound, and a compiled program whose commun
 Dew left them refused before it runs, never left to stall in a collective. The measurement itself needs two
 GPUs, which a two-GPU run of the check makes; here it is the child's report, as the parent reads it."""
 
+import gc
 import hashlib
 import itertools
 import json
@@ -180,6 +181,28 @@ def test_a_programs_code_is_held_beside_the_communicators_once():
     assert refused.value.needed == dict.fromkeys(range(4), 2 * GIB + GIB // 2 + GIB // 4 + GIB // 2)
 
 
+def test_a_released_executables_code_is_room_again():
+    """An executable's code leaves its GPUs once the executable is released (XLA unloads a module no
+    executable holds), while the communicators it made stay: a program refused beside a held executable's
+    code is admitted once that executable is gone."""
+    room = dict.fromkeys(range(4), 3 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    resident = communicators.Resident()
+
+    class Executable:
+        """An executable's stand-in, whose release the admission observes."""
+
+    held = Executable()
+    resident.admit(every, FOUR, room, lambda gpu: None, communicators.Loaded(b"step", (0, 1, 2, 3), GIB // 2),
+                   owner=held)
+    other = communicators.Loaded(b"other", (0, 1, 2, 3), GIB // 2)
+    with pytest.raises(CommunicatorRoom):
+        resident.admit(every, FOUR, room, lambda gpu: None, other, owner=Executable())
+    del held
+    gc.collect()
+    resident.admit(every, FOUR, room, lambda gpu: None, other, owner=Executable())
+
+
 def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeypatch):
     """A program's communicators are read from its text once per executable, kept in Dew's cache by its
     fingerprint as positions in its device assignment, so a warm start that loads it from the compilation
@@ -230,7 +253,7 @@ ADMITTED = """
 import jax, jax.numpy as jnp, numpy as np
 from jax.sharding import Mesh, PartitionSpec
 from dew import communicators
-from dew.communicators import CommunicatorRoom, Needs, Sizing
+from dew.communicators import Needs, Sizing
 from dew.nn.kernels import options
 
 mesh = Mesh(np.array(jax.devices()[:2]), ("pair",))
@@ -241,24 +264,21 @@ options.program(summed).compiled(jnp.ones(4))
 tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, connections={}, runtime=dict.fromkeys(ids, 0),
               seconds=1.0)
 communicators.hold(Sizing(tight, 0.95, 0.9, dict.fromkeys(ids, 2**30), dict.fromkeys(ids, 2**29)))
-try:
-    options.program(summed).compiled(jnp.ones(4))
-except CommunicatorRoom as refused:
-    print(sorted(refused.needed.values()))
+options.program(summed).compiled(jnp.ones(4))
+print("compiled")
 """
 """A fresh process of two CPU devices compiling one all-reduce through `options.program`, then holding a
-sizing that left too little room for its communicator and compiling it again."""
+sizing that left too little room for its communicator over two GPUs and compiling it again."""
 
 
-def test_every_program_dew_compiles_is_admitted_where_it_sized_the_pool():
-    """A program compiled through Dew's one compile point (`dew.nn.kernels.templates.report.compiled`, which
-    every outer program, step and evaluation passes) is admitted against the room the process's sizing left,
-    refused before it runs where its communicator needs more, naming the bytes; a process that holds no
-    sizing admits every program."""
+def test_a_cpu_program_takes_none_of_the_gpus_room():
+    """A program loaded on CPU devices makes no NCCL communicator and holds no GPU code, so a process whose
+    sizing leaves its GPUs too little room for the same all-reduce over two of them compiles it on two CPU
+    devices, admitted against nothing."""
     done = subprocess.run([sys.executable, "-c", ADMITTED], capture_output=True, text=True, check=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE),
                                "XLA_FLAGS": "--xla_force_host_platform_device_count=2"})
-    assert json.loads(done.stdout.strip().splitlines()[-1]) == [GIB, GIB]
+    assert done.stdout.strip().splitlines()[-1] == "compiled"
 
 
 AHEAD = """
