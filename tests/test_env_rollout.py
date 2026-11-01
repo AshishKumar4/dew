@@ -366,3 +366,58 @@ def test_a_driven_simulator_records_what_a_driven_env_records():
     jax.tree.map(np.testing.assert_array_equal, (simulated.observation, simulated.action),
                  (expected.observation, expected.action))
     assert np.asarray(expected.observation["first"])[1:].any()
+
+
+def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_stopped(tmp_path):
+    """A PPO run on walks, checkpointed every update, resumed from its third update's checkpoint by a fresh
+    rollout over fresh environments: the checkpoint holds the rollout's walks mid episode, the collection it
+    serves and its minibatches' order (`ControlRollout.saved`), so the resumed run's last state is the
+    uninterrupted run's, every leaf bit for bit, the key's as its raw bits; a run whose checkpoints were
+    written without the rollout's state resumes to another state, its walks begun again."""
+    import shutil
+
+    from dew.checkpoints import Checkpoints, Keep
+    from dew.data.dataset import Loader, replayed
+    from dew.training import Trainer
+
+    def walks():
+        return Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16)
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+
+    def trained(directory, steps, rollout):
+        trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
+                          checkpoints=Checkpoints(str(directory), keep=Keep(latest=8)))
+        return trainer.fit(data, steps=steps, log_every=1, checkpoint_every=1)
+
+    def resumed(directory, rollout):
+        copied = tmp_path / f"{directory.name}-resumed"
+        shutil.copytree(directory, copied)
+        for later in (4, 5, 6):
+            shutil.rmtree(Checkpoints(str(copied)).path(later))
+        return trained(copied, 6, rollout)
+
+    def bits(state):
+        return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                           else leaf) for leaf in jax.tree.leaves(state)]
+
+    whole = trained(tmp_path / "whole", 6, ControlRollout(objective, walks(), unroll_length=8, epochs=2,
+                                                            minibatches=2))
+    again = resumed(tmp_path / "whole", ControlRollout(objective, walks(), unroll_length=8, epochs=2,
+                                                       minibatches=2))
+    for one, other in zip(bits(whole), bits(again), strict=True):
+        np.testing.assert_array_equal(one, other)
+
+    class Forgetting(ControlRollout):
+        """The rollout saving nothing of what it carries, as one did before checkpoints held it."""
+
+        def saved(self):
+            return None
+
+    forgot = Forgetting(objective, walks(), unroll_length=8, epochs=2, minibatches=2)
+    trained(tmp_path / "forgot", 6, forgot)
+    afresh = resumed(tmp_path / "forgot", Forgetting(objective, walks(), unroll_length=8, epochs=2,
+                                                     minibatches=2))
+    assert not all(np.array_equal(one, other) for one, other in zip(bits(whole), bits(afresh), strict=True))

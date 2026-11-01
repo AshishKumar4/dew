@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import logging
 import math
 import time
 import types
@@ -55,8 +56,11 @@ from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture
+from dew.training.rollout import Rollout
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
+
+_log = logging.getLogger(__name__)
 
 
 def validation_suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
@@ -954,3 +958,45 @@ class Start:
     through: dict[int, int]
     resume: int | None
     shardings: Placement[TrainState]
+
+
+def _rollout_saved(rollout: Rollout | None) -> Mapping[str, object] | None:
+    """The state a checkpoint holds of `rollout` (`Rollout`'s `saved`), which a rollout is any callable
+    and a plain function has none of, so the trainer reads it at this boundary; None for none. A run of
+    several processes refuses one: each holds its own environments, and a checkpoint the pool's tree."""
+    saved = getattr(rollout, "saved", None)
+    tree = None if saved is None else saved()
+    if tree is not None and jax.process_count() > 1:
+        raise ValueError(f"{type(rollout).__name__} checkpoints the state it carries, which a run of "
+                         f"{jax.process_count()} processes holds one of a process, and a checkpoint holds "
+                         "the pool's; train it on one process")
+    return tree
+
+
+def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: int) -> None:
+    """`rollout` carrying on from the state the step it resumes from holds (`Rollout`'s `restored`, read at
+    this boundary, as `saved_shapes` is: a rollout is any callable), a key read back typed, as the run's
+    own key is (`request_key`); a rollout that saves none (its `saved_shapes` None, or absent) resumes as
+    it starts, and one whose step holds none (a checkpoint written before rollouts saved theirs) starts
+    its state afresh, said."""
+    shapes, restored = getattr(rollout, "saved_shapes", None), getattr(rollout, "restored", None)
+    if shapes is None:
+        return
+    if restored is None:
+        raise TypeError(f"{type(rollout).__name__} saves its state and holds no `restored` to carry on "
+                        "from it")
+    template = shapes()
+    if template is None:
+        return
+    tree = checkpoints.rollout_state(step, template)
+    if tree is None:
+        _log.warning("step %d holds no state of the run's %s: it starts its environments afresh", step,
+                     type(rollout).__name__)
+        return
+
+    def typed(leaf, want):
+        keyed = jnp.issubdtype(want.dtype, jax.dtypes.prng_key) and not jnp.issubdtype(
+            leaf.dtype, jax.dtypes.prng_key)
+        return jax.random.wrap_key_data(leaf) if keyed else leaf
+
+    restored(jax.tree.map(typed, tree, dict(template)))

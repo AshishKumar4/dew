@@ -111,6 +111,8 @@ from dew.training._fit import (
     FitRun,
     HandedSplits,
     Start,
+    _rollout_resumed,
+    _rollout_saved,
     afresh,
     check_inputs,
     clocked,
@@ -679,6 +681,7 @@ class Trainer(Generic[Loss, Effects]):
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
         state = restored(state, resume, self._examples)
+        _rollout_resumed(self.rollout, checkpoints, resume)
         if (config := self._config) is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = rates_set(state, lambda held: with_rates(held, config.rates()))
@@ -2272,7 +2275,7 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
             ranking=ranking, control={**run.stop_control, **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
-            boxed=self._boxed_axes())
+            boxed=self._boxed_axes(), rollout=None if weights_only else _rollout_saved(self.rollout))
         with run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
@@ -2298,7 +2301,7 @@ class Trainer(Generic[Loss, Effects]):
         write = functools.partial(
             checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
             control={**run.stop_control, **interval.token_control}, rung=self._checkpoint_rung(),
-            artifact=self._artifact(), boxed=self._boxed_axes())
+            artifact=self._artifact(), boxed=self._boxed_axes(), rollout=_rollout_saved(self.rollout))
         with run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")

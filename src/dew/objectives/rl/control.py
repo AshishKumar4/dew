@@ -19,7 +19,7 @@ import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -216,6 +216,16 @@ class ControlPPOObjective(Objective[Ratio]):
         return Ratio(per_step.sum(), jnp.asarray(per_step.size, per_step.dtype)), Aux(metrics)
 
 
+class Saved(TypedDict):
+    """What a `ControlRollout` carries between calls, as a checkpoint holds it (`ControlRollout.saved`)."""
+
+    carry: Carry
+    returns: jax.Array
+    collected: Mapping[str, np.ndarray]
+    order: np.ndarray
+    ended: np.ndarray
+
+
 @dataclass
 class ControlRollout:
     """The trainer's rollout (`dew.training.rollout.Rollout`) of a `ControlPPOObjective` in `env`, a
@@ -247,6 +257,45 @@ class ControlRollout:
     @property
     def metrics(self) -> Mapping[str, float]:
         return {"episode_return": self._ended}
+
+    def saved(self) -> Saved | None:
+        """What the rollout carries between calls, for the run's checkpoint (`Rollout`'s `saved`): every
+        environment mid episode and its running return, the collection it serves its minibatches from,
+        their order and the collection's mean ended return; None before its first call, and over a
+        `Simulator`, whose environments live outside JAX and start afresh on a resume."""
+        carry, returns, collected, order = self._carry, self._returns, self._collected, self._order
+        if carry is None or returns is None or collected is None or order is None or isinstance(
+                self.env, Simulator):
+            return None
+        return Saved(carry=carry, returns=returns, collected=dict(collected), order=order,
+                     ended=np.asarray(self._ended, np.float32))
+
+    def saved_shapes(self) -> Mapping[str, object] | None:
+        """`saved`'s leaves' shapes, placed on the device the environments are, before any call; None over
+        a `Simulator`."""
+        env = self.env
+        if isinstance(env, Simulator):
+            return None
+        key = jax.random.key(0)
+        carry = jax.eval_shape(functools.partial(rollout_start, env), key)
+        count = len(jax.tree.leaves(carry.observation)[0])
+
+        def collected(variables, carry):
+            _, steps = self._unrolled(env, variables, carry)
+            return self._summary(steps, jnp.zeros(count, jnp.float32))[1]
+
+        gathered = jax.eval_shape(collected, jax.eval_shape(self.objective.init, key), carry)
+        order = jax.ShapeDtypeStruct((self.epochs * len(gathered["reward"]),), np.int32)
+        where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), {
+            "carry": carry, "returns": jax.ShapeDtypeStruct((count,), jnp.float32), "collected": gathered,
+            "order": order, "ended": jax.ShapeDtypeStruct((), jnp.float32)})
+
+    def restored(self, tree: Saved) -> None:
+        """The rollout carrying on from a `saved` tree."""
+        self._carry, self._returns = tree["carry"], tree["returns"]
+        self._collected = jax.tree.map(np.asarray, dict(tree["collected"]))
+        self._order, self._ended = np.asarray(tree["order"]), float(tree["ended"])
 
     def _collector(self) -> Callable[[Variables, Carry], tuple[Carry, Transition]]:
         """The collection for the rollout's environment as it is now: a run may change it between
@@ -315,7 +364,7 @@ class ControlRollout:
             if sequences % self.minibatches:
                 raise ValueError(f"{sequences} sequences do not split into {self.minibatches} minibatches")
             rng = np.random.default_rng(np.asarray(jax.random.key_data(key)).ravel())
-            order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)])
+            order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)]).astype(np.int32)
         self._carry, self._returns, self._collected, self._order = carry, returns, collected, order
         size = len(collected["reward"]) // self.minibatches
         rows = order[served * size:(served + 1) * size]
