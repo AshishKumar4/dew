@@ -85,10 +85,12 @@ type Kind = Protected | Surrogate | KernelGlue | Algebra
 marked_call_p = create_call_primitive("marked_call")
 """A marked span: a call of its body's jaxpr (`call_jaxpr`) under its `kind`, whose JVP, linearization,
 transpose, batching, partial evaluation and checkpointing are JAX's call primitive's, each a marked call of
-the same kind; lowered by inlining its body, so it costs nothing compiled."""
+the same kind; lowered by inlining its body, so it costs nothing compiled. No Pallas backend lowers it: a
+span is marked where the algebra pass reads it, outside kernel bodies, and an error-free transform is still
+marked by its name scope (`dew.nn.precision.PROTECTED`), which kernel bodies carry as metadata alone."""
 
 
-def marked(kind: Kind, function: Callable[..., Value]) -> Callable[..., Value]:
+def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked_call_p`) over its arguments, a tree of arrays: it
     computes what `function` does, and every transform of it keeps a marked call of `kind`."""
     def call(*arguments):
