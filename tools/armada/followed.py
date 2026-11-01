@@ -227,16 +227,14 @@ STARTED_AT = "DEW_EXECUTED_STARTED"
 since is no tool (`tool`)."""
 
 
-def read(event: str, args: tuple, root: str, settings: bool) -> str | None:
+def read(event: str, args: tuple, root: str) -> str | None:
     """The checkout's file or directory, relative to `root`, that a read event names, or None: a file
     opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
     listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
     calls this; nor a module's source or bytecode the import system's loader reads to execute it, whose
     record is the code it ran (`code_unit`), nor a read of the source to digest it (`digesting`), nor a file
-    opened to write, nor, where this process's pytest records its `settings` itself (executed.py's, which a
-    followed child need not load: review), pytest's read of pyproject.toml to configure. An open relative to
-    a directory descriptor is `opening`'s to place. The interpreter audits the main script's open from no
-    frame at all."""
+    opened to write. An open relative to a directory descriptor is `opening`'s to place. The interpreter
+    audits the main script's open from no frame at all."""
     path = args[0]
     if isinstance(path, int):
         return None
@@ -260,8 +258,8 @@ def read(event: str, args: tuple, root: str, settings: bool) -> str | None:
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
     # The interpreter audits the main script's open from no frame (`sys._getframe(1)` is the audit hook's).
-    if digesting(sys._getframe(1).f_back) or (settings and os.path.basename(os.fsdecode(path or "")) ==
-                                                "pyproject.toml" and configuring(sys._getframe(1).f_back)):
+    if digesting(sys._getframe(1).f_back) or (os.path.basename(os.fsdecode(path or "")) == "pyproject.toml"
+                                                and configuring(sys._getframe(1).f_back)):
         return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
@@ -465,21 +463,16 @@ def _beneath_spawnv() -> bool:
     return False
 
 
-OPERANDS = ("-X", "-W", "--check-hash-based-pycs")
-"""The interpreter's options that take the argument after them as theirs (`sited`)."""
-
-
 def sited(argv) -> bool:
     """Whether Python started with command line `argv` makes its site, where the `.pth` that starts `follow`
-    runs (`installed`): no -S among the options before its program, an option's own argument (`OPERANDS`:
-    `-X utf8`) read as the option's, not as the program (review)."""
+    runs (`installed`): no -S among the options before its program."""
     arguments = [os.fsdecode(argument) for argument in list(argv)[1:]]
     for index, argument in enumerate(arguments):
-        if index and arguments[index - 1] in OPERANDS:
-            continue
         if argument in ("-c", "-m", "-") or not argument.startswith("-"):
             return True
-        if argument.startswith(("--", "-X", "-W")):
+        if argument.startswith("--") or (index and arguments[index - 1] in ("-X", "-W")):
+            continue
+        if argument.startswith(("-X", "-W")):
             continue
         if "S" in argument[1:]:
             return False
@@ -688,7 +681,7 @@ def follow() -> None:
     def audited(event, args):
         # `read` called here, as it reads its caller's frames.
         if event in READS:
-            if (item := read(event, args, root, settings=False)) is not None:
+            if (item := read(event, args, root)) is not None:
                 write("file", item)
             return
         if (taken := coded(event, args, root)) is not None:
