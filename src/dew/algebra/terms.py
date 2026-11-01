@@ -26,8 +26,8 @@ UNARY = frozenset({"neg", "exp", "exp2", "log", "log1p", "expm1", "sqrt", "rsqrt
 COMPARISONS = frozenset({"lt", "le", "eq", "ne", "ge", "gt"})
 REDUCTIONS = {"reduce_sum": "sum", "reduce_max": "max", "reduce_min": "min"}
 SHAPES = frozenset({"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims"})
-"""The primitives of the language (§1): elementwise arithmetic and comparisons, casts, the layout changes and
-the reductions a rule reads. Every other equation is a leaf of the region."""
+"""The primitives of the language (§1): elementwise arithmetic and comparisons, casts, the layout changes, the
+reductions a rule reads, and products (`dot_general`). Every other equation is a leaf of the region."""
 
 
 class Term(Expr):
@@ -63,6 +63,9 @@ class Term(Expr):
 
     @method(cost=1)
     def reduce(self, monoid: StringLike, axes: Vec[i64], params: i64Like) -> Term: ...
+
+    @method(cost=1)
+    def dot(self, other: Term, params: i64Like) -> Term: ...
 
 
 @dataclasses.dataclass
@@ -214,6 +217,8 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
     if name in REDUCTIONS and len(equation.invars) == 1:
         axes = Vec[i64](*(i64(int(axis)) for axis in equation.params["axes"]))  # the reduced axes
         return read(equation.invars[0]).reduce(REDUCTIONS[name], axes, param(primitive, equation.params))
+    if name == "dot_general" and len(equation.invars) == 2:
+        return read(equation.invars[0]).dot(read(equation.invars[1]), param(primitive, equation.params))
     return None
 
 
@@ -261,6 +266,10 @@ def _value(term: Term, value: Callable[[Term], jax.Array], region_: Region, leav
             left, _, right, index = args
             primitive, given = region_.params[_index(index)]
             return primitive.bind(value(left), value(right), **given)
+    if (args := get_callable_args(term, Term.dot)) is not None:
+        left, right, index = args
+        primitive, given = region_.params[_index(index)]
+        return primitive.bind(value(left), value(right), **given)
     if (args := get_callable_args(term, Term.select)) is not None:
         predicate, false, true = args
         return jax.lax.select_n_p.bind(value(predicate), value(false), value(true))

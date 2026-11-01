@@ -63,13 +63,18 @@ class Seconds:
 
 
 def model(device: Device, bytes_per_element: int = 4) -> DagCostModel:
-    """The cost of each node alone, in seconds: a reduction its operand's bytes over memory bandwidth, an
-    elementwise node its result's elements over the arithmetic rate, a layout change none (XLA lays it out
+    """The cost of each node alone, in seconds: a reduction its operand's bytes over memory bandwidth, a
+    product its operands' bytes, an elementwise node its result's elements over the arithmetic rate, a
+    layout change none (XLA lays it out
     within its consumer's fusion); extraction adds them, once a shared node. A node is priced from its
     operands' shapes, the e-classes the extractor hands its callback."""
     def marginal(graph: EGraph, node) -> Seconds:
         if (args := get_callable_args(node, Term.reduce)) is not None:
             return Seconds(made(graph, args[:1]) * bytes_per_element / device.memory_bandwidth)
+        if (args := get_callable_args(node, Term.dot)) is not None:
+            # A product reads both its operands once.
+            read = sum(made(graph, [operand]) for operand in args[:2])
+            return Seconds(read * bytes_per_element / device.memory_bandwidth)
         for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2)),
                                       (Term.unary, (0,)), (Term.convert, (0,))):
             if (args := get_callable_args(node, constructor)) is not None:

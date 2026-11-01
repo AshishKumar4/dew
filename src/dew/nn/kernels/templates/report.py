@@ -85,6 +85,8 @@ class _Registry:
     kernels that spilled, and each miss."""
     refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
     missed: list["Miss"] = dataclasses.field(default_factory=list)
+    rewritten: list = dataclasses.field(default_factory=list)
+    """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
 
 
 _PROCESS = _Registry()
@@ -226,6 +228,20 @@ def misses() -> tuple[Miss, ...]:
     scope's own within it."""
     with _GUARD:
         return tuple(_registry().missed)
+
+
+def record_rewrite(made) -> None:
+    """Record one region the algebra pass rewrote (`dew.algebra.program.AlgebraReport`) beside the kernels'
+    misses, as each program traces."""
+    with _GUARD:
+        _registry().rewritten.append(made)
+
+
+def rewrites() -> tuple:
+    """The regions the algebra pass rewrote as this process's programs traced (`record_rewrite`), for a
+    run's telemetry: a `refusals` scope's own within it."""
+    with _GUARD:
+        return tuple(_registry().rewritten)
 
 
 @contextlib.contextmanager
