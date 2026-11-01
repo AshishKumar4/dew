@@ -271,7 +271,8 @@ def written(path, dir_fd: int | None = None) -> str | None:
     database in memory)."""
     if isinstance(path, int) or path is None or path in (":memory:", b":memory:", ""):
         return None
-    base = os.readlink(f"/proc/self/fd/{dir_fd}") if dir_fd is not None else ""
+    # The audit names no directory descriptor as -1 (or None, shutil's).
+    base = os.readlink(f"/proc/self/fd/{dir_fd}") if dir_fd is not None and dir_fd >= 0 else ""
     name = os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path))))
     return None if own(name) else f"{WROTE}{name}"
 

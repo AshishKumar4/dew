@@ -73,6 +73,19 @@ def test_a_tool_leaves_what_it_writes_outside_the_files_own(followed, tmp_path, 
     assert (not all(followed.own(os.path.abspath(path)) for path in paths)) is leaves
 
 
+@pytest.mark.parametrize(("event", "args"), [
+    ("os.mkdir", ("{path}", 0o777, -1)), ("os.remove", ("{path}", -1)), ("os.rename", ("{own}", "{path}", -1, -1)),
+    ("os.symlink", ("{own}", "{path}", -1)), ("os.utime", ("{path}", None, None, -1)),
+    ("shutil.rmtree", ("{path}", None)), ("os.truncate", ("{path}", 0))],
+    ids=["mkdir", "remove", "rename", "symlink", "utime", "rmtree", "truncate"])
+def test_each_change_the_audit_names_leaves_its_path(followed, tmp_path, event, args):
+    """Each change event's path, as the audit names it (no directory descriptor as -1, or None), is the mark
+    of what it leaves (`changed`)."""
+    path, own = tmp_path / "checkout" / "made", tmp_path / "own" / "tmp" / "x"
+    named = tuple(arg.format(path=path, own=own) if isinstance(arg, str) else arg for arg in args)
+    assert followed.changed(event, named) == f"{followed.WROTE}{path}"
+
+
 def test_wandbs_service_may_write_anywhere(followed):
     assert followed.outputs("wandb-core", ["wandb-core", "--pid", "1"], "/") is None
 
