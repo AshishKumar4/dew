@@ -380,14 +380,24 @@ derive it from its arguments' facts.
 | `range(t)` | `Pair[f64, f64]` (bounds, where cheap) | intersect | a stable correction (exp arguments at most 0); a condition bound |
 | `rounding(t)` | `String` (`exact`, `reorders`, `bounded`) | the worse | the compile-time admission of a set |
 
-What is built of the table: `shape`, and `range` as a bound on each value's magnitude. The region states the
-bound when it traces a program (`terms.Region.bounds`). A constant's bound is its largest element, and a bounded
-function's (`tanh`, `sin`, a comparison) is its own. Each equation in the language propagates its operands'
-bounds by interval arithmetic on magnitudes, and an operand's bound, or an equation's outside the language, is
-infinite. A value whose bound times the region's largest extent is at most the square root of its narrowest
-dtype's largest value is `tame` (`rules.tame`). Every reordering rule that builds a new intermediate from its
-operands (`linear`'s, `carried`'s) fires only where those operands are tame, so no form is infinite where the
-program is finite (bible §6). With no range fact, the rule does not fire.
+What is built of the table: `shape`, and `range` as a bound on each value's magnitude
+(`terms.Magnitude`): `2**log2` times a product of powers of the program's unbounded operands' magnitudes
+(each at least 1, one slot an operand). The region states it as it traces a program
+(`terms.Region.magnitudes`). A constant's bound is its largest element, and a declared operand's is its range
+(`scan.Scan.ranges`: l2-normalised keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no
+declared range takes a slot of its own. Each equation in the language composes its operands' bounds: sums
+take twice the larger, products multiply, contractions and sums along an axis multiply by their length, and a
+bounded function (`tanh`, a comparison) is 1. An exponential of an operand, or a quotient, has no bound.
+
+The dominance rule decides which reorderings fire, in place of operand ranges alone. Its contract is bible §6:
+no infinity where the reference is finite. A reordering is admitted when every new intermediate it makes is
+bounded by a magnitude that the program as written already reaches (`rules.reaches`, one fact for each
+magnitude of the program's values; `rules.dominated`). Each rule computes its new intermediates' bounds from
+its operands' (`rules.log2_bound`, `rules.degree`) and states them for the rules after it (`rules.made`). So
+`a*x + a*y -> a*(x + y)` does not fire for a constant `a` under 1 when `x` and `y` are unbounded: their sum
+exceeds everything the program reaches. The delta rule's carry does distribute over `U - W h`: with its keys
+of unit norm, `K^T U` and `K^T W h` are under the state the chunk itself accumulates. Error-aware extraction
+then checks precision against float64 (§1.5).
 
 Two notes on the table:
 - "equal or fail" means members of one e-class that disagree raise, naming the rule that united them.

@@ -37,8 +37,7 @@ def draw(seed):
 def tiles(values: dict, tile: int) -> dict:
     """The operands' keys of key tile `tile`."""
     keys = slice(tile * TILE, (tile + 1) * TILE)
-    return {"logits": values["logits"][:, keys], "seen": values["seen"][:, keys],
-            "values": values["values"][keys]}
+    return {"logits": values["logits"][:, keys], "values": values["values"][keys]}
 
 
 def derived_walk(base2: bool, mask: str, split: bool):
@@ -50,7 +49,7 @@ def derived_walk(base2: bool, mask: str, split: bool):
         return walked(forms, [tiles(values, tile) for tile in steps])
 
     def run(logits, value):
-        values = {"logits": logits, "seen": MASKS[mask](), "values": value}
+        values = {"logits": jnp.where(MASKS[mask](), logits, -jnp.inf), "values": value}
         if split:
             state = forms.merge(walk(values, range(count // 2)), walk(values, range(count // 2, count)),
                                 values)

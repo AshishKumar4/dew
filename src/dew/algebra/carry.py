@@ -18,7 +18,7 @@ alone (`Split.carry`, `Split.emit`). The association reorders rounding.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -34,11 +34,11 @@ from egglog import (
     get_callable_args,
     get_literal_value,
     i64,
-    rewrite,
     rule,
     ruleset,
     seq,
     set_,
+    union,
     var,
     vars_,
 )
@@ -106,32 +106,50 @@ def _carrying():
 
 def _carried():
     """The products' linear algebra over values that read the state (the module's account), each over
-    matrices (`matrix`), products and sums in their operands' dtype (`matrix_product`, `rules.plain`),
-    summands of one shape, and operands its new intermediates read tame (`rules.tame`): each reorders
-    rounding."""
-    x, y, z = vars_("x y z", Term)
+    matrices (`matrix`), products and sums in their operands' dtype (`matrix_product`, `rules.plain`) and
+    summands of one shape, each firing only where every intermediate it makes is under a magnitude the
+    function as written reaches (`rules.dominated`, §6.3), each stating its own (`rules.made`): each
+    reorders rounding."""
+    x, y, z, t = vars_("x y z t", Term)
     p, m, s, q = vars_("p m s q", i64)
+    left = var("left", Vec[i64])
+    length = var("length", i64)
     one = i64(1)
     shape = rules.shape
+    # A matrix product's contraction's length's power: its left operand's columns'.
+    contracted = (eq(left).to(shape(x)), eq(length).to(rules.log2_of(left[i64(1)])))
+    facts, power, degrees = rules.magnitude(x, "x")
+    transposed = x.shaped(String("transpose"), s)
     sets = [
-        # x^T @ y as transpose(x) @ y, so it associates and factors with plain products.
-        rewrite(x.dot(y, p)).to(x.shaped(String("transpose"), s).dot(y, m), eq(m).to(plain_of(p)),
-                                eq(s).to(swap_of(p)), matrix(x), matrix(y), eq(reads(y)).to(one)),
-        # x @ (y @ z) as (x @ y) @ z, the state's product last.
-        rewrite(x.dot(y.dot(z, m), m)).to(x.dot(y, m).dot(z, m), matrix_product(m), matrix(x), matrix(y),
-                                          matrix(z), rules.tame(x), rules.tame(y), eq(reads(z)).to(one)),
+        # x^T @ y as transpose(x) @ y, so it associates and factors with plain products; the transpose a
+        # layout of x, of its magnitude.
+        rule(eq(t).to(x.dot(y, p)), eq(m).to(plain_of(p)), eq(s).to(swap_of(p)), matrix(x), matrix(y),
+             eq(reads(y)).to(one), *facts).then(
+            union(t).with_(transposed.dot(y, m)), *rules.made(transposed, power, degrees)),
     ]
+    # x @ (y @ z) as (x @ y) @ z, the state's product last: x @ y new.
+    facts, power, degrees = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
+    sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), matrix_product(m), matrix(x), matrix(y), matrix(z),
+                     eq(reads(z)).to(one), *contracted, *facts, *rules.dominated(power, degrees, "new")).then(
+        union(t).with_(x.dot(y, m).dot(z, m)), *rules.made(x.dot(y, m), power, degrees)))
     for combined in ("add", "sub"):
-        summed = (matrix_product(m), rules.plain(q), matrix(x), matrix(y), matrix(z), rules.tame(x),
-                  rules.tame(y))
-        sets += [
-            rewrite(x.dot(y.binary(combined, z, q), m)).to(
-                x.dot(y, m).binary(combined, x.dot(z, m), q), *summed, rules.tame(z),
-                eq(shape(y)).to(shape(z)), eq(reads(y.binary(combined, z, q))).to(one)),
-            rewrite(x.dot(z, m).binary(combined, y.dot(z, m), q)).to(
-                x.binary(combined, y, q).dot(z, m), *summed, eq(shape(x)).to(shape(y)),
-                eq(reads(z)).to(one)),
-        ]
+        plain = (matrix_product(m), rules.plain(q), matrix(x), matrix(y), matrix(z))
+        # x @ (y +- z) as x @ y +- x @ z: both new.
+        with_y = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
+        with_z = rules.product_magnitude(rules.magnitude(x, "x2"), rules.magnitude(z, "z"), length)
+        sets.append(rule(eq(t).to(x.dot(y.binary(combined, z, q), m)), *plain, eq(shape(y)).to(shape(z)),
+                         eq(reads(y.binary(combined, z, q))).to(one), *contracted, *with_y[0], *with_z[0],
+                         *rules.dominated(with_y[1], with_y[2], "y"),
+                         *rules.dominated(with_z[1], with_z[2], "z")).then(
+            union(t).with_(x.dot(y, m).binary(combined, x.dot(z, m), q)),
+            *rules.made(x.dot(y, m), with_y[1], with_y[2]), *rules.made(x.dot(z, m), with_z[1], with_z[2])))
+        # x @ z +- y @ z as (x +- y) @ z: x +- y new.
+        facts, power, degrees = rules.summed_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"))
+        added = x.binary(combined, y, q)
+        sets.append(rule(eq(t).to(x.dot(z, m).binary(combined, y.dot(z, m), q)), *plain,
+                         eq(shape(x)).to(shape(y)), eq(reads(z)).to(one), *facts,
+                         *rules.dominated(power, degrees, "new")).then(
+            union(t).with_(added.dot(z, m)), *rules.made(added, power, degrees)))
     return ruleset(*sets, name="carried")
 
 
@@ -187,13 +205,15 @@ class Split(NamedTuple):
 
 
 def split(function: Callable, state, operands: Sequence, carried: Sequence[int], *,
-          saturation: program.Saturation) -> Split:
+          saturation: program.Saturation, ranges: Mapping[int, float] | None = None) -> Split:
     """`function(state, *operands)`, a tuple of outputs, at `state`'s and `operands`' shapes and dtypes, split
-    by extraction (the module's account): its outputs at `carried` the carry's, its others emitted. Refused
-    (`Refused`) where an equation outside the language reads the state."""
+    by extraction (the module's account): its outputs at `carried` the carry's, its others emitted, the
+    operands' magnitudes bounded by `ranges` (by place among `operands`; the state's none), which the
+    reorderings' new intermediates are held under (§6.3). Refused (`Refused`) where an equation outside the
+    language reads the state."""
     with jax.disable_jit():
         closed = jax.make_jaxpr(forms.inlined(function))(state, *operands)
-    region = terms.region(closed)
+    region = terms.region(closed, {1 + index: bound for index, bound in (ranges or {}).items()})
     first = len(closed.jaxpr.constvars)
     graph = EGraph()
     program.stated(graph, region)

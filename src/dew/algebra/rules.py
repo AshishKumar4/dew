@@ -24,14 +24,17 @@ from egglog import (
     eq,
     function,
     i64,
+    i64Like,
     rewrite,
     rule,
     ruleset,
     set_,
+    union,
     var,
     vars_,
 )
 
+from dew.algebra import terms
 from dew.algebra.terms import Term
 
 
@@ -67,13 +70,64 @@ states it). A scale of any other value moved so reorders rounding, which the gat
 rule's adjoint (1.575 times the reference's error, past 1.5): it waits for error-aware extraction (§1.5)."""
 
 
+@function(merge=lambda old, new: old)
+def log2_bound(term: Term) -> i64: ...
+"""A value's magnitude's power of two (`terms.Magnitude.log2`): the region's (`program.stated`), or what a
+reordering rule states of the intermediate it makes (`made`)."""
+
+
+@function(merge=lambda old, new: old)
+def degree(term: Term, slot: i64Like) -> i64: ...
+"""A value's magnitude's power of an unbounded operand's (`terms.Magnitude.degrees`, one a slot)."""
+
+
 @function
-def tame(term: Term) -> Unit: ...
-"""Holds where a value's magnitude, bounded by the region's range facts (`terms.Region.bounds`, §6.3), times
-the region's largest extent is at most the root of its narrowest dtype's largest value: a sum of two tame
-values, a sum of one along an axis and a product of two contracted along one all stay finite. A reordering
-that makes an intermediate of its operands fires only where they are tame, so no form is infinite where the
-program is finite (bible §6); with no range fact, it does not fire (`program.stated` states it)."""
+def reaches(log2: i64Like, d0: i64Like, d1: i64Like, d2: i64Like, d3: i64Like) -> Unit: ...
+"""A magnitude a value of the program as written reaches (`program.stated`): a reordering's new intermediate
+under one of them is a value no larger than one the program computes already (§6.3, `dominated`)."""
+
+
+@function(merge=lambda old, new: old)
+def log2_of(size: i64Like) -> i64: ...
+"""`ceil(log2(size))` of each extent the region's shapes hold: a contraction's or a sum's length's power."""
+
+
+def magnitude(term: Term, name: str) -> tuple[list, i64, list]:
+    """The facts naming `term`'s magnitude (`log2_bound`, `degree`), and its power and degrees' variables."""
+    power = var(f"{name}_log2", i64)
+    degrees = [var(f"{name}_d{slot}", i64) for slot in range(terms.SLOTS)]
+    facts = [eq(power).to(log2_bound(term)), *(eq(each).to(degree(term, i64(slot)))
+                                              for slot, each in enumerate(degrees))]
+    return facts, power, degrees
+
+
+def dominated(power, degrees, name: str) -> list:
+    """The facts that hold where a magnitude of `power` and `degrees` is under one the program reaches
+    (`reaches`): the bible's §6 rule, no infinity where the program is finite, as a reordering rule reads
+    it."""
+    reached = var(f"{name}_reach", i64)
+    reached_degrees = [var(f"{name}_reach{slot}", i64) for slot in range(terms.SLOTS)]
+    return [reaches(reached, *reached_degrees), power <= reached,
+            *(mine <= theirs for mine, theirs in zip(degrees, reached_degrees, strict=True))]
+
+
+def made(term: Term, power, degrees) -> list:
+    """The actions stating a new intermediate's magnitude, for later rules to read."""
+    return [set_(log2_bound(term)).to(power),
+            *(set_(degree(term, i64(slot))).to(each) for slot, each in enumerate(degrees))]
+
+
+def summed_magnitude(left: tuple, right: tuple) -> tuple[list, i64, list]:
+    """A sum's magnitude from its terms' (`magnitude`'s): twice the larger power, the larger degrees."""
+    (facts, power, degrees), (more, other, others) = left, right
+    return facts + more, power.max(other) + 1, [a.max(b) for a, b in zip(degrees, others, strict=True)]
+
+
+def product_magnitude(left: tuple, right: tuple, length) -> tuple[list, i64, list]:
+    """A product's magnitude from its factors' (`magnitude`'s), its contraction's length's power `length`
+    (0 for an elementwise product): the powers and degrees added."""
+    (facts, power, degrees), (more, other, others) = left, right
+    return facts + more, power + other + length, [a + b for a, b in zip(degrees, others, strict=True)]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,37 +201,50 @@ def _linear() -> Ruleset:
     over arithmetic in its operands' dtype (`plain`), and a value a broadcast lays along every axis but a
     sum's taken out of the sum where the other factor has the product's shape (the broadcast's extent along
     the axis the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding,
-    and each fires only where the operands its new intermediate reads are tame (`tame`)."""
-    x, y, a = vars_("x y a", Term)
+    and each fires only where every intermediate it makes is under a magnitude the program as written reaches
+    (`dominated`, §6.3), each stating its own (`made`)."""
+    x, y, a, t = vars_("x y a t", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
     scalar = Vec[i64].empty()
-    return ruleset(
-        # A contraction scaled by a power of two: the scale on either operand, the product linear in each.
-        rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
-            x.binary("mul", a, multiplied).dot(y, params), eq(shape(a)).to(scalar), exact_scale(a),
-            plain(params), plain(multiplied), tame(x), tame(a)),
-        rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
-            x.dot(y.binary("mul", a, multiplied), params), eq(shape(a)).to(scalar), exact_scale(a),
-            plain(params), plain(multiplied), tame(y), tame(a)),
-        rewrite(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)).to(
-            x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y)), plain(added),
-            tame(x), tame(y)),
-        rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
-            a.binary("mul", x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y)),
-            plain(multiplied), plain(added), tame(x), tame(y)),
-        rewrite(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)).to(
-            a.dot(x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y)), plain(multiplied),
-            plain(added), tame(x), tame(y)),
-        rewrite(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)).to(
-            x.binary("add", y, added).dot(a, multiplied), eq(shape(x)).to(shape(y)), plain(multiplied),
-            plain(added), tame(x), tame(y)),
-        rewrite(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce(
-            "sum", axes, summed)).to(
-            a.binary("mul", x.reduce("sum", axes, summed), multiplied), along(laid, axis), plain(multiplied),
-            eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent), tame(x),
-            eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent)),
-        name="linear")
+    sets = []
+    # A contraction scaled by a power of two: the scale on either operand, the product linear in each.
+    for scaled, made_of in ((x, lambda s: s.dot(y, params)), (y, lambda s: x.dot(s, params))):
+        facts, power, degrees = product_magnitude(magnitude(scaled, "s"), magnitude(a, "a"), 0)
+        new = scaled.binary("mul", a, multiplied)
+        sets.append(rule(eq(t).to(x.dot(y, params).binary("mul", a, multiplied)), eq(shape(a)).to(scalar),
+                         exact_scale(a), plain(params), plain(multiplied), *facts,
+                         *dominated(power, degrees, "new")).then(
+            union(t).with_(made_of(new)), *made(new, power, degrees)))
+    facts, power, degrees = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
+    new = x.binary("add", y, added)
+    sets += [
+        rule(eq(t).to(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)),
+             eq(shape(x)).to(shape(y)), plain(added), *facts, *dominated(power, degrees, "new")).then(
+            union(t).with_(new.reduce("sum", axes, params)), *made(new, power, degrees)),
+        rule(eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
+             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
+             *dominated(power, degrees, "new")).then(
+            union(t).with_(a.binary("mul", new, multiplied)), *made(new, power, degrees)),
+        rule(eq(t).to(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)),
+             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
+             *dominated(power, degrees, "new")).then(
+            union(t).with_(a.dot(new, multiplied)), *made(new, power, degrees)),
+        rule(eq(t).to(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)),
+             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
+             *dominated(power, degrees, "new")).then(
+            union(t).with_(new.dot(a, multiplied)), *made(new, power, degrees)),
+    ]
+    facts, power, degrees = magnitude(x, "x")
+    length = var("length", i64)
+    sum_of = x.reduce("sum", axes, summed)
+    sets.append(rule(
+        eq(t).to(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce("sum", axes, summed)),
+        along(laid, axis), plain(multiplied), eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent),
+        eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent),
+        eq(length).to(log2_of(extent[axis])), *facts, *dominated(power + length, degrees, "new")).then(
+        union(t).with_(a.binary("mul", sum_of, multiplied)), *made(sum_of, power + length, degrees)))
+    return ruleset(*sets, name="linear")
 
 
 def _identities() -> Ruleset:

@@ -112,9 +112,9 @@ class Region:
     primitive and its parameters), its literals as the program holds them, value and weak type
     (`literals`), each term's shape as its equation states it (`shapes`), the longest chain of the
     language's equations (`depth`), the index of each primitive a rule may write afresh at its defaults
-    (`stock`, `stocked`), each term's dtype, a bound on each term's magnitude its equations and constants
-    prove (`bounds`, by term text; infinite where none: an operand's, an equation's outside the language),
-    and the largest finite value of its narrowest floating dtype (`limit`)."""
+    (`stock`, `stocked`), each term's dtype, and each term's magnitude its equations, constants and
+    declared ranges prove (`magnitudes`, by term text, `Magnitude`; None where none: an exponential of an
+    operand's, a quotient's)."""
 
     leaves: int
     opaque: list[Opaque]
@@ -127,8 +127,7 @@ class Region:
     equations: int
     stock: Mapping[str, int]
     dtypes: Mapping[str, np.dtype]
-    bounds: Mapping[str, float]
-    limit: float
+    magnitudes: Mapping[str, Magnitude | None]
     extents: dict[str, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -162,9 +161,44 @@ def protected(equation: jcore.JaxprEqn) -> bool:
     return PROTECTED in str(equation.source_info.name_stack)
 
 
-def region(closed: jcore.Jaxpr) -> Region:
+SLOTS = 4
+"""The operands without a declared range a region's magnitudes name apart (`Magnitude.degrees`); a value of
+a fifth has none (None)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Magnitude:
+    """A bound on a value's magnitude (docs/design/algebra.md §6.3): `2**log2` times the product of its
+    unbounded operands' magnitudes, each at least 1 (`max(1, |x_i|)`), to the powers `degrees`, one a slot
+    (`SLOTS`). A sum's is under twice the larger of its terms' (each operand's magnitude at least 1), a
+    product's their product, a contraction's their product times its length."""
+
+    log2: int
+    degrees: tuple[int, ...] = (0,) * SLOTS
+
+    def times(self, other: Magnitude, log2: int = 0) -> Magnitude:
+        return Magnitude(self.log2 + other.log2 + log2,
+                         tuple(a + b for a, b in zip(self.degrees, other.degrees, strict=True)))
+
+    def plus(self, other: Magnitude, log2: int = 1) -> Magnitude:
+        return Magnitude(max(self.log2, other.log2) + log2,
+                         tuple(max(a, b) for a, b in zip(self.degrees, other.degrees, strict=True)))
+
+    def within(self, other: Magnitude) -> bool:
+        """Whether this bound is under `other`'s for every operand magnitude."""
+        pairs = zip(self.degrees, other.degrees, strict=True)
+        return self.log2 <= other.log2 and all(a <= b for a, b in pairs)
+
+
+NOTHING = -(2 ** 20)
+"""A zero's `Magnitude.log2`: under every other."""
+
+
+def region(closed: jcore.Jaxpr, ranges: Mapping[int, float] | None = None) -> Region:
     """`closed`'s equations as terms: each of the language a constructor over its inputs' terms, each other
-    one (and each protected one, `protected`) a leaf for each output, after its inputs' terms."""
+    one (and each protected one, `protected`) a leaf for each output, after its inputs' terms. Each term's
+    magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index; an input
+    with none takes a slot of its own) and its equations'."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
     indexed: dict[tuple[str, str], int] = {}
@@ -181,14 +215,15 @@ def region(closed: jcore.Jaxpr) -> Region:
 
     env: dict[jcore.Var, Term] = {}
     dtypes: dict[str, np.dtype] = {}
-    bounds: dict[str, float] = {}
+    magnitudes: dict[str, Magnitude | None] = {}
     leaves = 0
-    held = [_magnitude(value) for value in closed.consts]
-    for var, bound in zip([*jaxpr.constvars, *jaxpr.invars], [*held, *([math.inf] * len(jaxpr.invars))],
-                          strict=True):
+    free = iter(range(SLOTS))
+    given = [*(_magnitude(value) for value in closed.consts),
+             *(_declared(index, ranges or {}, free) for index in range(len(jaxpr.invars)))]
+    for var, magnitude in zip([*jaxpr.constvars, *jaxpr.invars], given, strict=True):
         env[var] = Term.leaf(leaves)
         shapes.append((env[var], _shape(var)))
-        _typed(dtypes, bounds, env[var], var, bound)
+        _typed(dtypes, magnitudes, env[var], var, magnitude)
         leaves += 1
 
     def read(atom) -> Term:
@@ -196,12 +231,12 @@ def region(closed: jcore.Jaxpr) -> Region:
             literals.append(atom.val)
             term = Term.literal(len(literals) - 1)
             shapes.append((term, _shape(atom)))
-            _typed(dtypes, bounds, term, atom, _magnitude(atom.val))
+            _typed(dtypes, magnitudes, term, atom, _magnitude(atom.val))
             return term
         return env[atom]
 
-    def bound_of(atom) -> float:
-        return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else bounds[str(env[atom])]
+    def magnitude_of(atom) -> Magnitude | None:
+        return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else magnitudes[str(env[atom])]
 
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
@@ -216,7 +251,7 @@ def region(closed: jcore.Jaxpr) -> Region:
             out = equation.outvars[0]
             env[out] = read(source).shaped("broadcast_in_dim", param(equation.primitive, composed))
             shapes.append((env[out], _shape(out)))
-            _typed(dtypes, bounds, env[out], out, bounds[str(env[source])])
+            _typed(dtypes, magnitudes, env[out], out, magnitudes[str(env[source])])
             laid[out] = (source, composed["broadcast_dimensions"])
             depths[out] = depths.get(source, 0) + 1
             continue
@@ -228,8 +263,8 @@ def region(closed: jcore.Jaxpr) -> Region:
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
-            _typed(dtypes, bounds, term, out,
-                   _bounded(equation, [bound_of(atom) for atom in equation.invars]))
+            _typed(dtypes, magnitudes, term, out,
+                   _bounded(equation, [magnitude_of(atom) for atom in equation.invars]))
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -237,7 +272,7 @@ def region(closed: jcore.Jaxpr) -> Region:
         for var in equation.outvars:
             env[var] = Term.leaf(leaves)
             shapes.append((env[var], _shape(var)))
-            _typed(dtypes, bounds, env[var], var, math.inf)
+            _typed(dtypes, magnitudes, env[var], var, None)
             outputs.append(leaves)
             leaves += 1
         opaque.append(Opaque(equation, [None if isinstance(atom, jcore.Literal) else env[atom]
@@ -247,68 +282,82 @@ def region(closed: jcore.Jaxpr) -> Region:
     outputs = [None if isinstance(atom, jcore.Literal) else env[atom] for atom in jaxpr.outvars]
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
-    floats = [jnp.finfo(dtype).max for dtype in dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
-                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, bounds,
-                  float(min(floats, default=np.finfo(np.float32).max)))
+                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes)
 
 
-BOUNDED = {"tanh": 1.0, "logistic": 1.0, "sin": 1.0, "cos": 1.0, "erf": 1.0, "sign": 1.0}
-"""The language's functions whose magnitude is at most a constant whatever their operand's."""
+BOUNDED = frozenset({"tanh", "logistic", "sin", "cos", "erf", "sign"})
+"""The language's functions whose magnitude is at most 1 whatever their operand's."""
 KEEPING_MAGNITUDE = frozenset({"neg", "abs", "convert_element_type", "reduce_max", "reduce_min", "floor",
                                "ceil", "round"}) | SHAPES
 """The language's equations whose output is no larger in magnitude than their operand's."""
+UNIT = Magnitude(0)
 
 
-def _bounded(equation: jcore.JaxprEqn, given: list[float]) -> float:
-    """A bound on the magnitude of `equation`'s output from its operands' (`given`), by interval arithmetic
-    on magnitudes; infinite where its primitive proves none."""
+def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magnitude | None:
+    """A bound on the magnitude of `equation`'s output from its operands' (`operands`, `Magnitude`), None
+    where its primitive proves none (an exponential of a value of any magnitude, a quotient)."""
     name = equation.primitive.name
-    if name in COMPARISONS or name in ("and", "or", "xor", "not", "is_finite"):
-        return 1.0
-    if name in BOUNDED:
-        return BOUNDED[name]
-    if any(math.isinf(bound) for bound in given):
-        return math.inf
+    if name in COMPARISONS or name in ("and", "or", "xor", "not", "is_finite") or name in BOUNDED:
+        return UNIT
+    given = [bound for bound in operands if bound is not None]
+    if len(given) < len(operands):
+        return None
     if name in ("add", "sub"):
-        return given[0] + given[1]
+        return given[0].plus(given[1])
     if name == "mul":
-        return given[0] * given[1]
+        return given[0].times(given[1])
     if name in ("max", "min"):
-        return max(given)
+        return given[0].plus(given[1], 0)
     if name == "select_n":
-        return max(given[1:])
+        return functools.reduce(lambda a, b: a.plus(b, 0), given[1:])
     if name in KEEPING_MAGNITUDE:
         return given[0]
     if name == "square":
-        return given[0] ** 2
-    if name == "integer_pow" and equation.params["y"] >= 0:
-        return given[0] ** equation.params["y"]
+        return given[0].times(given[0])
+    if name == "integer_pow" and equation.params["y"] >= 1:
+        return functools.reduce(lambda a, _: a.times(given[0]), range(equation.params["y"] - 1), given[0])
+    if name in ("exp", "exp2") and given[0].degrees == (0,) * SLOTS and given[0].log2 <= 6:
+        # An exponential of a value under 64: under 2**(64 log2(e)).
+        return Magnitude(math.ceil(2 ** given[0].log2 * (math.log2(math.e) if name == "exp" else 1.0)))
     if name == "reduce_sum":
         shape = _shape(equation.invars[0])
-        return given[0] * math.prod(shape[axis] for axis in equation.params["axes"])
+        return given[0].times(UNIT, _log2(math.prod(shape[axis] for axis in equation.params["axes"])))
     if name == "dot_general":
         (contracted, _), _ = equation.params["dimension_numbers"]
         shape = _shape(equation.invars[0])
-        return given[0] * given[1] * math.prod(shape[axis] for axis in contracted)
-    return math.inf
+        return given[0].times(given[1], _log2(math.prod(shape[axis] for axis in contracted)))
+    return None
 
 
-def _magnitude(value) -> float:
-    """The largest magnitude among a constant's elements, infinite for one of no number (a key's)."""
+def _log2(value: float) -> int:
+    """`ceil(log2(value))`, `NOTHING` for 0: a magnitude's exponent bounding `value` from above."""
+    return NOTHING if value == 0 else math.ceil(math.log2(value))
+
+
+def _magnitude(value) -> Magnitude | None:
+    """A constant's magnitude, its elements' largest; None for one of no number (a key's)."""
     array = np.asarray(value)
-    if not (np.issubdtype(array.dtype, np.number) or array.dtype == bool) or array.size == 0:
-        return math.inf if array.size else 0.0
-    largest = float(np.max(np.abs(array.astype(np.float64))))
-    return largest if math.isfinite(largest) else math.inf
+    if not (np.issubdtype(array.dtype, np.number) or array.dtype == bool):
+        return None
+    largest = float(np.max(np.abs(array.astype(np.float64)))) if array.size else 0.0
+    return Magnitude(_log2(largest)) if math.isfinite(largest) else None
 
 
-def _typed(dtypes: dict, bounds: dict, term: Term, atom, bound: float) -> None:
-    """`term`'s dtype (`atom`'s) and its magnitude's bound, the tighter where its text names two values."""
+def _declared(index: int, ranges: Mapping[int, float], free) -> Magnitude | None:
+    """Input `index`'s magnitude: its declared range's, else a slot of its own (`SLOTS`; None past them)."""
+    if index in ranges:
+        return Magnitude(_log2(ranges[index]))
+    slot = next(free, None)
+    return None if slot is None else Magnitude(0, tuple(int(each == slot) for each in range(SLOTS)))
+
+
+def _typed(dtypes: dict, magnitudes: dict, term: Term, atom, magnitude: Magnitude | None) -> None:
+    """`term`'s dtype (`atom`'s) and its magnitude, the first where its text names two values."""
     key = str(term)
     if isinstance(atom.aval, ShapedArray):
         dtypes.setdefault(key, np.dtype(atom.aval.dtype))
-    bounds[key] = min(bounds.get(key, math.inf), bound)
+    magnitudes.setdefault(key, magnitude)
 
 
 @functools.cache

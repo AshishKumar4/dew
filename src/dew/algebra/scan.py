@@ -43,7 +43,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.extend import core as jcore
 
-from dew.algebra import carry, program
+from dew.algebra import carry, program, terms
 from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
@@ -70,7 +70,11 @@ class Scan:
     `readout(h, **token)` that token's output from the state after it, each in plain JAX on one token's
     operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype.
     `reset`, where given, names an operand of `operands`, booleans along the walked axis alone that neither
-    reads, marking each token a zero state enters (a packed document's first)."""
+    reads, marking each token a zero state enters (a packed document's first). `ranges` bounds operands'
+    magnitudes by name (l2-normalised keys 1, a sigmoid's gate 1), the range facts a reordering's new
+    intermediates are held under (docs/design/algebra.md §6.3); an operand it names none of is unbounded. Its
+    decays (the exponentials of its update's exponents) are at most 1: its exponents are at most zero, as a
+    gated recurrence's log decays are."""
 
     update: Callable
     readout: Callable
@@ -78,6 +82,7 @@ class Scan:
     walked: str
     state: tuple[tuple[int, ...], jnp.dtype]
     reset: str | None = None
+    ranges: Mapping[str, float] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,23 +183,47 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
 
     splits: dict = {}
 
+    def ranges(chunk: Mapping, affine) -> dict[int, float]:
+        # Each token value's range (`_token`'s) as the declared operands' bound it (`terms.Region`'s
+        # magnitudes), by its place among the chunk function's operands after its decays (each at most 1);
+        # a value an unbounded operand's has none.
+        tokens = [jax.ShapeDtypeStruct(tuple(extent for extent, axis in zip(chunk[name].shape,
+                                                                              declaration.operands[name],
+                                                                              strict=True)
+                                             if axis != declaration.walked), chunk[name].dtype)
+                  for name in names]
+        closed = jax.make_jaxpr(lambda *xs: _token(affine, xs)[1:])(*tokens)
+        declared = {index: declaration.ranges[name] for index, name in enumerate(names)
+                    if name in declaration.ranges}
+        region = terms.region(closed, declared)
+        bounded = {}
+        for index, output in enumerate(region.outputs):
+            magnitude = None if output is None else region.magnitudes.get(str(output))
+            if magnitude is not None and not any(magnitude.degrees):
+                bounded[DECAYS + index] = 2.0 ** magnitude.log2
+        return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
+
     def prepare(chunk):
-        affine, values = parts(chunk)
-        key = (affine.base2, bool(affine.corrections), *((value.shape, str(value.dtype)) for value in values))
+        affine, (exponent, *values) = parts(chunk)
+        decays = _decays(exponent, affine.base2)
+        natural = _scanned(exponent)[-1] * (math.log(2.0) if affine.base2 else 1.0)
+        given = (*decays, *values)
+        key = (affine.base2, bool(affine.corrections), *((value.shape, str(value.dtype)) for value in given))
         if key not in splits:
             h = jax.ShapeDtypeStruct(shape, dtype)
-            given = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in values]
-            splits[key] = carry.split(functools.partial(_chunk, affine.base2, bool(affine.corrections)), h,
-                                      given, (1, 2), saturation=saturation)
-        return Prepared(splits[key].prepare(*values), splits[key])
+            avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
+            splits[key] = carry.split(functools.partial(_chunk, bool(affine.corrections)), h, avals, (1,),
+                                      saturation=saturation, ranges=ranges(chunk, affine))
+        return Prepared((natural, splits[key].prepare(*given)), splits[key])
 
     def step(state, prepared):
         decay, h = state
-        leaving, natural = prepared.split.carry(prepared.values, h)
+        natural, values = prepared.values
+        (leaving,) = prepared.split.carry(values, h)
         return decay + natural, leaving
 
     def mapped(prepared, state):
-        (outputs,) = prepared.split.emit(prepared.values, state[1])
+        (outputs,) = prepared.split.emit(prepared.values[1], state[1])
         return outputs
 
     def merge(a, b, operands):
@@ -236,16 +265,19 @@ class Prepared:
     split: carry.Split
 
 
-def _chunk(base2: bool, corrects: bool, h, exponent, B, U, s, C, Q, R):
-    """A chunk's outputs, the state it leaves and its exponents' sum in natural units, from the state `h`
-    entering it and its tokens' values (`_token`): the module's forms, the solve where a token corrects the
-    state, which `carry.split` splits."""
-    decays = _decays(exponent, base2)
+DECAYS = 4
+"""The chunk function's leading operands: its decays (`_Decays`' four fields)."""
+
+
+def _chunk(corrects: bool, h, entering, to_last, whole, between, B, U, s, C, Q, R):
+    """A chunk's outputs and the state it leaves, from the state `h` entering it, its decays (`_Decays`'
+    fields, each at most 1) and its tokens' values (`_token`): the module's forms, the solve where a token
+    corrects the state, which `carry.split` splits."""
+    decays = _Decays(entering=entering, to_last=to_last, whole=whole, between=between)
     w = _corrected(decays, B, U, s, C, h) if corrects else U
     carried = float32_einsum("tk,tv->kv", B * decays.to_last, w)
-    natural = _scanned(exponent)[-1] * (math.log(2.0) if base2 else 1.0)
     outputs = float32_matmul(Q * decays.entering, h) + float32_matmul(_paired(Q, B, decays.between), w) + R
-    return outputs, decays.whole[:, None] * h + carried, natural
+    return outputs, decays.whole[:, None] * h + carried
 
 
 def _producer(jaxpr: jcore.Jaxpr, var):

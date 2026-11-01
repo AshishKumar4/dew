@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
-import math
 import time
 from collections.abc import Callable, Iterator, Mapping
 
@@ -286,8 +285,9 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
 def stated(graph: EGraph, region: terms.Region) -> None:
     """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s): each term's
     shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one axis, which
-    literals are powers of two or one, the primitives a stable rule writes, and which values its range facts
-    bound tame (`rules.tame`)."""
+    literals are powers of two or one, the primitives a stable rule writes, each term's magnitude
+    (`rules.log2_bound`, `rules.degree`), the magnitudes the program reaches (`rules.reaches`), which a
+    reordering's new intermediates are held under (§6.3), and each extent's power of two (`rules.log2_of`)."""
     for term, extent in region.shapes:
         graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent))))
     arithmetic = (jax.lax.add_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
@@ -303,10 +303,16 @@ def stated(graph: EGraph, region: terms.Region) -> None:
                 graph.register(rules.along(i64(index), i64(missing[0])))
     for name, index in region.stock.items():
         graph.register(set_(rules.stock(String(name))).to(i64(index)))
-    extent = max((size for _, sizes in region.shapes for size in sizes), default=1)
-    for term, _ in region.shapes:
-        if region.bounds[str(term)] * max(extent, 1) <= math.sqrt(region.limit):
-            graph.register(rules.tame(term))
+    reached = set()
+    for term, sizes in region.shapes:
+        for size in sizes:
+            graph.register(set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())))
+        bound = region.magnitudes.get(str(term))
+        if bound is not None:
+            graph.register(*rules.made(term, i64(bound.log2), [i64(each) for each in bound.degrees]))
+            reached.add(bound)
+    for bound in reached:
+        graph.register(rules.reaches(i64(bound.log2), *(i64(each) for each in bound.degrees)))
     for index, value in enumerate(region.literals):
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):

@@ -584,7 +584,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             if derived_on():
                 # Behind the switch, the portable math's forms derived from the token update.
                 return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
-                                    chunk_size=chunk_size, dtype=work)
+                                    chunk_size=chunk_size, dtype=work, bound=hooks.inverse_bound)
             group = value.shape[2] // key.shape[2]
             if group > 1:
                 query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -762,7 +762,7 @@ portable math, whose forms are those derived from the token update behind the sw
 
 
 def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,
-                 chunk_size: int, dtype):
+                 chunk_size: int, dtype, bound: float | None = None):
     """The recurrence over chunks by the forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
     carry alone in sequence): each value head's update `h = D h - beta k (k^T D h) + beta
@@ -770,7 +770,9 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
     head's or each key's own, read `scale q^T h`; `(output, final memory)` in `dtype`, the memory entering
     `state` (zero where None). A length off the chunk grid is padded with tokens that leave the memory as it
     was (zero keys and write gates, a unit decay). `starts` `[B, S]`, where given, marks packed documents'
-    first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`)."""
+    first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`). `bound`, the layer's
+    write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is the
+    declaration's range facts (`scan.Scan.ranges`)."""
     from dew.algebra import SATURATION, scan
 
     group = value.shape[2] // key.shape[2]
@@ -794,8 +796,10 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
     reset = None if starts is None else "first"
     declared = axes if reset is None else {**axes, reset: ("time",)}
+    ranges = {} if bound is None else {"k": 1.0, "beta": bound}
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
-                                       state=((width, columns), dtype), reset=reset), saturation=SATURATION)
+                                       state=((width, columns), dtype), reset=reset, ranges=ranges),
+                             saturation=SATURATION)
     chunks = -(-length // chunk_size)
     padded = chunks * chunk_size - length
 
