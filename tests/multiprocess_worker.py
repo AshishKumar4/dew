@@ -772,57 +772,6 @@ def mode_fit(args) -> dict:
     }
 
 
-def mode_read_rounds(args) -> dict:
-    """The rounds of agreement a pool's fit of the affine regression runs, for a run of `--steps` steps
-    and one of twice as many, over each stream a fit reads in a pool: a finite global order (12 records
-    a step's batch, repeated twice, read to its end), which every share runs out of at the same read;
-    arrays handed whole, the same batch every step; a Grain map dataset handed as it is, repeated without
-    end; and an endless order a cooldown branches from halfway, the branch half the run long. Each kind's
-    rounds over its two runs, the difference the steps of the longer run add, which a read agreed at
-    each step makes one a step."""
-    import grain.python as pygrain
-    import jax
-    import optax
-    from affine_run import FEATURES, Regression
-
-    from dew import _coordination
-    from dew.data import Memory
-    from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
-    from dew.training import Cooldowns, MeshSpec, Trainer
-
-    def rows(count: int) -> dict[str, np.ndarray]:
-        x = np.repeat(np.arange(count, dtype=np.float32)[:, None], FEATURES, axis=1) / count
-        return {"x": x, "y": 2 * x[:, :2]}
-
-    def rounds(kind: str, steps: int) -> int:
-        trainer = Trainer(Regression(), optax.inject_hyperparams(optax.sgd)(learning_rate=1e-2),
-                          key=jax.random.key(0), mesh=MeshSpec())
-        flags: dict = {"steps": 2 * steps}
-        if kind == "global":
-            data = compile(Pipeline(Memory(rows(BATCH * steps))).repeat(2).batch(BATCH), seed=0,
-                           loading=Loading(workers=0))
-            # More steps than the order holds: the run ends where every share runs out of it.
-            flags["steps"] = 4 * steps
-        elif kind == "whole":
-            data = rows(BATCH)
-        elif kind == "map":
-            data = pygrain.MapDataset.source([{name: column[index] for name, column in rows(BATCH).items()}
-                                              for index in range(BATCH)]).batch(BATCH)
-        else:
-            data = compile(Pipeline(Memory(rows(BATCH))).shuffle(0).repeat().batch(BATCH), seed=0,
-                           loading=Loading(workers=0))
-            flags.update(validation=Pipeline(Memory(rows(BATCH))).batch(BATCH),
-                         cooldowns=Cooldowns(at=(steps,), length=steps))
-        before = next(_coordination._agreements)
-        state = trainer.fit(data, log_every=10 * steps, **flags)
-        assert int(state.step) == 2 * steps, (kind, int(state.step))
-        return next(_coordination._agreements) - before - 1
-
-    return {kind: [rounds(kind, steps) for steps in (args.steps, 2 * args.steps)]
-            for kind in ("global", "whole", "map", "cooldown")}
-
-
 def mode_pool_refusals(args) -> dict:
     """What a pool refuses on every process before any trains on it, each a
     fit of the affine regression over a stream that differs on process 1
@@ -2483,7 +2432,6 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "evaluation_kept": mode_evaluation_kept,
          "evaluation_clocks": mode_evaluation_clocks,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
-         "read_rounds": mode_read_rounds,
          "fp8_sites": mode_fp8_sites}
 
 
