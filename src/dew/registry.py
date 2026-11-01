@@ -81,8 +81,6 @@ if TYPE_CHECKING:
     from dew.objectives.rl.control import ControlRollout
     from dew.objectives.rl.dreamer import DreamerRollout
     from dew.optim import ScheduleBase
-    from dew.rl.env import Env
-    from dew.rl.simulator import Simulator
     from dew.sampling.solvers import Solver
 
 # A type annotation as a value: a class, a union of them, a subscripted
@@ -1336,10 +1334,8 @@ source_kinds: Aliases[type[SourceKind], SourceKind] = Aliases("source", {
 
 
 models: Aliases[type[nn.Module], nn.Module] = Aliases("model", {
-    "actor_critic": "dew.objectives.rl.control:ActorCritic",
     "causal_transformer": "dew.nn.backbones.causal_transformer:CausalTransformer",
     "diffusion_gemma": "dew.nn.diffusion_gemma:DiffusionGemma",
-    "dreamer_world_model": "dew.objectives.rl.dreamer:WorldModel",
     "edm2_unet": "dew.nn.backbones.edm2:EDM2UNet",
     "flux2_transformer": "dew.nn.backbones.flux2:Flux2Transformer",
     "flux_transformer": "dew.nn.backbones.flux:FluxTransformer",
@@ -1498,23 +1494,25 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
-    "env": "dew.config.env:EnvRunConfig",
+    "env": "dew.objectives.rl.config:EnvRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
     "lm": "dew.config.lm:LMRunConfig",
 }, base="dew.config:RunConfig")
 
 
-envs: Aliases[type | Callable[..., Configured], Env | Simulator] = Aliases("env", {
+# An environment's types live in `dew.rl`, which only `dew.rl` and `dew.objectives.rl` import
+# (docs/design/architecture.md), so the table's type names none.
+envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
     "flight": "dew.rl.flight:FlightEnv",
     "gate_race": "dew.rl.flight:GateRace",
     "playground": "dew.rl.playground:Playground.load",
 })
-"""The environments an environment run names (`dew.config.env.EnvConfig`): a JAX `Env` class, a host
-`Simulator` class, or a function or classmethod that returns one; any other by its import path."""
+"""The environments an environment run names (`dew.objectives.rl.config.EnvConfig`): a JAX `Env` class, a
+host `Simulator` class, or a function or classmethod that returns one; any other by its import path."""
 rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | ControlRollout] = Aliases(
     "rollout", {"control": "dew.objectives.rl.control:ControlRollout",
                 "dreamer": "dew.objectives.rl.dreamer:DreamerRollout"})
-"""The rollouts an environment run collects its batches with (`dew.config.env.RolloutConfig`)."""
+"""The rollouts an environment run collects its batches with (`dew.objectives.rl.config.RolloutConfig`)."""
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,

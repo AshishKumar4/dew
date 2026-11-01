@@ -1,6 +1,6 @@
 """The FPV gate race's training phases (`dew.rl.flight` in JAX; images by HyperLux, `dew.rl.hyperlux`), each
-an environment run (`dew.config.env.EnvRunConfig`) under OUT, which the phase run again goes on from, beside a
-JSON report.
+an environment run (`dew.objectives.rl.config.EnvRunConfig`) under OUT, which the phase run again goes on
+from, beside a JSON report.
 
     python tools/fpv_race.py check OUT --assets A        The renderer on this GPU: frames of the race, and
                                                           frames a second at 16, 256 and 1024 drones, and
@@ -56,7 +56,7 @@ from flax import serialization, traverse_util
 
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
-from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
+from dew.objectives.rl.config import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
 
@@ -124,8 +124,8 @@ def teacher_run(out: Path, *, hz: float, level: float, drones: int = 4096) -> En
     every = SCORED_EVERY * rollout["epochs"] * rollout["minibatches"]
     return EnvRunConfig(
         env=EnvConfig("flight", flight, count=drones),
-        model=ModelConfig("actor_critic", {"policy_layers": [256] * 3, "value_layers": [256] * 4,
-                                           "spread": 0.2}),
+        model=ModelConfig("dew.objectives.rl.control:ActorCritic",
+                          {"policy_layers": [256] * 3, "value_layers": [256] * 4, "spread": 0.2}),
         objective=ObjectiveConfig("control_ppo", {"discount": 0.99 ** (60 / hz), "lam": 0.95 ** (60 / hz),
                                                   "clip": 0.2, "entropy_cost": 1e-4, "reads": ["teacher"]}),
         rollout=RolloutConfig("control", rollout), optim=OptimConfig(optimizer="adam", learning_rate=3e-4,
@@ -414,7 +414,7 @@ class World:
                     "context": self.length, "dtype": "bfloat16"}
         model = {"conv_depth": 64, "units": 1024, "reads": "image", "dtype": "bfloat16",
                  "auxiliary": [list(head) for head in AUXILIARY], "dynamics": dynamics}
-        return dataclasses.replace(run, model=ModelConfig("dreamer_world_model", model))
+        return dataclasses.replace(run, model=ModelConfig("dew.objectives.rl.dreamer:WorldModel", model))
 
 
 def _staged(world: World, stage: str, updates: int, every: int | None, report: dict, judge, races: tuple,
@@ -426,13 +426,13 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
     stage is prepared once and each chunk trains it on, its rollout's environments and replay kept between
     them. A score is written before the checkpoint that commits it, so a stage stopped between the two scores
     it again. Returns the stage's last state, its agent and the level it ended at."""
-    from dew.objectives.rl.dreamer import DreamerRollout
+    from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     done = _latest(world.out / stage)
     points = [point for point in report.get(stage, []) if point["updates"] <= done]
     prepared = world.run(stage, level).prepare()
     rollout, agent = prepared.rollout, prepared.objective
-    assert isinstance(rollout, DreamerRollout)
+    assert isinstance(rollout, DreamerRollout) and isinstance(agent, DreamerV3Objective)
     began, before = time.perf_counter(), points[-1]["seconds"] if points else 0.0
     state = None
     while state is None or done < updates:
@@ -446,7 +446,7 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
         point = {"updates": done, "environment_steps": rollout.environment_steps, "level": level,
                  "seconds": before + time.perf_counter() - began,
                  "episode_return": rollout.metrics["episode_return"],
-                 **judge(agent.act, state.variables, agent.memory(world.drones), jax.random.key(done))}
+                 **judge(agent.greedy, state.variables, agent.memory(world.drones), jax.random.key(done))}
         points.append(point)
         report[stage] = points
         print(json.dumps(point), flush=True)
@@ -463,11 +463,11 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
     """The world phase's stages (`World.run`) in turn, each going on from its checkpoints: pretraining for
     `pretrain_updates` updates, DAgger for `dagger_updates`, scored every 2,000, and online training for
     `environment_seconds` of flight over all its drones (FlyDreamer's 1M steps at 30 Hz), scored every 10,000;
-    the teacher and each stage's last agent scored alike (world.json), the cloned, DAgger and online agents'
-    first drones filmed (cloned.npz, dagger.npz, video.npz), each on an evaluation race of its own, on the
-    training families and, held out, the others. Every race is at the curriculum's `level` (its courses'
-    difficulty and its drones' randomization), which the scored stages raise as the teacher's curriculum did
-    (`teacher`) toward 1."""
+    the teacher and each stage's last agent scored alike, each flying greedy (world.json), the cloned, DAgger
+    and online agents' first drones filmed (cloned.npz, dagger.npz, video.npz), each on an evaluation race
+    of its own, on the training families and, held out, the others. Every race is at the curriculum's `level`
+    (its courses' difficulty and its drones' randomization), which the scored stages raise as the teacher's
+    curriculum did (`teacher`) toward 1."""
     families = TRAINING if world.highlight else (("loop", 1.0),)
 
     def raced(families):
@@ -501,7 +501,7 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
                                      strict=True):
         state, agent, level = _staged(world, stage, updates, every, report, judge, (judged, held_out), level)
         report["level"] = level
-        report[f"{stage}_agent"] = judge(agent.act, state.variables, agent.memory(world.drones),
+        report[f"{stage}_agent"] = judge(agent.greedy, state.variables, agent.memory(world.drones),
                                          jax.random.key(7 + STAGES.index(stage)),
                                          film=world.out / filmed[stage])
         print(json.dumps({key: value for key, value in report.items() if not isinstance(value, list)}),

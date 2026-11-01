@@ -171,10 +171,10 @@ class EpisodesConfig:
 @dataclasses.dataclass(frozen=True)
 class EnvRunConfig(RunConfig):
     """A run that trains an agent in an environment: the shared run fields, the environment (`env`), the
-    agent's networks (`model`: a `dreamer_world_model`, its `dynamics` a nested `TSSM` record where it has
-    one, or an `actor_critic`) and objective (`objective`: `dreamer_v3` or `control_ppo`, its imitation
-    among its arguments), the rollout's settings (`rollout`), an optional teacher (`teacher`), the saved
-    run the agent starts from (`pretrained`) and the episodes each validation flies (`episodes`).
+    agent's networks (`model`: a `WorldModel`, its `dynamics` a nested `TSSM` record where it has one, or an
+    `ActorCritic`, each by its import path) and objective (`objective`: `dreamer_v3` or `control_ppo`, its
+    imitation among its arguments), the rollout's settings (`rollout`), an optional teacher (`teacher`), the
+    saved run the agent starts from (`pretrained`) and the episodes each validation flies (`episodes`).
 
     The environment is what the run reads, as data is a run's, so a run resumed under its name may change
     it (`RESUMABLE`): a curriculum resumes the run at a new difficulty. The run has no epochs, so its
@@ -184,7 +184,8 @@ class EnvRunConfig(RunConfig):
                                                    "teacher": "teacher"}
     RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "env", "episodes")
 
-    model: ModelConfig = dataclasses.field(default_factory=lambda: ModelConfig("dreamer_world_model"))
+    model: ModelConfig = dataclasses.field(
+        default_factory=lambda: ModelConfig("dew.objectives.rl.dreamer:WorldModel"))
     """The agent's networks. The run derives from its environment each width the class declares: its
     `action_size`, and a world model's `observation_size` and `image` from the view it `reads`; a record
     that states one is refused. A run that starts from a saved run trains that run's model, and names none."""

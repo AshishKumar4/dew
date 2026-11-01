@@ -1,7 +1,7 @@
-"""Environment runs built from their records (`dew.config.env.EnvRunConfig`): an agent trained in the gate
-race as the same run composed in Python trains, its record read back training it again, a teacher saved as
-a run labelling and demonstrating the steps its own policy would, stages chained from the run before them,
-a resume ending where the run that never stopped ends, and each setup the kind refuses."""
+"""Environment runs built from their records (`dew.objectives.rl.config.EnvRunConfig`): an agent trained in
+the gate race as the same run composed in Python trains, its record read back training it again, a teacher
+saved as a run labelling and demonstrating the steps its own policy would, stages chained from the run before
+them, a resume ending where the run that never stopped ends, and each setup the kind refuses."""
 
 import dataclasses
 import json
@@ -14,8 +14,8 @@ import pytest
 from test_env_rollout import evaluation_key
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
-from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.nn.kernels import generation
+from dew.objectives.rl.config import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfig, TeacherConfig
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
 from dew.objectives.rl.tssm import TSSM
@@ -26,6 +26,9 @@ from dew.rl.env import Batched
 from dew.rl.evaluation import episodes
 from dew.rl.flight import TEACHER, FlightEnv, GateRace, Racing
 from dew.training import Trainer
+
+WORLD_MODEL, ACTOR_CRITIC = "dew.objectives.rl.dreamer:WorldModel", "dew.objectives.rl.control:ActorCritic"
+"""The agent's networks, by their import paths."""
 
 RACING = {"families": [["loop", 1.0]], "obstacles": 0, "episode_seconds": 0.4, "hz": 30.0}
 """A race of loops, each episode cut after 12 steps, so the runs' few steps restart episodes."""
@@ -53,7 +56,7 @@ def flight(count: int = 16) -> EnvConfig:
 
 def teacher_run(root: Path, steps: int = 2) -> EnvRunConfig:
     """PPO over the race's privileged view, as tools/fpv_race.py's teacher, at a test's size."""
-    model = ModelConfig("actor_critic", {"policy_layers": [16], "value_layers": [16]})
+    model = ModelConfig(ACTOR_CRITIC, {"policy_layers": [16], "value_layers": [16]})
     return EnvRunConfig(env=flight(), model=model,
                         objective=ObjectiveConfig("control_ppo", {"discount": 0.9, "reads": ["teacher"]}),
                         rollout=RolloutConfig("control", {"unroll_length": 4, "epochs": 1, "minibatches": 2}),
@@ -68,7 +71,7 @@ def teacher_policy() -> ControlPPOObjective:
 def student(root: Path, steps: int, **fields) -> EnvRunConfig:
     """A Dreamer agent of the drone's state in the race, at a test's size."""
     rollout = {"batch": 8, "length": 8, "train_ratio": 16.0, "prefill": 8, "capacity": 64}
-    run = EnvRunConfig(env=flight(8), model=ModelConfig("dreamer_world_model", {**TINY, "reads": "state"}),
+    run = EnvRunConfig(env=flight(8), model=ModelConfig(WORLD_MODEL, {**TINY, "reads": "state"}),
                        rollout=RolloutConfig("dreamer", rollout), optim=OPTIM, trainer=trainer(root, steps))
     return dataclasses.replace(run, **fields)
 
@@ -115,7 +118,7 @@ def dreamer(root: Path):
 def transdreamer_race(root: Path):
     """TransDreamer's agent in the race a host simulator steps (`GateRace`, no images)."""
     race = {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": 8}
-    model = ModelConfig("dreamer_world_model", {**TINY, "reads": "state", "dynamics": DYNAMICS})
+    model = ModelConfig(WORLD_MODEL, {**TINY, "reads": "state", "dynamics": DYNAMICS})
     run = student(root, 3, env=EnvConfig("gate_race", race), model=model)
     objective = DreamerV3Objective(world_model(dynamics=TSSM(**DYNAMICS)))
     simulator = GateRace(None, racing(), views=VIEWS, count=8)
@@ -168,7 +171,7 @@ def test_a_command_line_names_the_run_its_record_does(tmp_path):
     alone (`--set env.difficulty=`), is the run its record states."""
     args = ["--env.name", "flight", "--env.count", "16", "--env.fields", json.dumps(
                 {"racing": RACING, "views": list(VIEWS)}),
-            "--model", "actor_critic", "--model.policy-layers", "16", "--model.value-layers", "16",
+            "--model", ACTOR_CRITIC, "--model.policy-layers", "16", "--model.value-layers", "16",
             "--objective", "control_ppo", "--objective.discount", "0.9", "--objective.reads", "teacher",
             "--rollout.name", "control", "--rollout.fields", json.dumps(
                 {"unroll_length": 4, "epochs": 1, "minibatches": 2}),
@@ -262,7 +265,7 @@ REFUSED = {
     "labels imitated without a teacher": {"objective": ObjectiveConfig("dreamer_v3", {"imitation": 1.0,
                                                                                       "imitates": LABEL})},
     "a teacher that neither labels nor demonstrates": {"teacher": True},
-    "a width the environment states": {"model": ModelConfig("dreamer_world_model",
+    "a width the environment states": {"model": ModelConfig(WORLD_MODEL,
                                                             {**TINY, "reads": "state", "action_size": 4})},
     "a simulator batched again": {"env": EnvConfig("gate_race", {"renderer": None, "racing": RACING,
                                                                  "views": list(VIEWS), "count": 8}, count=8)},
@@ -272,7 +275,7 @@ REFUSED = {
     "an unbatched environment": {"env": EnvConfig("flight", {"racing": RACING, "views": list(VIEWS)})},
     "another objective's rollout": {"rollout": RolloutConfig("control")},
     "a teacher for a rollout that takes none": {"teacher": "demonstrates", "objective": ObjectiveConfig(
-        "control_ppo", {"reads": ["state"]}), "model": ModelConfig("actor_critic"),
+        "control_ppo", {"reads": ["state"]}), "model": ModelConfig(ACTOR_CRITIC),
         "rollout": RolloutConfig("control", {"unroll_length": 4, "minibatches": 2})},
     "a model beside the run it starts from": {"pretrained": True},
 }
