@@ -55,19 +55,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources, tail as tail_of
+from dew.nn.kernels.templates import bundles, mosaic, resources, tail as tail_of
 from dew.nn.kernels.templates.gemm import cost, rows_padded
-
-FAMILY: mosaic.Family = mosaic_sm90.WGMMA
-"""Hopper's warpgroup MMA bundle, a wgmma tile's (`family_of`)."""
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
-    """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`), mma.sync's a dtype's
-    with its warps arranged for a consumer's share of the tile (`mosaic_sm80.Mma.for_tile`)."""
-    if tiles.family != mosaic_sm80.Mma.name:
-        return bundles.named(tiles.family, dtype)
-    return mosaic_sm80.Mma.for_tile(dtype, tiles.block_m // tiles.warpgroups, tiles.block_n)
+    """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`), for a consumer's share
+    of the tile (`mosaic.Issuer.specialized`)."""
+    return bundles.named(tiles.family, dtype).specialized(tiles.block_m // tiles.warpgroups, tiles.block_n)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,15 +96,13 @@ class Tiles:
         if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
             raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
                              "multiprocessors")
-        warpgroup = self.family in (mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name)
-        if not warpgroup and self.family != mosaic_sm80.Mma.name:
-            raise ValueError(f"{self}: Hopper's warpgroup MMA (a producer's or not), or Ampere's mma.sync")
-        if self.cluster > bundles.named(self.family, jnp.bfloat16).cluster:
+        family = bundles.named(self.family, jnp.bfloat16)
+        if self.cluster > family.cluster:
             raise ValueError(f"{self}: a cluster of at most its bundle's (`mosaic.Family.cluster`)")
-        wide = warpgroup and self.block_n > 256
-        if self.warpgroups == 2 and (self.block_m % 128 or wide):
-            # Each consumer's half of the rows is a role's, a multiple of 64 rows, and on warpgroup MMA at
-            # most 256 columns.
+        wide = family.widest_product is not None and self.block_n > family.widest_product
+        if self.warpgroups == 2 and (self.block_m % (2 * family.role_rows) or wide):
+            # Each consumer's half of the rows is a role's, and its columns at most one product's (warpgroup
+            # MMA's 256).
             raise ValueError(f"{self}: two warpgroups halve the tile's rows into whole roles")
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.

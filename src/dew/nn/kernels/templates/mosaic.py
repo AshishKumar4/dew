@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
+from typing import Self
 
 import jax
 from jax import lax, numpy as jnp
@@ -723,6 +724,12 @@ class Issuer[Accumulator](abc.ABC):
         """The rows a step of an operand its products read from registers transposed (a kernel gradient's
         `[rows, depth]` stage) takes at least: a role's (`role_rows`)."""
         return self.role_rows
+
+    def specialized(self, rows: int, columns: int) -> Self:
+        """The issuer for a consumer role's `rows` x `columns` share of a tile: itself, unless its layout
+        arranges its warps by the share (mma.sync's)."""
+        del rows, columns
+        return self
 
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,

@@ -9,6 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 from collections.abc import Callable
+from typing import Self
 
 import jax
 import jax.numpy as jnp
@@ -91,7 +92,7 @@ class Streams:
 class MmaIssuer(mosaic.Issuer[jax.Array]):
     """mma.sync's issuer and home for operands of `dtype`: accumulators in registers, products synchronous,
     each operand loaded into its fragments from shared memory (ldmatrix), its warps `m_warps` along a tile's
-    rows and the rest along its columns (JAX's `MMALayouts`; `Mma.for_tile`)."""
+    rows and the rest along its columns (JAX's `MMALayouts`; `specialized`)."""
 
     dtype: jnp.dtype
 
@@ -109,6 +110,18 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     operands_in_registers = True
 
     products_overlap = False
+
+    def specialized(self, rows: int, columns: int) -> Self:
+        # Its warps split `m_warps` along a warpgroup's `rows` and the rest along its `columns` (`MMALayouts`;
+        # each product states it, `plgpu.mma`'s `m_warps`): of the splits whose atom, `m_warps * 16` rows by
+        # `(4 // m_warps) * 8` columns, divides the share, the one reading its operands from shared memory
+        # fewest times a step, each warp reading its rows' share whole and its columns' share whole
+        # (`rows * (4 // m) + columns * m`), the most along the rows on a tie. A 128 x 128 share so splits
+        # 2 x 2 (512 reads a step, where four warps along its rows read 640), each warp holding half the
+        # right operand's fragments.
+        splits = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
+        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, -m)) if splits else 4
+        return dataclasses.replace(self, m_warps=m_warps)
 
     @property
     def transposed_rows(self) -> int:
@@ -460,19 +473,6 @@ class Mma(MmaIssuer, CpAsync):
     # one program took 1.04 to 1.50 of one's time on an A100 (CONSUMERS1), their shared copies leaner or
     # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
     consumers = 1
-
-    @classmethod
-    def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
-        """The bundle for a warpgroup's `rows` x `columns` of a tile, its warps split `m_warps` along the
-        rows and the rest along the columns (`MMALayouts`; each product states it, `plgpu.mma`'s
-        `m_warps`): of the splits whose atom, `m_warps * 16` rows by `(4 // m_warps) * 8` columns, divides
-        it, the one reading its operands from shared memory fewest times a step, each warp reading its
-        rows' share whole and its columns' share whole (`rows * (4 // m) + columns * m`), the most along
-        the rows on a tie. A 128 x 128 tile so splits 2 x 2 (512 reads a step, where four warps along its
-        rows read 640), each warp holding half the right operand's fragments."""
-        splits = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
-        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, -m)) if splits else 4
-        return cls(jnp.dtype(dtype), m_warps)
 
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
 
