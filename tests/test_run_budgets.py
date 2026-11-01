@@ -796,13 +796,15 @@ def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_
 
 class DrawingFurther:
     """A rollout that draws one batch past its step's (`draws_further`) and makes its step of that one,
-    or of the step's where the stream has run out."""
+    or of the step's where the stream has run out, each its rows as host code reads them (`local_rows`)."""
 
     draws_further = True
 
     def __call__(self, state, batch, key, further):
+        from dew.nn.inputs import local_rows
+
         drawn = further()
-        return batch if drawn is None else drawn
+        return {name: local_rows(column) for name, column in (batch if drawn is None else drawn).items()}
 
 
 @pytest.mark.parametrize("accumulation", [1, 2])

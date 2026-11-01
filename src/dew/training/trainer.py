@@ -1135,7 +1135,11 @@ class Trainer(Generic[Loss, Effects]):
         held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        given = placed_shapes(batch, placement) if mesh is not None else batch
+        # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
+        # arrays a step compiled ahead reads (`first_step_batch`) and one over the placed arrays a run steps
+        # are two texts of one program (`dew.training.ahead.program_of`), the types of a helper call's
+        # arguments, their shardings among them, telling its functions apart in the module.
+        given = placed_shapes(batch, placement)
         lower = Routed(functools.partial(
             lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
             *apart(prepared), given, part))

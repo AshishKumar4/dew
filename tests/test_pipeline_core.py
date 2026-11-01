@@ -2436,3 +2436,23 @@ def test_a_repeat_after_the_batch_replays_its_first_pass_draws_included(read):
         assert head + batches(resumed, 2) == expected
     finally:
         resumed.close()
+
+
+@pytest.mark.parametrize(("taken", "bounded", "workers", "pools", "alike"), [
+    (True, False, 0, {}, True), (True, False, 2, {}, False), (True, True, 0, {}, False),
+    (True, False, 0, {"0": 2}, False), (False, False, 2, {"0": 2}, True)])
+def test_a_version_7_streamed_plan_of_two_shares_reads_as_8s_where_8_reads_its_takes_alike(
+        taken, bounded, workers, pools, alike):
+    """A version 7 plan of a streamed mixture read by two shares, a member's order taking some of it or
+    not (a member's `Limit`, within the mixture's order): version 8 reads it as 7 did where no take reads
+    it, or no loading workers read it, a member's own pool among them, and it is no bound in examples (its
+    manifest's steps hold no `MarkConsumed`); a take read by workers, or a bound, 8 deals otherwise (row
+    3350's review)."""
+    from dew.data.plan import read_alike_at_8
+
+    steps = [{"identity": "Map(step=MarkConsumed())"}] if bounded else []
+    member = {"read": "streamed", "stages": ["Limit(count=5)"] if taken else ["Map(step=Shout())"]}
+    saved = {"version": 7, "order": {"read": "streamed", "corpora": [member, member]},
+             "members": {"0": "a", "1": "b"}, "manifest": {"steps": steps},
+             "topology": {"shares": 2, "share": 0, "workers": workers, "pools": pools}}
+    assert read_alike_at_8(saved) is alike

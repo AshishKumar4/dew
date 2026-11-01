@@ -81,7 +81,7 @@ class EMASpec(decay: optax.Schedule, select: PathFilter = <function everything>,
   .constant(cls, decay: float | None) -> EMASpec | None  [classmethod]
   .select(path: Path) -> bool
 class EvalSuite(data: Reader, metrics: Sequence[Metric] = (), every: int | str | Counted | None = None) -> None  [dew.training.evaluation]
-class Evaluation(step: int, split: str, scores: dict[str, float], coordinated_batches: int, records: int, event_key: tuple[int, ...], elapsed_seconds: float, previews: tuple[Artifact, ...], examples: int | None = None) -> None  [dew.training.evaluation]
+class Evaluation(step: int, split: str, scores: dict[str, float], coordinated_batches: int, records: int, event_key: tuple[int, ...], elapsed_seconds: float, previews: tuple[Artifact, ...], examples: int | None = None, real_token_share: float | None = None) -> None  [dew.training.evaluation]
   .branched(self) -> Evaluation
   .run(cls, objective: Objective[Loss, Effects], variables: Variables, batches: Reader | Dataset | None, *, key: int | jax.Array, metrics: Sequence[Metric] = (), step: int | jax.Array = 0, averaged: Variables | None = None, preview: bool = False, mesh: Mesh | None = None, split: str = 'val', schedule_step: int | jax.Array | None = None, loss: bool = False, training: Mapping[str, jax.Array] | None = None, warm: bool = False, updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None) -> Evaluation  [classmethod]
   .scalars: property -> dict[str, float]
@@ -204,7 +204,7 @@ class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.
   .stop(self, *, wait: bool = True) -> None
 class Representations(features: jax.Array, labels: jax.Array) -> None  [dew.artifacts]
   .replace(self, **updates)
-class Step(step: jax.Array, key: jax.Array, ema: Variables | None, training: bool = True, committed: jax.Array | None = None, example_key: jax.Array | None = None, example_index: jax.Array | None = None, example_count: int | None = None, tape: Mapping[str, jax.Array] | None = None, recorder: Recorder | None = None, record: bool = False, witness: Witness | None = None, qk_stats: bool = False, watched: Watched | None = None) -> None  [dew.objectives.base]
+class Step(step: jax.Array, key: jax.Array, ema: Variables | None, training: bool = True, committed: jax.Array | None = None, example_key: jax.Array | None = None, example_index: jax.Array | None = None, example_count: int | None = None, tape: Mapping[str, jax.Array] | None = None, recorder: Recorder | None = None, record: bool = False, witness: Witness | None = None, qk_stats: bool = False, equations: bool = False, watched: Watched | None = None) -> None  [dew.objectives.base]
   .boundary(self, name: str, value: jax.Array) -> jax.Array
   .examples(self, rows: int) -> jax.Array
   .places(self, rows: int) -> tuple[jax.Array, int]

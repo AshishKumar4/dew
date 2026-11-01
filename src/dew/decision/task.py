@@ -1247,6 +1247,11 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
     passes: PassTokens = field(default_factory=PassTokens, compare=False)
     """The tokens each pass shape's text passes computed and their rows held (`PassTokens.metrics`)."""
 
+    def metrics(self) -> dict[str, float]:
+        """Its passes' share of their tokens its rows held (`PassTokens.metrics`), as its server reports it
+        (`dew.inference.scoring.Metered`)."""
+        return self.passes.metrics()
+
     def planned(self) -> "_WirePlan":
         return _WirePlan(self.decide)
 

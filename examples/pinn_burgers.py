@@ -149,7 +149,7 @@ def main(config: Config) -> dict[str, float]:
     levels = 0 if config.model == "mlp" else 4 if config.smoke else 12
     steps, batch = (20, 64) if config.smoke else (config.steps, config.batch)
     objective = BurgersProfile(Profile(pyramid=levels))
-    optimizer = (gauss_newton(config.damping) if config.damping is not None else
+    optimizer = (gauss_newton(damping=config.damping) if config.damping is not None else
                  optax.adam(optax.cosine_decay_schedule(config.learning_rate, steps), eps=1e-15))
     points = Memory([{"point": np.zeros((), np.float64)}] * batch).repeat().batch(batch)
     trainer = Trainer(objective, optimizer, key=config.seed)
