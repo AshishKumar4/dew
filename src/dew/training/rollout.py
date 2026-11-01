@@ -80,7 +80,6 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
 
     if rollout is None:
         return run.closing(interval, batch, examples) if closes else (batch, None)
-    position = None
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
     batch = _hosted(batch)
@@ -88,15 +87,13 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
         made = clocked_rollout(rollout(state, _unclocked(batch), key, **further), batch, consumed)
-    if closes:
-        made, position = run.closing(interval, made, examples)
-    with run.held():
         prepared = marked(made)
         # The count the rollout's batch consumes is what it read, as `ConsumedCount`s count it.
         batch = shard_batch(mesh, prepared if CONSUMED_COUNT not in made else {
             **prepared, CONSUMED_COUNT: made[CONSUMED_COUNT]})
     interval.rollout_seconds += time.perf_counter() - began
-    return batch, position
+    # Placed, as a step's read batch is closed: what the stream's end leaves goes to the pool's first row.
+    return run.closing(interval, batch, examples) if closes else (batch, None)
 
 
 CLOCK = (EXAMPLES_CONSUMED, CONSUMED_COUNT, CLOSES_WINDOW)
@@ -118,13 +115,20 @@ def _hosted(batch: Batch) -> Batch:
 
 
 def _held(column) -> np.ndarray:
-    """This process's rows of a `column`: a placed column's shards it holds, each rows' once, in the order
-    of their rows, or a host column whole."""
+    """This process's block of a `column`: a placed column's shards it holds, each part once, laid where
+    they stand in it (its rows, and a sequence its devices split), or a host column whole."""
     if not isinstance(column, jax.Array):
         return np.asarray(column)
-    shards = {(shard.index[0].start or 0) if shard.index else 0: shard.data
+    shards = {tuple(index.indices(size)[:2] for index, size in zip(shard.index, column.shape, strict=True)):
+              shard.data
               for shard in column.addressable_shards}
-    return np.concatenate([np.asarray(shards[start]) for start in sorted(shards)], axis=0)
+    lows = [min(bounds[axis][0] for bounds in shards) for axis in range(column.ndim)]
+    highs = [max(bounds[axis][1] for bounds in shards) for axis in range(column.ndim)]
+    held = np.empty([high - low for low, high in zip(lows, highs, strict=True)], column.dtype)
+    for bounds, data in shards.items():
+        at = tuple(slice(start - low, stop - low) for (start, stop), low in zip(bounds, lows, strict=True))
+        held[at] = np.asarray(data)
+    return held
 
 
 class _Consumed:
