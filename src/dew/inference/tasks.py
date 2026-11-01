@@ -42,7 +42,6 @@ from dew.batch import (
     token_validity,
 )
 from dew.cache import persist_compilations
-from dew.data.text import Tokenizer
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
@@ -73,6 +72,9 @@ from dew.telemetry.profile import region
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    # A run processor's tokenizer is read through its methods alone, so image generation, which builds none,
+    # reads no tokenizer library (tests/test_imports.py's optional backends).
+    from dew.data.text import Tokenizer
     from dew.distributed.placement import Layout, MeshSpec
     from dew.quantization import Quantization
     from dew.registry import ModelConfig
