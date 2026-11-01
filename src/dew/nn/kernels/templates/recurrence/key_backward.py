@@ -326,7 +326,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
                 db_ref, *, streams, staging, landing):
-        pairs, squares, referenced = staging
+        pairs, squares, referenced, *padded = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         keyed = h // call.group * width
@@ -355,20 +355,40 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
 
             # Each pairs' gradient staged once in the step, its parts read by every product as they are and
             # transposed; the scores' scaled as their pairs were.
-            d_pairs = []
+            d_pairs, d_values = [], []
             for (name, scaled), buffers in zip((("scores", scale), ("system", 1.0)), squares, strict=True):
                 value = _tile(slots, name, square).value() * scaled
+                d_values.append(value)
                 d_pairs.append(Parts([family.staged(part, buffer)
                                       for part, buffer in zip(product.formed(value, parted.parts), buffers,
                                                               strict=True)], jnp.float32))
             query = _tile(slots, "queries", given).value().astype(jnp.float32)
             key = _tile(slots, "keys", given).value().astype(jnp.float32)
+
+            def gated(c):
+                return _tile(slots, "gates", gates).value(), _tile(slots, "lows", gates).value()
+
+            def shifted(c):
+                """The key block's keys and separated prefix staged below `SUB` rows of any values, each
+                offset's reads its loads shifted by it (`algebra.Shifted`)."""
+                behind, _ = padded
+                for i, value in enumerate((key, *algebra.separated(*gated(c)))):
+                    behind.at[i, pl.ds(algebra.SUB, CHUNK)][...] = value
+                return lambda e: tuple(family.tile_of(behind.at[i, pl.ds(algebra.SUB - e, CHUNK)])
+                                       for i in range(3))
+
+            def lower(e, value):
+                """`value`'s row `i` at row `i - e`: staged above `SUB` rows of any values, read shifted."""
+                _, ahead = padded
+                ahead.at[pl.ds(0, CHUNK)][...] = value
+                return family.tile_of(ahead.at[pl.ds(e, CHUNK)])
+
             found = {}
             algebra.key_decayed_pairs_back(
-                d_pairs, [lambda c: query, lambda c: key * betas[:, None]], lambda c: key, 1,
-                lambda c: (_tile(slots, "gates", gates).value(), _tile(slots, "lows", gates).value()),
+                d_pairs, [lambda c: query, lambda c: key * betas[:, None]], lambda c: key, 1, gated,
                 reference, Issuer(call, {"pairs": list(pairs)}).summed, chunk=CHUNK,
-                emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad))
+                emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad),
+                **({} if call.factored else {"shifted": shifted, "lower": lower, "d_values": d_values}))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
             for ref, grad in ((dq_ref, d_query), (dk_ref, d_keyed * betas[:, None] + d_key),
                               (dg_ref, query * d_query + key * (d_keyed * betas[:, None] - d_key))):
@@ -403,9 +423,13 @@ def _key_pairs_staged(call: _Call, keys: int) -> tuple:
     of a chunk's square in `_parted`'s form, and the sub-chunks' references' plain tile; a key block's
     landing."""
     parted = _parted(call)
+    # Where the call's pairs do not factor (`_Call.factored`), a key block's keys and separated prefix below a
+    # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads).
+    padded = () if call.factored else (plgpu.SMEM((3, algebra.SUB + CHUNK, keys), jnp.float32),
+                                       plgpu.SMEM((CHUNK + algebra.SUB, keys), jnp.float32))
     staging = ([_staging(parted, (CHUNK, keys))[0] for _ in range(2)],
                [_staging(parted, (CHUNK, CHUNK))[0] for _ in range(2)],
-               plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32))
+               plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32), *padded)
     return staging, {"block": _fp32(call).landing(CHUNK, keys)}
 
 

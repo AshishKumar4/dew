@@ -104,13 +104,15 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     head (the SSD's under the run's fast forms, its route's), the same DAG without the delta rule's at
     mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
-    delta rule, which no recording holds, a decay a key dimension without it or without a declared `floor`
-    its sub-chunks factor under (`algebra.factored_range`; the pairs' gradient factors each sub-chunk's own,
-    `algebra.key_decayed_pairs_back`), and an fp32 call's three parts (the accurate forms) take none."""
+    delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
+    (the accurate forms) take none. A decay a key dimension's `floor`, where it bounds a sub-chunk's range
+    (`algebra.factored_range`), factors each sub-chunk's own pairs; without one they are each their own decay
+    (`algebra.key_diagonal_pairs_back`)."""
+    del floor
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
     if per_key:
-        return delta and floor is not None and algebra.factored_range(floor)
+        return delta
     return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
 
 
