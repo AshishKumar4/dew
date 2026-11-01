@@ -100,10 +100,10 @@ def test_an_edit_to_the_function_a_file_called_reruns_it(ci, tmp_path, monkeypat
 def test_a_default_changed_on_the_function_a_file_called_reruns_it(ci, tmp_path, monkeypatch, cache_worker):
     """The control: a default of the one function the file calls, changed, reruns it, its call reading the
     default through the function's own unit."""
-    reused = task(ci, tmp_path, monkeypatch, cache_worker, {"test_pure.py": PURE})
-    assert reused() == [True]
-    (tmp_path / "src/pkg/pure.py").write_text("def double(x, by=2):\n    return x * by\n")
-    assert reused() == [False]
+    package = {**PACKAGE, "pkg/pure.py": "def double(x, by=2):\n    return x * by\n"}
+    for name in package:
+        (tmp_path / "src" / name).parent.mkdir(parents=True, exist_ok=True)
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {"test_pure.py": PURE}, package)
     assert reused() == [True]
     (tmp_path / "src/pkg/pure.py").write_text("def double(x, by=3):\n    return x * by\n")
     assert reused() == [False]
