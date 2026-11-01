@@ -256,10 +256,10 @@ class Mma(mosaic.Family):
         _one(consumers, clustered=bool(multicast))
         return Pipeline(blocks, stages, dict(swizzles or {}))
 
-    def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
-        # `emit_pipeline` allocates a walk's slots in its own scope.
-        return (), (tuple(plgpu.SMEM((streams.stages, *shape), dtype)
-                          for shape, dtype in streams.blocks.values()),)
+    def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
+        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.
+        slots = streams.stages if steps is None else min(streams.stages, steps)
+        return (), (tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values()),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
