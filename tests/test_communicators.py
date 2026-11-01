@@ -1,9 +1,9 @@
 """The room NCCL's communicators take outside XLA's pool (ledger 2901): measured once per configuration by a
-child process before the backend opens and kept in Dew's cache, the pool's share sized to leave it, a share
-the user set too high for it refused naming the bytes, and a compiled step whose collectives need more room
-than its GPUs have outside the pool refused before it runs, never left to stall in a collective. The
-measurement itself needs two GPUs, which a two-GPU run of the check makes; here it is the child's report, as the
-parent reads it."""
+child process before the backend opens and kept in Dew's cache, the pool's share held to leave it at NCCL's
+full speed, the user's share its upper bound, and a compiled step whose collectives need more room than its
+GPUs have outside the pool refused before it runs, never left to stall in a collective. The measurement
+itself needs two GPUs, which a two-GPU run of the check makes; here it is the child's report, as the parent
+reads it."""
 
 import json
 import os
@@ -27,20 +27,21 @@ MEMORY = {0: (79 * GIB, 80 * GIB), 1: (76 * GIB, 80 * GIB)}
 """Each GPU's free and total bytes before the backend opens: 79 and 76 of 80 GiB free."""
 
 
-def test_dews_share_leaves_the_communicators_room_and_the_users_is_held_to_it():
-    """Dew's share of each GPU leaves the room its step's communicators and the runtime take outside the
-    pool, the tightest GPU deciding, never above Dew's 95%; a share the user set within it is kept, and one
-    beyond it is refused naming each side's bytes."""
-    share = communicators.pool_share(NEEDS, MEMORY, requested=None, kinds=frozenset({0}))
-    # The tighter GPU decides: 76 GiB free less 1.5 GiB of room, to a thousandth below.
-    assert share * 80 * GIB <= 76 * GIB - GIB - GIB // 2 < (share + 0.001) * 80 * GIB
+def test_the_pool_takes_at_most_the_users_share_and_leaves_the_communicators_room():
+    """The pool's share of each GPU is the user's (XLA_PYTHON_CLIENT_MEM_FRACTION, Dew's 95% where they named
+    none) as an upper bound: it leaves the room its communicators and the runtime take outside the pool at
+    NCCL's full speed, the tightest GPU deciding, to a thousandth below, and NCCL is never slowed to fit. A
+    pool the communicators leave no room for at all is refused, naming each side's bytes."""
+    tightest = 76 * GIB - (3 * GIB + GIB // 2)
+    for requested in (None, 0.97):
+        share = communicators.pool_share(NEEDS, MEMORY, requested=requested, kinds=frozenset({0, 1}))
+        assert share * 80 * GIB <= tightest < (share + 0.001) * 80 * GIB
     roomy = {0: (79 * GIB, 80 * GIB)}
     assert communicators.pool_share(NEEDS, roomy, requested=None, kinds=frozenset({0})) == 0.95
-    assert communicators.pool_share(NEEDS, MEMORY, requested=0.9, kinds=frozenset({0})) == 0.9
+    assert communicators.pool_share(NEEDS, MEMORY, requested=0.5, kinds=frozenset({0, 1})) == 0.5
     with pytest.raises(CommunicatorRoom) as refused:
-        communicators.pool_share(NEEDS, MEMORY, requested=0.97, kinds=frozenset({0, 1}))
-    assert refused.value.needed == {0: 3 * GIB + GIB // 2, 1: 3 * GIB + GIB // 2}
-    assert refused.value.room == {0: 79 * GIB - int(0.97 * 80 * GIB), 1: 76 * GIB - int(0.97 * 80 * GIB)}
+        communicators.pool_share(NEEDS, {0: (3 * GIB, 80 * GIB)}, requested=0.97, kinds=frozenset({0, 1}))
+    assert refused.value.needed == {0: 3 * GIB + GIB // 2} and refused.value.room == {0: 3 * GIB}
 
 
 def test_a_measurement_is_paid_once_per_configuration(tmp_path, monkeypatch):
@@ -61,10 +62,25 @@ def test_a_measurement_is_paid_once_per_configuration(tmp_path, monkeypatch):
     assert taken == [configuration, other]
 
 
+def test_the_sized_pool_is_recorded_with_what_it_left_room_for(monkeypatch):
+    """A pool Dew sized is recorded as the user's bound, the share it took and each GPU's room it left, which
+    the fit check's record carries into the run record."""
+    monkeypatch.setattr(communicators, "needs_of", lambda: NEEDS)
+    monkeypatch.setattr(communicators, "gpu_count", lambda: 2)
+    monkeypatch.setattr(communicators, "gpu_memory", MEMORY.get)
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.97")
+    monkeypatch.delenv("XLA_PYTHON_CLIENT_PREALLOCATE", raising=False)
+    communicators.sized_pool()
+    sized = communicators.SIZED
+    assert sized is not None and sized["requested"] == 0.97
+    assert float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) == sized["share"] < 0.97
+    assert sized["needed"] == NEEDS.needed(frozenset({0, 1}), runtime=True)
+
+
 def test_a_compiled_steps_collectives_are_held_to_the_room_outside_the_pool():
     """A compiled step whose collectives (a collective's and a permute's, the communicators XLA keys apart)
-    need more than its GPUs have free outside the pool is refused before it runs, naming the bytes; one
-    within it passes."""
+    need more than its GPUs have free outside the pool is refused before it runs, naming the bytes, never
+    left to stall in a collective; one within it passes."""
     kinds = communicators.kinds_of("%x = f32[8] all-gather(...)\n%y = f32[8] collective-permute(...)")
     assert kinds == frozenset({0, 1})
     assert communicators.kinds_of("%x = f32[8] add(...)") == frozenset()
