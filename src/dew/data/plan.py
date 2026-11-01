@@ -598,7 +598,7 @@ class Plan:
         default_factory=dict, compare=False, repr=False)
     """Each of `members`' manifests, undigested, with the token stores the member reads, from which a
     resume makes the digests an earlier Dew made of it (`earlier_plan`); no part of the plan's record."""
-    version: ClassVar[int] = 8
+    version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
         return {

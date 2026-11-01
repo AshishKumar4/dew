@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import grain.experimental as experimental
 import grain.python as grain
 
-from dew._records import boolean, record
+from dew._records import boolean
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
 from .sources.base import Shard, ShardManifest
@@ -161,9 +161,9 @@ class _ShardPass[Place](grain.IterDataset):
 
     def __iter__(self) -> grain.DatasetIterator:
         if not len(self.root) or self.quota == 0:
-            # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
-            # raises).
-            return _Passing(None)
+            # A worker dealt no place or no row of the bound reads nothing; Grain's interleave of no
+            # dataset raises.
+            return grain.MapDataset.source(()).to_iter_dataset().__iter__()
         empty = _EmptyRun(self.name)
         rows = experimental.InterleaveIterDataset(
             self.root.map(_Reader(self.reader, empty)),
@@ -171,36 +171,7 @@ class _ShardPass[Place](grain.IterDataset):
             num_make_iter_threads=max(self.loading.threads, 1),
             make_iter_buffer_size=self.loading.read_buffer,
         )
-        limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
-        return _Passing(limited.__iter__())
-
-
-class _Passing(grain.DatasetIterator):
-    """A share's rows of its places (`_ShardPass`), or none where it was dealt none, its position its rows'
-    as `rows` or None. Grain saves an unstarted loading worker's position in the reading process, from the
-    share's whole read before the worker takes its slice, so a worker dealt nothing restores a position of
-    rows it never holds: it reads nothing, as it did unstarted."""
-
-    def __init__(self, rows: grain.DatasetIterator | None):
-        super().__init__(() if rows is None else rows)
-        self._rows = rows
-
-    def __next__(self):
-        if self._rows is None:
-            raise StopIteration
-        return next(self._rows)
-
-    def get_state(self) -> Mapping[str, object]:
-        return {"rows": None if self._rows is None else self._rows.get_state()}
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        rows = state["rows"]
-        if self._rows is not None and rows is not None:
-            self._rows.set_state(record(rows, "a share's rows"))
-
-    def close(self) -> None:
-        if self._rows is not None:
-            self._rows.close()
+        return (rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)).__iter__()
 
 
 class _EmptyRun:
