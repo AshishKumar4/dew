@@ -170,6 +170,55 @@ def checked(built: Callable, kernel: str) -> Callable:
 
 
 @dataclasses.dataclass(frozen=True)
+class Outbox:
+    """A stage each of a program's consumers writes its share of a step's sum into, which the program's
+    producer adds into global memory (TMA's reduction) and frees (FlashAttention 3's dQ store warp: the add's
+    waits off the consumers' walk): a consumer `claim`s its stage once the producer has read its last share,
+    at its step's start, and `put`s its share when formed (a claim beside the put, ptxas sank the wait below
+    the share's products and held them across it, 352 bytes spilled and C7512 serializing the walk's
+    products where at the step's start the walk spills none, a shared dQ at width 128); the producer
+    `take`s a step once every share is staged, adds each into its view and frees the stage once the adds
+    have read it (`streamed`'s `adds`), having freed it once before its first (`opened`). Allocated with
+    `outbox`."""
+
+    smem: jax.Ref
+    full: jax.Ref
+    empty: jax.Ref
+
+    def opened(self) -> None:
+        """The producer's every stage freed before its first step, so a consumer's first put waits as its
+        others do, with no branch of its own."""
+        for share in range(self.smem.shape[0]):
+            plgpu.barrier_arrive(self.empty.at[share])
+
+    def claim(self, share: int) -> None:
+        """Consumer share `share`'s stage, once the producer has read its last."""
+        plgpu.barrier_wait(self.empty.at[share])
+
+    def put(self, share: int, value: jax.Array) -> None:
+        """Consumer share `share`'s `value` staged in its claimed stage (`claim`)."""
+        self.smem.at[share][...] = value
+        plgpu.commit_smem()
+        plgpu.barrier_arrive(self.full.at[share])
+
+    def take(self, views: tuple) -> None:
+        """The producer's add of each staged share into its view of `views`, the stage freed once read."""
+        for share, view in enumerate(views):
+            plgpu.barrier_wait(self.full.at[share])
+            plgpu.copy_smem_to_gmem(self.smem.at[share], view, reduction_op="add")
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        for share in range(len(views)):
+            plgpu.barrier_arrive(self.empty.at[share])
+
+
+def outbox(shape: tuple, dtype, shares: int) -> list:
+    """An `Outbox`'s allocations for `pl.run_scoped`: a stage of `shape` in `dtype` a share, and its staged
+    and freed barriers, one a share."""
+    return [plgpu.SMEM((shares, *shape), dtype), plgpu.Barrier(num_barriers=shares),
+            plgpu.Barrier(num_barriers=shares)]
+
+
+@dataclasses.dataclass(frozen=True)
 class Exchange:
     """A shared-memory block each of a program's consumers stages its share of and every consumer then
     reads whole, a step at a time (FlashAttention 3's P and dS between its two MMA warpgroups at width 256):
@@ -222,13 +271,25 @@ def viewed(view: tuple, block: tuple, step):
                         for index, extent in zip(index_map(step), block, strict=True))]
 
 
-def streamed(rings: tuple, views, lo, hi) -> None:
+def streamed(rings: tuple, views, lo, hi, *, adds: tuple | None = None) -> None:
     """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
-    from its view of `views(step)`, then each ring drained."""
-    @pl.loop(lo, hi)
+    from its view of `views(step)`, then each ring drained; with `adds` (an `Outbox` and `targets(step)`, its
+    views of a step's sum), each step's sum added, a ring's depth behind its loads: a step's sum is staged
+    after its slots are released, so the producer waits for it no sooner than for the next load's slot."""
+    lag = min(ring.stages for ring in rings) if adds is not None else 0
+    if adds is not None:
+        adds[0].opened()
+
+    @pl.loop(lo, hi + lag)
     def _(index):
-        for ring, view in zip(rings, views(index), strict=True):
-            ring.load(ring.turn(index - lo), view)
+        @pl.when(index < hi)
+        def _():
+            for ring, view in zip(rings, views(index), strict=True):
+                ring.load(ring.turn(index - lo), view)
+
+        if adds is not None:
+            box, targets = adds
+            pl.when(index - lag >= lo)(lambda: box.take(targets(index - lag)))
 
     for ring in rings:
         ring.drain(hi - lo)
@@ -856,9 +917,10 @@ class Issuer[Accumulator](abc.ABC):
         time (the left operand's it holds a step deep)."""
         return depth
 
-    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
-        """The right operand's depth held in registers, by its storage orientation."""
-        del transposed
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
+        """The right operand's depth held in registers, by its storage orientation and its stage's swizzle
+        (bytes; the family's default staging where None)."""
+        del transposed, swizzle
         return self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int) -> int:
@@ -1122,6 +1184,12 @@ class Transport[Allocated, Opened](abc.ABC):
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
     of 128', R9-gpu-a100): a step reads a side vector it does not copy from global memory instead."""
 
+    adds_vectors: bool = True
+    """Whether `added` takes a vector of fewer entries than a warpgroup's threads (TMA's reduction from shared
+    memory), where Mosaic GPU refuses atomic stores from a layout that replicates its entries across
+    threads (mma.sync's row and column layouts): a program writes such a sum to a place of its own
+    instead."""
+
     cluster: int = 1
     """The programs a cluster of the family's launch takes where they read a block in common (`kernel`'s
     `cluster`), each loading its share of the block multicast into every one's shared memory (`streams`'
@@ -1233,8 +1301,9 @@ class Transport[Allocated, Opened](abc.ABC):
         self.roles(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
 
     @abc.abstractmethod
-    def stream(self, streams, views: dict, lo, hi) -> None:
-        """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one."""
+    def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
+        """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one,
+        and with `adds` each step's sum the consumers stage added (`streamed`)."""
 
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
@@ -1460,14 +1529,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
 
-    def stream(self, streams, views: dict, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
         rings = tuple(streams.values())
 
         def tiles(index):
             return tuple(viewed(views[name], ring.block, index)
                          for name, ring in zip(streams, rings, strict=True))
 
-        streamed(rings, tiles, lo, hi)
+        streamed(rings, tiles, lo, hi, adds=adds)
 
     def output_staging(self, outputs: tuple, consumers: int) -> list:
         # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).
@@ -1754,7 +1823,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         del consumers, producer
         return consumer(lax.axis_index("wg"))
 
-    def stream(self, streams, views: dict, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
         raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:

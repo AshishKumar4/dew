@@ -283,7 +283,8 @@ def _attend_backward(longest, scale, causal, window, residuals, grad):
         out = _sunk(out, lse, starts, sinks)
         lse = jnp.logaddexp(lse, sinks.astype(jnp.float32)[:, None])
     dq, dk, dv = _backward(grad, query, key, value, out, lse, starts, longest, scale, causal, window)
-    offsets = None if starts is None else tuple(np.zeros(part.shape, jax.dtypes.float0) for part in starts)
+    zeros = jax.custom_derivatives.zero_from_primal
+    offsets = None if starts is None else tuple(zeros(part) for part in starts)
     return dq, dk, dv, dsinks, offsets
 
 
