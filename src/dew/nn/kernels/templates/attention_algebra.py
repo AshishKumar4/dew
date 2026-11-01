@@ -499,11 +499,15 @@ def power2(x: jax.Array, k: jax.Array, reach: float = POWER2_REACH) -> jax.Array
     281 registers at its peak)."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -reach, reach)
     if reach <= 2 * 127:
-        # The half truncated from an exact multiply, `k` an integer only at each factor's bias: an int32 `k`
-        # halved (a shift or a floored division alike) spilled an A100's recurrence query_key launch 32
-        # bytes at the 27B gated delta net's training tiles, the float half none (gate_one, ledger 2519).
-        half = jnp.trunc(k * np.float32(0.5))
-        return x * exact_power2(half.astype(jnp.int32)) * exact_power2((k - half).astype(jnp.int32))
+        # The half truncated from an exact multiply by its conversion, `k` an integer only at each factor's
+        # bias: an int32 `k` halved (a shift or a floored division alike) spilled an A100's recurrence
+        # query_key launch 32 bytes at the 27B gated delta net's training tiles, the float half none
+        # (gate_one, ledger 2519); a float `trunc` compares each entry's sign, whose predicates over a
+        # 32-entry fragment pass a thread's seven and ptxas parks them in general registers, holding the
+        # exponent's parts live to their selects (an A100's hooked training forwards at width 128 spilled
+        # 496 to 588 bytes; the conversion's own truncation none).
+        half = (k * np.float32(0.5)).astype(jnp.int32)
+        return x * exact_power2(half) * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32))
     k = k.astype(jnp.int32)
     first = k // 3
     second = (k - first) // 2
@@ -1676,7 +1680,9 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     product with dO, as the reference's output is, so none overflows where the sums are near fp32's
     largest (a state's)."""
     over = jnp.where(shift < 0, 1.0, inverse(power2(total, -shift)))
-    state_weight = state_total * inverse(total)
+    # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
+    # and the state's share of D about the anchor with it (row 2466).
+    state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)

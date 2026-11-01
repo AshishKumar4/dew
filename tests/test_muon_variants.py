@@ -9,7 +9,8 @@ import optax
 import pytest
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import as_given, assert_as_exact
-from test_optim import UPDATE_SEEDS, assert_updates_as, at, muon_solver, stacked_draw
+from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_draw
+from torch_layout import node
 
 from dew.newton_schulz import NEWTON_SCHULZ, POLAR_EXPRESS_TABLE, orthogonalized, polar_express
 
@@ -58,7 +59,7 @@ def test_per_head_muonclip_clips_each_head_after_its_own_update():
         gamma = clip_scale(s_max, 100.0, guard=0.0)
         return {'layers_0': {'self_attn': {projection: {'kernel': clip_qk_kernel(
             params['layers_0']['self_attn'][projection]['kernel']
-            + at(updates, ('layers_0', 'self_attn', projection, 'kernel')), gamma, 4)}
+            + node(updates, ('layers_0', 'self_attn', projection, 'kernel')), gamma, 4)}
             for projection in ('q_proj', 'k_proj')}}}
 
     assert_as_exact(applied, paper, lambda seed: qk_tree(seed=seed), "MuonClip per head", seeds=CLIP_SEEDS,
@@ -175,7 +176,7 @@ def test_normuon_normalizes_each_neuron_as_its_paper_does():
 
     def draw(seed):
         grads = [drawn_tree(params, seed * 3 + index)[1] for index in range(3)]
-        return tuple(at(grad, path) for grad in grads)
+        return tuple(node(grad, path) for grad in grads)
 
     def dew(*grads):
         solver = muon_solver(optimizer_opts={"neuron_beta2": 0.95})
@@ -185,7 +186,7 @@ def test_normuon_normalizes_each_neuron_as_its_paper_does():
             given = jax.tree_util.tree_map_with_path(lambda key, leaf, grad=grad: grad if tuple(
                 entry.key for entry in key) == path else np.zeros_like(leaf), tree)
             updates, state = solver.update(given, state, tree)
-        return at(updates, path)
+        return node(updates, path)
 
     @as_given
     def paper(*grads):
@@ -208,9 +209,9 @@ def test_normuon_normalizes_a_half_precision_update_in_float32():
     norm = scale_by_neuron_norm(0.95)
     zero = {"w": jnp.zeros((64, 32), jnp.float16)}
     updated, _ = norm.update(zero, norm.init(zero))
-    assert not np.any(np.asarray(at(updated, ("w",))))
+    assert not np.any(np.asarray(node(updated, ("w",))))
     large = {"w": jnp.full((512, 512), 100.0, jnp.float16)}
     updated, _ = norm.update(large, norm.init(large))
-    assert np.all(np.isfinite(np.asarray(at(updated, ("w",)), np.float32)))
-    assert np.linalg.norm(np.asarray(at(updated, ("w",)), np.float64)) == np.linalg.norm(
+    assert np.all(np.isfinite(np.asarray(node(updated, ("w",)), np.float32)))
+    assert np.linalg.norm(np.asarray(node(updated, ("w",)), np.float64)) == np.linalg.norm(
         np.asarray(large["w"], np.float64))

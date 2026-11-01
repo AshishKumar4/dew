@@ -309,6 +309,50 @@ def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
     assert isinstance(verify.verify_mapping(config), verify.Unmapped)
 
 
+def test_a_probe_whose_source_builds_no_model_is_unavailable():
+    """A type whose shrunken config builds no causal LM (CWM asking for an attention backend this host
+    does not install) is `ProbeUnavailable`, wherever the probe first builds it, its depth's cut
+    (`verify.shallow`) included."""
+    from dew.interop import verify
+
+    config = {**tiny_config("cwm", sliding_window=4).to_dict(), "attn_implementation": "flash_attention_2"}
+    with pytest.raises(verify.ProbeUnavailable):
+        verify.verify_mapping(config)
+
+
+HY_V3 = {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1, "moe_intermediate_size": 32}
+"""A small HY-3's routing, its first layer dense and the rest routed."""
+
+
+@pytest.mark.parametrize(("model_type", "fields", "depth"), [
+    ("hy_v3", {**HY_V3, "num_hidden_layers": 80}, 2),
+    ("smollm3", {"num_hidden_layers": 36}, 4),
+    ("smollm3", {"num_hidden_layers": 36, "no_rope_layers": [1, 1, 1, 0] * 9}, 4),
+    ("smollm3", {"num_hidden_layers": 12, "no_rope_layers": [1] * 11 + [0]}, 12),
+])
+def test_the_probe_runs_the_first_layers_that_hold_every_kind_its_depth_builds(model_type, fields, depth):
+    """The probe runs a stated depth's fewest first layers that hold every kind of layer it builds
+    (`verify.shallow`), each stated per-layer list cut alike, and the stated depth where the last layer is
+    a kind of its own: HY-3's 80 layers as its dense first and a routed second, SmolLM3's 36 as its
+    first four, the fourth without positions, whether its config states the per-layer list or its class
+    derives it."""
+    from dew.interop import verify
+
+    source = verify.ModelSource(model_type)
+    config = tiny_config(model_type, **fields).to_dict()
+    shrunk = verify.shrink(config, source)
+    cut = verify.shallow(source, shrunk)
+    assert cut["num_hidden_layers"] == depth
+    stated = fields.get("no_rope_layers")
+    assert stated is None or cut["no_rope_layers"] == stated[:depth]
+    built = source.configured(cut)
+    assert built.num_hidden_layers == depth
+    if model_type == "smollm3":
+        assert built.no_rope_layers[depth - 1] == 0 and all(built.no_rope_layers[:depth - 1])
+    else:
+        assert built.mlp_layer_types == ["dense", "sparse"]
+
+
 def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     """tools/hf_coverage.py classifies a census of configs by the loader's own route (`source_route`),
     with the real verifier: a storage format the codecs refuse is refused before transformers is

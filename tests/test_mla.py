@@ -690,7 +690,7 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
                         steps=2, log_every=1)
 
     assert dict(trainer.device_mesh.shape) == {
-        "data": 8 // (fsdp * expert), "expert": expert, "fsdp": fsdp,
+        "diloco": 1, "data": 8 // (fsdp * expert), "expert": expert, "fsdp": fsdp,
         "tensor": 1, "sequence": 1, "stage": 1}
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert len(losses) == 2 and all(np.isfinite(losses)), losses

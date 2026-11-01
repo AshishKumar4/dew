@@ -420,3 +420,23 @@ def test_a_loops_carry_is_one_buffer_from_its_start_to_its_result(carried):
     held = jax.jit(program).lower(placed).compile().memory_analysis()
     assert held is not None, "the compile states no memory"
     assert least <= derived <= held.output_size_in_bytes + held.temp_size_in_bytes
+
+
+def test_a_derived_footprint_traces_its_loss_once():
+    """The derivation reads a loss's pullback residuals and its gradient program's peak from one trace of
+    its forward and backward (row 2440): the loss runs once as it is traced, where it ran once for each,
+    and each term is what tracing it alone derives."""
+    from dew.training.footprint import derived_terms, residual_bytes
+
+    traced = []
+    weights = jax.ShapeDtypeStruct((64, 32), jnp.float32)
+    rows = jax.ShapeDtypeStruct((16, 64), jnp.float32)
+
+    def loss(weights, rows):
+        traced.append(None)
+        return jnp.sum(jnp.tanh(rows @ weights) ** 2), {}
+
+    residuals, peak = derived_terms(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0))
+    assert len(traced) == 1
+    assert residuals == residual_bytes(loss, weights, (rows,), platform="gpu")
+    assert peak == gradient_peak(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0))

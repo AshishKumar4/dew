@@ -65,8 +65,13 @@ def case_arrays(arrays, case: str):
                                                      if name.startswith(prefix)]
 
 
-def leaf(tree, path: tuple[str, ...]) -> np.ndarray:
-    """The array at `path` in a nested tree."""
+def node(tree, path: tuple[str, ...]):
+    """The node at `path` in a nested tree."""
     for key in path:
         tree = tree[key]
-    return np.asarray(tree)
+    return tree
+
+
+def leaf(tree, path: tuple[str, ...]) -> np.ndarray:
+    """The array at `path` in a nested tree (`node`)."""
+    return np.asarray(node(tree, path))

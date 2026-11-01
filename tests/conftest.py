@@ -157,31 +157,11 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture(autouse=True)
-def own_rung_records(monkeypatch, tmp_path_factory):
-    """Each test keeps its own rung records (`dew.training.rungs`). The suite
-    shares one compilation cache, beside which a run records its step's
-    rung, and a rung one test forces would be another's floor."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
-
-
-@pytest.fixture(autouse=True)
-def own_data_cache(monkeypatch, tmp_path_factory):
-    """Each test keeps its own automatic data cache (`dew.data.cache.automatic_root`): records one
-    test's maps made are not another's to read back."""
-    monkeypatch.setenv("DEW_DATA_CACHE", str(tmp_path_factory.mktemp("data-cache")))
-
-
-@pytest.fixture(autouse=True)
-def own_hub_answers(monkeypatch, tmp_path_factory, request):
-    """Each test keeps its own recorded Hub answers (`dew.cache.hub_answer`): a commit one test's
-    stand-in answered is not another's offline record. A test that reaches no network keeps its own
-    Hub cache too, whose refs its stand-ins' answers write (`dew.cache.hub_commit`), never the
-    runner's cache."""
-    monkeypatch.setenv("DEW_HUB_ANSWERS", str(tmp_path_factory.mktemp("hub-answers")))
-    if request.node.get_closest_marker("network") is None:
-        from huggingface_hub import constants
-
-        monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path_factory.mktemp("hub-cache")))
+def own_settings(monkeypatch, tmp_path_factory, request):
+    """Each test's own rung records, data cache, Hub answers and, reaching no network, Hub cache
+    (`lane_environment.per_test_settings`)."""
+    lane_environment.per_test_settings(monkeypatch, tmp_path_factory.mktemp,
+                                       network=request.node.get_closest_marker("network") is not None)
 
 
 MAPPINGS = Path("/proc/self/maps")

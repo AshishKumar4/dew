@@ -353,7 +353,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     # --marked names it for the caller that still passes it (2714); --evidence prints each beside its reads.
     tier = functools.partial(named_tier, ci, monkeypatch, capsys)
     assert tier("--shards=2") == tier("--marked") == ["tests/test_marked.py"]
-    assert [line.split("\t")[:2] for line in tier("--evidence", lines=True)] == [
+    assert [line.split("\t") for line in tier("--evidence", lines=True)] == [
         ["tests/test_marked.py", "1 marked"]]
     # A file gains a GPU test after its record: the checkout's marks choose, not records; a kernel's test is
     # the CPU's, interpreted.

@@ -60,10 +60,18 @@ class Ambiguous(ValueError):
     """A part the source's code does not let tier 2 read, which leaves the decoder to tier 3."""
 
 
-def gated_activation(module: torch.nn.Module) -> str:
+def gated_activation(module: torch.nn.Module | Callable[..., object]) -> str:
     """The gated MLP Dew computes for the activation module a source part holds: the `hidden_act` name
-    transformers' ACT2FN builds that same module for, read back by its class and state."""
+    transformers' ACT2FN builds that same module for, read back by its class and state, or for torch's
+    own function that computes it (LFM2-MoE's experts hold `F.silu`)."""
+    import torch
     from transformers.activations import ACT2FN
+
+    functions = {torch.nn.functional.silu: 'silu', torch.nn.functional.gelu: 'gelu'}
+    if not isinstance(module, torch.nn.Module):
+        if module not in functions:
+            raise Ambiguous(f"the activation {module!r} is none of torch's {sorted(functions.values())}")
+        return ACTIVATIONS[functions[module]]
 
     def state(activation: torch.nn.Module) -> dict[str, tuple]:
         """Each public attribute as it computes: a partial by its function and arguments, a bound
@@ -174,17 +182,25 @@ def _read_layer_typed_model(view: PartView) -> Mapping[str, object]:
     return fields
 
 
-def _read_attention(view: PartView) -> Mapping[str, object]:
+def _head_geometry(view: PartView) -> dict[str, int]:
+    """A causal attention's heads, key and value heads and head width, read off its query and key
+    projections and its `head_dim`, each a whole number of heads."""
     width = view.head_dim
     if not view.is_causal:
         raise Ambiguous("the attention is not causal")
     heads, kv_heads = view.q_proj.out_features // width, view.k_proj.out_features // width
     if heads * width != view.q_proj.out_features or kv_heads * width != view.k_proj.out_features:
         raise Ambiguous("the projections hold no whole number of heads")
+    return {'num_heads': heads, 'num_kv_heads': kv_heads, 'head_dim': width}
+
+
+def _read_attention(view: PartView) -> Mapping[str, object]:
+    geometry = _head_geometry(view)
+    width = geometry['head_dim']
     biased = _biased(view.q_proj, view.k_proj, view.v_proj)
     fields: dict[str, object] = {
-        'num_heads': heads, 'num_kv_heads': kv_heads, 'head_dim': width, 'qk_norm': False,
-        'attention_bias': biased, 'attention_dropout_rate': float(view.attention_dropout)}
+        **geometry, 'qk_norm': False, 'attention_bias': biased,
+        'attention_dropout_rate': float(view.attention_dropout)}
     if (view.o_proj.bias is not None) != biased:
         # Qwen2 biases its queries, keys and values and not its output.
         fields['o_proj_bias'] = view.o_proj.bias is not None
@@ -222,6 +238,49 @@ def _read_scale_first_norm(view: PartView) -> Mapping[str, object]:
     return {'norm_eps': float(view.variance_epsilon), 'scale_after_cast': False, 'scale_offset': False}
 
 
+def _read_lfm2_attention(view: PartView) -> Mapping[str, object]:
+    """LFM2's attention: Qwen3's, its queries and keys normed per head (`q_layernorm`, `k_layernorm`), its
+    output projection `out_proj`, and no dropout, in training as in evaluation."""
+    geometry = _head_geometry(view)
+    unscaled = view.scaling != geometry['head_dim'] ** -0.5
+    if _biased(view.q_proj, view.k_proj, view.v_proj, view.out_proj) or unscaled:
+        raise Ambiguous("the attention biases its projections or scales by another than its head width")
+    return {**geometry, 'qk_norm': True, 'attention_bias': False, 'attention_dropout_rate': 0.0}
+
+
+def _read_lfm2_model(view: PartView) -> Mapping[str, object]:
+    """LFM2's model: Llama's over its layers, the head geometry its config states for its attention
+    layers and its rotary (`num_attention_heads`, `num_key_value_heads`, `head_dim` or the width over the
+    heads), which a model of convolution layers alone states through no attention."""
+    config = view.config
+    heads = _records.integer(config.num_attention_heads, 'num_attention_heads')
+    width = config.to_dict().get('head_dim') or _records.integer(config.hidden_size, 'hidden_size') // heads
+    return {**_read_llama_model(view), 'num_heads': heads, 'head_dim': _records.integer(width, 'head_dim'),
+            'num_kv_heads': _records.integer(config.num_key_value_heads, 'num_key_value_heads')}
+
+
+def _read_lfm2_mlp(view: PartView) -> Mapping[str, object]:
+    """LFM2's feed-forward: `w2(silu(w1(x)) * w3(x))`, Llama's SwiGLU under its own names."""
+    return {'mlp': 'swiglu', 'mlp_features': view.w1.out_features,
+            'mlp_bias': _biased(view.w1, view.w3, view.w2)}
+
+
+def _read_short_conv(view: PartView) -> Mapping[str, object]:
+    """LFM2's gated short convolution (`dew.nn.mixers.short_conv.GatedShortConv`): `in_proj` to B, C and x,
+    the depthwise causal convolution of B * x over `conv_kernel_size` taps, gated by C, and `out_proj`
+    back; a per-layer fact (`_with_convolutions`). Its `bias`, biasing all three, is `Ambiguous`."""
+    conv, width = view.conv, view.in_proj.in_features
+    taps = int(view.conv_kernel_size)
+    if (conv.groups != width or conv.kernel_size != (taps,) or conv.padding != (taps - 1,)
+            or view.in_proj.out_features != 3 * width):
+        raise Ambiguous("the convolution is not one causal depthwise filter per channel over its taps")
+    if _biased(view.in_proj, view.out_proj, conv):
+        # Its padded slots, zeroed before `in_proj`, still convolve their bias terms into the next real
+        # tokens' history, which Dew's held convolution keeps empty.
+        raise Ambiguous("the convolution is biased, so its padded slots convolve their bias terms")
+    return {_LAYER: {'conv': {'conv_L_cache': taps, 'conv_bias': False}}}
+
+
 def _read_mlp(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), 'mlp_features': view.gate_proj.out_features,
             'mlp_bias': _biased(view.gate_proj, view.up_proj, view.down_proj)}
@@ -243,6 +302,16 @@ def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
     weighted by score renormalized over the chosen and times `router_scaling_factor` (DeepSeek V3's)."""
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
                      'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
+
+
+def _read_lfm2_moe_router(view: PartView) -> Mapping[str, object]:
+    """LFM2-MoE's router: sigmoid scores, chosen by score plus the block's `expert_bias` where
+    `use_expert_bias`, weighted by score, renormalized over the chosen where `norm_topk_prob` with 1e-6
+    added to their sum (its code's constant), and times `routed_scaling_factor`."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
+                     'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
+                     'scaling': float(view.routed_scaling_factor), 'bias': bool(view.use_expert_bias),
+                     'weight_sum_epsilon': 1e-6}}
 
 
 def _read_grouped_router(view: PartView) -> Mapping[str, object]:
@@ -360,6 +429,9 @@ class KnownPart:
     """The state a checkpoint stores beside its parameters (a router's correction bias, a buffer), by the
     known class's names, onto its canonical name under the part (HY-3's MoE holds the bias its router
     reads, which Dew keeps in the router, `gate.e_score_correction_bias`)."""
+    canonical: Mapping[str, str] = field(default_factory=dict)
+    """Each child's canonical module name, by the known class's attribute name, where the two differ:
+    LFM2's `operator_norm` is the shared `input_layernorm`, its `feed_forward.w1` the `mlp.gate_proj`."""
 
     def known(self) -> type:
         module, _, qualname = self.location.partition(':')
@@ -377,6 +449,8 @@ _GRANITE = 'transformers.models.granite.modeling_granite'
 _SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
 _OLMO2 = 'transformers.models.olmo2.modeling_olmo2'
 _HY_V3 = 'transformers.models.hy_v3.modeling_hy_v3'
+_LFM2 = 'transformers.models.lfm2.modeling_lfm2'
+_LFM2_MOE = 'transformers.models.lfm2_moe.modeling_lfm2_moe'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 Children = Mapping[str, tuple[str, ...]]
@@ -401,6 +475,30 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('causal_lm', f'{_HY_V3}:HYV3ForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
               _read_causal_lm),
     KnownPart('model', f'{_HY_V3}:HYV3Model', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('model', f'{_LFM2}:Lfm2Model', {**_MODEL_CHILDREN, 'embedding_norm': ('norm',)},
+              _read_lfm2_model, canonical={'embedding_norm': 'norm'}),
+    KnownPart('model', f'{_LFM2_MOE}:Lfm2MoeModel',
+              {'embed_tokens': ('embedding',), 'layers': ('layers',), 'embedding_norm': ('norm',),
+               'pos_emb': ('rotary',)}, _read_lfm2_model,
+              canonical={'embedding_norm': 'norm', 'pos_emb': 'rotary_emb'}),
+    KnownPart('moe', f'{_LFM2_MOE}:Lfm2MoeSparseMoeBlock', {'gate': ('router',), 'experts': ('experts',)},
+              _read_nothing, state={'expert_bias': 'gate.e_score_correction_bias'}),
+    KnownPart('router', f'{_LFM2_MOE}:Lfm2MoeTopKRouter', {}, _read_lfm2_moe_router, ('weight',)),
+    KnownPart('layer', f'{_LFM2}:Lfm2DecoderLayer',
+              {'self_attn': ('attention',), 'conv': ('short_conv',), 'feed_forward': ('mlp', 'moe'),
+               'operator_norm': ('norm',), 'ffn_norm': ('norm',)}, _read_nothing,
+              canonical={'feed_forward': 'mlp', 'operator_norm': 'input_layernorm',
+                         'ffn_norm': 'post_attention_layernorm'}),
+    KnownPart('attention', f'{_LFM2}:Lfm2Attention',
+              {**dict.fromkeys(('q_proj', 'k_proj', 'v_proj', 'out_proj'), ('linear',)),
+               'q_layernorm': ('norm',), 'k_layernorm': ('norm',)}, _read_lfm2_attention,
+              canonical={'out_proj': 'o_proj', 'q_layernorm': 'q_norm', 'k_layernorm': 'k_norm'}),
+    KnownPart('mlp', f'{_LFM2}:Lfm2MLP', dict.fromkeys(('w1', 'w3', 'w2'), ('linear',)), _read_lfm2_mlp,
+              canonical={'w1': 'gate_proj', 'w3': 'up_proj', 'w2': 'down_proj'}),
+    KnownPart('short_conv', f'{_LFM2}:Lfm2ShortConv',
+              {'in_proj': ('linear',), 'conv': ('conv1d',), 'out_proj': ('linear',)}, _read_short_conv),
+    KnownPart('conv1d', 'torch.nn:Conv1d', {}, _read_nothing, ('weight', 'bias')),
+    KnownPart('rotary', f'{_LFM2}:Lfm2RotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('model', f'{_LLAMA}:LlamaModel', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_GRANITE}:GraniteModel', _MODEL_CHILDREN, _read_scaled_model),
     KnownPart('model', f'{_MIXTRAL}:MixtralModel', _MODEL_CHILDREN, _read_windowed_model),
@@ -656,9 +754,10 @@ class _Assembler:
             child = children.get(name)
             if child is None:
                 continue
+            spelled = part.canonical.get(known, known)
             role = self.walk(child, child_roles, f'{path}.{name}' if path else name,
-                             f'{canonical}.{known}' if canonical else known, layer)
-            if part.role == 'layer' and known == 'mlp' and layer is not None:
+                             f'{canonical}.{spelled}' if canonical else spelled, layer)
+            if part.role == 'layer' and spelled == 'mlp' and layer is not None:
                 self.layers.setdefault(layer, {})['routed'] = role == 'moe'
         unclaimed = [name for name, child in children.items() if name not in claimed
                      and any(True for _ in child.parameters())]
@@ -678,7 +777,7 @@ def assemble(model: PreTrainedModel) -> Assembly:
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope'))) for layer in routed}
+                               if key not in ('routed', 'nope', 'conv'))) for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
@@ -686,7 +785,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
         # A router's scores, scaling and correction bias and a block's shared experts, where its parts
         # state them (DeepSeek's routing, HY-3's).
         stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
-                                                'groups', 'groups_per_token') if key in mixture}
+                                                'groups', 'groups_per_token', 'weight_sum_epsilon')
+                  if key in mixture}
         fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
             top_k=_records.integer(mixture['top_k'], 'top_k'),
@@ -699,6 +799,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
             raise Ambiguous(f"no part states {required}")
     unrotated = sorted(layer for layer, facts in assembler.layers.items() if facts.get('nope'))
     fields.update(_without_positions(fields, unrotated))
+    convolutions = {layer: facts['conv'] for layer, facts in assembler.layers.items() if 'conv' in facts}
+    fields.update(_with_convolutions(fields, convolutions))
     capacity, context = decoder_parts.context_lengths(
         {'max_position_embeddings': model.config.to_dict().get('max_position_embeddings')})
     fields.update(max_seq_len=capacity, context_length=context)
@@ -709,6 +811,29 @@ def assemble(model: PreTrainedModel) -> Assembly:
                               'num_nextn_predict_layers')
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
                     tuple(assembler.dropouts), _load_names(model), depths)
+
+
+def _with_convolutions(fields: Mapping[str, object], convolutions: Mapping[int, object]
+                       ) -> Mapping[str, object]:
+    """The layer types and kinds that make each layer of `convolutions` (LFM2's, each its short_conv mixer's
+    fields) a gated short convolution (`short_conv`) beside the attention layers, which keep their layer
+    type."""
+    if not convolutions:
+        return {}
+    mixers = [dict(_records.record(mixer, 'conv')) for mixer in convolutions.values()]
+    if any(mixer != mixers[0] for mixer in mixers):
+        raise Ambiguous("the convolution layers convolve differently")
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    stated_types = fields.get('layer_types')
+    types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
+             else ['full_attention'] * count)
+    kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
+    kind = dict(native_fields(LayerKind)())
+    kind['mixer'] = {'class': 'short_conv', 'fields': mixers[0]}
+    kinds['conv'] = kind
+    for layer in convolutions:
+        types[layer] = 'conv'
+    return {'layer_types': tuple(types), 'kinds': kinds}
 
 
 def _without_positions(fields: Mapping[str, object], layers: list[int]) -> Mapping[str, object]:
@@ -753,13 +878,6 @@ _STACKED_EXPERTS: decoder_parts.Leaves = {
 """The canonical experts, each projection one tensor over every expert (`decoder_parts.FUSED_EXPERTS`)."""
 
 
-_PREDICTION_OWN = frozenset({'eh_proj.weight', 'enorm.weight', 'hnorm.weight', 'shared_head.norm.weight',
-                             'final_layernorm.weight'})
-"""A release's prediction depth's own tensors, by their names past `model.layers.{num_layers + d}.`
-(DeepSeek V3's layout, GLM-4.7-Flash's; HY-3 norms its output as `final_layernorm`), which no part of the
-trunk holds."""
-
-
 def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     """The decoder family a type verified from parts loads through (`dew.interop.verify`): `assembly`'s
     fields for its config, every field of which the source's own code read, and each stored tensor at
@@ -768,9 +886,10 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     of the release's prediction depths past the trunk (`Assembly.depths`, by `decoder_parts.layer_depth`)
     fills no leaf: the source's own code builds no depth and its load leaves them unread, so the decoder
     assembled from that code has none (`prediction_depths` trims them before any is read). Only a depth's
-    own tensors (`_PREDICTION_OWN`) and its block's, a name a trunk layer's part holds, are so; its
-    copies of the trunk's table and head are the trunk's (`hf_decoders` checks each against it, and an
-    export writes it from the trunk's leaf)."""
+    own tensors (`decoder_parts.PREDICTION_LEAVES`, `PREDICTION_STEP_END`) and its block's, a name a trunk
+    layer's part holds, are so; its copies of the trunk's table and head are the trunk's
+    (`decoder_parts.prediction_copy_path`: `hf_decoders` checks each against it, and an export writes it
+    from the trunk's leaf)."""
     def translated(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
         used.update(hf_config)
         return assembly.fields.copy()
@@ -779,18 +898,18 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         depth = decoder_parts.layer_depth(name, config)
         if depth is not None and depth < assembly.depths:
             tail = name.split('.', 3)[3]
-            head, table = assembly.tied
-            if tail == 'shared_head.head.weight':
-                return weight_path(table if config['tie_embeddings'] else head, config)
-            if tail == 'embed_tokens.weight':
-                return weight_path(table, config)
+            copy = decoder_parts.prediction_copy_path(tail, config)
+            if copy is not None:
+                return copy
+            own = {**decoder_parts.PREDICTION_LEAVES, **decoder_parts.PREDICTION_STEP_END}
             last = _records.integer(config['num_layers'], 'num_layers') - 1
-            if tail in _PREDICTION_OWN or assembly.canonical(f'model.layers.{last}.{tail}') is not None:
+            if tail in own or assembly.canonical(f'model.layers.{last}.{tail}') is not None:
                 return None
         canonical = assembly.canonical(name)
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
-        return decoder_parts.renamed_path((), canonical, config, layer_leaves=_STACKED_EXPERTS)
+        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES}
+        return decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
 
     return decoder_parts.DecoderFamily(
         (model_type,), translated, lambda fields: False, model_type, 'ForCausalLM', lambda model: {},
