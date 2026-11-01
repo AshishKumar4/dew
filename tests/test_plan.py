@@ -563,7 +563,8 @@ def test_a_run_that_ends_inside_its_profile_window_stops_its_capture_and_reports
     trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                                  tracker=tracker, profile=ProfileWindow(str(tmp_path), steps=4, warmup=0)))
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
-    trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=2, log_every=1)
+    # The window opens past the first step's compile: it holds the run's second and third steps.
+    trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=3, log_every=1)
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
     (capture,) = tmp_path.glob("capture-*")
     assert window.steps == 2 and traced_steps(capture) == (1, 2)
