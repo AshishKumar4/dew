@@ -717,17 +717,22 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
                     _run(streams, walked, call)
                 return
 
+            def tile(at: dict) -> Walked:
+                """The tile's walk, which a persistent launch's program returns."""
+                walked = given(at)
+                assert walked is not None and not walked.segments, "a persistent tile walks its one step"
+                return walked
+
             def schedule(index):
                 at = _tile_at(index, grid, grid_names)
-                walked = given(at)
-                assert not walked.segments, "a persistent launch's tile walks one step"
+                walked = tile(at)
                 return live(at, arrays), walked.steps, walked.views, at
 
             def consumer(_, at, walk, store, *, active):
                 del store
                 if not active:
                     return
-                walked = given(at)
+                walked = tile(at)
                 step = walked.step if walked.prologue is None else functools.partial(walked.step,
                                                                                     loaded=walked.prologue())
                 walk(step, None, ())
