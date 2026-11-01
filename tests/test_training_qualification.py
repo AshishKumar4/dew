@@ -152,47 +152,42 @@ def prepared(directory: Path, kind: str) -> Path:
     return directory
 
 
-KEPT = ("result.json", "state.npz", "export_logits.npz", "reference.npz", "export", "cpu.txt")
+KEPT = ("result.json", "state.npz", "export_logits.npz", "reference.npz", "export")
 """What a run's directory holds that the judge reads: its result, state, export and the export's logits,
-the baseline's reference loss and gradients, and the CPU class of the host it ran on (`HOST.cpu_class`),
-not its checkpoints or its log."""
+and the baseline's reference loss and gradients, not its checkpoints or its log."""
 
 
-def ran(directory: Path, unit: int) -> dict[str, bytes]:
-    """Unit `unit` of the qualification's runs over `directory` (`prepared`): 0, the uninterrupted run;
-    1, the interrupted run, SIGKILLed once blocked past its checkpoint, then its resume. What the unit's
-    runs wrote that the judge reads (`KEPT`), by path in `directory`, the source among them, which the
-    baseline's reference was taken against."""
-    if unit == 0:
-        finish(spawn(directory, "baseline"), "baseline")
-        out, files = directory / "baseline", {"source": directory / "source"}
-    else:
-        with ProcessGroup() as started:
-            started.running.append(interrupted := spawn(directory, "interrupted"))
-            kill_when_ready(interrupted, directory / "ready-to-kill")
-        finish(spawn(directory, "resumed"), "resumed")
-        out, files = directory / "restarted", {}
-    # XLA:CPU compiles for its host's class, so the two units' bits are comparable on one class alone.
-    (out / "cpu.txt").write_text(HOST.cpu_class())
-    files.update({name: out / name for name in KEPT if (out / name).exists()})
-    return {str(path.relative_to(directory)): path.read_bytes() for kept in files.values()
+def ran(directory: Path) -> dict[str, bytes]:
+    """The qualification's runs over `directory` (`prepared`), one after the other on one host, as
+    XLA:CPU compiles for its host's class and their states are compared bit for bit: the uninterrupted
+    run, then the interrupted run, SIGKILLed once blocked past its checkpoint, then its resume. What they
+    wrote that the judge reads (`KEPT`), by path in `directory`, with the source the baseline's
+    reference was taken against and the CPU class they ran on (`HOST.cpu_class`)."""
+    finish(spawn(directory, "baseline"), "baseline")
+    with ProcessGroup() as started:
+        started.running.append(interrupted := spawn(directory, "interrupted"))
+        kill_when_ready(interrupted, directory / "ready-to-kill")
+    finish(spawn(directory, "resumed"), "resumed")
+    (directory / "cpu.txt").write_text(HOST.cpu_class())
+    files = [directory / "source", directory / "cpu.txt"] + [
+        directory / run / name for run in ("baseline", "restarted") for name in KEPT]
+    return {str(path.relative_to(directory)): path.read_bytes() for kept in files if kept.exists()
             for path in ([kept] if kept.is_file() else sorted(kept.rglob("*"))) if path.is_file()}
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("kind", ["dense", "moe"])
-@pytest.mark.shards(units=2, per_task=1)
+@pytest.mark.shards(units=1, per_task=1)
 def test_a_loaded_source_resumes_mid_accumulation_and_exports_as_transformers_reads_it(kind, tmp_path):
-    """The module's claims for a source of `kind`: its uninterrupted run and its interrupted run's resume
-    (`ran`), each a map task's unit (`map_judge.record_units`), judged together (`pooled_units`); run whole,
-    one after the other."""
+    """The module's claims for a source of `kind`: its runs (`ran`), one map task's unit
+    (`map_judge.record_units`), which its judge holds to transformers (`pooled_units`); run whole, the
+    runs then the judge."""
     directory = prepared(tmp_path / "qualification", kind)
     label = f"the {kind} source's qualification runs"
-    if record_units(label, lambda start, stop: [ran(directory, unit) for unit in range(start, stop)]):
+    if record_units(label, lambda start, stop: [ran(directory) for _ in range(start, stop)]):
         return
-    pooled = pooled_units(label, 2)
-    units = [ran(directory, unit) for unit in range(2)] if pooled is None else [
-        unit for _, _, payload in pooled for unit in payload]
+    pooled = pooled_units(label, 1)
+    units = [ran(directory)] if pooled is None else [unit for _, _, payload in pooled for unit in payload]
     for files in units:
         for name, content in files.items():
             (directory / name).parent.mkdir(parents=True, exist_ok=True)
@@ -204,11 +199,9 @@ def test_a_loaded_source_resumes_mid_accumulation_and_exports_as_transformers_re
 
 
 def assert_resumed_onto_every_leaf_of_the_uninterrupted_run(qualified: Path) -> None:
-    """The run killed mid-accumulation resumes onto every leaf of the uninterrupted run, bit for bit, its
-    resume finding every program in the cache its interrupted run filled."""
-    hosts = [(qualified / run / "cpu.txt").read_text() for run in ("baseline", "restarted")]
-    assert hosts[0] == hosts[1], (f"the uninterrupted run ran on {hosts[0]} and the resumed on {hosts[1]}: "
-                                  "XLA:CPU compiles for its host's class, so their bits compare on one alone")
+    """The run killed mid-accumulation resumes onto every leaf of the uninterrupted run, bit for bit, on the
+    host's CPU class (`cpu.txt`), its resume finding every program in the cache the runs before it filled:
+    each the uninterrupted run's."""
     baseline, resumed = (json.loads((qualified / run / "result.json").read_text())
                          for run in ("baseline", "restarted"))
     assert (resumed["restored_step"], resumed["restored_updates"]) == (worker.CHECKPOINT_STEP,
@@ -217,7 +210,7 @@ def assert_resumed_onto_every_leaf_of_the_uninterrupted_run(qualified: Path) -> 
         assert resumed[field] == baseline[field], field
     # A restored leaf that entered the step in another layout or sharding would be another program.
     assert baseline["cache_misses"] > 0 and resumed["cache_hits"] > 0 and resumed["cache_misses"] == 0, (
-        baseline, resumed)
+        baseline, resumed, (qualified / "cpu.txt").read_text())
     assert baseline["final_loss"] < baseline["initial_loss"], "training did not lower the probe's loss"
     with (np.load(qualified / "baseline" / "state.npz") as left,
           np.load(qualified / "restarted" / "state.npz") as right):
