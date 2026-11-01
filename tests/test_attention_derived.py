@@ -163,7 +163,8 @@ def forward_rows(form: str):
 
 def derived_backward(form: str, along: str):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
-    first), from the template forward's residual rows (`forward_rows`)."""
+    first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
+    unseen, and D about no anchor (its whole `delta`)."""
     forms = derive.derive(algebra.backward_declaration(scale=SCALE, walked=along),
                           accurate=False, saturation=SATURATION)
     seen = seen_of(form)
@@ -171,10 +172,11 @@ def derived_backward(form: str, along: str):
 
     def tile(values: dict, index: int) -> dict:
         part = slice(index * BLOCK, (index + 1) * BLOCK)
-        tiled = ("q", "dout", "peak", "total", "delta", "seen") if along == "rows" else ("k", "values")
+        tiled = (("q", "dout", "peak", "total", "anchor", "delta", "logits") if along == "rows"
+                 else ("k", "values"))
 
         def part_of(name, value):
-            if along == "keys" and name == "seen":
+            if along == "keys" and name == "logits":
                 return value[:, part]
             return value[part] if name in tiled else value
 
@@ -182,11 +184,12 @@ def derived_backward(form: str, along: str):
 
     def run(q, k, v, d):
         _, peak, total, delta = rows_of(q, k, v, d)
-        values = {"q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total, "delta": delta,
-                  "seen": seen}
+        logits = jnp.where(seen, float32_einsum("qd,kd->qk", q, k) * SCALE, -jnp.inf)
+        values = {"logits": logits, "q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total,
+                  "anchor": jnp.zeros_like(delta), "delta": delta}
         parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
         mapped = [forms.mapped(part) for part in parts]
-        dq, dk, dv = forms.finish(walked(forms, parts), values)
+        dq, dk, dv, *_ = forms.finish(walked(forms, parts), values)
         if along == "rows":
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
         return (dq, jnp.concatenate([parts[1] for parts in mapped]),
@@ -260,3 +263,32 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, derived)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), operands, f"portable forward {form} derived {derived}",
                     seeds=16)
+
+
+@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+@pytest.mark.parametrize("form", ["full", "causal"])
+def test_the_portable_mainloop_differentiates_attention_by_either_forms(form, derived):
+    """The plain-JAX mainloop's backward (`attention_portable.backward`) under the run's fast forms, its dQ
+    walk over the keys and its dK and dV walks over the queries the hand-written forms or the derived ones
+    behind the switch (`dew.algebra.forms.derived`, `attention_algebra.derived_backward`), from the
+    forward's residuals and its split D: the gradients on par with the reference's (check 1) either way."""
+    spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
+
+    def ours(q, k, v, dout):
+        fast = dataclasses.replace(generation.numerics(), forms="fast")
+        with generation.run_precision(fast), algebra_forms.derived(derived):
+            grads = attention_portable.backward(q[None, :, None], k[None, :, None], v[None, :, None], spans,
+                                                None, dout[None, :, None], **TILES)
+        return grads.query[0, :, 0], grads.key[0, :, 0], grads.value[0, :, 0]
+
+    def reference(q, k, v, dout):
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q[None, :, None], k[None, :, None],
+                                                             v[None, :, None], spans, None)[0, :, 0], q, k, v)
+        return pull(dout)
+
+    def operands(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rng.standard_normal((LENGTH, DEPTH)), jnp.float32) for _ in range(4))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
+                    f"portable backward {form} derived {derived}", seeds=16)

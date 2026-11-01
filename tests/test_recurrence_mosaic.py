@@ -31,6 +31,7 @@ from test_recurrence_chunk import (
     token_by_token,
 )
 
+from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, fast_rounding, mosaic_rule
 from dew.nn.kernels.selection import KernelRefused
@@ -566,6 +567,34 @@ def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
 
     assert_as_exact(applied('mosaic_gpu'), applied('xla'), draw, 'a layer named onto the template',
                     seeds=SEEDS, truth_fn=truth)
+
+
+def test_a_gated_delta_net_on_the_template_by_its_derived_tiles_matches_the_portable_rule():
+    """A layer naming the template, its system's pairs and its readout's scores the derived tile forms behind
+    the switch (`dew.algebra.forms.derived`, `recurrence_algebra.derived_tile`) over the template's own
+    products and compensated prefix's decays: its output on par from float64 with the portable rule's
+    (check 1, the layer's own float64 forward the truth)."""
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
+                          dtype=jnp.bfloat16)
+
+    def draw(seed):
+        x = jax.random.normal(jax.random.key(23 + seed), (1, 72, 64)).astype(jnp.bfloat16)
+        with generation.chosen(gated_delta_rule='xla'):
+            return layer.init(jax.random.key(29 + seed), x), x
+
+    def applied(kernel, *, derived: bool):
+        def run(params, x):
+            with generation.chosen(gated_delta_rule=kernel), algebra_forms.derived(derived):
+                return layer.apply(params, x)
+        return run
+
+    def truth(params, x):
+        return layer.clone(dtype=jnp.float64).apply(params, x)
+
+    assert_as_exact(applied('mosaic_gpu', derived=True), applied('xla', derived=False), draw,
+                    'a layer on the template by its derived tiles', seeds=SEEDS, truth_fn=truth)
 
 
 def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():

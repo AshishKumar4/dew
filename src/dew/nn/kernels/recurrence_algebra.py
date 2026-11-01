@@ -41,6 +41,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.algebra.forms import derived_on
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
@@ -679,9 +680,42 @@ def keyed(product, gate, low, beta, column_gate, column_low):
     """One chunk's `A = tril(beta_s (k_s . k_t) exp2(g_s - g_t), -1)` `[C, C]`, a decay a head, from its keys'
     products `product` (`k k^T`) and its prefix halves and write gates as a row's vectors (`gate`, `low`,
     `beta`) and the halves as a column's (`column_gate`, `column_low`), where a mainloop's layouts keep the
-    two apart."""
-    lag = _lags(product.shape)
-    return jnp.where(lag > 0, product * decayed(gate, low, column_gate, column_low) * beta[:, None], 0.0)
+    two apart. The decays are the compensated prefix's (`decayed`, a representation the template keeps);
+    behind the switch the tile's algebra over them is the derived forms' (`derived_tile`, `pairs_of`)."""
+    decays = decayed(gate, low, column_gate, column_low)
+    if derived_on():
+        return derived_tile("pairs").mapped({"products": product, "decays": decays, "scales": beta})
+    return pairs_of(product, decays, beta)
+
+
+def pairs_of(products, decays, scales):
+    """A chunk's strictly lower pairs `tril(products decays scales_s, -1)` `[C, C]` (theme A's tile
+    declaration of the delta rule's system, `derived_tile`): each pair's product times its decay, its row's
+    token's scale (its write gate), zero on and above the diagonal."""
+    return jnp.where(_lags(products.shape) > 0, products * decays * scales[:, None], 0.0)
+
+
+def scores_of(products, decays, scales):
+    """A chunk's own pairs' scores `tril(products decays scales_t)` `[C, C]` (theme A's tile declaration of
+    the readout's scores, `derived_tile`): each pair's product times its decay and its column's token's scale
+    (the keys' side's write gate, or 1), zero above the diagonal."""
+    return jnp.where(_lags(products.shape) >= 0, products * decays * scales[None, :], 0.0)
+
+
+TILES = {"pairs": pairs_of, "scores": scores_of}
+"""The recurrence's tile declarations (`derived_tile`): its system's pairs and its readout's scores."""
+
+
+@functools.cache
+def derived_tile(name: str):
+    """The derived forms of the tile declaration `name` (`TILES`, the fast class), the template's behind the
+    switch (`dew.algebra.forms.derived`): a mainloop forms the products and its compensated prefix's decays
+    (representations it keeps) and takes the tile's algebra over them from these forms."""
+    from dew.algebra import SATURATION, derive
+    axes = {"products": ("rows", "columns"), "decays": ("rows", "columns"),
+            "scales": ("rows",) if name == "pairs" else ("columns",)}
+    return derive.derive(derive.Reduction(TILES[name], axes, walked="columns", exponent="e"), accurate=False,
+                         saturation=SATURATION)
 
 
 def doubled(a, issue: Issue):
@@ -805,11 +839,12 @@ def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issu
     scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
     for c in range(columns):
         scores += issue("scores", queries(c), keys(c).T)
-    scores = scores * decay
-    if column_scale is not None:
-        scores = scores * column_scale[None, :]
-    lag = _lags(scores.shape)
-    return jnp.where(lag >= 0, scores, 0.0).astype(dtype)
+    scales = jnp.ones((gate.shape[0],), jnp.float32) if column_scale is None else column_scale
+    # Behind the switch, the tile's algebra over its products and decays the derived forms' (`scores_of`).
+    if derived_on():
+        return derived_tile("scores").mapped({"products": scores, "decays": decay, "scales": scales}).astype(
+            dtype)
+    return scores_of(scores, decay, scales).astype(dtype)
 
 
 def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,

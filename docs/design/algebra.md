@@ -625,10 +625,39 @@ largest terms that read no state are the walk's prepared values (`Derived.prepar
 at once; the carry alone runs in sequence. The delta rule's carry is one product of the state by a matrix the
 chunk prepared, its solve against the state off the carry.
 
-**Drift to fix.** `scan.py` still matches its update with its own symbolic matcher and emits one chunk
-algorithm. Doubling against substitution, a per-key decay's sub-chunk factoring and the decays' hoisting are
-hard-coded rather than extracted under a kernel cost. The derived forms run at trace time (the generator is
-parked, §6.11).
+Behind the one switch (`dew.algebra.forms.derived`, in JAX's trace context), the templates take their derived
+forms where the declarations state the walk:
+
+- The attention forward. Every mainloop's step, merge and finish take the declaration's forms, with the sums
+  in the mainloop's own accumulator and every product through its own issuer. The declaration covers
+  natural and base-2 exponents, keys-first tiles, dropout's multipliers, initial states and score hooks.
+- The attention backward. The plain-JAX mainloop walks dQ over the keys and dK and dV over the queries by
+  the backward declaration's forms. Every Mosaic backward launch takes its tiles' weights and score
+  cotangents from the tile declaration (`softmax_cotangents`) over its own products. Both cover hooks'
+  slopes, dropout, the first pass's D and initial states.
+- The recurrence. The plain-JAX path runs `derive_scan`'s chunk forms with their carry split
+  (`derived_rule`). The Mosaic mainloop takes its system's pairs and its readout's scores from tile
+  declarations (`recurrence_algebra.pairs_of`, `scores_of`) over its own products and its compensated
+  prefix's decays.
+
+The template's own forms run in three places:
+- the accurate forms (the compensated exponent, the largest weight held to 1, raw logits, the anchor test,
+  the keyed sums);
+- compensated running sums and the headroom guard's shifted sums;
+- representations the template keeps: the compensated prefix, the inverse by doubling, the launch structure.
+Those are rounding and representation choices the fast class does not make. The replacement rule holds:
+a derived form replaces a hand-written one only where it states the walk, passes check 1 and is no slower.
+
+**Drift to fix.**
+- Error-aware extraction with the compensation rules (`error_free`'s TwoSum and product splitting,
+  rewriting into compensated forms where check 1 needs them) is the next derivation build. It covers the
+  accurate forms and the guard.
+- `scan.py` still matches its update with its own symbolic matcher and emits one chunk algorithm. Doubling
+  against substitution, a per-key decay's sub-chunk factoring and the decays' hoisting are hard-coded
+  rather than extracted under a kernel cost.
+- A Mosaic launch built from the derived chunk forms' terms is the generator's work (§6.11). Until then the
+  Mosaic recurrence takes derived tile algebra inside its own launches.
+- The derived forms run at trace time.
 
 Derivation runs at dev time, in the generator (§6.11); its output is a checked-in module. A declaration states
 semantics only: plain JAX on whole operands, or token functions along a walked axis. It never states a

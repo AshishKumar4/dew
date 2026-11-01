@@ -466,7 +466,29 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("call", ["full", "causal", "spans"])
+@pytest.mark.parametrize("form", ["default", "fused", "fused-keys-first"])
+@pytest.mark.parametrize("call", CALLS)
+def test_the_backward_by_its_derived_forms_is_on_par_interpreted(call, form):
+    """The fast backward, each of its launches' tile weights and score cotangents the derived forms behind the
+    switch (`dew.algebra.forms.derived`, `attention_algebra.derived_cotangents`: queries first and keys
+    first), under Mosaic GPU's interpreter: the gradients on par with the reference (check 1), as the
+    hand-written forms' are (`test_the_backward_is_on_par_interpreted`)."""
+    with algebra_forms.derived():
+        _check_backward(call, SHAPES["interpreted"], form=form, interpret=True,
+                        width=FORM_WIDTHS.get(form, 128))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_a_dropping_backward_by_its_derived_forms_is_on_par_interpreted(call):
+    """The default backward of a call that drops, its tile weights and score cotangents the derived forms
+    behind the switch, the dropout multipliers an operand of theirs: on par with the reference (check 1)."""
+    with algebra_forms.derived():
+        _check_backward(call, SHAPES["interpreted"], form="default", interpret=True, drop=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
 def test_the_forward_by_its_derived_forms_is_on_par_interpreted(call):
     """The forward, the base-2 fold, its walk's step, merge and finish the derived forms behind the switch
     (`dew.algebra.forms.derived`, `attention_algebra.derived_forms`), its weighted values' sums in the

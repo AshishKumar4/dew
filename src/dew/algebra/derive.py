@@ -27,7 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
 import jax
@@ -494,7 +494,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 return made
         raise Refused(f"a state of shapes {shapes} no walk formed (`init`, `step`)")
 
-    def step(state, tiles, *, product=None, accumulate=None):
+    def step(state, tiles, *, product=None, accumulate=None, outputs: Sequence[int] = ()):
         made = forms(shaped(tiles))
         value = evaluator(made.region, [*made.consts, *(tiles[name] for name in names)],
                           carried(made, state), product=product)
@@ -505,7 +505,14 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 stepped.append(accumulate(state[index], value(factor), value(weights), value(values)))
             else:
                 stepped.append(value(form))
-        return tuple(stepped)
+        if not outputs:
+            return tuple(stepped)
+        # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a
+        # term both read, once.
+        for index in outputs:
+            if not made.mapped[index] or made.outputs[index] is None:
+                raise Refused(f"output {index} is no output along the walked axis")
+        return tuple(stepped), tuple(value(made.outputs[index]) for index in outputs)
 
     def merge(a, b, operands=None):
         made = held(a)
