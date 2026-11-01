@@ -1387,10 +1387,10 @@ def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[s
         # tensor per expert, stacked by _stack_experts below.
         return ('mlp', 'experts', parts[5], parts[6], 'kernel')
     if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
-            and parts[5] in MOE_SHARED and leaf == 'weight'):
+            and parts[5] in MOE_SHARED and leaf in ('weight', 'bias')):
         # The dense shared experts beside them, one MLP however many the
-        # config counts.
-        return ('mlp', 'shared_experts', parts[5], 'kernel')
+        # config counts, biased where the model's MLPs are (ERNIE 4.5's use_bias).
+        return ('mlp', 'shared_experts', parts[5], 'kernel' if leaf == 'weight' else 'bias')
     if (module == 'linear_attn'
             and _records.strings(config['layer_types'], 'layer_types')[int(parts[2])] == 'linear_attention'):
         tail = tuple(parts[4:])
@@ -1627,8 +1627,9 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
                 and parts[4] in MOE_SHARED and leaf == 'kernel'):
             return f'model.layers.{index}.mlp.experts.{parts[3]}.{parts[4]}.weight'
         if (module == 'mlp' and len(parts) == 5 and parts[2] == 'shared_experts'
-                and parts[3] in MOE_SHARED and leaf == 'kernel'):
-            return f'model.layers.{index}.mlp.shared_experts.{parts[3]}.weight'
+                and parts[3] in MOE_SHARED and leaf in ('kernel', 'bias')):
+            return (f'model.layers.{index}.mlp.shared_experts.{parts[3]}.'
+                    + ('weight' if leaf == 'kernel' else 'bias'))
         if module == 'mlp' and len(parts) == 4 and parts[2] == 'gate' and leaf in _MOE_STATE:
             return f'model.layers.{index}.mlp.gate.{leaf}'
         if len(parts) == 3 and _PER_LAYER_INPUTS.get(module) == leaf:

@@ -1,12 +1,11 @@
 """GPT-1's post-LN blocks over GPT-2's Conv1D layers against transformers."""
 
-import numpy as np
+import json
+
 import pytest
-from interop_support import token_draw, transformers_arms, transformers_model
-from reference_error import assert_as_exact, seeds_for
+from interop_support import assert_exported_decoder_follows_transformers, token_draw
 
 from dew.interop import Pretrained
-from dew.sampling import Sampling, generate
 
 
 @pytest.mark.parametrize("afn", ["gelu", "relu"])
@@ -23,29 +22,14 @@ def test_a_gpt1_decoder_computes_transformers_logits_and_greedy_continuation(afn
     torch.manual_seed(0)
     OpenAIGPTLMHeadModel(config).eval().save_pretrained(tmp_path / "source")
     loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
-    reference, truth = transformers_arms(transformers_model(tmp_path / "source"),
-                                         lambda model, ids: model(ids).logits)
-    draw = token_draw(0x3079, 96, (2, 9))
-    seeds = seeds_for(reference, draw, "GPT-1 logits", truth_fn=truth)
-    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw,
-                    "GPT-1 logits", seeds=seeds, truth_fn=truth)
-    loaded.save(tmp_path / "export")
-    exported, source = (transformers_model(tmp_path / name) for name in ("export", "source"))
-    ids = torch.as_tensor(np.asarray(draw(0)[0]), dtype=torch.long)
-    with torch.no_grad():
-        np.testing.assert_array_equal(exported(ids).logits.numpy(), source(ids).logits.numpy())
-        drawn = source.generate(ids[:1, :4], max_new_tokens=6, min_new_tokens=6, do_sample=False)
-    generated = generate(loaded.model, loaded.variables, np.asarray(ids[:1, :4]), 6, key=0,
-                         sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
+    assert_exported_decoder_follows_transformers(loaded, tmp_path, token_draw(0x3079, 96, (2, 9)),
+                                                 "GPT-1 logits", lambda model, ids: model(ids).logits)
 
 
 def test_gpt1_scales_by_the_head_width_whatever_its_config_carries(tmp_path):
     """GPT-1's blocks always scale their attention by the head width (modeling_openai.py builds each with
     `scale=True`): a config carrying GPT-2's `scale_attn_weights: false` loads with that scale, as
     transformers runs it, not unscaled."""
-    import json
-
     import torch
     from transformers import OpenAIGPTConfig, OpenAIGPTLMHeadModel
 
