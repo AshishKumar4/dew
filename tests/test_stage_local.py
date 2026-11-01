@@ -331,9 +331,10 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     model = decoder()
     assert trainer(model, optax.adam(1e-3), STAGED, 8, ema=None).staging.sites
     for given in (optax.adafactor(1e-3), OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
+        # An OptimConfig's transformation is built over the run's length, which fit gives.
         whole = trainer(model, given, STAGED, 8, ema=None)
-        assert not whole.staging.sites
         assert int(whole.fit(stream(), steps=1, log_every=1).step) == 1
+        assert not whole.staging.sites
 
 
 @pytest.mark.mesh(devices=8)
