@@ -55,25 +55,26 @@ def replaced(src, name: str, *edits: tuple[str, str]) -> None:
     (src / name).write_text(text)
 
 
-@pytest.mark.parametrize(("name", "edit"), [
+@pytest.mark.parametrize(("name", "edit", "reused_after"), [
     ("a module added beside the package's",
-     lambda src: (src / "pkg/added.py").write_text("def added():\n    return 1\n")),
+     lambda src: (src / "pkg/added.py").write_text("def added():\n    return 1\n"), True),
     ("a docstring edited in a module the hub imports",
-     lambda src: replaced(src, "pkg/sibling.py", ('"""Spare."""', '"""Spare, edited."""'))),
+     lambda src: replaced(src, "pkg/sibling.py", ('"""Spare."""', '"""Spare, edited."""')), False),
     ("a function's signature and body edited, never called",
      lambda src: replaced(src, "pkg/sibling.py", ("def spare(x, by=2):", "def spare(x, by=3):"),
-                          ("return x * by", "return by * x"))),
+                          ("return x * by", "return by * x")), False),
 ], ids=["module added", "docstring edited", "signature edited"])
-def test_an_edit_to_code_a_file_imported_and_never_called_leaves_its_row(ci, tmp_path, monkeypatch,
-                                                                       cache_worker, name, edit):
-    """A head's edit in a package the file imports through its hub, which no test of the file calls into,
-    leaves the file's row reusable: the key hashes a module's top level and a package's listing for every
-    file that imported a module of it, so each of these reruns every importer (`inputs`, `packages`,
-    `digested`)."""
+def test_an_edit_to_code_a_file_imported_and_never_called_leaves_its_row_where_it_cannot_observe_it(
+        ci, tmp_path, monkeypatch, cache_worker, name, edit, reused_after):
+    """A head's edit in a package the file imports through its hub, which no test of the file calls into: a
+    module added where no import of the file searched leaves its row (an import keys the candidates it was
+    searched for in, `contents`); a docstring or a signature edited reruns it, as a module's top level keeps
+    every definition's docstring, defaults and annotations, which a function value shows unrun (`__doc__`,
+    `inspect.signature`) and which may fail as the module imports (a default of 1/0)."""
     reused = task(ci, tmp_path, monkeypatch, cache_worker, {"test_pure.py": PURE})
     assert reused() == [True]
     edit(tmp_path / "src")
-    assert reused() == [True], name
+    assert reused() == [reused_after], name
 
 
 @pytest.mark.xfail(strict=True, reason="a new top-level function is a name in every importer's module: "

@@ -302,7 +302,7 @@ class Shape:
     (("    return x * by", "    return by * x + 0"), [True, False]),
     (("        return side * side", "        return side ** 2"), [False, True]),
     (("        return self.sides * side", "        return side * self.sides"), [False, False]),
-    (("def scaled(x, by=2):", "def scaled(x, by=3):"), [True, False]),
+    (("def scaled(x, by=2):", "def scaled(x, by=3):"), [False, False]),
     (("LIMIT = 3", "LIMIT = 4"), [True, True]),
     (("    sides = 4", "    sides = 5"), [True, True]),
     (("import functools\n", "import functools\n\n\n# a note above\n\n"), [False, False]),
@@ -421,10 +421,10 @@ def test_a_process_ending_1_after_its_tests_passed_is_red(ci, tmp_path, monkeypa
 
 def test_each_files_record_is_its_own_where_files_share_a_task(ci, tmp_path, monkeypatch, cache_worker):
     """Each input moves exactly the files that may have seen it (row 2642): a fixture's arrival reruns its
-    prober, the task's last file, alone; a helper shadowing a name only a file's child imported reruns that
-    file alone; a module one file imported lazily reruns it alone, as each file runs in a process of its own
-    (ci.py's `alone`) that nothing it left can serve; and two files whose records share inputs never take
-    each other's row."""
+    prober, the task's last file, alone; a helper shadowing a name only a file's child imported, where the
+    child's import searched for it, reruns that file alone; a module one file imported lazily reruns it
+    alone, as each file runs in a process of its own (ci.py's `alone`) that nothing it left can serve; and
+    two files whose records share inputs never take each other's row."""
     child = ("import site, sysconfig; site.addsitedir(sysconfig.get_paths()['purelib']); "
              "import tabnanny")
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
@@ -441,9 +441,14 @@ def test_each_files_record_is_its_own_where_files_share_a_task(ci, tmp_path, mon
     (tmp_path / "tests/fixtures/f.txt").write_text("")
     assert reused() == [True, True, True, False]
     (tmp_path / "tests/fixtures/f.txt").unlink()
+    # The child's import searched the checkout's root (its `-c`'s ''), not tests/, which a helper there
+    # cannot shadow.
     (tmp_path / "tests/tabnanny.py").write_text("")
-    assert reused() == [False, True, True, True]
+    assert reused() == [True, True, True, True]
     (tmp_path / "tests/tabnanny.py").unlink()
+    (tmp_path / "tabnanny.py").write_text("")
+    assert reused() == [False, True, True, True]
+    (tmp_path / "tabnanny.py").unlink()
     (tmp_path / "src/lazy.py").write_text("VALUE = 2\n")
     assert reused() == [True, False, True, True]
     (tmp_path / "src/lazy.py").write_text("VALUE = 1\n")

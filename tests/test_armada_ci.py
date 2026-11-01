@@ -1916,8 +1916,9 @@ def test_a_helper_added_under_tests_reruns_only_the_runs_that_imported_a_module_
 def test_a_helper_named_as_a_module_only_a_child_process_imported_reruns_its_file(
         ci, tmp_path, monkeypatch, cache_worker):
     """A module only a test's child process imports (a tool run as a script) is that file's input as one its
-    own process imports is: a helper of its name added under tests/ reruns the file (row 2502: the recorder
-    named the pytest process's imports alone, so such a helper kept the file's green key)."""
+    own process imports is: a helper of its name added where the child's import searched (its `-c`'s '', the
+    checkout's root) reruns the file (row 2502: the recorder named the pytest process's imports alone, so
+    such a helper kept the file's green key), and one added where it did not (tests/) leaves it."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     written(tmp_path, {"test_c.py": "import subprocess, sys\nfrom pathlib import Path\n"
                                     "def test_c():\n"
@@ -1927,6 +1928,8 @@ def test_a_helper_named_as_a_module_only_a_child_process_imported_reruns_its_fil
     armada_task(ci, monkeypatch, verdict)
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     (tmp_path / "tests/wave.py").write_text("")
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    (tmp_path / "wave.py").write_text("")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 

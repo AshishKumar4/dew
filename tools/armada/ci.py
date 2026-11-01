@@ -111,6 +111,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -1574,9 +1575,12 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     # there is no other's to read. uv's cache, which only holds packages by their digests, stays shared.
     caches = base.with_name(f"{base.name}.caches")
     shutil.rmtree(caches, ignore_errors=True)
-    (caches / "tmp").mkdir(parents=True)
+    caches.mkdir()
+    # Short, under the system's own: a Unix socket's path (multiprocessing's forkserver, its resource tracker)
+    # holds 107 bytes at most.
+    scratch = tempfile.mkdtemp(prefix="dew-file-")
     environment = session.pytest_environment({
-        **environ, **site_environment(site), "XDG_CACHE_HOME": str(caches), "TMPDIR": str(caches / "tmp"),
+        **environ, **site_environment(site), "XDG_CACHE_HOME": str(caches), "TMPDIR": scratch,
         "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache" / "uv")),
         followed.PRIVATE: str(caches), "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
     # A store elsewhere, inherited, would be one every file of the task shared.
@@ -1609,6 +1613,7 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     # A process of the group still running may yet open a file: no record of this file keeps a key.
     closed = opens.closed()
     reader.join(10)
+    shutil.rmtree(scratch, ignore_errors=True)
     # How collection found the file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     return Alone(done.returncode, "".join(lines), report.is_file(),
