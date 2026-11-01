@@ -5,7 +5,7 @@ import dataclasses
 import itertools
 import json
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import pytest
@@ -19,7 +19,7 @@ from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.lora import LoRA
 from dew.nn.kernels import generation
-from dew.objectives.world_model import TokenizerObjective, WorldModelObjective
+from dew.objectives.world_model import CausalTokenizer, Dynamics, TokenizerObjective, WorldModelObjective
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 from dew.state import TrainState
@@ -28,8 +28,8 @@ from dew.training import Trainer
 WORLD = "dew.objectives.world_model"
 WINDOW, SIZE, BATCH = 4, 8, 8
 """A clip's frames, a frame's side in pixels and a batch's clips."""
-TOKENIZER = {"patch": 4, "width": 16, "depth": 1, "heads": 2, "latents": 4, "bottleneck": 4}
-DYNAMICS = {"spatial": 2, "width": 16, "depth": 1, "heads": 2, "levels": 3, "frames": WINDOW}
+TOKENIZER: dict[str, Any] = {"patch": 4, "width": 16, "depth": 1, "heads": 2, "latents": 4, "bottleneck": 4}
+DYNAMICS: dict[str, Any] = {"spatial": 2, "width": 16, "depth": 1, "heads": 2, "levels": 3, "frames": WINDOW}
 """The tokenizer's and the dynamics model's fields at a test's size; the run derives the rest."""
 OPTIM = OptimConfig(optimizer="adam", learning_rate=1e-3)
 TOKENIZER_STEPS, DYNAMICS_STEPS = 3, 2
@@ -101,8 +101,8 @@ def test_each_stage_from_its_record_trains_as_the_stage_composed_in_python(stage
     every leaf of their states bit for bit, where the same networks and objectives composed in Python end
     over the same clips: the run derives the tokenizer's frame from its data, and the dynamics' widths
     from the tokenizer."""
-    tokenizer = ModelConfig(f"{WORLD}:CausalTokenizer", TOKENIZER).build(frame=(SIZE, SIZE, 1))
-    dynamics = ModelConfig(f"{WORLD}:Dynamics", DYNAMICS).build(latents=4, bottleneck=4)
+    tokenizer = CausalTokenizer((SIZE, SIZE, 1), **TOKENIZER)
+    dynamics = Dynamics(latents=4, bottleneck=4, **DYNAMICS)
     run = tokenizer_run(stages.root, stages.clips)
     with generation.run_precision(run.trainer.precision):
         tokens = Trainer(TokenizerObjective(tokenizer), OPTIM, key=0).fit(
