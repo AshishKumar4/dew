@@ -221,10 +221,11 @@ def armada_seen(text: str | None) -> str:
 
 
 def pytest_settings(pyproject: Path) -> str:
-    """The part of `pyproject` every test process reads before its record starts: pytest's own settings
-    (`[tool.pytest]`: its markers, options and filters), as one text, or "missing". The rest of the file is
-    the input of each run that opens it (executed.py's `Opens`), not of every row's: a train that registered
-    two markers there and changed nothing pytest reads reran all 3,445 rows (ledger 3220, train 416)."""
+    """The part of `pyproject` every test process's pytest reads as it starts, which no record keeps
+    (followed.py's `configuring`): its own settings (`[tool.pytest]`: its options and filters), as one text,
+    or "missing". The rest of the file is the input of each run that opens it, not of every row's: a train
+    that registered two markers there and changed nothing pytest reads reran all 3,445 rows (ledger 3220,
+    train 416)."""
     if not pyproject.is_file():
         return "missing"
     settings = dict(tomllib.loads(pyproject.read_text()).get("tool", {}).get("pytest", {}))
@@ -353,11 +354,18 @@ def contents(name: str) -> bytes:
         path, _, executed = name.partition(followed.CODE)
         return unit(path, executed) if Path(path).is_file() else b"missing"
     if name.startswith("import:"):
-        # A module a run imported or tried to (followed.py's `IMPORTED`): a top-level one, whether a helper
-        # under tests/, which leads sys.path, would shadow it, a module or a package of that name; a
-        # submodule, what its import finds under src/ or tools/, a module, a package, a namespace or an
-        # extension of that name.
-        module = name.removeprefix("import:")
+        # A module a run imported or tried to (followed.py's `imports`), with the checkout's directories it
+        # was searched for in, in order: whether each holds a module, a package, a namespace or an extension
+        # of its name, any of which arriving ahead of what the import found shadows it.
+        module, searched, roots = name.removeprefix("import:").partition(followed.ROOTS)
+        if searched:
+            last = module.rpartition(".")[2]
+            return b"".join(b"1" if candidate.exists() else b"0" for root in roots.split(os.pathsep) if root
+                            for candidate in (Path(root, f"{last}.py"), Path(root, last, "__init__.py"),
+                                              Path(root, last), *sorted(Path(root).glob(f"{last}.*.so"))))
+        # A module the process held before its recorder ran (lifetime.py's `boot`, a child's start): a
+        # top-level one, whether a helper under tests/, which leads sys.path, would shadow it; a submodule,
+        # what its import finds under src/ or tools/.
         if "." in module:
             *parents, last = module.split(".")
             return b"".join(b"1" if candidate.exists() else b"0" for root in ("src", "tools")
@@ -415,13 +423,9 @@ def units(path: str) -> dict[str, bytes] | bytes:
 def digested(source: bytes, path: str) -> dict[str, bytes] | None:
     """The digest of each unit of module text `source` (`unit`), or None where it does not compile
     (`compiled`): a body left out would hide what fails it. The top level holds, beside its text with each
-    outermost function reduced to what defining it runs (its decorators, and its defaults and annotations
-    that evaluate code: `inert`), what compiling a body makes of the code around it (`shapes`): whether a
-    function is a generator or a coroutine, and the cells a class body makes for its methods (super()). A
-    function's name, parameters, docstring and body are its own unit's, keyed for the runs that entered it
-    or took its code (`inspect.signature`, followed.py's `coded`): an edited docstring of one function moved
-    every row that imported its module (ledger 3220: train 395's two docstring edits moved 84% of rows). A
-    bare `__doc__` read, which no audit sees, is no input."""
+    outermost function's body left out but its docstring, what compiling a body makes of the code around it
+    (`shapes`): whether a function is a generator or a coroutine, and the cells a class body makes for its
+    methods (super())."""
     code = compiled(source, path)
     if isinstance(code, str):
         return None
@@ -429,8 +433,8 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
     found: dict[str, list[str]] = collections.defaultdict(list)
 
     class Hollow(ast.NodeTransformer):
-        """The module's top level: each outermost function's text kept under its name, and left at the top
-        level as what defining it runs, its decorators and the defaults and annotations that evaluate code."""
+        """The module's top level: each outermost function's text kept under its name, its body left out but
+        its docstring, which the function value shows without running."""
 
         def __init__(self) -> None:
             self.scope: list[str] = []
@@ -443,15 +447,8 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
 
         def visit_FunctionDef(self, node):
             found[".".join([*self.scope, node.name])].append(ast.dump(node))
-            arguments = node.args
-            parameters = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs, arguments.vararg,
-                          arguments.kwarg)
-            annotations = [each.annotation for each in parameters if each is not None]
-            evaluated = [part for part in (*arguments.defaults, *arguments.kw_defaults, node.returns,
-                                           *annotations) if part is not None and not inert(part)]
-            node.args = ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[],
-                                      kwarg=None, defaults=evaluated)
-            node.returns, node.body = None, [ast.Pass()]
+            documented = ast.get_docstring(node, clean=False) is not None
+            node.body = [*node.body[:1 if documented else 0], ast.Pass()]
             return node
 
         visit_AsyncFunctionDef = visit_FunctionDef
@@ -459,27 +456,6 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
     top = ast.dump(Hollow().visit(tree)) + json.dumps(shapes(code))
     digests = {name: hashlib.sha256("\n".join(dumps).encode()).digest() for name, dumps in found.items()}
     return {**digests, followed.TOP: hashlib.sha256(top.encode()).digest()}
-
-
-def inert(expression: ast.expr) -> bool:
-    """Whether evaluating `expression` (a default or an annotation) runs none of the module's code: a constant
-    or a name, and the attributes, operators, subscripts and displays of those, whose value a run that calls
-    the function reads through the function's own unit (`digested`)."""
-    if isinstance(expression, ast.Constant | ast.Name):
-        return True
-    if isinstance(expression, ast.Attribute):
-        return inert(expression.value)
-    if isinstance(expression, ast.Tuple | ast.List | ast.Set):
-        return all(map(inert, expression.elts))
-    if isinstance(expression, ast.BoolOp):
-        return all(map(inert, expression.values))
-    if isinstance(expression, ast.BinOp):
-        return inert(expression.left) and inert(expression.right)
-    if isinstance(expression, ast.UnaryOp):
-        return inert(expression.operand)
-    if isinstance(expression, ast.Subscript):
-        return inert(expression.value) and inert(expression.slice)
-    return False
 
 
 def compiled(source: bytes, path: str) -> types.CodeType | str:
@@ -658,9 +634,9 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
     apart from the last run's record (`record_key`): every green run of a row on any inputs stays found by
     its own key, so a run of another commit, which replaces the last record, loses none of them
     (`green_record`; owner, 2026-10-29: a lane's one-line change over a green verdict reran half its suite,
-    its records replaced). The row's own place holds it, as the files one process ran share what it executed
-    before them and so their keys (`executed.py`): kept by the key alone, one file's run stood for each of
-    them (2026-10-30: a kept task reported one file's row for six files)."""
+    its records replaced). The row's own place holds it, as two files' records may share every input and so
+    their keys: kept by the key alone, one file's run stood for each of them (2026-10-30: a kept task
+    reported one file's row for six files)."""
     return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
@@ -970,12 +946,6 @@ def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | N
     return None if whole is None else (whole, 1)
 
 
-APART = re.compile(r"\bpytest\.mark\.torchax\b")
-"""A file marked `torchax` imports torchax, which renames torch's privateuse1 backend to "jax" for
-the whole process, so a torch.compile in a later file of its task fails (test_reference_helpers'
-MXFP4, armada dew-20261011231242-dd32ac90): its tasks hold only files so marked."""
-
-
 def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]]]:
     """The names of `weights` packed heaviest first into the lightest of `count` bins: each bin's
     weight and its names, sorted, in bin order."""
@@ -992,11 +962,13 @@ notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its op
 elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
 no record placed it (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows
 reused)."""
-PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
-"""The checkout's own files at its root that tests read as a page is read, and the changelog, which
-no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
-it turned the cache off for every train holding such a head, which then ran its whole suite on every
-round (train 149: 30 task-hours, twice)."""
+PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md", "pyproject.toml")
+"""The checkout's own files at its root that tests read as a page is read; the changelog, which no test
+reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none, it turned the
+cache off for every train holding such a head, which then ran its whole suite on every round (train 149: 30
+task-hours, twice); and pyproject.toml, whose pytest settings every row keys (`pytest_settings`), whose
+markers each row that uses one (`marks`), and whose rest each run that opens it (ledger 3220: train 416
+registered two markers and reran all 3,445 rows)."""
 
 
 def policy(base: str) -> str:
@@ -1233,7 +1205,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
+    then on; each file of a task runs in a process of its own (`alone`). Each entry carries
     the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
     whose rows the cache holds for exactly these inputs (`reusable`) share tasks of the target's lookups each,
     which look each up again in their containers, so the verdict names every file and containers scale with
@@ -1280,11 +1252,8 @@ def plan(target: float, timings: dict) -> list[dict]:
                   if (name, group) not in found]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and name not in groups and (name, "") not in found}
-        apart = {name for name in light if APART.search(Path(name).read_text())}
-        for family in (sorted(set(light) - apart), sorted(apart)):
-            count = max(math.ceil(sum(light[name] for name in family) / target), 1)
-            tasks += [([(name, "") for name in names], held)
-                      for held, names in packed({name: light[name] for name in family}, count) if names]
+        count = max(math.ceil(sum(light.values()) / target), 1)
+        tasks += [([(name, "") for name in names], held) for held, names in packed(light, count) if names]
         for index, (held_rows, weight) in enumerate(tasks, start=1):
             # A kept row says where its green run is kept, and its group where it has one (`kept_of`); a task
             # of one file's group runs that group (`split`).
@@ -1423,11 +1392,11 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
-    A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
-    the plan weighs a file by what it costs a container (its import, its collection, the
-    container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
-    at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
-    file goes there (`coverage_items`)."""
+    Each file runs in a pytest process of its own (`alone`), and a row's seconds are that process's wall
+    time: the plan weighs a file by what it costs a container (its import, its collection, the container's
+    pace), which pytest's case times leave out. Weighed by case times, tasks planned at 300 seconds ran a
+    median of 392. With `coverage`, pytest runs under coverage.py, whose data file goes there
+    (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
@@ -1547,11 +1516,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
                        coverage, network, whole, release, site) if left > 0 else None
         ran.append(file_row(python, name, group, site, alone_, deadline))
+        # The verdict first, so no cache write that waits on the Worker keeps it from armada.
+        out.write_text(json.dumps({"rows": rows + ran}))
         if coverage is None and not release and alone_ is not None:
             # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which
             # runs under its requirement's overlay and on the whole suite's run alone.
             record(python, ran[-1:], alone_.log, common, network, alone_.opened)
-    out.write_text(json.dumps({"rows": rows + ran}))
     return 0
 
 
@@ -1600,12 +1570,17 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     # A cache directory of the file's own, empty as a cold container's: no record another file's process wrote
     # beside the compilation cache (a step's rungs, keyed by Dew's source digest, followed.py's `DIGEST`)
     # serves this file by code its record never held (its bundle of programs fetched into it as before).
+    # Its scratch too (TMPDIR, which tempfile and pytest's tmp_path take), so what one file's tests leave
+    # there is no other's to read. uv's cache, which only holds packages by their digests, stays shared.
     caches = base.with_name(f"{base.name}.caches")
     shutil.rmtree(caches, ignore_errors=True)
-    caches.mkdir()
+    (caches / "tmp").mkdir(parents=True)
     environment = session.pytest_environment({
-        **environ, **site_environment(site), "XDG_CACHE_HOME": str(caches), "DEW_EXECUTED_LOG": str(log),
-        "DEW_COLLECTED": str(collection)})
+        **environ, **site_environment(site), "XDG_CACHE_HOME": str(caches), "TMPDIR": str(caches / "tmp"),
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache" / "uv")),
+        followed.PRIVATE: str(caches), "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
+    # A store elsewhere, inherited, would be one every file of the task shared.
+    environment = {name: value for name, value in environment.items() if name not in followed.CACHES}
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the process's group opens, held from before pytest starts until its group stopped

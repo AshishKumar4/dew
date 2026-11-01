@@ -22,7 +22,8 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     until one changes, though it leaves through os._exit, it writes each as it
     happens, or execs itself again (dew.devices' restart under XLA's flags),
     whose new image writes on into the log of the old. A child given an
-    environment of its own, or killed before it wrote its record, leaves its
+    environment of its own, one that execs itself again with no site (-S),
+    whose .pth never runs, or one killed before it wrote its record, leaves its
     file without a key."""
     url, _, _ = cache_worker
     cached(monkeypatch, url)
@@ -41,12 +42,20 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                      "    again = {**os.environ, 'REEXECED': '1'}\n"
                      "    os.execve(sys.executable, [sys.executable, __file__], again)\n"
                      "assert plain.helper()\n",
+        # A new image with no site, whose .pth never runs: what it executes no log holds.
+        "reexec_bare.py": "import os, sys\n"
+                          "if os.environ.get('REEXECED') != '1':\n"
+                          "    again = {**os.environ, 'REEXECED': '1'}\n"
+                          "    os.execve(sys.executable, [sys.executable, '-S', __file__], again)\n"
+                          "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
         "test_child.py": started + "done = subprocess.run([sys.executable, 'tests/child.py'], check=True,\n"
                                    "                      capture_output=True, text=True)\n"
                                    "    assert not done.stderr, done.stderr\n",
         "test_quiet.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
         "test_exits.py": started + "subprocess.run([sys.executable, 'tests/exit.py'], check=True)\n",
         "test_reexecs.py": started + "subprocess.run([sys.executable, 'tests/reexec.py'], check=True)\n",
+        "test_reexecs_bare.py": started + "subprocess.run([sys.executable, 'tests/reexec_bare.py'],\n"
+                                          "                   check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
@@ -62,18 +71,19 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
 
-    assert reused() == [True, True, True, True, False, False]
+    assert reused() == [True, True, True, True, False, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
-    assert reused() == [False, True, True, True, False, False]
+    assert reused() == [False, True, True, True, False, False, False]
     (tmp_path / "notes/page.md").write_text("page\n")
-    assert reused() == [True, True, True, True, False, False]
+    assert reused() == [True, True, True, True, False, False, False]
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
-    assert reused() == [False, True, False, False, False, False]
+    assert reused() == [False, True, False, False, False, False, False]
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
                                    "tests/test_exits.py": ["changed"],
                                    "tests/test_killed.py": ["changed"],
                                    "tests/test_own_environment.py": ["changed"],
-                                   "tests/test_reexecs.py": ["changed"]}
+                                   "tests/test_reexecs.py": ["changed"],
+                                   "tests/test_reexecs_bare.py": ["changed"]}
 
 
 def test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs_it(
@@ -150,21 +160,25 @@ def test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs
 def test_a_native_media_binary_keeps_its_files_key_and_what_it_opened_is_that_keys_input(
         ci, tmp_path, monkeypatch, cache_worker):
     """The media binary imageio-ffmpeg ships, named for its platform and version, and the other native
-    programs of `followed.TOOLS` run no checkout code and hold no GPU: a file that starts one keeps its key,
-    whose inputs include the data files the program opened under tests/ (the watch's: it raises no Python
-    audit event). A shell script of the same directory, which may run any code, leaves its file without a
-    key."""
+    programs of `followed.TOOLS` the environment or the system owns run no checkout code and hold no GPU: a
+    file that starts one keeps its key, whose inputs include the data files the program opened under tests/
+    (the watch's: it raises no Python audit event). A script under the same name, which may run any code,
+    leaves its file without a key, the checkout's or a test's alike (`followed.tool`)."""
     url, _, _ = cache_worker
     cached(monkeypatch, url)
-    run = ("import subprocess\ndef test_run():\n"
-           "    subprocess.run(['tests/bin/{}'], check=True, capture_output=True)\n")
     written(tmp_path, {"clip.bin": "frames\n"})
     (tmp_path / "tests/bin").mkdir()
-    for name in ("ffmpeg-linux-x86_64-v7.0.2", "unlisted"):
-        (tmp_path / "tests/bin" / name).write_text("#!/bin/sh\ncat tests/clip.bin\n")
-        (tmp_path / "tests/bin" / name).chmod(0o755)
-    written(tmp_path, {"test_media.py": run.format("ffmpeg-linux-x86_64-v7.0.2"),
-                       "test_shell_script.py": run.format("unlisted")})
+    script = tmp_path / "tests/bin/ffmpeg-linux-x86_64-v7.0.2"
+    script.write_text("#!/bin/sh\ncat tests/clip.bin\n")
+    script.chmod(0o755)
+    written(tmp_path, {
+        "test_media.py": "import imageio_ffmpeg, subprocess\ndef test_run():\n"
+                         "    program = imageio_ffmpeg.get_ffmpeg_exe()\n"
+                         "    subprocess.run([program, '-v', 'quiet', '-i', 'tests/clip.bin'],\n"
+                         "                   capture_output=True)\n",
+        "test_shell_script.py": "import subprocess\ndef test_run():\n"
+                                "    subprocess.run(['tests/bin/ffmpeg-linux-x86_64-v7.0.2'], check=True,\n"
+                                "                   capture_output=True)\n"})
     interpreter(tmp_path, "3.12")
     tests = ["tests/test_media.py", "tests/test_shell_script.py"]
     ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
@@ -469,19 +483,42 @@ def test_a_file_that_digests_dews_source_keys_on_what_it_ran_not_on_every_source
     assert reused() == [False]
 
 
-def test_each_file_of_a_task_finds_its_cache_directory_empty(ci, tmp_path):
+def test_a_marker_registered_in_pyproject_reruns_the_files_that_use_it_and_its_other_parts_none(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """pytest's read of pyproject.toml as it starts is no input of any row (followed.py's `configuring`):
+    its pytest settings are every row's (ci.py's `pytest_settings`), a marker's registration the input of the
+    files that use that marker (`marks`), and its other parts no row's that never opened it (ledger 3220:
+    train 416 registered two markers and reran all 3,445 rows)."""
+    project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = [\"tidy: {}\"]\n"
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_marked.py": "import pytest\n@pytest.mark.tidy\ndef test_marked():\n    pass\n",
+        "test_plain.py": "def test_plain():\n    pass\n"}, {})
+    assert reused() == [True, True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
+    assert reused() == [False, True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test").replace("'x'", "'y'"))
+    assert reused() == [True, True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test") + "addopts = \"-p no:randomly\"\n")
+    assert reused() == [False, False]
+
+
+def test_each_file_of_a_task_finds_its_cache_and_scratch_directories_empty(ci, tmp_path):
     """No record one file's process leaves in its caches (XDG_CACHE_HOME: Dew's, the compilation cache and
-    a step's rungs beside it) serves another file of its task (`alone`), which is what lets a file's key
-    leave out the source digest those records are named by (followed.py's `DIGEST`)."""
+    a step's rungs beside it) or its scratch (TMPDIR, pytest's tmp_path among it) serves another file of its
+    task (`alone`), which no key would hold, as reads outside the checkout are none: what lets a file's key
+    leave out what its taskmates ran, and the source digest those records are named by (followed.py's
+    `DIGEST`, `private`)."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     for name in ("first", "second"):
         (tmp_path / f"tests/test_{name}.py").write_text(
-            "import os\nfrom pathlib import Path\n"
+            "import os, tempfile\nfrom pathlib import Path\n"
             f"def test_{name}():\n"
-            "    record = Path(os.environ['XDG_CACHE_HOME']) / 'dew' / 'left.txt'\n"
-            "    assert not record.exists()\n"
-            "    record.parent.mkdir(parents=True, exist_ok=True)\n"
-            "    record.write_text('x')\n")
+            "    for record in (Path(os.environ['XDG_CACHE_HOME']) / 'dew' / 'left.txt',\n"
+            "                   Path(tempfile.gettempdir()) / 'left.txt'):\n"
+            "        assert not record.exists()\n"
+            "        record.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        record.write_text('x')\n")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     ci.task("3.12", ["tests/test_first.py", "tests/test_second.py"], "", out, 600.0)

@@ -854,7 +854,7 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
 @pytest.mark.parametrize(("changed", "policy"), [
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
-    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
+    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "on"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "off"),
     ({"tools/armada/executed.py": "# the recorder\n"}, "off"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
@@ -872,8 +872,9 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
     where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
     is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache
-    off, and 0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every
-    file's input: an old record may lack a dependency a new recorder finds."""
+    off, and 0.75% of rows were reused), and pyproject.toml is placed too: its pytest settings every row keys,
+    its markers each row that uses one (ledger 3220). The recorder (executed.py, followed.py, watched.py)
+    stays every file's input: an old record may lack a dependency a new recorder finds."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():

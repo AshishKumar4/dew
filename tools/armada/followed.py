@@ -151,18 +151,51 @@ def reads_backend(code: types.CodeType) -> bool:
 
 DIGEST = (os.path.join("src", "dew", "cache.py"), "package_digest")
 """The code that reads the checkout's source only to digest it (`dew.cache.package_digest`), into the key of a
-record Dew's caches keep beside the compilation cache: CI gives each file's process a cache directory of its
-own (ci.py's `alone`), so a record a file finds there is one its own process wrote, by code its record holds,
-and the digest's reads are no input of it (ledger 3220: they keyed 37-45% of rows on every source file)."""
+record Dew's caches keep: CI gives each file's process caches of its own (ci.py's `alone`, `private`), so a
+record a file finds there is one its own process wrote, by code its record holds, and the digest's reads are
+no input of it (ledger 3220: they keyed 37-45% of rows on every source file)."""
+
+
+PRIVATE = "DEW_EXECUTED_CACHES"
+"""Where ci.py's `alone` gives a test file's process its own caches, named in its environment."""
+CACHES = ("JAX_COMPILATION_CACHE_DIR", "DEW_RUNG_RECORDS")
+"""The settings that would place a record named by the source digest (`DIGEST`) outside the caches of a file's
+own (`PRIVATE`): JAX's cache directory and the rungs' (dew.cache's `beside_compilation_cache`)."""
 
 
 def digesting(frame: types.FrameType | None) -> bool:
-    """Whether `frame`, or a frame it was called from, runs `DIGEST`'s code."""
+    """Whether `frame`, or a frame it was called from, runs `DIGEST`'s code in a process whose every store
+    of what the digest names is its own (`PRIVATE`), as only then is no record it finds another's."""
     while frame is not None:
         if frame.f_code.co_name == DIGEST[1] and frame.f_code.co_filename.endswith(DIGEST[0]):
+            return private()
+        frame = frame.f_back
+    return False
+
+
+CONFIGURATION = os.path.join("_pytest", "config", "")
+"""Where pytest reads its own settings, from pyproject.toml among others: ci.py's `shared` keys the part it
+reads (`pytest_settings`) and each file the markers it uses (`marks`), so its read of the whole file is no
+input."""
+
+
+def configuring(frame: types.FrameType | None) -> bool:
+    """Whether `frame`, or a frame it was called from, is pytest reading its settings (`CONFIGURATION`)."""
+    while frame is not None:
+        if CONFIGURATION in frame.f_code.co_filename:
             return True
         frame = frame.f_back
     return False
+
+
+def private() -> bool:
+    """Whether Dew's caches (XDG_CACHE_HOME) and every store set apart from them (`CACHES`) lie in the caches
+    ci.py's `alone` gave this process (`PRIVATE`)."""
+    if not (own := os.environ.get(PRIVATE)):
+        return False
+    own = os.path.join(os.path.abspath(own), "")
+    return all(os.path.join(os.path.abspath(os.environ.get(name, own)), "").startswith(own)
+               for name in ("XDG_CACHE_HOME", *CACHES))
 
 
 def read(event: str, args: tuple, root: str) -> str | None:
@@ -194,7 +227,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
     # The interpreter audits the main script's open from no frame (`sys._getframe(1)` is the audit hook's).
-    if digesting(sys._getframe(1).f_back):
+    if digesting(sys._getframe(1).f_back) or (os.path.basename(os.fsdecode(path or "")) == "pyproject.toml"
+                                                and configuring(sys._getframe(1).f_back)):
         return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
@@ -296,18 +330,43 @@ def programs(event: str, args: tuple) -> list:
     return []
 
 
-def tool(path) -> str:
-    """The name of the program at `path` as `TOOLS` has it: its file's, but for imageio-ffmpeg's binary, which
-    names its platform and version (`ffmpeg-linux-x86_64-v7.0.2`)."""
-    name = os.path.basename(os.fsdecode(path))
-    return "ffmpeg" if name.startswith("ffmpeg-") else name
+OWNED = ("/usr/", "/bin/", "/sbin/", "/lib/", "/opt/")
+"""The system's own directories, whose programs, beside the environment's (`sys.prefix`), a start may run as a
+tool (`tool`); a program a test wrote or built lies elsewhere."""
+
+
+def tool(path) -> str | None:
+    """The name of the program at `path` as `TOOLS` has it, or None where it is no tool: its file's, but for
+    imageio-ffmpeg's binary, which names its platform and version (`ffmpeg-linux-x86_64-v7.0.2`), and only
+    where it is a native binary (ELF) the environment or the system owns, not a script nor a program of the
+    checkout's or a test's, which may run any code under a tool's name."""
+    import shutil  # on a start alone: every child imports this module before its own imports
+
+    name = os.fsdecode(path)
+    found = name if os.sep in name else shutil.which(name)
+    if found is None:
+        return None
+    real = os.path.realpath(found)
+    if not real.startswith((os.path.join(os.path.realpath(sys.prefix), ""), *OWNED)):
+        return None
+    try:
+        with open(real, "rb") as program:
+            if program.read(4) != b"\x7fELF":
+                return None
+    except OSError:
+        return None
+    base = os.path.basename(name)
+    return "ffmpeg" if base.startswith("ffmpeg-") else base
 
 
 def native(names: list) -> bool:
-    """Whether every one of `names`, and at least one, is a program of `TOOLS`. A start that names
-    its program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
-    return bool(names) and all(isinstance(name, (str, bytes, os.PathLike)) and tool(name) in TOOLS
-                               for name in names)
+    """Whether every one of `names` that exists, and at least one, is a program of `TOOLS` (`tool`): a
+    start's candidates along PATH (`_posixsubprocess`'s) run the first that exists. A start that names its
+    program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
+    if not names or not all(isinstance(name, (str, bytes, os.PathLike)) for name in names):
+        return False
+    existing = [name for name in names if os.sep not in os.fsdecode(name) or os.path.exists(name)]
+    return bool(existing) and all(tool(name) in TOOLS for name in existing)
 
 
 def spawned(code: types.CodeType, frame: types.FrameType) -> str | None:
@@ -347,12 +406,29 @@ def _beneath_spawnv() -> bool:
     return False
 
 
+def sited(argv) -> bool:
+    """Whether Python started with command line `argv` makes its site, where the `.pth` that starts `follow`
+    runs (`installed`): no -S among the options before its program."""
+    arguments = [os.fsdecode(argument) for argument in list(argv)[1:]]
+    for index, argument in enumerate(arguments):
+        if argument in ("-c", "-m", "-") or not argument.startswith("-"):
+            return True
+        if argument.startswith("--") or (index and arguments[index - 1] in ("-X", "-W")):
+            continue
+        if argument.startswith(("-X", "-W")):
+            continue
+        if "S" in argument[1:]:
+            return False
+    return True
+
+
 def start(event: str, args: tuple, directory: str, child: bool = False) -> str | None:
     """How a process start the audit names counts for its test file: None for none of its own (a
     native tool, `subprocess`'s own start beneath the Popen its audit already named, multiprocessing's
     exec of a spawned child, which `spawned` counts, a fork, whose child runs this process's own code
     under its hooks, and, in a followed `child`, its exec of this Python again with the recorder's
-    environment, which records into its log, the pid's), "followed" for a child that records itself into
+    environment and its site (`sited`), which records into its log, the pid's), "followed" for a child that
+    records itself into
     `directory`, else "unfollowed"."""
     if event not in SPAWNS:
         return None
@@ -362,7 +438,7 @@ def start(event: str, args: tuple, directory: str, child: bool = False) -> str |
         return None
     if event == "_posixsubprocess.fork_exec" and _beneath_spawnv():
         return None
-    if child and event == "os.exec" and _this_python(args[0]) and \
+    if child and event == "os.exec" and _this_python(args[0]) and sited(args[1]) and \
             (os.environ if args[2] is None else args[2]).get(CHILDREN) == directory:
         return None
     if native(programs(event, args)):
@@ -451,18 +527,36 @@ def closed_imports(seen: set[str], root: str):
     return Closed
 
 
-def imports(write: Callable[[str], None]):
+ROOTS = "@"
+"""Between a module's name and where its import searched for it, in an `IMPORTED` item (`imports`)."""
+
+
+def searched(entries, root: str) -> str:
+    """The checkout's directories among import search `entries` (sys.path, or a package's `__path__`), in
+    order and relative to `root` ("." the checkout's own), joined by os.pathsep: where an import of a name
+    looks for it, each a directory whose candidates for the name ci.py's `contents` keys. The environment's
+    packages, which the locks key, hidden directories and those outside the checkout are none."""
+    found = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        relative = os.path.relpath(os.path.abspath(entry or "."), root)
+        if relative == "." or not (relative.startswith(".") or "site-packages" in relative):
+            found.append(relative)
+    return os.pathsep.join(dict.fromkeys(found))
+
+
+def imports(write: Callable[[str], None], root: str):
     """The import system's first finder that passes each module imported by name, a statement's or
-    `importlib.import_module`'s, found or not, to `write` (`IMPORTED`): its top-level name, which a helper
-    under tests/ would shadow, and a submodule's dotted name, whose module, package or namespace the import
-    finds; it finds nothing itself."""
+    `importlib.import_module`'s, found or not, to `write` (`IMPORTED`): its dotted name, and the checkout's
+    directories it is searched for in (`searched`, after `ROOTS`), the import system's own search path for a
+    top-level name or its package's path for a submodule, so a module or package of that name arriving in any
+    of them ahead of what the import found is keyed (ledger 3220); it finds nothing itself."""
 
     class Imports:
         @staticmethod
         def find_spec(name, path=None, target=None):
-            write(f"{IMPORTED}{name.partition('.')[0]}")
-            if "." in name:
-                write(f"{IMPORTED}{name}")
+            write(f"{IMPORTED}{name}{ROOTS}{searched(sys.path if path is None else list(path), root)}")
 
     return Imports
 
@@ -556,7 +650,7 @@ def follow() -> None:
     if holder is not None:
         write("unfollowed", 1)
         return
-    sys.meta_path.insert(0, imports(lambda item: write("file", item)))
+    sys.meta_path.insert(0, imports(lambda item: write("file", item), root))
     opening(lambda item: write("file", item), root)
     sys.monitoring.use_tool_id(FOLLOWER_TOOL, FOLLOWER)
     sys.monitoring.register_callback(FOLLOWER_TOOL, sys.monitoring.events.PY_START, started)
