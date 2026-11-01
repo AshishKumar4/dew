@@ -62,6 +62,8 @@ The rule: a lower layer contains no decision an upper one owns. A mainloop never
 
 The algebra is a set of named, pure functions on tile values. It declares which products a step needs and on what operands. The mainloop issues and waits on them, so FA3's issue-early overlap, FA4's correction warpgroup and CUTLASS's ping-pong are placements of the same functions.
 
+A template's online, tiled and combine forms, forward and backward, are to be derived from its declaration by Dew's algebraic optimizer, the hand-written algebra its oracle ([algebra.md](algebra.md) §2, template algebra).
+
 Rounding points are algebra:
 - narrowing to the operand dtype;
 - dV's form by dtype;
