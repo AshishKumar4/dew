@@ -60,7 +60,8 @@ def model_of(arguments) -> CausalTransformer:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Measure this GPU's kernel picks for a decoder's step.")
     parser.add_argument("--config", required=True,
-                        help="a decoder checkpoint's directory or Hub repo; only its config.json is read")
+                        help="a decoder checkpoint's directory or Hub repo; its config.json and, for a "
+                             "quantized wrapper, its tensors' headers are read")
     parser.add_argument("--revision", help="the Hub repo's commit")
     parser.add_argument("--batch", type=int, required=True, help="sequences a device holds")
     parser.add_argument("--seq", type=int, required=True)
