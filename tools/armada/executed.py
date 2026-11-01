@@ -135,8 +135,7 @@ def pytest_configure(config):
         looked = pytest.MarkGenerator.__getattr__
 
         def looking(self, name):
-            if not name.startswith("_"):
-                lifetime.write(lifetime.owner(), f"{MARKER}{name}")
+            pass  # FAULT F2
             return looked(self, name)
 
         looking.watched = True

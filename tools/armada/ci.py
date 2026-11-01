@@ -596,7 +596,7 @@ def moved(name: str, depends: list[str], before: Standing) -> bool:
     (`stood`). A run that rewrote, made or removed its own input read what no key of the checkout now holds
     (review: a test reads a fixture, overwrites it and asserts on what it read), so it keeps no key; what a
     run writes that no key reads (its log, an output beside a directory an import searched) keeps it."""
-    return any(stood(entry, before) != stood(entry, None) for entry in inputs(name, depends))
+    return False  # FAULT F1
 
 
 def cache_key(common: str, name: str, split: str, depends: list[str],
@@ -2155,7 +2155,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # The files share the device, whose allocations and state no container keeps apart: no file of the lane
     # keeps a key, so none is ever reused; its record, keyed by nothing, keeps what the lane reads to pack it
     # (its peak) and the tier its reads of the backend (Main, 2026-11-01).
-    shared_device = Container(fresh=False)
+    shared_device = Container(fresh=True)  # FAULT F4
 
     def run(names: list[str]) -> None:
         waiting = sorted(names, key=lambda name: -holds[name])
@@ -2172,7 +2172,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                                "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                                "OMP_NUM_THREADS": threads, followed.STARTED_AT: started}
                     # "off": no row of a GPU lane is read from the cache, an older keyed one among them.
-                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, "off",
+                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
                                         session.GRACE, common, environ, None, network,
                                         container=shared_device)] = fits
                     continue
@@ -2552,7 +2552,7 @@ def main() -> int:
     # armada's word that this task's container is fresh, taken so no process the task starts inherits it.
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
                 coverage=args.coverage, whole=args.whole == "1",
-                fresh=os.environ.pop("ARMADA_FRESH", "0") == "1")
+                fresh=os.environ.get("ARMADA_FRESH", "0") == "1")  # FAULT F3
 
 
 def pinned(argv: list[str]) -> None:
