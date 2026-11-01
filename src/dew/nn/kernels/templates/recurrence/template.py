@@ -123,12 +123,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
         given = [arguments.get(name) for name in names]
         shapes = tuple(None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in given)
         dtype = jnp.result_type(*(arguments[name].dtype for name in names[:3]))
-        per_head = arguments["g"].ndim == 3
         family = bundle(target, dtype)
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         delta = arguments.get("delta", True)
-        fast = backward and per_head and mainloop_backward.fast_backward_form(
-            delta, arguments.get("rounded", False), dtype)
+        fast = backward and mainloop_backward.fast_backward_form(
+            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4)
         return _planned(shapes, config, family, target, arguments.get("max_segments"), delta, bool(fast),
                         arguments.get("floor"), arguments.get("rounded", False), arguments.get("wide", False),
                         ranged(dtype, delta, arguments.get("bound")))
@@ -294,8 +293,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
-                                                     arguments.get("rounded", False), dtype)
-        if not (forms and arguments["g"].ndim == 3):
+                                                     arguments.get("rounded", False), dtype,
+                                                     per_key=arguments["g"].ndim == 4)
+        if not forms:
             return False
         fits = self.fits(ba, target)
         return bool(fits) and self._backward_holds(ba, fits[0], target)

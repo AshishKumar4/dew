@@ -16,6 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
     _PLANNED,
@@ -97,15 +98,18 @@ def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> b
                for launch in launches)
 
 
-def fast_backward_form(delta: bool, rounded: bool, dtype) -> bool:
-    """Whether the fast backward takes a call's form (a decay a head besides): the delta rule, fla's DAG at
-    fla's rounding, or a bf16 `rounded` call without it (the SSD's under the run's fast forms, its route's),
-    the same DAG without the delta rule's at mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's
-    bf16 case; either in fp32 under the run's fast forms (`rounded`), its operands in two bf16 parts
-    (`mainloop.FAST_PARTS`). An fp16 call without the delta rule, which no recording holds, and an fp32 call's
-    three parts (the accurate forms) take none."""
+def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
+    """Whether the fast backward takes a call's form: the delta rule, fla's DAG at fla's rounding, a decay a
+    head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 `rounded` call without it and a decay a
+    head (the SSD's under the run's fast forms, its route's), the same DAG without the delta rule's at
+    mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
+    fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
+    delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
+    (the accurate forms) take none."""
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
+    if per_key:
+        return delta
     return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
 
 
@@ -143,19 +147,20 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no
     `w^T dv`; a `skip` `[HV]` (Mamba2's `D`, `mainloop.forward`'s) adds `D do` to `dv`, its own gradient
     `sum(v do)` a seventh output."""
-    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v)):
+    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms, an fp32 call's under them alone")
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                     tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
                     firsts=firsts, rounded=rounded, ranged=ranged)
     call = run.call
-    if call.per_key:
-        raise NotImplementedError("the fast backward takes a decay a head")
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
-    batch = run.batch
     laid_do = call.given.split(run.laid(_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
     dht = _padded(_padded(dfinal.astype(jnp.float32), 2, width), 3, columns).reshape(-1, columns)
+    if call.per_key:
+        dq, dk, dv, dg, dbeta, dh0 = key_backward.gradients(run, laid_do, dht, tiles)
+        dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
+        return _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
     local = _local_back(run.q, run.k, laid_do, run.hi, run.lo, run.taken, call, scale=run.scale)
     # Without the delta rule the walk gates the values where their columns are the call's own. Padded, it
     # read a padded copy of them (0.061 ms of Nemotron-H 4B's SSD training on an H100) and its gate took
@@ -213,23 +218,34 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
         return x.reshape(*x.shape[:2], heads // call.group, call.group, width).sum(3)[..., :run.key_width]
 
     # The launches' gradients in the operands' dtype (fla's), summed in fp32, the held operand's parts joined.
-    dq, dk = (x.astype(jnp.float32) for x in (dq, dk))
     dv = call.held.joined(dv) if delta else dv.astype(jnp.float32)
     dk_w = None if dk_w is None else call.held.joined(dk_w)
-    key_heads = heads // call.group
+    extra = 0.0 if dk_w is None else keyed(headed(dk_w, width))
+    grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, run.unlaid(dg), run.unlaid(dbeta), dh0, starts,
+                    extra_dk=extra)
+    return grads if skip is None else (*grads, dskip)
+
+
+def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_dk=0.0) -> tuple:
+    """The backward's gradients laid back as the call's operands (`operands`, `(q, k, v, g, beta)`) and in
+    their dtypes: the queries' and keys' `[R, H * Dk]` a key head's, `extra_dk` `[B, T, H, Dk]` added to the
+    keys', the values' `[R, HV * Dv]`, the log decay's and write gates' as the call's (laid back already), and
+    the initial memory's `[B * HV * Dk, Dv]`, zero for a row a document starts."""
+    call = run.call
+    q, k, v, g, beta = operands
+    rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
+
     def key_headed(x):
         """`[R, H * Dk]`, a key head's, laid back as `[B, T, H, Dk]`."""
-        return run.unlaid(x.reshape(rows, key_heads, width))[..., :run.key_width]
+        laid = run.unlaid(x.astype(jnp.float32).reshape(rows, heads // call.group, width))
+        return laid[..., :run.key_width]
 
-    dq = key_headed(dq)
-    dk = key_headed(dk) + (0.0 if dk_w is None else keyed(headed(dk_w, width)))
-    dv = headed(dv, columns)[..., :run.value_width]
-    dh0 = dh0.reshape(batch, heads, width, columns)[:, :, :run.key_width, :run.value_width]
+    dv = run.unlaid(dv.reshape(rows, heads, columns))[..., :run.value_width]
+    dh0 = dh0.reshape(run.batch, heads, width, columns)[:, :, :run.key_width, :run.value_width]
     if starts is not None:
         dh0 = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], 0.0, dh0)
-    grads = (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), run.unlaid(dg).astype(g.dtype),
-             run.unlaid(dbeta).astype(beta.dtype), dh0)
-    return grads if skip is None else (*grads, dskip)
+    return (key_headed(dq).astype(q.dtype), (key_headed(dk) + extra_dk).astype(k.dtype), dv.astype(v.dtype),
+            dg.astype(g.dtype), dbeta.astype(beta.dtype), dh0)
 
 
 # The fast backward of a decay a head under the delta rule (fla's DAG through the algebra's backward tile
