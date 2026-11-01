@@ -23,6 +23,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Launch,
     Tiles,
     Work,
+    _addressed,
     _axis,
     _block_stored,
     _Call,
@@ -241,13 +242,16 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
 # XLA adds.
 
 
-def _value_block(call: _Call, held: Callable[[int], _Held], consumers: int = 1) -> int:
+def _value_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple],
+                 consumers: int = 1) -> int:
     """A launch's value block where it takes a value row a block at a time: the call's value width, halved
-    while its register model (`held(block)`, `_Held`) is past a consumer thread's registers
+    while its register model (`held(block)`, `_Held`, beside its addresses into its staging and landing
+    tiles there, `staged(block)`, as `mainloop._key_block` prices them) is past a consumer thread's registers
     (`Family.registers`) and the block stays whole blocks (`_Call.block`); the narrowest where none holds,
     which the launch then refuses."""
-    block = call.value_width
-    while block > call.block and held(block).registers(call.family) > call.family.registers(consumers):
+    block, family = call.value_width, call.family
+    while block > call.block and (held(block).registers(family, _addressed(*staged(block)))
+                                  > family.registers(consumers)):
         block //= 2
     return block
 
@@ -265,6 +269,13 @@ def _local_back_held(call: _Call, vb: int) -> _Held:
          *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, vb))]))
 
 
+def _local_back_staged(call: _Call, vb: int) -> tuple:
+    """`_local_back`'s staging tiles and landings at value block `vb`: the scores' narrow form and a value
+    block's gradient's landing."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    return _staging(held, (CHUNK, CHUNK)), {"row": _value_grads(call).landing(CHUNK, vb)}
+
+
 @_lowered_once
 def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     """`[R, HV * Dv]` in `_value_grads`' form: the corrected values' gradient from each chunk's own output
@@ -272,9 +283,9 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     (persistent): apart from the memory's reverse walk (`_reverse`), whose tiles beside these spilled 80
     bytes a thread on an H100's."""
     width, value_width, family = call.width, call.value_width, call.family
-    held, given = dataclasses.replace(call.held, rows=call.rows), call.given
-    grads = _value_grads(call)
-    vb = _value_block(call, functools.partial(_local_back_held, call))
+    given, grads = call.given, _value_grads(call)
+    vb = _value_block(call, functools.partial(_local_back_held, call),
+                      functools.partial(_local_back_staged, call))
 
     def program(q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
@@ -319,11 +330,11 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
     work = Work(2 * CHUNK * CHUNK * (width + value_width), exponentials=CHUNK * CHUNK)
+    staging, landing = _local_back_staged(call, vb)
     return _kernel(program, call, out_type=grads.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
-                   live=_taken(7), work=work, held=_local_back_held(call, vb),
-                   staging=_staging(held, (CHUNK, CHUNK)), landing={"row": grads.landing(CHUNK, vb)},
-                   persistent=True)(
+                   live=_taken(7), work=work, held=_local_back_held(call, vb), staging=staging,
+                   landing=landing, persistent=True)(
         q, k, do, hi, lo, hi, lo, taken)
 
 
