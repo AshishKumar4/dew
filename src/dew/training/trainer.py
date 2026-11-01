@@ -44,7 +44,6 @@ from dew.data.dataset import (
     Loader,
     PhasedStream,
     RampedStream,
-    Reader,
     Stage,
     rows_of,
     stream_identity,
@@ -111,6 +110,9 @@ from dew.training._fit import (
     FitRun,
     HandedSplits,
     Start,
+    _rollout_admitted,
+    _rollout_resumed,
+    _rollout_saved,
     afresh,
     check_inputs,
     clocked,
@@ -156,7 +158,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Summary, admit_split
+from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Split, Summary, admit_split, episodic
 from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
@@ -193,7 +195,7 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -690,6 +692,7 @@ class Trainer(Generic[Loss, Effects]):
         state, position = self.staging.restore(checkpoints, placed_shapes(abstract, shardings), resume,
                                                share, served=self.objective.served_groups(abstract.variables))
         state = restored(state, resume, self._examples)
+        _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = rates_set(state, lambda held: with_rates(held, config.rates()))
@@ -1391,7 +1394,7 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         return trained
 
-    def _plan(self, loader: Loader, held: Mapping[str, Reader | EvalSuite] | None,
+    def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
               written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
               checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,
@@ -1537,7 +1540,7 @@ class Trainer(Generic[Loss, Effects]):
                 if run.traced == profile.steps:
                     run.tracing = False
                     assert profiler is not None
-                    self._stop_trace(run, profile, profiler)
+                    run.close_window(profiler)
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
 
     def _closed(self, run: FitRun, primary: BaseException | None,
@@ -1558,7 +1561,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.tracing and profile is not None:
             run.tracing = False
             assert profiler is not None
-            stop_trace = functools.partial(self._stop_trace, run, profile, profiler)
+            stop_trace = functools.partial(run.close_window, profiler)
         error = primary
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
@@ -2172,20 +2175,20 @@ class Trainer(Generic[Loss, Effects]):
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
                    preview: bool, stated: Dataset | Loader | Handed, loss: bool) -> None:
-        """The refusals `fit` makes before it places anything: validation
-        nothing reads, and a pipeline's batch, whose placement could take minutes or run out of memory before
-        the error. Every other mesh's batch is checked with its stream (`check_stream`), a ramp's at each of
-        its stages. The checkpoints learn why no record rebuilds a run of
-        this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
+        """The refusals `fit` makes before it places anything: validation nothing reads, a rollout that
+        checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
+        take minutes or run out of memory before the error. Every other mesh's batch is checked with its
+        stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
+        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
         if self.checkpoints is not None:
-            given = {"a custom step (step=)": self.step, "a rollout (rollout=)": self.rollout,
-                     "a tracker (tracker=)": self.tracker, "recording each step's draws (record=True)":
-                     self.record or None}
+            given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
+                     "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
+                     "recording each step's draws (record=True)": self.record or None}
             self.checkpoints.python_run(unrecorded_parts(
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
         for name, suite in suites.items():
-            if loss and not any(metric.name == 'loss' for metric in suite.metrics):
+            if loss and not episodic(suite.data) and all(metric.name != 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:
                 read = self.objective.defines_validation_loss or self.checkpoints is not None or loss
@@ -2278,7 +2281,7 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.save, step, self.staging.saved(state), position, metadata, ranking=ranking,
             share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
-            boxed=self._boxed_axes())
+            boxed=self._boxed_axes(), rollout=None if weights_only else _rollout_saved(self.rollout))
         with run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
@@ -2304,7 +2307,8 @@ class Trainer(Generic[Loss, Effects]):
         write = functools.partial(
             checkpoints.save_local, step, self.staging.saved(state), position,
             share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
-            rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes())
+            rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes(),
+            rollout=_rollout_saved(self.rollout))
         with run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
@@ -2414,7 +2418,7 @@ class Trainer(Generic[Loss, Effects]):
         self,
         state: TrainState,
         shardings: Placement[TrainState],
-        reader: Reader | None,
+        reader: Split | None,
         metrics: Sequence[Metric],
         preview: bool,
         *,
@@ -2486,15 +2490,3 @@ class Trainer(Generic[Loss, Effects]):
                     self.tracker.log(scalars, advanced.step)
 
         agreed("evaluation reporting", report)
-
-
-    # ------------------------------------------------------------------ Telemetry
-    # ------------------------------------------------------------------
-
-    def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
-        """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
-        it until the run's cleanup waits for them and its outcome reports the window
-        (`_reported_outcome`)."""
-        stop_capture(profiler, run.loss)
-        run.profiled = (run.traced, run.current)
-

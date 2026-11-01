@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import os
 import sys
 import time
@@ -16,6 +17,7 @@ from typing import Any, ClassVar, Literal
 import jax
 import numpy as np
 from jax.sharding import Mesh
+from typing_extensions import TypeIs
 
 from dew._coordination import (
     agree_process_phase,
@@ -44,15 +46,83 @@ from dew.training.tracker import write_artifact
 
 
 @dataclass(frozen=True)
+class Flown:
+    """The scores a split's episodes earned in one evaluation, by name: the artifact every
+    `EpisodeScore` of the split reads."""
+
+    scores: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class EpisodeScore:
+    """A score a split's episodes report (`Episodes`), declared as any metric is, so a selection, a stop
+    or a summary reads it as a data split's (`Best("flight/return")`): its `name` and how it shows
+    (`shown`, which way is better). A pass holds one artifact, the episodes' `Flown` scores, which it
+    reads its own entry of."""
+
+    name: str
+    shown: Shown
+
+    @property
+    def reads(self) -> type:
+        return Flown
+
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> float:
+        if not isinstance(artifact, Flown):
+            raise TypeError(f"{self.name} reads a split's episodes (Flown), not a {type(artifact).__name__}")
+        return float(artifact.scores[self.name])
+
+    def merge(self, accumulated: float, contribution: float, /) -> float:
+        return contribution
+
+    def finalize(self, accumulated: float, /) -> float:
+        return accumulated
+
+
+@dataclass(frozen=True)
+class Episodes:
+    """A split scored by flying a policy, not by reading records: `score(variables, key)` returns the
+    split's scores by name (`dew.rl.evaluation.episodes`), each declared with how it shows (`scores`,
+    the split's metrics, `EpisodeScore`). It goes where a reader goes (`EvalSuite(Episodes(...))`), and
+    `Evaluation.run` scores it on the averaged weights where the run keeps them, on every process and
+    agreed (a scorer that fails on one, or reports other scores than `scores` declares, fails the
+    evaluation on all), process 0's scores the pool's, each of the metrics asked for (all of `metrics`
+    unless a suite names fewer) named `<split>/<name>` as a data split's; a warming pass flies to compile
+    and keeps none. Its key is
+    the evaluation's event key (`_event`: the run's key folded with 'EVAL' and the step) folded with
+    'EPIS'. It reads no batches, so a run's data metrics and loss are not its."""
+
+    score: Callable[[Variables, jax.Array], Mapping[str, float]]
+    scores: Mapping[str, Shown]
+
+    @functools.cached_property
+    def metrics(self) -> tuple[Metric, ...]:
+        """The split's metrics: one `EpisodeScore` a declared score, made once, so a selection given one
+        (`Best(split.metrics[0])`) reads the very metric the run declares."""
+        return tuple(EpisodeScore(name, shown) for name, shown in self.scores.items())
+
+
+type Split = Reader | Episodes
+"""What a validation split is scored from: the batches a reader opens, or the episodes a policy flies."""
+
+
+def episodic(reader: Reader | Dataset | Episodes | None) -> TypeIs[Episodes]:
+    """Whether a split is scored by its episodes (`Episodes`) rather than by the batches a reader
+    opens: the one test every reader of a suite's data makes."""
+    return isinstance(reader, Episodes)
+
+
+@dataclass(frozen=True)
 class EvalSuite:
     """A validation split `fit` scores with its own metrics on its own cadence.
 
     Empty `metrics` scores fit's, and `every` None scores it on fit's
     `eval_every`. Every suite is also scored at a checkpoint that ranks the
-    run's steps and at the end, so no ranking reads an earlier score.
+    run's steps and at the end, so no ranking reads an earlier score. A split
+    scored by its episodes holds an `Episodes` as its `data`.
     """
 
-    data: Reader
+    data: Split
     metrics: Sequence[Metric] = ()
     every: int | str | Counted | None = None
 
@@ -181,7 +251,7 @@ class Evaluation:
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,
-            batches: Reader | Dataset | None, *,
+            batches: Reader | Dataset | Episodes | None, *,
             key: int | jax.Array, metrics: Sequence[Metric] = (),
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
@@ -241,6 +311,10 @@ class Evaluation:
         from dew.data.compile import held
         from dew.nn.inputs import request_key
         key = request_key(key)
+        if episodic(batches):
+            return cls._episodes(batches, averaged if averaged is not None else variables, key=key, step=step,
+                                 schedule_step=schedule_step, updates=updates, split=split, warm=warm,
+                                 metrics=metrics or batches.metrics, training=training)
         if isinstance(batches, Dataset):
             batches = held(batches, objective=objective.data())
         started = time.perf_counter()
@@ -270,6 +344,40 @@ class Evaluation:
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
         return cls(event_step, split, scores, scored, records, event_words, elapsed, previews,
                    real_token_share=share)
+
+
+    @classmethod
+    def _episodes(cls, episodes: Episodes, variables: Variables, *, key: jax.Array, step: int | jax.Array,
+                  schedule_step: int | jax.Array | None, updates: int | jax.Array | None, split: str,
+                  warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array] | None
+                  ) -> Evaluation:
+        """`run`'s evaluation of a split scored by its episodes: its metrics checked and agreed as a data
+        split's are (`_agree_configuration`), each one reading the flight's scores (`Flown`), its clocks,
+        key and training values as well (`_event`); then, on every process and agreed, the flight, its
+        scores held to those the split declares and each metric asked for read off them (`EpisodeScore`)
+        and named `<split>/<name>`, process 0's the pool's; a warming pass flies once to compile and keeps
+        none."""
+        started = time.perf_counter()
+        _agree_configuration(metrics, episodes, split, loss=False, training=training is not None, warm=warm)
+        unread = [metric.name for metric in metrics if not issubclass(metric.reads, Flown)]
+        if unread:
+            raise ValueError(f"the {split} split is scored by its episodes, which its metrics read (Flown); "
+                             f"{unread} read none")
+        event_step, context, event_words, training_scores = _event(key, step, schedule_step, None, training,
+                                                                   updates)
+
+        def flown() -> dict[str, float]:
+            reported = Flown(dict(episodes.score(variables, _folded(context.key, 0x45504953))))
+            if set(reported.scores) != set(episodes.scores):
+                raise ValueError(f"the {split} split's episodes report {sorted(reported.scores)}, and it "
+                                 f"declares {sorted(episodes.scores)}")
+            # A split's episodes read no batch: each of its metrics reads the one artifact the flight made.
+            return {} if warm else {f"{split}/{metric.name}": metric.finalize(metric(reported, {}))
+                                    for metric in metrics}
+
+        scores = {**agreed(f"{split} episodes", flown), **training_scores}
+        scores, elapsed = broadcast_from_process_zero((scores, time.perf_counter() - started))
+        return cls(event_step, split, scores, 0, 0, event_words, elapsed, ())
 
 
 def _pick(artifacts: tuple[Artifact, ...], reads: type):
@@ -538,12 +646,13 @@ def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> N
     agreed("validation input declaration", lambda: inputs.check(device, whole=False))
 
 
-def admit_split(objective: Objective[Loss, Effects], batches: Reader, mesh: Mesh, split: str) -> None:
+def admit_split(objective: Objective[Loss, Effects], batches: Reader | Episodes, mesh: Mesh,
+                split: str) -> None:
     """Read a validation split's first batch and check it against what the objective declares
     (`_admitted`), before a run that scores the split only past its first step trains on: a split of
     undeclared inputs is refused before an update, not after training. Its later batches are checked
-    as they are scored."""
-    if objective.inputs is None:
+    as they are scored. A split scored by its episodes (`Episodes`) reads none."""
+    if objective.inputs is None or episodic(batches):
         return
     source = iterator = None
     try:
