@@ -27,6 +27,7 @@ from jax.sharding import Sharding
 
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
+from dew.nn.nested import staged
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -202,11 +203,13 @@ class OuterProgram:
         return jax.jit(self.function, **arguments)
 
     def __call__(self, *args, **kwargs):
-        # Within another trace, a tracer its arguments hold or one its function closes over, the
-        # enclosing program compiles this one as part of its own; under `jax.disable_jit` its jit runs
-        # the function as Python.
-        if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
+        # Within a staging trace the enclosing program compiles this one as part of its own, under its
+        # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
+        # compiles itself with its options, or runs the function as Python.
+        if staged():
             return self._nested(*args, **kwargs)
+        if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
+            return self.jitted(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
