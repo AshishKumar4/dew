@@ -150,15 +150,38 @@ def _first_episodes(reward: np.ndarray, passed: np.ndarray, terminal: np.ndarray
 
 def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: float) -> dict:
     """`scored` of a teacher's greedy flight in a batched JAX race (`dew.rl.flight.FlightEnv`, its views the
-    teacher's and `passed`), the whole flight one jitted rollout (`dew.rl.env.env_rollout`)."""
+    teacher's, `passed` and `gates`), the whole flight one jitted rollout (`dew.rl.env.env_rollout`); and
+    the share of its first episodes' steps whose next gate lies in the camera's view (`in_view`), which a
+    policy of the camera alone needs of the flights it learns from."""
     from dew.rl.env import env_rollout, start
+    from dew.rl.flight import mounted
 
     def rolled(params, key):
-        return env_rollout(env, objective.greedy, params, start(env, key), steps)[1].following
+        carry = start(env, key)
+        camera = carry.state.camera
+        taken = env_rollout(env, objective.greedy, params, carry, steps)[1]
+        return taken, jax.vmap(mounted)(camera), camera.fov
 
-    following = jax.device_get(jax.jit(rolled)(params, key))
-    return _first_episodes(following.reward, following.observation["passed"], following.terminated,
-                           following.terminated | following.truncated, crash_penalty)
+    taken, mounts, fov = jax.device_get(jax.jit(rolled)(params, key))
+    following, last = taken.following, taken.following.terminated | taken.following.truncated
+    alive = np.cumsum(last, 0) - last == 0
+    seen = in_view(taken.observation["gates"], mounts, fov)
+    return {**_first_episodes(following.reward, following.observation["passed"], following.terminated, last,
+                              crash_penalty), "in_view": float(seen[alive].mean())}
+
+
+def in_view(gates: np.ndarray, mounts: np.ndarray, fov: np.ndarray) -> np.ndarray:
+    """Whether the next gate's centre lies in each drone's camera's field of view `[steps, drones]`, from the
+    `gates` view (its corners in the body frame), each drone's camera mount `[drones, 3, 3]`
+    (`dew.rl.flight.mounted`) and field of view `[drones]` (radians, a square image's): in front of the
+    camera, its angles across and up from the camera's axis within half the field of view. A drone's mount
+    holds through its first episode, the steps this scores."""
+    center = np.asarray(gates, np.float64)[..., :12].reshape(*np.shape(gates)[:-1], 4, 3).mean(-2)
+    local = np.einsum("dji,sdj->sdi", np.asarray(mounts, np.float64), center)
+    depth, half = local[..., 0], np.asarray(fov, np.float64) / 2
+    across = np.arctan2(np.abs(local[..., 1]), np.maximum(depth, 1e-9))
+    rise = np.arctan2(np.abs(local[..., 2]), np.maximum(depth, 1e-9))
+    return (depth > 0) & (across < half) & (rise < half)
 
 
 def teacher_policy(objective, *, explore: bool = False):
@@ -224,7 +247,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         return Batched(flight, drones)
 
     def judged_at(level: float, families) -> Batched:
-        shown = ("teacher", "passed")
+        shown = ("teacher", "passed", "gates")
         return Batched(FlightEnv(racing_at(hz, families), shown, difficulty=level, ramp=level), 1024)
 
     objective = teacher_objective()

@@ -109,6 +109,35 @@ def transformers_model(directory: Path, *, masked: bool = False, dtype: str = "f
                                 experts_implementation="eager", **options).eval()
 
 
+def assert_exported_decoder_follows_transformers(loaded, directory: Path, draw, label: str, run,
+                                                  generating=6):
+    """A decoder `loaded` from the checkpoint at `directory / "source"` against transformers' own class
+    for it: its logits (`run(model, ids)`) on par from the float64 twin over `draw` (check 1, the draw's
+    seeds sized by `seeds_for`), its export at `directory / "export"` reloading in transformers to the
+    same logits bit for bit (both read by the same class on the same attention, so the export's weights
+    and config alone differ), and a greedy continuation of `generating` tokens from the first draw's
+    first four ids drawing the tokens transformers' generate draws, prompt and continuation both."""
+    import torch
+    from reference_error import seeds_for
+
+    from dew.sampling import Sampling, generate
+
+    reference, truth = transformers_arms(transformers_model(directory / "source"), run)
+    seeds = seeds_for(reference, draw, label, truth_fn=truth)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw, label,
+                    seeds=seeds, truth_fn=truth)
+    loaded.save(directory / "export")
+    exported, source = (transformers_model(directory / name) for name in ("export", "source"))
+    ids = torch.as_tensor(np.asarray(draw(0)[0]), dtype=torch.long)
+    with torch.no_grad():
+        np.testing.assert_array_equal(run(exported, ids).numpy(), run(source, ids).numpy())
+        drawn = source.generate(ids[:1, :4], max_new_tokens=generating, min_new_tokens=generating,
+                                do_sample=False)
+    generated = generate(loaded.model, loaded.variables, np.asarray(ids[:1, :4]), generating, key=0,
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
+
+
 def transformers_arms(model, run, *, source=None, twin=None):
     """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
     `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by the float64

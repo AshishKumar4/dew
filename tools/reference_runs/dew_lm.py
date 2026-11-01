@@ -264,7 +264,10 @@ def versions() -> dict:
 
 def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProbe | None,
            built_from: dict) -> dict:
-    """The run's curves, conditions, versions, throughput and memory."""
+    """The run's curves, conditions, versions, throughput and memory, its model by its whole record
+    (`ModelConfig.from_model`, every nested field and wrapper)."""
+    from dew.registry import ModelConfig, to_record
+
     device_kind = jax.devices()[0].device_kind
     devices = jax.device_count()
     timed = throughput(curves.window_seconds, curves.timed_steps, args.batch * run.seq)
@@ -284,8 +287,8 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
                    "optimizer": "optax.chain(clip_by_global_norm, adamw) via OptimConfig.build, "
                                 "its gradient norm the trainer's commit telemetry",
                    "schedule": "dew.optim.Cosine", "ema": None,
-                   "model_config": {k: v for k, v in run.trainer.objective.model.__dict__.items()
-                                    if isinstance(v, (int, float, str, bool, type(None)))}},
+                   "model_config": to_record(ModelConfig.from_model(run.trainer.objective.model),
+                                             ModelConfig)},
         "versions": built_from,
         "device": device_kind,
         "host": host(),

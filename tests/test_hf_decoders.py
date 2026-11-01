@@ -1725,6 +1725,23 @@ def test_a_config_of_a_type_transformers_lacks_reads_its_layers_by_its_familys_c
         {name: value for name, value in config.items() if name != "head_dim"})
 
 
+def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
+    """A tool that builds a checkpoint's decoder from its config reads it as a load of its language model
+    does (`decoder_config`, ledger 3006): Qwen 3.5's wrapper unties its head at its own scope over a text
+    config that ties it, and states its modeling overrides there; a registered family that reads its whole
+    record (Kimi K2.5's) is read as it is."""
+    from dew.interop.hf_decoders import decoder_config
+
+    native = json.loads((FIXTURES / "qwen35-native-tiny" / "config.json").read_text())
+    assert native["text_config"]["tie_word_embeddings"] and not native["tie_word_embeddings"]
+    assert not translate_config(decoder_config(native))["tie_embeddings"]
+    assert translate_config(native["text_config"])["tie_embeddings"]
+    blocks = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())
+    assert decoder_config(blocks)["modeling_overrides"] == blocks["modeling_overrides"]
+    whole = json.loads((FIXTURES / "kimi-k25-tiny" / "config.json").read_text())
+    assert decoder_config(whole) is whole
+
+
 def test_a_decoder_of_the_default_feed_forward_width_exports(tmp_path):
     """A decoder that leaves its feed-forward width unstated computes four times its residual's, which its
     export states, so the export reads back the model it was (`refuse_lossy_export`, ledger 3065): its
