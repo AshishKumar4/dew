@@ -305,14 +305,24 @@ def test_a_simulator_answering_arrays_laid_out_over_a_mesh_rolls_out_as_one_answ
         np.testing.assert_array_equal(getattr(sharded.following, name), getattr(plain.following, name))
 
 
-def test_a_simulators_policy_step_compiles_through_dews_compile_point():
-    """A simulator's rollout compiles its policy's step as an `OuterProgram`, whose every compile passes
-    where every program Dew compiles does (`report.compiled`, ledger 3314: its communicators admitted
-    against the pool's room, as the other rollouts' are), and runs its rollout through it."""
-    from dew.nn.kernels.options import OuterProgram
+def test_every_rl_program_compiles_through_dews_compile_point():
+    """No program of Dew's RL packages compiles by a bare `jax.jit` (ledger 3314): each is an
+    `OuterProgram`, whose every compile passes where every program Dew compiles does (`report.compiled`:
+    its communicators admitted against the pool's room), a simulator's policy step and a host race's
+    programs as the rollouts' (3287); and a simulator's rollout runs its policy's step through one."""
+    import ast
+    from pathlib import Path
+
+    import dew
     from dew.rl import simulator as simulated
 
-    assert isinstance(simulated._acted, OuterProgram)
+    root = Path(dew.__file__).parent
+    bare = [f"{path.relative_to(root)}:{node.lineno}"
+            for package in ("rl", "objectives/rl") for path in sorted((root / package).rglob("*.py"))
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Attribute) and node.attr == "jit"
+            and isinstance(node.value, ast.Name) and node.value.id == "jax"]
+    assert bare == []
     simulator = HostWalks(5, 3)
     _, record = simulated.simulator_rollout(simulator, heads_home, None,
                                             simulated.simulator_start(simulator, jax.random.key(4)), 2)
