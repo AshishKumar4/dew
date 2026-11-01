@@ -18,7 +18,7 @@ from dew.sampling import Sampling
 def smoke_model():
     return CausalTransformer(
         vocab_size=512, emb_features=64, num_layers=2, num_heads=4,
-        num_kv_heads=2, head_dim=16, mlp_features=256, max_seq_len=32,
+        num_kv_heads=2, head_dim=16, mlp_features=256, max_seq_len=128,
         qk_norm=True, dtype=jnp.bfloat16, scan_layers=True,
         mixture={"experts": 8, "top_k": 2, "expert_features": 32,
                  "layers": (0, 1)})
@@ -55,9 +55,24 @@ def test_banked_smoke_serve(release_source):
         "source_deleted": embedding.is_deleted(), "placed_deleted": placed.is_deleted(),
     })
     task = TextGeneration(model, banked, None, sampling=Sampling(temperature=0))
-    server = Server.from_task(task, slots=2, capacity=32, admission=1)
+    server = Server.from_task(task, slots=2, capacity=128, admission=1)
     results = [result.host() for result in server([[100, 101, 102, 103]], 2, key=0)]
     assert results
+
+
+def test_explicit_source_delete_invalidates_embedding_before_any_serve():
+    model = smoke_model()
+    source = smoke_weights(model)
+    banked = jax.block_until_ready(HeldBanks(source).place(model))
+    embedding = source["params"]["embed_tokens"]["embedding"]
+    placed = banked["params"]["embed_tokens"]["embedding"]
+    assert not embedding.is_deleted()
+    assert not placed.is_deleted()
+    for leaf in jax.tree.leaves(source):
+        leaf.delete()
+    assert embedding.is_deleted()
+    assert placed.is_deleted()
+    print("CONFIRMED: explicit source deletion invalidates placed embedding before Server.from_task")
 
 
 def test_original_eight_layer_warm_smoke():
