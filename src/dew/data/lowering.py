@@ -441,7 +441,9 @@ def _consumes(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
     examples marks each where its bound is (`examples_bound`), among its stages or those a memory read ran
     as it held its rows (`_written`), so every row after it holds a count."""
-    return examples_bound(_written(pipeline.source, pipeline.stages)) is not None
+    source = pipeline.source
+    stages = pipeline.stages if isinstance(source, (Mixture, Phases)) else _written(source, pipeline.stages)
+    return examples_bound(stages) is not None
 
 
 def _bound(pipeline: Pipeline, at: int) -> int:

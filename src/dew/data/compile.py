@@ -668,14 +668,21 @@ def _measure(
             for branch, scored in zip(branches, held, strict=True)
         )
     # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
-    # a count set once it holds them (`_staged`).
-    ahead = None if epochs is None or not training else _held_ahead(branches[0], read)
+    # a count set once it holds them (`_staged`). What it holds is what it runs: its steps configured for
+    # their source bound as it binds them to run them, so a map bound so keys a cache after it.
+    configured = any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch))
+    ahead = None
+    if epochs is not None and training:
+        first = branches[0]
+        if configured and read == "memory":
+            first = _configured(first, _metadata(branches, read), read, "source")
+        ahead = _held_ahead(first, read)
     examples = _UNCOUNTED if ahead is not None else examples
     if examples is not None and training:
         branches = (_bounded(branches[0], examples), *branches[1:])
         if ahead == "layout":
             branches = (_rebound(branches[0], _UNCOUNTED, epochs), *branches[1:])
-    if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
+    if configured:
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
 
@@ -981,8 +988,9 @@ def _held_count(train: Pipeline) -> int:
     """The examples a memory read's held bound resolved to (`Limit.passes`), as the stages it ran state."""
     ran = _written(train.source, ())
     at = examples_bound(ran)
-    assert at is not None and isinstance(ran[at - 1], Limit), "a held bound is among the stages it ran"
-    return ran[at - 1].count
+    limit = None if at is None else ran[at - 1]
+    assert isinstance(limit, Limit), "a held bound is among the stages it ran"
+    return limit.count
 
 
 def _output_batch(pipeline: Pipeline) -> int:
