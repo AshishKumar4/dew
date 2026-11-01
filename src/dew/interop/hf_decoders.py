@@ -1351,6 +1351,20 @@ def bundles(config: Mapping[str, object]) -> bool:
             and config.get("vision_config") is not None)
 
 
+def decoder_config(config: Mapping[str, object]) -> Mapping[str, object]:
+    """A checkpoint's config as its decoder reads it, as a load of its language model reads it
+    (`Pretrained.load(..., text_only=True)`): a media bundle its own family reads whole, without its
+    vision_config (`bundle_text_config`); another wrapper's language model as its text family states it,
+    the wrapper's head policy, dtype and overrides over its text_config (`language_model_config`); and
+    any other config, a registered family's that reads its whole record among them (kimi_k25's), as it
+    is. A tool that builds a checkpoint's decoder from its config reads it here (ledger 3006)."""
+    if bundles(config):
+        return bundle_text_config(config)
+    if config.get("model_type") in families() or "text_config" not in config:
+        return config
+    return language_model_config(config)
+
+
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     """A media bundle's config as its family's text checkpoint states it: the same record without its
     vision_config, which its decoder family reads as text alone."""

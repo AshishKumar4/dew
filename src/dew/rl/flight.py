@@ -6,11 +6,19 @@ The reward is the one drone-racing RL has converged on: each step, the progress 
 centre (Kaufmann et al., Nature 2023, Swift, Eq 8; Song et al., Sci. Robot. 2023, Eq 5; SkyDreamer, arXiv
 2510.14783, Sec II-C), less a cost on the body rates (Song 2023, b = 0.01 a step at 100 Hz, here 1 a second)
 and on the action's change (Swift's lambda5); a bonus on passing a gate, the more for passing it centred
-(SkyDreamer's r_gate); and a crash's penalty, which ends the episode (Song 2023's -10). A gate counts only
-when its plane is crossed through its opening in its direction; crossing the next gate's plane beside it
-misses it, a crash (SkyDreamer; Ferede et al., arXiv 2504.21586). The ground, the gates' frames and the
-obstacles are solid, the drone's path through each physics step tested against them (`struck`), so a fast
-drone cannot pass through one between two steps. An open track ends, a success, on passing its last gate.
+(SkyDreamer's r_gate); a reward for the camera's optical axis pointing at the next gate's centre (Swift's
+perception term, Eq 8: lambda2 exp(lambda3 delta_cam^4), the angle in radians), without which a drone flies
+its yaw where it likes: a teacher of the privileged views flew tail first, the next gate out of its camera's
+view on 95% of its steps (on a G4, 10-31), a flight no policy of the camera alone can learn. Its weights are
+those of Geles et al.'s policy from pixels (RSS 2024, arXiv 2406.12505, Sec III-A4: 0.025 exp(-delta^4) a
+step, here 1.5 exp(-delta^4) a second, 0.025 a step at 60 Hz), whose term pays four fifths of its most at a
+gate 40 degrees off the axis, where Swift's sharper one (Extended Data Table 1a: 0.02 exp(-10 delta^4)) pays a
+tenth: a teacher on Swift's turned to the gate on 59% of its steps at the curriculum's level 0.8; and a
+crash's penalty, which ends the episode (Song 2023's -10). A gate counts only when its plane is crossed
+through its opening in its direction; crossing the next gate's plane beside it misses it, a crash (SkyDreamer;
+Ferede et al., arXiv 2504.21586). The ground, the gates' frames and the obstacles are solid, the drone's path
+through each physics step tested against them (`struck`), so a fast drone cannot pass through one between two
+steps. An open track ends, a success, on passing its last gate.
 
 Each episode is flown on a course of its own (`drawn_course`), of a `family`:
 - `layout`: a published racing layout (uzh-rpg/agile_flight, MIT: Split-S and its real-world variant,
@@ -116,6 +124,8 @@ class Racing:
     rate_cost: float = 1.0
     smoothness_cost: float = 0.005
     gate_bonus: float = 6.0
+    perception_scale: float = 1.5
+    perception_sharpness: float = 1.0
     crash_penalty: float = 10.0
     miss_radius: float = 3.0
     ceiling: float = 25.0
@@ -581,8 +591,11 @@ def raced(racing: Racing, race: Race, action: jax.Array, path: jax.Array) -> tup
     and the drone's path through the step to its flight after it. The reward is the progress toward the gate
     headed for, its distance before the step less its distance after (times `progress_scale`), less
     `rate_cost` times the body rates' norm over the step, less `smoothness_cost` times the squared change of
-    the action; on passing that gate, `gate_bonus` times one less its offset's share of half the opening, the
-    drone heading for the next; on a crash (`struck`), less `crash_penalty`, which ends the episode. Passing
+    the action; plus `perception_scale` times exp(-`perception_sharpness` delta^4) over the step (a rate a
+    second, times its seconds), delta the angle in radians
+    between the camera's optical axis and the centre of the gate headed for after the step (`looking`); on
+    passing that gate, `gate_bonus` times one less its offset's share of half the opening, the drone heading
+    for the next; on a crash (`struck`), less `crash_penalty`, which ends the episode. Passing
     an open track's last gate ends it, a success. An episode is cut after `max_steps` steps."""
     crashed, passed, across = struck(racing, race, path)
     course, flight = race.course, race.flight
@@ -596,12 +609,28 @@ def raced(racing: Racing, race: Race, action: jax.Array, path: jax.Array) -> tup
     finished = passed & ~course.closed & (following >= course.count)
     index = jnp.where(passed & ~finished, following, race.index)
     distance = jnp.linalg.norm(course.center[index] - flight.position)
-    reward = progress + bonus - rate - smoothness - jnp.where(crashed, racing.crash_penalty, 0.0)
+    angle = looking(race, course.center[index])
+    seen = racing.perception_scale * jnp.exp(-racing.perception_sharpness * angle**4) * racing.dt
+    reward = progress + bonus + seen - rate - smoothness - jnp.where(crashed, racing.crash_penalty, 0.0)
     taken = race.steps + 1
     after = dataclasses.replace(race, index=index, distance=distance, steps=taken, action=action,
                                 passed=race.passed + passed)
     ended = crashed | finished
     return after, reward, ended, ~ended & (taken >= racing.max_steps)
+
+
+def mounted(camera: Camera) -> jax.Array:
+    """A camera's mount `[3, 3]`: its columns the camera's forward, left and up in the body frame, the body's
+    rolled by the mount's roll, tilted up by the camera's uptilt and turned by the mount's yaw."""
+    return rotation(quaternion(camera.mount[0], -camera.uptilt, camera.mount[1]))
+
+
+def looking(race: Race, point: jax.Array) -> jax.Array:
+    """The angle in radians between the drone's camera's optical axis (its mount's forward, `mounted`) and
+    the direction from the drone to `point` (Swift's delta_cam)."""
+    axis = rotation(race.flight.orientation) @ mounted(race.camera)[:, 0]
+    toward = point - race.flight.position
+    return jnp.arctan2(jnp.linalg.norm(jnp.cross(axis, toward)), jnp.dot(axis, toward))
 
 
 def corners(racing: Racing, race: Race, ahead: int = 2) -> jax.Array:
@@ -798,8 +827,7 @@ def cameras(race: Race, aspect: float, before: float = 0.0) -> jax.Array:
     angle = jnp.linalg.norm(rates)
     axis = rates / jnp.maximum(angle, 1e-12)
     back = rotation(jnp.concatenate([jnp.cos(angle / 2)[None], jnp.sin(angle / 2) * axis]))
-    mount = rotation(quaternion(camera.mount[0], -camera.uptilt, camera.mount[1]))
-    axes = turned @ back @ mount
+    axes = turned @ back @ mounted(camera)
     forward, left, up = axes[:, 0], axes[:, 1], axes[:, 2]
     scale = 2 * jnp.tan(camera.fov / 2)
     across, down = -left * scale, -up * scale / aspect
@@ -895,5 +923,5 @@ def _scene(racing: Racing, race: Race) -> Scene:
 __all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER",
            "VIEWS", "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene",
            "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
-           "drawn_course", "facings", "nearest", "physics", "privileged", "quaternion", "raced",
-           "started", "struck"]
+           "drawn_course", "facings", "looking", "mounted", "nearest", "physics", "privileged",
+           "quaternion", "raced", "started", "struck"]

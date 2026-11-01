@@ -30,7 +30,7 @@ import contextlib
 import dataclasses
 import functools
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import Literal, overload
 
 import jax
@@ -201,12 +201,30 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
     arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
     """
-    dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
-    # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
-    # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
-    # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
-    bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + spread(bias, product.shape).astype(dtype)
+    dtype = jnp.result_type(product, bias)
+    # The bias over the product's trailing axes, as flax's layers reshape it, so no rank is promoted
+    # implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds the round trip,
+    # so the product and bias fuse as before) and its gradient sums at fp32 (`broadcast_summed`).
+    leading = product.ndim - bias.ndim
+    spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
+    return product.astype(dtype) + spread_bias
+
+
+def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,
+                     dtype: DTypeLike | None = None) -> jax.Array:
+    """`jax.lax.broadcast_in_dim(value, shape, dimensions)` in `dtype` (the value's where None), whose
+    gradient, the sum of a cotangent over every position the value spread over, sums at fp32 or wider
+    and rounds once to the value's dtype, as torch's autograd sums a bf16 one: the value widened to fp32
+    between exact casts and spread (`spread`), which a CPU running Dew's wide arithmetic sums in
+    float64, then cast to `dtype`, so a cotangent wider than the value sums before it rounds. Every
+    order JAX forms its transpose at takes it, forward mode's included. A bias's spread (`biased`, in
+    the dtype its addition promotes to) and a tier-3 model's broadcasts (`dew.interop.torchax_fallback`)
+    are each this (ledger 3038)."""
+    wide = at_least_fp32(value.dtype)
+    kept = iter(value.shape)
+    placed = tuple(next(kept) if axis in dimensions else 1 for axis in range(len(shape)))
+    spread_value = spread(jnp.reshape(value.astype(wide), placed), shape)
+    return spread_value.astype(value.dtype if dtype is None else dtype)
 
 
 def _doubled(value: jax.Array, shape: tuple[int, ...], axes: tuple[int, ...]) -> jax.Array:
@@ -432,11 +450,63 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     products here. A computation that stands for such a target, a reference for a kernel interpreted
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
+    if not _sums_in_float64(*operands):
+        return product(*operands, preferred_element_type=preferred_element_type)
+    if (key := _contraction(product, preferred_element_type)) is not None:
+        return _traced_once(key)(*operands)
+    return _summed_wide(product, preferred_element_type, *operands)
+
+
+CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
+"""The contractions `accumulated` traces once a call (`_contraction`): JAX's own, whose trace states no
+derivative of its own (`_own_backward`) and depends on its operands' types and its arguments alone."""
+
+_JAX_CODE = (jax.lax.dot_general.__code__, jnp.einsum.__code__)
+"""The code of the contractions every other one calls through, as JAX defines it: a library that
+intercepts JAX's products in place (Qwix's `quantize_model` replaces `jax.lax.dot_general`'s and
+`jax.numpy.einsum`'s) changes it, and a trace cached before would skip the library's product."""
+
+
+def _contraction(product: Callable, preferred_element_type) -> tuple | None:
+    """`product` as a key of one of JAX's contractions (`CONTRACTIONS`, each as JAX defines it), bound through
+    plain `functools.partial`s around it (a subclass may call it otherwise) to arguments with no array among
+    them, with the dtype it is asked for: the contraction, the arguments' tree and their leaves; None for any
+    other product."""
+    function, arguments, keywords = product, (), {}
+    while isinstance(function, functools.partial) and type(function) is functools.partial:
+        arguments, keywords = function.args + arguments, {**function.keywords, **keywords}
+        function = function.func
+    intercepted = (jax.lax.dot_general.__code__, jnp.einsum.__code__) != _JAX_CODE
+    if intercepted or not any(function is contraction for contraction in CONTRACTIONS):
+        return None
+    leaves, tree = jax.tree.flatten((arguments, keywords, preferred_element_type))
+    if not all(isinstance(leaf, Hashable) and not isinstance(leaf, jax.Array | np.ndarray)
+               for leaf in leaves):
+        return None
+    return function, tree, tuple(leaves)
+
+
+@functools.lru_cache(maxsize=1024)
+def _traced_once(key: tuple) -> Callable:
+    """`_summed_wide` of the contraction `key` names (`_contraction`) as one program JAX traces once for its
+    operands' types: a gated delta net layer's portable chunked math sums some 64 contractions a call,
+    each traced afresh at about 6.6 ms (the wide sum, its derivative and the narrow one each traced
+    again), 130 s of a decision witness's trace under Dew's test arithmetic (row 3142). Its arithmetic is
+    the product's own, the call a nested program XLA inlines. The most recent 1024 contractions are kept,
+    a model's working set many times over."""
+    function, tree, leaves = key
+    arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
+    product = functools.partial(function, *arguments, **keywords)
+    return jax.jit(functools.partial(_summed_wide, product, preferred_element_type))
+
+
+def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Array:
+    """`accumulated`'s product under Dew's wide CPU arithmetic: its float64 sum where it takes the
+    platform's choice (`platform_dependent`), the plain product where its result is wider than float32 or
+    its library states its derivative."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if not _sums_in_float64(*operands):
-        return narrow(*operands)
     traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
     dtype = shape.dtype
     if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):

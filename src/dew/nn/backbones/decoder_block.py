@@ -94,8 +94,9 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
         if kind == 'layer' and offset:
             return OffsetLayerNorm(epsilon=eps, use_bias=bias, dtype=dtype, name=name)
         if kind == 'layer':
-            return nn.LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
-                                dtype=dtype, name=name)
+            # Torch's exact variance, rematerialized as every Dew LayerNorm is (ledger 3010).
+            return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
+                             dtype=dtype, name=name)
         return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, dtype=dtype, name=name)
 
     return build
@@ -146,7 +147,9 @@ class Mixture:
     `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
     `routing_block` with `block_experts` is LLaDA2.2's block routing.
     `weight_sum_epsilon` is the term a renormalization of non-softmax weights
-    adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6).
+    adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6),
+    and `weight_sum_min` the least it divides by (ERNIE 4.5's `moe_norm_min`,
+    `Router.weight_sum_min`).
     """
 
     experts: int
@@ -161,6 +164,7 @@ class Mixture:
     bias: bool = False
     bias_in_weights: bool = False
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
+    weight_sum_min: float = 0.0
     routing_block: int | None = None
     block_experts: int | None = None
     scale_inputs: bool = False
@@ -220,11 +224,12 @@ class Mixture:
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
                 or self.bias_in_weights or self.routing_block is not None
-                or self.scale_inputs or self.shared_features or self.latent_features is not None):
+                or self.scale_inputs or self.shared_features or self.latent_features is not None
+                or self.weight_sum_epsilon != WEIGHT_SUM_EPSILON or self.weight_sum_min):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, routing blocks, input scaling "
-                "or shared branch to set")
+                "score function, scaling, groups, balancing bias, routing blocks, input scaling, "
+                "shared branch or renormalization bounds to set")
 
     @property
     def beside_dense(self) -> bool:
@@ -272,7 +277,8 @@ class Mixture:
                                          'groups_per_token', 'group_score', 'bias', 'bias_in_weights',
                                          'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
-                                         'latent_features', 'latent_norm', 'media_bias')
+                                         'latent_features', 'latent_norm', 'media_bias',
+                                         'weight_sum_epsilon', 'weight_sum_min')
                        if getattr(self, name) != getattr(plain, name)]
             ignored += ['swiglu_limit'] if swiglu_limit is not None else []
             if ignored:
@@ -299,7 +305,7 @@ class Mixture:
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
             group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
-            weight_sum_epsilon=self.weight_sum_epsilon,
+            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
             media_bias=self.media_bias, routing_block=self.routing_block,
             block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,

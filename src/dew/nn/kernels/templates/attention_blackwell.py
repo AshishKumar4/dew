@@ -33,7 +33,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, mosaic_sm100
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
-from dew.nn.kernels.templates.mosaic_sm100 import ROW, STORED, TCGEN05, TMEM
+from dew.nn.kernels.templates.mosaic_sm100 import STORED, TCGEN05, TMEM
 
 CHUNK = 32
 """The output accumulator's columns the softmax rescales at a time."""
@@ -213,7 +213,8 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     out_ref, maxima_ref, over_ref = outs
     rows, block_k = TCGEN05.rows, tiles.block_k
     value_width = scratch.acc_tmem.shape[1]
-    # A step's tile `PART` columns at a time.
+    # A step's tile `PART` columns at a time, its places' layout stated: a full call reads neither, and an
+    # iota nothing reads takes no inferred layout (2977).
     q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, PART), 0, layout=TMEM)
     columns = plgpu.broadcasted_iota(jnp.int32, (rows, PART), 1, layout=TMEM)
     parts = block_k // PART
@@ -242,7 +243,12 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
                 plgpu.async_store_tmem(chunk, algebra.rescale(acc, alpha))
 
         for part in range(parts):
-            weights = algebra.weights(spec, logits(read, index, part, masked)[0], m)
+            # The weights complete before their two readers, the sum below and the narrowed copy `P V` takes:
+            # else the compiler fuses each one's last multiply into the sum's fma and sinks the sums past the
+            # last part (a full call's parts are one block, no mask's branch between them), keeping both
+            # operands of every earlier part's weights live to there, 24 registers a part, 250 of 255 and the
+            # denominator spilled at width 64 (ptxas for a B200, tests/test_attention_blackwell.py's compile).
+            weights = lax.optimization_barrier(algebra.weights(spec, logits(read, index, part, masked)[0], m))
             total = (algebra.denominator_after(total, alpha, weights) if part == 0
                      else total + weights.sum(axis=-1))
             plgpu.async_store_tmem(mosaic_sm100.columns(scratch.p_tmem, part * PART, PART),
@@ -258,8 +264,8 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     if spec.form == "causal" or padded:
         # The blocks every query of the block sees whole, below its diagonal and before padding.
         whole = jnp.maximum(jnp.minimum(lax.div(block.first, block_k), blocks - padded), 0)
-    start = (plgpu.layout_cast(jnp.full((rows,), -jnp.inf, jnp.float32), ROW),
-             plgpu.layout_cast(jnp.zeros((rows,), jnp.float32), ROW))
+    # Its layouts inferred from the row reductions the walk's carry meets.
+    start = (jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.float32))
     def walked(index, carry):
         # A block the query block walks, masked from its first that some query sees in part.
         return lax.cond(index < block.steps, lambda carry: step(index, carry, masked=index >= whole),
