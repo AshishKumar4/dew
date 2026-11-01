@@ -1012,7 +1012,8 @@ def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower:
 def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grads: TileLoad,
                      corrected: TileLoad, value_grads: TileLoad, entered: TileLoad, leaving: TileLoad,
                      blocks: int, lower: Tile, betas, scale: float, dtype, issue: Issue, *,
-                     emit: Callable[[str, jax.Array], None]) -> tuple[jax.Array, jax.Array]:
+                     emit: Callable[[str, jax.Array], None],
+                     columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of `key_memory_gradients`, its queries `query` and keys `key` `[C, BK]`, their
     prefix halves from the chunk's start `gates` `[C, BK]` and the chunk's last token's `last` as a row's
     vectors, and each value block `j`'s memory entered `entered(j)` and its gradient leaving `leaving(j)`
@@ -1023,7 +1024,8 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     gradient's part `dw (kg beta)^T` `[C, C]` and the write gates' `sum(kg d(kg beta))`, fp32. The last
     prefix's other term, the memory's decay across the chunk (`key_memory_decay`), is the caller's: a key
     block's memory tiles' rows met the keys' columns here, which Mosaic GPU's layout inference ran out of
-    fuel laying (kda-lower5-sm90 at 6e03eb57e)."""
+    fuel laying (kda-lower5-sm90 at 6e03eb57e). `columns`, where given, sums a tile's columns (the
+    mainloop's, `summed_back`'s)."""
     decays = raised(*gates)
     to_last = range_decay(*(half[None, :] for half in last), *gates)
     products = [(issue("memory_dq", out_grads(j), entered(j).T),
@@ -1042,7 +1044,7 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     rows, _ = _grid(d_query.shape)
     # The chunk's last prefix's term on its last token through the gated keys' `exp2(g_last - g)` every
     # token's.
-    at_last = jnp.sum(keys * d_key, axis=0)
+    at_last = jnp.sum(keys * d_key, axis=0) if columns is None else columns(keys * d_key)
     emit("dq", d_query)
     emit("dk", d_key + d_gated * decays * betas[:, None])
     emit("dg", query.value().astype(jnp.float32) * d_query - keys * d_key

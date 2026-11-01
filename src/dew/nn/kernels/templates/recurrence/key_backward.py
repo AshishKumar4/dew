@@ -23,6 +23,8 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _axis,
     _Call,
     _column,
+    _column_scratch,
+    _columns,
     _f32,
     _fragments,
     _Held,
@@ -128,7 +130,7 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
                 beta_ref, taken_ref, dq_ref, dk_ref, dg_ref, dv_out_ref, da_ref, db_ref, *, streams, staging,
                 landing):
         squared = landing[_square_landing(keys)]
-        weights, values, system = staging
+        weights, values, system, scratch = staging
         n, h = lax.axis_index("chunks"), lax.axis_index("heads")
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
         keyed, memory_row = h // call.group * width, (n * call.heads + h) * width
@@ -172,7 +174,7 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
                 _tile(slots, "queries", given), _tile(slots, "keys", given),
                 (_tile(slots, "gates", gates).value(), _tile(slots, "lows", gates).value()), last_prefix,
                 loads["out"], loads["corrected"], loads["value_grads"], loads["entered"], loads["leaving"],
-                blocks, lower, betas, scale, held.dtype, issue, emit=stored)
+                blocks, lower, betas, scale, held.dtype, issue, emit=stored, columns=_columns(call, scratch))
             d_system, d_betas = d_system + system, d_betas + beta_terms
 
             # The values' part and the system's gradient once every key block's terms are in.
@@ -202,8 +204,9 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
                       keys=((CHUNK, keys), given), gates=((CHUNK, keys), gates),
                       lows=((CHUNK, keys), gates), entered=((keys, value_width), memories),
                       leaving=((keys, value_width), memories))
-    staging = ([_staging(held, (CHUNK, keys))[0] for _ in range(2)],
-               _staging(held, (CHUNK, call.block))[0], _staging(held, (CHUNK, CHUNK))[0])
+    # The column sums' scratch where they take the consumer's own (`mainloop._column_scratch`).
+    staging = ([_staging(held, (CHUNK, keys))[0] for _ in range(2)], _staging(held, (CHUNK, call.block))[0],
+               _staging(held, (CHUNK, CHUNK))[0], _column_scratch(call))
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, square.shape(call.heads * value_width),
                 square.shape(call.heads * CHUNK), jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
