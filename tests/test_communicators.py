@@ -4,8 +4,10 @@ full speed, the run's share its upper bound, and a compiled program whose commun
 Dew left them refused before it runs, never left to stall in a collective. The measurement itself needs two
 GPUs, which a two-GPU run of the check makes; here it is the child's report, as the parent reads it."""
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -122,8 +124,9 @@ def test_a_compiled_programs_communicators_are_read_through_the_flop_counts_pars
 def test_a_processs_communicators_are_held_together_to_the_room_dew_left_outside_the_pool():
     """Every communicator a process has made stays made (XLA caches them), so each compiled program is
     admitted only if its communicators and those of the programs before it, each counted once, and the
-    runtime fit the room Dew left outside the pool, and those it adds fit what its GPUs have free there now;
-    one beyond either is refused before it runs, naming the bytes, never left to stall in a collective."""
+    runtime fit the room Dew left outside the pool, and the communicators it adds fit what its GPUs have
+    free there now; one beyond either is refused before it runs, naming the bytes, never left to stall in a
+    collective."""
     room = dict.fromkeys(range(4), 3 * GIB + 3 * GIB // 4)
     every = (0, 1, 2, 3)
     resident = communicators.Resident()
@@ -139,6 +142,18 @@ def test_a_processs_communicators_are_held_together_to_the_room_dew_left_outside
     with pytest.raises(CommunicatorRoom):
         resident.admit(Collectives(exchanges=frozenset({(0, 1)})), FOUR, room, lambda gpu: GIB // 8)
     assert resident.held == Collectives(groups=frozenset({every, (0, 1), (2, 3)}))
+
+
+def test_what_a_gpu_has_spent_already_is_not_charged_to_a_program_again():
+    """The free memory a program is admitted against is read after the runtime started and after the
+    programs before it made their communicators, so neither is charged to it again: a program whose new
+    communicators take exactly what its GPUs have free is admitted, the runtime warmed before it, and so is
+    one adding a pair's communicator beside one already made."""
+    room = dict.fromkeys(range(4), 3 * GIB + 3 * GIB // 4)
+    resident = communicators.Resident()
+    resident.admit(Collectives(groups=frozenset({(0, 1, 2, 3), (0, 1)})), FOUR, room, lambda gpu: 3 * GIB)
+    resident.admit(Collectives(groups=frozenset({(2, 3)})), FOUR, room, lambda gpu: GIB)
+    assert resident.held == Collectives(groups=frozenset({(0, 1, 2, 3), (0, 1), (2, 3)}))
 
 
 def test_programs_admitted_at_once_are_held_together():
@@ -236,6 +251,63 @@ def test_a_measurement_is_paid_once_per_configuration(tmp_path, monkeypatch):
     for other in others:
         assert communicators.measured(other, measure=measure) == NEEDS
     assert taken == [configuration, *others]
+
+
+def test_a_measurement_kept_in_an_earlier_form_is_measured_afresh(tmp_path, monkeypatch):
+    """A host's measurement kept by an earlier Dew, whose child wrote a permute's costs as two numbers, is
+    not read as this one's: the configuration is measured afresh."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    configuration = {"gpus": ["NVIDIA H100 80GB HBM3"] * 2, "placement": ["0000:18:00.0", "0000:2a:00.0"],
+                     "driver": 12090, "nccl": 23203, "nccl_env": {}, "xla_nccl": [], "jax": "0.12.0"}
+    digest = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()[:24]
+    earlier = tmp_path / "dew" / "communicators" / f"{digest}.json"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_text(json.dumps({"configuration": configuration, "needs": {
+        "collective": {"2": GIB}, "exchanged": {"2": GIB // 4}, "permuted": {"2": [GIB, GIB // 2]},
+        "runtime": {"0": GIB // 2, "1": GIB // 2}, "seconds": 4.0}}))
+    taken = []
+
+    def measure(configured):
+        taken.append(configured)
+        return NEEDS
+
+    assert communicators.measured(configuration, measure=measure) == NEEDS
+    assert taken == [configuration]
+
+
+def test_a_permutes_costs_are_the_most_any_pair_of_its_clique_took():
+    """A permute's communicator is measured connecting every directed pair of its clique in turn, the first
+    making the communicator, as NCCL picks each peer's transport apart (GPU buffers for one over NVLink or
+    PCIe peer access, host memory for one through shared memory): its send and receive costs are the most
+    any pair's source and target gave, so a clique whose first pair connects cheaply is charged for its
+    dearest, and its base is what the first run took beside its pair's own connections."""
+    mib = 2**20
+    runs = [(0, 1, {0: 64 * mib + mib, 1: 64 * mib + mib, 2: 64 * mib, 3: 64 * mib}),
+            (1, 0, {0: mib, 1: mib, 2: 0, 3: 0}),
+            (2, 3, {0: 0, 1: 0, 2: 40 * mib, 3: 24 * mib}),
+            (3, 2, {0: 0, 1: 0, 2: 24 * mib, 3: 40 * mib})]
+    assert communicators.peer_costs(runs) == (64 * mib, 40 * mib, 24 * mib)
+
+
+def test_a_hosts_gpus_are_counted_by_its_cuda_driver_without_nvidia_smi(tmp_path):
+    """A container whose CUDA driver makes two GPUs visible and that ships no nvidia-smi counts both, so its
+    pool is sized for their communicators; one whose driver finds no GPU counts none."""
+    compiler = shutil.which("cc")
+    assert compiler is not None, "the stand-in driver library is built by the host's C compiler, cc"
+    for found, status, expected in ((2, 0, 2), (0, 100, 0)):
+        directory = tmp_path / str(found)
+        directory.mkdir()
+        (directory / "libcuda.c").write_text(
+            f"int cuInit(unsigned flags) {{ return {status}; }}\n"
+            f"int cuDeviceGetCount(int *count) {{ *count = {found}; return 0; }}\n")
+        subprocess.run([compiler, "-shared", "-fPIC", "-o", str(directory / "libcuda.so.1"),
+                        str(directory / "libcuda.c")], check=True)
+        environment = {name: value for name, value in os.environ.items() if name != "CUDA_VISIBLE_DEVICES"}
+        counted = "from dew.pool import local_gpu_count; print(local_gpu_count())"
+        done = subprocess.run([sys.executable, "-c", counted], capture_output=True, text=True, check=True,
+                              env={**environment, "PATH": str(directory), "PYTHONPATH": str(SOURCE),
+                                   "LD_LIBRARY_PATH": str(directory)})
+        assert done.stdout.strip() == str(expected)
 
 
 def test_a_configuration_names_the_xla_nccl_flags_the_build_and_the_gpus_places(monkeypatch):
