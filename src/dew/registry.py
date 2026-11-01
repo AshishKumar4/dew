@@ -245,7 +245,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
 
     def __getitem__(self, name: str) -> T:
         """The member an alias or import path names. The table's own entries
-        are code's; a path may come from a record, name anything imported, and
+        are code's, named by their aliases or by the import paths a record holds them as;
+        any other path may come from a record, name anything imported, and
         be built, so its member must derive from `base` (or be a function
         declared to return one), and with no base be a class of Dew's or of a
         trusted package (`_owned`)."""
@@ -254,7 +255,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
                            f"or any class by its import path")
         if name not in self._imported:
             member = imported(self.paths.get(name, name))
-            if name not in self.paths and not self._holds(member):
+            own = name in self.paths or name in self.paths.values()
+            if not own and not self._holds(member):
                 raise ValueError(f"{name!r} names {member!r}, which is no {self.kind}")
             self._imported[name] = member
         return self._imported[name]

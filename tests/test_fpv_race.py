@@ -19,12 +19,12 @@ fpv_race = load("fpv_race")
 def test_a_wrapped_teacher_is_the_teacher_phases_run_holding_its_weights_at_step_0(tmp_path):
     """A teacher's weights written whole, wrapped (`wrap`), are the teacher phase's run at its level
     (`teacher_run`) whose step 0 holds them, every leaf bit for bit: its record reads back as that run, its
-    environment, model, objective and rollout the phase's own."""
+    environment, model, objective and rollout the phase's own, and its report is the phase's, unscored."""
     phase = fpv_race.teacher_run(tmp_path, hz=30.0, level=1.0, drones=16)
     weights = phase.prepare().objective.init(jax.random.key(3))
     (tmp_path / "teacher.msgpack").write_bytes(serialization.to_bytes(jax.device_get(weights)))
     report = fpv_race.wrap(tmp_path, weights=tmp_path / "teacher.msgpack", hz=30.0, level=1.0, drones=16)
-    assert report["step"] == 0
+    assert report["wrapped"]["step"] == 0
     saved = RunConfig.load(str(tmp_path / "teacher"))
     assert isinstance(saved, EnvRunConfig)
     for field in ("env", "model", "objective", "rollout", "optim"):
@@ -35,7 +35,9 @@ def test_a_wrapped_teacher_is_the_teacher_phases_run_holding_its_weights_at_step
     for one, other in zip(jax.tree.leaves(jax.device_get(held)), jax.tree.leaves(jax.device_get(weights)),
                           strict=True):
         np.testing.assert_array_equal(one, other)
-    assert json.loads((tmp_path / "teacher.json").read_text())["best"]["step"] == 0
+    # The teacher phase's own report, unscored, which the phase goes on from.
+    written = json.loads((tmp_path / "teacher.json").read_text())
+    assert (written["curve"], written["best"], written["level"]) == ([], None, 1.0)
 
 
 @pytest.mark.parametrize("stage", fpv_race.STAGES)

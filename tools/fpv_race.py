@@ -342,13 +342,15 @@ def wrap(out: Path, *, weights: Path, hz: float = 60.0, level: float = 1.0, dron
     its first race's, `warmed`) as the teacher phase's run, OUT/teacher, of no updates: its record the phase's
     own at `level` (`teacher_run`), its env, model and objective those a trained teacher's are, and its step 0
     checkpoint the weights, which `RunConfig.train` writes as a run's last step, so the world phase reads it
-    as it reads a trained teacher. The record cannot name the file the weights came from; the report does."""
+    as it reads a trained teacher, and the teacher phase goes on from it. The record cannot name the file the
+    weights came from; the report (teacher.json, the teacher phase's, unscored) does."""
     prepared = teacher_run(out, hz=hz, level=level, drones=drones).override({"trainer.steps": 0}).prepare()
     prepared.objective.variables = warmed(weights, prepared.objective)
     state = prepared.train(TEACHER_RUN)
-    report = {"run": str(out / TEACHER_RUN), "step": int(state.step), "weights": str(weights), "level": level}
-    _written(out / "teacher.json", json.dumps({**report, "best": {"level": level, "step": int(state.step)}},
-                                              indent=1))
+    # The teacher phase's own report, unscored, so the phase goes on from the wrapped run.
+    report = {"drones": drones, "hz": hz, "warm": str(weights), "curve": [], "best": None, "level": level,
+              "wrapped": {"run": str(out / TEACHER_RUN), "step": int(state.step)}}
+    _written(out / "teacher.json", json.dumps(report, indent=1))
     return report
 
 
@@ -428,8 +430,9 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
     scored (`judge`) into report[stage] and its curriculum raised from `level` as the teacher's was, up a
     tenth, to 1, at each score whose crashes fall under a third, the stage's race and `races` drawn at it. The
     stage is prepared once and each chunk trains it on, its rollout's environments and replay kept between
-    them. A score is written before the checkpoint that commits it, so a stage stopped between the two scores
-    it again. Returns the stage's last state, its agent and the level it ended at."""
+    them. A chunk's checkpoint is written as it ends, then its score and the level the next chunk trains at
+    (world.json's `level`), where a stopped stage goes on; one stopped between the two scores the chunk again.
+    Returns the stage's last state, its agent and the level it ended at."""
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     done = _latest(world.out / stage)
@@ -454,11 +457,13 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
         points.append(point)
         report[stage] = points
         print(json.dumps(point), flush=True)
-        _written(world.out / "world.json", json.dumps(report, indent=1))
         if point["crashed"] < 1 / 3 and level < 1.0:
             level = round(min(1.0, level + 0.1), 1)
             for raced in (rollout.env, *races):
                 raced.difficulty = raced.ramp = level
+        # The level the next chunk trains at, beside the score that earned it: a resumed stage goes on there.
+        report["level"] = level
+        _written(world.out / "world.json", json.dumps(report, indent=1))
     return state, agent, level
 
 
@@ -473,6 +478,12 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
     (its courses' difficulty and its drones' randomization), which the scored stages raise as the teacher's
     curriculum did (`teacher`) toward 1."""
     families = TRAINING if world.highlight else (("loop", 1.0),)
+    path = world.out / "world.json"
+    report = json.loads(path.read_text()) if path.exists() else {
+        "drones": world.drones, "hz": world.hz, "length": world.length, "highlight": world.highlight,
+        "level": level, "teacher_run": str(world.teacher)}
+    # A phase going on goes on at the level its last committed chunk reached.
+    level = report["level"]
 
     def raced(families):
         raced = race(world.drones, VIEWS, hz=world.hz, families=families, assets=world.assets,
@@ -487,11 +498,6 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
         return {**scored(judged, policy, params, memory, key, horizon, film=film),
                 "held_out": scored(held_out, policy, params, memory, key, horizon)}
 
-    path = world.out / "world.json"
-    report = json.loads(path.read_text()) if path.exists() else {
-        "drones": world.drones, "hz": world.hz, "length": world.length, "highlight": world.highlight,
-        "level": level, "teacher_run": str(world.teacher)}
-    level = report["level"]
     if "teacher" not in report:
         saved = EnvRunConfig.load(str(world.teacher))
         with Checkpoints(str(world.teacher)) as checkpoints:
@@ -499,7 +505,9 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
         report["teacher"] = judge(teacher_policy(saved.agent(judged, variables)), variables, None,
                                   jax.random.key(4))
         _written(path, json.dumps(report, indent=1))
-    online = int(round(environment_seconds * world.hz) * 128.0 / (16 * world.length))
+    collecting = world.run("online", level).rollout.arguments
+    online = int(round(environment_seconds * world.hz) * collecting["train_ratio"]
+                 / (collecting["batch"] * collecting["length"]))
     filmed = {"pretrain": "cloned.npz", "dagger": "dagger.npz", "online": "video.npz"}
     for stage, updates, every in zip(STAGES, (pretrain_updates, dagger_updates, online), (None, 2000, 10_000),
                                      strict=True):

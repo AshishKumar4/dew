@@ -20,7 +20,7 @@ from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlR
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
 from dew.objectives.rl.tssm import TSSM
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig
+from dew.registry import ModelConfig, envs
 from dew.rl.aggregation import LABEL, Teacher
 from dew.rl.env import Batched
 from dew.rl.evaluation import episodes
@@ -298,3 +298,14 @@ def test_an_environment_run_refuses_a_setup_it_cannot_train(tmp_path, saved_teac
         fields["pretrained"] = str(saved_teacher)
     with pytest.raises(ValueError):
         dataclasses.replace(run, **fields).prepare()
+
+
+def test_an_environment_a_function_builds_is_named_again_by_its_record():
+    """An environment the registry builds with a function (`playground`, `Playground.load`), which its record
+    holds as the function's import path, is named by that record again, read back with its run."""
+    held = EnvConfig("playground", {"name": "CartpoleBalance"})
+    assert held.member is envs["playground"]
+    run = EnvRunConfig(env=held)
+    again = EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict())))
+    assert again.env is not None and again.env.member is envs["playground"]
+
