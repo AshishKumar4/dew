@@ -98,7 +98,7 @@ def trained(out: Path, assets: Path, updates: int, every: int) -> dict:
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     path = out / "base.json"
-    report = json.loads(path.read_text()) if path.exists() else {"points": []}
+    report: dict = json.loads(path.read_text()) if path.exists() else {"points": []}
     done = 0
     if (out / "base").is_dir():
         with Checkpoints(str(out / "base")) as checkpoints:
