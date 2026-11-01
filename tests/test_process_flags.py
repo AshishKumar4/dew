@@ -1,6 +1,7 @@
-"""A run's XLA flags take effect as JAX opens its backend (`dew.devices.flags_hold`): one holds where
-XLA would read its value; a process prepared with flags after its backend opened is refused
-(`dew.training.prepare_process`), not appended to no effect, and one whose flags already hold is
+"""A run's XLA flags hold where XLA_FLAGS carried them before the process loaded jaxlib
+(`dew.devices.flags_hold`): one holds where XLA would read its value; a process prepared with flags after
+its backend opened is refused (`dew.training.prepare_process`), not appended to no effect, one prepared
+with them before is warned they are unproven where jaxlib had loaded, and one whose flags already hold is
 prepared again as often as its run asks (row 1901)."""
 
 import json
@@ -106,9 +107,9 @@ environment itself and prepares with them."""
 
 
 def test_flags_written_into_the_environment_after_the_backend_opened_do_not_hold(tmp_path):
-    """The backend read its flags as it opened; flags written into the environment after that match
-    the environment and nothing the backend runs with, so preparing with them is refused (row 1984).
-    Before, the environment alone was read, and the run went on without them."""
+    """Flags written into the environment after the backend opened match the environment and nothing
+    the backend runs with, so preparing with them is refused (row 1984). Before, the environment alone
+    was read, and the run went on without them."""
     env = {**os.environ, "XLA_FLAGS": os.environ.get("XLA_FLAGS", ""),
            "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
     done = subprocess.run([sys.executable, "-c", SET_LATE, STATED], capture_output=True, text=True, env=env,
@@ -127,7 +128,6 @@ from dew.training import prepare_process
 imported, opened = sys.argv[1], sys.argv[2]
 os.environ["XLA_FLAGS"] = opened
 jax.devices()
-os.environ["XLA_FLAGS"] = imported
 held = [flags_hold(opened), flags_hold(imported)]
 try:
     prepare_process(xla_flags=opened)
@@ -137,18 +137,93 @@ else:
     held.append("prepared")
 print(json.dumps(held))
 """
-"""A fresh process imported under one XLA_FLAGS whose backend opens under others, written between
-Dew's import and the opening, the first written back after it."""
+"""A fresh process imported under one XLA_FLAGS whose backend opens under others, written by hand between
+Dew's import, which loaded jaxlib, and the opening."""
 
 
-def test_flags_hold_as_the_backend_read_them_when_it_opened():
-    """The backend reads XLA_FLAGS as it opens: flags written after Dew's import and before the
-    opening hold, and preparing with them is no refusal; those Dew's import saw, written back after
-    the opening, do not (row 1984's review). Before, Dew judged by what it had last seen itself."""
+def test_flags_written_by_hand_after_jaxlib_loaded_are_unproven():
+    """XLA parses XLA_FLAGS once per runtime it loads, at its first use of its debug options, which can
+    come before a backend opens: flags in the environment before the process loaded jaxlib hold, and flags
+    written by hand after it are unproven, so a process prepared with them once its backend opened is
+    refused (row 2047). Dew no longer watches JAX open its backend."""
     imported, opened = "--xla_dump_hlo_pass_re=imported", "--xla_dump_hlo_pass_re=opened"
     env = {**os.environ, "XLA_FLAGS": imported,
            "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
     done = subprocess.run([sys.executable, "-c", OPENED_ON, imported, opened], capture_output=True, text=True,
                           env=env, cwd=ROOT, check=False)
     assert done.returncode == 0, done.stderr
-    assert json.loads(done.stdout.strip().splitlines()[-1]) == [True, False, "prepared"]
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == [False, True, "refused"]
+
+
+OWN_FLAGS = """
+import json, sys
+if sys.argv[1] == "jax first":
+    import jax
+import dew
+from dew.devices import flags_hold
+
+print(json.dumps(flags_hold("--xla_allow_excess_precision=false")))
+"""
+"""A fresh process importing Dew, after jax where asked."""
+
+
+@pytest.mark.parametrize(("order", "held"), [("dew first", True), ("jax first", False)])
+def test_dews_own_flags_hold_where_dew_is_imported_before_jax(order, held):
+    """`import dew` writes its own flags into XLA_FLAGS before anything it imports loads jaxlib, so they hold
+    for every runtime the process loads; where jax was imported first, they are unproven."""
+    env = {**os.environ, "XLA_FLAGS": "",
+           "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
+    done = subprocess.run([sys.executable, "-c", OWN_FLAGS, order], capture_output=True, text=True, env=env,
+                          cwd=ROOT, check=False)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.strip().splitlines()[-1]) is held
+
+
+LATE = """
+import json, logging, sys
+import dew
+from dew.devices import flags_hold, xla_flag
+from dew.training import prepare_process
+
+logging.basicConfig(level=logging.WARNING)
+prepare_process(xla_flags=sys.argv[1])
+print(json.dumps([flags_hold(sys.argv[1]), xla_flag("xla_dump_hlo_pass_re")]))
+"""
+"""A fresh process importing Dew, which loads jaxlib, then preparing with the run's flags before its
+backend opens: a library caller's late flags."""
+
+
+def test_a_library_caller_preparing_with_flags_after_jaxlib_loaded_is_told_they_are_unproven():
+    """Flags a process is prepared with after it loaded jaxlib and before its backend opened are written
+    into XLA_FLAGS, as XLA may still read them, and the process is warned that they are unproven, where
+    setting XLA_FLAGS before the process starts would make them certain."""
+    env = {**os.environ, "XLA_FLAGS": "",
+           "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
+    done = subprocess.run([sys.executable, "-c", LATE, STATED], capture_output=True, text=True, env=env,
+                          cwd=ROOT, check=False)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == [False, "fusion=all"]
+    assert "XLA_FLAGS" in done.stderr
+
+
+HELD = """
+import json, sys
+import dew
+from dew.devices import flags_hold, hold_xla_flags
+
+hold_xla_flags(sys.argv[1])
+print(json.dumps(flags_hold(sys.argv[1])))
+"""
+"""A fresh process importing Dew, which loads jaxlib, then asking for the run's flags to hold, as Dew's
+command line does before it trains a run."""
+
+
+def test_a_command_lines_flags_hold_as_it_runs_again_with_them_set_before_jaxlib_loads():
+    """`hold_xla_flags` runs the process again from its start with the flags in XLA_FLAGS where they do not
+    hold, as `dew train` does with a run's `trainer.xla_flags`: the process that goes on holds them."""
+    env = {**os.environ, "XLA_FLAGS": "",
+           "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
+    done = subprocess.run([sys.executable, "-c", HELD, STATED], capture_output=True, text=True, env=env,
+                          cwd=ROOT, check=False)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip().splitlines() == ["true"]
