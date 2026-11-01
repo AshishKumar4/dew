@@ -83,6 +83,7 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     position = None
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
+    batch = _hosted(batch)
     consumed = _Consumed(batch)
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
@@ -108,13 +109,22 @@ def _unclocked(batch: Batch) -> Batch:
     return {name: value for name, value in batch.items() if name not in CLOCK}
 
 
+def _hosted(batch: Batch) -> Batch:
+    """`batch` as a rollout, host code, reads it: a column a pool's read placed over its processes
+    (`dew.training._fit.pooled_read`) as this process's rows of it, in order (`_held`), which the
+    rollout's batch is placed from again (`shard_batch`); a column one process holds whole as it is."""
+    return {name: _held(value) if isinstance(value, jax.Array) and not value.is_fully_addressable else value
+            for name, value in batch.items()}
+
+
 def _held(column) -> np.ndarray:
-    """This process's rows of a `column`: a placed column's shards it holds, each rows' once, or a host
-    column whole."""
+    """This process's rows of a `column`: a placed column's shards it holds, each rows' once, in the order
+    of their rows, or a host column whole."""
     if not isinstance(column, jax.Array):
         return np.asarray(column)
-    shards = {str(shard.index): np.asarray(shard.data) for shard in column.addressable_shards}
-    return np.concatenate([held.reshape(-1) for held in shards.values()])
+    shards = {(shard.index[0].start or 0) if shard.index else 0: shard.data
+              for shard in column.addressable_shards}
+    return np.concatenate([np.asarray(shards[start]) for start in sorted(shards)], axis=0)
 
 
 class _Consumed:
@@ -137,6 +147,7 @@ class _Consumed:
             batch = read()
             if batch is None:
                 return None
+            batch = _hosted(batch)
             self.add(batch)
             return _unclocked(batch)
         return drawn

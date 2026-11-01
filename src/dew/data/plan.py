@@ -398,7 +398,7 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
-def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], JSON]:
+def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], object]:
     """A per-share read's saved position (its data plan and its Grain iterator's state) as `plan`, this
     run's, reads it: the plan as `earlier_plan` translates it, and the iterator's state, where the plan
     was written before version 8, with the counts version 8 keeps of what a read delivered (each
@@ -409,9 +409,9 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
     from dew.data.pipeline import CONSUMED, REFUSED
 
     written = record(saved.get("dew_data_plan"), "saved data plan")
-    iterator = json_value(saved.get("iterator"), "saved Grain iterator")
+    iterator = saved.get("iterator")
 
-    def counted(branch: JSON) -> JSON:
+    def counted(branch: object) -> object:
         if isinstance(branch, list):
             return [counted(child) for child in branch]
         if not isinstance(branch, dict):
