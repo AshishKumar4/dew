@@ -13,15 +13,17 @@ A txtar archive of four sections, each a contract consumers outside the reposito
 - `records`: each run record type (`dew.telemetry.records.RECORD_TYPES`), its fields as `config`'s, and
   the schema versions the records, generations and kernel reports carry.
 
-An API change moves a line of one section, which tests/test_api_report.py and thresh's published-language
-seams (.thresh/thresh.cue) both see.
+An API change moves a line of one section, which check.sh's api-report gate (`--check`) and thresh's
+published-language seams (.thresh/thresh.cue) both see.
 
     python tools/api_report.py           # print the report
     python tools/api_report.py --write   # write it to docs/api/report.txtar
+    python tools/api_report.py --check   # fail, showing the moved lines, where the committed report is stale
 """
 import argparse
 import ast
 import dataclasses
+import difflib
 import functools
 import importlib
 import inspect
@@ -291,13 +293,24 @@ def report() -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--write", action="store_true",
-                        help=f"write the report to {REPORT.relative_to(ROOT)}")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--write", action="store_true", help=f"write the report to {REPORT.relative_to(ROOT)}")
+    mode.add_argument("--check", action="store_true",
+                      help=f"compare the report with {REPORT.relative_to(ROOT)}, print the moved lines and "
+                      "exit 1 where they differ (check.sh's api-report gate)")
     args = parser.parse_args()
     text = report()
     if args.write:
         REPORT.parent.mkdir(parents=True, exist_ok=True)
         REPORT.write_text(text)
+    elif args.check:
+        committed = REPORT.read_text()
+        if text != committed:
+            name = str(REPORT.relative_to(ROOT))
+            sys.stdout.writelines(difflib.unified_diff(committed.splitlines(keepends=True),
+                                                       text.splitlines(keepends=True), name, "the checkout"))
+            print(f"the public surface moved: run python tools/api_report.py --write and commit {name}")
+            return 1
     else:
         sys.stdout.write(text)
     return 0
