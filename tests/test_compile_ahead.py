@@ -351,6 +351,41 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     assert AheadOfTime.load(path).peak_bytes > 0
 
 
+CLOCKED = ["--trainer.examples", "48", "--trainer.eval-every", "3", "--trainer.checkpoint-every", "3",
+           "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
+           "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
+           "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']
+"""The clocked decision run's flags (the clocked GPU cell's): its tickets stream, of no record count, so its
+evaluations and checkpoints are counted in steps (ledger 3153)."""
+
+
+def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fit_hands_its_step(tmp_path):
+    """The clocked GPU cell's property, read where a host has no GPU (ledger 3153): the decision run compiled
+    ahead for eight sm90 GPUs (`--trainer.compile-ahead`) and the same run lowered for them as `fit` hands it
+    its step, its batch placed on the devices (`--trainer.lower-for`), are one program, so a run handed the
+    step it compiled ahead takes it. A step lowered over the host batch the loader gave and over that batch
+    placed came to two module texts, a helper call's function told apart by its arguments' shardings."""
+    from run_kinds import decision
+
+    from dew.decision.config import DecisionRunConfig
+    from dew.training._lowering import Lowered
+    from dew.training.ahead import AheadOfTime, CompiledAhead, program_of
+
+    path = tmp_path / "ahead.dew-aot"
+    stated = ["--trainer.checkpoint-dir", str(tmp_path / "runs"), *CLOCKED]
+    target = ["--trainer.compile-ahead.generation", "sm90", "--trainer.compile-ahead.devices", "8",
+              "--trainer.compile-ahead.path", str(path)]
+    ahead = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *target],
+                                  default=decision(tmp_path, drawn=False))
+    with pytest.raises(CompiledAhead):
+        ahead.run()
+    lowering = DecisionRunConfig.cli(["--trainer.name", "lowered", *stated, "--trainer.lower-for", "sm90"],
+                                     default=decision(tmp_path, drawn=False))
+    with pytest.raises(Lowered) as lowered:
+        lowering.run()
+    assert program_of(lowered.value.lowered) == AheadOfTime.load(path).program
+
+
 def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py; it trains from a step compiled ahead on this host's own
     GPU): a decision run on the examples clock under a schedule over the run, with a cooldown, compiled
@@ -366,13 +401,7 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
 
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
-    # Its tickets stream, of no record count, so its evaluations and checkpoints are counted in steps
-    # (ledger 3153).
-    stated = ["--trainer.checkpoint-dir", str(runs), "--trainer.examples", "48", "--trainer.eval-every", "3",
-              "--trainer.checkpoint-every", "3",
-              "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
-              "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
-              "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']
+    stated = ["--trainer.checkpoint-dir", str(runs), *CLOCKED]
     ahead = ["--trainer.compile-ahead.generation", device_generation(),
              "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
     compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default)
