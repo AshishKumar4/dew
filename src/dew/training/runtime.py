@@ -28,6 +28,7 @@ from dew.devices import (
     backend_open,
     cuda_plugin,
     flags_hold,
+    flags_set,
     preallocate_gpu_pool,
     refuse_cpu_only_jax,
     xla_flag,
@@ -46,6 +47,9 @@ from dew.pool import (
 )
 
 _log = logging.getLogger(__name__)
+
+_UNPROVEN: set[str] = set()
+"""The run flags a process was told are unproven (`prepare_process`), once each."""
 
 if TYPE_CHECKING:
     from dew.training.tracker import Wandb
@@ -83,10 +87,14 @@ def prepare_process(wandb: Wandb | None = None,
     where its pool shares it (`dew.cache.persist_compilations`), and
     JAX_ENABLE_COMPILATION_CACHE=false turns the cache off.
 
-    `xla_flags` reaches XLA through the environment, which XLA reads when it
-    opens a backend. So this call has to come before the first JAX call in
-    the process, and it is the first line of every recipe. If you use the
-    library without a recipe, set XLA_FLAGS in the environment yourself.
+    `xla_flags` reaches XLA through XLA_FLAGS, which XLA parses once per
+    runtime it loads, at the first use of its debug options. Flags set here
+    before the backend opens are written into XLA_FLAGS, as XLA may not have
+    parsed them yet; where `import dew` has loaded jaxlib, it may have, and
+    Dew warns that they are unproven (`dew.devices.flags_hold`). Setting
+    XLA_FLAGS before the process starts makes them certain, as Dew's command
+    line does for a run's `trainer.xla_flags`. Flags asked for after the
+    backend opened are refused.
     A state kept on the CPU (`Layout(host=("variables",))`) needs one CPU
     device per local accelerator, which the trainer checks on its own mesh
     (`dew.distributed.host.companion_mesh`).
@@ -101,12 +109,13 @@ def prepare_process(wandb: Wandb | None = None,
 def unprepared(multi_host: bool | None, xla_flags: str | None,
                compilation_cache_dir: str | None) -> list[str]:
     """Which of `prepare_process`'s options a run states that this process does not carry: a flag of
-    `xla_flags` that does not hold as XLA reads its flags (`flags_hold`), a compilation cache JAX keeps
-    elsewhere, a pool it has not joined (`multi_host=True`; False only says never to join one). Each
-    acts as JAX opens its backend, and `prepare_process` sets none after (`_set_environment`), so a
-    run trained in a process no `prepare_process` set up with them would run without them."""
+    `xla_flags` XLA_FLAGS did not carry while the backend was closed (`flags_set`), a compilation cache
+    JAX keeps elsewhere, a pool it has not joined (`multi_host=True`; False only says never to join one).
+    Each acts by the time JAX opens its backend, and `prepare_process` sets none after
+    (`_set_environment`), so a run trained in a process no `prepare_process` set up with them would run
+    without them."""
     missed = []
-    if xla_flags and not flags_hold(xla_flags):
+    if xla_flags and not flags_set(xla_flags):
         missed.append("xla_flags")
     if compilation_cache_dir and jax.config.jax_compilation_cache_dir != compilation_cache_dir:
         missed.append("compilation_cache_dir")
@@ -139,12 +148,17 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
     # HF tokenizers fork a thread pool, and grain's workers fork the process, which deadlocks a pool
     # the parent started; a value the user set is theirs.
     os.environ.setdefault('TOKENIZERS_PARALLELISM', "false")
-    if xla_flags and not flags_hold(xla_flags):
+    if xla_flags and not flags_set(xla_flags):
         if backend_open():
-            raise ValueError(f"XLA reads its flags as JAX opens its backend, which has opened: {xla_flags!r} "
+            raise ValueError(f"XLA parsed its flags before JAX's backend opened, and it has: {xla_flags!r} "
                              "would not take effect. Call prepare_process before anything calls JAX, or "
                              "set XLA_FLAGS before the process starts")
         apply_xla_flags(xla_flags)
+    if xla_flags and not flags_hold(xla_flags) and xla_flags not in _UNPROVEN:
+        _UNPROVEN.add(xla_flags)
+        _log.warning("XLA_FLAGS %r were set after the process loaded jaxlib, whose XLA may have parsed its "
+                     "flags before: they are unproven. Set XLA_FLAGS before the process starts, as "
+                     "`dew train` does, to make them certain", xla_flags)
     preallocate_gpu_pool()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)

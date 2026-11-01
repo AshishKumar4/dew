@@ -130,7 +130,7 @@ Each setting's default is the recipe's own, which can differ from the configurat
 | `--trainer.eval-every`, `--trainer.checkpoint-every` | A step interval, `epoch`, or `None`. |
 | `--trainer.checkpoint-dir`, `--trainer.name` | The run's directory is `<checkpoint-dir>/<name>`. |
 | `--trainer.multi-host` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
-| `--trainer.xla-flags` | Extra `XLA_FLAGS`, applied before JAX opens a backend. |
+| `--trainer.xla-flags` | Extra `XLA_FLAGS`, set before the process loads jaxlib, so every runtime XLA loads parses them. |
 
 A chain's `workers(n)`, `threads(n)` or `loading(Loading(...))` control how the host reads data; they do not change the batch size on the device. With zero workers the loader starts no worker processes. [Training data](concepts/data.md) covers the loading settings.
 
