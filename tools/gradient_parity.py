@@ -67,6 +67,8 @@ def measured(model_type: str, built=None) -> tuple[float, float] | str:
                  else built(shrunk).float())
     verify.scatter_weights(reference)
     reference.set_attn_implementation("eager")
+    # Its eval forward, as the probe runs it: Seed-OSS drops its sublayers' outputs in training.
+    reference.eval()
     ids = verify.probe_ids(shrunk.vocab_size)
     with torch.no_grad():
         expected = reference(torch.as_tensor(ids, dtype=torch.long), use_cache=False).logits.numpy()
