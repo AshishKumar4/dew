@@ -172,7 +172,7 @@ def write_seeded() -> None:
     import jax
     from recorded_references import provenance, record_case, save
     from reference_error import assert_computes_the_oracle, chain_roundings, widened
-    from ssd_support import mamba2_draw, mamba2_run
+    from ssd_support import LAYER_GEOMETRY, mamba2_draw, mamba2_layer_draw, mamba2_layer_run, mamba2_run
 
     def draw(seed):
         inputs = mamba2_draw(seed, (B, S, H, P, G, N))
@@ -222,6 +222,43 @@ def write_seeded() -> None:
             return narrow, exact
 
         stored.update(record_case(site, draw, evaluate, lambda inputs, site=site: mamba2_run(site, inputs),
+                                  store_inputs=False, summary=True))
+
+    # One `Mamba2Mixer` on fresh weights and hidden states: in fp32, and in bfloat16 end to end (its weights
+    # cast too) against Dew's bfloat16 compute on fp32 weights; each one's truth the mixer in torch float64.
+    g = LAYER_GEOMETRY
+    config = Mamba2Config(hidden_size=g["hidden_size"], expand=2, num_heads=g["num_heads"],
+                          head_dim=g["head_dim"], state_size=g["state_size"], n_groups=g["n_groups"],
+                          conv_kernel=g["conv_kernel"],
+                          chunk_size=g["chunk_size"], num_hidden_layers=1, vocab_size=32,
+                          layer_norm_epsilon=g["layer_norm_epsilon"])
+
+    def mixer(arrays, dtype):
+        layer = Mamba2Mixer(config, layer_idx=0).eval()
+        layer.load_state_dict({name: torch.from_numpy(value) for name, value in arrays.items()
+                               if name != "hidden"})
+        return layer.to(dtype)(torch.from_numpy(arrays["hidden"]).to(dtype))
+
+    exact_layer = jax.jit(lambda inputs: mamba2_layer_run("layer", inputs))
+    for site, dtype in (("layer", torch.float32), ("layer_bf16", torch.bfloat16)):
+        with jax.enable_x64(new_val=True):
+            roundings = chain_roundings(jax.make_jaxpr(exact_layer)(widened(mamba2_layer_draw(0))))
+
+        def evaluate(inputs, dtype=dtype, roundings=roundings, site=site):
+            """The mixer's outputs in `dtype` and in torch float64, Dew's float64 mixer held to the latter at
+            this seed (the test's truth, `indexed_recording`'s `truth_fn`)."""
+            with torch.no_grad():
+                narrow = {"output": mixer(inputs, dtype).float().numpy()}
+                with float64():
+                    exact = {"output": mixer(inputs, torch.float64).numpy()}
+            with jax.enable_x64(new_val=True):
+                twin = np.asarray(exact_layer(widened(inputs))["output"])
+            assert_computes_the_oracle(twin, exact["output"], f"transformers float64 {site}",
+                                       roundings=roundings)
+            return narrow, exact
+
+        stored.update(record_case(site, mamba2_layer_draw, evaluate,
+                                  lambda inputs, site=site: mamba2_layer_run(site, inputs),
                                   store_inputs=False, summary=True))
     stored["provenance"] = provenance(
         f"transformers {transformers.__version__}", transformers_record()["revision"], "cpu",
