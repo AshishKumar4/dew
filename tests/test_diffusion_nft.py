@@ -139,6 +139,50 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
                                   rollout(old_weights, prompts, jax.random.key(23))["latents"])
 
 
+def test_a_rollout_over_a_partly_read_share_trains_only_its_real_rows():
+    """A batch whose last three source rows repeat others (`VALID_ROWS`, a pool's share whose read ran out
+    partway): the rollout's samples of them are marked so (`real_samples`), train nothing, and leave the
+    rewards' spread its real samples' alone (row 3346's review)."""
+    from dew.batch import VALID_ROWS
+
+    start = objective().init(jax.random.key(20))
+    nft = objective(variables=nudged(start, jax.random.key(22)), old_decay=optax.constant_schedule(0.9))
+    prompts = nft.inputs.tokenize(PROMPTS)
+    real = np.arange(len(PROMPTS)) < len(PROMPTS) - 3
+    rollout, initial, _ = fitted(nft, reward, prompts, groups=3, steps=5, train_steps=3)
+    batch = rollout(initial, {**prompts, VALID_ROWS: real}, jax.random.key(23))
+    held = np.repeat(real, 3)
+    np.testing.assert_array_equal(batch[VALID_ROWS], held)
+    rewards = np.asarray(batch["rewards"], np.float64)
+    grouped = rewards.reshape(len(PROMPTS), 3)
+    expected = (grouped - grouped.mean(axis=1, keepdims=True)) / (rewards[held].std() + 1e-4)
+    np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
+
+
+def test_a_loss_weighs_nothing_of_a_repeated_source_rows_samples():
+    """DiffusionNFT's loss over 8 samples, the last 3 of repeated source rows (`VALID_ROWS`): it is the loss
+    of the first 5 alone, its mean over the real samples, however large the repeats' advantages (row 3346's
+    review)."""
+    from dew.batch import VALID_ROWS
+    from dew.objectives.base import Step
+
+    nft = objective()
+    variables = nudged(nft.init(jax.random.key(30)), jax.random.key(33))
+    rng = np.random.default_rng(31)
+    samples = rng.normal(size=(8, 4, 4, 1)).astype(np.float32)
+    times = np.broadcast_to(np.asarray([1.0, 0.75, 0.5], np.float32), (8, 3))
+    advantages = rng.normal(size=8).astype(np.float32)
+    batch = {"latents": samples, "timesteps": times, "advantages": advantages,
+             **nft.inputs.tokenize(["red"] * 8)}
+    step = Step(jnp.asarray(0), jax.random.key(32), {"params": variables["params"]})
+    real = np.arange(8) < 5
+    loud = {**batch, "advantages": np.where(real, advantages, 1e6).astype(np.float32), VALID_ROWS: real}
+    masked, _ = nft.loss(variables, loud, step)
+    assert float(masked.mass) == 5
+    quiet, _ = nft.loss(variables, {**batch, VALID_ROWS: real}, step)
+    np.testing.assert_array_equal(np.asarray(masked.total), np.asarray(quiet.total))
+
+
 def test_the_released_decay_is_its_trainers_schedule():
     """The old policy's decay at the update after s completed ones is min(0.001 (s + 1), 0.5), the
     released trainer's decay_type 1 at the gradient steps taken (train_nft_sd3.py:169-189 and

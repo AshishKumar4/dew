@@ -31,6 +31,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
+from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn.inspection import (
     PROBES,
@@ -438,7 +439,8 @@ def attempt_step(state, variables, ema, batch, *, split: int, slots: int, attemp
     record nothing and watch nothing."""
     accepted = state.microstep if microstep is None else microstep
     return Step(accepted // split, jax.random.fold_in(state.key, attempt), with_ema(variables, ema),
-                committed=state.updates, record=record, qk_stats=clips_qk(state.opt_state), watched=watched,
+                committed=state.updates, record=record, qk_stats=clips_qk(state.opt_state),
+                equations=solves_equations(state.opt_state), watched=watched,
                 **example_fields(state, slot, split, batch, slots, part, attempt - accepted, microstep))
 
 
@@ -686,8 +688,10 @@ class Transaction:
                              "a run bounded in examples that no plan counts ahead keeps")
         return jnp.asarray(current.consumed, jnp.float32) / self.bound
 
-    def commit(self, current, gradient, effects, qk):
-        """Apply the pooled native gradient and return its finiteness and global norm.
+    def commit(self, current, gradient, effects, qk, statistics):
+        """Apply the pooled native gradient and return its finiteness and global norm. An optimizer that
+        reads more than the gradient is handed the update's pooled loss `statistics` (a Gauss-Newton
+        update's system, `dew.gauss_newton`) and attention logit maxima (`qk`).
 
         The norm is reduced beside optimizer.update, in the same compiled
         transaction, and leaves it with the loss and auxiliary report. No
@@ -718,8 +722,10 @@ class Transaction:
             stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
                 clocked = {} if self.bound is None else {"progress": self.progress(current)}
+                # Only an optimizer that solves the update's system reads its statistics (`dew.gauss_newton`).
+                solved = {"statistics": statistics} if solves_equations(current.opt_state) else {}
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk,
-                                                          **clocked)
+                                                          **solved, **clocked)
             else:
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored)
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
@@ -797,7 +803,7 @@ class Transaction:
                                         microstep=state.microstep + 1)
 
         def commit(current):
-            return self.commit(current, gradient, effects, qk)
+            return self.commit(current, gradient, effects, qk, pending.pooled)
 
         def recopied(current):
             # A window of several microbatches reads one set of copies
