@@ -148,8 +148,8 @@ class Priced:
     def __add__(self, other: Priced) -> Priced:
         return Priced(self.sequential + other.sequential, self.parallel + other.parallel)
 
-    def key(self) -> tuple[float, float]:
-        return self.sequential.value, self.parallel.value
+    def key(self) -> tuple:
+        return self.sequential.key(), self.parallel.key()
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Priced) and self.key() == other.key()

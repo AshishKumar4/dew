@@ -91,8 +91,9 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4) -> Wor
 @dataclasses.dataclass(frozen=True, eq=False)
 class Seconds:
     """A form's work and the seconds its schedule gives it, as extraction adds and compares it (egglog's
-    `ComparableAdd`): the work summed, compared by the seconds the schedule gives the sum alone (two works
-    of one time are equal, so every pair compares)."""
+    `ComparableAdd`): the work summed, compared by the seconds the schedule gives the sum, ties broken by
+    the schedule's `tiebreak` where it states one (`Walk`'s: its units' seconds in series); two works of one
+    key are equal, so every pair compares."""
 
     work: Work
     schedule: Callable[[Work], float] = dataclasses.field(repr=False)
@@ -104,14 +105,18 @@ class Seconds:
     def __add__(self, other: Seconds) -> Seconds:
         return Seconds(self.work + other.work, self.schedule)
 
+    def key(self) -> tuple[float, float]:
+        tiebreak = getattr(self.schedule, "tiebreak", None)
+        return self.value, 0.0 if tiebreak is None else tiebreak(self.work)
+
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Seconds) and self.value == other.value
+        return isinstance(other, Seconds) and self.key() == other.key()
 
     def __lt__(self, other: Seconds) -> bool:
-        return self.value < other.value
+        return self.key() < other.key()
 
     def __hash__(self) -> int:
-        return hash(self.value)
+        return hash(self.key())
 
 
 def fused(facts: generation.GpuTarget) -> Callable[[Work], float]:
@@ -133,10 +138,25 @@ def fused(facts: generation.GpuTarget) -> Callable[[Work], float]:
     return seconds
 
 
-def walk(facts: generation.GpuTarget) -> Callable[[Work], float]:
+@dataclasses.dataclass(frozen=True)
+class Walk:
     """A template's tile walk (`templates.cost.walked`): a tile's work on its program, its units
-    overlapped, its operands staged; its device bytes the launch's, which no form of its algebra changes."""
-    return lambda done: kernel_cost.walked(dataclasses.replace(done, device_bytes=0.0), facts)
+    overlapped, its operands staged; its device bytes the launch's, which no form of its algebra changes.
+    Two forms of one overlapped time are told apart by their units' seconds in series (`tiebreak`): the
+    lighter leaves its units more of the step another form's work would take."""
+
+    facts: generation.GpuTarget
+
+    def __call__(self, done: Work) -> float:
+        return kernel_cost.walked(dataclasses.replace(done, device_bytes=0.0), self.facts)
+
+    def tiebreak(self, done: Work) -> float:
+        return fused(self.facts)(dataclasses.replace(done, device_bytes=0.0))
+
+
+def walk(facts: generation.GpuTarget) -> Walk:
+    """The template's tile walk's schedule over `facts` (`Walk`)."""
+    return Walk(facts)
 
 
 def model(region: Region, schedule: Callable[[Work], float], bytes_per_element: int = 4) -> DagCostModel:
