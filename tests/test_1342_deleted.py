@@ -55,7 +55,7 @@ def test_banked_smoke_serve(release_source):
         "source_deleted": embedding.is_deleted(), "placed_deleted": placed.is_deleted(),
     })
     task = TextGeneration(model, banked, None, sampling=Sampling(temperature=0))
-    server = Server.from_task(task, slots=2, capacity=128, admission=1)
+    server = Server.from_task(task, slots=8, capacity=128, admission=8)
     results = [result.host() for result in server([[100, 101, 102, 103]], 2, key=0)]
     assert results
 
@@ -76,6 +76,8 @@ def test_explicit_source_delete_invalidates_embedding_before_any_serve():
 
 
 def test_original_eight_layer_warm_smoke():
-    subprocess.run(
+    ran = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("warm1342_debug.py")),
-         "8", "banked", "smoke"], check=True)
+         "8", "banked", "smoke"], text=True, capture_output=True)
+    print(ran.stdout)
+    assert ran.returncode == 0, ran.stderr[-1000:]
