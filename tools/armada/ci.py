@@ -1406,10 +1406,14 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
     began = time.monotonic()
+    # The task's start, one for every call below (a heavy file's kept groups run after its whole files): what
+    # one file's process leaves for another's, whichever call runs it, is made after it (followed.py's
+    # `outside`).
+    started = {followed.STARTED_AT: str(time.time())}
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
-    code = tested(python, names, split, out, deadline, cache, grace, common, {}, coverage, whole=whole,
+    code = tested(python, names, split, out, deadline, cache, grace, common, started, coverage, whole=whole,
                   release=release, kept=whole_files)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
@@ -1432,7 +1436,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                          "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
             continue
         part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, left, cache, grace, common, {}, coverage,
+        code = max(code, tested(python, [name], group, part, left, cache, grace, common, started, coverage,
                                 whole=whole, release=release, kept={name: at}))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
@@ -1516,8 +1520,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # process did, so it keys on the code its tests ran, never a taskmate's collection, tests or caches
     # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
     ran = []
-    # The task's start, before which every program it may run as a tool was made (followed.py's `tool`).
-    environ = {**environ, followed.STARTED_AT: str(time.time())}
+    # The task's start (`task` names it; a call made on its own, its own), before which every program it may
+    # run as a tool was made and every file it reads in shared scratch or the home was (followed.py's `tool`,
+    # `outside`).
+    environ = {followed.STARTED_AT: str(time.time()), **environ}
     for index, name in enumerate(tests):
         left = deadline - (time.monotonic() - began)
         alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
@@ -1993,6 +1999,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
+    # The lane's start, for every file's process alike (the files run at once): what one leaves for another is
+    # made after it (followed.py's `outside`).
+    started = str(time.time())
 
     def run(names: list[str]) -> None:
         waiting = sorted(names, key=lambda name: -holds[name])
@@ -2007,7 +2016,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                     # says whatever its own environment does: a GPU node's session grows every job's pool.
                     environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                                "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
-                               "OMP_NUM_THREADS": threads}
+                               "OMP_NUM_THREADS": threads, followed.STARTED_AT: started}
                     running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
                                         session.GRACE, common, environ, None, network)] = fits
                     continue

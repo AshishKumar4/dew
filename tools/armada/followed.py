@@ -207,16 +207,25 @@ OUTSIDE = "outside:"
 """A file read where another process of the task may have left it (`outside`): its record has no key."""
 SHARED_ROOTS = ("/tmp", "/var/tmp", "/dev/shm")
 """The machine's scratch every process shares, beside the user's home (`outside`)."""
+STARTED_AT = "DEW_EXECUTED_STARTED"
+"""The epoch second the task began, which ci.py's `task` sets for every process it records: a program made
+since is no tool (`tool`), and a file in shared scratch or the home made or changed since may be another
+process's leaving (`outside`)."""
 CREATED: set[str] = set()
 """The files this process opened to write: what it reads of them again is its own (`outside`)."""
 
 
 def outside(name: str, root: str) -> bool:
-    """Whether a read of file `name` reads what another process may have left there, which no key holds: an
-    existing file in the machine's shared scratch (`SHARED_ROOTS`) or the user's home, outside the checkout
-    `root`, this file's own scratch and caches (ci.py's `alone`: TMPDIR, `PRIVATE`), the interpreter and its
-    environment, and not one this process wrote (`CREATED`): one file of a task writes /tmp/result and the
-    next reads it, an edit to the first then failing the second, whose record never named the first's code."""
+    """Whether a read of file `name` reads what another process of the task may have left there, which no key
+    holds: an existing file in the machine's shared scratch (`SHARED_ROOTS`) or the user's home, made or
+    changed since the task began (`STARTED_AT`; its change time too, which a copy's mtime from its source
+    hides), outside the checkout `root`, this file's own scratch and caches (ci.py's `alone`: TMPDIR,
+    `PRIVATE`), the interpreter and its environment and compiled bytecode, and not one this process wrote
+    (`CREATED`): one file of a task writes /tmp/result and the next reads it, an edit to the first then
+    failing the second, whose record never named the first's code. What was there before the task began no
+    process of it left: the environment's files and the harness's own where a test runs these tools on a
+    checkout of its own (the venv's pyvenv.cfg, which Python 3.12's site reads before it sets sys.prefix to
+    the venv, its packages' metadata, the plugins), a tool or a fixture a test put in place ahead of it."""
     import tempfile
 
     beneath = lambda where: name.startswith(os.path.join(os.path.realpath(where), ""))  # noqa: E731
@@ -224,7 +233,14 @@ def outside(name: str, root: str) -> bool:
         return False
     own = [root, tempfile.gettempdir(), sys.prefix, sys.base_prefix, sys.exec_prefix,
            *(where for where in (os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR")) if where)]
-    return not any(beneath(where) for where in own) and name not in CREATED and os.path.isfile(name)
+    if any(beneath(where) for where in own) or name in CREATED or "__pycache__" in name.split(os.sep):
+        return False
+    try:
+        found = os.stat(name)
+    except OSError:
+        return False
+    started = os.environ.get(STARTED_AT)
+    return os.path.isfile(name) and (not started or max(found.st_mtime, found.st_ctime) >= float(started))
 
 
 def read(event: str, args: tuple, root: str) -> str | None:
@@ -361,10 +377,6 @@ def programs(event: str, args: tuple) -> list:
     if event == "os.spawn":
         return [args[1]]
     return []
-
-
-STARTED_AT = "DEW_EXECUTED_STARTED"
-"""The epoch second the task began, which ci.py's `alone` sets: a program made since is no tool (`tool`)."""
 
 
 def same_program(first: str, second: str) -> bool:
