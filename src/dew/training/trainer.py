@@ -2075,11 +2075,8 @@ class Trainer(Generic[Loss, Effects]):
         # already: only the others are scored now, joined to the scores that step reported.
         joined = run.evaluation if run.evaluation is not None and run.evaluation.step == current else None
         scored = run.scored if joined is not None else frozenset()
-        if (
-            (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
-            and run.preempted is None
-            and run.paused is None
-        ):
+        if ((plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
+                and run.preempted is None and run.paused is None):
             missing = [name for name in plan.suites if name not in scored]
             if not plan.suites or missing:
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, missing,
