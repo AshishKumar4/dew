@@ -2377,14 +2377,16 @@ class OptimConfig:
         elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
             # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
-        # Gauss-Newton solves its own direction, one solve over every parameter, which a rate scales (each
-        # group's its leaves of it) and a clip caps (`clip_grads`, on the step's norm before its rate).
+        # Gauss-Newton solves its own direction, which it caps at `clip_grads` (the gradient it is handed
+        # it never reads): one solve over every parameter, each param group's rate its leaves of it.
         solved = None
-        if make is gauss_newton:
-            damping = opts.pop('damping', 0.0)
+        if make is gauss_newton and self.clip_grads > 0:
+            opts['clip'] = self.clip_grads
+        if make is gauss_newton and self.param_groups:
+            damping, clip = opts.pop('damping', 0.0), opts.pop('clip', None)
             if not isinstance(damping, int | float):
                 raise ValueError(f"Gauss-Newton's damping is a number, got {damping!r}")
-            solved, make = solved_directions(float(damping)), _rate_only
+            solved, make = solved_directions(float(damping), clip), _rate_only
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
@@ -2401,16 +2403,15 @@ class OptimConfig:
                 solvers[group.name] = group.solver(make, self.rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
+            if solved is not None:
+                solver = optax.chain(solved, solver)
         else:
             if self.spared and self._spares(make):
                 opts['mask'] = weight_decay_mask
             solver = scheduled_solver(make, self.rate, steps, opts, clocked=clocked)
 
-        clipped = (optax.clip_by_global_norm(self.clip_grads),) if self.clip_grads > 0 else ()
-        if solved is not None:
-            solver = optax.chain(solved, *clipped, solver)
-        elif clipped:
-            solver = optax.chain(*clipped, solver)
+        if self.clip_grads > 0:
+            solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
         if self.forced_weight_normalization:
             from dew.nn.mp import forced_weight_normalization
 
