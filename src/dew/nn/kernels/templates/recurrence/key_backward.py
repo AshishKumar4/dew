@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import product
@@ -122,9 +123,10 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     gates, grads, square = call.gates, _value_grads(call), _fp32(call)
-    keys = _key_block(call, functools.partial(_key_memory_held, call))
+    keys = _key_block(call, functools.partial(_key_memory_held, call),
+                      functools.partial(_key_memory_staged, call))
     steps, blocks = width // keys, value_width // call.block
-    landing = _landings(call, keys)
+    staging, landing = _key_memory_staged(call, keys)
 
     def program(q_ref, k_ref, hi_ref, lo_ref, do_ref, v_new_ref, dv_ref, v_ref, h_ref, dh_ref, a_ref,
                 beta_ref, taken_ref, dq_ref, dk_ref, dg_ref, dv_out_ref, da_ref, db_ref, *, streams, staging,
@@ -174,7 +176,8 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
                 _tile(slots, "queries", given), _tile(slots, "keys", given),
                 (_tile(slots, "gates", gates).value(), _tile(slots, "lows", gates).value()), last_prefix,
                 loads["out"], loads["corrected"], loads["value_grads"], loads["entered"], loads["leaving"],
-                blocks, lower, betas, scale, held.dtype, issue, emit=stored, columns=_columns(call, scratch))
+                blocks, lower, betas, scale, held.dtype, issue, issue.summed, emit=stored,
+                columns=_columns(call, scratch))
             d_system, d_betas = d_system + system, d_betas + beta_terms
 
             # The values' part and the system's gradient once every key block's terms are in.
@@ -204,9 +207,6 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
                       keys=((CHUNK, keys), given), gates=((CHUNK, keys), gates),
                       lows=((CHUNK, keys), gates), entered=((keys, value_width), memories),
                       leaving=((keys, value_width), memories))
-    # The column sums' scratch where they take the consumer's own (`mainloop._column_scratch`).
-    staging = ([_staging(held, (CHUNK, keys))[0] for _ in range(2)], _staging(held, (CHUNK, call.block))[0],
-               _staging(held, (CHUNK, CHUNK))[0], _column_scratch(call))
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, square.shape(call.heads * value_width),
                 square.shape(call.heads * CHUNK), jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
@@ -214,8 +214,18 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(12),
                    work=Work(products, steps), held=_key_memory_held(call, keys), staging=staging,
-                   landing={**landing, "values": square.landing(CHUNK, call.block)})(
+                   landing=landing)(
         q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, taken)
+
+
+def _key_memory_staged(call: _Call, keys: int) -> tuple:
+    """`_key_memory_back`'s staging tiles and landings at key block `keys`: the weights' merge's two sets of
+    a key block's, the values' merge's value block and the system's square, the column sums' scratch where
+    they take the consumer's own (`mainloop._column_scratch`); a key block's landing and a value block's."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    staging = ([_staging(held, (CHUNK, keys))[0] for _ in range(2)], _staging(held, (CHUNK, call.block))[0],
+               _staging(held, (CHUNK, CHUNK))[0], _column_scratch(call))
+    return staging, {**_landings(call, keys), "values": _fp32(call).landing(CHUNK, call.block)}
 
 
 def _key_memory_held(call: _Call, keys: int) -> _Held:
@@ -252,12 +262,13 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
     once a step in `_parted`'s form. The queries' and keys' each value head's, which `gradients` sums."""
     width, family = call.width, call.family
     given, gates, square, parted = call.given, call.gates, _fp32(call), _parted(call)
-    keys = _key_block(call, functools.partial(_key_pairs_held, call))
+    keys = _key_block(call, functools.partial(_key_pairs_held, call),
+                      functools.partial(_key_pairs_staged, call))
     steps = width // keys
 
     def program(q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
                 db_ref, *, streams, staging, landing):
-        pairs, squares = staging
+        pairs, squares, referenced = staging
         n, h = lax.axis_index("chunks"), lax.axis_index("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         keyed = h // call.group * width
@@ -270,19 +281,25 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
                           lows=gates.views(lo_ref, row, CHUNK, h * width, width))}
 
         def step(index, slots, d_betas, accumulators):
+            # Every slot acquired in the step's own trace: the rolled sub-chunks read them.
+            slots.acquire_all()
             betas = family.rows_of(beta_ref.at[h, span])
             at = pl.ds(h * width + index * keys, keys)
+            # The sub-chunks' first tokens' prefix halves read once a step into a plain tile, a row each, as
+            # the intra launch reads its own (`mainloop._intra`).
+            for half, ref in enumerate((hi_ref, lo_ref)):
+                for sub in range(CHUNK // algebra.SUB):
+                    referenced[half, sub, :] = family.columns_of(ref.at[row + sub * algebra.SUB, at])
 
             def reference(sub, c):
                 del c
-                return tuple(family.columns_of(ref.at[row + sub * algebra.SUB, at])
-                             for ref in (hi_ref, lo_ref))
+                return tuple(family.columns_of(referenced.at[half, sub]) for half in (0, 1))
 
             # Each pairs' gradient staged once in the step, its parts read by every product as they are and
-            # transposed.
+            # transposed; the scores' scaled as their pairs were.
             d_pairs = []
-            for name, buffers in zip(("scores", "system"), squares, strict=True):
-                value = _tile(slots, name, square).value()
+            for (name, scaled), buffers in zip((("scores", scale), ("system", 1.0)), squares, strict=True):
+                value = _tile(slots, name, square).value() * scaled
                 d_pairs.append(Parts([family.staged(part, buffer)
                                       for part, buffer in zip(product.formed(value, parted.parts), buffers,
                                                               strict=True)], jnp.float32))
@@ -292,8 +309,8 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
             algebra.key_decayed_pairs_back(
                 d_pairs, [lambda c: query, lambda c: key * betas[:, None]], lambda c: key, 1,
                 lambda c: (_tile(slots, "gates", gates).value(), _tile(slots, "lows", gates).value()),
-                reference, Issuer(call, {"pairs": list(pairs)}), chunk=CHUNK,
-                emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad), scales=(scale, 1.0))
+                reference, Issuer(call, {"pairs": list(pairs)}).summed, chunk=CHUNK,
+                emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
             for ref, grad in ((dq_ref, d_query), (dk_ref, d_keyed * betas[:, None] + d_key),
                               (dg_ref, query * d_query + key * (d_keyed * betas[:, None] - d_key))):
@@ -312,26 +329,38 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
     tiles = _streamed(scores=((CHUNK, CHUNK), square), system=((CHUNK, CHUNK), square),
                       queries=((CHUNK, keys), given), keys=((CHUNK, keys), given),
                       gates=((CHUNK, keys), gates), lows=((CHUNK, keys), gates))
-    staging = ([_staging(parted, (CHUNK, keys))[0] for _ in range(2)],
-               [_staging(parted, (CHUNK, CHUNK))[0] for _ in range(2)])
+    staging, landing = _key_pairs_staged(call, keys)
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     products = 2 * 2 * 2 * CHUNK * CHUNK * keys * (CHUNK // algebra.SUB) * steps
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(7),
                    work=Work(products, steps, exponentials=(CHUNK // algebra.SUB + 1) * CHUNK * width),
-                   held=_key_pairs_held(call, keys), staging=staging,
-                   landing={"block": square.landing(CHUNK, keys)})(
+                   held=_key_pairs_held(call, keys), staging=staging, landing=landing)(
         q, k, hi, lo, beta, d_scores, d_system, taken)
 
 
+def _key_pairs_staged(call: _Call, keys: int) -> tuple:
+    """`_key_pairs_back`'s staging tiles and landings at key block `keys`: two sets of a key block's and two
+    of a chunk's square in `_parted`'s form, and the sub-chunks' references' plain tile; a key block's
+    landing."""
+    parted = _parted(call)
+    staging = ([_staging(parted, (CHUNK, keys))[0] for _ in range(2)],
+               [_staging(parted, (CHUNK, CHUNK))[0] for _ in range(2)],
+               plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32))
+    return staging, {"block": _fp32(call).landing(CHUNK, keys)}
+
+
 def _key_pairs_held(call: _Call, keys: int) -> _Held:
-    """`_key_pairs_back`'s consumer thread at key block `keys`: the write gates' terms carried; a key block's
-    prefix halves, its rows' common points' and decays, its queries, keys and their gated rows, each pairs'
-    gradients' sums and the keys' beside a sub-chunk's raised keys and a product's fragments."""
+    """`_key_pairs_back`'s consumer thread at key block `keys`: the write gates' terms carried; across the
+    rolled sub-chunks (`algebra.key_decayed_pairs_back`) a key block's prefix halves, its rows' decays to
+    their common points, its queries and keys, the rows' and keys' gradients carried and the rows' indices;
+    in a sub-chunk's turn its keys' gate up, the keys raised, a product's sum and the operand its product
+    forms, their mask, beside a product's fragments."""
     parted = _parted(call)
     return _Held(carried=[_f32(CHUNK, 1)], phases=(
-        [_f32(CHUNK, keys)] * 10 + _fragments(call, (parted, CHUNK, CHUNK), (parted, CHUNK, keys)),))
+        [_f32(CHUNK, keys)] * 8 + _masks(CHUNK, keys) + [_f32(CHUNK, keys)] * 4 + _masks(CHUNK, keys)
+        + _fragments(call, (parted, CHUNK, CHUNK), (parted, CHUNK, keys)),))
 
 
 def gradients(run, laid_do, dht, tiles) -> tuple:
