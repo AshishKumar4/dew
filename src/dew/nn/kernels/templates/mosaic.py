@@ -793,6 +793,21 @@ class Issuer[Accumulator](abc.ABC):
         have), so a template forms only the indices it reads."""
         return plgpu.broadcasted_iota(jnp.int32, shape, dimension)
 
+    @property
+    @abc.abstractmethod
+    def lane_columns(self) -> int:
+        """The bits of a column's index in a tile in the accumulator's layout that a thread's lane and warp
+        decide; the others are the element's place among the thread's registers (`column_offsets`)."""
+
+    def column_offsets(self, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        """Each column index of a `shape` tile (`iota(shape, 1)`) as `(base, offsets)`, their sum the index:
+        `base` the bits the thread's lane and warp decide (`lane_columns`), equal across a thread's elements,
+        so a row's bound takes it once (`offsets <= bound - base`); `offsets` the bits its register decides, a
+        constant the compiler folds into each comparison (FA3's causal mask, against a column index formed
+        whole per element). Any layout inference gives the iota keeps the sum exact."""
+        columns = self.iota(shape, 1)
+        return columns & self.lane_columns, columns & ~self.lane_columns
+
     def rows_of(self, ref) -> jax.Array:
         """A row vector read from `ref` (`[rows]`) in a row's layout."""
         return plgpu.load(ref, layout=self.row, optimized=False)
