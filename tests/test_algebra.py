@@ -82,6 +82,95 @@ def test_a_compensated_sum_keeps_its_residual():
     assert float(jax.jit(algebra.rewritten(compensated))(a, b)[0]) == low != 0.0
 
 
+def count(closed, primitive: str) -> int:
+    """The equations of `closed` binding `primitive`."""
+    return sum(equation.primitive.name == primitive for equation in closed.jaxpr.eqns)
+
+
+def test_sums_of_operands_of_other_shapes_stay_apart():
+    """Two sums along one axis of operands of different extents are not joined: one sum of their terms would
+    broadcast the narrower operand along the axis, or add operands of no common shape."""
+    def apart(x, y):
+        return jnp.sum(x, axis=1) + jnp.sum(y, axis=1)
+
+    for shapes in (((2, 1), (2, 4)), ((2, 3), (2, 4))):
+        x, y = rows(1, *shapes)
+        closed = jax.make_jaxpr(algebra.rewritten(apart))(x, y)
+        assert count(closed, "reduce_sum") == 2
+        np.testing.assert_array_equal(np.asarray(algebra.rewritten(apart)(x, y)), np.asarray(apart(x, y)))
+
+
+def test_distributivity_factors_a_shared_scale():
+    """A scale multiplied into two terms that are then added is multiplied once into their sum."""
+    def scaled(x, y, a):
+        return a * x + a * y
+
+    x, y, a = rows(2, (8, 64), (8, 64), (8, 64))
+    assert (count(jax.make_jaxpr(scaled)(x, y, a), "mul"),
+            count(jax.make_jaxpr(algebra.rewritten(scaled))(x, y, a), "mul")) == (2, 1)
+
+
+def test_a_row_scalar_leaves_a_sum_along_its_rows():
+    """A per-row scale broadcast along a row and summed with it is taken out of the sum: the rewritten program
+    multiplies the row sums, not the rows."""
+    def weighted(x, s):
+        return jnp.sum(s[:, None] * x, axis=1)
+
+    x, (s,) = rows(3, (8, 64))[0], rows(4, (8,))
+    closed = jax.make_jaxpr(algebra.rewritten(weighted))(x, s)
+    multiplied = [equation for equation in closed.jaxpr.eqns if equation.primitive.name == "mul"]
+    assert [equation.outvars[0].aval.shape for equation in multiplied] == [(8,)]
+
+
+def test_literals_keep_their_exact_values_and_types():
+    """A program's literals pass through the rewrite as the program wrote them: integers, booleans and floats
+    each in its own type and value."""
+    def literal(x, n):
+        return jnp.where(n > np.int32(2_000_000_011), x * 3.5, x - 1.25), n + np.int32(2_000_000_011)
+
+    x, n = rows(5, (4,))[0], jnp.asarray([2_000_000_013, 1], jnp.int32)
+    for given, got in zip(literal(x, n), jax.jit(algebra.rewritten(literal))(x, n), strict=True):
+        assert given.dtype == got.dtype
+        np.testing.assert_array_equal(np.asarray(given), np.asarray(got))
+
+
+def test_custom_derivatives_survive_the_rewrite():
+    """A program calling a function with a custom JVP or a custom VJP computes the same values rewritten, and
+    the rewritten program differentiates through the same rule."""
+    @jax.custom_vjp
+    def clipped(x):
+        return jnp.clip(x, -1.0, 1.0)
+
+    clipped.defvjp(lambda x: (clipped(x), None), lambda _, g: (g,))
+    (x,) = rows(6, (16,))
+    for fn in (jax.nn.relu, clipped):
+        np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(fn))(x)), np.asarray(fn(x)))
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda v: jnp.sum(algebra.rewritten(clipped)(v)))(x)),
+                                  np.ones(16, np.float32))
+
+
+def test_a_protected_region_stays_protected_once_rewritten():
+    """An error-free transform's residual survives a rewrite of a program already rewritten, as the rewrite
+    emits its protected equations under their marker again."""
+    def compensated(a, b):
+        return precision.compensated_add((a, jnp.zeros_like(a)), (b, jnp.zeros_like(b)))[1]
+
+    a, b = jnp.asarray([1e8], jnp.float32), jnp.asarray([1.0], jnp.float32)
+    twice = algebra.rewritten(algebra.rewritten(compensated))
+    assert float(jax.jit(twice)(a, b)[0]) == float(jax.jit(compensated)(a, b)[0]) != 0.0
+
+
+def test_outputs_sharing_a_value_keep_it_shared():
+    """A program returning a sum and that sum added to another keeps the shared sum, two reductions in all,
+    where joining the second output's sums would leave the first's to compute apart."""
+    def shared(x, y):
+        first = jnp.sum(x, axis=-1)
+        return first + jnp.sum(y, axis=-1), first
+
+    x, y = rows(7, (8, 64), (8, 64))
+    assert count(jax.make_jaxpr(algebra.rewritten(shared))(x, y), "reduce_sum") == 2
+
+
 REWRITE = """
 import json, sys
 import jax, jax.numpy as jnp
