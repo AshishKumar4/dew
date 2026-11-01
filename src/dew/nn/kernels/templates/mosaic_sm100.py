@@ -144,6 +144,13 @@ class Tcgen05:
         plgpu.wait_load_tmem()
 
     @staticmethod
+    def relaid(value: jax.Array, smem: Ref, layout) -> jax.Array:
+        """`value` in `layout`, through the shared buffer `smem` (a row vector's tensor-memory layout to an
+        epilogue's, which no register relayout reaches)."""
+        smem[...] = value
+        return plgpu.load(smem, layout=layout)
+
+    @staticmethod
     def zeros(shape: tuple[int, int]) -> jax.Array:
         """An fp32 accumulator chunk of zeros in an epilogue's layout (`STORED`): an output a tile that
         multiplies nothing stores."""
@@ -181,6 +188,11 @@ def operand_columns(rows: int, columns_: int, dtype):
     """A tensor-memory operand of `rows` x `columns_` in `dtype` a product reads (`S`'s narrowed weights,
     FA4's `P`), packed two to a column where its elements are 16-bit."""
     return plgpu.TMEM((rows, columns_), dtype, packed=jnp.dtype(dtype).itemsize < 4)
+
+
+def vector(length: int, dtype=jnp.float32):
+    """A shared-memory vector of `length` (a tile's rows' statistics on their way out or between layouts)."""
+    return plgpu.SMEM((length,), dtype)
 
 
 def accumulator_columns(rows: int, columns_: int):
