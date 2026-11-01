@@ -106,9 +106,10 @@ _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # How much farther the source's float32 gradient of any parameter may be from the float64 truth than
 # Dew's own float32 gradient of it is (`gradient_parity`, each parameter's pooled over its elements on
-# the probe's draw). Two float32 roundings of one gradient put the ratio near one: tools/gradient_parity.py
-# measured 1.05 to 1.26 over the types and compositions that assemble from parts, and the tests' MoE
-# sources reach 2.70 on their smaller leaves, whose few elements make one draw's ratio spread. A backward
+# the probe's draw), Dew's float32 summed as users' processes sum it (`_users_arithmetic`). Two float32
+# roundings of one gradient put the ratio near one: tools/gradient_parity.py measured 1.03 to 1.37 over
+# the types and compositions that assemble from parts, and the tests' sources reach 1.83 on their smaller
+# leaves, whose few elements make one draw's ratio spread (armada IGGRADPAR, IGP3291). A backward
 # the source's forward does not show (a hook, a custom autograd function) that moves a gradient by a
 # relative r puts it near r / eps. The bound is the geometric middle of the two, eps ** -0.5 (2 ** 11.5,
 # 2896): a draw's rounding spread stays orders of magnitude below it, and any backward that moves a
