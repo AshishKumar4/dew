@@ -734,18 +734,6 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     return found
 
 
-def tangent_zero(leaf):
-    """`leaf`'s zero tangent: its own dtype's zeros, or float0's for a leaf with no tangent space (an
-    index, a bool mask, a count), as JAX requires of it."""
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-
-    if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact):
-        return jnp.zeros_like(leaf)
-    return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
-
-
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
                    live_cotangents: bool = False, primal: Callable | None = None,
                    nested: bool = True) -> Callable:
@@ -772,7 +760,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
     policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
     import jax
-    from jax.custom_derivatives import SymbolicZero
+    from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
     @jax.custom_jvp
     def produced(*operands):
@@ -782,7 +770,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def _(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(tangent_zero, saved))
+        return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
     @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
     def pulled(saved, operands, cotangent, live):
@@ -812,11 +800,11 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         live = [index for index, direction in enumerate(directions)
                 if not isinstance(direction, SymbolicZero)]
         if not live:
-            return output, jax.tree.map(tangent_zero, output)
+            return output, zero_from_primal(output)
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            whole = [tangent_zero(operand) for operand in jax.tree.leaves(operands)]
+            whole = [zero_from_primal(operand) for operand in jax.tree.leaves(operands)]
             for index, value in zip(live, moving, strict=True):
                 whole[index] = value
             return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
