@@ -191,7 +191,7 @@ class SkyRace:
     def reset(self, key: jax.Array) -> tuple[Lap, TimeStep]:
         """A start of Table III's (the module docstring)."""
         sky = self.sky
-        keys = iter(jax.random.split(key, 8))
+        keys = iter(jax.random.split(key, 9))
         anywhere = jax.random.uniform(next(keys)) < sky.anywhere
         index = jnp.where(anywhere, jax.random.randint(next(keys), (), 0, len(sky.track)), 0)
         low = jnp.where(anywhere, 0.0, 0.7)
