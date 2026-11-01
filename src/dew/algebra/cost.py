@@ -52,18 +52,28 @@ def made(graph: EGraph, operands) -> int:
     return math.prod(np.broadcast_shapes(*(known for known in shapes if known is not None)))
 
 
+@dataclasses.dataclass(frozen=True, order=True)
+class Seconds:
+    """A form's time, in seconds, as extraction adds and compares it (egglog's `ComparableAdd`)."""
+
+    value: float
+
+    def __add__(self, other: Seconds) -> Seconds:
+        return Seconds(self.value + other.value)
+
+
 def model(device: Device, bytes_per_element: int = 4) -> DagCostModel:
     """The cost of each node alone, in seconds: a reduction its operand's bytes over memory bandwidth, an
     elementwise node its result's elements over the arithmetic rate, a layout change none (XLA lays it out
     within its consumer's fusion); extraction adds them, once a shared node. A node is priced from its
     operands' shapes, the e-classes the extractor hands its callback."""
-    def marginal(graph: EGraph, node) -> float:
+    def marginal(graph: EGraph, node) -> Seconds:
         if (args := get_callable_args(node, Term.reduce)) is not None:
-            return made(graph, args[:1]) * bytes_per_element / device.memory_bandwidth
+            return Seconds(made(graph, args[:1]) * bytes_per_element / device.memory_bandwidth)
         for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2)),
                                       (Term.unary, (0,)), (Term.convert, (0,))):
             if (args := get_callable_args(node, constructor)) is not None:
-                return made(graph, [args[index] for index in operands]) / device.arithmetic_rate
-        return 0.0
+                return Seconds(made(graph, [args[index] for index in operands]) / device.arithmetic_rate)
+        return Seconds(0.0)
 
-    return DagCostModel(marginal_cost=marginal, identity=0.0)
+    return DagCostModel(marginal_cost=marginal, identity=Seconds(0.0))
