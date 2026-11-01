@@ -8,6 +8,7 @@ not, each on par with NumPy's solve of the same normal equations, and the traine
 A float64 run keeps float64 through its parameters, optimizer state, loss and checkpoints.
 """
 
+import dataclasses
 import json
 
 import jax
@@ -240,16 +241,16 @@ def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_s
     optimizer steps the damped solve's step from zero, on par with NumPy's float32 solve from its float64
     solve (check 1), with `clip_grads` set that step capped to the clip's norm; and the run's own path
     (`RunConfig.train`) trains the least-squares objective one step with it (rows 3359, 3360)."""
-    from dew.config import RunConfig
+    from dew.config import RunConfig, TrainerConfig
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
     from dew.gauss_newton import solves_equations
 
     flags = ["--optim.optimizer", "dew.gauss_newton:gauss_newton", "--optim.optimizer-opts",
-             json.dumps({"damping": 1e-3}), "--optim.clip-grads", str(clip), "--trainer.steps", "1",
-             "--trainer.checkpoint-dir", str(tmp_path), "--trainer.eval-every", "none",
-             "--trainer.checkpoint-every", "none", "--trainer.checkpoint-final", "false"]
-    config = RunConfig.cli(flags)
+             json.dumps({"damping": 1e-3}), "--optim.clip-grads", str(clip)]
+    trainer = TrainerConfig(steps=1, checkpoint_final=False, checkpoint_dir=str(tmp_path), eval_every=None,
+                            checkpoint_every=None)
+    config = dataclasses.replace(RunConfig.cli(flags), trainer=trainer)
     assert config.optim.learning_rate == 1.0
     rows, features = 64, 8
     draw = least_squares_draw(rows, features, 0x6E)
