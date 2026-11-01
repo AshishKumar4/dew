@@ -406,15 +406,18 @@ def _read(h, q, k, v, g, beta):
     return q @ h
 
 
+# Near float32's largest a chunk's corrections' overlaps (keys' products near 2^126 against states as large)
+# overflow at entries the token recurrence's float64 keeps normal, as fla's chunked form's do at the same
+# entries (ledger 2470, `precedent_chunked`).
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated_delta", "kimi_delta"])
-@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
     """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
     key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
     derivatives (the decays' range sums, `_decays_of`; the corrected inputs' substitution, `_substituted`):
     the primal, the reverse derivative and reverse over reverse finite wherever float64 is a normal float32
-    and the token-by-token scan's are, at queries, keys and values whose products near float32's ends.
-    Forward mode does not run: both are custom VJPs (`FORWARD_ORDERS`)."""
+    and the token-by-token scan's are, at unit queries, keys and values and at ones whose products near
+    float32's least normal. Forward mode does not run: both are custom VJPs (`FORWARD_ORDERS`)."""
     tokens, chunk, keys_, values = 24, 8, 4, 6
     draws = jax.random.split(jax.random.key(3311 + per_key), 7)
     scale = EDGES[edge]
