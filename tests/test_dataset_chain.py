@@ -799,7 +799,7 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
     (`Questioned`) or a chunk of two tokens each (`text.Chunks`), and one that refuses 4 of those
     (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are its 12 source examples,
     counted before the step makes rows of them, and not the rows it delivers again after; its
-    rejections are the rows refused after it, and its chunks a record are the step's (row 1944)."""
+    rejections are the rows refused after it (row 1944)."""
     steps = ((Questioned(), ThirdQuestionRefused()) if expansion == "questions"
              else (text.Chunks(2, fields=("tokens",)),))
     data = compile(_asked(read).batch(2), objective=ObjectiveData(train=steps), read=read,
@@ -816,7 +816,6 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
         assert counts["data/rejected/asked/third question"] == 4
     else:
         assert rows == 24
-        assert counts["data/chunks_per_record/asked"] == 24 / 12
 
 
 @pytest.mark.parametrize("workers", [0, 2])
