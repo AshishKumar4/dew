@@ -11,11 +11,10 @@ import functools
 import jax
 import jax.numpy as jnp
 import pytest
-from check1_statistics import FEWEST_SEEDS
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import chunk_on, token_by_token
+from reference_error import with_gradients
+from test_recurrence_chunk import chunk_on
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -229,40 +228,30 @@ def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
 
 
 def test_a_value_row_split_by_its_blocks_takes_every_column_interpreted():
-    """The fast backward planned for an A100 (assumed, interpreted by its bundle off a GPU) over a value row
-    three blocks wide, whose query/key launch's streams at the whole row are past an A100's block
-    (`mainloop_backward._query_key_split`): split by the blocks dividing the row, its every gradient on par
-    from float64 with the portable math's. Halved instead, 192 columns took 96, a block and a half, and the
-    split's programs read no column past their first block's."""
+    """The fast backward planned for an A100 (assumed, its launches interpreted off a GPU) over one sequence
+    in fp32 under the fast forms, at Qwen3.5-27B's widths: its query/key launch's streams over the whole
+    value row, an fp32 call's two parts, pass an A100's block (237824 bytes against its 166912,
+    `mainloop_backward._query_key_split`), so the row splits by the blocks dividing it, its every gradient on
+    par from float64 with recorded fla-core's (`fla_sites`). Halved instead, 192 columns took 96, a block and
+    a half, and the split's programs read no column past their first block's."""
     if mainloop.family_of() is not None:
         pytest.skip("an A100's plan interpreted off a GPU: a GPU plans for its own")
-    hooks = recurrence.Hooks(decay='scalar', scale=64 ** -0.5, write_bound=1.0)
-    shape = {'rows': 1, 'length': 64, 'key_heads': 1, 'value_heads': 1, 'key_width': 64, 'value_width': 192}
-
-    def draws(seed):
-        (given,) = draw(jnp.bfloat16, seed, **shape)
-        keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
-        return given, (jax.random.normal(keys[0], given.value.shape),
-                       jax.random.normal(keys[1], (1, 1, 64, 192)))
+    case, dtype = 'one sequence', jnp.float32
+    hooks = case_hooks(case)
+    (sample,) = draw(dtype, 0, **geometry(case))
+    fast = generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast'))
+    with fast, generation.assumed('sm80'):
+        assert trained(sample, hooks)
+        tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm80'))
 
     def planned(given: Chunk):
         # The A100's own tiles and plan, its launches interpreted.
-        return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
-                           family=bundles.of('sm80', jnp.bfloat16), interpret=True)
+        with generation.assumed('sm80'):
+            return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
+                               tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound, rounded=True,
+                               family=mainloop.family_of(dtype), interpret=True)
 
-    def widened(fn):
-        # Each arm's output at fp32 at least, the draws' cotangents'.
-        def run(given: Chunk):
-            out, final = fn(given)
-            return out.astype(jnp.promote_types(out.dtype, jnp.float32)), final
-        return run
-
-    with generation.assumed('sm80'):
-        assert trained(draws(0)[0], hooks)
-        tiles = template.MOSAIC.derived(template_call(draws(0)[0], hooks), generation.gpu_target('sm80'))
-        assert_as_exact(with_gradients(widened(planned)),
-                        with_gradients(widened(functools.partial(chunk_on, 'xla', hooks))), draws,
-                        "the template's gradient over a value row split by its blocks, an A100's plan",
-                        seeds=FEWEST_SEEDS,
-                        truth_fn=with_gradients(widened(functools.partial(token_by_token, hooks))))
+    with fast:
+        the_template_is_as_exact_as_fla(planned, recorded_site(case, dtype),
+                                        label="the template's gradient over a value row split by its blocks, "
+                                              "an A100's plan")
