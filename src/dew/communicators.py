@@ -45,6 +45,7 @@ from pathlib import Path
 
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jaxlib.xla_client import LoadedExecutable
 
 from dew.cache import dew_cache_dir
 from dew.devices import (
@@ -90,6 +91,21 @@ class Collectives:
                   for clique in {*self.permutes, *other.permutes}}
         return Collectives(self.groups | other.groups, self.exchanges | other.exchanges, joined)
 
+    def to_json(self) -> dict:
+        return {"groups": sorted(map(list, self.groups)), "exchanges": sorted(map(list, self.exchanges)),
+                "permutes": [[list(clique), sorted(map(list, pairs))]
+                             for clique, pairs in self.permutes.items()]}
+
+    @classmethod
+    def of(cls, written: Mapping, gpus: Sequence[int]) -> Collectives:
+        """Communicators written as positions in a device assignment (`to_json`), on the assignment's
+        `gpus`."""
+        def placed(positions) -> tuple[int, ...]:
+            return tuple(gpus[int(position)] for position in positions)
+        return cls(frozenset(map(placed, written["groups"])), frozenset(map(placed, written["exchanges"])),
+                   {placed(clique): frozenset((gpus[int(source)], gpus[int(sink)]) for source, sink in pairs)
+                    for clique, pairs in written["permutes"]})
+
     def beyond(self, held: Collectives) -> Collectives:
         """What these communicators add to `held`: the groups and exchanges it has not made, and each
         permute clique's pairs it has not connected, a clique it has not made among them with no pairs."""
@@ -112,8 +128,9 @@ class Needs:
     (`collective`), an all-to-all's connections to every peer beside it (`exchanged`), and a permute's
     communicator's base on every member (`permuted`); each directed pair's connection, its bytes on its
     source, on its target and the most on any other GPU, the most of any clique it was measured in
-    (`connections`, `measured_connections`); the runtime's own
-    bytes beside its pool on each GPU, by ordinal (cuBLAS's handles and workspaces, the kernels it loads);
+    (`connections`, `measured_connections`); the runtime's own bytes beside its pool on each GPU, by ordinal
+    (CUDA's context, cuBLAS's and cuDNN's handles and workspaces, as a matrix product and a convolution leave
+    them; each program's own code is held as it is admitted, `Loaded`);
     and the seconds the measurement took."""
 
     collective: Mapping[int, int]
@@ -197,7 +214,7 @@ def configuration() -> dict:
             "xla_nccl": [setting for setting in flags if "nccl" in setting], "jax": jax.__version__}
 
 
-FORM = 5
+FORM = 6
 """The form of the measurement Dew keeps, which names its place in the cache: a change to what the child
 measures or how it writes it takes the next, so a host measures afresh rather than read an earlier one."""
 
@@ -272,19 +289,10 @@ def ordinal(device) -> int:
     return device.id if device.local_hardware_id is None else device.local_hardware_id
 
 
-def assigned(executable: jax.stages.Compiled) -> tuple[int, ...]:
-    """The devices a compiled program runs on, as ordinals in the order of its device assignment, which its
-    collectives' groups count positions in: the runtime executable's devices, as JAX reads them; else its
-    first named sharding's mesh, its inputs' or its outputs', laid out; else its devices by id."""
-    runtime = executable.runtime_executable()
-    if runtime is not None:
-        return tuple(ordinal(device) for device in runtime.local_devices())
-    shardings = jax.tree.leaves((executable.input_shardings, executable.output_shardings))
-    for sharding in shardings:
-        if isinstance(sharding, NamedSharding) and isinstance(sharding.mesh, Mesh):
-            return tuple(ordinal(device) for device in sharding.mesh.devices.flat)
-    devices = {device for sharding in shardings for device in sharding.device_set}
-    return tuple(ordinal(device) for device in sorted(devices, key=lambda device: device.id))
+def assigned(devices: Iterable) -> tuple[int, ...]:
+    """The `devices` a program loaded on this process runs on (its `LoadedExecutable`'s, `admit`), as ordinals
+    in the order of its device assignment, which its collectives' groups count positions in."""
+    return tuple(ordinal(device) for device in devices)
 
 
 def collectives_of(program: str, gpus: tuple[int, ...]) -> Collectives:
@@ -323,10 +331,11 @@ class Resident:
 
     def __init__(self) -> None:
         self.held = Collectives()
+        self.loaded: dict[bytes, Loaded] = {}
         self.lock = threading.Lock()
 
     def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
-              free: Callable[[int], int | None]) -> None:
+              free: Callable[[int], int | None], loaded: Loaded | None = None) -> None:
         """Admit a compiled program's communicators (`made`), refusing it, naming the bytes, before it runs,
         where they and the process's earlier ones, each counted once, with the runtime's need more than the
         room Dew left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it), or where those it
@@ -336,11 +345,18 @@ class Resident:
         communicator's buffers as its program first runs, which no process can see, so free memory cannot
         tell an earlier program not yet run from one that ran: the room holds every program's together,
         and what is free now refuses a program whose own communicators cannot fit even beside the earlier
-        ones all made."""
+        ones all made. A program's code (`loaded`) is held beside them the same way, each executable's
+        once."""
         with self.lock:
             held = self.held | made
+            new = loaded is not None and loaded.fingerprint not in self.loaded
+            programs = {**self.loaded, **({loaded.fingerprint: loaded} if loaded is not None and new else {})}
             needed = needs.needed(held, room, runtime=True)
             added = needs.needed(made, room, runtime=False, made=self.held)
+            for program in programs.values():
+                for gpu in set(program.gpus) & set(needed):
+                    needed[gpu] += program.code
+                    added[gpu] += program.code if new and program is loaded else 0
             now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
             short = (any(needed[gpu] > room[gpu] for gpu in room)
                      or any(added[gpu] > now[gpu] for gpu in now))
@@ -352,7 +368,17 @@ class Resident:
                                        "process's, which its GPUs have too little room for outside XLA's "
                                        f"pool; lower {fraction_name()} by the shortfall over the GPU's bytes",
                                        needed, {gpu: min(room[gpu], now.get(gpu, room[gpu])) for gpu in room})
-            self.held = held
+            self.held, self.loaded = held, programs
+
+
+@dataclasses.dataclass(frozen=True)
+class Loaded:
+    """A program's code as its GPUs hold it outside XLA's pool from its first run on: its executable's
+    fingerprint, the GPUs it runs on, and the bytes of its generated code on each (`memory_analysis`)."""
+
+    fingerprint: bytes
+    gpus: tuple[int, ...]
+    code: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -388,9 +414,13 @@ def sized_pool(*, measure: Callable[[], Needs | None] = needs_of,
     `hold` is given it. None where nothing is sized: a process off CUDA (`cuda`, JAX's CUDA plugin by
     default) or whose backend has opened (`opened`), a pool of no fixed share (`dew.devices.pool_bound`), or
     a host that makes no communicator (`needs_of`). A pool of processes is not measured: its communicators
-    span hosts, whose network buffers one host's child does not make."""
+    span hosts, whose network buffers one host's child does not make. Once the backend has opened, the pool
+    keeps the share it took, so a process prepared again (a sweep's next run, a profile after a run) gets the
+    sizing it holds (`held`)."""
     cuda = cuda_plugin() if cuda is None else cuda
-    if (backend_open() if opened is None else opened) or (bound := pool_bound(cuda=cuda)) is None:
+    if backend_open() if opened is None else opened:
+        return _HELD
+    if (bound := pool_bound(cuda=cuda)) is None:
         return None
     needs = measure()
     if needs is None:
@@ -424,15 +454,39 @@ def held() -> Sizing | None:
     return _HELD
 
 
+def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...], text: Callable[[], str]) -> Collectives:
+    """The communicators an executable makes on `gpus` (`collectives_of`), read from its `text` once per
+    executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, so a
+    warm start that loads it from the compilation cache reads no text."""
+    path = Path(dew_cache_dir()) / "communicators" / "programs" / f"{fingerprint.hex()}.json"
+    if path.exists():
+        return Collectives.of(json.loads(path.read_text()), gpus)
+    positions = collectives_of(text(), tuple(range(len(gpus))))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_atomically(path, json.dumps(positions.to_json()))
+    return Collectives.of(positions.to_json(), gpus)
+
+
 def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = gpu_free_bytes) -> None:
-    """Admit a compiled or loaded program's communicators against the room the process's sizing left them
-    and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit before it
-    runs; a process that holds no sizing admits every program. Every program Dew compiles passes here
-    (`dew.nn.kernels.templates.report`), and every executable it loads compiled ahead
-    (`dew.training.ahead`)."""
-    if _HELD is not None:
-        _RESIDENT.admit(collectives_of(executable.as_text() or "", assigned(executable)), _HELD.needs,
-                        _HELD.room, free)
+    """Admit a compiled or loaded program's communicators and code against the room the process's sizing
+    left them and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit
+    before it runs; a process that holds no sizing admits every program, and a program compiled for devices
+    this process has not (`dew.training.ahead.compile_only_gpus`) is never loaded here, so it takes none of
+    this host's room. Every program Dew compiles passes here (`dew.nn.kernels.templates.report`) but the
+    RL rollouts' own jits, and every executable it loads compiled ahead (`dew.training.ahead`)."""
+    runtime = executable.runtime_executable()
+    if _HELD is None or runtime is None or not isinstance(runtime, LoadedExecutable):
+        return
+    gpus = assigned(runtime.local_devices())
+    fingerprint = runtime.fingerprint
+    if not isinstance(fingerprint, bytes):
+        made = collectives_of(executable.as_text() or "", gpus)
+        loaded = None
+    else:
+        made = collectives_kept(fingerprint, gpus, lambda: executable.as_text() or "")
+        memory = executable.memory_analysis()
+        loaded = Loaded(fingerprint, gpus, int(getattr(memory, "generated_code_size_in_bytes", 0) or 0))
+    _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded)
 
 
 type Run = tuple[int, int, Mapping[int, int]]
@@ -488,8 +542,8 @@ def main() -> None:
     that divides this host's GPUs (the first GPUs of that many), the bytes each GPU gave, less its pool's
     growth, as a collective's communicator is made over them (an all-gather's), as an all-to-all connects
     every peer beside it, each the most a member gave, and as a permute's communicator connects each
-    directed pair of them in turn (`peer_costs`); and the rest, after a matrix product on each GPU, the
-    runtime's beside its pool."""
+    directed pair of them in turn (`peer_costs`); and the rest, after a matrix product and a convolution on
+    each GPU (cuBLAS's and cuDNN's handles and workspaces), the runtime's beside its pool."""
     import jax.numpy as jnp
     import numpy as np
 
@@ -547,7 +601,9 @@ def main() -> None:
     permuted, connections = measured_connections(cliques)
     for device in devices:
         square = jax.device_put(jnp.ones((512, 512), jnp.float32), device)
-        jax.block_until_ready(square @ square)
+        image = jax.device_put(jnp.ones((1, 8, 32, 32), jnp.float32), device)
+        jax.block_until_ready((square @ square,
+                               jax.lax.conv(image, jnp.ones((8, 8, 3, 3), jnp.float32), (1, 1), "SAME")))
     after = held_now()
     # The runtime's share on each GPU: what went that neither the pool's growth nor a communicator took.
     runtime = {gpu: before[gpu] - after[gpu][0] - after[gpu][1] - spent[gpu] for gpu in after}
