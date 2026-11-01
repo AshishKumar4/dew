@@ -1111,7 +1111,8 @@ def mode_pipeline(args) -> dict:
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
-    dump_params(args.out.with_suffix(".npz"), state.variables)
+    # A stage-local state holds each stage's layers stacked on its own devices; the dump reads every layer.
+    dump_params(args.out.with_suffix(".npz"), trainer.staging.whole(state.variables))
     return {
         "process_index": jax.process_index(),
         "losses": losses,
