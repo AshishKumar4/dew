@@ -26,7 +26,6 @@ from reference_error import (
     equations,
     indexed_recording,
     recording,
-    seeds_for,
     widened,
 )
 from tool_support import load as load_tool
@@ -90,21 +89,27 @@ def tensors_of(loaded: Pretrained) -> dict[str, np.ndarray]:
     return {key: np.array(value, copy=True) for key, value in loaded.export().items()}
 
 
-def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, **fields):
+def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, *,
+                truth_tensors: dict[str, np.ndarray] | None = None, **fields):
     """The transcription's float32 and float64 runs of `compute(reference, *inputs)` over `tensors`
-    (`TOOL.DoryReference` with `fields`): check 1's reference and truth arms, each run as given."""
-    arms = [TOOL.DoryReference(config, tensors, dtype, **fields) for dtype in (TOOL.torch.float32,
-                                                                              TOOL.torch.float64)]
+    (`TOOL.DoryReference` with `fields`), the float64 run over `truth_tensors` where the weights it is
+    exact for are not the float32 run's: check 1's reference and truth arms, each run as given."""
+    held = ((tensors, TOOL.torch.float32), (tensors if truth_tensors is None else truth_tensors,
+                                            TOOL.torch.float64))
+    arms = [TOOL.DoryReference(config, weights, dtype, **fields) for weights, dtype in held]
     return tuple(as_given(lambda *inputs, arm=arm: compute(arm, *(np.asarray(value) for value in inputs)))
                  for arm in arms)
 
 
-def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, **fields) -> None:
+def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, weights=None,
+                           truth_weights=None, **fields) -> None:
     """Check 1 of `dew(ids)`, Dory's logits over drawn ids of the fixture's shape, against the
     transcription's forward (`transcribed`) over `loaded`'s weights, its float64 run the truth, over
-    `LOGITS_SEEDS`."""
-    reference, truth = transcribed(loaded.config, tensors_of(loaded), lambda arm, ids: arm.forward(ids),
-                                   **fields)
+    `LOGITS_SEEDS`. `weights` (host tensors under the checkpoint's names) replace `loaded`'s in both
+    runs, and `truth_weights` the float64 run's alone, where Dew's arm computes another function of the
+    same checkpoint (an adapter's)."""
+    reference, truth = transcribed(loaded.config, tensors_of(loaded) if weights is None else weights,
+                                   lambda arm, ids: arm.forward(ids), truth_tensors=truth_weights, **fields)
     draw = token_draw(stream, loaded.config['vocab_size'], REFERENCE['input_ids'].shape)
     assert_as_exact(dew, reference, draw, label, seeds=LOGITS_SEEDS, truth_fn=truth)
 
@@ -589,11 +594,11 @@ def train(objective, directory: Path, steps: int):
     return jax.device_get(state.variables)
 
 
-def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
-    """The checkpoint's tensors with the adapter at `adapter` merged in by PEFT itself: its LoRA
-    layers injected by the adapter's own config into a torch module of the checkpoint's linear
-    projections under their checkpoint names, the saved factors loaded as PEFT loads them, and each
-    layer's merge."""
+def peft_merged(checkpoint: Path, adapter: Path, dtype) -> dict[str, np.ndarray]:
+    """The checkpoint's tensors with the adapter at `adapter` merged in by PEFT itself, in the torch
+    dtype `dtype`: its LoRA layers injected by the adapter's own config into a torch module of the
+    checkpoint's linear projections under their checkpoint names, the saved factors loaded as PEFT
+    loads them, and each layer's merge, which PEFT sums in the layer's dtype."""
     import torch
     from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
     from peft.tuners.lora import LoraLayer
@@ -610,8 +615,8 @@ def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
             if not hasattr(parent, part):
                 parent.add_module(part, torch.nn.Module())
             parent = getattr(parent, part)
-        linear = torch.nn.Linear(value.shape[1], value.shape[0], bias=False)
-        linear.weight.data = torch.as_tensor(value)
+        linear = torch.nn.Linear(value.shape[1], value.shape[0], bias=False, dtype=dtype)
+        linear.weight.data = torch.as_tensor(value).to(dtype)
         parent.add_module(leaf, linear)
     model = inject_adapter_in_model(LoraConfig.from_pretrained(str(adapter)), base)
     saved = load_file(str(adapter / 'adapter_model.safetensors'))
@@ -627,19 +632,15 @@ def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
     return merged
 
 
-MERGED_SEEDS = 8
-"""The merged-adapter site's declared draws (`seeds_for`)."""
-
-
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
     loss reaches each projection; a run resumed after its first step ends where two uninterrupted
     steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
-    merges it into every projection the checkpoint holds by its name there, and the transcription
-    over that merge computes the adapted model's logits within the rule of its own run against
-    float64; and the merged checkpoint reloads to logits on par with the adapted model's from
-    float64."""
+    merges it into every projection the checkpoint holds by its name there; and the adapted model's
+    logits, like those of the merged checkpoint Dew writes and reloads, are on par with the
+    transcription's over PEFT's float32 merge, each from the transcription's float64 run over the
+    merge PEFT sums in float64, the function the saved factors define (check 1)."""
     from safetensors.numpy import load_file
 
     loaded = load()
@@ -669,40 +670,21 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     ids = REFERENCE['input_ids']
     logits = np.asarray(adapted.model.apply(resumed, ids))
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)), logits)
-    import torch
 
-    config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
-    assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
-    vocabulary = adapted.model.vocab_size
+    single, double = (peft_merged(TINY, tmp_path / 'adapter', dtype)
+                      for dtype in (TOOL.torch.float32, TOOL.torch.float64))
+    for merge in (single, double):
+        assert {name for name in merge if not np.array_equal(merge[name], original[name])} == projections
 
-    draw = token_draw(0xD0E, vocabulary, ids.shape)
+    def as_peft_merges(dew, label):
+        assert_logits_as_vllms(dew, loaded, label, stream=0xD0E, weights=single, truth_weights=double)
 
-    # The adapter as PEFT merges it, its consumer: the transcription over PEFT's merge computes the
-    # adapted model's logits on par with its own fp32 run from its float64 one (check 1).
-    merged_by_peft = {dtype: TOOL.DoryReference(config, peft, dtype)
-                      for dtype in (torch.float32, torch.float64)}
-
-    def peft_logits(dtype):
-        return as_given(lambda drawn: merged_by_peft[dtype].forward(np.asarray(drawn)))
-
-    def adapted_logits(drawn):
-        return adapted.model.apply(resumed, drawn)
-
-    seeds = seeds_for(peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
-                      truth_fn=peft_logits(torch.float64))
-    assert_as_exact(adapted_logits, peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
-                    seeds=seeds, truth_fn=peft_logits(torch.float64))
+    as_peft_merges(lambda drawn: adapted.model.apply(resumed, drawn), 'the adapter as PEFT merges it')
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
-    # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
-    # model's logits are on par with the adapted model's over drawn ids, both from the adapted
-    # model's float64 forward (check 1).
-
-    def merged_logits(drawn):
-        return merged.model.apply(merged.variables, drawn)
-
-    assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
-                    truth_fn=as_given(lambda drawn: float64_forward(adapted.model, resumed, drawn)[0]))
+    # Merging folds each adapter into its projection's weight, a rounding of its own, which PEFT's
+    # float32 merge makes too.
+    as_peft_merges(lambda drawn: merged.model.apply(merged.variables, drawn), 'the merged adapter')
 
 
 INTENT = Choice('which team?', {'billing': 'payments', 'technical': 'outages', 'sales': 'pricing'})
