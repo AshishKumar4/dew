@@ -204,8 +204,11 @@ def divide_exactly() -> None:
     _gpu_default("xla_backend_extra_options", "--xla_backend_extra_options=-nvptx-prec-divf32=2")
 
 
-POOL_NAMES = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE",
-              "XLA_PYTHON_CLIENT_ALLOCATOR")
+FRACTIONS = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
+"""The environment variables JAX reads a GPU pool's share from, its current name first; it refuses a run
+that sets both (jaxlib's `xla_client.generate_pjrt_gpu_plugin_options`)."""
+
+POOL_NAMES = (*FRACTIONS, "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
 """The environment variables a run names its GPU pool by."""
 
 DEW_SHARE, JAX_SHARE = 0.95, 0.75
@@ -214,17 +217,23 @@ takes it where a run names preallocation or the allocator without a fraction (do
 gpu_memory_allocation)."""
 
 
+def fraction_name() -> str:
+    """The variable this run names its pool's share by (`FRACTIONS`), the deprecated one where it names
+    none, as Dew's own share is written (`preallocate_gpu_pool`)."""
+    return next((name for name in FRACTIONS if name in os.environ), FRACTIONS[1])
+
+
 def pool_bound(*, cuda: bool) -> float | None:
     """The share of each GPU XLA's pool takes as this run names it, which Dew may size it below and never
-    above (`dew.communicators`): its fraction where it names one; Dew's own where it names nothing
-    (`preallocate_gpu_pool`); JAX's where it names preallocation or the allocator without one. None where
-    the pool holds no fixed share: a process off CUDA, a pool that grows
-    (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) or another allocator than XLA's own (`platform`)."""
+    above (`dew.communicators`): its fraction where it names one (`fraction_name`); Dew's own where it
+    names nothing (`preallocate_gpu_pool`); JAX's where it names preallocation or the allocator without
+    one. None where the pool holds no fixed share: a process off CUDA, a pool that grows
+    (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) or another allocator than XLA's own BFC pool."""
     allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
     growing = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "true").lower() in ("false", "0")
     if not cuda or growing or allocator not in ("default", "bfc"):
         return None
-    named = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")
+    named = os.environ.get(fraction_name())
     if named is not None:
         return float(named)
     return JAX_SHARE if any(name in os.environ for name in POOL_NAMES) else DEW_SHARE
@@ -439,15 +448,6 @@ def gpu_memory(ordinal: int) -> tuple[int, int] | None:
             cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
     finally:
         cuda.cuDevicePrimaryCtxRelease_v2(device)
-
-
-def gpu_count() -> int:
-    """The GPUs visible to this process, as the CUDA driver counts them (CUDA_VISIBLE_DEVICES applied),
-    asked before the backend opens; 0 where no driver answers."""
-    cuda, count = _driver(), ctypes.c_int()
-    if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGetCount(ctypes.byref(count)):
-        return 0
-    return count.value
 
 
 def gpu_name(ordinal: int) -> str | None:

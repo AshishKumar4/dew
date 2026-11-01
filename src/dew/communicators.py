@@ -37,6 +37,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
@@ -49,7 +50,8 @@ from dew.devices import (
     backend_open,
     cuda_driver_version,
     cuda_plugin,
-    gpu_count,
+    fraction_name,
+    gpu_free_bytes,
     gpu_memory,
     gpu_name,
     gpu_place,
@@ -57,18 +59,16 @@ from dew.devices import (
     pool_bound,
 )
 from dew.files import write_atomically
+from dew.pool import local_gpu_count
 from dew.telemetry.instrumentation import hlo_instructions
+from dew.telemetry.trace import collective
 
 _log = logging.getLogger(__name__)
-
-COLLECTIVES = frozenset({"all-gather", "all-gather-start", "all-reduce", "all-reduce-start", "reduce-scatter",
-                         "all-to-all", "ragged-all-to-all", "collective-broadcast"})
-"""The ops that run on a collective's communicator (XLA's communication id 0)."""
 
 EXCHANGES = frozenset({"all-to-all", "ragged-all-to-all"})
 """The collectives that connect every peer of their group point to point as they first run."""
 
-PERMUTES = frozenset({"collective-permute", "collective-permute-start", "send", "recv"})
+PERMUTES = frozenset({"collective-permute", "send", "recv"})
 """The ops that run on a permute's communicator (XLA's communication id 1), each connecting the peers it
 sends to and receives from as it first runs."""
 
@@ -76,18 +76,26 @@ sends to and receives from as it first runs."""
 @dataclasses.dataclass(frozen=True)
 class Collectives:
     """The communicators a process's programs make on its GPUs, by GPU ordinal: each distinct device group a
-    collective takes (`groups`, a communicator each), each an all-to-all takes (`exchanges`, its connections
-    to every peer of the group), and each GPU's permute peers (`peers`, the GPUs it sends to or receives
-    from on a permute's communicator)."""
+    collective takes (`groups`, a communicator each, its devices as the program orders them), each an
+    all-to-all takes (`exchanges`, its connections to every peer of the group), and each permute's clique
+    (the devices of the program that runs it) with the directed pairs it sends along (`permutes`)."""
 
     groups: frozenset[tuple[int, ...]] = frozenset()
     exchanges: frozenset[tuple[int, ...]] = frozenset()
-    peers: Mapping[int, frozenset[int]] = dataclasses.field(default_factory=dict)
+    permutes: Mapping[tuple[int, ...], frozenset[tuple[int, int]]] = dataclasses.field(default_factory=dict)
 
     def __or__(self, other: Collectives) -> Collectives:
-        joined = {gpu: self.peers.get(gpu, frozenset()) | other.peers.get(gpu, frozenset())
-                  for gpu in {*self.peers, *other.peers}}
+        joined = {clique: self.permutes.get(clique, frozenset()) | other.permutes.get(clique, frozenset())
+                  for clique in {*self.permutes, *other.permutes}}
         return Collectives(self.groups | other.groups, self.exchanges | other.exchanges, joined)
+
+    def beyond(self, held: Collectives) -> Collectives:
+        """What these communicators add to `held`: the groups and exchanges it has not made, and each
+        permute clique's pairs it has not connected, a clique it has not made among them with no pairs."""
+        added = {clique: pairs - held.permutes.get(clique, frozenset())
+                 for clique, pairs in self.permutes.items()
+                 if clique not in held.permutes or pairs - held.permutes[clique]}
+        return Collectives(self.groups - held.groups, self.exchanges - held.exchanges, added)
 
 
 def _at(table: Mapping[int, int], size: int) -> int:
@@ -99,15 +107,15 @@ def _at(table: Mapping[int, int], size: int) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class Needs:
-    """What a child measured, each the most any GPU of its group took, by the group's size: a collective's
-    communicator (`collective`), an all-to-all's connections to every peer beside it (`exchanged`), and a
-    permute's communicator connected to one peer and to every peer (`permuted`); the runtime's own bytes
-    beside its pool on each GPU, by ordinal (cuBLAS's workspaces, the kernels it loads); and the seconds the
-    measurement took."""
+    """What a child measured on a group of each size, each GPU's bytes: a collective's communicator
+    (`collective`), an all-to-all's connections to every peer beside it (`exchanged`), and a permute's
+    communicator (`permuted`: its base on every member, each send connection and each receive connection);
+    the runtime's own bytes beside its pool on each GPU, by ordinal (cuBLAS's handles and workspaces, the
+    kernels it loads); and the seconds the measurement took."""
 
     collective: Mapping[int, int]
     exchanged: Mapping[int, int]
-    permuted: Mapping[int, tuple[int, int]]
+    permuted: Mapping[int, tuple[int, int, int]]
     runtime: Mapping[int, int]
     seconds: float
 
@@ -121,33 +129,43 @@ class Needs:
     def of(cls, written: Mapping) -> Needs:
         return cls({int(size): int(taken) for size, taken in written["collective"].items()},
                    {int(size): int(taken) for size, taken in written["exchanged"].items()},
-                   {int(size): (int(one), int(every)) for size, (one, every) in written["permuted"].items()},
+                   {int(size): (int(base), int(send), int(receive))
+                    for size, (base, send, receive) in written["permuted"].items()},
                    {int(gpu): int(taken) for gpu, taken in written["runtime"].items()},
                    float(written["seconds"]))
 
-    def permute(self, size: int, peers: int) -> int:
-        """A permute's communicator over `size` GPUs on a GPU connected to `peers` of them: its bytes with
-        one peer, and each further peer's share of the bytes every peer added."""
-        if peers == 0 or not self.permuted:
-            return 0
+    def permute(self, size: int) -> tuple[int, int, int]:
+        """A permute's communicator's base, send and receive bytes on a clique of `size`, as `_at` takes a
+        size the child did not measure."""
         larger = sorted(measured for measured in self.permuted if measured >= size)
-        measured = larger[0] if larger else max(self.permuted)
-        one, every = self.permuted[measured]
-        return one + (every - one) * (peers - 1) // max(1, measured - 2)
+        return self.permuted[larger[0] if larger else max(self.permuted)] if self.permuted else (0, 0, 0)
 
-    def needed(self, held: Collectives, gpus: Iterable[int], *, runtime: bool) -> dict[int, int]:
-        """Each of `gpus`' bytes outside the pool for `held`: every group's communicator and every
-        exchange's connections on the GPUs of the group, at its size, and each GPU's permute peers on a
-        permute's communicator over all `gpus`; with the runtime's where `runtime`."""
+    def needed(self, held: Collectives, gpus: Iterable[int], *, runtime: bool,
+               made: Collectives | None = None) -> dict[int, int]:
+        """Each of `gpus`' bytes outside the pool for `held` beyond what `made` holds already
+        (`Collectives.beyond`): every group's communicator and every exchange's connections on the GPUs of
+        the group, at its size; every new permute clique's base on its members and each new pair's send on
+        its source and receive on its target; with the runtime's where `runtime`."""
+        made = Collectives() if made is None else made
+        added = held.beyond(made)
         needed = {gpu: self.runtime.get(gpu, 0) if runtime else 0 for gpu in sorted(gpus)}
-        for groups, table in ((held.groups, self.collective), (held.exchanges, self.exchanged)):
+
+        def charge(gpu: int, taken: int) -> None:
+            if gpu in needed:
+                needed[gpu] += taken
+
+        for groups, table in ((added.groups, self.collective), (added.exchanges, self.exchanged)):
             for group in groups:
                 for gpu in group:
-                    if gpu in needed:
-                        needed[gpu] += _at(table, len(group))
-        for gpu, peers in held.peers.items():
-            if gpu in needed:
-                needed[gpu] += self.permute(len(needed), len(peers))
+                    charge(gpu, _at(table, len(group)))
+        for clique, pairs in added.permutes.items():
+            base, send, receive = self.permute(len(clique))
+            if clique not in made.permutes:
+                for gpu in clique:
+                    charge(gpu, base)
+            for source, target in pairs:
+                charge(source, send)
+                charge(target, receive)
         return needed
 
 
@@ -166,7 +184,7 @@ def configuration() -> dict:
     """What a measurement holds for: this host's GPUs by name and by place (PCI bus id, which their links
     follow), the driver's CUDA version, NCCL's version and every NCCL setting in the environment, each XLA
     flag that sets NCCL's communicators, and the JAX build that makes them."""
-    count = gpu_count()
+    count = local_gpu_count() or 0
     flags = os.environ.get("XLA_FLAGS", "").split()
     return {"gpus": [gpu_name(index) for index in range(count)],
             "placement": [gpu_place(index) for index in range(count)], "driver": cuda_driver_version(),
@@ -195,7 +213,8 @@ def needs_of(gpus: int | None = None) -> Needs | None:
     host of fewer than two GPUs, or in a process that asks JAX for no GPU, where no communicator is made."""
     platforms = os.environ.get("JAX_PLATFORMS", "")
     asks_no_gpu = bool(platforms) and not {"cuda", "gpu"} & set(platforms.split(","))
-    if (gpu_count() if gpus is None else gpus) < 2 or asks_no_gpu:
+    count = (local_gpu_count() or 0) if gpus is None else gpus
+    if count < 2 or asks_no_gpu:
         return None
     return measured(configuration(), measure=_child)
 
@@ -216,10 +235,11 @@ def _child(configured: Mapping) -> Needs:
 
 def everything(gpus: Iterable[int]) -> Collectives:
     """What a program over `gpus` may make before it compiles: a collective's communicator over all of them,
-    its all-to-all's connections to every peer, and a permute's to every peer."""
+    its all-to-all's connections to every peer, and a permute's along every pair."""
     every = tuple(sorted(gpus))
     return Collectives(frozenset({every}), frozenset({every}),
-                       {gpu: frozenset(every) - {gpu} for gpu in every})
+                       {every: frozenset((source, target) for source in every for target in every
+                                         if source != target)})
 
 
 def pool_share(needs: Needs, memory: Mapping[int, tuple[int, int]], bound: float, held: Collectives) -> float:
@@ -244,9 +264,13 @@ def ordinal(device) -> int:
 
 
 def assigned(executable: jax.stages.Compiled) -> tuple[int, ...]:
-    """The GPUs a compiled program runs on, in the order of its device assignment, which its collectives'
-    groups count positions in: its first named sharding's mesh, laid out; else its devices by id."""
-    shardings = jax.tree.leaves(executable.input_shardings)
+    """The devices a compiled program runs on, as ordinals in the order of its device assignment, which its
+    collectives' groups count positions in: the runtime executable's devices, as JAX reads them; else its
+    first named sharding's mesh, its inputs' or its outputs', laid out; else its devices by id."""
+    runtime = executable.runtime_executable()
+    if runtime is not None:
+        return tuple(ordinal(device) for device in runtime.local_devices())
+    shardings = jax.tree.leaves((executable.input_shardings, executable.output_shardings))
     for sharding in shardings:
         if isinstance(sharding, NamedSharding) and isinstance(sharding.mesh, Mesh):
             return tuple(ordinal(device) for device in sharding.mesh.devices.flat)
@@ -256,50 +280,68 @@ def assigned(executable: jax.stages.Compiled) -> tuple[int, ...]:
 
 def collectives_of(program: str, gpus: tuple[int, ...]) -> Collectives:
     """The communicators a compiled program's text makes on `gpus` (its device assignment, `assigned`), read
-    by the parser the FLOP count reads (`hlo_instructions`): each distinct group of its collectives and of its
-    all-to-alls, however XLA prints it, and each GPU's permute peers; a send or a receive of no pairs read
-    connects its GPU to every other."""
+    by the parser the FLOP count reads (`hlo_instructions`) and its collective vocabulary
+    (`dew.telemetry.trace.collective`): each distinct group of its collectives and of its all-to-alls,
+    however XLA prints it, and its permutes' directed pairs on one clique of all its devices; a group whose
+    positions lie past the assignment is taken as every device, and a send or a receive of no pairs read
+    as connecting every pair."""
     groups: set[tuple[int, ...]] = set()
     exchanges: set[tuple[int, ...]] = set()
-    peers: dict[int, set[int]] = {}
+    pairs: set[tuple[int, int]] = set()
     for instruction in hlo_instructions(program).values():
-        positions = instruction.groups
-        if instruction.op in COLLECTIVES:
-            taken = [tuple(gpus[position] for position in group) for group in positions] or [gpus]
-            groups.update(taken)
-            if instruction.op in EXCHANGES:
-                exchanges.update(taken)
-        elif instruction.op in PERMUTES:
-            pairs = [(gpus[source], gpus[target]) for source, target in positions]
-            for source, target in pairs or [(gpu, other) for gpu in gpus for other in gpus if other != gpu]:
-                peers.setdefault(source, set()).add(target)
-                peers.setdefault(target, set()).add(source)
-    return Collectives(frozenset(groups), frozenset(exchanges),
-                       {gpu: frozenset(connected) for gpu, connected in peers.items()})
+        kind = collective(instruction.op)
+        if kind is None:
+            continue
+        read = [group for group in instruction.groups if all(position < len(gpus) for position in group)]
+        if len(read) < len(instruction.groups):
+            read = []
+        if kind in PERMUTES:
+            pairs.update((gpus[source], gpus[target]) for source, target in read)
+            if not read:
+                pairs.update((source, target) for source in gpus for target in gpus if source != target)
+            continue
+        taken = [tuple(gpus[position] for position in group) for group in read] or [gpus]
+        groups.update(taken)
+        if kind in EXCHANGES:
+            exchanges.update(taken)
+    return Collectives(frozenset(groups), frozenset(exchanges), {gpus: frozenset(pairs)} if pairs else {})
 
 
 class Resident:
-    """The communicators this process has made: XLA keeps each it creates, so every program's are admitted
-    together with those of the programs before it (`admit`)."""
+    """The communicators this process has made: XLA keeps each it creates, so every program is admitted with
+    those of the programs before it (`admit`), one program at a time, as programs of different keys compile
+    at once (`dew.nn.kernels.options.OuterProgram`)."""
 
     def __init__(self) -> None:
         self.held = Collectives()
+        self.started = False
+        self.lock = threading.Lock()
 
-    def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int]) -> None:
+    def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
+              free: Callable[[int], int | None]) -> None:
         """Admit a compiled program's communicators (`made`), refusing it, naming the bytes, before it runs,
-        where they and the process's earlier ones, each counted once, with the runtime need more than the
-        room Dew left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it). Held against the
-        room Dew left, not what is free now, which the earlier communicators already took."""
-        held = self.held | made
-        needed = needs.needed(held, room, runtime=True)
-        if any(needed[gpu] > room[gpu] for gpu in room):
-            raise CommunicatorRoom(f"the compiled program's collectives and the process's earlier ones make "
-                                   f"{len(held.groups)} collective groups, {len(held.exchanges)} exchanges "
-                                   f"and {sum(map(len, held.peers.values()))} permute connections, which the "
-                                   "room left outside XLA's pool does not hold; lower "
-                                   "XLA_PYTHON_CLIENT_MEM_FRACTION by the shortfall over the GPU's bytes",
-                                   needed, room)
-        self.held = held
+        where they and the process's earlier ones, each counted once, with the runtime's need more than the
+        room Dew left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it), or where those it
+        adds (`Needs.needed`), with the runtime's for the process's first program, need more than its GPUs
+        have free there now (`free`, by ordinal; a GPU of no answer is held to the room alone): NCCL takes a
+        communicator's buffers as the program first runs, after this, so an earlier program admitted and
+        not yet run holds room that is still free."""
+        with self.lock:
+            held = self.held | made
+            needed = needs.needed(held, room, runtime=True)
+            added = needs.needed(made, room, runtime=not self.started, made=self.held)
+            now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
+            short = (any(needed[gpu] > room[gpu] for gpu in room)
+                     or any(added[gpu] > now[gpu] for gpu in now))
+            if short:
+                new = made.beyond(self.held)
+                raise CommunicatorRoom(f"the compiled program's collectives add {len(new.groups)} collective "
+                                       f"groups, {len(new.exchanges)} exchanges and "
+                                       f"{sum(map(len, new.permutes.values()))} permute connections to the "
+                                       "process's, which its GPUs have too little room for outside XLA's "
+                                       f"pool; lower {fraction_name()} by the shortfall over the GPU's bytes",
+                                       needed, {gpu: min(room[gpu], now.get(gpu, room[gpu])) for gpu in room})
+            self.held, self.started = held, True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -323,7 +365,8 @@ class Sizing:
 
 def gpu_memories() -> dict[int, tuple[int, int]]:
     """Each visible GPU's free and total bytes, by ordinal, as the driver reports them (`gpu_memory`)."""
-    return {index: answered for index in range(gpu_count()) if (answered := gpu_memory(index)) is not None}
+    return {index: answered for index in range(local_gpu_count() or 0)
+            if (answered := gpu_memory(index)) is not None}
 
 
 def sized_pool(*, measure: Callable[[], Needs | None] = needs_of,
@@ -335,7 +378,7 @@ def sized_pool(*, measure: Callable[[], Needs | None] = needs_of,
     default) or whose backend has opened (`opened`), a pool of no fixed share (`dew.devices.pool_bound`), or
     a host that makes no communicator (`needs_of`). A pool of processes is not measured: its communicators
     span hosts, whose network buffers one host's child does not make."""
-    cuda = cuda_plugin() is not None if cuda is None else cuda
+    cuda = cuda_plugin() if cuda is None else cuda
     if (backend_open() if opened is None else opened) or (bound := pool_bound(cuda=cuda)) is None:
         return None
     needs = measure()
@@ -346,7 +389,7 @@ def sized_pool(*, measure: Callable[[], Needs | None] = needs_of,
     # compiles; each compiled program's own are held to the room left (`admit`).
     held = everything(memory)
     share = pool_share(needs, memory, bound, held)
-    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(share)
+    os.environ[fraction_name()] = str(share)
     sizing = Sizing(needs, bound, share, needs.needed(held, memory, runtime=True),
                     {gpu: free - int(share * total) for gpu, (free, total) in memory.items()})
     _log.info("XLA's pool takes %s of each GPU (the run's bound %s), leaving each GPU %s bytes for NCCL's "
@@ -359,8 +402,8 @@ _RESIDENT = Resident()
 
 
 def hold(sizing: Sizing | None) -> None:
-    """Have this process admit every program it compiles against `sizing`'s room (`admit`); a process holds
-    one sizing, the one its preparation made, and None holds nothing."""
+    """Have this process admit every program it compiles or loads (`admit`), its pool sized as `sizing`
+    says; a process holds one sizing, the one its preparation made, and None holds nothing."""
     global _HELD
     _HELD = sizing
 
@@ -370,27 +413,28 @@ def held() -> Sizing | None:
     return _HELD
 
 
-def admit(executable: jax.stages.Compiled) -> None:
-    """Admit a compiled program's communicators against the room the process's sizing left (`Resident`),
-    refusing one that would not fit before it runs; a process that holds no sizing admits every program."""
+def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = gpu_free_bytes) -> None:
+    """Admit a compiled or loaded program's communicators against the room the process's sizing left them
+    and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit before it
+    runs; a process that holds no sizing admits every program. Every program Dew compiles passes here
+    (`dew.nn.kernels.templates.report`), and every executable it loads compiled ahead
+    (`dew.training.ahead`)."""
     if _HELD is not None:
         _RESIDENT.admit(collectives_of(executable.as_text() or "", assigned(executable)), _HELD.needs,
-                        _HELD.room)
+                        _HELD.room, free)
 
 
 def main() -> None:
     """The child's measurement: each GPU's free bytes before the runtime starts; then, for each group size
-    that divides this host's GPUs (the first GPUs of that many), the bytes a GPU gave, less its pool's
+    that divides this host's GPUs (the first GPUs of that many), the bytes each GPU gave, less its pool's
     growth, as a collective's communicator is made over them (an all-gather's), as an all-to-all connects
-    every peer beside it, and as a permute's communicator connects one peer and then every peer, the most
-    any of them gave; and the rest, the runtime's beside its pool."""
-    from dew.devices import gpu_free_bytes
-
-    before = {index: gpu_free_bytes(index) or 0 for index in range(gpu_count())}
-
+    every peer beside it, and as a permute's communicator sends from the first to the second (its base on
+    every member, a send and a receive) and then back (one more send and receive), each the most a member
+    gave; and the rest, after a matrix product on each GPU, the runtime's beside its pool."""
     import jax.numpy as jnp
     import numpy as np
 
+    before = {index: gpu_free_bytes(index) or 0 for index in range(local_gpu_count() or 0)}
     devices = jax.local_devices()
 
     def held_now() -> dict[int, tuple[int, int]]:
@@ -400,9 +444,8 @@ def main() -> None:
 
     spent = dict.fromkeys(before, 0)
 
-    def taken(group: list, program: Callable) -> int:
-        """The most bytes a GPU of `group` gave as `program` first ran over it, each GPU's kept in
-        `spent`."""
+    def taken(group: list, program: Callable) -> dict[int, int]:
+        """The bytes each GPU of `group` gave as `program` first ran over it, kept in `spent` as well."""
         mesh = Mesh(np.array(group), ("group",))
         rows = jax.device_put(jnp.ones((len(group) * len(group), 256), jnp.float32),
                               NamedSharding(mesh, PartitionSpec("group")))
@@ -415,22 +458,29 @@ def main() -> None:
                 for gpu in (device.local_hardware_id for device in group)}
         for gpu, given in gave.items():
             spent[gpu] += given
-        return max(gave.values())
+        return gave
 
-    def every_peer(part, size: int):
-        for shift in range(1, size):
-            ring = [(index, (index + shift) % size) for index in range(size)]
-            part = jax.lax.ppermute(part, "group", ring)
-        return part
+    def gathered(part):
+        return jax.lax.all_gather(part, "group", tiled=True)[:part.shape[0]]
+
+    def exchanged_rows(part):
+        return jax.lax.all_to_all(part, "group", 0, 0, tiled=True)
 
     collective, exchanged, permuted = {}, {}, {}
     for size in (size for size in range(2, len(devices) + 1) if len(devices) % size == 0):
         group = devices[:size]
-        collective[str(size)] = taken(group, lambda part: jax.lax.all_gather(part, "group", tiled=True)
-                                      [:part.shape[0]])
-        exchanged[str(size)] = taken(group, lambda part: jax.lax.all_to_all(part, "group", 0, 0, tiled=True))
-        one = taken(group, lambda part: jax.lax.ppermute(part, "group", [(0, 1), (1, 0)]))
-        permuted[str(size)] = [one, one + taken(group, lambda part, size=size: every_peer(part, size))]
+        first, second = group[0].local_hardware_id, group[1].local_hardware_id
+        collective[str(size)] = max(taken(group, gathered).values())
+        exchanged[str(size)] = max(taken(group, exchanged_rows).values())
+        forth = taken(group, lambda part: jax.lax.ppermute(part, "group", [(0, 1)]))
+        back = taken(group, lambda part: jax.lax.ppermute(part, "group", [(1, 0)]))
+        send, receive = back[second], back[first]
+        base = max(forth[first] - send, forth[second] - receive,
+                   *(given for gpu, given in forth.items() if gpu not in (first, second)))
+        permuted[str(size)] = [base, send, receive]
+    for device in devices:
+        square = jax.device_put(jnp.ones((512, 512), jnp.float32), device)
+        jax.block_until_ready(square @ square)
     after = held_now()
     # The runtime's share on each GPU: what went that neither the pool's growth nor a communicator took.
     runtime = {gpu: before[gpu] - after[gpu][0] - after[gpu][1] - spent[gpu] for gpu in after}
