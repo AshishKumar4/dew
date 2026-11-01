@@ -470,12 +470,11 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
     cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
     graph = jax.make_jaxpr(lambda variables, cache: scanned.apply(
         {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(banked, cache)
-    scans = [equation for equation in equations(graph) if equation.primitive.name == "scan"]
-    handed = [{tuple(operand.aval.shape) for operand in scan.invars[:scan.params["num_consts"]]}
-              for scan in scans]
-    sliced = [{tuple(operand.aval.shape)
-               for operand in scan.invars[scan.params["num_consts"] + scan.params["num_carry"]:]}
-              for scan in scans]
+    handed, sliced = [], []
+    for scan in (equation for equation in equations(graph) if equation.primitive.name == "scan"):
+        consts, _, xs = (list(part) for part in scan.params["ft_in"].update(scan.invars).unpack())
+        handed.append({tuple(operand.aval.shape) for operand in consts})
+        sliced.append({tuple(operand.aval.shape) for operand in xs})
     assert any(stacks <= whole for whole in handed) and not any(stacks & xs for xs in sliced)
 
     def draw(seed):
