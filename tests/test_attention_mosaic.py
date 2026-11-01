@@ -67,7 +67,7 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
-slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
+slot's queries (`attention_mosaic_program.split_queries`), as the derivation takes it."""
 RAISED_FORMS = ("fused-shared-dq", "fused-producer-dq")
 """The backward's forms whose consumers hold more registers than a warpgroup's even share, legal only where
 the GPU's compile honors their raise (`resources.RAISES_HONORED`)."""
@@ -1036,6 +1036,62 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
     programs each take a key block, the last ones wholly past the queries' diagonal, and walk no query tile,
     the producer loading none for them."""
     _check_backward("causal", (1, 64, 2, 1), form="default", interpret=True, keys=256)
+
+
+@INTERPRETS
+def test_a_shared_key_backward_over_a_partial_key_tile_reads_no_padded_key():
+    """The fast backward's one launch whose two consumers share a key tile (`fused-shared-keys`, each 32 of
+    its 64 keys) over 96 keys under the interpreter: the last tile's second piece is all padding. Every real
+    logit is near -128 (each query 32 and each key -64 along one feature, the scale 1/16 at width 256), so a
+    padded key's logit of 0 would weigh exp(128): the gradients on par with the reference (check 1)."""
+    shape, keys, width = (1, 128, 2, 1), 96, 256
+    spans = template.spans(shape[1], keys, shape[0])
+    accurate, config = _backward_form("fused-shared-keys")
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        query = rng.standard_normal((shape[0], shape[1], shape[2], width)) * 1e-2
+        key = rng.standard_normal((shape[0], keys, shape[3], width)) * 1e-2
+        query[..., 0], key[..., 0] = 32.0, -64.0
+        value = rng.standard_normal((shape[0], keys, shape[3], width))
+        dout = rng.standard_normal((shape[0], shape[1], shape[2], width))
+        return tuple(jnp.asarray(array, jnp.bfloat16) for array in (query, key, value, dout))
+
+    def ours(query, key, value, dout):
+        with _device(interpret=True):
+            residuals = attention_mosaic.forward(query, key, value, spans, None, interpret=True,
+                                                 residuals=template.Kept.SPLIT)[1:]
+            with _pinned(backward=config):
+                grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                                  accurate=accurate, interpret=True)
+        return grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None), query, key, value)
+        return pull(dout)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "a shared key tile past the keys", seeds=SEEDS,
+                    terms=_gradient_terms(spans))
+
+
+@INTERPRETS
+def test_a_backward_whose_dkv_launch_holds_more_keys_than_its_dq_launch_writes_every_key_interpreted():
+    """The backward in two launches, the dK/dV launch's two consumers each their own key block beside one
+    dQ consumer (`dkv_consumers=2` on a producer's layout), over 192 keys, under the interpreter: the dK/dV
+    launch's last program holds a partial key block, and every key's gradients are written, on par with the
+    reference (check 1)."""
+    config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2)
+    _check_backward("full", (1, 192, 2, 1), form=None, config=config, interpret=True, width=64)
+
+
+@INTERPRETS
+def test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_tile_interpreted():
+    """The backward's dK/dV launch whose two consumers each hold their own causal key block and share a staged
+    logits tile (`staged_logits`), over 128 causal queries and keys, under the interpreter: each consumer's
+    query walk is its own block's, and the gradients are on par with the reference (check 1)."""
+    config = attention_mosaic.BackwardTiles(64, 64, 2, 1, dkv_family="wgmma", dkv_consumers=2,
+                                            staged_logits=True)
+    _check_backward("causal", (1, 128, 2, 1), form=None, config=config, interpret=True, width=64)
 
 
 HOPPER_HOOK_SITES = ("alibi", "resumed", "softcap-sinks-alibi")

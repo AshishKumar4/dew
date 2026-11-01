@@ -380,6 +380,15 @@ derive it from its arguments' facts.
 | `range(t)` | `Pair[f64, f64]` (bounds, where cheap) | intersect | a stable correction (exp arguments at most 0); a condition bound |
 | `rounding(t)` | `String` (`exact`, `reorders`, `bounded`) | the worse | the compile-time admission of a set |
 
+What is built of the table: `shape`, and `range` as a bound on each value's magnitude. The region states the
+bound when it traces a program (`terms.Region.bounds`). A constant's bound is its largest element, and a bounded
+function's (`tanh`, `sin`, a comparison) is its own. Each equation in the language propagates its operands'
+bounds by interval arithmetic on magnitudes, and an operand's bound, or an equation's outside the language, is
+infinite. A value whose bound times the region's largest extent is at most the square root of its narrowest
+dtype's largest value is `tame` (`rules.tame`). Every reordering rule that builds a new intermediate from its
+operands (`linear`'s, `carried`'s) fires only where those operands are tame, so no form is infinite where the
+program is finite (bible §6). With no range fact, the rule does not fire.
+
 Two notes on the table:
 - "equal or fail" means members of one e-class that disagree raise, naming the rule that united them.
 - Every fact is invariant under equality, as congruence requires. Error is not: it is measured per candidate
@@ -554,8 +563,9 @@ class Rewrite:
 
 ### 6.8 The report
 
-`AlgebraReport` joins the one kernel report (`dew.nn.kernels.templates.report`, through `report.compiled`), so it
-is recorded with each compiled step (`StepCompiled`) and each `OuterProgram` compile. It holds:
+`AlgebraReport` joins the one kernel report (`dew.nn.kernels.templates.report.rewrites`), beside the kernels'
+misses, as each program traces; a relowering's rewrites join it only where its replacement compiles. A compiled
+step records its search's rewrites with its kernels (`StepCompiled.plan`'s `kernels`). It holds:
 - the regions rewritten;
 - the price before and after;
 - the rule sets that fired, with counts;
@@ -642,8 +652,11 @@ def derive(declaration: Declaration, numerics, cost: CostModel) -> Derived: ... 
 
 ### 6.10 Marked regions and custom derivatives
 
-These live in `dew.nn.derivatives`, below `dew.algebra`, which reads them; `dew.nn.surrogate` is row 3271's
-declaration, exported from there.
+These live in `dew.nn.derivatives`, below `dew.algebra`; `dew.nn.surrogate` is row 3271's declaration, exported
+from there. What exists: the four kinds, `marked_call_p` with its transform rules and their prototype test, and
+`surrogate`. Not yet: the pass reading a marked call's kind, the precision transforms and the custom-derivative
+sites marked, and the slop check; the bullets below state that design, which the pass reads the name scope in
+place of until then.
 
 ```python
 class Protected: ...                  # error-free transforms and numerics bodies (§1.2, §1.3)

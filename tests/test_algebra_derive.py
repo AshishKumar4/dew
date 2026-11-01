@@ -146,7 +146,7 @@ def test_two_walks_merged_compute_the_declared_function(name):
         values = operands(q, k, v)
         first = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2)])
         second = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2, tiles)])
-        return forms.finish(forms.merge(first, second), values)
+        return forms.finish(forms.merge(first, second, values), values)
 
     assert_as_exact(jax.jit(split), jax.jit(whole(DECLARED[name][0])), draw, f"{name} merged", seeds=16)
 
@@ -168,6 +168,83 @@ def test_sums_no_maximum_scales_walk_as_plain_sums():
 
     assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(unshifted)), small, "unshifted walked",
                     seeds=16)
+
+
+def test_a_narrow_declaration_walks_as_its_whole_function():
+    """Causal attention in bfloat16, its maxima narrow and its sums widened to float32 as JAX sums a narrow
+    value: the derived walk on par with the whole-operand function in bfloat16 (check 1)."""
+    forms = derive.derive(declared(causal), accurate=False, saturation=SATURATION)
+
+    def narrow(seed):
+        return tuple(operand.astype(jnp.bfloat16) for operand in draw(seed))
+
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(causal)), narrow, "bfloat16 causal walked",
+                    seeds=16)
+
+
+def peaks(q, k, v, rows, keys):
+    """Each query's largest logit over the keys it sees, -inf for a query that sees none."""
+    del v
+    seen = (keys[None, :] <= rows[:, None]) & (rows[:, None] > 0)
+    return jnp.max(jnp.where(seen, q @ k.T, -jnp.inf), axis=-1)
+
+
+def latest(q, k, v, rows, keys):
+    """Each query's latest key it sees, by place (int32), -1 for a query that sees none."""
+    del q, k, v
+    seen = (keys[None, :] <= rows[:, None]) & (rows[:, None] > 0)
+    return jnp.max(jnp.where(seen, keys[None, :], -1), axis=-1)
+
+
+@pytest.mark.parametrize("function", [peaks, latest])
+def test_a_walked_maximum_is_its_monoids(function):
+    """A walked maximum's value over a query that sees no key (-inf for a float, its fill for an integer)
+    and over the rest, walked in key tiles: the whole-operand function's, exactly (a maximum rounds
+    nothing)."""
+    forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
+    operands_ = draw(0)
+    np.testing.assert_array_equal(walked_whole(forms)(*operands_), whole(function)(*operands_))
+
+
+def floored(q, k, v, rows, keys):
+    """Softmax totals shifted by each query's largest logit or its floor, whichever is larger (`floor`, an
+    operand of the queries)."""
+    del v, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    floor = -jnp.abs(rows.astype(jnp.float32))
+    return jnp.sum(jnp.exp(s - jnp.maximum(jnp.max(s, axis=-1), floor)[:, None]), axis=-1)
+
+
+def test_a_merge_of_a_shift_that_reads_an_operand_computes_the_declared_function():
+    """A walk whose shift reads an operand of the queries beside the walked maximum, walked in two halves
+    and merged: on par with the whole-operand function (check 1)."""
+    forms = derive.derive(declared(floored), accurate=False, saturation=SATURATION)
+    tiles = KEYS // TILE
+
+    def split(q, k, v):
+        values = operands(q, k, v)
+        first = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2)])
+        second = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2, tiles)])
+        return forms.finish(forms.merge(first, second, values), values)
+
+    assert_as_exact(jax.jit(split), jax.jit(whole(floored)), draw, "floored merged", seeds=16)
+
+
+def with_a_count(q, k, v, rows, keys):
+    """Each query's logits' sum and a constant beside it, a literal output."""
+    del v, rows, keys
+    return jnp.sum(q @ k.T, axis=-1), np.float32(7.0)
+
+
+def test_a_literal_output_is_finished_as_the_declaration_returns_it():
+    """A declaration that returns a constant beside a walked sum: the walk finishes both, the constant as the
+    function returns it."""
+    forms = derive.derive(declared(with_a_count), accurate=False, saturation=SATURATION)
+    operands_ = draw(0)
+    _, count = walked_whole(forms)(*operands_)
+    assert float(count) == 7.0
+    assert_as_exact(jax.jit(lambda *xs: walked_whole(forms)(*xs)[0]),
+                    jax.jit(lambda *xs: whole(with_a_count)(*xs)[0]), draw, "literal beside a sum", seeds=16)
 
 
 def squared_shift(q, k, v, rows, keys):

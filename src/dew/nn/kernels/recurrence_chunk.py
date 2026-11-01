@@ -561,7 +561,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
-                                 work, max_segments=max_segments)
+                                 work, dtype, max_segments=max_segments)
     else:
         # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
         # over to the portable math there, reported as the call's route.
@@ -1227,7 +1227,7 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 
 
 def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, state, starts, firsts,
-                chunk_size: int, work, *, max_segments: int | None = None):
+                chunk_size: int, work, dtype, *, max_segments: int | None = None):
     """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
     `C` the queries, `dt` the write gate and `A` the rate) on the kernel the scan's selector gives each
     product (`SCAN`, `scan_kernel`): the recurrence template; the port of mamba_ssm's kernels, which adds
@@ -1238,7 +1238,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     scan take head and state widths padded with zero columns to powers of two (`_scan_widths`), which change
     no real output or gradient, the outputs cut back: Nemotron-H 4B's 80-wide heads took the portable math,
     6.89 ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
-    unrounded, and the memory `[B, Hv, Dk, Dv]`."""
+    rounded to no narrower than `dtype`, the caller's (unrounded where it asks it wide, Mamba-2's mixer for
+    the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
 
@@ -1249,17 +1250,19 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
         if kernel == 'mosaic_gpu':
             # Under the fast forms the skip in the template's own output and walk (`mainloop._output`,
-            # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where no epilogue
-            # reads it after (`hooks.output`'s norm): added after, its fp32 output's skip and cast took
-            # 0.045 ms past an H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
-            # window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values ungated
-            # (`mainloop._Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast
-            # forms), the skip is added after.
+            # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where the caller
+            # asks it so and no epilogue reads it after (`hooks.output`'s norm), else wide: added after, its
+            # fp32 output's skip and cast took 0.045 ms past an H100's launches, and its gradient's 0.094
+            # (ssd-rounded-h100-fdab2424c, window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit
+            # values ungated (`mainloop._Call.gated_keys`: the accurate forms, or an fp32 call's two parts
+            # under the fast forms), the skip is added after.
             fast = fast_rounding()
-            fused = fast and hooks.skip and jnp.dtype(jnp.result_type(query, key, value)).itemsize == 2
+            operand = jnp.dtype(jnp.result_type(query, key, value))
+            fused = fast and hooks.skip and operand.itemsize == 2
+            narrow = fused and hooks.output is None and jnp.dtype(dtype) == operand
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        skip=skip if fused else None, max_segments=max_segments, scale=1.0,
-                                       delta=False, wide=not fused or hooks.output is not None, rounded=fast)
+                                       delta=False, wide=not narrow, rounded=fast)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, value, {'skip': skip}, work)), final
         operand = jnp.result_type(query, key, value)

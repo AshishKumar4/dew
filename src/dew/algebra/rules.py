@@ -67,6 +67,15 @@ states it). A scale of any other value moved so reorders rounding, which the gat
 rule's adjoint (1.575 times the reference's error, past 1.5): it waits for error-aware extraction (§1.5)."""
 
 
+@function
+def tame(term: Term) -> Unit: ...
+"""Holds where a value's magnitude, bounded by the region's range facts (`terms.Region.bounds`, §6.3), times
+the region's largest extent is at most the root of its narrowest dtype's largest value: a sum of two tame
+values, a sum of one along an axis and a product of two contracted along one all stay finite. A reordering
+that makes an intermediate of its operands fires only where they are tame, so no form is infinite where the
+program is finite (bible §6); with no range fact, it does not fire (`program.stated` states it)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Rules:
     """A named set of rules: its rounding class (`exact`: each rewrite rounds as the form it replaces;
@@ -137,7 +146,8 @@ def _linear() -> Ruleset:
     product of the summed others, and a power of two's scale of the product on either operand instead), each
     over arithmetic in its operands' dtype (`plain`), and a value a broadcast lays along every axis but a
     sum's taken out of the sum where the other factor has the product's shape (the broadcast's extent along
-    the axis the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
+    the axis the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding,
+    and each fires only where the operands its new intermediate reads are tame (`tame`)."""
     x, y, a = vars_("x y a", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
@@ -146,25 +156,26 @@ def _linear() -> Ruleset:
         # A contraction scaled by a power of two: the scale on either operand, the product linear in each.
         rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
             x.binary("mul", a, multiplied).dot(y, params), eq(shape(a)).to(scalar), exact_scale(a),
-            plain(params), plain(multiplied)),
+            plain(params), plain(multiplied), tame(x), tame(a)),
         rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
             x.dot(y.binary("mul", a, multiplied), params), eq(shape(a)).to(scalar), exact_scale(a),
-            plain(params), plain(multiplied)),
+            plain(params), plain(multiplied), tame(y), tame(a)),
         rewrite(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)).to(
-            x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y)), plain(added)),
+            x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y)), plain(added),
+            tame(x), tame(y)),
         rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
             a.binary("mul", x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y)),
-            plain(multiplied), plain(added)),
+            plain(multiplied), plain(added), tame(x), tame(y)),
         rewrite(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)).to(
             a.dot(x.binary("add", y, added), multiplied), eq(shape(x)).to(shape(y)), plain(multiplied),
-            plain(added)),
+            plain(added), tame(x), tame(y)),
         rewrite(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)).to(
             x.binary("add", y, added).dot(a, multiplied), eq(shape(x)).to(shape(y)), plain(multiplied),
-            plain(added)),
+            plain(added), tame(x), tame(y)),
         rewrite(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce(
             "sum", axes, summed)).to(
             a.binary("mul", x.reduce("sum", axes, summed), multiplied), along(laid, axis), plain(multiplied),
-            eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent),
+            eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent), tame(x),
             eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent)),
         name="linear")
 

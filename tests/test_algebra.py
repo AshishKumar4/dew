@@ -12,6 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
@@ -96,6 +97,48 @@ def test_a_complex_programs_literals_are_read_by_the_rules():
 
     assert_as_exact(jax.jit(algebra.rewritten(complex_sums)), jax.jit(complex_sums), draw, "complex sums",
                     seeds=16)
+
+
+LARGEST = float(np.finfo(np.float32).max)
+
+
+def filled(*given):
+    """Float32 operands, each a shape and its fill or its rows."""
+    return tuple(jnp.full(shape, value, jnp.float32) if np.ndim(value) == 0
+                 else jnp.broadcast_to(jnp.asarray(value, jnp.float32), shape) for shape, value in given)
+
+
+NEAR_LARGEST = {
+    "a product's operands summed first": (
+        lambda a, x, y: a * x + a * y,
+        lambda: filled(((8,), 0.25), ((8,), LARGEST * 0.6), ((8,), LARGEST * 0.6))),
+    "two sums' terms summed first": (
+        lambda a, x, y: a * (jnp.sum(x, -1) + jnp.sum(y, -1)),
+        lambda: filled(((2,), 1.0), ((2, 2), [LARGEST * 0.6, -LARGEST * 0.6]),
+                       ((2, 2), [LARGEST * 0.6, -LARGEST * 0.6]))),
+    "two contractions' operands summed first": (
+        lambda a, x, y: a @ x + a @ y,
+        lambda: filled(((4, 4), 0.01), ((4, 4), LARGEST * 0.6), ((4, 4), LARGEST * 0.6))),
+    "a scale moved onto an operand": (
+        lambda a, x, y: (x @ a) * 2.0,
+        lambda: filled(((4, 4), 1e-38), ((1, 4), LARGEST * 0.6), ((1,), 0.0))),
+    "a factor taken out of a sum": (
+        lambda a, x, y: jnp.sum(a[:, :1] * x, axis=-1),
+        lambda: filled(((2, 4), 0.25), ((2, 4), LARGEST * 0.6), ((1,), 0.0))),
+}
+"""Programs a reordering rule rewrites whose rewritten intermediate would pass float32's largest where the
+program's never does, each with its operands (a, x, y)."""
+
+
+@pytest.mark.parametrize("name", list(NEAR_LARGEST))
+def test_a_rewritten_program_is_finite_wherever_the_program_is(name):
+    """A sum of products, of sums, of contractions, a scale after a contraction and a factor in a sum, their
+    operands near float32's largest: each program is finite; rewritten, it stays finite (bible §6: no
+    infinity where the reference is finite), whether or not a rule fires."""
+    program, given = NEAR_LARGEST[name]
+    operands_ = given()
+    assert np.all(np.isfinite(program(*operands_)))
+    assert np.all(np.isfinite(jax.jit(algebra.rewritten(program))(*operands_)))
 
 
 def count(closed, primitive: str) -> int:

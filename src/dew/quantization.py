@@ -69,7 +69,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax.custom_derivatives import zero_from_primal
 
 from dew.batch import Coordinates
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
@@ -1097,10 +1096,13 @@ def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., 
     return convolved
 
 
-def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool):
+def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool, collect: bool = True):
     """`operand` quantized as Qwix's training forward quantizes it (0.1.8
     `conv_general_qt_fwd`'s `_quantize_operand`), or as it is where its
-    configuration quantizes nothing."""
+    configuration quantizes nothing; its calibration recorded where its
+    configuration collects it, unless `collect` is off (a derivative's
+    recomputation, which records nothing: collecting records the calibration
+    it is given)."""
     conv_general = _qwix("qwix._src.core.conv_general")
     qarray = _qwix("qwix._src.core.qarray")
     numerics = _qwix("qwix._src.core.numerics")
@@ -1114,8 +1116,8 @@ def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool):
     if getattr(config, f"{side}_disable_channelwise_axes"):
         how = dataclasses.replace(how, channelwise_axes=[])
     calibration = qarray.calibrate(operand, how)
-    if (collect := getattr(config, f"{side}_collect_quant_stat")) is not None:
-        calibration = collect(calibration)
+    if collect and (collected := getattr(config, f"{side}_collect_quant_stat")) is not None:
+        calibration = collected(calibration)
     scale, zero_point = qarray.compute_scale_zero_point(calibration, qtype)
     return qarray.quantize_with_scale_zero_point(operand, qtype, scale, zero_point)
 
@@ -1142,9 +1144,16 @@ def _grouped_convolution_gradient() -> type:
     def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                          feature_group_count, batch_group_count, out_sharding, primals, tangents, value):
         """The float convolution's tangent at the operands the forward dequantized (`_qt_forward`'s, read
-        from its value, not quantized again), which reverse mode transposes into Qwix's float backward;
-        the quantized operands move nothing."""
+        from its value, not quantized again), which reverse mode transposes into Qwix's float backward; and
+        the quantized operands' own tangent, their codes' none and their scales' the calibration's
+        derivative, so a derivative of this one goes through each operand's quantization, its scale
+        included, as Qwix's computes it."""
         _, quantized = value
+        numbers = jax.lax.conv_dimension_numbers(primals[0].shape, primals[1].shape, dimension_numbers)
+
+        def quantize(lhs, rhs):
+            return (_qt_operand(lhs, config, numbers, for_lhs=True, collect=False),
+                    _qt_operand(rhs, config, numbers, for_lhs=False, collect=False))
         operands = [qwix.dequantize(operand) if isinstance(operand, qwix.QArray) else operand
                     for operand in quantized]
 
@@ -1156,7 +1165,8 @@ def _grouped_convolution_gradient() -> type:
                 lhs.astype(dtype), rhs.astype(dtype), window_strides, padding, lhs_dilation, rhs_dilation,
                 dimension_numbers, feature_group_count, batch_group_count)
 
-        return jax.jvp(convolve, tuple(operands), tuple(tangents))[1], zero_from_primal(quantized)
+        return jax.jvp(convolve, tuple(operands), tuple(tangents))[1], jax.jvp(quantize, tuple(primals),
+                                                                              tuple(tangents))[1]
 
     # The integer convolution, differentiated as the float one at its dequantized operands: a surrogate,
     # whose value carries the quantized operands so the forward quantizes once (a static-scale

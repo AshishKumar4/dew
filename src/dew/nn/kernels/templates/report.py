@@ -266,19 +266,27 @@ def refusals() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[None]:
+def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[_Registry]:
     """Refusals visible while deriving and compiling a replacement, without changing the kept program's
-    registry or its file. A successful replacement commits them after this scope ends."""
+    registry or its file; the scope's registry, whose rewrites the replacement's trace recorded. A successful
+    replacement commits both after this scope ends (`_commit`)."""
     registry = _registry()
     with _GUARD:
         proposed = dict(registry.refused)
     for identity, kernel in entries:
         proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
-    token = _SCOPE.set(_Registry(refused=proposed))
+    scope = _Registry(refused=proposed)
+    token = _SCOPE.set(scope)
     try:
-        yield
+        yield scope
     finally:
         _SCOPE.reset(token)
+
+
+def _commit(proposal: _Registry) -> None:
+    """A successful replacement's rewrites (`_proposing`'s scope) recorded as the kept program's."""
+    with _GUARD:
+        _registry().rewritten.extend(proposal.rewritten)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
@@ -324,13 +332,14 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
         _recorded(found, stepped=False)
         return executable
     try:
-        with _proposing(refusals):
+        with _proposing(refusals) as proposal:
             relowered = relower()
             replacement, spilling = _compiled_reported(relowered, options)
     except Exhausted as failed:
         _log.warning("relowering after a spill found no config: %s; the first program runs", failed)
         _recorded(found, stepped=False)
         return executable
+    _commit(proposal)
     for refusal, kernel in refusals:
         _record(refusal, None, frozenset({kernel}))
     _recorded(found, stepped=True)
@@ -366,7 +375,8 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         progressed = False
         for refusal, (kernel, launch) in list(pending.items()):
             try:
-                with _proposing([*((held, name) for held, name, _, _ in kept), (refusal, kernel)]):
+                proposed = [*((held, name) for held, name, _, _ in kept), (refusal, kernel)]
+                with _proposing(proposed) as proposal:
                     replacement, spilling = _compiled_reported(relower(), options)
             except Exhausted:
                 del pending[refusal]
@@ -380,6 +390,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
                     del pending[refusal]
                     asking, progressed = int(left.group(1)), True
                 continue
+            _commit(proposal)
             for held, name, held_launch, removed in [*kept, (refusal, kernel, launch, asking)]:
                 _record(held, None, frozenset({name}))
                 _missed_block(name, held_launch, removed, stepped=True)

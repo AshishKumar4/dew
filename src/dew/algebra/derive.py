@@ -163,6 +163,19 @@ def lifts(given: Vec[i64], to: Vec[i64]) -> i64: ...
 
 
 @function(merge=lambda old, new: old)
+def retype(slot: i64) -> i64: ...
+"""The parameters of a conversion to a walked reduction's dtype, by its index (`slot`): a sum's correction,
+of its anchor's dtype, converted to its accumulator's (a narrow exponent summed in float32, as JAX sums a
+narrow value) before it scales the carried sum."""
+
+
+@function(merge=lambda old, new: old)
+def least() -> i64: ...
+"""The literal of the walked maxima's dtype's least finite value (`Region.literals`): a correction's shift
+`max(k_now, least)` keeps `exp(k_carried - k_now)` zero, not `exp(-inf + inf)`, where nothing is seen yet."""
+
+
+@function(merge=lambda old, new: old)
 def slot(term: Term) -> i64: ...
 """A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
 
@@ -306,8 +319,8 @@ def _decoupled():
     reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first."""
     x, y, z, k, t = vars_("x y z k t", Term)
     name = var("name", String)
-    p, e, s, side, a, b, lift, added, multiplied, largest, i = vars_(
-        "p e s side a b lift added multiplied largest i", i64)
+    p, e, s, side, a, b, lift, added, multiplied, largest, i, floor, typed = vars_(
+        "p e s side a b lift added multiplied largest i floor typed", i64)
     axes = var("axes", Vec[i64])
     given, to = vars_("given to", Vec[i64])
     stock = rules.stock
@@ -351,14 +364,17 @@ def _decoupled():
     derived.append(rewrite(t.held(side)).to(Term.state(i, side), peaked(t), slotted))
 
     # A sum along the walked axis of values that scale with an anchor `k`: its carried value rescaled by
-    # exp(k carried - k now), lifted to its shape, beside the tile's sum at the anchor now.
+    # exp(k carried - k now), lifted to its shape, beside the tile's sum at the anchor now; the anchor now
+    # at least the least finite value, so a state that has seen nothing (both -inf) rescales by 0.
     def rescaled(carried_side, now):
-        correction = k.held(carried_side).binary(String("sub"), now, s).unary(name, e)
+        shifted = now.binary(String("max"), Term.literal(floor), largest)
+        correction = k.held(carried_side).binary(String("sub"), shifted, s).unary(name, e).convert(typed)
         lifted = correction.shaped(String("broadcast_in_dim"), lift)
         return Term.state(i, carried_side).binary(String("mul"), lifted, multiplied)
 
     lifted = (eq(given).to(shape(k)), eq(to).to(shape(t)), eq(lift).to(lifts(given, to)),
-              eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), slotted)
+              eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
+              eq(floor).to(least()), eq(typed).to(retype(i)), slotted)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
@@ -468,18 +484,20 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         leaves = [*made.consts, *(tiles[name] for name in names)]
         return tuple(evaluated(made.region, form, leaves, carried(made, state)) for form in made.steps)
 
-    def merge(a, b):
-        if not cache:
-            raise Refused("a merge before the walk's state was formed (`init`)")
-        made = next(reversed(cache.values()))
-        return tuple(evaluated(made.region, form, list(made.consts), carried(made, a, b))
-                     for form in made.merges)
+    def merge(a, b, operands):
+        # The forms the walks took; a merge reads no walked operand (`_derived`), its unwalked ones whole.
+        made = next(reversed(cache.values())) if cache else forms(shaped(operands))
+        leaves = [*made.consts, *(None if name in walked_axes else operands[name] for name in names)]
+        return tuple(evaluated(made.region, form, leaves, carried(made, a, b)) for form in made.merges)
 
     def finish(state, operands):
         made = forms(shaped(operands))
         leaves = [*made.consts, *(operands[name] for name in names)]
-        outputs = [None if form is None else evaluated(made.region, form, leaves, carried(made, state))
-                   for form in made.finishes]
+        # A literal output is its literal; one along the walked axis, `mapped`'s.
+        outputs = [jnp.asarray(literal) if term is None else
+                   None if form is None else evaluated(made.region, form, leaves, carried(made, state))
+                   for term, literal, form in zip(made.region.outputs, made.region.literal_outputs,
+                                                  made.finishes, strict=True)]
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def mapped(tiles):
@@ -514,12 +532,14 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({str(term): term for term in found}.values())
-    known = {str(term): extent for term, extent in region.shapes}
     for index, reduction in enumerate(reductions):
         graph.register(set_(slot(reduction)).to(i64(index)))
+        region.params.append((jax.lax.convert_element_type_p, {
+            "new_dtype": region.dtypes[str(reduction)], "weak_type": False, "sharding": None}))
+        graph.register(set_(retype(i64(index))).to(i64(len(region.params) - 1)))
         for side in (0, 1):
             graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
-                Vec[i64](*(i64(size) for size in known[str(reduction)]))))
+                Vec[i64](*(i64(size) for size in region.shape(reduction)))))
     _lift(graph, region, reductions)
     outputs = list(region.outputs)
     along = [term is not None and _walked(graph, term) for term in outputs]
@@ -556,6 +576,9 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     for form in finishes:
         if form is not None and _reads_leaves(form) & walked_leaves:
             raise Refused("an output reads a walked operand outside every walked reduction")
+    for form in merges:
+        if _reads_leaves(form) & walked_leaves:
+            raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
                   walked_leaves, tuple(closed.consts), report)
 
@@ -576,6 +599,7 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
     the derivation's own), and each input's walked axis."""
     program.stated(graph, region)
     elementwise = terms.BINARY | terms.COMPARISONS | terms.UNARY | {"convert_element_type"}
+    _least(graph, region, closed)
     for index, (primitive, params) in enumerate(region.params):
         name = primitive.name
         if name in elementwise:
@@ -631,6 +655,22 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
             graph.register(zero(literal))
 
 
+def _least(graph: EGraph, region: terms.Region, closed) -> None:
+    """The walked maxima's least finite value, a literal of their dtype (`least`), refused where the maxima
+    are of more than one dtype: no one shift is each one's."""
+    peaks = {jnp.dtype(equation.outvars[0].aval.dtype) for equation in closed.jaxpr.eqns
+             if equation.primitive.name == "reduce_max"}
+    if len(peaks) > 1:
+        raise Refused(f"maxima of more than one dtype ({sorted(map(str, peaks))}): no one shift corrects "
+                      "them")
+    if peaks and jnp.issubdtype(dtype := peaks.pop(), jnp.floating):
+        region.literals.append(np.asarray(jnp.finfo(dtype).min, dtype))
+        literal = Term.literal(i64(len(region.literals) - 1))
+        region.shaped(literal, ())
+        graph.register(set_(least()).to(i64(len(region.literals) - 1)),
+                       set_(rules.shape(literal)).to(Vec[i64]()))
+
+
 def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[int, int]]:
     """A squeeze's, an expand_dims' or a reshape's moves of its operand's axes, where each axis of extent
     other than one keeps its order: each such axis's place before and after."""
@@ -646,11 +686,10 @@ def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[in
 
 def _operand_and_result_shapes(region: terms.Region, index: int):
     """The shapes of the operand and the result of a single-operand term of parameters `index`."""
-    known = {str(term): extent for term, extent in region.shapes}
     for term, extent in region.shapes:
         args = get_callable_args(term, Term.shaped) or get_callable_args(term, Term.reduce)
         if args is not None and int(get_literal_value(args[-1])) == index:
-            return known.get(str(args[0])), extent
+            return region.extents.get(str(args[0])), extent
     return None, None
 
 
@@ -660,11 +699,10 @@ def _rank_before(region: terms.Region, index: int, reduced: set[int]) -> int:
 
 
 def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
-    known = {str(term): extent for term, extent in region.shapes}
     for term, _ in region.shapes:
         args = get_callable_args(term, Term.dot)
         if args is not None and int(get_literal_value(args[-1])) == index:
-            return len(known[str(args[0])]), len(known[str(args[1])])
+            return len(region.shape(args[0])), len(region.shape(args[1]))
     return 0, 0
 
 
@@ -687,12 +725,10 @@ def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
 def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
     """Each broadcast a rescaled sum needs, an anchor's shape to the sum's (`lifts`), its parameters added to
     the region's table: the anchor's axes its leading ones."""
-    known = {str(term): extent for term, extent in region.shapes}
-    anchors = {known[str(term)] for term, _ in region.shapes
-               if str(term) in known and _holds(graph, anchor(term))}
+    anchors = {extent for term, extent in region.shapes if _holds(graph, anchor(term))}
     lifted = set()
     for reduction in reductions:
-        to = known.get(str(reduction))
+        to = region.extents.get(str(reduction))
         if to is None:
             continue
         for given in anchors:
@@ -719,13 +755,12 @@ def _holds(graph: EGraph, fact) -> bool:
 
 
 def _identity(reduction: Term, dtype) -> float:
-    """A walked reduction's empty value: a sum's zero; a maximum's the dtype's least finite value, not -inf,
-    so an empty partial's correction `exp(k_carried - k_now)` is zero (or one, where nothing is seen yet),
-    never `exp(-inf + inf)`: the same for any finite data as the monoid's identity."""
+    """A walked reduction's empty value, its monoid's identity: a sum's zero; a maximum's -inf (its dtype's
+    least value where it has no infinity). A correction never reads it unshifted (`least`)."""
     args = get_callable_args(reduction, Term.reduce)
-    if args is not None and get_literal_value(args[1]) == "max":
-        return float(jnp.finfo(dtype).min)
-    return 0.0
+    if args is None or get_literal_value(args[1]) != "max":
+        return 0.0
+    return -math.inf if jnp.issubdtype(dtype, jnp.floating) else float(jnp.iinfo(dtype).min)
 
 
 def _reads_leaves(form: Term) -> set[int]:

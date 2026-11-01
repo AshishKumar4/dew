@@ -156,8 +156,8 @@ def serve() -> None:
 
 
 class Worker:
-    """`serve`'s torch process in the fla Python `python`, started again where it died: one request a line,
-    answered `done` (`ask`)."""
+    """`serve`'s torch process in the fla Python `python`: one request a line, answered `done` (`ask`); a
+    process that dies on a request fails the recording, its exit code and the request stated."""
 
     def __init__(self, python: str):
         self.python, self.process, self.started = python, None, None
@@ -172,23 +172,20 @@ class Worker:
         return self.started
 
     def ask(self, line: str) -> None:
-        """`line` answered, the process started once more where it died on it (its exit code printed): any
-        other line it answers is printed, the request still waited on."""
-        for attempt in range(2):
-            self.process.stdin.write(f"{line}\n")
-            self.process.stdin.flush()
-            for answer in iter(self.process.stdout.readline, ""):
-                if answer.strip() == "done":
-                    return
-                print(f"the torch process: {answer.rstrip()}", flush=True)
-            print(f"the torch process died on a request (exit {self.process.wait()}), attempt {attempt + 1}",
-                  flush=True)
-            self.start()
-        raise RuntimeError("the torch process answered no request twice")
+        """`line` answered: any other line the process answers is printed, the request still waited on."""
+        self.process.stdin.write(f"{line}\n")
+        self.process.stdin.flush()
+        for answer in iter(self.process.stdout.readline, ""):
+            if answer.strip() == "done":
+                return
+            print(f"the torch process: {answer.rstrip()}", flush=True)
+        raise RuntimeError(f"the torch process died on {line!r} (exit {self.process.wait()})")
 
     def close(self) -> None:
-        self.process.stdin.close()
-        self.process.wait()
+        """The process ended and reaped, whether or not its requests were answered."""
+        if self.process is not None:
+            self.process.stdin.close()
+            self.process.wait()
 
 
 def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
@@ -312,8 +309,10 @@ def main() -> None:
         print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
     else:
         worker = Worker(sys.argv[1])
-        write_seeded(worker, sys.argv[3:], Path(sys.argv[2]))
-        worker.close()
+        try:
+            write_seeded(worker, sys.argv[3:], Path(sys.argv[2]))
+        finally:
+            worker.close()
 
 
 if __name__ == "__main__":

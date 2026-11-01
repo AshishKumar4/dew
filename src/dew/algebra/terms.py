@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from egglog import Expr, StringLike, Vec, get_callable_args, get_literal_value, i64, i64Like, method
 from jax.core import ShapedArray
 from jax.extend import core as jcore
@@ -109,8 +111,10 @@ class Region:
     for a literal output, kept in `literal_outputs`), the parameters terms refer to by index (`params`: a
     primitive and its parameters), its literals as the program holds them, value and weak type
     (`literals`), each term's shape as its equation states it (`shapes`), the longest chain of the
-    language's equations (`depth`), and the index of each primitive a rule may write afresh at its defaults
-    (`stock`, `stocked`)."""
+    language's equations (`depth`), the index of each primitive a rule may write afresh at its defaults
+    (`stock`, `stocked`), each term's dtype, a bound on each term's magnitude its equations and constants
+    prove (`bounds`, by term text; infinite where none: an operand's, an equation's outside the language),
+    and the largest finite value of its narrowest floating dtype (`limit`)."""
 
     leaves: int
     opaque: list[Opaque]
@@ -122,6 +126,25 @@ class Region:
     depth: int
     equations: int
     stock: Mapping[str, int]
+    dtypes: Mapping[str, np.dtype]
+    bounds: Mapping[str, float]
+    limit: float
+    extents: dict[str, tuple[int, ...]] = dataclasses.field(init=False)
+
+    def __post_init__(self):
+        self.extents = {}
+        for term, extent in self.shapes:
+            self.extents.setdefault(str(term), extent)
+
+    def shape(self, term: Term) -> tuple[int, ...]:
+        """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
+        terms carry (`shapes`, `extents` by text)."""
+        return self.extents[str(term)]
+
+    def shaped(self, term: Term, extent: tuple[int, ...]) -> None:
+        """`term`, a term a derivation adds (a literal of its own), held at `extent`."""
+        self.shapes.append((term, extent))
+        self.extents.setdefault(str(term), extent)
 
     def roots(self) -> list[Term]:
         """The terms extraction chooses forms for: each output and each input of an equation outside the
@@ -157,10 +180,15 @@ def region(closed: jcore.Jaxpr) -> Region:
         return indexed[key]
 
     env: dict[jcore.Var, Term] = {}
+    dtypes: dict[str, np.dtype] = {}
+    bounds: dict[str, float] = {}
     leaves = 0
-    for var in [*jaxpr.constvars, *jaxpr.invars]:
+    held = [_magnitude(value) for value in closed.consts]
+    for var, bound in zip([*jaxpr.constvars, *jaxpr.invars], [*held, *([math.inf] * len(jaxpr.invars))],
+                          strict=True):
         env[var] = Term.leaf(leaves)
         shapes.append((env[var], _shape(var)))
+        _typed(dtypes, bounds, env[var], var, bound)
         leaves += 1
 
     def read(atom) -> Term:
@@ -168,8 +196,12 @@ def region(closed: jcore.Jaxpr) -> Region:
             literals.append(atom.val)
             term = Term.literal(len(literals) - 1)
             shapes.append((term, _shape(atom)))
+            _typed(dtypes, bounds, term, atom, _magnitude(atom.val))
             return term
         return env[atom]
+
+    def bound_of(atom) -> float:
+        return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else bounds[str(env[atom])]
 
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
@@ -184,6 +216,7 @@ def region(closed: jcore.Jaxpr) -> Region:
             out = equation.outvars[0]
             env[out] = read(source).shaped("broadcast_in_dim", param(equation.primitive, composed))
             shapes.append((env[out], _shape(out)))
+            _typed(dtypes, bounds, env[out], out, bounds[str(env[source])])
             laid[out] = (source, composed["broadcast_dimensions"])
             depths[out] = depths.get(source, 0) + 1
             continue
@@ -195,6 +228,8 @@ def region(closed: jcore.Jaxpr) -> Region:
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
+            _typed(dtypes, bounds, term, out,
+                   _bounded(equation, [bound_of(atom) for atom in equation.invars]))
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -202,6 +237,7 @@ def region(closed: jcore.Jaxpr) -> Region:
         for var in equation.outvars:
             env[var] = Term.leaf(leaves)
             shapes.append((env[var], _shape(var)))
+            _typed(dtypes, bounds, env[var], var, math.inf)
             outputs.append(leaves)
             leaves += 1
         opaque.append(Opaque(equation, [None if isinstance(atom, jcore.Literal) else env[atom]
@@ -211,8 +247,68 @@ def region(closed: jcore.Jaxpr) -> Region:
     outputs = [None if isinstance(atom, jcore.Literal) else env[atom] for atom in jaxpr.outvars]
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
+    floats = [jnp.finfo(dtype).max for dtype in dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
-                  max(depths.values(), default=0), len(jaxpr.eqns), stock)
+                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, bounds,
+                  float(min(floats, default=np.finfo(np.float32).max)))
+
+
+BOUNDED = {"tanh": 1.0, "logistic": 1.0, "sin": 1.0, "cos": 1.0, "erf": 1.0, "sign": 1.0}
+"""The language's functions whose magnitude is at most a constant whatever their operand's."""
+KEEPING_MAGNITUDE = frozenset({"neg", "abs", "convert_element_type", "reduce_max", "reduce_min", "floor",
+                               "ceil", "round"}) | SHAPES
+"""The language's equations whose output is no larger in magnitude than their operand's."""
+
+
+def _bounded(equation: jcore.JaxprEqn, given: list[float]) -> float:
+    """A bound on the magnitude of `equation`'s output from its operands' (`given`), by interval arithmetic
+    on magnitudes; infinite where its primitive proves none."""
+    name = equation.primitive.name
+    if name in COMPARISONS or name in ("and", "or", "xor", "not", "is_finite"):
+        return 1.0
+    if name in BOUNDED:
+        return BOUNDED[name]
+    if any(math.isinf(bound) for bound in given):
+        return math.inf
+    if name in ("add", "sub"):
+        return given[0] + given[1]
+    if name == "mul":
+        return given[0] * given[1]
+    if name in ("max", "min"):
+        return max(given)
+    if name == "select_n":
+        return max(given[1:])
+    if name in KEEPING_MAGNITUDE:
+        return given[0]
+    if name == "square":
+        return given[0] ** 2
+    if name == "integer_pow" and equation.params["y"] >= 0:
+        return given[0] ** equation.params["y"]
+    if name == "reduce_sum":
+        shape = _shape(equation.invars[0])
+        return given[0] * math.prod(shape[axis] for axis in equation.params["axes"])
+    if name == "dot_general":
+        (contracted, _), _ = equation.params["dimension_numbers"]
+        shape = _shape(equation.invars[0])
+        return given[0] * given[1] * math.prod(shape[axis] for axis in contracted)
+    return math.inf
+
+
+def _magnitude(value) -> float:
+    """The largest magnitude among a constant's elements, infinite for one of no number (a key's)."""
+    array = np.asarray(value)
+    if not (np.issubdtype(array.dtype, np.number) or array.dtype == bool) or array.size == 0:
+        return math.inf if array.size else 0.0
+    largest = float(np.max(np.abs(array.astype(np.float64))))
+    return largest if math.isfinite(largest) else math.inf
+
+
+def _typed(dtypes: dict, bounds: dict, term: Term, atom, bound: float) -> None:
+    """`term`'s dtype (`atom`'s) and its magnitude's bound, the tighter where its text names two values."""
+    key = str(term)
+    if isinstance(atom.aval, ShapedArray):
+        dtypes.setdefault(key, np.dtype(atom.aval.dtype))
+    bounds[key] = min(bounds.get(key, math.inf), bound)
 
 
 @functools.cache

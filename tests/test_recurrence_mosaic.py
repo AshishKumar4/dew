@@ -259,8 +259,29 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     return rule
 
 
-@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, INTERPRETED_FORWARD))
+SHARDED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('packed documents', 'bf16')}
+"""The interpreted forward's cases whose recorded sites declare 256 seeds on the CPU (`fla_sites`, sized by
+the gate's rule against fla's own spread): together 840 s a whole run, past a CI task's share, so their draws
+are sharded over map tasks (`check1_shards`); the others declare 128 and run whole."""
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=128)
+@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, SHARDED_FORWARD))
 def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at the cases of 256 recorded seeds
+    (`SHARDED_FORWARD`)."""
+    the_mosaic_forward_is_as_exact_as_its_reference(case, dtype)
+
+
+@pytest.mark.parametrize(('case', 'dtype'),
+                         interpreted(FORWARD_GRID, INTERPRETED_FORWARD - SHARDED_FORWARD))
+def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference(case, dtype):
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at the cases of 128 recorded seeds, a decay a key
+    dimension's."""
+    the_mosaic_forward_is_as_exact_as_its_reference(case, dtype)
+
+
+def the_mosaic_forward_is_as_exact_as_its_reference(case: str, dtype) -> None:
     """The mainloop's output and final memory on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time in float64): the gated delta rule with a decay a head or
     a key dimension (Kimi delta attention's), its queries scaled by `Dk^-1/2`. An fp32 call's reference
@@ -294,7 +315,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     the bundle declares it within a block of it (`mainloop_backward.planned`), with two chunks in flight
     unless two are past it or leave a multiprocessor fewer of the states launch's programs
     (`Mosaic.states_held`); at those tiles the forward, on the bundle interpreted, is on par from float64 with
-    its reference's (check 1, as `test_the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants,
+    its reference's (check 1, as `the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants,
     which the opt-in tuner times (`Mosaic.variants`), lead with those tiles, each legal there and on par too.
     An fp32 call it refuses: a launch's registers at its narrowest tiles pass a thread's (the fp32 solve's
     merges hold the inverse's three parts)."""
@@ -787,7 +808,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         # A delta rule's layer declares unit keys and sigmoid write gates (`recurrence.Hooks.inverse_bound`).
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
                                      floor=resource_floor(name), bound=None if name in RATED else 1.0,
-                                     **form(name, dtype))
+                                     **form(name, dtype), **skipped(name, dtype))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
             held = Unbudgeted().derived(bound, facts)
@@ -809,7 +830,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
             if training and not mainloop_backward.backward_holds(
                     *args, tiles=derived, family=family, target=facts, starts=starts,
-                    max_segments=8 if packed else None, floor=resource_floor(name), **unwide):
+                    max_segments=8 if packed else None, floor=resource_floor(name), **unwide,
+                    **skipped(name, dtype)):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
@@ -840,6 +862,13 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         for its skip."""
         return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
+    def skipped(name: str, dtype) -> dict:
+        """The skip a rated scan's 16-bit call fuses into the template's output and reverse walk under the
+        run's fast forms (`recurrence_chunk._rated_scan`), its value heads' `[HV]`, as its route hands it."""
+        if name not in RATED or jnp.dtype(dtype).itemsize != 2:
+            return {}
+        return {'skip': jax.ShapeDtypeStruct((RESOURCE_SHAPES[name][1],), jnp.float32)}
+
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, _ = RESOURCE_SHAPES[name]
 
@@ -853,7 +882,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or mainloop_backward.backward_holds(
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
-                floor=resource_floor(name), **unwide)
+                floor=resource_floor(name), **unwide, **skipped(name, dtype))
         if not held:
             # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`,
             # as at the derived tiles): the launches its model refuses held apart (`apart_failures`).
@@ -868,13 +897,15 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             formed = {key: value for key, value in form(name, dtype).items() if key != 'wide' or not training}
             run = functools.partial(mainloop_backward.gradients if training else mainloop.forward, **formed,
                                     floor=resource_floor(name))
+            skip = list(skipped(name, dtype).values())
 
             def fn(*operands):
                 *operands, documents = operands if packed else (*operands, None)
+                *operands, fused = (*operands, None) if not skip else operands
                 return run(*operands, tiles=tiles, starts=documents, max_segments=8 if packed else None,
-                           family=family)
+                           family=family, skip=fused)
 
-            return fn, (*given, *([starts] if packed else []))
+            return fn, (*given, *skip, *([starts] if packed else []))
 
         # A refused tile compiled for the model's evidence alone, which no call runs (`KernelCase.required`).
         return KernelCase(label, call, {launch.name: _model(launch, family) for launch in plans[label]},

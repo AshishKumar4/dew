@@ -69,6 +69,27 @@ def test_a_bodys_math_is_rewritten_in_place(kind):
     assert_as_exact(jax.jit(algebra.rewritten(fn)), jax.jit(fn), draw, f"two sums in a {kind}", seeds=16)
 
 
+@pytest.mark.parametrize("pass_n", ["positionally", "by keyword"])
+@pytest.mark.parametrize("statics", [{"static_argnames": "n"}, {"static_argnums": 3}], ids=["name", "number"])
+def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pass_n):
+    """A function whose loop count is static, rewritten and jitted with the same static arguments, named or
+    numbered, the count passed positionally or by keyword: it runs as the function does (check 1)."""
+    def repeated(x, y, a, n):
+        for _ in range(n):
+            x = two_sums(x, y, a)[:, None] * x
+        return two_sums(x, y, a)
+
+    rewritten = jax.jit(algebra.rewritten(repeated, **statics), **statics)
+    plain = jax.jit(repeated, **statics)
+
+    def called(fn):
+        return (lambda x, y, a: fn(x, y, a, 2)) if pass_n == "positionally" else (
+            lambda x, y, a: fn(x, y, a, n=2))
+
+    assert_as_exact(called(rewritten), called(plain), lambda seed: rows(seed, (8, 64), (8, 64), (8, 64)),
+                    f"a static count passed {pass_n}", seeds=16)
+
+
 def test_products_with_a_shared_operand_join_into_one():
     """Two products with one shared operand (`dot_general`), summed, become one product of the shared operand
     with the summed other: a contraction is bilinear, so the rewritten program reads the shared rows once."""

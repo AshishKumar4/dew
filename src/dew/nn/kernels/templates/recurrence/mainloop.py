@@ -33,9 +33,12 @@ The decay's prefix is compensated, a `(hi, lo)` pair in base 2 within each chunk
 
 A 16-bit call's numbers are fla's (`fla_gdn.chunk_gated_delta_rule`'s): the values the launches pass (the
 inverse, `w`, `u`, the memories and the corrected values) and the operands the algebra rounds are in its
-dtype, the memory fp32 across chunks. An fp32 call keeps them fp32; as the tensor cores take 16-bit operands
-alone (mma.sync's), an fp32 operand is three bf16 parts summing to it exactly (`product.formed`) and its
-product the six of the parts' whose orders sum under three, an fp32 product's accuracy.
+dtype, the memory fp32 across chunks. An fp32 call keeps them fp32, and its products take each operand as
+the run's forms ask (`_parts`): under the accurate forms as three bf16 parts summing to it exactly
+(`product.formed`), its product the six of the parts' whose orders sum under three, an fp32 product's
+accuracy; under the fast forms as itself, a TF32 operand, on a family whose products take transposed TF32
+operands (mma.sync's, `_fast_parts`: JAX's default precision for an fp32 product, and fla's, which its
+recording holds it to), else as `FAST_PARTS` bf16 parts.
 
 The fast backward's launches and the plan of a call's launches, forward and backward, are
 `mainloop_backward`'s, on this module's machinery. Decode is not on the mainloop: a one-token step takes
@@ -1789,10 +1792,11 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
     (`per_key_refusal`). A `rounded` call takes the run's fast forms' numbers: without the delta rule
     (Mamba2's SSD, whose 16-bit numbers are mamba_ssm's) it passes its values between launches in the
-    operands' dtype, and an fp32 call's products take its operands in `FAST_PARTS` bf16 parts (`_prepared`,
-    `_parts`). A `ranged` 16-bit delta rule, whose form proves no bound on its chunk inverse, solves it at
-    fp32's range (`_merged`). A `skip` `[HV]` adds `D v` to the output of a call whose write gate takes the
-    keys' side (`_Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it."""
+    operands' dtype, and an fp32 call's products take its operands as TF32 where its family's products take
+    them transposed (mma.sync's), else in `FAST_PARTS` bf16 parts (`_prepared`, `_parts`). A `ranged` 16-bit
+    delta rule, whose form proves no bound on its chunk inverse, solves it at fp32's range (`_merged`). A
+    `skip` `[HV]` adds `D v` to the output of a call whose write gate takes the keys' side
+    (`_Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, floor=floor, keeps=False,

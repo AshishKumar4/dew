@@ -248,25 +248,40 @@ def _block(config: Tiles | BackwardTiles) -> int:
     """The block a launch at `config` pads a call's queries and keys to: whole programs of query blocks and
     key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs, a shared
     dQ's dK/dV program a key block each of its consumers': padded to a block of the dQ launch's consumers,
-    its last program's last consumer read keys past the padded call, NaN interpreted)."""
+    its last program's last consumer read keys past the padded call, NaN interpreted), its keys whole
+    blocks of the dK/dV launch's programs too (`dkv_holders`: a layout and consumers of its own, padded
+    to the dQ launch's, its last keys had no program to write them)."""
     if isinstance(config, BackwardTiles):
         keys = (config.dkv.consumers if config.shared_dq else config.consumers) * config.block_k
+        keys = math.lcm(keys, dkv_holders(config) * config.block_k)
     else:
         keys = config.block_k
     return math.lcm(config.consumers * config.block_q, keys)
+
+
+def split_queries(family: mosaic.Family) -> bool:
+    """Whether the dK/dV program's consumers share one key block and split each slot's queries between them:
+    on a layout whose consumers feed their own rings (`Transport.feeds_itself`), each consumer's step its
+    share of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own
+    keys."""
+    return family.feeds_itself
+
+
+def holders(family: mosaic.Family, consumers: int) -> int:
+    """The key blocks a dK/dV program holds: one its consumers share (`split_queries`), else one each."""
+    return 1 if split_queries(family) else consumers
+
+
+def dkv_holders(config: BackwardTiles) -> int:
+    """The key blocks a program of the dK/dV launch at `config` holds (`holders`), its layout's own."""
+    dkv = config.dkv
+    return holders(bundles.named(dkv.family, jnp.bfloat16), dkv.consumers)
 
 
 def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int, int]:
     """A call's queries and keys as a launch at `config` pads them (`padded_call`, `_block`)."""
     block = _block(config)
     return whole(max(queries, 1), block), whole(max(keys, 1), block)
-
-
-@functools.cache
-def _parts(accurate: bool, dtype) -> int:
-    """The parts a backward tile's score cotangents take to their products in the form `accurate` names
-    (`algebra.cotangent_parts`: one in the fast form's bf16, three in the accurate form's)."""
-    return len(algebra.cotangent_parts(jnp.zeros((1, 1), jnp.float32), dtype, accurate=accurate))
 
 
 DROPPING = Refusal('dropout_places',
@@ -833,14 +848,16 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
             q_pos=None, columns=None, *, keys_first: bool = False, read: tuple[bool, bool] = (False, False),
-            draw: Draw | None = None) -> algebra.Coords:
+            draw: Draw | None = None, tile_keys: int | None = None) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
     intervals and, with documents, both blocks' ids, and a dropping call's `draw`. A tile whose rows are its
     keys (`keys_first`, `shape` `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in
     a row's: each one's places a vector broadcast where the step surely reads them (`read`, its queries' and
-    its keys', `algebra.places_read`), a tile otherwise."""
+    its keys', `algebra.places_read`), a tile otherwise. A part of the walk's tile (a consumer's share of
+    its keys) states the whole tile's keys (`tile_keys`, `algebra.Coords.key_count`), so a part past the
+    call's keys is masked as its tile is."""
     query_axis, key_axis = (1, 0) if keys_first else (0, 1)
 
     def places(start, axis: int) -> jax.Array:
@@ -870,8 +887,8 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     else:
         k_pos = places(k_first, key_axis) if keys_read else k_first + family.iota(shape, key_axis)
     if spans is None:
-        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, key_start=key_start,
-                              key_offsets=key_offsets)
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, tile_keys=tile_keys,
+                              key_start=key_start, key_offsets=key_offsets)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
     of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
                            else (family.rows_of, family.columns_of))
@@ -885,7 +902,7 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
         ids = of_queries(spans.query_ids.at[row, rows]), of_keys(spans.key_ids.at[row, keys])
-    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first)
+    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first, tile_keys=tile_keys)
 
 
 def _rows(family: mosaic.Family, ref, row, head, first, count: int):

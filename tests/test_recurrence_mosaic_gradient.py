@@ -221,6 +221,24 @@ def test_the_rated_scan_rounds_where_mamba_ssm_does(case):
     assert float(found) == value, f"{case}: {float(found)!r} where mamba_ssm's is {value!r}"
 
 
+def test_the_rated_scans_skip_reaches_the_output_in_the_dtype_its_caller_asks():
+    """A rated scan's (Mamba2's SSD) 16-bit call on the template under the run's fast forms, interpreted off
+    a GPU, its output asked in float32 (Mamba-2's mixer asks it so, unrounded for the earlier shards' state it
+    adds, `mamba2.chunk_ssd`): with no state term (`B = C = 0`) each output is its skip's product `x D` in
+    float32, at `x = D = 129/128` 16641/16384, which a bfloat16 output rounds to 130/128."""
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    rows, length, heads, states, width = 1, 64, 1, 64, 64
+    x = jnp.full((rows, length, heads, width), 129 / 128, jnp.bfloat16)
+    B = C = jnp.zeros((rows, length, heads, states), jnp.bfloat16)
+    dt = jnp.full((rows, length, heads), 0.5, jnp.float32)
+    skip = jnp.full((heads,), 129 / 128, jnp.float32)
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
+        out, _ = chunk_on('mosaic_gpu', hooks, Chunk(C, B, x, beta=dt, rate=jnp.zeros((heads,), jnp.float32),
+                                                     skip=skip), chunk_size=64, dtype=jnp.float32)
+    assert out.dtype == jnp.float32
+    assert bool(jnp.all(out == jnp.float32(129 / 128) * jnp.float32(129 / 128)))
+
+
 def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template's gradient runs a call over `given`'s operands under `hooks` on the device its
     launches run for (`Mosaic.trains`: the fast backward takes it, its launches held at the call's tiles)."""

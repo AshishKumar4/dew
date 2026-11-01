@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
+from reference_error import assert_as_exact
 
 from dew.interop import torchax_fallback
 from dew.nn import precision
@@ -327,6 +328,36 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
     (cotangent,) = normal_draw(1136, (1, 6, 6, 8))
     assert_contract(convolved, primals, direction, cotangent, f"a quantized convolution of {groups} {edge}",
                     truth_fn=plain, plain_fn=plain)
+
+
+def test_a_quantized_convolutions_second_derivative_reads_its_scales():
+    """The quantized convolution's gradient in its kernel, differentiated in its input (a mixed second
+    derivative): the gradient reads the input quantized, whose scale (each example's absolute maximum)
+    moves with the input, so the derivative goes through it, as the independent oracle's does
+    (`quantized_convolution`): on par with the oracle against its float64 truth (check 1)."""
+    from dew.nn.conv import Conv
+    from dew.quantization import Quantization
+
+    quantized = Quantization().apply(Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False))
+
+    def mixed(convolution):
+        def run(x, kernel, along_x, cotangent):
+            def kernel_gradient(x):
+                return jax.grad(lambda k: jnp.sum(convolution(x, k) * cotangent))(kernel)
+            return jax.jvp(kernel_gradient, (x,), (along_x,))[1]
+        return run
+
+    def dew_convolution(x, kernel):
+        return quantized.apply({"params": {"kernel": kernel}}, x)
+
+    def oracle(x, kernel):
+        return quantized_convolution(x, kernel, 1)
+
+    def draw(seed):
+        return tuple(normal_draw(2000 + seed, (1, 6, 6, 4), (3, 3, 4, 8), (1, 6, 6, 4), (1, 6, 6, 8)))
+
+    assert_as_exact(jax.jit(mixed(dew_convolution)), jax.jit(mixed(oracle)), draw,
+                    "a quantized convolution's mixed second derivative", seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)

@@ -78,6 +78,10 @@ def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True, se
     return out, tuple(found)
 
 
+FP32_SEEDS = 8
+"""The fp32 conv's check-1 seeds, the gate's fewest."""
+
+
 def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype):
     return short_conv.conv(x, weights, shift, None if valid is None else valid.astype(jnp.int8), segments,
                            parts, activation=activation, eps=1e-6, dtype=jnp.dtype(dtype),
@@ -143,18 +147,6 @@ def row_truth(x, weights, parts, grads, segments):
     return pieces, (dx, dtaps, *rows[0][1][2:])
 
 
-def assert_follows_xla(got, want, exact, label):
-    """A piece or gradient as XLA computes it: a bf16 one rounded where XLA rounds it, apart only where
-    their fp32 sums straddle a rounding (`assert_rounds_where_the_reference_does`), an fp32 one within
-    fp32 reassociation of the largest value."""
-    assert got.dtype == want.dtype, (label, got.dtype, want.dtype)
-    if want.dtype == jnp.bfloat16:
-        assert_rounds_where_the_reference_does(got, want, exact, label)
-        return
-    apart, scale = (float(np.abs(np.asarray(a, np.float64)).max()) for a in (got - want, exact))
-    assert within(apart, 1e-5 * scale), (label, apart, scale)
-
-
 @pytest.mark.parametrize("dtype, out", [(jnp.bfloat16, jnp.bfloat16), (jnp.bfloat16, jnp.float32),
                                          (jnp.float32, jnp.float32)])
 @pytest.mark.parametrize("shape, parts, taps, bias, valid, packed", [
@@ -168,22 +160,42 @@ def assert_follows_xla(got, want, exact, label):
     ((2, 9), ((48, None),), 2, True, False, False),
 ])
 def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
-    """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them:
-    bf16 values rounded where XLA rounds them, fp32 ones within fp32 reassociation, at lengths that
-    leave runs and a tile partly past the end, and over packed documents that start inside a window."""
-    x, weights, shift, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
+    """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them, at
+    lengths that leave runs and a tile partly past the end, and over packed documents that start inside a
+    window: bf16 pieces and gradients rounded where XLA rounds them, a call's of fp32 pieces on par with
+    XLA's from float64 over seeded draws (check 1)."""
     segments = documents(*shape) if packed else None
+    if jnp.dtype(out) == jnp.float32:
+        def drawn(seed):
+            x, weights, shift, _ = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid,
+                                            seed=seed)
+            return x, weights, shift, cotangents(x, parts, out, seed=seed + 1)
+
+        _, _, _, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
+
+        def conv(fn):
+            return lambda x, weights, shift, grads: run(fn, x, weights, shift, kept, parts, out, grads,
+                                                       segments=segments)
+
+        def exact(x, weights, shift, grads):
+            return truth(x, weights, shift, kept, parts, grads, segments=segments)
+
+        assert_as_exact(jax.jit(conv(kernel_conv)), jax.jit(conv(xla_conv1d)), drawn,
+                        f"the conv to fp32 {jnp.dtype(dtype).name} {shape} {parts}", seeds=FP32_SEEDS,
+                        truth_fn=exact)
+        return
+    x, weights, shift, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
     grads = cotangents(x, parts, out)
     got, got_grads = run(kernel_conv, x, weights, shift, kept, parts, out, grads, segments=segments)
     want, want_grads = run(xla_conv1d, x, weights, shift, kept, parts, out, grads, segments=segments)
     exact, exact_grads = truth(x, weights, shift, kept, parts, grads, segments=segments)
     for number, (piece, reference, value) in enumerate(zip(got, want, exact, strict=True)):
         assert piece.dtype == jnp.dtype(out)
-        assert_follows_xla(piece, reference, value, f"piece {number}")
+        assert_rounds_where_the_reference_does(piece, reference, value, f"piece {number}")
     for name, grad, reference, value in zip(("x", "taps", "bias"), got_grads, want_grads, exact_grads,
                                             strict=True):
         if grad is not None:
-            assert_follows_xla(grad, reference, value, f"d{name}")
+            assert_rounds_where_the_reference_does(grad, reference, value, f"d{name}")
 
 
 def test_padding_tokens_are_zero_and_pass_no_gradient():

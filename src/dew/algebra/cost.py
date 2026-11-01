@@ -10,31 +10,37 @@ from __future__ import annotations
 import dataclasses
 import math
 
-import jax
 import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args, get_literal_value
 
 from dew.algebra.rules import shape
 from dew.algebra.terms import Term
+from dew.cache import ALGEBRA
+from dew.nn.kernels import generation
 
 
 @dataclasses.dataclass(frozen=True)
 class Device:
-    """The facts a price reads: memory bandwidth (bytes a second) and arithmetic rate (operations a
-    second)."""
+    """The facts a price reads, a GPU target's (`generation.GpuTarget`, their one owner): its memory bandwidth
+    (bytes a second) and its fp32 arithmetic rate (operations a second: its CUDA-core lanes' FMAs over its
+    multiprocessors and clock)."""
 
     memory_bandwidth: float
     arithmetic_rate: float
 
     @classmethod
-    def of(cls, device=None) -> Device:
-        """A device's published facts by its kind: an H100 SXM's 3.35 TB/s and 67 TFLOP/s of fp32 vector
-        arithmetic, an A100 SXM's 2.04 TB/s and 19.5 TFLOP/s; any other device takes the H100's, whose ratio
-        of one to the other is all extraction compares."""
-        kind = (device if device is not None else jax.devices()[0]).device_kind
-        if "A100" in kind:
-            return cls(2.04e12, 1.95e13)
-        return cls(3.35e12, 6.7e13)
+    def of(cls, target: str | None = None) -> Device:
+        """The facts of the target `target` names, else the algebra pass's (`program.passes`'s target), else
+        the process's own GPU's (`generation.gpu_target`); a process of no GPU prices as the interpreted
+        templates' generation (an H100's), as the gate lowers for."""
+        named = target or ALGEBRA.value.target
+        if named is None and generation.device_generation() not in generation.TARGETS:
+            named = generation.INTERPRETED_GENERATION
+        facts = generation.gpu_target(named)
+        rate = facts.tensor_rate("fp32")
+        if facts.memory_bandwidth is None or rate is None or not (facts.multiprocessors and facts.clock_hz):
+            raise ValueError(f"{facts.device_kind}: no memory bandwidth or fp32 rate to price a form by")
+        return cls(facts.memory_bandwidth, rate * facts.multiprocessors * facts.clock_hz)
 
 
 def shape_of(graph: EGraph, term) -> tuple[int, ...] | None:

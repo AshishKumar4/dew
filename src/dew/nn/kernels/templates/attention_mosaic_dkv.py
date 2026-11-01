@@ -21,18 +21,14 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    holders,
     issued_into,
     reducing,
+    split_queries,
     stated,
     transposed_swizzles,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import (
-    _Backward,
-    _dq_added,
-    _score_params,
-    _scores,
-    split_queries,
-)
+from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _score_params, _scores
 
 
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
@@ -81,8 +77,10 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
                    *(family.exchange(consumers) if config.shared_dq else [])]
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
-        # and the two turns that order its writes against their products' reads (`_staged_logits`).
-        scoped += [mosaic.staged((block_q, width), dtype, swizzle), family.schedule(consumers),
+        # and the two turns that order its writes against their products' reads (`_staged_logits`): the
+        # logits' product reads that stage transposed, at the swizzle a transposed read takes.
+        staged = transposed_swizzles(config, "logits").get("logits", swizzle) if swizzle is None else swizzle
+        scoped += [mosaic.staged((block_q, width), dtype, staged), family.schedule(consumers),
                    family.schedule(consumers)]
     else:
         blocks["logits"] = ((block_q, width), dtype)
@@ -94,8 +92,9 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         blocks.update({name: ((block_q,), kept) for name, kept in STATISTICS.items()})
         blocks["positions"] = ((block_q,), jnp.int32)
     # Keys first, the logits' and dP's products read their queries (the stream of them by the power where it
-    # has one) and the output cotangents transposed; a launch's own swizzle every stream's.
-    transposed = transposed_swizzles(config, "logits" if "logits" in blocks else "queries", "douts")
+    # has one, its stage where staged) and the output cotangents transposed; a launch's own swizzle every
+    # stream's.
+    transposed = transposed_swizzles(config, *(("logits",) if "logits" in blocks else ()), "douts")
     swizzles = transposed if swizzle is None else dict.fromkeys(blocks, swizzle)
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles)
 
@@ -106,9 +105,6 @@ the anchor key's index), in the order of their arrays, and their dtypes: a share
 beside its queries."""
 
 
-def _holders(family: mosaic.Family, consumers: int) -> int:
-    """The key blocks a dK/dV program holds: one its consumers share (`split_queries`), else one each."""
-    return 1 if split_queries(family) else consumers
 
 def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, store_tiles, shares, part,
               logits_stage, add_dq, index, slots, carry, accumulators):
@@ -490,7 +486,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
     """The dK/dV program `entry`'s launch (`Family.kernel`) over `query` `[B, Qp, H, D]` and `key` and
     `value` `[B, Kp, Hk, D]`: dK and dV `[B, Kp, H, D]` fp32 out, each its share's columns (`shares`), the
     hook's key and tile gradients added into refs of their own (`_dkv_launched`); a program a query head's
-    key block a consumer, or one its consumers share (`_holders`)."""
+    key block a consumer, or one its consumers share (`holders`)."""
     batch, queries, heads, width = query.shape
     keys_padded, value_width = key.shape[1], value.shape[-1]
     family, consumers = walk.program.family, walk.consumers
@@ -498,7 +494,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
     dk, dv = (jax.ShapeDtypeStruct((batch, keys_padded, heads, share), jnp.float32) for _, share in shares)
     return family.kernel(
         entry, out_type=(dk, dv),
-        grid=(heads, keys_padded // (_holders(family, consumers) * walk.program.tiles.block_k), batch),
+        grid=(heads, keys_padded // (holders(family, consumers) * walk.program.tiles.block_k), batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
         name=name,
@@ -595,8 +591,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                       (v_ref.at[keys_view], v_smem.at[holder], v_loaded.at[holder]))
             # Shared between the consumers (`split_queries`): the first loads them, each waits.
             family.loaded(copies, issued=index == 0 if split else True)
-            # A shared dQ's consumers walk every streamed step in step: each step's exchange takes them all.
-            lo, hi = streamed if tiles.shared_dq else program.readers(k_first, q_steps, spans_of, row)[:2]
+            # Consumers that meet each step walk every streamed step in step, each masking the queries its own
+            # keys do not see: a shared dQ's exchange and a staged logits tile (one consumer writes it, every
+            # one reads it) each take them all.
+            lo, hi = (streamed if tiles.shared_dq or tiles.staged_logits
+                      else program.readers(k_first, q_steps, spans_of, row)[:2])
             part = (index * count, count) if split else (0, block_q)
 
             store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, (row, head), k_first,

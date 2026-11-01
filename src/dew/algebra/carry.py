@@ -6,13 +6,13 @@ A function of a carried state and a chunk's operands, traced at one chunk, enter
 are marked (`reads`), and the products' linear algebra saturates over them (`CARRIED`): a product of a
 transposed operand as a plain product of its transpose, a product distributed over a sum or a difference that
 reads the state, two products associated so the state is the last operand, two products of one right operand
-factored. Extraction prices the carried outputs' forms by the work that reads the state first and the rest
-second (`Priced`), so the carry reads the state through the fewest products: the delta rule's carry is one
-product of the state by a matrix the chunk forms beside its others, its solve against the state off the carry.
-The other outputs, emitted from each chunk's entering state once the carry has run, take the program's cost
-(`cost.model`). The forms' largest terms that read no state are the walk's prepared values, computed for every
-chunk at once (`Split.prepare`); the carry and the emitted outputs read the state and those alone
-(`Split.carry`, `Split.emit`). The association reorders rounding.
+factored, each where the region's range facts bound the operands its new intermediates read (`rules.tame`): no
+form is infinite where the function is finite. Extraction prices the carried outputs' forms by the work that
+reads the state first and the rest second (`Priced`), so the carry reads the state through the fewest products
+its facts allow. The other outputs, emitted from each chunk's entering state once the carry has run, take the
+program's cost (`cost.model`). The forms' largest terms that read no state are the walk's prepared values,
+computed for every chunk at once (`Split.prepare`); the carry and the emitted outputs read the state and those
+alone (`Split.carry`, `Split.emit`). The association reorders rounding.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import jax
+import jax.numpy as jnp
 from egglog import (
     DagCostModel,
     EGraph,
@@ -54,8 +55,15 @@ def reads(term: Term) -> i64: ...
 
 @function
 def matrix_product(params: i64) -> Unit: ...
-"""A product's parameters (`Term.dot`) of two matrices, `x @ y`: the left's last axis with the right's first,
-no batch."""
+"""A product's parameters (`Term.dot`) contracting its left operand's last axis with its right's first, no
+batch, in its operands' dtype (no wider accumulation it rounds back from): `x @ y` of matrices
+(`matrix`)."""
+
+
+@function
+def matrix(term: Term) -> Unit: ...
+"""A value of rank two: each operand a rule moves a matrix product past must be one, as a product's
+parameters hold whatever its operands' ranks."""
 
 
 @function(merge=lambda old, new: old)
@@ -85,36 +93,42 @@ def _carrying():
                    for child in children]
     return ruleset(
         *marked,
+        rule(eq(left).to(rules.shape(t)), eq(left.length()).to(i64(2))).then(matrix(t)),
         rule(eq(t).to(x.shaped(String("transpose"), p)), eq(left).to(rules.shape(x)),
              eq(left.length()).to(i64(2))).then(
             set_(rules.shape(t)).to(Vec[i64](left[i64(1)], left[i64(0)]))),
-        rule(eq(t).to(x.dot(y, p)), matrix_product(p), eq(left).to(rules.shape(x)),
+        rule(eq(t).to(x.dot(y, p)), matrix_product(p), matrix(x), matrix(y), eq(left).to(rules.shape(x)),
              eq(right).to(rules.shape(y))).then(
             set_(rules.shape(t)).to(Vec[i64](left[i64(0)], right[i64(1)]))),
         name="carrying")
 
 
 def _carried():
-    """The products' linear algebra over values that read the state (the module's account): each reorders
+    """The products' linear algebra over values that read the state (the module's account), each over
+    matrices (`matrix`), products and sums in their operands' dtype (`matrix_product`, `rules.plain`),
+    summands of one shape, and operands its new intermediates read tame (`rules.tame`): each reorders
     rounding."""
     x, y, z = vars_("x y z", Term)
     p, m, s, q = vars_("p m s q", i64)
     one = i64(1)
-    plain = (matrix_product(m),)
+    shape = rules.shape
     sets = [
         # x^T @ y as transpose(x) @ y, so it associates and factors with plain products.
         rewrite(x.dot(y, p)).to(x.shaped(String("transpose"), s).dot(y, m), eq(m).to(plain_of(p)),
-                                eq(s).to(swap_of(p)), eq(reads(y)).to(one)),
+                                eq(s).to(swap_of(p)), matrix(x), matrix(y), eq(reads(y)).to(one)),
         # x @ (y @ z) as (x @ y) @ z, the state's product last.
-        rewrite(x.dot(y.dot(z, m), m)).to(x.dot(y, m).dot(z, m), *plain, eq(reads(z)).to(one)),
+        rewrite(x.dot(y.dot(z, m), m)).to(x.dot(y, m).dot(z, m), matrix_product(m), matrix(x), matrix(y),
+                                          matrix(z), rules.tame(x), rules.tame(y), eq(reads(z)).to(one)),
     ]
     for combined in ("add", "sub"):
+        summed = (matrix_product(m), rules.plain(q), matrix(x), matrix(y), matrix(z), rules.tame(x),
+                  rules.tame(y))
         sets += [
             rewrite(x.dot(y.binary(combined, z, q), m)).to(
-                x.dot(y, m).binary(combined, x.dot(z, m), q), *plain,
-                eq(reads(y.binary(combined, z, q))).to(one)),
+                x.dot(y, m).binary(combined, x.dot(z, m), q), *summed, rules.tame(z),
+                eq(shape(y)).to(shape(z)), eq(reads(y.binary(combined, z, q))).to(one)),
             rewrite(x.dot(z, m).binary(combined, y.dot(z, m), q)).to(
-                x.binary(combined, y, q).dot(z, m), *plain, eq(rules.shape(x)).to(rules.shape(y)),
+                x.binary(combined, y, q).dot(z, m), *summed, eq(shape(x)).to(shape(y)),
                 eq(reads(z)).to(one)),
         ]
     return ruleset(*sets, name="carried")
@@ -176,7 +190,7 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     first = len(closed.jaxpr.constvars)
     graph = EGraph()
     program.stated(graph, region)
-    _products(graph, region)
+    _products(graph, region, closed)
     reading = {first}
     for opaque in region.opaque:
         if any(term is not None and _reads(term, reading) for term in opaque.inputs):
@@ -215,15 +229,22 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     return Split(prepare, reading_forms(carry_forms), reading_forms(emit_forms))
 
 
-def _products(graph: EGraph, region: terms.Region) -> None:
-    """Which of the region's products are plain matrix products (`matrix_product`), and for each `x^T @ y`
-    the plain product and the transpose its rewrite takes (`plain_of`, `swap_of`), their parameters added to
-    the region's table where it holds none."""
+def _products(graph: EGraph, region: terms.Region, closed) -> None:
+    """Which of the region's products are plain matrix products (`matrix_product`: in their operands' dtype,
+    each equation of `closed` holding its parameters so), and for each `x^T @ y` the plain product and the
+    transpose its rewrite takes (`plain_of`, `swap_of`), their parameters added to the region's table where it
+    holds none. Each rule asks its operands' ranks of the terms themselves (`matrix`)."""
     plain = (((1,), (0,)), ((), ()))
     transposed = (((0,), (0,)), ((), ()))
-    ranks = _dot_ranks(region)
+    widening: set[int] = set()
+    for equation in closed.jaxpr.eqns:
+        if equation.primitive is jax.lax.dot_general_p:
+            wanted = equation.params.get("preferred_element_type")
+            dtypes = {jnp.dtype(atom.aval.dtype) for atom in equation.invars}
+            if wanted is not None and dtypes != {jnp.dtype(wanted)}:
+                widening.add(_parameters(region, equation.primitive, equation.params))
     for index, (primitive, params) in list(enumerate(region.params)):
-        if primitive is not jax.lax.dot_general_p or ranks.get(index) != (2, 2):
+        if primitive is not jax.lax.dot_general_p or index in widening:
             continue
         numbers = jax.tree.map(int, params["dimension_numbers"])
         if numbers == plain:
@@ -235,23 +256,13 @@ def _products(graph: EGraph, region: terms.Region) -> None:
                            set_(swap_of(i64(index))).to(i64(swapped)))
 
 
-def _parameters(region: terms.Region, primitive, params: dict) -> int:
+def _parameters(region: terms.Region, primitive, params) -> int:
     """The index of `primitive` at `params` in the region's table, added where it holds none."""
     for index, (held, given) in enumerate(region.params):
-        if held is primitive and jax.tree.map(str, dict(given)) == jax.tree.map(str, params):
+        if held is primitive and jax.tree.map(str, dict(given)) == jax.tree.map(str, dict(params)):
             return index
-    region.params.append((primitive, params))
+    region.params.append((primitive, dict(params)))
     return len(region.params) - 1
-
-
-def _dot_ranks(region: terms.Region) -> dict[int, tuple[int, int]]:
-    """Each product's parameters' index to its operands' ranks."""
-    known = {str(term): extent for term, extent in region.shapes}
-    ranks = {}
-    for term, _ in region.shapes:
-        if (args := get_callable_args(term, Term.dot)) is not None:
-            ranks[int(get_literal_value(args[2]))] = (len(known[str(args[0])]), len(known[str(args[1])]))
-    return ranks
 
 
 def _reads(term: Term, reading: set[int]) -> bool:

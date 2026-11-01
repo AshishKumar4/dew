@@ -10,13 +10,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import math
 import time
 from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import numpy as np
 from egglog import EGraph, Schedule, String, Vec, get_callable_args, i64, set_
-from jax._src import config as jax_config
+from jax._src import api_util, config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
@@ -82,8 +83,14 @@ def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation,
     jit around it binds them (`static_argnums`, `static_argnames`), traced over the others, its terms
     saturated under the rule sets its numerics admit (`rules.admitted`) and its values evaluated in their
     cheapest forms. Its arguments, outputs and their structure are `fn`'s."""
-    numbers = (static_argnums,) if isinstance(static_argnums, int) else tuple(static_argnums)
-    names = (static_argnames,) if isinstance(static_argnames, str) else tuple(static_argnames)
+    # The static positions and names as jit resolves them: each given, and its other spelling inferred from
+    # the signature, so a static argument passed either way is bound.
+    numbers, names = static_argnums, static_argnames
+    signature = api_util.fun_signature(fn)
+    if signature is not None:
+        numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
+    numbers = (numbers,) if isinstance(numbers, int) else tuple(numbers)
+    names = (names,) if isinstance(names, str) else tuple(names)
 
     @functools.wraps(fn)
     def run(*args, **kwargs):
@@ -279,7 +286,8 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
 def stated(graph: EGraph, region: terms.Region) -> None:
     """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s): each term's
     shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one axis, which
-    literals are powers of two or one, the primitives a stable rule writes."""
+    literals are powers of two or one, the primitives a stable rule writes, and which values its range facts
+    bound tame (`rules.tame`)."""
     for term, extent in region.shapes:
         graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent))))
     arithmetic = (jax.lax.add_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
@@ -295,6 +303,10 @@ def stated(graph: EGraph, region: terms.Region) -> None:
                 graph.register(rules.along(i64(index), i64(missing[0])))
     for name, index in region.stock.items():
         graph.register(set_(rules.stock(String(name))).to(i64(index)))
+    extent = max((size for _, sizes in region.shapes for size in sizes), default=1)
+    for term, _ in region.shapes:
+        if region.bounds[str(term)] * max(extent, 1) <= math.sqrt(region.limit):
+            graph.register(rules.tame(term))
     for index, value in enumerate(region.literals):
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):

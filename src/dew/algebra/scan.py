@@ -45,6 +45,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import carry, program
 from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
+from dew.nn.kernels import recurrence_algebra
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
 
 Axes = tuple[str, ...]
@@ -196,7 +197,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         (outputs,) = prepared.split.emit(prepared.values, state[1])
         return outputs
 
-    def merge(a, b):
+    def merge(a, b, operands):
+        del operands
         # A state's decay is its walk's exponent sum per key in natural units. A later walk from zero leaves
         # the state before it decayed alone only where no token corrects it: refused where one does.
         if corrects != [False]:
@@ -526,9 +528,13 @@ def _token(affine: _Affine, token: tuple) -> tuple:
     C = jnp.zeros_like(B)
     for correction in affine.corrections:
         C = C - coefficient(correction, read, leaving=affine.decay) * read(correction.right)
-    out = values(readout, [*affine.read.factors, affine.read.right,
+    weights = () if affine.read.diag is None else (affine.read.diag,)
+    out = values(readout, [*affine.read.factors, affine.read.right, *weights,
                            *(atom for term in affine.free for atom in (*term.factors, term.right))])
+    # A readout that weighs the state's rows first (`_Term.diag`) reads them through its vector so weighed.
     Q = coefficient(affine.read, out) * out(affine.read.right)
+    for weight in weights:
+        Q = Q * out(weight)
     R = sum((coefficient(term, out) * out(term.right) for term in affine.free),
             jnp.zeros((aval(update.jaxpr.invars[0]).shape[1],), jnp.float32))
     keys = aval(update.jaxpr.invars[0]).shape[0] if affine.per_key else 1
@@ -556,13 +562,19 @@ def _paired(left, right, between):
 
 @jax.custom_vjp
 def _lowered(overlaps):
-    """`(I + overlaps)^-1` less its unit diagonal, `overlaps` strictly lower: the inverse by doubling
-    (`_inverse`), each product a Dew product (`float32_matmul`), the template's own form (recurrence_algebra's
-    `doubled`), log2(C) levels of products where a forward substitution took C dependent row steps (the
-    derived forward's every chunk 64 launches in sequence). The solve applies it with the unit diagonal
-    outside the product (`_applied`, `given + L given`, as `weighted` adds it), so the product rounds the
-    off-diagonal terms alone. Its derivative, with `X = I + L`, `-X^T dL X^T` below the diagonal."""
-    return _below(_inverse(overlaps))
+    """`(I + overlaps)^-1` less its unit diagonal, `overlaps` strictly lower: the template's inverse by
+    doubling (`recurrence_algebra.doubled` of `-overlaps`), each product a Dew product (`float32_matmul`),
+    log2(C) levels of products where a forward substitution took C dependent row steps (the derived forward's
+    every chunk 64 launches in sequence). The solve applies it with the unit diagonal outside the product
+    (`_applied`, `given + L given`, as `weighted` adds it), so the product rounds the off-diagonal terms
+    alone. Its derivative, with `X = I + L`, `-X^T dL X^T` below the diagonal."""
+    return _below(recurrence_algebra.doubled(-overlaps, _issued))
+
+
+def _issued(name: str, left, right):
+    """The doubling's products (`recurrence_algebra.doubled`'s issuer) as Dew's (`float32_matmul`)."""
+    del name
+    return float32_matmul(left, right)
 
 
 def _applied(lower, given):
@@ -586,23 +598,6 @@ def _lowered_backward(lower, d_lower):
 
 
 _lowered.defvjp(_lowered_forward, _lowered_backward)
-
-
-def _inverse(overlaps):
-    """`(I + overlaps)^-1` of a strictly lower `overlaps` `[C, C]` by doubling: from the two-wide blocks, each
-    level joins pairs of `w`-blocks as `X_2w = X_w + (M_w * (X_w A)) X_w`, `A = -overlaps` and `M_w` each
-    pair's lower block (recurrence_algebra's `doubled`), until one block spans the chunk: a chunk of any
-    length, its last blocks shorter."""
-    a = -overlaps
-    size = a.shape[0]
-    rows, cols = jnp.arange(size)[:, None], jnp.arange(size)[None, :]
-    inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
-    width = 2
-    while width < size:
-        lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-        inverse = inverse + float32_matmul(jnp.where(lower, float32_matmul(inverse, a), 0.0), inverse)
-        width *= 2
-    return inverse
 
 
 def _compensated(values, *, reverse: bool = False) -> tuple[jax.Array, jax.Array]:

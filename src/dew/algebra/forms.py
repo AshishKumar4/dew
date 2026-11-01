@@ -19,17 +19,18 @@ from dew.nn.precision import float32_dot_general
 
 class Derived(NamedTuple):
     """A declaration's forms (`derive`): `init(shapes)` the empty state for operands of `shapes` (by name,
-    their walked axis a tile's), `step(state, tiles)` the state after one tile of each walked operand (and
-    the whole of each other), `merge(a, b)` two states of disjoint walks joined, `finish(state, operands)`
-    the declaration's outputs that the walk reduces, `mapped(tiles)` its outputs along the walked axis, a
-    tile's own (each reads no walked reduction: a backward's dQ, walking queries), each form None in the
-    other's outputs' places; `report` what the derivation decoupled and its rounding class; `prepare(tiles)`
-    a tile's values that read no state, which a walk computes for every tile at once (a reduction's tiles as
-    they are). A scan's (`scan.derive_scan`) `step(state, prepared)` and `mapped(prepared, state)` read a
-    chunk's prepared values and the state alone (the carry, and a chunk's outputs from the state entering
-    it); its `backward(tiles, state, d_state, d_outputs)` is a chunk's adjoint: the cotangent of the state
-    entering it and of each of its operands, from the state entering it and the cotangents of the state
-    leaving it and of its outputs (a reduction's backward is a declaration of its own, None here)."""
+    their walked axis a tile's), `step(state, tiles)` the state after one tile of each walked operand (and the
+    whole of each other), `merge(a, b, operands)` two states of disjoint walks joined (its unwalked operands
+    whole beside them), `finish(state, operands)` the declaration's outputs that the walk reduces,
+    `mapped(tiles)` its outputs along the walked axis, a tile's own (each reads no walked reduction: a
+    backward's dQ, walking queries), each form None in the other's outputs' places; `report` what the
+    derivation decoupled and its rounding class; `prepare(tiles)` a tile's values that read no state, which a
+    walk computes for every tile at once (a reduction's tiles as they are). A scan's (`scan.derive_scan`)
+    `step(state, prepared)` and `mapped(prepared, state)` read a chunk's prepared values and the state alone
+    (the carry, and a chunk's outputs from the state entering it); its `backward(tiles, state, d_state,
+    d_outputs)` is a chunk's adjoint: the cotangent of the state entering it and of each of its operands, from
+    the state entering it and the cotangents of the state leaving it and of its outputs (a reduction's
+    backward is a declaration of its own, None here)."""
 
     init: Callable
     step: Callable

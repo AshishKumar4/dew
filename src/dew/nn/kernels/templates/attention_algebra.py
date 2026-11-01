@@ -1983,7 +1983,10 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding, so a query that
     sees one key has no cotangent, as the reference's: FlashAttention's order, `(dP - D) / T` with no anchor
     test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
-    key" and causal windows' first queries: rows whose float64 gradient is exactly 0)."""
+    key" and causal windows' first queries: rows whose float64 gradient is exactly 0). That is the accurate
+    form's. The fast form's (`weights` given, the normalized weights its launch forms anyway) is
+    FlashAttention's order about the anchor, `weights ((dP - c) - (D - c))`, its anchor test the accurate
+    form's alone (`at_anchor` None)."""
     products = dropped_products(products, multiplier)
     relative = products - expand(anchor, products)
     if at_anchor is not None:

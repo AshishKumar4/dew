@@ -156,8 +156,9 @@ class StepCompiled:
     fits this process's devices (`dew.training.memory.memory_record`), and
     its plan: the microbatches it reads each batch in, their rows, every
     compile the search made (`dew.training.memory.Probe`), its kernels
-    (`dew.training._lowering.KernelReport.record`), and the kernels those compiles found spilling and
-    the launch configs they refused (`dew.training.planning.FitSearch.kernels`)."""
+    (`dew.training._lowering.KernelReport.record`), and the kernels those compiles found spilling, the
+    launch configs they refused and the regions the algebra pass rewrote as they traced
+    (`dew.training.planning.FitSearch.kernels`)."""
     seconds: float
     remat: JSON
     links: Mapping[str, AxisLink]

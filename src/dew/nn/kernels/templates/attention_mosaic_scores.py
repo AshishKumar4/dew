@@ -1,6 +1,6 @@
 """What the attention template's Mosaic GPU backward launches share (`attention_mosaic_backward`): a launch's
-static choices (`_Backward`), whether a layout's consumers share a key block (`split_queries`), and a step's
-hook parameters and its weights and score cotangents under the forward's statistics (`_scores`)."""
+static choices (`_Backward`), and a step's hook parameters and its weights and score cotangents under the
+forward's statistics (`_scores`)."""
 
 import dataclasses
 import functools
@@ -19,13 +19,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
 )
 
-
-def split_queries(family: mosaic.Family) -> bool:
-    """Whether the dK/dV program's consumers share one key block and split each slot's queries between them:
-    on a layout whose consumers feed their own rings (`Transport.feeds_itself`), each consumer's step its
-    share of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own
-    keys."""
-    return family.feeds_itself
 
 @dataclasses.dataclass(frozen=True)
 class _Backward:

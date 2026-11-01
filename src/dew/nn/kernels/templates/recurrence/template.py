@@ -25,10 +25,6 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
 from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
-INTERPRETED_GENERATION = "sm90"
-"""The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
-interpreted bundle's (`bundles.INTERPRETED`, wgmma's)."""
-
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family) -> tuple[int, int, jnp.dtype]:
     """The call's keys' and values' widths padded to whole tiles of `family`'s bundle (`mainloop.block_of`),
@@ -105,14 +101,15 @@ class Mosaic(base.Template[mainloop.Tiles]):
     @staticmethod
     def launched() -> generation.GpuTarget:
         """The target a call's launches run for: this device's where a bundle claims its family, else the
-        interpreted bundle's generation's (`INTERPRETED_GENERATION`), its multiprocessors unstated: an
-        interpreter runs a launch's programs one after another, no wave of them to fill, so the derivation
-        takes the widest tiles that hold (`derived`; packed documents' interpreted gradient took 21 s a draw
-        at the one-wave rule's 16-wide value block and 14 at 32, row 1850)."""
+        interpreted bundle's generation's (`generation.INTERPRETED_GENERATION`), its multiprocessors
+        unstated: an interpreter runs a launch's programs one after another, no wave of them to fill, so the
+        derivation takes the widest tiles that hold (`derived`; packed documents' interpreted gradient took
+        21 s a draw at the one-wave rule's 16-wide value block and 14 at 32, row 1850)."""
         target = generation.gpu_target()
         if bundle(target) is not None:
             return target
-        return dataclasses.replace(generation.gpu_target(INTERPRETED_GENERATION), multiprocessors=None)
+        interpreted = generation.gpu_target(generation.INTERPRETED_GENERATION)
+        return dataclasses.replace(interpreted, multiprocessors=None)
 
     def _launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
                   backward: bool) -> tuple[mainloop.Launch, ...]:

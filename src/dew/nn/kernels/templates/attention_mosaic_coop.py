@@ -125,7 +125,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
             family.loaded(((k_ref.at[keys_view], k_smem, loads.at[0]),
                            (v_ref.at[keys_view], v_smem, loads.at[1])), issued=share == 0)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first + share * (
-                block_k // consumers), shape=(block_q, block_k // consumers))
+                block_k // consumers), shape=(block_q, block_k // consumers), tile_keys=block_k)
             mine = pl.ds(share * columns, columns)
             smem = out_smem.at[share]
 

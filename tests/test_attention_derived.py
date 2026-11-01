@@ -52,7 +52,8 @@ def derived_walk(base2: bool, mask: str, split: bool):
     def run(logits, value):
         values = {"logits": logits, "seen": MASKS[mask](), "values": value}
         if split:
-            state = forms.merge(walk(values, range(count // 2)), walk(values, range(count // 2, count)))
+            state = forms.merge(walk(values, range(count // 2)), walk(values, range(count // 2, count)),
+                                values)
         else:
             state = walk(values, range(count))
         return forms.finish(state, values)
@@ -63,8 +64,9 @@ def derived_walk(base2: bool, mask: str, split: bool):
 def oracle_walk(base2: bool, mask: str, split: bool):
     """The template's own forms over the same tiles (`plain_step`, `merge`, `finish`), as a call whose spans
     narrow (`form="spans"`), so a query may see no key (`Forward.guarded`), its logits as the declaration's,
-    unit-scaled in their base."""
-    spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=1.0, natural=not base2)
+    unit-scaled in their base: a folding call's scale times log2(e) below 1 (`algebra.folds`), so its forms
+    exponentiate in base 2 as the declaration's do, the tiles' logits taken as they are."""
+    spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=0.5 if base2 else 1.0, natural=not base2)
     count = KEYS // TILE
 
     def dot(a, b):

@@ -103,9 +103,54 @@ def test_two_walks_merged_give_the_final_state():
         values = operands(x, dt, B, C)
         _, first = walk(forms, values, range(half), forms.init({}))
         _, second = walk(forms, values, range(half, 2 * half), forms.init({}))
-        return forms.finish(forms.merge(first, second), values)
+        return forms.finish(forms.merge(first, second, values), values)
 
     assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: tokenwise(*xs)[1]), draw, "ssd merged", seeds=16)
+
+
+def weighted_readout(h, x, dt, B, C, a, rate, skip):
+    """A readout that weighs the state's rows by the token's own vector `a` before contracting it with C."""
+    del dt, B, rate
+    return C @ (a[:, None] * h) + skip * x
+
+
+def weighted_update(h, x, dt, B, C, a, rate, skip):
+    del a
+    return update(h, x, dt, B, C, rate, skip)
+
+
+def test_a_readout_that_weighs_the_states_rows_computes_the_token_scan():
+    """Mamba-2's update read out through the state's rows weighed by a vector of the token's
+    (`C @ (a * h)`), walked in chunks: outputs on par with the token-by-token scan (check 1)."""
+    weighted = {**OPERANDS, "a": ("time", "state")}
+    forms = scan.derive_scan(scan.Scan(weighted_update, weighted_readout, weighted, walked="time",
+                                       state=((STATE, WIDTH), jnp.float32)), saturation=SATURATION)
+
+    def derived(x, dt, B, C, a):
+        values = {**operands(x, dt, B, C), "a": a}
+        outputs = []
+        state = forms.init({})
+        for index in range(TOKENS // CHUNK):
+            tokens = slice(index * CHUNK, (index + 1) * CHUNK)
+            chunk = {name: value[tokens] if weighted[name][:1] == ("time",) else value
+                     for name, value in values.items()}
+            prepared = forms.prepare(chunk)
+            outputs.append(forms.mapped(prepared, state))
+            state = forms.step(state, prepared)
+        return jnp.concatenate(outputs)
+
+    def tokens(x, dt, B, C, a):
+        def one(h, token):
+            h = weighted_update(h, *token, RATE, SKIP)
+            return h, weighted_readout(h, *token, RATE, SKIP)
+
+        return jax.lax.scan(one, jnp.zeros((STATE, WIDTH), x.dtype), (x, dt, B, C, a))[1]
+
+    def weights(seed):
+        return (*draw(seed), jnp.asarray(np.random.default_rng(seed + 1).uniform(0.1, 2.0, (TOKENS, STATE)),
+                                         jnp.float32))
+
+    assert_as_exact(jax.jit(derived), jax.jit(tokens), weights, "a readout weighing the rows", seeds=16)
 
 
 def columnwise(h, x, dt, B, C, rate, skip):
@@ -449,7 +494,7 @@ def test_two_reset_walks_merged_give_the_final_state():
             for index in chunks:
                 state = forms.step(state, forms.prepare(chunked(given, index)))
             states.append(state)
-        return forms.finish(forms.merge(*states), given)
+        return forms.finish(forms.merge(*states, given), given)
 
     assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: tokens_run(*xs)[1]),
                     lambda seed: (resets_of(seed), *draw(seed)), "ssd reset merged", seeds=16)

@@ -64,11 +64,11 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     layouts,
     reducing,
     refused,
+    split_queries,
     stagings,
     varying_slopes,
     whole_tiles,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import split_queries
 from dew.nn.kernels.templates.base import Template, Unfitted
 
 
