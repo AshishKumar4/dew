@@ -276,7 +276,7 @@ def test_epochs_of_a_read_whose_objective_makes_rows_of_its_examples_are_passes_
     from dew.training.budget import recorded
 
     ids = np.arange(1, 13, dtype=np.int32)
-    chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(8)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(4)
     loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
     assert (loader.records, loader.examples) == (None, 24)
     evaluated = TrainerConfig(epochs=2, eval_every="epoch").eval_interval(loader)
@@ -294,6 +294,6 @@ def test_epochs_of_a_read_it_packs_as_its_rows_arrive_are_passes_over_its_docume
     from dew.training import Trainer
 
     documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
-    chain = Pipeline(Memory(documents)).shuffle(seed=1).read("indexed").pack(8, fields=("id",)).batch(8)
+    chain = Pipeline(Memory(documents)).shuffle(seed=1).read("indexed").pack(8, fields=("id",)).batch(2)
     state = Trainer(_pulled(), optax.sgd(0.01), key=0).fit(chain, epochs=3, log_every=1)
     assert int(state.consumed) == 30

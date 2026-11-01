@@ -31,8 +31,7 @@ COUNTED = {"lm", "decision"}
 
 COUNTED_RECORDS = {"lm", "diffusion", "jepa"}
 """The kinds whose training data states its record count, which an epoch reads; a decision run's
-questions stream through a filter, whose count no read states before it ends, so its epoch is a pass
-over its source examples, which it counts ahead (`Loader.pass_examples`)."""
+questions stream through a filter, whose count no read states before it ends."""
 
 EXAMPLES = {"lm": 2, "decision": 16, "diffusion": 16, "jepa": 16}
 """Examples a run of each kind reads in a few steps: an LM's example is a document, many windows long;
@@ -119,17 +118,15 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
     """A run of two epochs ends at twice the step one epoch ends at (`epochs`), where the kind's data
-    states its record count, and consumes twice the source examples one epoch does where it states none,
-    an epoch a pass over them (row 1902); one of twice the examples ends at twice the step (`examples`)."""
+    states its record count, and is refused where it does not; one of twice the examples ends at twice
+    the step (`examples`)."""
     if kind in COUNTED_RECORDS:
         once = saved(trained(kind, tmp_path, "once", **{"trainer.epochs": 1}))[-1]
         twice = saved(trained(kind, tmp_path, "twice", **{"trainer.epochs": 2}))[-1]
         assert twice == 2 * once
     else:
-        def consumed(epochs: int) -> int:
-            logged = scalars(trained(kind, tmp_path, f"epochs-{epochs}", **{"trainer.epochs": epochs}))
-            return int(logged[max(logged)]["train/examples_consumed"])
-        assert consumed(2) == 2 * consumed(1) > 0
+        with pytest.raises(ValueError):
+            trained(kind, tmp_path, "once", **{"trainer.epochs": 1})
     few = saved(trained(kind, tmp_path, "few", **{"trainer.examples": EXAMPLES[kind]}))[-1]
     assert saved(trained(kind, tmp_path, "more", **{"trainer.examples": 2 * EXAMPLES[kind]}))[-1] == 2 * few
 
