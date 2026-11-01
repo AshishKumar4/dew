@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterator, Mapping
 
 import jax
 from egglog import EGraph, Vec, get_callable_args, i64, set_
+from jax._src import config as jax_config
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -83,7 +84,9 @@ def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation,
 
     @functools.wraps(fn)
     def run(*args, **kwargs):
-        if not ALGEBRA.value.on:
+        # Under `jax.disable_jit` a program runs as Python, its values concrete, so nothing is traced to
+        # rewrite.
+        if not ALGEBRA.value.on or jax_config.disable_jit.value:
             return fn(*args, **kwargs)
         statics = {number % len(args) for number in numbers if -len(args) <= number < len(args)}
         fixed = {name: value for name, value in kwargs.items() if name in names}

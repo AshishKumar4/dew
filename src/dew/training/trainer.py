@@ -32,6 +32,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
+from dew import algebra
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, Variables, owned_dicts, select
@@ -1203,11 +1204,7 @@ class Trainer(Generic[Loss, Effects]):
             stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
                                      batch_consumed(micro))
             return (apart(stepped)[0], *rest)
-
-        # The algebra pass rewrites the step where it is jitted, its backward included (§6.7 of
-        # docs/design/algebra.md), so the planner prices, lowers and compiles one program.
-        from dew import algebra
-
+        # The algebra pass rewrites the step, its backward included, where it is jitted (algebra.md §6.7).
         return jax.jit(algebra.rewritten(step), in_shardings=(moving, frozen, placement, replicated),
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
