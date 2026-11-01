@@ -150,11 +150,7 @@ _EXPORTS = {
 (`dew._exports.lookup`), so `import dew.decision` imports none of them."""
 
 
-__getattr__ = _lookup(__name__, _EXPORTS)
-
-
-def __dir__() -> list[str]:
-    return list(__all__)
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 
 # Written from _EXPORTS (tools/gen_exports.py).
