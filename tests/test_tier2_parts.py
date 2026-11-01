@@ -631,33 +631,61 @@ def test_a_biased_short_convolution_is_left_to_tier_3():
         parts.assemble(model)
 
 
+ERNIE_CLAMP_SEEDS = 8
+"""The clamped router's declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
 def test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert():
     """ERNIE 4.5's router picks by score plus its correction bias and divides the chosen scores by their sum
-    clamped below at `moe_norm_min`: where the bias picks an expert of faint score, the clamp binds and its
-    weight stays faint. Dew's router as tier 2 reads it (`Router.weight_sum_min`) picks and weighs alike."""
+    clamped below at `moe_norm_min`: where the bias picks an expert of faint score (its logit near -40),
+    the clamp binds. Dew's router as tier 2 reads it (`Router.weight_sum_min`) picks alike, and its
+    weights and their gradient into the tokens are on par with the source's from its float64 twin
+    (check 1)."""
     import jax.numpy as jnp
     from transformers import Ernie4_5_MoeConfig
     from transformers.models.ernie4_5_moe.modeling_ernie4_5_moe import Ernie4_5_MoeTopKRouter
 
     from dew.nn.moe import EXPERT_BIAS, EXPERT_BIAS_COLLECTION, Router
 
-    source = Ernie4_5_MoeTopKRouter(Ernie4_5_MoeConfig(hidden_size=4, moe_num_experts=2, moe_k=1))
+    config = Ernie4_5_MoeConfig(hidden_size=4, moe_num_experts=2, moe_k=1)
+    source = Ernie4_5_MoeTopKRouter(config)
     with torch.no_grad():
         source.weight.copy_(torch.tensor([[0.0, 0.0, 0.0, 0.0], [-40.0, 0.0, 0.0, 0.0]]))
         source.moe_statics.e_score_correction_bias.copy_(torch.tensor([[0.0, 2.0]]))
-    hidden = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-    _, weights, chosen = source(hidden)
+    wide = float64_twin(source, lambda: Ernie4_5_MoeTopKRouter(config))
     router = Router(num_experts=2, in_features=4, top_k=1, expert_bias=True, weight_sum_epsilon=0.0,
                     weight_sum_min=float(source.norm_min))
     variables = {**router.init(jax.random.key(0), jnp.zeros((1, 4))),
                  "params": {"kernel": jnp.asarray(source.weight.detach().numpy().T)},
                  EXPERT_BIAS_COLLECTION: {EXPERT_BIAS: jnp.asarray([0.0, 2.0])}}
-    ours, indices = router.apply(variables, jnp.asarray(hidden.numpy()))
-    np.testing.assert_array_equal(np.asarray(indices), chosen.numpy())
-    # The faint score over the clamp (about 4e-6 in the source) on both sides, where the quotient over the
-    # chosen score's own sum is 1.
-    assert float(weights[0, 0]) < 1e-5
-    assert float(ours[0, 0]) < 1e-5
+
+    def draw(seed):
+        rng = np.random.default_rng([0x3078, seed])
+        tokens = (np.array([1.0, 0.0, 0.0, 0.0]) + 0.05 * rng.standard_normal((6, 4))).astype(np.float32)
+        return tokens, rng.standard_normal((6, 1)).astype(np.float32)
+
+    @as_given
+    def ours(tokens, cotangent):
+        def weighed(tokens):
+            return jnp.sum(router.apply(variables, tokens)[0] * cotangent)
+        return (np.asarray(router.apply(variables, jnp.asarray(tokens))[0]),
+                np.asarray(jax.grad(weighed)(jnp.asarray(tokens))))
+
+    def torch_arm(model, dtype):
+        def run(tokens, cotangent):
+            held = torch.from_numpy(np.asarray(tokens)).to(dtype).requires_grad_()
+            _, weights, chosen = model(held)
+            assert chosen.flatten().tolist() == [1] * len(chosen)
+            (weights * torch.from_numpy(np.asarray(cotangent)).to(dtype)).sum().backward()
+            return weights.detach().numpy(), held.grad.numpy()
+        return run
+
+    def truth(tokens, cotangent):
+        with float64():
+            return torch_arm(wide, torch.float64)(tokens, cotangent)
+
+    assert_as_exact(ours, as_given(torch_arm(source, torch.float32)), draw, "ERNIE clamped router",
+                    seeds=ERNIE_CLAMP_SEEDS, truth_fn=truth)
 
 
 def test_attention_fields_join_the_kinds_of_the_layers_that_state_them():

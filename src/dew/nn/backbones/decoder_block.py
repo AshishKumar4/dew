@@ -223,11 +223,12 @@ class Mixture:
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
                 or self.bias_in_weights or self.routing_block is not None
-                or self.scale_inputs or self.shared_features or self.latent_features is not None):
+                or self.scale_inputs or self.shared_features or self.latent_features is not None
+                or self.weight_sum_epsilon != WEIGHT_SUM_EPSILON or self.weight_sum_min):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, routing blocks, input scaling "
-                "or shared branch to set")
+                "score function, scaling, groups, balancing bias, routing blocks, input scaling, "
+                "shared branch or renormalization bounds to set")
 
     @property
     def beside_dense(self) -> bool:
@@ -275,7 +276,8 @@ class Mixture:
                                          'groups_per_token', 'group_score', 'bias', 'bias_in_weights',
                                          'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
-                                         'latent_features', 'latent_norm', 'media_bias')
+                                         'latent_features', 'latent_norm', 'media_bias',
+                                         'weight_sum_epsilon', 'weight_sum_min')
                        if getattr(self, name) != getattr(plain, name)]
             ignored += ['swiglu_limit'] if swiglu_limit is not None else []
             if ignored:

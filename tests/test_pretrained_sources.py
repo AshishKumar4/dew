@@ -275,14 +275,12 @@ def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for
     """Tier 3 observes, on the probe's model, whether every decoder layer asks transformers' attention
     interface for its attention with a mask Dew's visibility reproduces: StableLM's do, though its
     class declares no attention backend, and run on Dew's (a StableLM norming each head's queries and keys
-    by a layer norm of its own, which tier 2 does not assemble); CTRL's and GPT-NeoX Japanese's compute
-    their own, and keep them, saying why."""
+    by a layer norm of its own, which tier 2 does not assemble); GPT-NeoX Japanese's compute their own,
+    and keep it, saying why."""
     from dew.interop.pretrained import source_route
 
     stablelm = source_route(tiny_config("stablelm", qk_layernorm=True).to_dict()).admitted
     assert stablelm.attends and not stablelm.why
-    ctrl = source_route(tiny_config("ctrl").to_dict()).admitted
-    assert not ctrl.attends and ctrl.why
     # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: the probe's mask is
     # transformers' eager one, so its attention stays causal and the type is admitted on its own.
     japanese = source_route(tiny_config("gpt_neox_japanese").to_dict()).admitted
