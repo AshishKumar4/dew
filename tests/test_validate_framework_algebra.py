@@ -62,7 +62,8 @@ def test_accurate_only_identities_does_not_build_saturate_extract(monkeypatch, s
                       "unchanged": str(before) == str(after)}), flush=True)
     assert admitted == ["identities"]
     assert str(before) == str(after)
-    assert seen == {}, f"Identities-only tracing still did the runtime algebra phases: {seen}"
+    if seen:
+        pytest.fail(f"Identities-only tracing still did the runtime algebra phases: {seen}", pytrace=False)
 
 
 def leaf_read_control(region, schedule):
@@ -95,7 +96,10 @@ def test_two_inputs_are_read_in_both_reduction_forms(leaf_reads):
         print(json.dumps({"leaf_reads": leaf_reads, "target": cost.target().device_kind,
                           "Fused_rates": dataclasses.asdict(schedule), **row}), flush=True)
     expected = 2 * 8192 * 4
-    assert [row["work"]["device_bytes"] for row in rows] == [expected, expected], rows
+    observed = [row["work"]["device_bytes"] for row in rows]
+    if observed != [expected, expected]:
+        pytest.fail(f"Both forms read two inputs of {expected} bytes in all, but cost.work gives {observed}",
+                    pytrace=False)
 
 
 def test_default_pass_selects_joined_but_accurate_does_not():
