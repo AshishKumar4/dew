@@ -324,7 +324,7 @@ class WorldModel(nn.Module):
         """The encoder's tokens of an observation (`seen`): a vector's symlogged first (rssm.py:218), an
         image's pixels through the convolutions, its proprioceptive entries symlogged through an MLP and
         joined to them."""
-        if isinstance(observation, Mapping):
+        if self.proprio:
             image, proprio = view(observation, "image"), view(observation, "proprio")
             return jnp.concatenate([self.encoder(image), self.proprio_encoder(symlog(proprio))], -1)
         read = view(observation)
@@ -377,17 +377,15 @@ class WorldModel(nn.Module):
             return self.decoded(self.vector_decoder(self.feature(deter, stoch)))
         return self.image_decoder(deter, stoch)
 
-    def reconstruction(self, deter: jax.Array, stoch: jax.Array,
-                       observation: jax.Array | dict[str, jax.Array]) -> jax.Array:
+    def reconstruction(self, deter: jax.Array, stoch: jax.Array, observation: Observation) -> jax.Array:
         """The decoder's squared error, summed over the observation: against a vector's symlog, or an
         image's pixels over 255 (rssm.py:345-355, outs.MSE summed over the image's axes); the
         proprioceptive entries are the auxiliary heads' to decode."""
-        if isinstance(observation, Mapping):
-            observation = view(observation, "image")
+        read = view(observation, "image" if self.proprio else None)
         decoded = self.decode(deter, stoch).astype(jnp.float32)
         if self.image is None:
-            return jnp.sum(jnp.square(decoded - symlog(observation)), -1)
-        return jnp.sum(jnp.square(decoded - divided(observation.astype(decoded.dtype), 255)), (-3, -2, -1))
+            return jnp.sum(jnp.square(decoded - symlog(read)), -1)
+        return jnp.sum(jnp.square(decoded - divided(read.astype(decoded.dtype), 255)), (-3, -2, -1))
 
     def reward(self, feature: jax.Array) -> jax.Array:
         return self.reward_logits(self.reward_layers(feature)).astype(jnp.float32)
@@ -520,7 +518,9 @@ class DreamerV3Objective(Objective[Ratio]):
     `imagination` is the imagined steps from each replayed state, `lam` the lambda-returns' lambda,
     `entropy` the actor's bonus, `slow_decay` the slow critic's EMA and `return_rate` the rate of
     the returns' percentile EMA. The slow critic is the EMA slot over the critic alone; with
-    `slow_targets` the imagined returns bootstrap from it (configs.yaml `slowtar`, as SkyDreamer sets it).
+    `slow_targets` the imagined returns bootstrap from it and the advantage is taken over it (configs.yaml
+    `slowtar`, agent.py's `tarval`, as SkyDreamer sets it). A `decoder` scale of 0 rebuilds no observation:
+    an informed world model's auxiliary heads decode privileged entries alone (SkyDreamer, Sec II-B).
     `smoothness` weighs the squared change of the policy's mean between imagined steps, added to the
     policy's loss (SkyDreamer, arXiv 2510.14783 Eq 11, its 0.002: on the mean alone, so the entropy bonus
     is untouched)."""
@@ -694,8 +694,10 @@ class DreamerV3Objective(Objective[Ratio]):
                                     self.free_nats),
             "representation": jnp.maximum(kl_divergence(jax.lax.stop_gradient(prior), posterior).sum(-1),
                                           self.free_nats),
-            "decoder": model.reconstruction(deter, stoch, observation),
             "reward": twohot_loss(model.reward(feature), reward, self.bins),
+            # An informed world model decodes privileged entries in the observation's place (scale 0).
+            **({"decoder": model.reconstruction(deter, stoch, observation)}
+               if self.scales["decoder"] else {}),
         }
         alive = (1 - terminal) * (1 - 1 / self.horizon)
         logit = model.continue_(feature)
@@ -754,7 +756,7 @@ class DreamerV3Objective(Objective[Ratio]):
         low = (1 - rate) * held_returns["low"] + rate * jnp.percentile(returns, 5)
         high = (1 - rate) * held_returns["high"] + rate * jnp.percentile(returns, 95)
         scale = jnp.maximum(1.0, high - low)
-        advantage = jax.lax.stop_gradient((returns - values[:, :-1]) / scale)
+        advantage = jax.lax.stop_gradient((returns - boot[:, :-1]) / scale)
         imagined_policy = self._imagined_policy(model.policy(features), actions, advantage, weight)
         value_logits = model.value(features)
         targets = jnp.concatenate([returns, jnp.zeros_like(returns[:, -1:])], 1)

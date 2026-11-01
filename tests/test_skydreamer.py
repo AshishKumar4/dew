@@ -3,6 +3,7 @@ and ends over drawn flights (Eq 1-2, Sec II-C), its starts (Table III), the flig
 commands its actions are; a world model reading proprioceptive entries beside its image; the policy-mean
 smoothness term (Eq 11); and the base check's run (`tools/skydreamer_race.py`) read back from its record."""
 
+import dataclasses
 import itertools
 import json
 import math
@@ -14,7 +15,7 @@ import numpy as np
 from reference_error import assert_computes_the_oracle
 
 from dew.objectives.rl.dreamer import DreamerV3Objective, WorldModel
-from dew.rl.quadrotor import GRAVITY
+from dew.rl.quadrotor import GRAVITY, hovering
 from dew.rl.skydreamer import CIRCLE, Lap, Sky, SkyRace, plan
 
 SKY = Sky()
@@ -30,10 +31,11 @@ def written_step(sky: Sky, before: np.ndarray, after: np.ndarray, velocity: np.n
                  orientation: np.ndarray, held: tuple) -> tuple:
     """A step of the race written from Sec II-C, from the drone's position before and after it: the planes
     crossed in order on the step's straight path (pre-gate, gate, post-gate, then the next gate's), each
-    crossing's gate reward or, outside the gate's size, the end; progress toward the pre-gate headed for
-    while before it; the rate penalty; the shaped ground contact; a final reward of zero at an end."""
+    crossing's gate reward or, outside the gate's size, the end there; progress toward the pre-gate headed
+    for up to where the step crosses it; the rate penalty; the shaped ground contact; a final reward of zero
+    at an end."""
     index, stage, distance, passed = held
-    approaching, aimed, gate, collided = stage == 0, index, 0.0, False
+    approaching, aimed, gate, collided, reached = stage == 0, index, 0.0, False, after
     for _ in range(3):
         center, heading = sky.track[index]
         heading = math.radians(heading)
@@ -43,16 +45,19 @@ def written_step(sky: Sky, before: np.ndarray, after: np.ndarray, velocity: np.n
         start, end = (before - center) @ normal, (after - center) @ normal
         if not start < plane <= end:
             break
-        where = before + (plane - start) / (end - start) * (after - before) - np.asarray(center)
+        crossing = before + (plane - start) / (end - start) * (after - before)
+        where = crossing - np.asarray(center)
         off = max(abs(where @ left), abs(where[2])) / sky.size
+        if stage == 0:
+            reached = crossing
         if off > 1:
             collided = True
-        else:
-            gate += 1 - off
+            break
+        gate += 1 - off
         if stage == 2:
             passed, index = passed + 1, (index + 1) % len(sky.track)
         stage = (stage + 1) % 3
-    progress = distance - np.linalg.norm(after - pre_gate_of(sky, aimed)) if approaching else 0.0
+    progress = distance - np.linalg.norm(reached - pre_gate_of(sky, aimed)) if approaching else 0.0
     rate = math.expm1(min(np.abs(rates).sum(), 17.0)) / (2 * sky.hz * 1e5)
     w, x, y, z = orientation
     roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
@@ -90,8 +95,10 @@ def test_a_race_rewards_and_ends_as_skydreamer_writes():
                 reward, ended, held = written_step(
                     SKY, before, np.asarray(flight.position), np.asarray(flight.velocity),
                     np.asarray(flight.angular_velocity), np.asarray(flight.orientation), held)
-                got.append(float(taken.reward))
-                want.append(reward)
+                # Each reward beside the distance its progress is a difference of: rounding at the course's
+                # size, which a small reward alone would not show.
+                got += [float(taken.reward), float(lap.distance)]
+                want += [reward, held[2]]
                 assert (bool(taken.terminated), int(lap.index), int(lap.stage), int(lap.passed)) == (
                     ended, held[0], held[1], held[3])
                 planes += held[1] != 0
@@ -102,6 +109,32 @@ def test_a_race_rewards_and_ends_as_skydreamer_writes():
             assert_computes_the_oracle(np.asarray(got), np.asarray(want), f"drone {drone}'s rewards",
                                        roundings=256)
     assert planes and gates and ends
+
+
+def test_a_step_through_the_pre_gate_approaches_it_up_to_where_it_crosses():
+    """A drone hovering level along the first gate's normal at 3.6 m/s, 0.41 m before the gate (the pre-gate
+    0.4 m before it), crosses the pre-gate within a step: it earns the 0.01 m it approached the pre-gate,
+    none for the way past it, and the pre-gate's reward at its centre, 30, so 30.05; started 0.9 m to the
+    gate's side instead, it crosses the pre-gate beyond the gate's 0.8 m and ends there, its reward 0."""
+    race = SkyRace(views=("passed",))
+    center, heading = CIRCLE[0]
+    heading = math.radians(heading)
+    normal = np.asarray([math.cos(heading), math.sin(heading), 0.0])
+    left = np.asarray([-math.sin(heading), math.cos(heading), 0.0])
+    level = np.asarray([math.cos(heading / 2), 0.0, 0.0, math.sin(heading / 2)])
+    with jax.enable_x64(new_val=True):
+        lap, _ = race.reset(jax.random.key(0))
+        for aside, reward, ended in ((0.0, 30.05, False), (0.9, 0.0, True)):
+            start = np.asarray(center) - 0.41 * normal + aside * left
+            flight = dataclasses.replace(
+                hovering(SKY.quadrotor, lap.body, jnp.asarray(start), jnp.asarray(level)),
+                velocity=jnp.asarray(3.6 * normal))
+            here = dataclasses.replace(lap, flight=flight, index=jnp.asarray(0), stage=jnp.asarray(0),
+                                       distance=jnp.asarray(np.hypot(0.01, aside)))
+            after, taken = race.step(here, jnp.zeros(4))
+            assert (bool(taken.terminated), int(after.stage)) == (ended, 0 if ended else 1)
+            assert_computes_the_oracle(np.asarray([float(taken.reward)]), np.asarray([reward]),
+                                       f"crossing {aside} m aside", roundings=64)
 
 
 def test_a_race_starts_before_a_gate_at_rest():
@@ -163,28 +196,42 @@ def test_an_action_commands_collective_thrust_and_body_rates():
             clipped = min(max(throttle, -1.0), 1.0)
             expected = hover + clipped * (full - hover if clipped >= 0 else hover)
             assert_computes_the_oracle(np.r_[float(collective), np.asarray(commanded)],
-                                       np.r_[expected, rates * SKY.rate_limit], f"throttle {throttle}",
+                                       np.r_[expected, np.clip(rates, -1, 1) * SKY.rate_limit],
+                                       f"throttle {throttle}",
                                        roundings=4)
 
 
 def test_a_world_model_reads_its_proprioceptive_entries_beside_its_image():
-    """A world model reading proprioceptive entries beside its image sets two observations apart that differ
-    in them alone, and reads an image alike whatever they are when it reads none; its posterior over a
-    window of such observations trains (a finite loss) as an image's alone does."""
+    """An agent whose world model reads proprioceptive entries beside its image acts apart on two drones that
+    see the same image and differ in those entries alone, where one reading the image alone acts alike; and
+    its loss over windows of such observations, the posterior scanned over each, is finite."""
+    from dew.objectives.base import Step
+
     proprio = (("rates", 3), ("plan", 5))
     shared = {"image": (16, 16, 3), "reads": "image", "deter": 32, "hidden": 8, "stoch": 4, "classes": 4,
               "units": 16, "conv_depth": 4}
-    image = np.random.default_rng(1).integers(0, 255, (16, 16, 3))
-    images = jnp.asarray(np.stack([image, image]), jnp.uint8)
-    observed = {"image": images, "rates": jnp.asarray([[0.1, 0.2, 0.3]] * 2),
-                "plan": jnp.asarray([[0.0] * 5, [1.0] * 5])}
+    rng = np.random.default_rng(1)
+    image = rng.integers(0, 255, (16, 16, 3))
+    seen = {"image": jnp.asarray(np.stack([image, image]), jnp.uint8),
+            "rates": jnp.asarray([[0.1, 0.2, 0.3]] * 2), "plan": jnp.asarray([[0.0] * 5, [1.0] * 5])}
+    step = {"observation": seen, "reward": jnp.zeros(2), "first": jnp.ones(2, bool),
+            "last": jnp.zeros(2, bool), "terminal": jnp.zeros(2, bool)}
+    windows = {"observation": {"image": jnp.asarray(rng.integers(0, 255, (2, 6, 16, 16, 3)), jnp.uint8),
+                               "rates": jnp.asarray(rng.normal(size=(2, 6, 3))),
+                               "plan": jnp.asarray(rng.normal(size=(2, 6, 5)))},
+               "action": jnp.asarray(rng.uniform(-1, 1, (2, 6, 4))),
+               "reward": jnp.asarray(rng.normal(size=(2, 6))),
+               "first": jnp.zeros((2, 6), bool), "last": jnp.zeros((2, 6), bool),
+               "terminal": jnp.zeros((2, 6), bool)}
     for reading, apart in ((proprio, True), ((), False)):
-        model = WorldModel(0, 4, proprio=reading, **shared)
-        objective = DreamerV3Objective(model)
+        objective = DreamerV3Objective(WorldModel(0, 4, proprio=reading, **shared), imagination=3)
         variables = objective.init(jax.random.key(0))
-        bound = model.bind(variables)
-        posterior = np.asarray(bound.posterior(jnp.zeros((2, 32)), bound.embed(bound.seen(observed))))
-        assert (not np.array_equal(posterior[0], posterior[1])) == apart
+        acted, _, _ = objective.greedy(variables, step, jax.random.key(1), objective.memory(2))
+        assert (not np.array_equal(np.asarray(acted[0]), np.asarray(acted[1]))) == apart
+        if reading:
+            step_of = Step(jnp.zeros((), jnp.int32), jax.random.key(2), None)
+            ratio, _ = objective.loss(variables, windows, step_of)
+            assert np.isfinite(float(ratio.total))
 
 
 def test_the_smoothness_term_is_the_squared_change_of_the_imagined_means():

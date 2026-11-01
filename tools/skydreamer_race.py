@@ -2,20 +2,21 @@
 from scratch on its race (`dew.rl.skydreamer`) from the camera's RGB image, by collective thrust and body
 rates, its world model decoding the privileged state; an environment run
 (`dew.objectives.rl.config.EnvRunConfig`) under OUT, which the tool run again goes on from, judged greedy
-every `--every` updates into OUT/base.json.
+every `--every` updates into OUT/base.json, on Table III's evaluation starts (each before the first gate)
+and gates (1 m in size).
 
     python tools/skydreamer_race.py OUT --assets A [--updates 125000] [--every 12500]
 
 The recipe at SkyDreamer's settings (Sec III-A): DreamerV3's size12m model (an RSSM of 2048, 256 hidden, 16
 classes; 16 deep convolutions and 256 units) over a 64 x 64 image beside the body rates, rotor speeds and
-flight plan, decoding the `state` and those three; `train_ratio` 128 over 16 environments, a replay of
-`REPLAY` steps, imagined returns bootstrapped from the slow critic (`slowtar`) and the policy's mean smoothed
-at 0.002 (Eq 11), LaProp at 4e-5 after a 1000-update warmup. 125,000 updates replay 128 steps for each of 1M
-taken. Not SkyDreamer's: its replay of 10M steps (of 64 x 64 masks, 4 KB a step; this image's 12 KB a step
-holds 2M in 25 GB of the GPU's memory, and 10M would take 123 GB), its `replay_context` of 16 (each window
-here starts its latent afresh), its later phases (a batch length of 256 after 8M steps, the entropy and rate
-lowered after 13M) and the race's departures (`dew.rl.skydreamer`: the track, the camera's tilt, the actions,
-the image)."""
+flight plan, decoding the `state`, the rates and the rotor speeds in the image's place; `train_ratio` 128 over
+16 environments, a replay of `REPLAY` steps, imagined returns bootstrapped from the slow critic (`slowtar`)
+and the policy's mean smoothed at 0.002 (Eq 11), LaProp at 4e-5 after a 1000-update warmup. 125,000 updates
+replay 128 steps for each of 1M taken. Not SkyDreamer's: its replay of 10M steps (of 64 x 64 masks, 4 KB a
+step; this image's 12 KB a step holds 2M in 25 GB of the GPU's memory, and 10M would take 123 GB), its
+`replay_context` of 16 (each window here starts its latent afresh), its later phases (a batch length of 256
+after 8M steps, the entropy and rate lowered after 13M) and the race's departures (`dew.rl.skydreamer`: the
+track, the camera's tilt, the actions, the image)."""
 
 from __future__ import annotations
 
@@ -33,13 +34,16 @@ from dew.config import ObjectiveConfig, TrainerConfig
 from dew.objectives.rl.config import EnvConfig, EnvRunConfig, RolloutConfig
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
+from dew.rl.hyperlux import HyperLuxRenderer
+from dew.rl.skydreamer import Sky, SkyDreamerRace
 
 ENVIRONMENTS, PIXELS, REPLAY = 16, 64, 2_000_000
 SENSED = (("rates", 3), ("motors", 4), ("plan", 24))
 """What the encoder reads beside the image, each entry and its width."""
-DECODED = (("state", 16, 256), *((name, width, 256) for name, width in SENSED))
-"""What the world model decodes besides the image (the informed decoder): the privileged state and the
-sensed entries, each two layers of 256 then its width."""
+DECODED = (("state", 16, 256), ("rates", 3, 256), ("motors", 4, 256))
+"""What the informed world model decodes, in the image's place (SkyDreamer Sec II-B: the information variable
+leaves the image out, and the flight plan is no observation of the drone): the privileged state and the
+sensed rates and rotor speeds, each two layers of 256 then its width."""
 
 
 def run(out: Path, assets: Path, drones: int = ENVIRONMENTS) -> EnvRunConfig:
@@ -54,7 +58,7 @@ def run(out: Path, assets: Path, drones: int = ENVIRONMENTS) -> EnvRunConfig:
             "auxiliary": [list(head) for head in DECODED], "deter": 2048, "hidden": 256, "stoch": 32,
             "classes": 16, "blocks": 8, "units": 256, "conv_depth": 16, "dtype": "bfloat16"}),
         objective=ObjectiveConfig("dew.objectives.rl.dreamer:DreamerV3Objective",
-                                  {"slow_targets": True, "smoothness": 0.002}),
+                                  {"slow_targets": True, "smoothness": 0.002, "scales": {"decoder": 0.0}}),
         rollout=RolloutConfig("dreamer", {"batch": 16, "length": 64, "train_ratio": 128.0,
                                           "capacity": REPLAY // drones, "prefill": 64}),
         optim=OptimConfig(optimizer="laprop", learning_rate=Linear(peak_value=4e-5, warmup_steps=1000,
@@ -98,20 +102,29 @@ def trained(out: Path, assets: Path, updates: int, every: int) -> dict:
     prepared = run(out, assets).prepare()
     rollout, agent = prepared.rollout, prepared.objective
     assert isinstance(rollout, DreamerRollout) and isinstance(agent, DreamerV3Objective)
-    judged = EnvConfig("skydreamer", {"renderer": {"class": "dew.rl.hyperlux:HyperLuxRenderer", "fields": {
-        "count": ENVIRONMENTS, "assets": str(assets), "size": PIXELS}}}).build()
-    began = time.perf_counter()
-    while done < updates:
-        reached = min(updates, (done // every + 1) * every)
+    # Table III's evaluation: every start before the first gate, the gates' size 1 m.
+    judged = SkyDreamerRace(HyperLuxRenderer(ENVIRONMENTS, assets, size=PIXELS), Sky(anywhere=0.0, size=1.0))
+    began, state = time.perf_counter(), None
+    scored_at = {point["updates"] for point in report["points"]}
+    while state is None or done < updates:
+        # A chunk checkpointed and stopped before its score is restored there and scored before the next.
+        pending = state is None and done > 0 and done not in scored_at
+        reached = done if pending else min(updates, (done // every + 1) * every)
         prepared = dataclasses.replace(prepared, run=prepared.run.override({"trainer.steps": reached}))
         state = prepared.train("base")
         done = int(state.step)
+        if done in scored_at:
+            continue
         point = {"updates": done, "environment_steps": rollout.environment_steps,
                  "seconds": time.perf_counter() - began, "episode_return": rollout.metrics["episode_return"],
                  **scored(judged, agent, state.variables, jax.random.key(done))}
         report["points"].append(point)
+        scored_at.add(done)
         print(json.dumps(point), flush=True)
-        path.write_text(json.dumps(report, indent=1))
+        # Written aside and moved over, so a stop mid-write leaves the last report whole.
+        aside = path.with_suffix(".json.part")
+        aside.write_text(json.dumps(report, indent=1))
+        aside.replace(path)
     return report
 
 

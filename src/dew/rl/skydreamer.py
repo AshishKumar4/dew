@@ -3,7 +3,8 @@ thrust and body rates: its task, reward, termination and starts, with Dew's quad
 
 The task (Sec II-C, Table III): a track's gates passed in order, each through its pre-gate, itself and its
 post-gate, planes `depth` / 2 before and after it. The reward is 5 progress - rate + 30 gate. Progress is the
-step's approach to the next pre-gate, zero from the pre-gate through the post-gate. The rate penalty is
+step's approach to the next pre-gate, zero from the pre-gate through the post-gate: a step that crosses the
+pre-gate approaches it up to where it crosses. The rate penalty is
 (exp(min(|rates|_1, 17)) - 1) over 2 f_c 1e5. The gate reward at each of the three planes is 1 - max(|y|, |z|)
 / `size` where the drone crosses it. An episode ends, its last reward zero, when the drone crosses one of
 those planes beyond `size` of the gate's centre, or when it is within 0.5 m of the ground while descending
@@ -23,13 +24,17 @@ et al., arXiv 2501.14377, Sec III-B): its first entry the throttle, zero the dro
 
 The policy reads the camera's image (`image`, the renderer's, `SkyDreamerRace`) and, as SkyDreamer's does,
 the body rates, the rotors' speeds (each a share of the top speed, so a decoder's squared error over them is
-of the others' size) and the flight plan (Sec II-H, Eq 12: for the next three gates, the change
-in position and yaw from the gate before, then their positions and yaws). The privileged entries a world
-model decodes (`state`, Sec II-B) are the position and velocity in the world and in the gate headed for, and
-the orientation; with randomization off the camera's extrinsics and the dynamics' parameters are constants,
-left out. The camera is tilted up `uptilt`, 30 degrees and fixed (the owner's, where SkyDreamer's is 45 to
-55), its field of view `fov` that of SkyDreamer's focal length, 25 pixels across 64. Randomization is off:
-no parameter spread, disturbances or noise.
+of the others' size) and the flight plan (Sec II-H, Eq 12: for the next three gates, the change in position
+and yaw from the gate before, then their positions and yaws). The plan moves on as the drone crosses a gate's
+plane: SkyDreamer moves it at a random point from the pre-gate to the post-gate in training, and where its
+world model's decoded position passes 0.15 m before the gate in flight; with randomization off it moves at
+the gate. The privileged entries a world model decodes (`state`, Sec II-B) are the position and velocity in
+the world and in the gate headed for, and the orientation, the roll, pitch and yaw in the world and the yaw
+from the gate's heading; with randomization off the camera's extrinsics and the dynamics' parameters are
+constants, left out. The camera is tilted up `uptilt`, 30 degrees and fixed (the owner's, where SkyDreamer's
+is 45 to 55), its field of view `fov` that of SkyDreamer's focal length, 25 pixels across 64. Randomization
+is off: no parameter spread, disturbances or noise; and SkyDreamer's image and action delays (33 and 11 ms,
+Sec III-A) are off, as the baseline's latency is (the owner's).
 
 Not SkyDreamer's: the track. Its tracks are given only in figures, so `CIRCLE` stands four gates on a circle
 in its 8 x 8 m arena. The world frame is x forward, y left, z up (`dew.rl.flight`'s).
@@ -145,6 +150,12 @@ def plan(sky: Sky, index: jax.Array) -> jax.Array:
     return jnp.concatenate([changes, jnp.concatenate([centers[1:], headings[1:, None]], -1).reshape(-1)])
 
 
+def heading_of(orientation: jax.Array) -> jax.Array:
+    """An orientation's yaw (its yaw, pitch, roll Euler angles')."""
+    w, x, y, z = orientation
+    return jnp.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+
 def roll_pitch(orientation: jax.Array) -> tuple[jax.Array, jax.Array]:
     """An orientation's roll and pitch (its yaw, pitch, roll Euler angles')."""
     w, x, y, z = orientation
@@ -173,11 +184,16 @@ class SkyRace:
         normal, left = _axes(jnp.asarray(sky.headings)[lap.index])
         up = jnp.asarray([0.0, 0.0, 1.0])
         in_its = jnp.stack([flight.velocity @ axis for axis in (normal, left, up)])
-        orientation = flight.orientation * jnp.where(flight.orientation[0] < 0, -1.0, 1.0)
+        roll, pitch = roll_pitch(flight.orientation)
+        yaw = heading_of(flight.orientation)
+        from_gate = yaw - jnp.asarray(sky.headings)[lap.index]
+        angles = jnp.stack([roll, pitch, yaw, jnp.arctan2(jnp.sin(from_gate), jnp.cos(from_gate))])
         state = jnp.concatenate([flight.position, in_gate(sky, lap.index, flight.position), flight.velocity,
-                                 in_its, orientation])
+                                 in_its, angles])
         motors = flight.speed / sky.quadrotor.top_speed
-        shown = {"rates": flight.angular_velocity, "motors": motors, "plan": plan(sky, lap.index),
+        # Past the gate's plane, the plan shows the gates after it.
+        planned = (lap.index + (lap.stage == len(PLANES) - 1)) % len(sky.track)
+        shown = {"rates": flight.angular_velocity, "motors": motors, "plan": plan(sky, planned),
                  "state": state, "passed": lap.passed}
         return {view: shown[view] for view in self.views}
 
@@ -241,24 +257,27 @@ class SkyRace:
         after = flight.position
         index, stage, approaching = lap.index, lap.stage, lap.stage == 0
         crossing, collided = jnp.ones((), bool), jnp.zeros((), bool)
-        gate, passed = jnp.zeros(()), lap.passed
+        gate, passed, reached = jnp.zeros(()), lap.passed, after
         for _ in PLANES:
-            # The next plane: crossed this step where the step's path meets it from behind.
+            # The next plane: crossed this step where the step's path meets it from behind, inside the gate's
+            # size to go on; outside it, the episode ends there.
             plane = sky.depth / 2 * (stage - 1)
             start, end = in_gate(sky, index, before)[0], in_gate(sky, index, after)[0]
             crossed = crossing & (start < plane) & (end >= plane)
             where = before + (plane - start) / jnp.where(crossed, end - start, 1.0) * (after - before)
             local = in_gate(sky, index, where)
             off = jnp.maximum(jnp.abs(local[1]), jnp.abs(local[2])) / sky.size
+            inside = crossed & (off <= 1)
             collided = collided | (crossed & (off > 1))
-            gate = gate + jnp.where(crossed & (off <= 1), 1 - off, 0.0)
-            through = crossed & (stage == len(PLANES) - 1)
+            reached = jnp.where(crossed & (stage == 0), where, reached)
+            gate = gate + jnp.where(inside, 1 - off, 0.0)
+            through = inside & (stage == len(PLANES) - 1)
             passed = passed + through.astype(passed.dtype)
             index = jnp.where(through, (index + 1) % len(sky.track), index)
-            stage = jnp.where(crossed, (stage + 1) % len(PLANES), stage)
-            crossing = crossed
-        # Progress toward the pre-gate headed for, none from it through the post-gate.
-        approached = lap.distance - jnp.linalg.norm(after - pre_gate(sky, lap.index))
+            stage = jnp.where(inside, (stage + 1) % len(PLANES), stage)
+            crossing = inside
+        # Progress toward the pre-gate headed for, up to where it is crossed; none from it to the post-gate.
+        approached = lap.distance - jnp.linalg.norm(reached - pre_gate(sky, lap.index))
         progress = jnp.where(approaching, approached, 0.0)
         rate = jnp.expm1(jnp.minimum(jnp.sum(jnp.abs(flight.angular_velocity)), 17.0)) / (2 * sky.hz * 1e5)
         roll, pitch = roll_pitch(flight.orientation)
@@ -289,5 +308,5 @@ class SkyDreamerRace(Seen):
         super().__init__(renderer, SkyRace(self.sky, shown if shown else ("passed",)), views, count)
 
 
-__all__ = ["CIRCLE", "PLANES", "QUADCOPTER", "VIEWS", "Lap", "Sky", "SkyDreamerRace", "SkyRace", "in_gate",
-           "plan", "pre_gate", "roll_pitch"]
+__all__ = ["CIRCLE", "PLANES", "QUADCOPTER", "VIEWS", "Lap", "Sky", "SkyDreamerRace", "SkyRace",
+           "heading_of", "in_gate", "plan", "pre_gate", "roll_pitch"]
