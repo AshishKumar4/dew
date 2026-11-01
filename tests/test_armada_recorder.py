@@ -90,12 +90,13 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     assert reused() == [True, True, True, True, False, False, False]
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     assert reused() == [False, True, False, False, False, False, False]
-    # A file whose records keep no key (a child unfollowed) is in as unrecorded: no record is evidence of it.
+    # A keyed file whose inputs moved is in as changed; one whose records keep no key (a child unfollowed) as
+    # unrecorded, as no record is evidence of it.
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
-                                   "tests/test_exits.py": ["unrecorded"],
+                                   "tests/test_exits.py": ["changed"],
                                    "tests/test_killed.py": ["unrecorded"],
                                    "tests/test_own_environment.py": ["unrecorded"],
-                                   "tests/test_reexecs.py": ["unrecorded"],
+                                   "tests/test_reexecs.py": ["changed"],
                                    "tests/test_reexecs_bare.py": ["unrecorded"]}
 
 
