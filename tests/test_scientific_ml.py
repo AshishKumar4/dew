@@ -270,6 +270,29 @@ def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_s
     assert int(state.updates) == 1 and solves_equations(state.opt_state)
 
 
+@pytest.mark.parametrize("clip", [0.0, 0.05])
+@pytest.mark.parametrize("groups", [False, True])
+def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before_it(clip, groups):
+    """A configured Gauss-Newton optimizer's state, clipped or not, in param groups or not, holds the tree
+    the optimizer a run saved before its clip took effect held (the rate injected around the whole update,
+    a clip chained before it), so such a run's checkpoint restores onto it (row 3360's review)."""
+    from dew.gauss_newton import solved_directions
+    from dew.optim import OptimConfig, ParamGroup, _rate_only, param_labels, scheduled_solver
+
+    params = LeastSquares(8, bias=True).init(jax.random.key(0))["params"]
+    grouped = (ParamGroup("kernels", ("*kernel",)), ParamGroup("rest", ("*",))) if groups else ()
+    config = OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": 1e-3}, clip_grads=clip,
+                         param_groups=grouped)
+    if groups:
+        solvers = {group.name: group.solver(_rate_only, 1.0, 1, {}) for group in grouped}
+        earlier = optax.chain(solved_directions(1e-3), optax.multi_transform(solvers, param_labels(grouped)))
+    else:
+        earlier = scheduled_solver(gauss_newton, 1.0, 1, {"damping": 1e-3})
+    if clip:
+        earlier = optax.chain(optax.clip_by_global_norm(clip), earlier)
+    assert jax.tree.structure(config.build(1).init(params)) == jax.tree.structure(earlier.init(params))
+
+
 def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():
     """A run whose optimizer the command line names (`--optim.optimizer gauss_newton`, its rate 0.5 and
     its damping 1e-3 among `optimizer_opts`), built as `OptimConfig` builds every optimizer
