@@ -46,10 +46,10 @@ past their fourteenth token."""
 
 LONG = Choice("Which intent does the customer's message express? " + "Read the message whole. " * 2000,
               list(INTENTS[:2]))
-"""A question that alone passes `MAX_LEN`, which no row holds."""
+"""A question that alone passes every head's `MAX_LEN`, which no row holds."""
 
-MAX_LEN = 2048
-"""Every head's window, which a joint row of both questions' options holds as a question row holds one's."""
+MAX_LEN = {"joint": 3072, "question": 2048, "letters": 2048}
+"""Each head's window: a joint row lays both questions' options out in one schema, a question row one."""
 
 OPTION_TOKENS, BATCH = 10, 8
 CONTEXT_LAYERS = "0"
@@ -154,7 +154,7 @@ def run_of(cell: Cell, backbone: Path, root: Path) -> DecisionRunConfig:
                 .loading(Loading(workers=0)))
     return DecisionRunConfig(
         pretrained=str(backbone), model=ModelConfig("causal_transformer", {"dtype": "float32"}),
-        head=HEADS[cell.head], max_len=MAX_LEN,
+        head=HEADS[cell.head], max_len=MAX_LEN[cell.head],
         option_tokens=None if cell.joint else OPTION_TOKENS,
         objective=ObjectiveConfig("decision", {"consistency": cell.consistency}), calibrate=False,
         data=read(TRAIN[0], "train"), validation=read(HELD[0], "held"))
