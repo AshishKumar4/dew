@@ -1667,10 +1667,11 @@ class _Build:
 
     def bound_at(self, pipeline: Pipeline, partition: DataPartition) -> int | None:
         """Where a per-share training read of several shares holds a run's bound in examples, the limit
-        before its marks (`examples_bound`), which each share reads its part of (`DataPartition.bounded`);
-        None for a read of one share or in one order, which takes the bound whole before it cuts its
-        shares."""
-        if self.global_order or not self.training or partition.count == 1:
+        before its marks (`examples_bound`), which each share reads its part of (`DataPartition.bounded`),
+        as a streamed read of one share does, whose loading workers each read a slice of the bound's
+        shards (`dew.data.shards.bounded_places`); None for any other read of one share or one in one
+        order, which takes the bound whole before it cuts its shares."""
+        if self.global_order or not self.training or (partition.count == 1 and self.read != "streamed"):
             return None
         marked = examples_bound(pipeline.stages)
         return None if marked is None else marked - 1

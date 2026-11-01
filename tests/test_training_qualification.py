@@ -38,6 +38,7 @@ import qualification_worker as worker
 import torch
 from map_judge import pooled_units, record_units
 from process_support import ProcessGroup
+from remote_cache import HOST
 from token_support import encoded_token_fixture
 from transformers import (
     AutoModelForCausalLM,
@@ -151,9 +152,10 @@ def prepared(directory: Path, kind: str) -> Path:
     return directory
 
 
-KEPT = ("result.json", "state.npz", "export_logits.npz", "reference.npz", "export")
+KEPT = ("result.json", "state.npz", "export_logits.npz", "reference.npz", "export", "cpu.txt")
 """What a run's directory holds that the judge reads: its result, state, export and the export's logits,
-and the baseline's reference loss and gradients, not its checkpoints or its log."""
+the baseline's reference loss and gradients, and the CPU class of the host it ran on (`HOST.cpu_class`),
+not its checkpoints or its log."""
 
 
 def ran(directory: Path, unit: int) -> dict[str, bytes]:
@@ -170,6 +172,8 @@ def ran(directory: Path, unit: int) -> dict[str, bytes]:
             kill_when_ready(interrupted, directory / "ready-to-kill")
         finish(spawn(directory, "resumed"), "resumed")
         out, files = directory / "restarted", {}
+    # XLA:CPU compiles for its host's class, so the two units' bits are comparable on one class alone.
+    (out / "cpu.txt").write_text(HOST.cpu_class())
     files.update({name: out / name for name in KEPT if (out / name).exists()})
     return {str(path.relative_to(directory)): path.read_bytes() for kept in files.values()
             for path in ([kept] if kept.is_file() else sorted(kept.rglob("*"))) if path.is_file()}
@@ -202,6 +206,9 @@ def test_a_loaded_source_resumes_mid_accumulation_and_exports_as_transformers_re
 def assert_resumed_onto_every_leaf_of_the_uninterrupted_run(qualified: Path) -> None:
     """The run killed mid-accumulation resumes onto every leaf of the uninterrupted run, bit for bit, its
     resume finding every program in the cache its interrupted run filled."""
+    hosts = [(qualified / run / "cpu.txt").read_text() for run in ("baseline", "restarted")]
+    assert hosts[0] == hosts[1], (f"the uninterrupted run ran on {hosts[0]} and the resumed on {hosts[1]}: "
+                                  "XLA:CPU compiles for its host's class, so their bits compare on one alone")
     baseline, resumed = (json.loads((qualified / run / "result.json").read_text())
                          for run in ("baseline", "restarted"))
     assert (resumed["restored_step"], resumed["restored_updates"]) == (worker.CHECKPOINT_STEP,
