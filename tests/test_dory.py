@@ -419,9 +419,9 @@ def test_a_shared_loop_cache_takes_each_prompt_whole(options):
         Server.from_task(greedy('last_loop'), slots=2, capacity=32, **options)
 
 
-DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 32}
-"""Declared seeds for check 1, sized by `seeds_for` on armada: the live torch reference's gradient of
-every checkpoint tensor, through every pass or through the last pass alone."""
+DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 64}
+"""Declared seeds for check 1, each sized paired (`seeds_for` with Dew's arm) on armada: the live torch
+reference's gradient of every checkpoint tensor, through every pass or through the last pass alone."""
 
 
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
@@ -429,9 +429,10 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     """The gradient of a loss over the logits in every tensor the checkpoint holds, its projections,
     nGPT gains and steps, the embeddings and the logit gain, as the reference's autograd takes it,
     within the rule: through every pass, and with the loop cut before its last pass, where the
-    input layers still train through what that pass reinjects (Huginn's truncation). Each draw has
-    fresh token ids and cotangents, with their batch rows permuted together, an exact symmetry of
-    the summed loss. The same torch reference that wrote the fixture runs live in fp32 and float64;
+    input layers still train through what that pass reinjects (Huginn's truncation). The loss
+    reaches every tensor, so no gradient is compared as zero against zero. Each draw has fresh
+    token ids and cotangents, with their batch rows permuted together, an exact symmetry of the
+    summed loss. The same torch reference that wrote the fixture runs live in fp32 and float64;
     every gradient keeps its checkpoint name."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
@@ -467,6 +468,8 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
         order = rng.permutation(len(ids))
         return ids[order], cotangent[order]
 
+    unreached = [tensor for tensor, gradient in torch_gradients(*draw(0)).items() if not np.any(gradient)]
+    assert not unreached, unreached
     dew, reference = jax.jit(dew), jax.jit(reference)
     label = f'Dory {name} gradients'
     assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
