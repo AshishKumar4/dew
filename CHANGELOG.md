@@ -12,6 +12,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   of Dew's optimizers reads a stacked leaf as its stored layers. A checkpoint holds every layer as one
   device's would and resumes onto any stage count. `Layout(stage_local=False)` keeps every layer whole on
   every stage, as does a run whose optax transformation may read a parameter whole, and a DiLoCo run.
+- A corpus whose objective makes several rows of each example counts its examples as `data/rows`, not the
+  rows or windows made of them: a run bounded in examples counts those whose last rows were delivered, an
+  example a step refused or made no row of under `data/rejected`; any other run counts the examples read
+  before the objective's step. A streamed read's examples bound and `.take(n)` read by loading workers take
+  their count once across the workers (each worker took it of its own slice). A run bounded in examples
+  trains with a rollout, and with a custom `step=` whose schedule decays over its own steps. In a pool, a
+  read of the training stream after its first is agreed over the coordination service only where its
+  shares may run out apart, so a global order, arrays handed whole and a handed map dataset step without a
+  round a step.
 - Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md).
   egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
   (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,

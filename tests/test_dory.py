@@ -15,7 +15,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from float64_terms import float64_forward
-from interop_support import assert_reloads, assert_same_stored_tensors
+from interop_support import assert_reloads, assert_same_stored_tensors, token_draw
 from model_support import as_stepped
 from reference_error import (
     as_given,
@@ -99,21 +99,14 @@ def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, **fields)
                  for arm in arms)
 
 
-def drawn_ids(stream: int, shape: tuple[int, ...], vocabulary: int):
-    """A draw of token ids of `shape` past the tiny's specials, `stream`'s own for each seed."""
-    def draw(seed):
-        return (np.random.default_rng([stream, seed]).integers(12, vocabulary, shape, dtype=np.int32),)
-    return draw
-
-
-def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, seeds: int, *, stream: int,
-                           config: dict | None = None, **fields) -> None:
+def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, **fields) -> None:
     """Check 1 of `dew(ids)`, Dory's logits over drawn ids of the fixture's shape, against the
-    transcription's forward (`transcribed`) over `loaded`'s weights, its float64 run the truth."""
-    config = loaded.config if config is None else config
-    reference, truth = transcribed(config, tensors_of(loaded), lambda arm, ids: arm.forward(ids), **fields)
-    assert_as_exact(dew, reference, drawn_ids(stream, REFERENCE['input_ids'].shape, config['vocab_size']),
-                    label, seeds=seeds, truth_fn=truth)
+    transcription's forward (`transcribed`) over `loaded`'s weights, its float64 run the truth, over
+    `LOGITS_SEEDS`."""
+    reference, truth = transcribed(loaded.config, tensors_of(loaded), lambda arm, ids: arm.forward(ids),
+                                   **fields)
+    draw = token_draw(stream, loaded.config['vocab_size'], REFERENCE['input_ids'].shape)
+    assert_as_exact(dew, reference, draw, label, seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize('loops', [1, 2, 4])
@@ -172,9 +165,9 @@ def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop
         table = model.apply(loaded.variables, method='output_table')
         return table.logits(model.apply(loaded.variables, ids, method='hidden_states'))
 
-    assert_logits_as_vllms(logits, loaded, f'Dory logits at {loops} loops', LOGITS_SEEDS,
+    assert_logits_as_vllms(logits, loaded, f'Dory logits at {loops} loops',
                            stream=0xD01, loops=loops)
-    assert_logits_as_vllms(tabled, loaded, f"Dory's output table at {loops} loops", LOGITS_SEEDS,
+    assert_logits_as_vllms(tabled, loaded, f"Dory's output table at {loops} loops",
                            stream=0xD02, loops=loops)
 
 
@@ -237,7 +230,7 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
 
     def draw(seed):
         rng = np.random.default_rng([0xD04, seed])
-        return tuple(rng.integers(12, vocabulary, length, dtype=np.int32) for length in (6, 8))
+        return tuple(rng.integers(0, vocabulary, length, dtype=np.int32) for length in (6, 8))
 
     def decoded_by(arm, prompt, tokens):
         return arm.forced(prompt, tokens, prompt_rows=False)
@@ -340,7 +333,7 @@ def test_packed_documents_read_only_themselves_through_every_pass(attention_impl
                          for row in range(len(ids))])
 
     reference, truth = transcribed(loaded.config, tensors_of(loaded), alone)
-    draw = drawn_ids(0xD03, REFERENCE['packed_ids'].shape, loaded.config['vocab_size'])
+    draw = token_draw(0xD03, loaded.config['vocab_size'], REFERENCE['packed_ids'].shape)
     assert_as_exact(packed, reference, draw, 'Dory packed documents', seeds=LOGITS_SEEDS,
                     truth_fn=truth)
 
@@ -442,7 +435,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     every gradient keeps its checkpoint name."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
-    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    tensors = tensors_of(loaded)
     cut = None if backprop_steps is None else loops - backprop_steps
 
     def shapes(dtype):
@@ -469,7 +462,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
 
     def draw(seed):
         rng = np.random.default_rng(5 + seed)
-        ids = rng.integers(12, loaded.config['vocab_size'], REFERENCE['input_ids'].shape, dtype=np.int32)
+        ids = rng.integers(0, loaded.config['vocab_size'], REFERENCE['input_ids'].shape, dtype=np.int32)
         cotangent = rng.normal(size=REFERENCE['cotangent'].shape).astype(np.float32)
         order = rng.permutation(len(ids))
         return ids[order], cotangent[order]
@@ -502,7 +495,7 @@ def test_a_float64_model_computes_in_float64():
     independent implementation of the same tensors (`assert_computes_the_oracle`), where one fp32
     rounding point on the path would sit many orders further."""
     loaded = load()
-    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    tensors = tensors_of(loaded)
     with jax.enable_x64(new_val=True):
         model = loaded.model.clone(dtype=jnp.float64)
         variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
@@ -679,8 +672,7 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
     vocabulary = adapted.model.vocab_size
 
-    def draw(seed):
-        return (np.random.default_rng([0xD0E, seed]).integers(0, vocabulary, ids.shape, dtype=np.int32),)
+    draw = token_draw(0xD0E, vocabulary, ids.shape)
 
     # The adapter as PEFT merges it, its consumer: the transcription over PEFT's merge computes the
     # adapted model's logits on par with its own fp32 run from its float64 one (check 1).
@@ -729,7 +721,7 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
         table = loaded.model.apply(loaded.variables, method='output_table')
         return loaded.model.apply(loaded.variables, ids, method='hidden_states') @ table.rows().T
 
-    assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", LOGITS_SEEDS, stream=0xD05)
+    assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", stream=0xD05)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
@@ -805,7 +797,7 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     def logits(ids):
         return loaded.model.apply(loaded.variables, ids)
 
-    assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', LOGITS_SEEDS, stream=0xD06)
+    assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', stream=0xD06)
 
 
 def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
@@ -996,7 +988,7 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
     config = json.loads((TINY / 'config.json').read_text())
     ids = REFERENCE['input_ids'][0]
     for mode in ('per_loop', 'last_loop'):
-        tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+        tensors = tensors_of(loaded)
         reference = TOOL.DoryReference(config, tensors, torch.float64, mode=mode)
         # The tiny Dory's window is 5: the second prompt runs past it.
         prompts = {'sentence': (ids[:4], True), 'window': (ids, False)}

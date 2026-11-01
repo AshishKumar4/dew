@@ -35,7 +35,8 @@ import tyro
 
 from dew._moments import QuantizedMoments, bf16_moments, int8_moments, scale_by_adam
 from dew._records import share
-from dew.held_updates import refuse_untold, update_applied
+from dew.gauss_newton import gauss_newton, solved_directions
+from dew.held_updates import holds_state, refuse_untold, update_applied
 from dew.laprop import laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
@@ -607,8 +608,7 @@ def clips_qk(opt_state) -> bool:
     """Whether an optimizer state holds a QK-Clip's (`QKClipState`), however the optimizer composes it:
     a run then asks its objective for the step's attention logit maxima (`dew.objectives.Step.qk_stats`)
     and hands them to the update."""
-    return any(isinstance(node, QKClipState) for node in jax.tree.leaves(
-        opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+    return holds_state(opt_state, QKClipState)
 
 
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
@@ -631,7 +631,8 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     def init_fn(params) -> QKClipState:
         return QKClipState(jnp.zeros([], jnp.int32), _rescales(params, None, tau))
 
-    def update_fn(updates, state, params=None, qk_stats=None):
+    def update_fn(updates, state, params=None, qk_stats=None, **extra_args):
+        del extra_args
         if params is None:
             return updates, state
         return updates, state._replace(steps=optax.safe_increment(state.steps),
@@ -998,7 +999,7 @@ def _lamb(learning_rate, b1=0.9, b2=0.999, eps=1e-6, eps_root=0.0, weight_decay=
                        scale_by_trust_ratio(), optax.scale_by_learning_rate(learning_rate))
 
 
-Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop']
+Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop', 'gauss_newton']
 """The optimizers `OptimConfig.optimizer` names, each built by its `OPTIMIZER_MAP` entry."""
 
 STATE_OPTIMIZERS: dict[str, dict[Optimizer, Callable[..., optax.GradientTransformation]]] = {
@@ -1009,6 +1010,11 @@ STATE_OPTIMIZERS: dict[str, dict[Optimizer, Callable[..., optax.GradientTransfor
 their moments stored in bf16 (`bf16_moments`) or in 8 bits (`int8_moments`), their other options kept."""
 
 
+def _rate_only(learning_rate: optax.ScalarOrSchedule) -> optax.GradientTransformation:
+    """A param group's rate over a direction a solve before the groups made (`dew.gauss_newton`)."""
+    return optax.scale_by_learning_rate(learning_rate)
+
+
 OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'adam': _adam,
     'adamw': _adamw,
@@ -1016,7 +1022,14 @@ OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'muon': _muon_groups,
     'muonclip': _muonclip_groups,
     'laprop': laprop,
+    'gauss_newton': gauss_newton,
 }
+
+STACKED_OPTIMIZERS: frozenset[str] = frozenset({'adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop'})
+"""Dew's optimizers whose every rule reads a stage-local run's stacked leaf as its stored layers
+(`layers_of`): a run of one of these keeps its pipelined runs stage-local; any other optimizer's run is
+read by its state's transforms (`dew.training.stages.whole_reading`). Gauss-Newton's one solve over every
+parameter is not yet qualified over stacked leaves, so its run keeps every layer whole on every stage."""
 
 optimizers: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(
     "optimizer", {name: f"{make.__module__}:{make.__qualname__}" for name, make in OPTIMIZER_MAP.items()},
@@ -2112,22 +2125,28 @@ class OptimConfig:
     Empty keeps none.
     """
 
+    def schedules(self) -> list[tuple[str, ScheduleBase]]:
+        """The schedules its solvers run, by where the config holds them: its learning rate's, or each
+        param group's rate (`ParamGroup.rate`, the config's own where the group names none) and b1."""
+        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
+        for group in self.param_groups:
+            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
+            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
+        return [(name, schedule) for name, schedule in held if isinstance(schedule, ScheduleBase)]
+
+    def reads_progress(self) -> bool:
+        """Whether a run that counts no updates ahead (one bounded in examples) hands its optimizer its
+        progress: a schedule of its whose horizon is the run's (`ScheduleBase.run_relative`)."""
+        return any(schedule.run_relative() for _, schedule in self.schedules())
+
     def warmups(self, steps: int | None, clocked: bool = False) -> dict[str, int | str | float]:
         """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
         its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
         run's plan records it; a schedule with no warmup of steps is not among them. A `clocked` run
         counts no updates ahead, so a warmup over the run's progress is recorded as written, its share
         of the examples the run consumes (`ScheduleBase.progressed`)."""
-        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
-        for group in self.param_groups:
-            # The schedules the group's solver runs (`ParamGroup.rate`): the config's own where the
-            # group names none.
-            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
-            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
         warmups: dict[str, int | str | float] = {}
-        for name, schedule in held:
-            if not isinstance(schedule, ScheduleBase):
-                continue
+        for name, schedule in self.schedules():
             if clocked and schedule.run_relative():
                 written = schedule.written_warmup()
                 if written:
@@ -2173,6 +2192,13 @@ class OptimConfig:
         elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
             # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
+        # Gauss-Newton's one solve spans every parameter: each group scales its leaves of its direction.
+        solved = None
+        if self.param_groups and make is gauss_newton:
+            damping = opts.pop('damping', 0.0)
+            if not isinstance(damping, int | float):
+                raise ValueError(f"Gauss-Newton's damping is a number, got {damping!r}")
+            solved, make = solved_directions(float(damping)), _rate_only
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
@@ -2189,6 +2215,8 @@ class OptimConfig:
                 solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
+            if solved is not None:
+                solver = optax.chain(solved, solver)
         else:
             if self.spared and self._spares(make):
                 opts['mask'] = weight_decay_mask

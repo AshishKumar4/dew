@@ -99,7 +99,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import OPTIMIZER_MAP, held_rates, scaled_rates, settable_rates, with_rates
+from dew.optim import STACKED_OPTIMIZERS, held_rates, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -465,8 +465,9 @@ class Trainer(Generic[Loss, Effects]):
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
         """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
         self._device, self._prefetch = loader.device, prefetch
-        self._examples = clocked(examples, steps, custom=self.step is not None,
-                                 rollout=self.rollout is not None, bound_ends=loader.bound_ends)
+        progress = self._config is not None and self._config.reads_progress()
+        self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
+                                 custom_progress=self.step is not None and progress)
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -498,11 +499,10 @@ class Trainer(Generic[Loss, Effects]):
     @functools.cached_property
     def staging(self) -> StageLocal:
         """Where the state keeps each pipelined run stacked by stage (`dew.training.stages`), as the objective
-        declares it over its tree; a CPU-owned state, which streams its stack's banks, keeps none, nor a
-        DiLoCo run, whose groups' inner copies stack on an axis of their own. Dew's own optimizers step a
-        stacked run as its layers; an import path's is read as a transform given (`StageLocal.of`)."""
+        declares it over its tree and its optimizer reads it (`StageLocal.of`); none for a CPU-owned state,
+        which streams its stack's banks, nor a DiLoCo run, whose groups' copies stack on their own axis."""
         tree = {} if self.host_master else jax.eval_shape(self.objective.initializer, jax.random.key(0))
-        built = self._config is not None and self._config.optimizer in OPTIMIZER_MAP
+        built = self._config is not None and self._config.optimizer in STACKED_OPTIMIZERS
         return StageLocal.of(self.objective, tree, self.device_mesh, local=self.layout.stage_local
                              and self.diloco is None, optimizer=None if built else self.optimizer)
 
@@ -1147,7 +1147,11 @@ class Trainer(Generic[Loss, Effects]):
         held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        given = placed_shapes(batch, placement) if mesh is not None else batch
+        # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
+        # arrays a step compiled ahead reads (`first_step_batch`) and one over the placed arrays a run steps
+        # are two texts of one program (`dew.training.ahead.program_of`), the types of a helper call's
+        # arguments, their shardings among them, telling its functions apart in the module.
+        given = placed_shapes(batch, placement)
         lower = Routed(functools.partial(
             lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
             *apart(prepared), given, part))
@@ -1470,9 +1474,9 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, ahead = run.closing(interval, batch, self._examples)
-                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval, run,
-                                   view=self.staging.outside)
+                batch, ahead = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked,
+                                          interval, run, examples=self._examples, closes=True,
+                                          view=self.staging.outside)
                 device, _ = split_fields(batch)
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
@@ -1514,8 +1518,8 @@ class Trainer(Generic[Loss, Effects]):
                 position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
-                interval.count(batch, measured_flops, loss, finite, committed, aux)
-                run.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                interval.count(batch, measured_flops, loss, finite, committed, aux,
+                               run.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
@@ -1754,7 +1758,8 @@ class Trainer(Generic[Loss, Effects]):
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
         run.opened(source, self._examples)
         self._marked = marked(run.partition, self._counted_batch)
-        prepare = self._marked if self.rollout is None else None
+        prepare = self._marked if self.rollout is None else functools.partial(
+            consumption_counted, clocked=self._examples is not None, marks_rows=False)
         if run.pooled:
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
@@ -1921,16 +1926,16 @@ class Trainer(Generic[Loss, Effects]):
                                         phase="cooldown read")
                     if batch is None:
                         break
-                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
-                                       branched, view=self.staging.outside)
+                    batch, _ = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
+                                          counted, branched, view=self.staging.outside)
                     device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                     cooled, loss, aux, finite, _, committed = step(
                         rates_set(cooled, functools.partial(scaled_rates, held=held, factor=factor)), device)
-                    counted.count(batch, None, loss, finite, committed, aux)
-                    branched.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                    counted.count(batch, None, loss, finite, committed, aux,
+                                  branched.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                     done, branched.current = done + 1, branched.current + 1
             finally:
                 self._stage_starts = starts
@@ -2299,8 +2304,7 @@ class Trainer(Generic[Loss, Effects]):
         write = functools.partial(
             checkpoints.save_local, step, self.staging.saved(state), position,
             share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
-            rung=self._checkpoint_rung(),
-            artifact=self._artifact(), boxed=self._boxed_axes())
+            rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes())
         with run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
