@@ -622,7 +622,7 @@ class _Measured:
     branches: tuple[Pipeline, ...]
     metadata: Mapping[str, object] | None
     counts: tuple[dict[str, CorpusCounts], ...]
-    held: bool = False
+    ahead: bool = False
     """Whether its training read is bounded ahead of the expansion its memory would hold, to a count set
     once it holds the examples (`_UNCOUNTED`, `_staged`)."""
 
@@ -662,8 +662,8 @@ def _measure(
         )
     # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
     # a count set once it holds them (`_staged`).
-    held = epochs is not None and training and _holds_expansion(branches[0], read)
-    examples = _UNCOUNTED if held else examples
+    ahead = epochs is not None and training and _holds_expansion(branches[0], read)
+    examples = _UNCOUNTED if ahead else examples
     if examples is not None and training:
         branches = (_bounded(branches[0], examples), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
@@ -681,8 +681,8 @@ def _measure(
             if training and not stored(branches[0]):
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
-        return _Measured(tuple(branches), metadata, tuple(counts or ()), held)
-    return _Measured(tuple(branches), None, tuple(counts or ()), held)
+        return _Measured(tuple(branches), metadata, tuple(counts or ()), ahead)
+    return _Measured(tuple(branches), None, tuple(counts or ()), ahead)
 
 
 def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
@@ -850,7 +850,7 @@ def _staged(
         validation = None
     build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     passes = None
-    if epochs is not None and measured.held:
+    if epochs is not None and measured.ahead:
         # Bounded before the expansion it would hold, it now holds the examples a pass reaches it with.
         passes = _pass_examples(train, read)
         if passes is not None:
