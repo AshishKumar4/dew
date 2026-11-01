@@ -457,6 +457,11 @@ class Layout:
     host: tuple[str, ...] = ()
     host_parameters: tuple[str, ...] = ()
     frozen_whole: bool = False
+    stage_local: bool = True
+    """Whether a pipelined run's layers, with their optimizer state and EMA, are kept stacked by stage on
+    their own stage's devices (`dew.training.stages`), about 1/S of the run on each; False keeps every
+    layer whole on every stage, which an optax transformation that may read a stacked leaf whole needs.
+    Either trains the same arithmetic, bit for bit."""
     data_axes: tuple[str, ...] = ()
     """The axes a batch's rows split over, ahead of the rules' own
     `activation_batch` entries: a native mesh's names for its data-parallel

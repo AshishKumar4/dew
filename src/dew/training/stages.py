@@ -105,13 +105,14 @@ class StageLocal:
     layers, rather than an optax transformation given as it is (`refused`)."""
 
     @classmethod
-    def of(cls, objective, variables, mesh: Mesh, *, built: bool) -> StageLocal:
+    def of(cls, objective, variables, mesh: Mesh, *, built: bool, local: bool = True) -> StageLocal:
         """How a trainer over `mesh` keeps `objective`'s pipelined runs, from `variables` (their shapes
-        or the arrays), its optimizer Dew's where `built`: no run where the mesh has no stage axis or
-        the objective declares none (`Objective.stage_sites`)."""
+        or the arrays), its optimizer Dew's where `built`: no run where the mesh has no stage axis, the
+        objective declares none (`Objective.stage_sites`) or the layout keeps every layer whole on every
+        stage (not `local`, `Layout.stage_local`)."""
         stages = mesh.shape.get(STAGE_AXIS, 1)
         shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype), variables)
-        declared = objective.stage_sites(shapes, stages) if stages > 1 and variables else ()
+        declared = objective.stage_sites(shapes, stages) if local and stages > 1 and variables else ()
         # A run a collection holds in part (a stack frozen by layer index) stays on its stored layers in
         # every collection, which the pipeline restacks as it would any stored layers.
         return cls(tuple(site for site in declared if not any(
@@ -329,7 +330,8 @@ class StageLocal:
                     f"the optimizer's state holds {unknown}, transforms that may read a parameter whole, "
                     f"and a stage axis holds each pipelined run's layers stacked in one; build the "
                     f"optimizer from an OptimConfig, whose rules read a stacked parameter as its layers, "
-                    f"or from transforms that act a number at a time, or train without a stage axis")
+                    f"or from transforms that act a number at a time, or keep every layer whole on every "
+                    f"stage (Layout(stage_local=False)), which trains the same steps")
         return opt_state
 
 

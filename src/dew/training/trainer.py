@@ -500,7 +500,8 @@ class Trainer(Generic[Loss, Effects]):
         """Where the state keeps each pipelined run stacked by stage (`dew.training.stages`), as the objective
         declares it over its tree; a CPU-owned state, which streams its stack's banks, keeps none."""
         tree = {} if self.host_master else jax.eval_shape(self.objective.initializer, jax.random.key(0))
-        return StageLocal.of(self.objective, tree, self.device_mesh, built=self._config is not None)
+        return StageLocal.of(self.objective, tree, self.device_mesh, built=self._config is not None,
+                             local=self.layout.stage_local)
 
     def _groups(self, state: TrainState) -> dict[str, str] | None:
         """Where the optimizer's split sent each parameter (`OptimConfig.groups`), read under the axes the
