@@ -35,7 +35,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.batch import Batch, Variables, dicts, merge
+from dew.batch import VALID_ROWS, Batch, Variables, dicts, merge
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -50,7 +50,7 @@ from dew.sampling.solvers import Solver
 from dew.sampling.solvers.dpm import DPMSolverMultistep
 from dew.sampling.walks import walk_and_decode
 
-from .flow import REWARDS_KEY, GroupedRollout, _source
+from .flow import REWARDS_KEY, GroupedRollout, _source, real_samples
 from .sessions import ADVANTAGES_KEY
 
 if TYPE_CHECKING:
@@ -256,7 +256,10 @@ class NFTRollout(GroupedRollout):
         latents, times = generated
         grouped = rewards.reshape(-1, self.groups)
         centred = grouped - grouped.mean(axis=1, keepdims=True)
-        advantages = (centred / (rewards.std() + 1e-4)).reshape(-1).astype(np.float32)
+        # The rewards' spread is the real samples' (`real_samples`), whose rows alone train.
+        held = real_samples(context)
+        real = np.ones(rewards.shape[0], bool) if held is None else held
+        advantages = (centred / (rewards[real].std() + 1e-4)).reshape(-1).astype(np.float32)
         if not np.isfinite(advantages).all():
             raise ValueError("DiffusionNFT's advantages must remain finite")
         local = np.asarray(latents)[owned]
@@ -269,6 +272,7 @@ class NFTRollout(GroupedRollout):
                                          (local.shape[0], self.train_steps)),
             ADVANTAGES_KEY: advantages[owned],
             REWARDS_KEY: rewards[owned],
+            VALID_ROWS: real[owned],
         })
         return prepared
 

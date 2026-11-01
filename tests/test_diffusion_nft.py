@@ -139,6 +139,26 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
                                   rollout(old_weights, prompts, jax.random.key(23))["latents"])
 
 
+def test_a_rollout_over_a_partly_read_share_trains_only_its_real_rows():
+    """A batch whose last three source rows repeat others (`VALID_ROWS`, a pool's share whose read ran out
+    partway): the rollout's samples of them are marked so (`real_samples`), train nothing, and leave the
+    rewards' spread its real samples' alone (row 3346's review)."""
+    from dew.batch import VALID_ROWS
+
+    start = objective().init(jax.random.key(20))
+    nft = objective(variables=nudged(start, jax.random.key(22)), old_decay=optax.constant_schedule(0.9))
+    prompts = nft.inputs.tokenize(PROMPTS)
+    real = np.arange(len(PROMPTS)) < len(PROMPTS) - 3
+    rollout, initial, _ = fitted(nft, reward, prompts, groups=3, steps=5, train_steps=3)
+    batch = rollout(initial, {**prompts, VALID_ROWS: real}, jax.random.key(23))
+    held = np.repeat(real, 3)
+    np.testing.assert_array_equal(batch[VALID_ROWS], held)
+    rewards = np.asarray(batch["rewards"], np.float64)
+    grouped = rewards.reshape(len(PROMPTS), 3)
+    expected = (grouped - grouped.mean(axis=1, keepdims=True)) / (rewards[held].std() + 1e-4)
+    np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
+
+
 def test_the_released_decay_is_its_trainers_schedule():
     """The old policy's decay at the update after s completed ones is min(0.001 (s + 1), 0.5), the
     released trainer's decay_type 1 at the gradient steps taken (train_nft_sd3.py:169-189 and
