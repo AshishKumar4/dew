@@ -242,6 +242,7 @@ seams: "decoder-families": {
 		MUSE_GLIMMER_TEXT:    "MuseGlimmerTextModel (muse_glimmer_text)"
 		NEMOTRON_H:           "NemotronHForCausalLM (nemotron_h)"
 		OLMO3:                "Olmo3ForCausalLM (olmo3)"
+		OPENAI_GPT:           "OpenAIGPTLMHeadModel (openai-gpt)"
 		OPT:                  "OPTForCausalLM (opt)"
 		OURO:                 "OuroForCausalLM (ouro)"
 		PHI:                  "PhiForCausalLM (phi)"
