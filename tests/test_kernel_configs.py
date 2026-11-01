@@ -243,18 +243,29 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
 
 class _Uncounted(grouped_matmul.MosaicGmm):
     """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
-    registers do not hold: a launch whose model misses."""
+    registers do not hold: a launch whose model misses. Its first tile is a paired product's widest, 128 x
+    256, two accumulators of 128 registers a thread, which spills in every compile whatever its walk's
+    addresses take (the paired 128 x 128 tile this launch took first spilled 16 bytes in the process's own
+    compile only while its walk held a stage's addresses in registers, and none since the walk forms them
+    where it uses them: `mosaic.opaque`); a narrower tile comes once a compile has refused a tile of its
+    launch (`report.refused_launches`, the relowering's proposals included)."""
 
     def registers(self, ba, config):
         return 0
 
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and (
+            config.block_n == 256 or bool(report.refused_launches()))
+
 
 class _OnlyTile(_Uncounted):
-    """A launch with one tile shape, so refusing that shape exhausts its derivation."""
+    """A launch with one tile, the wide one on a producer's layout, so refusing it exhausts its derivation
+    (a tile refused at the planner's first stage count, two, gives way to the next layout, which takes the
+    same shape: `wgmma.fed`)."""
 
     def candidate(self, ba, config, target):
-        return (config.block_m == 128 and config.block_n == 128 and config.warpgroups == 2
-                and super().candidate(ba, config, target))
+        return (config.block_m == 128 and config.block_n == 256 and config.warpgroups == 2
+                and config.family == "wgmma" and super().candidate(ba, config, target))
 
 
 def _spilling_forward(launch, rows: int, devices):

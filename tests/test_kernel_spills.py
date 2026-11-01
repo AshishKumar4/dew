@@ -21,6 +21,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import program
+from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.instrumentation import Compiles
@@ -31,10 +32,16 @@ ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
 
 class _Uncounted(grouped_matmul.MosaicGmm):
     """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
-    registers do not hold: a launch whose model misses, as the kernels' own step-down test makes one."""
+    registers do not hold: a launch whose model misses, as the kernels' own step-down test makes one (its
+    first tile the paired 128 x 256, which spills in every compile whatever its walk's addresses take; a
+    narrower one once a compile has refused a tile of its launch, `report.refused_launches`)."""
 
     def registers(self, ba, config):
         return 0
+
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and (
+            config.block_n == 256 or bool(report.refused_launches()))
 
 
 class Experts(nn.Module):
