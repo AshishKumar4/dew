@@ -1,11 +1,11 @@
 """A pipelined run's state is stage-local (row 861): over a stage axis of S, each device holds its own
 stage's layers of the run a pipeline repeats, with their optimizer state and EMA, about 1/S of the run,
-as the compiled step's own arguments measure it; that state trains bit for bit what the same pipeline
-trains with every layer whole on every stage (`Layout.stage_local`), through each of Dew's optimizers and
-their per-layer rules, and a LoRA adapter's; a checkpoint it writes holds every layer as one device's
-would and resumes onto another stage count; and an optax transformation that may read a stacked leaf
-whole is refused by name, naming the replicated layout that takes it. The pipeline's own parity with one
-device is the pipeline's (ledger 3369), whatever its state's storage."""
+as the compiled step's own arguments measure it; that state trains on par with the same pipeline with
+every layer whole on every stage (`Layout.stage_local`), through each of Dew's optimizers and their
+per-layer rules, and a LoRA adapter's (check 1 against float64); a checkpoint it writes holds every layer
+as one device's would and resumes onto another stage count; and an optax transformation that may read a
+stacked leaf whole is refused by name, naming the replicated layout that takes it. The pipeline's own
+parity with one device is the pipeline's (ledger 3369), whatever its state's storage."""
 
 import dataclasses
 
@@ -16,7 +16,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from model_support import TINY_DECODER
-from reference_error import as_given
+from reference_error import as_given, assert_as_exact, widened
 from token_support import token_rows
 
 from dew.checkpoints import Checkpoints
@@ -141,7 +141,7 @@ def initials(model, optimizer, variables=None):
     drawn again by the seed's key, or `variables(seed)`, its optimizer state the one every draw starts
     from, which no rule here reads parameter values to make. No draw starts where another does, so
     what one fixed state rounds alike on every draw (an Adam step's few near-tied gradients) is no
-    factor every draw shares. Each seed's is made once, by one compiled draw."""
+    factor every draw shares. Each seed's is made once, outside float64, by one compiled draw."""
     with jax.enable_x64(new_val=False):
         one = trainer(model, optimizer, MeshSpec(), 1, variables=None if variables is None else variables(0))
         one.validate(steps=STEPS)
@@ -163,29 +163,39 @@ def initials(model, optimizer, variables=None):
     return initial
 
 
+def wide(state):
+    """`state` as a float64 truth's inputs (`widened`), its PRNG keys copies of its own, which a step
+    donates."""
+    return jax.tree.map(lambda leaf: jnp.copy(leaf) if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                        else widened(leaf), state)
+
+
 def on_host(tree):
     """`tree`'s arrays on the host, a PRNG key as its key data."""
     return jax.device_get(jax.tree.map(lambda leaf: jax.random.key_data(leaf) if jax.dtypes.issubdtype(
         leaf.dtype, jax.dtypes.prng_key) else leaf, tree))
 
 
-def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variables=None,
+def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variables=None, exact: bool = False,
             stage_local: bool = True):
     """`STEPS` steps of `model` from the seed's state (`initial`) on the batch a draw gives, over
     `mesh`, its pipelined runs stage-local or whole on every stage (`stage_local`), its step compiled
     once for every draw, returning the variables, optimizer state and EMA as a checkpoint holds them,
-    every layer its own (`StageLocal.saved`)."""
+    every layer its own (`StageLocal.saved`). `exact` runs in float64 from the state widened, under the
+    caller's float64."""
     built = []
 
     @as_given
     def run(tokens, seed):
         if not built:
-            built.append(trainer(model, optimizer, mesh, devices, variables=variables,
+            held = model.clone(dtype=jnp.float64) if exact else model
+            built.append(trainer(held, optimizer, mesh, devices, variables=variables,
                                  stage_local=stage_local))
             built[0].validate(steps=STEPS)
         steps = built[0]
         start = initial(int(seed))
-        state, _ = steps.staging.supplied(jax.tree.map(jnp.copy, start), steps.shardings)
+        state, _ = steps.staging.supplied(wide(start) if exact else jax.tree.map(jnp.copy, start),
+                                          steps.shardings)
         batch = shard_batch(steps.device_mesh, {"text": tokens})
         if len(built) == 1:
             built.append(steps.compile(state, batch))
@@ -196,14 +206,16 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
     return run
 
 
-STORAGE_SEEDS = 4
-"""The draws a storage cell compares bit for bit: one differing bit fails it, so no statistic is pooled."""
+SEEDS = 8
+"""Each storage cell's check-1 seeds."""
 
 
 def assert_trains_as_replicated(model, optimizer, label: str, variables=None):
     """`STEPS` steps over the stage layout with each pipelined run stage-local and with every layer whole
-    on every stage (`Layout.stage_local`): the variables, optimizer state and EMA a checkpoint of each holds
-    are equal bit for bit on every draw, the storage changing the arithmetic of no step."""
+    on every stage (`Layout.stage_local`) leave the variables, optimizer state and EMA a checkpoint of each
+    holds on par, against one device's float64 (check 1). Bits are no contract: XLA fuses a stacked leaf's
+    FP32 Nesterov direction apart from its layers', one ulp that Newton-Schulz's BF16 cast can round apart
+    (row 861's MuonClip, seed 1)."""
     given = None if variables is None else variables(0)
     banked = trainer(model, optimizer, STAGED, 8, variables=given)
     banked.validate(steps=STEPS)
@@ -211,23 +223,16 @@ def assert_trains_as_replicated(model, optimizer, label: str, variables=None):
     initial = initials(model, optimizer, variables)
     local, replicated = (stepped(model, optimizer, STAGED, 8, initial, variables=given, stage_local=held)
                          for held in (True, False))
-    for seed in range(STORAGE_SEEDS):
-        inputs = draw(seed)
-        mine, theirs = local(*inputs), replicated(*inputs)
-        assert jax.tree.structure(mine) == jax.tree.structure(theirs), label
-        for (path, held), other in zip(jax.tree_util.tree_leaves_with_path(mine), jax.tree.leaves(theirs),
-                                       strict=True):
-            held, other = np.asarray(held), np.asarray(other)
-            same = (held.dtype, held.shape, held.tobytes()) == (other.dtype, other.shape, other.tobytes())
-            assert same, f"{label} {jax.tree_util.keystr(path)} differs at seed {seed}"
+    truth = stepped(model, optimizer, MeshSpec(), 1, initial, variables=given, exact=True)
+    assert_as_exact(local, replicated, draw, label, seeds=SEEDS, truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("name", list(OPTIMIZERS))
 def test_a_stage_local_decoder_trains_as_the_replicated_pipeline_through_each_optimizer(name):
     """Two steps of a decoder whose run two stages hold stacked, through each of Dew's optimizers,
-    leave its variables, optimizer state and EMA bit for bit as the same pipeline's with every layer
-    whole on every stage: each rule that reads a leaf as one layer reads a stacked leaf as its layers.
+    leave its variables, optimizer state and EMA on par with the same pipeline's with every layer whole
+    on every stage (check 1): each rule that reads a leaf as one layer reads a stacked leaf as its layers.
     Read whole, a layer's norm scales stacked would decay as a matrix, Muon would find three sides,
     QK-Clip would find no maxima, LAMB would take one ratio over both stages, a group's pattern would
     miss, and int8 would quantize a moment one layer keeps in float32."""
@@ -251,10 +256,10 @@ def lora(seed: int = 0):
 
 @pytest.mark.mesh(devices=8)
 def test_a_lora_adapter_over_a_stage_local_run_trains_as_the_replicated_pipeline():
-    """A LoRA adapter's factors and its frozen base, both held stacked by stage, train two steps bit for
-    bit as the same pipeline trains them whole on every stage: each stage's layers apply their own
-    factors, which a stage finding no adapter target under its pipelined names (`stages/layers_j`) would
-    leave untrained."""
+    """A LoRA adapter's factors and its frozen base, both held stacked by stage, train two steps on par
+    with the same pipeline training them whole on every stage (check 1): each stage's layers apply their
+    own factors, which a stage finding no adapter target under its pipelined names (`stages/layers_j`)
+    would leave untrained."""
     model, _ = lora()
     assert_trains_as_replicated(model, LORA_OPTIMIZER, "stage-local lora",
                                 variables=lambda seed: lora(seed)[1])
