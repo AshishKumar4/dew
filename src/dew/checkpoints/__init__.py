@@ -1452,8 +1452,10 @@ class Checkpoints:
         rung: JSON = None,
         artifact: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
+        rollout: Mapping[str, object] | None = None,
     ) -> None:
-        """Write `state` under `step`, asynchronously.
+        """Write `state` under `step`, asynchronously, a train state with its rollout's tree of arrays where
+        it holds one (`rollout`), which `rollout_state` reads back.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
@@ -1492,13 +1494,16 @@ class Checkpoints:
             self._identify_run()
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
-                    or artifact is not None):
+                    or artifact is not None or rollout is not None):
                 raise ValueError("a mapping is saved as it is: it takes no data position, share, "
-                                 "weights-only split, rung or artifact, which a train state's save records")
+                                 "weights-only split, rung, artifact or rollout, which a train state's save "
+                                 "records")
             profiles, state_tree, frozen, deltas = None, dict(state), {}, []
         else:
             profiles = None if weights_only else _power_profiles(state.opt_state)
-            state_tree, frozen = self._frozen(self._item(state, saved, share))
+            if weights_only and rollout is not None:
+                raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
+            state_tree, frozen = self._frozen(self._item(state, saved, share, rollout))
             state_tree, deltas = _with_ema_deltas(state_tree)
             if weights_only:
                 from dew.state import MODEL_STATE
@@ -1738,8 +1743,10 @@ class Checkpoints:
         rung: JSON = None,
         artifact: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
+        rollout: Mapping[str, object] | None = None,
     ) -> None:
-        """Write `state` under `step` to this process's local directory, asynchronously.
+        """Write `state` under `step` to this process's local directory, asynchronously, with its
+        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole).
 
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
@@ -1747,7 +1754,7 @@ class Checkpoints:
         placement raises before it reads shards from directories that do not
         hold them.
         """
-        state_tree = self._item(state, saved, share)
+        state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = _grid({name: leaf for name, leaf in state_tree.items() if name != 'position'})
         state_tree, deltas = _with_ema_deltas(state_tree)
@@ -1773,10 +1780,12 @@ class Checkpoints:
                 local.wait_until_finished()
 
     @staticmethod
-    def _item(state: TrainState, saved: bytes | None,
-              share: DataPartition | None) -> dict[str, StateLeaf]:
+    def _item(state: TrainState, saved: bytes | None, share: DataPartition | None,
+              rollout: Mapping[str, object] | None = None) -> dict[str, StateLeaf]:
         from dew.state import CHECKPOINTED
         state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
+        if rollout is not None:
+            state_tree['rollout'] = dict(rollout)
         if saved is not None:
             if share is None:
                 raise ValueError(
@@ -1950,6 +1959,21 @@ class Checkpoints:
         table = (_from_table_record(self._from_holder(recovery[1], lambda: _table_record(read())))
                  if from_local and recovery is not None and recovery[0] == step else read())
         return read_position(table, self.source(step), share)
+
+    def rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None:
+        """The rollout's tree the step at `step` holds (`save`'s `rollout`), read alone and placed as
+        `template`'s leaves (`jax.ShapeDtypeStruct`s) are; None for a step saved without one."""
+        from_local = step == self._local_latest()
+        metadata = _item_metadata(self._step_metadata(step, local=from_local))
+        if 'rollout' not in metadata:
+            return None
+        wanted = {'rollout': dict(template)}
+        _refuse_reshaped(wanted, metadata, self.source(step))
+        checkpointer = self._open_local() if from_local else self._open()
+        restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+            item=wanted, partial_restore=True,
+            restore_args=jax.tree.map(lambda want: _read(want, want.dtype), wanted)))
+        return _placed(dict(restored['rollout']), wanted['rollout'])
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,

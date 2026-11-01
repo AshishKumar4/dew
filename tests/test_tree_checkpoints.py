@@ -232,3 +232,30 @@ def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path):
     # The classification refuses what a listing must not do, without an open.
     assert all(touches(event) for event in ("os.utime", "os.chown", "os.setxattr", "os.rename",
                                             "os.truncate", "shutil.move"))
+
+
+def test_a_steps_rollout_tree_restores_alone_and_a_step_without_one_holds_none(tmp_path):
+    """A train state saved with its rollout's tree (`save(rollout=)`) holds it: read alone at the step
+    (`rollout_state`), placed as its template asks, it is the tree saved, bit for bit, and the train state
+    restores as the step saved without one does. A step saved without one holds none, and a weights-only
+    snapshot, which resumes nothing, or a mapping saved in a train state's place takes none."""
+    import optax
+    from affine_run import Regression, dataset
+
+    from dew.training import Trainer
+
+    state = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0)).fit(dataset(), steps=1, log_every=1)
+    checkpoints = Checkpoints(str(tmp_path), keep=Keep(latest=2))
+    held = tree(3)
+    checkpoints.save(1, state, rollout=held)
+    checkpoints.save(2, state.replace(step=jnp.int32(2)))
+    checkpoints.wait()
+    same(checkpoints.rollout_state(1, template(held)), held)
+    assert checkpoints.rollout_state(2, template(held)) is None
+    shapes = jax.eval_shape(lambda: state)
+    restored = (checkpoints.restore(shapes, step)[0] for step in (1, 2))
+    same(next(restored).replace(step=jnp.int32(2)).variables, next(restored).variables)
+    with pytest.raises(ValueError):
+        checkpoints.save(3, state.replace(step=jnp.int32(3)), weights_only=True, rollout=held)
+    with pytest.raises(ValueError):
+        checkpoints.save(3, held, rollout=held)
