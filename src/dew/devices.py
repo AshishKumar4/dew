@@ -1,8 +1,12 @@
-"""The extra XLA flags a run hands to the backend, and what the CUDA driver
-says of a GPU.
+"""The extra XLA flags a run hands to XLA, and what the CUDA driver says of a
+GPU.
 
-XLA reads XLA_FLAGS once, when it opens a backend, so a run's flags have to
-reach the environment before the first JAX call of the process.
+XLA parses XLA_FLAGS once per runtime it loads (jaxlib's, the CUDA plugin's),
+at the first use of its debug options, which can come before any backend opens
+(a compile-only topology's compile options). None parses before the process
+loads jaxlib, so a run's flags hold for certain where XLA_FLAGS carries them
+by then (`flags_hold`). `import dew` imports this module, which writes Dew's
+own flags, before anything it imports loads jaxlib.
 """
 
 import ctypes
@@ -21,55 +25,77 @@ _late_policy_warned = False
 
 
 def apply_xla_flags(flags: str | None) -> None:
-    """Append flags to XLA_FLAGS, which XLA reads when it initializes a backend.
+    """Append flags to XLA_FLAGS, which XLA parses at its first use of its debug options.
 
     The flags are appended because the environment may already carry some
-    (CI sets the host device count). Only useful before the first JAX call;
-    `dew.training.prepare_process` calls it there.
+    (CI sets the host device count). Certain only before the process loads
+    jaxlib (`flags_hold`); `dew.training.prepare_process` calls it before the
+    backend opens.
     """
     if not flags:
         return
     existing = os.environ.get('XLA_FLAGS', '')
     os.environ['XLA_FLAGS'] = f"{existing} {flags}".strip()
+    _seen()
 
 
-_LOADED: str | None = None
-"""XLA_FLAGS as JAX's backend read them as it opened (`_watch_opening`), None where it opened before
-Dew was imported. The environment can change before and after, to no effect on the backend."""
+_UNPARSED: str | None = None
+"""XLA_FLAGS as Dew last saw or set them before the process loaded jaxlib, None where it had loaded it
+before Dew was imported: flags they carry hold for every runtime XLA loads, provided nothing rewrites
+XLA_FLAGS without them after."""
+
+_UNOPENED: str | None = None
+"""XLA_FLAGS as Dew last saw or set them while JAX's backend was closed, None where it had opened before
+Dew was imported: flags a backend that opened since may have read."""
 
 
-def _watch_opening() -> None:
-    """Record XLA_FLAGS as JAX's backend opens (`_LOADED`): JAX opens it in `xla_bridge.backends`,
-    each of its callers looking the function up there, so Dew's import wraps it once to read the
-    environment as the backend does. A backend already open read flags Dew never saw."""
-    # Private JAX entry point pinned by jax<0.11.3, as `backend_open`'s query is.
-    bridge = importlib.import_module("jax._src.xla_bridge")
-    if bridge.backends_are_initialized():
-        return
-    opening = bridge.backends
-
-    def backends():
-        global _LOADED
-        if not bridge.backends_are_initialized():
-            _LOADED = os.environ.get('XLA_FLAGS', '')
-        return opening()
-    # The function its callers look up in the module's namespace (`xla_bridge.backends`).
-    vars(bridge)["backends"] = backends
-
-
-def _loaded() -> str | None:
-    """The flags the backend reads: the environment's while it is closed, those it read as it opened
-    once it has (`_LOADED`)."""
-    return _LOADED if backend_open() else os.environ.get('XLA_FLAGS', '')
+def _seen() -> None:
+    """Record XLA_FLAGS where no XLA runtime can have parsed them yet (`_UNPARSED`) and where no backend
+    has opened (`_UNOPENED`)."""
+    global _UNPARSED, _UNOPENED
+    flags = os.environ.get('XLA_FLAGS', '')
+    if "jaxlib" not in sys.modules:
+        _UNPARSED = flags
+    if not backend_open():
+        _UNOPENED = flags
 
 
 def flags_hold(flags: str) -> bool:
-    """Whether every flag of `flags` holds as JAX's backend reads its flags (`_loaded`), or read them
-    as it opened: each read as XLA reads `flags` alone, its last occurrence's value, a bare flag's
-    'true'. Where the backend opened before Dew could watch it, no flag holds."""
-    loaded = _loaded()
-    if loaded is None:
-        return False
+    """Whether every flag of `flags` holds for each runtime XLA loads: carried by XLA_FLAGS while the
+    process has not loaded jaxlib, or as Dew last saw them before it did (`_UNPARSED`); each read as XLA
+    reads `flags` alone, its last occurrence's value, a bare flag's 'true'. A flag set after jaxlib loaded
+    is unproven: XLA may have parsed its flags before, with no public way to tell. Flags that held stay
+    certain while nothing rewrites XLA_FLAGS without them before a runtime XLA loads later parses them."""
+    parsed = os.environ.get('XLA_FLAGS', '') if "jaxlib" not in sys.modules else _UNPARSED
+    return parsed is not None and _carries(parsed, flags)
+
+
+def flags_set(flags: str) -> bool:
+    """Whether XLA_FLAGS carried every flag of `flags` while JAX's backend was closed: now, while it is,
+    recorded as Dew saw them (`_seen`), or as Dew last saw or set them before it opened (`_UNOPENED`). A
+    backend that opened since may have read them, which `flags_hold` proves where XLA_FLAGS carried them
+    before jaxlib loaded."""
+    if not backend_open():
+        _seen()
+    return _UNOPENED is not None and _carries(_UNOPENED, flags)
+
+
+def hold_xla_flags(flags: str | None) -> None:
+    """Make every flag of `flags` hold for each runtime XLA loads (`flags_hold`): where one does not, run
+    the process again from its start (`sys.orig_argv`) with XLA_FLAGS carrying them, which its `import dew`
+    then sees before anything loads jaxlib. Dew's command line does, as its `import dew` loads jaxlib
+    before it reads a run's flags. A process that loaded jaxlib before Dew would load it first again, and
+    goes on as it is."""
+    if not flags or flags_hold(flags) or _UNPARSED is None:
+        return
+    existing = os.environ.get('XLA_FLAGS', '')
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, sys.orig_argv, {**os.environ, 'XLA_FLAGS': f"{existing} {flags}".strip()})
+
+
+def _carries(loaded: str, flags: str) -> bool:
+    """Whether the XLA_FLAGS `loaded` carry every flag of `flags`, as `flags_hold` reads them."""
     asked = {}
     for token in flags.split():
         name, equals, value = token.removeprefix("--").partition("=")
@@ -81,9 +107,9 @@ def xla_flag(name: str) -> str | None:
     """The value `--<name>` carries in XLA_FLAGS, or None when it is absent.
 
     A bare `--<name>` reads as 'true' and the last occurrence wins, which is
-    how XLA's own parser resolves a repeated flag. XLA reads the variable
-    when it initializes a backend, so this reports what the run asked for,
-    not what a live backend was built with.
+    how XLA's own parser resolves a repeated flag. XLA parses the variable
+    once, so this reports what the run asked for, not what a live backend was
+    built with (`flags_hold`).
     """
     return _flag(os.environ.get('XLA_FLAGS', ''), name)
 
@@ -103,8 +129,8 @@ def keep_roundings() -> None:
     """Keep declared narrow-dtype roundings unless the caller names XLA's policy.
 
     Fusion must not normalize an unrounded FP32 value where the program
-    produces a BF16 sum. `import dew` applies it before the process's first
-    JAX computation: XLA reads these flags when its backend opens. In an
+    produces a BF16 sum. `import dew` applies it before anything it imports
+    loads jaxlib, before which XLA parses no flag (`flags_hold`). In an
     already-used notebook, restart with
     `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
     """
@@ -381,4 +407,7 @@ def gpu_free_bytes(ordinal: int) -> int | None:
         cuda.cuDevicePrimaryCtxRelease_v2(device)
 
 
-_watch_opening()
+
+# `import dew` imports this module, and writes Dew's own flags (dew/__init__.py), before anything it imports
+# loads jaxlib.
+_seen()

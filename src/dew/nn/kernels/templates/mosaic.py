@@ -121,7 +121,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            reduction_scratch: int = 0) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
-    (`report.named`)."""
+    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
@@ -579,6 +579,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+
+    def scalar_registers(self, addressed=()) -> int:
+        """The registers a consumer thread holds beside its tiles: its own scalars (`held_registers`), its
+        addresses into the shared tiles it reads and writes through registers (`addressed`, each
+        `(shape, dtype)`) among them where the family's count is a measured whole, as this one is."""
+        del addressed
+        return self.held_registers
     register_step: int = cost.REGISTER_STEP
     """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
     A compile gate tests admits at their actual cap, refusals one such step below it."""

@@ -32,9 +32,8 @@ from dew.decision.questions import KINDS, Score
 from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, option_width, packing
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
-from dew.inference.loading import RunProcessor
 from dew.inference.projections import declared_groups
-from dew.inference.tasks import Processor as TaskProcessor
+from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter

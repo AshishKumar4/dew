@@ -119,7 +119,8 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
           "--batch-size", "8", "--sequence-length", "12", "--experts", "2", "--top-k", "1",
           smoke_args=False, devices=8)
     record = json.loads((out / "moe-mesh.json").read_text())
-    assert record["mesh"] == {"data": 2, "expert": 2, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}
+    assert record["mesh"] == {"diloco": 1, "data": 2, "expert": 2, "fsdp": 2, "tensor": 1, "sequence": 1,
+                              "stage": 1}
     assert len(record["devices"]) == 8 and record["dispatch"] == "exchange" and record["all_to_all_ops"] > 0
     assert [step["step"] for step in record["steps"]] == [1, 2]
     assert all(np.isfinite(step["loss"]) for step in record["steps"])

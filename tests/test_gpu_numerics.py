@@ -26,7 +26,7 @@ import test_lowering as lowering
 import test_moe_precision as moe_precision
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
-from gpu_flow import Cell, run_cells, when
+from gpu_flow import Cell, isolated, run_cells, when
 
 from dew.nn.kernels import grouped_matmul, norm_swiglu
 from dew.nn.kernels.generation import triton_runs
@@ -44,9 +44,8 @@ def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(tmp_path_factory):
         Cell("the GPU divides fp32 to the nearest float",
              precision_policy.the_gpu_divides_fp32_to_the_nearest_float),
         Cell("a frozen FP8 site's products take no FP8 GEMM whose sum is narrower",
-             when(fp8_base.FP8_CORES, "this GPU has no FP8 tensor cores", lambda: (
-                 fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower(
-                     tmp_path_factory.mktemp("fp8"))))),
+             when(fp8_base.FP8_CORES, "this GPU has no FP8 tensor cores", isolated(tmp_path_factory)(
+                 fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower, "fp8"))),
         *(Cell(f"the {kind} audio encoder compiles with its mask built in the same jit",
                lambda kind=kind: audio.encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(
                    audio._audio(kind)))

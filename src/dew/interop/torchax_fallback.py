@@ -1506,13 +1506,16 @@ def _shapes(leaves: Mapping[str, np.ndarray | SourceLeaf | jax.ShapeDtypeStruct]
 
 
 def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
-    """`_plain_head` of the class `config` builds, at the probe's sizes (`verify.shrink`) with
-    transformers' own initialization: the head's structure, which no size changes."""
+    """`_plain_head` of the class `config` builds, at the probe's sizes and depth (`verify.shrink`,
+    `verify.shallow`) with transformers' own initialization: the head's structure, which no size
+    changes."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    fields = {key: value for key, value in verify.shrink(config).items() if key != "model_type"}
-    stated = AutoConfig.for_model(str(config["model_type"]), **fields)
+    model_type = str(config["model_type"])
+    probed = verify.shallow(verify.ModelSource(model_type), verify.shrink(config))
+    fields = {key: value for key, value in probed.items() if key != "model_type"}
+    stated = AutoConfig.for_model(model_type, **fields)
     model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
     return _plain_head(model.eval(), model.get_output_embeddings())
 

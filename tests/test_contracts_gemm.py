@@ -31,6 +31,29 @@ def test_an_embedding_lookup_holds_every_order(edge):
                     f"an embedding lookup {edge}")
 
 
+def test_an_embedding_lookup_over_ids_split_on_an_explicit_axis_takes_every_order():
+    """`blocks.table_rows` over ids split along an Explicit data axis, where the rows are fewer than the
+    table so the backward gathers them whole (row 3150): its gradient, the jvp of its gradient and the
+    gradient of its gradient run and are finite, the ids' zero cotangent typed as the ids arrive, not as
+    the gather holds them."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
+    whole, split = NamedSharding(mesh, P()), NamedSharding(mesh, P("data", None))
+    table, direction = (jax.device_put(jnp.asarray(drawn), whole)
+                        for (drawn,) in (normal_draw(3150, (64, 8)), normal_draw(3151, (64, 8))))
+    with jax.set_mesh(mesh):
+        ids = jax.device_put(jnp.asarray(np.arange(16).reshape(4, 4) * 5 % 64, jnp.int32), split)
+
+        def loss(table):
+            return jnp.sum(table_rows(table, ids, table.dtype) ** 3)
+
+        gradient = jax.grad(loss)
+        orders = (gradient(table), jax.jvp(gradient, (table,), (direction,))[1],
+                  jax.grad(lambda table: jnp.vdot(gradient(table), direction))(table))
+    assert all(np.all(np.isfinite(np.asarray(order))) for order in orders)
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_bf16_dot_holds_every_order(edge):
     """`precision.bf16_dot_general` (the BF16_BF16_F32 algorithm's dot and its cotangent's one rounding
