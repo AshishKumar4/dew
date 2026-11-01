@@ -71,18 +71,42 @@ def allocated(*sizes: int) -> int:
     return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
 
 
-def live_registers(family: "Family", carried, *phases) -> int:
+def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
     """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
     of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
-    32-bit words spread over a role's threads, and what it holds beside them (`Family.held_registers`).
+    32-bit words spread over a role's threads, and what it holds beside them: its scalars and its
+    addresses into the shared tiles it reads and writes itself (`addressed`, each `(shape, dtype)`:
+    `Family.scalar_registers`).
     The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
     a legal config holds within a thread's budget (`base.Template.legal`)."""
     def words(tiles) -> float:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
     phase = max((words(tiles) for tiles in phases), default=0.0)
-    return family.held_registers + int(-(-(words(carried) + phase) // THREADS))
+    return family.scalar_registers(addressed) + int(-(-(words(carried) + phase) // THREADS))
+
+
+def addresses(tiles) -> int:
+    """The registers a thread holds for its own addresses into the shared-memory tiles `tiles` (each
+    `(shape, dtype)`) it reads or writes through registers: one for each swizzle pattern its accesses to a
+    tile take, the swizzle its rows' width fills (`plgpu.find_swizzle`) over the bytes one pattern covers,
+    and one for a vector. A 16-bit tile moves in ldmatrix or stmatrix rows, two patterns at a 128-byte
+    swizzle and one at 64; a 32-bit one in each lane's own columns (an accumulator's), four at 128 bytes.
+    A ring slot's offset is an immediate, so a tile costs this once whatever its stages. A tile read by
+    descriptor or TMA costs none: its base is a uniform register (3117's census on the sm90 recurrence and
+    GEMM kernel gradient: the SSD, GDN and KDA states launches' staging and landing tiles 5 to 10, the exact
+    normed kernel gradient's rewrite 8, its statistics vector 1 and its output staging 4, each a SASS
+    address register of one pattern)."""
+    def patterns(shape: tuple, dtype) -> int:
+        itemsize = jnp.dtype(dtype).itemsize
+        row = shape[-1] * itemsize
+        # A vector, or rows of no whole 16-byte chunk, stage unswizzled: one pattern.
+        if len(shape) < 2 or row % 16:
+            return 1
+        return max(1, plgpu.find_swizzle(row * 8) // (64 if itemsize == 2 else 32))
+
+    return sum(patterns(tuple(shape), dtype) for shape, dtype in tiles)
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,

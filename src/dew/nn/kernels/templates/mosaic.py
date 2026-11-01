@@ -579,6 +579,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+
+    def scalar_registers(self, addressed=()) -> int:
+        """The registers a consumer thread holds beside its tiles: its own scalars (`held_registers`), its
+        addresses into the shared tiles it reads and writes through registers (`addressed`, each
+        `(shape, dtype)`) among them where the family's count is a measured whole, as this one is."""
+        del addressed
+        return self.held_registers
     register_step: int = cost.REGISTER_STEP
     """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
     A compile gate tests admits at their actual cap, refusals one such step below it."""
