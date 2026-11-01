@@ -215,10 +215,11 @@ def oracle_backward(form: str):
     return run
 
 
-SERVED_BY_TEMPLATE = {("causal", "keys")}
+SERVED_BY_TEMPLATE = {("causal", "keys"), ("started", "keys")}
 """The backward cells the template's own form serves, the derived form not on par there until the engine's
 error-aware extraction prices the choice that passes (docs/design/algebra.md §1.5, the generator's first
-acceptance case; a causal call walked queries first, whose derived dV erred 1.62 times the template's)."""
+acceptance case, row 3310; a causal call walked queries first, whose derived dV erred 1.62 times the
+template's, 1.74 where its first queries see no key)."""
 
 
 @pytest.mark.parametrize("walked", ["keys", "rows"], ids=["queries-first", "keys-first"])
