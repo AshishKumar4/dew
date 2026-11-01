@@ -1413,10 +1413,17 @@ elements, or arrays whole."""
 
 
 class _Whole:
-    """The same batch every step, the arrays a run was handed whole; its position the steps read."""
+    """The same batch every step, the arrays a run was handed whole; its position the steps read. It
+    never runs out (`Identified.endless`), and names what it reads as a stream Dew names no further does:
+    by its type (`stream_identity`)."""
+
+    endless = True
 
     def __init__(self, batch: Batch):
         self.batch, self.read = batch, 0
+
+    def identity(self) -> str:
+        return type(self).__name__
 
     def __iter__(self):
         return self
@@ -1448,10 +1455,16 @@ def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
 
 class _Shared(Forwarding):
     """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
-    the stream's."""
+    the stream's; `endless` where it reads a map dataset repeated without end (`native`), which says
+    so of nothing it reads."""
 
-    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool):
-        self._source, self.partition, self.held = batches, partition, held
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool,
+                 endless: bool = False):
+        self._source, self.partition, self.held, self._endless = batches, partition, held, endless
+
+    @property
+    def endless(self) -> bool:
+        return self._endless or super().endless
 
     def __iter__(self):
         return self
@@ -1476,10 +1489,11 @@ def native(handed: Handed, *, training: bool) -> Reader:
         if training:
             return lambda partition: _Shared(_Whole(batch), partition, held=False)
         return lambda partition: iter([_share(batch, partition, held=True)])
+    repeated = training and isinstance(handed, pygrain.MapDataset)
     stream: pygrain.IterDataset = (
         (handed.repeat() if training else handed).to_iter_dataset() if isinstance(handed, pygrain.MapDataset)
         else handed)
-    return lambda partition: _Shared(iter(stream), partition, held=not training)
+    return lambda partition: _Shared(iter(stream), partition, held=not training, endless=repeated)
 
 
 def native_loader(handed: Handed) -> Loader:
