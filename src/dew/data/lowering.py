@@ -2280,7 +2280,7 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
     repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
     or a streamed source's rows as its shards state them, each slice and limit before that place applied;
     a mixture by weights, those in which every part it mixes comes round once (`Proportions.covering`). None
-    for a mixture by tokens, or where a
+    for a mixture by tokens, a memory read that laid its examples out as it held them, or where a
     step before that place drops or adds one, or keeps them by a rule not yet bound, or nothing states
     the count."""
     source = train.source
@@ -2294,6 +2294,11 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
     # the first repeat bound it.
     if any(_drops(stage) or isinstance(stage, Native)
            or (isinstance(stage, Configured) and not stage.one_to_one) for stage in train.stages[:at]):
+        return None
+    # A memory read that laid its examples out as it held them (a pack before its shuffle) holds no source
+    # example a bound before that layout could count, as a run bounded in examples refuses it too.
+    if any(isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)
+           for stage in _written(source, ())):
         return None
     prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
     if isinstance(source, Mixture):

@@ -437,3 +437,29 @@ def test_epochs_count_no_pass_where_a_step_after_a_repeat_drops_records():
     assert (loader.epochs, loader.pass_examples) == (None, None)
     with pytest.raises(ValueError):
         Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+
+
+def test_epochs_count_no_pass_of_a_memory_read_that_packs_its_examples_as_it_holds_them():
+    """Documents a memory read packs as it holds them, before a shuffle, then an objective makes two rows of
+    each window, so its read has no record count: its held windows are no source examples a bound could
+    count before the pack, which a run bounded in examples refuses too, so no pass is stated and a run of
+    epochs over it is refused, where counting the windows would clock them as examples (row 1902's
+    review)."""
+    import optax
+
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+    from dew.training import Trainer
+
+    class Twice:
+        identity = "twice@1"
+
+        def flat_map(self, element):
+            return (element, element)
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
+    assert (loader.records, loader.epochs, loader.pass_examples) == (None, None, None)
+    with pytest.raises(ValueError):
+        Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
