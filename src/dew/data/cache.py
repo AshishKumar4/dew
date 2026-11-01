@@ -40,6 +40,7 @@ from dew.data.generation import (
     completion_facts,
     seal_facts,
 )
+from dew.data.once import LOCK, locked_cached_property
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
 from dew.data.sinks import write_array_record
@@ -756,18 +757,14 @@ class _CachedMap(_Mapped):
         # Not `source`, which names MapDataset's own constructor.
         self.cache, self.key, self.transform, self.filled = cache, key, transform, source
         self.missing = missing
-        self.writer_lock = threading.RLock()
 
-    @property
+    @locked_cached_property
     def writer(self) -> _Writer | _Computed:
-        with self.writer_lock:
-            if "_writer" not in self.__dict__:
-                writer = _opened_writer(self.cache, self.key, expected=len(self), source=self.filled)
-                if isinstance(writer, _Writer):
-                    finalizer = weakref.finalize(self, writer.close)
-                    finalizer.atexit = False
-                self.__dict__["_writer"] = writer
-            return self.__dict__["_writer"]
+        writer = _opened_writer(self.cache, self.key, expected=len(self), source=self.filled)
+        if isinstance(writer, _Writer):
+            finalizer = weakref.finalize(self, writer.close)
+            finalizer.atexit = False
+        return writer
 
     def record(self, index: int) -> CachedValue:
         return self.writer.process(
@@ -779,22 +776,18 @@ class _CachedMap(_Mapped):
             self.record(position)
 
     def close(self) -> None:
-        if "_writer" in self.__dict__:
+        if "writer" in self.__dict__:
             self.writer.close()
 
     def finish(self) -> None:
-        if "_writer" in self.__dict__:
+        if "writer" in self.__dict__:
             self.writer.finish()
 
     def metrics(self) -> CacheStats:
         return self.writer.metrics()
 
     def __getstate__(self) -> dict:
-        return {key: value for key, value in self.__dict__.items() if key not in ("_writer", "writer_lock")}
-
-    def __setstate__(self, state: Mapping[str, object]) -> None:
-        self.__dict__.update(state)
-        self.writer_lock = threading.RLock()
+        return {key: value for key, value in self.__dict__.items() if key not in ("writer", LOCK)}
 
 
 @dataclass(frozen=True)

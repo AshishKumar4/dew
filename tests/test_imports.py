@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import dew
+from tools import gen_exports
 
 SOURCE = Path(dew.__file__).parent.parent
 
@@ -260,12 +261,12 @@ def test_a_lazy_packages_star_import_binds_its_modules_as_its_eager_one_did(pack
                    env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
 
 
-@pytest.mark.parametrize("package", ["dew", "dew.data", "dew.diffusion", "dew.eval", "dew.inference",
-                                     "dew.nn.autoencoders", "dew.nn.backbones", "dew.nn.vision",
-                                     "dew.sampling", "dew.training"])
+@pytest.mark.parametrize("package", [".".join(path.parent.relative_to(SOURCE).parts)
+                                     for path in gen_exports.packages(SOURCE / "dew")])
 def test_a_lazy_packages_listing_names_what_it_exports(package):
-    """A lazily exporting package lists every name it exports to `dir()`, which an editor and an
-    interpreter complete from, though it has imported none of them (row 3206)."""
+    """Each lazily exporting package, every one that declares its exports (`gen_exports.packages`), lists
+    every name it exports to `dir()`, which an editor and an interpreter complete from, though it has
+    imported none of them (rows 3206, 3217)."""
     script = (f"import importlib\nmodule = importlib.import_module({package!r})\n"
               "missing = sorted(set(module.__all__) - set(dir(module)))\nassert not missing, missing\n")
     subprocess.run([sys.executable, "-c", script], check=True,

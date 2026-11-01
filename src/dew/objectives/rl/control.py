@@ -15,11 +15,12 @@ terminal state takes no value after it.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -29,20 +30,9 @@ from flax import linen as nn
 from dew.batch import Batch, Variables
 from dew.nn.kernels.options import OuterProgram
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
-from dew.rl.env import (
-    Carry,
-    Env,
-    Memory,
-    Observation,
-    Params,
-    TimeStep,
-    Transition,
-    Tree,
-    env_rollout,
-    start,
-    view,
-)
-from dew.rl.simulator import Simulator, rollout_start, simulator_rollout, simulator_start
+from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
+from dew.rl.evaluation import episodes, first_episode_rows
+from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout, simulator_start
 from dew.rl.surrogate import clipped_surrogate_terms
 
 if TYPE_CHECKING:
@@ -217,6 +207,16 @@ class ControlPPOObjective(Objective[Ratio]):
         return Ratio(per_step.sum(), jnp.asarray(per_step.size, per_step.dtype)), Aux(metrics)
 
 
+class Saved(TypedDict):
+    """What a `ControlRollout` carries between calls, as a checkpoint holds it (`ControlRollout.saved`)."""
+
+    carry: Carry
+    returns: jax.Array
+    collected: Mapping[str, np.ndarray]
+    order: np.ndarray
+    ended: np.ndarray
+
+
 @dataclass
 class ControlRollout:
     """The trainer's rollout (`dew.training.rollout.Rollout`) of a `ControlPPOObjective` in `env`, a
@@ -248,6 +248,56 @@ class ControlRollout:
     @property
     def metrics(self) -> Mapping[str, float]:
         return {"episode_return": self._ended}
+
+    @contextlib.contextmanager
+    def branch(self, name: str) -> Iterator[None]:
+        """A cooldown branch's calls (`Rollout`'s `branch`), after which the rollout stands as the run left
+        it: its environments mid episode, the collection it serves and their order. Nothing it carries is
+        donated, so what the run left is kept as it is; a begun `Simulator` keeps its own environments
+        (`dew.rl.simulator.branched`)."""
+        env, kept = self.env, (self._carry, self._returns, self._collected, self._order, self._ended)
+        try:
+            with (branched(env) if isinstance(env, Simulator) and self._carry is not None
+                  else contextlib.nullcontext()):
+                yield
+        finally:
+            self._carry, self._returns, self._collected, self._order, self._ended = kept
+
+    def saved(self) -> Saved | None:
+        """What the rollout carries between calls, for the run's checkpoint (`Rollout`'s `saved`): every
+        environment mid episode and its running return, the collection it serves its minibatches from,
+        their order and the collection's mean ended return; None before its first call, and over a
+        `Simulator`, whose environments live outside JAX and start afresh on a resume."""
+        carry, returns, collected, order = self._carry, self._returns, self._collected, self._order
+        if carry is None or returns is None or collected is None or order is None or isinstance(
+                self.env, Simulator):
+            return None
+        return Saved(carry=carry, returns=returns, collected=dict(collected), order=order,
+                     ended=np.asarray(self._ended, np.float32))
+
+    def saved_shapes(self) -> Mapping[str, object] | None:
+        """`saved`'s leaves' shapes and dtypes, before any call; None over a `Simulator`."""
+        env = self.env
+        if isinstance(env, Simulator):
+            return None
+        key = jax.random.key(0)
+        carry = jax.eval_shape(functools.partial(rollout_start, env), key)
+        count = len(jax.tree.leaves(carry.observation)[0])
+
+        def collected(variables, carry):
+            _, steps = self._unrolled(env, variables, carry)
+            return self._summary(steps, jnp.zeros(count, jnp.float32))[1]
+
+        gathered = jax.eval_shape(collected, jax.eval_shape(self.objective.init, key), carry)
+        order = jax.ShapeDtypeStruct((self.epochs * len(gathered["reward"]),), np.int32)
+        return {"carry": carry, "returns": jax.ShapeDtypeStruct((count,), jnp.float32), "collected": gathered,
+                "order": order, "ended": jax.ShapeDtypeStruct((), jnp.float32)}
+
+    def restored(self, tree: Saved) -> None:
+        """The rollout carrying on from a `saved` tree."""
+        self._carry, self._returns = tree["carry"], tree["returns"]
+        self._collected = jax.tree.map(np.asarray, dict(tree["collected"]))
+        self._order, self._ended = np.asarray(tree["order"]), float(tree["ended"])
 
     def _collector(self) -> Callable[[Variables, Carry], tuple[Carry, Transition]]:
         """The collection for the rollout's environment as it is now: a run may change it between
@@ -316,37 +366,25 @@ class ControlRollout:
             if sequences % self.minibatches:
                 raise ValueError(f"{sequences} sequences do not split into {self.minibatches} minibatches")
             rng = np.random.default_rng(np.asarray(jax.random.key_data(key)).ravel())
-            order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)])
+            order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)]).astype(np.int32)
         self._carry, self._returns, self._collected, self._order = carry, returns, collected, order
         size = len(collected["reward"]) // self.minibatches
         rows = order[served * size:(served + 1) * size]
         return jax.tree.map(lambda values: values[rows], collected)
 
 
-def _first_episodes_return(following: TimeStep) -> jax.Array:
-    """The mean undiscounted return of each environment's first episode in a rollout's steps `[T, envs]`,
-    the steps after it ended unread."""
-    after = (jnp.cumsum(following.done, 0) - following.done) > 0
-    return jnp.mean(jnp.sum(jnp.where(after, 0, following.reward), axis=0))
-
-
 def episode_return(objective: ControlPPOObjective, env: Env | Simulator, params: Variables, key: jax.Array,
                    steps: int, *, greedy: bool = True) -> float:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the policy, its deterministic action where `greedy`: the whole
-    episode where `steps` is an episode's length."""
+    episode where `steps` is an episode's length, read as every first episode is
+    (`dew.rl.evaluation.first_episode_rows`; an `Env`'s by `dew.rl.evaluation.episodes`)."""
     policy = objective.greedy if greedy else objective.act
     if isinstance(env, Simulator):
         _, taken = simulator_rollout(env, policy, params, simulator_start(env, key), steps, reset=False)
-        return float(_first_episodes_return(taken.following))
-
-    @OuterProgram
-    def run(params: Variables, key: jax.Array) -> jax.Array:
-        _, taken = env_rollout(env, policy, params, start(env, key), steps, reset=False)
-        return _first_episodes_return(taken.following)
-
-    return float(run(params, key))
+        return float(jnp.mean(first_episode_rows(taken.following)["return"]))
+    return episodes(policy, env, steps)(params, key)["return"]
 
 
-__all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "episode_return", "tanh_normal_entropy",
-           "tanh_normal_log_prob"]
+__all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "Saved", "episode_return",
+           "tanh_normal_entropy", "tanh_normal_log_prob"]

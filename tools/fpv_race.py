@@ -1,23 +1,31 @@
-"""The FPV gate race's training phases (`dew.rl.flight` in JAX; images by HyperLux, `dew.rl.hyperlux`). Each
-phase writes a JSON report and its weights to OUT.
+"""The FPV gate race's training phases (`dew.rl.flight` in JAX; images by HyperLux, `dew.rl.hyperlux`), each
+an environment run (`dew.objectives.rl.config.EnvRunConfig`) under OUT, which the phase run again goes on
+from, beside a JSON report.
 
     python tools/fpv_race.py check OUT --assets A        The renderer on this GPU: frames of the race, and
                                                           frames a second at 16, 256 and 1024 drones, and
                                                           the race's steps a second without images.
-    python tools/fpv_race.py teacher OUT [--seconds S]    The privileged teacher: PPO over the teacher's
-              [--warm W]                                  view, 4096 drones in JAX, for S seconds; its greedy
-                                                          episodes scored as it trains, the best kept. Its
-                                                          curriculum's level, 0.2 at first, rises by 0.1 to 1
-                                                          at each score whose crashes fall under a third (Song
-                                                          et al. 2021 raised theirs on the crash rate): the
-                                                          courses' difficulty, the drones' randomization and,
-                                                          from 0.3, chained tracks beside loops. From W, a
-                                                          teacher of the first race's view (`warmed`).
-    python tools/fpv_race.py world OUT --teacher W        The world model's phases: the teacher's
-              --assets A [--no-highlight]                 demonstrations, DreamerV3 pretrained on them with
-                                                          behaviour cloning, then trained online at
-                                                          FlyDreamer's train ratio; the teacher, the cloned
-                                                          agent and the online agent scored alike.
+    python tools/fpv_race.py teacher OUT [--seconds S]    The privileged teacher, OUT/teacher: PPO over the
+              [--warm W]                                  teacher's view, 4096 drones in JAX, for S seconds;
+                                                          its greedy episodes scored as it trains, each
+                                                          score's step kept, the best named (teacher.json).
+                                                          Its curriculum's level, 0.2 at first, rises by 0.1
+                                                          to 1 at each score whose crashes fall under a third
+                                                          (Song et al. 2021 raised theirs on the crash rate):
+                                                          the courses' difficulty, the drones' randomization
+                                                          and, from 0.3, chained tracks beside loops. From W,
+                                                          a teacher of the first race's view (`warmed`).
+    python tools/fpv_race.py wrap OUT --teacher W         A teacher's weights (an earlier teacher.msgpack) as
+                                                          the teacher phase's run of no updates, OUT/teacher,
+                                                          its record the phase's own at --level (1).
+    python tools/fpv_race.py world OUT --teacher T        The world model's stages from the teacher's run T
+              --assets A [--teacher-step N]               (its step N, its latest unless named), each started
+              [--no-highlight]                            from the one before, its replay begun with the
+                                                          teacher's demonstrations: pretrain, DreamerV3
+                                                          pretrained on them with behaviour cloning; dagger,
+                                                          the agent flying and the teacher labelling its steps
+                                                          (DAgger); online, at FlyDreamer's train ratio. The
+                                                          teacher and each stage's agent scored alike.
 
 `--hz` sets the control rate (60 by default). The world model's windows and imagination span the same
 seconds at any rate: 64 steps and 15 imagined at 30 Hz, 128 and 30 at 60. `--assets` is the folder
@@ -35,32 +43,51 @@ OptiX.
 from __future__ import annotations
 
 import argparse
-import itertools
+import dataclasses
 import json
+import math
 import time
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import serialization, traverse_util
 
-from dew.data.dataset import Loader
+from dew.checkpoints import Checkpoints, Keep
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.objectives.rl.config import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
+from dew.optim import Linear, OptimConfig
+from dew.registry import ModelConfig
 
 AUXILIARY = (("state", 13, 512), ("gates", 24, 512), ("airframe", 6, 256), ("physics", 20, 256),
              ("obstacles", 12, 256))
 """The world model's auxiliary heads: each privileged view, its width and its head's units."""
+CONTROL, DREAMER = "dew.objectives.rl.control", "dew.objectives.rl.dreamer"
+"""The modules the teacher's and the agent's networks and objectives are named from."""
 TRAINING = (("loop", 0.4), ("chain", 0.6))
 """The course families a teacher and an agent train on."""
 HELD_OUT = (("layout", 0.5), ("figure8", 0.5))
 """The course families held out of training, for scoring alone."""
 
 
-def _idle() -> Loader:
-    """A loader whose batches a rollout replaces whole."""
-    return Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+VIEWS = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed", "finishing", "teacher")
+"""What the world phase's races show: the camera's image, which the agent reads, and the privileged views."""
+TEACHER_RUN, STAGES = "teacher", ("pretrain", "dagger", "online")
+"""The runs under OUT: the teacher's, and the world phase's stages, each started from the one before."""
+SCORED_EVERY = 10
+"""The teacher's collections between its scores."""
+
+
+def families_at(level: float):
+    """The course families a teacher trains on at the curriculum's `level`: loops, and chained tracks beside
+    them from 0.3."""
+    return TRAINING if level >= 0.3 else (("loop", 1.0),)
+
+
+def racing_record(hz: float, families, *, highlight: bool = True) -> dict:
+    """The race at `hz` over `families` (`racing_at`) as an environment run's record holds it."""
+    return {"hz": hz, "families": [[name, weight] for name, weight in families], "highlight": highlight}
 
 
 def racing_at(hz: float, families=TRAINING, *, highlight: bool = True):
@@ -86,22 +113,35 @@ def race(drones: int, views: tuple[str, ...], *, hz: float = 60.0, families=TRAI
     return GateRace(renderer, racing_at(hz, families, highlight=highlight), views=views, count=drones)
 
 
-def teacher_objective(observation_size: int | None = None):
-    """PPO over the teacher's view (`dew.rl.flight.TEACHER` wide, or `observation_size`), its policy's spread
-    a fifth of the actor-critic's, so the first rollouts fly rather than tumble."""
-    from dew.objectives.rl.control import ActorCritic, ControlPPOObjective
-    from dew.rl.flight import TEACHER
+def teacher_run(out: Path, *, hz: float, level: float, drones: int = 4096) -> EnvRunConfig:
+    """The teacher phase's run at the curriculum's `level` (`teacher`): PPO over the teacher's view
+    (`dew.rl.flight.TEACHER` wide) of `drones` drones in JAX (`FlightEnv`), on the courses of its level
+    (`families_at`) at its difficulty and randomization, its policy's spread a fifth of the actor-critic's, so
+    the first rollouts fly rather than tumble; at `hz` control steps a second, its discount and its
+    advantages' decay those of 0.99 and 0.95 a step at 60 Hz, so the teacher looks as many seconds ahead at
+    any rate. Each step it scores at (`SCORED_EVERY` collections) is kept."""
+    flight = {"racing": racing_record(hz, families_at(level)), "views": ["teacher"], "difficulty": level,
+              "ramp": level}
+    rollout = {"unroll_length": round(32 * hz / 30), "epochs": 4, "minibatches": 32}
+    every = SCORED_EVERY * rollout["epochs"] * rollout["minibatches"]
+    return EnvRunConfig(
+        env=EnvConfig("flight", flight, count=drones),
+        model=ModelConfig(f"{CONTROL}:ActorCritic",
+                          {"policy_layers": [256] * 3, "value_layers": [256] * 4, "spread": 0.2}),
+        objective=ObjectiveConfig(f"{CONTROL}:ControlPPOObjective", {
+            "discount": 0.99 ** (60 / hz), "lam": 0.95 ** (60 / hz), "clip": 0.2, "entropy_cost": 1e-4,
+            "reads": ["teacher"]}),
+        rollout=RolloutConfig("control", rollout), optim=OptimConfig(optimizer="adam", learning_rate=3e-4,
+                                                                     clip_grads=1.0),
+        trainer=TrainerConfig(checkpoint_dir=str(out), steps=every, log_every=every, eval_every=None,
+                              checkpoint_every=None, keep=Keep(latest=1, every=every)))
 
-    networks = ActorCritic(4, (256, 256, 256), (256, 256, 256, 256), spread=0.2)
-    return ControlPPOObjective(networks, observation_size or TEACHER, discount=0.99, lam=0.95, clip=0.2,
-                               entropy_cost=1e-4, reads=("teacher",))
 
-
-def warmed(path: Path):
-    """A teacher's weights for the race's view from a teacher of the race's or of its first race's
-    (`dew.rl.flight.INTERFACE` entries): every weight its own, each first layer's weights from the view's new
-    entries zero, so it acts as it did."""
-    new = jax.device_get(teacher_objective().init(jax.random.key(0)))
+def warmed(path: Path, objective):
+    """A teacher's weights for `objective`, the race's teacher, from a teacher of the race's view or of its
+    first race's (`dew.rl.flight.INTERFACE` entries) written whole (`flax.serialization.to_bytes`): every
+    weight its own, each first layer's weights from the view's new entries zero, so it acts as it did."""
+    new = jax.device_get(objective.init(jax.random.key(0)))
     previous = traverse_util.flatten_dict(serialization.msgpack_restore(path.read_bytes()))
     fresh = traverse_util.flatten_dict(serialization.to_state_dict(new))
     for name, value in fresh.items():
@@ -115,37 +155,53 @@ def warmed(path: Path):
     return serialization.from_state_dict(new, traverse_util.unflatten_dict(fresh))
 
 
+def _latest(directory: Path) -> int:
+    """The last step the run in `directory` checkpointed, 0 where it has none."""
+    if not directory.is_dir():
+        return 0
+    with Checkpoints(str(directory)) as checkpoints:
+        return checkpoints.latest or 0
+
+
+def _written(path: Path, text: str) -> None:
+    """`text` at `path`, written whole beside it before it replaces what was there, so a run stopped at any
+    point leaves either file whole."""
+    path.with_name(path.name + ".part").write_text(text)
+    path.with_name(path.name + ".part").replace(path)
+
+
 def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
            film: Path | None = None) -> dict:
     """Each drone's first episode under `policy` (reading the driven step whole) over `steps` steps from
     fresh episodes of `simulator`, an evaluation race of its own (`_first_episodes`); with `film`, the first
     four drones' camera images after each step written there `[steps, 4, H, W, 3]`."""
+    from dew.rl.env import view, views
     from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
 
     driven = DrivenSimulator(simulator)
     _, taken = simulator_rollout(driven, policy, params, simulator_start(driven, key, memory), steps,
                                  reset=False)
-    observed = jax.device_get(taken.following.observation)
+    following = taken.following
     if film is not None:
-        np.savez_compressed(film, frames=observed["observation"]["image"][:, :4])
-    return _first_episodes(observed["reward"], observed["observation"]["passed"], observed["terminal"],
-                           observed["last"], simulator.racing.crash_penalty)
+        frames = view(views(following.observation)["observation"], "image")
+        np.savez_compressed(film, frames=np.asarray(frames)[:, :4])
+    passed = view(views(following.observation)["observation"], "passed")
+    return _first_episodes(following, passed, simulator.racing.crash_penalty)
 
 
-def _first_episodes(reward: np.ndarray, passed: np.ndarray, terminal: np.ndarray, last: np.ndarray,
-                    crash_penalty: float) -> dict:
-    """Each drone's first episode from its steps' rewards, gates passed so far, and whether each step was its
-    episode's `terminal` or `last` `[steps, drones]`: its return, gates passed, whether it crashed or
-    finished an open track (an end whose step paid less than half the crash penalty is a crash) and its
+def _first_episodes(following, passed, crash_penalty: float) -> dict:
+    """Each drone's first episode from the steps that followed its actions and the gates passed so far
+    `[steps, drones]` (`dew.rl.evaluation.first_episode_rows`): its return, gates passed, whether it crashed
+    or finished an open track (an end whose step paid less than half the crash penalty is a crash) and its
     steps, averaged over the drones."""
-    ended = np.cumsum(last, 0) - last > 0
-    earned = np.where(ended, 0, reward)
-    gates = np.where(ended, 0, passed).max(0)
-    ending = terminal & ~ended
-    crashed = ending & (reward < -crash_penalty / 2)
-    return {"return": float(earned.sum(0).mean()), "gates": float(gates.mean()),
-            "gates_max": int(gates.max()), "crashed": float(crashed.any(0).mean()),
-            "finished": float((ending & ~crashed).any(0).mean()), "steps": float((~ended).sum(0).mean())}
+    from dew.rl.evaluation import first_episode_rows
+
+    rows = jax.device_get(first_episode_rows(following, {"passed": passed}))
+    gates = np.asarray(rows["passed"])
+    crashed = rows["terminated"] & (rows["last_reward"] < -crash_penalty / 2)
+    return {"return": float(rows["return"].mean()), "gates": float(gates.mean()),
+            "gates_max": int(gates.max()), "crashed": float(crashed.mean()),
+            "finished": float((rows["terminated"] & ~crashed).mean()), "steps": float(rows["steps"].mean())}
 
 
 def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: float) -> dict:
@@ -154,6 +210,7 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
     the share of its first episodes' steps whose next gate lies in the camera's view (`in_view`), which a
     policy of the camera alone needs of the flights it learns from."""
     from dew.rl.env import env_rollout, start
+    from dew.rl.evaluation import first_episodes
     from dew.rl.flight import mounted
 
     def rolled(params, key):
@@ -163,11 +220,11 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
         return taken, jax.vmap(mounted)(camera), camera.fov
 
     taken, mounts, fov = jax.device_get(jax.jit(rolled)(params, key))
-    following, last = taken.following, taken.following.terminated | taken.following.truncated
-    alive = np.cumsum(last, 0) - last == 0
+    following = taken.following
+    alive = np.asarray(first_episodes(following))
     seen = in_view(taken.observation["gates"], mounts, fov)
-    return {**_first_episodes(following.reward, following.observation["passed"], following.terminated, last,
-                              crash_penalty), "in_view": float(seen[alive].mean())}
+    return {**_first_episodes(following, following.observation["passed"], crash_penalty),
+            "in_view": float(seen[alive].mean())}
 
 
 def in_view(gates: np.ndarray, mounts: np.ndarray, fov: np.ndarray) -> np.ndarray:
@@ -184,13 +241,10 @@ def in_view(gates: np.ndarray, mounts: np.ndarray, fov: np.ndarray) -> np.ndarra
     return (depth > 0) & (across < half) & (rise < half)
 
 
-def teacher_policy(objective, *, explore: bool = False):
-    """The teacher's action from a driven step: its greedy one, or where it `explore`s a draw from its policy
-    as it trained (tanh of a normal draw)."""
-    acted = objective.act if explore else objective.greedy
-
+def teacher_policy(objective):
+    """The teacher's greedy action from a driven step, its environment's observation."""
     def policy(params, observed, key, memory):
-        action, _, memory = acted(params, observed["observation"], key, memory)
+        action, _, memory = objective.greedy(params, observed["observation"], key, memory)
         return action, {}, memory
 
     return policy
@@ -228,309 +282,270 @@ def check(out: Path, *, assets: Path, hz: float = 60.0) -> dict:
 
 def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float = 60.0,
             warm: Path | None = None, level: float = 0.2) -> dict:
-    """PPO's teacher for `seconds` over 4096 drones in JAX (`dew.rl.flight.FlightEnv`), scored every ten
-    collections on 1024 drones of the training families and of the held-out ones, the weights of the best
-    greedy return at the highest level reached kept (teacher.msgpack); its curriculum's level starts at
-    `level` and rises by 0.1, to 1, at each score whose crashes fall under a third: the courses' difficulty
-    and the drones' randomization its level, chained tracks beside loops from 0.3. From `warm`, a teacher of
-    the first race's view (`warmed`)."""
-    from dew.objectives.rl.control import ControlRollout
+    """The teacher phase's run (`teacher_run`, OUT/teacher) trained for `seconds` over `drones` drones in JAX,
+    going on from where its checkpoints and teacher.json hold it, scored every `SCORED_EVERY` collections on
+    1024 drones of the training families and of the held-out ones, the step of the best greedy return at the
+    highest level reached named (teacher.json's `best`); its curriculum's level starts at `level` and rises by
+    0.1, to 1, at each score whose crashes fall under a third, each chunk between scores the run at its level.
+    A fresh run starts from `warm`, a teacher of the first race's view (`warmed`), where given."""
     from dew.rl.env import Batched
     from dew.rl.flight import FlightEnv
-    from dew.training import Trainer
-
-    def families_at(level: float):
-        return TRAINING if level >= 0.3 else (("loop", 1.0),)
-
-    def env_at(level: float):
-        flight = FlightEnv(racing_at(hz, families_at(level)), ("teacher",), difficulty=level, ramp=level)
-        return Batched(flight, drones)
 
     def judged_at(level: float, families) -> Batched:
         shown = ("teacher", "passed", "gates")
         return Batched(FlightEnv(racing_at(hz, families), shown, difficulty=level, ramp=level), 1024)
 
-    objective = teacher_objective()
-    if warm is not None:
-        objective.variables = warmed(warm)
-    rollout = ControlRollout(objective, env_at(level), unroll_length=round(32 * hz / 30), epochs=4,
-                             minibatches=32)
-    trainer = Trainer(objective, optax.chain(optax.clip_by_global_norm(1.0), optax.adam(3e-4)),
-                      key=jax.random.key(0), rollout=rollout)
-    state = trainer.place()[0]
-    report = {"drones": drones, "hz": hz, "warm": None if warm is None else str(warm), "curve": []}
-    best, began, updates = (-1.0, -np.inf), time.perf_counter(), 0
-    every = 10 * rollout.epochs * rollout.minibatches
+    path = out / "teacher.json"
+    report = json.loads(path.read_text()) if path.exists() else {
+        "drones": drones, "hz": hz, "warm": None if warm is None else str(warm), "curve": [], "best": None,
+        "level": level}
+    level, began = report["level"], time.perf_counter()
     horizon, penalty = round(20 * hz), racing_at(hz).crash_penalty
-    trained, held_out = judged_at(level, families_at(level)), judged_at(level, HELD_OUT)
     while time.perf_counter() - began < seconds:
-        state = trainer.fit(_idle(), steps=updates + every, log_every=every, state=state)
-        updates += every
+        done = _latest(out / TEACHER_RUN)
+        run = teacher_run(out, hz=hz, level=level, drones=drones)
+        prepared = run.override({"trainer.steps": done + run.trainer.steps}).prepare()
+        if warm is not None and not done:
+            prepared.objective.variables = warmed(warm, prepared.objective)
+        state = prepared.train(TEACHER_RUN)
+        updates, objective = int(state.step), prepared.objective
+        epochs, minibatches, length = (prepared.run.rollout.arguments[name]
+                                       for name in ("epochs", "minibatches", "unroll_length"))
         point = {"updates": updates, "seconds": round(time.perf_counter() - began, 1),
-                 "environment_steps": updates // (rollout.epochs * rollout.minibatches) * drones
-                 * rollout.unroll_length, "level": level,
-                 **flown(trained, objective, state.variables, jax.random.key(1), horizon, penalty),
-                 "held_out": flown(held_out, objective, state.variables, jax.random.key(1), horizon, penalty)}
+                 "environment_steps": updates // (epochs * minibatches) * drones * length, "level": level,
+                 **flown(judged_at(level, families_at(level)), objective, state.variables, jax.random.key(1),
+                         horizon, penalty),
+                 "held_out": flown(judged_at(level, HELD_OUT), objective, state.variables, jax.random.key(1),
+                                   horizon, penalty)}
         report["curve"].append(point)
         print(json.dumps(point), flush=True)
-        if (level, point["return"]) > best:
-            best = level, point["return"]
-            (out / "teacher.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
+        best = report["best"]
+        if best is None or (level, point["return"]) > (best["level"], best["return"]):
+            report["best"] = {"level": level, "return": point["return"], "step": updates}
         if point["crashed"] < 1 / 3 and level < 1.0:
             level = round(min(1.0, level + 0.1), 1)
-            rollout.env = env_at(level)
-            trained, held_out = judged_at(level, families_at(level)), judged_at(level, HELD_OUT)
-        (out / "teacher.json").write_text(json.dumps(report, indent=1))
-    kept = (out / "teacher.msgpack").read_bytes()
-    variables = serialization.from_bytes(jax.device_get(state.variables), kept)
+        report["level"] = level
+        _written(path, json.dumps(report, indent=1))
+    best = report["best"]
+    saved = EnvRunConfig.load(str(out / TEACHER_RUN))
+    with Checkpoints(str(out / TEACHER_RUN)) as checkpoints:
+        variables = checkpoints.variables(step=best["step"], ema=False)
     final = judged_at(1.0, TRAINING), judged_at(1.0, HELD_OUT)
+    objective = saved.agent(final[0], variables)
     names = ("trained", "held_out")
-    report["best"] = {"level": best[0], **{name: flown(judged, objective, variables, jax.random.key(2),
-                                                        racing_at(hz).max_steps, penalty)
-                                           for name, judged in zip(names, final, strict=True)}}
-    (out / "teacher.json").write_text(json.dumps(report, indent=1))
+    report["final"] = {name: flown(judged, objective, variables, jax.random.key(2), racing_at(hz).max_steps,
+                                   penalty) for name, judged in zip(names, final, strict=True)}
+    _written(path, json.dumps(report, indent=1))
     return report
 
 
-def demonstrations(simulator, objective, variables, steps: int, capacity: int, chunk: int = 1000):
-    """The teacher's flight from every drone of `simulator` for `steps` steps, recorded in the agent's
-    convention, as a replay of `capacity` steps a drone the online agent goes on writing. The teacher flies
-    its policy's draws as it trained, not its greedy action: the demonstrations then hold the states a small
-    error leads to and the teacher's way back from them (DART, Laskey et al., arXiv 1703.09327), where a
-    student cloned from greedy flight alone missed the teacher's actions on fresh flights by three times its
-    training error (on the G4, 10-31) and crashed within two seconds. The flight
-    is written `chunk` steps at a time into the replay, which each write updates in place: a whole flight's
-    record beside the replay would hold its 96-pixel images several times over (16 drones' 18,000 steps
-    took the G4's 96 GB)."""
-    from dew.rl.replay import ReplayBuffer
-    from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
-
-    driven = DrivenSimulator(simulator)
-    carry, replay = simulator_start(driven, jax.random.key(3)), None
-    added = jax.jit(lambda replay, stream: replay.add(stream), donate_argnums=0)
-    for start in range(0, steps, chunk):
-        carry, taken = simulator_rollout(driven, teacher_policy(objective, explore=True), variables, carry,
-                                         min(chunk, steps - start), reset=False)
-        stream = {**taken.observation, "action": taken.action}
-        if replay is None:
-            replay = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), capacity)
-        replay = added(replay, stream)
-    return replay
+def wrap(out: Path, *, weights: Path, hz: float = 60.0, level: float = 1.0, drones: int = 4096) -> dict:
+    """A teacher's weights written whole (an earlier teacher phase's teacher.msgpack, of the race's view or
+    its first race's, `warmed`) as the teacher phase's run, OUT/teacher, of no updates: its record the phase's
+    own at `level` (`teacher_run`), its env, model and objective those a trained teacher's are, and its step 0
+    checkpoint the weights, which `RunConfig.train` writes as a run's last step, so the world phase reads it
+    as it reads a trained teacher, and the teacher phase goes on from it. The record cannot name the file the
+    weights came from; the report (teacher.json, the teacher phase's, unscored) does."""
+    prepared = teacher_run(out, hz=hz, level=level, drones=drones).override({"trainer.steps": 0}).prepare()
+    prepared.objective.variables = warmed(weights, prepared.objective)
+    state = prepared.train(TEACHER_RUN)
+    # The teacher phase's own report, unscored, so the phase goes on from the wrapped run.
+    report = {"drones": drones, "hz": hz, "warm": str(weights), "curve": [], "best": None, "level": level,
+              "wrapped": {"run": str(out / TEACHER_RUN), "step": int(state.step)}}
+    _written(out / "teacher.json", json.dumps(report, indent=1))
+    return report
 
 
-def _written(path: Path, text: str) -> None:
-    """`text` at `path`, written whole beside it before it replaces what was there, so a run stopped at any
-    point leaves either file whole."""
-    path.with_name(path.name + ".part").write_text(text)
-    path.with_name(path.name + ".part").replace(path)
+@dataclasses.dataclass(frozen=True)
+class World:
+    """The world phase's settings (`world`): FlyDreamer's agent at its size (TransDreamer's dynamics,
+    bfloat16) on the image alone in races of `drones` drones at `hz`, its images drawn by HyperLux over
+    `assets`, its teacher the run `teacher` at `teacher_step` (its latest where None). Without `highlight` the
+    next gate is not lit and the courses are loops alone (a comparison). Each stage's replay holds
+    `capacity_seconds` a drone (16 GB of 96-pixel images over 16 drones at 60 Hz) and begins with
+    `demonstration_seconds` a drone of the teacher's flight, its policy's draws (DART, Laskey et al., arXiv
+    1703.09327: a student cloned from greedy flight alone missed the teacher's actions on fresh flights by
+    three times its training error and crashed within two seconds). A DAgger stage replays `dagger_ratio`
+    steps for each it takes. Each stage writes its checkpoint every `saved_every` updates (about ten minutes
+    on a G4)."""
+
+    out: Path
+    teacher: Path
+    assets: Path
+    teacher_step: int | None = None
+    drones: int = 16
+    hz: float = 60.0
+    highlight: bool = True
+    demonstration_seconds: float = 600.0
+    capacity_seconds: float = 600.0
+    dagger_ratio: float = 64.0
+    saved_every: int = 2000
+
+    @property
+    def length(self) -> int:
+        """The windows' steps, 64 at 30 Hz: the same seconds at any rate."""
+        return round(64 * self.hz / 30)
+
+    def run(self, stage: str, level: float) -> EnvRunConfig:
+        """The stage's run (`STAGES`) at the curriculum's `level`. Every stage's replay begins with the
+        teacher's demonstrations. `pretrain` clones them, the world model at FlyDreamer's `pretrain_wm` scales
+        and the actor imitating the actions taken, training on them alone (`train_ratio` inf); `dagger`, from
+        it, has the agent fly and imitate the teacher's label of each of its steps; `online`, from it, learns
+        by imagination at FlyDreamer's train ratio of 128."""
+        families = TRAINING if self.highlight else (("loop", 1.0),)
+        renderer = {"class": "dew.rl.hyperlux:HyperLuxRenderer",
+                    "fields": {"count": self.drones, "assets": str(self.assets)}}
+        race = {"renderer": renderer, "racing": racing_record(self.hz, families, highlight=self.highlight),
+                "views": list(VIEWS), "difficulty": level, "ramp": level}
+        imagination = round(15 * self.hz / 30)
+        cloned = {"imagination": imagination, "imitation": 1.0, "scales": {
+            "policy": 0.0, "value": 0.0, "replay_value": 0.0, **{name: 1.0 for name, _, _ in AUXILIARY}}}
+        objective = {"pretrain": cloned, "dagger": {**cloned, "imitates": "label"},
+                     "online": {"imagination": imagination}}[stage]
+        ratio = {"pretrain": math.inf, "dagger": self.dagger_ratio, "online": 128.0}[stage]
+        rollout = {"batch": 16, "length": self.length, "train_ratio": ratio,
+                   "prefill": round(self.demonstration_seconds * self.hz),
+                   "capacity": round(self.capacity_seconds * self.hz)}
+        # DreamerV3's rate, 4e-5 after a linear warmup over its first 1000 updates.
+        rate = Linear(peak_value=4e-5, warmup_steps=1000, end_value=4e-5)
+        run = EnvRunConfig(
+            env=EnvConfig("gate_race", race),
+            objective=ObjectiveConfig(f"{DREAMER}:DreamerV3Objective", objective),
+            rollout=RolloutConfig("dreamer", rollout),
+            teacher=TeacherConfig(str(self.teacher), self.teacher_step, demonstrates=True),
+            optim=OptimConfig(optimizer="laprop", learning_rate=rate),
+            trainer=TrainerConfig(checkpoint_dir=str(self.out), key=STAGES.index(stage), log_every=1000,
+                                  eval_every=None, checkpoint_every=self.saved_every, keep=Keep(latest=1)))
+        if stage != STAGES[0]:
+            return dataclasses.replace(run, pretrained=str(self.out / STAGES[STAGES.index(stage) - 1]))
+        dynamics = {"action_size": 4, "stoch": 32, "classes": 32, "width": 512, "layers": 4, "heads": 8,
+                    "context": self.length, "dtype": "bfloat16"}
+        model = {"conv_depth": 64, "units": 1024, "reads": "image", "dtype": "bfloat16",
+                 "auxiliary": [list(head) for head in AUXILIARY], "dynamics": dynamics}
+        return dataclasses.replace(run, model=ModelConfig(f"{DREAMER}:WorldModel", model))
 
 
-def _committed(out: Path, progress: dict) -> dict:
-    """`progress` made where a world run is (progress.json: its phase, that phase's updates, and the weight
-    files of each phase it holds), written whole before it replaces the last, then every weight file it
-    no longer names removed: a run stopped at any point goes on from one consistent generation."""
-    _written(out / "progress.json", json.dumps(progress))
-    for stale in out.glob("*-[0-9]*.msgpack"):
-        if stale.name not in (progress["pretrained"], progress["world"]):
-            stale.unlink()
-    return progress
+def _staged(world: World, stage: str, updates: int, every: int | None, report: dict, judge, races: tuple,
+            level: float):
+    """The world phase's `stage` (`World.run`) trained to `updates` updates under OUT/<stage>, going on from
+    its checkpoints, its replay made again; with `every`, in chunks of that many updates, each chunk's agent
+    scored (`judge`) into report[stage] and its curriculum raised from `level` as the teacher's was, up a
+    tenth, to 1, at each score whose crashes fall under a third, the stage's race and `races` drawn at it. The
+    stage is prepared once and each chunk trains it on, its rollout's environments and replay kept between
+    them. A chunk's checkpoint is written as it ends, then its score and the level the next chunk trains at
+    (world.json's `level`), where a stopped stage goes on; one stopped between the two is restored at that
+    checkpoint and scored before the next chunk trains. Returns the stage's last state, its agent and the
+    level it ended at."""
+    from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
+
+    done = _latest(world.out / stage)
+    points = [point for point in report.get(stage, []) if point["updates"] <= done]
+    prepared = world.run(stage, level).prepare()
+    rollout, agent = prepared.rollout, prepared.objective
+    assert isinstance(rollout, DreamerRollout) and isinstance(agent, DreamerV3Objective)
+    began, before = time.perf_counter(), points[-1]["seconds"] if points else 0.0
+    state = None
+    while state is None or done < updates:
+        # A chunk checkpointed and stopped before its score is restored there and scored before the next.
+        pending = (state is None and every is not None and done > 0 and done % every == 0
+                   and all(point["updates"] != done for point in points))
+        reached = done if pending else updates if every is None else min(updates, (done // every + 1) * every)
+        prepared = dataclasses.replace(prepared, run=prepared.run.override(
+            {"trainer.steps": reached, "env.difficulty": level, "env.ramp": level}))
+        state = prepared.train(stage)
+        done = int(state.step)
+        if every is None or (points and points[-1]["updates"] == done):
+            continue
+        point = {"updates": done, "environment_steps": rollout.environment_steps, "level": level,
+                 "seconds": before + time.perf_counter() - began,
+                 "episode_return": rollout.metrics["episode_return"],
+                 **judge(agent.greedy, state.variables, agent.memory(world.drones), jax.random.key(done))}
+        points.append(point)
+        report[stage] = points
+        print(json.dumps(point), flush=True)
+        if point["crashed"] < 1 / 3 and level < 1.0:
+            level = round(min(1.0, level + 0.1), 1)
+            for raced in (rollout.env, *races):
+                raced.difficulty = raced.ramp = level
+        # The level the next chunk trains at, beside the score that earned it: a resumed stage goes on there.
+        report["level"] = level
+        _written(world.out / "world.json", json.dumps(report, indent=1))
+    return state, agent, level
 
 
-def _saved(out: Path, progress: dict, phase: str, updates: int, variables) -> dict:
-    """The phase's weights after `updates` updates written to a file of their own, then made where the run
-    is (`_committed`)."""
-    kind = "pretrained" if phase == "pretrain" else "world"
-    name = f"{kind}-{updates:07d}.msgpack"
-    (out / name).write_bytes(serialization.to_bytes(jax.device_get(variables)))
-    return _committed(out, {**progress, "phase": phase, "updates": updates, kind: name})
-
-
-def _resumed(out: Path, objective, name: str):
-    """The weights a world run wrote to `name`, in `objective`'s tree."""
-    fresh = jax.device_get(objective.init(jax.random.key(0)))
-    return serialization.from_bytes(fresh, (out / name).read_bytes())
-
-
-def _pretrained(out: Path, pretraining, windows: Loader, updates: int, saved_every: int,
-                progress: dict) -> tuple[object, dict]:
-    """The world model pretrained on `windows` to `updates` updates from where `progress` holds it, its
-    weights written every `saved_every` updates (`_saved`), then the online phase made begun; and the run's
-    progress."""
-    from dew.optim import laprop
-    from dew.training import Trainer
-
-    done = progress["updates"]
-    if done:
-        pretraining.variables = _resumed(out, pretraining, progress["pretrained"])
-    trainer = Trainer(pretraining, laprop(), key=jax.random.key(6 + done))
-    state = trainer.place()[0]
-    while done < updates:
-        chunk = min(saved_every, updates - done)
-        state = trainer.fit(windows, steps=int(state.step) + chunk, log_every=1000, state=state)
-        done += chunk
-        progress = _saved(out, progress, "pretrain", done, state.variables)
-    return jax.device_get(state.variables), _committed(out, {**progress, "phase": "online", "updates": 0})
-
-
-def _online(out: Path, report: dict, progress: dict, agent, races: tuple, judge, replay, *, level: float,
-            length: int, steps: int, saved_every: int):
-    """The world phase's online training of `agent` over the first of `races` (the training race, then the
-    two it is judged on) at train ratio 128 from `replay`, for `steps` environment steps over all its drones,
-    from where `progress` holds it: its weights and where it is written every `saved_every` updates
-    (`_saved`), and every 10,000 updates its point (`judge`) added to `report` (world.json). Its curriculum
-    goes on from `level`, as the teacher's did: up a tenth, to 1, at each point whose crashes fall under a
-    third, every race's courses and drones drawn at it. Its environment steps and seconds go on from those
-    its checkpoint holds. Returns its last state."""
-    from dew.objectives.rl.dreamer import DreamerRollout
-    from dew.optim import laprop
-    from dew.training import Trainer
-
-    simulator = races[0]
-    online = progress["updates"] if progress["phase"] == "online" else 0
-    if online:
-        agent.variables = _resumed(out, agent, progress["world"])
-    level = progress.get("level", level)
-    for raced in races:
-        raced.difficulty = raced.ramp = level
-    rollout = DreamerRollout(agent, simulator, batch=16, length=length, train_ratio=128.0, replay=replay)
-    trainer = Trainer(agent, laprop(), key=jax.random.key(8 + online), rollout=rollout)
-    updates = int(steps * rollout.train_ratio / (rollout.batch * rollout.length))
-    steps_before, seconds_before = progress.get("environment_steps", 0), progress.get("seconds", 0.0)
-    state, began, done = trainer.place()[0], time.perf_counter(), online
-    while done < updates:
-        chunk = min(saved_every, updates - done, 10_000 - done % 10_000)
-        state = trainer.fit(_idle(), steps=int(state.step) + chunk, log_every=1000, state=state)
-        done += chunk
-        steps_now = steps_before + rollout.environment_steps
-        seconds_now = seconds_before + time.perf_counter() - began
-        if done % 10_000 == 0 or done == updates:
-            # A judgment's point and the level it earns are written before the checkpoint that commits them:
-            # a run stopped between the two goes on from the checkpoint before, and judges again.
-            point = {"updates": done, "environment_steps": steps_now, "level": level, "seconds": seconds_now,
-                     "episode_return": rollout.metrics["episode_return"],
-                     **judge(agent.act, state.variables, agent.memory(simulator.count), jax.random.key(done))}
-            report["online"].append(point)
-            print(json.dumps(point), flush=True)
-            _written(out / "world.json", json.dumps(report, indent=1))
-            if point["crashed"] < 1 / 3 and level < 1.0:
-                level = round(min(1.0, level + 0.1), 1)
-                for raced in races:
-                    raced.difficulty = raced.ramp = level
-        progress = _saved(out, {**progress, "level": level, "environment_steps": steps_now,
-                                "seconds": seconds_now}, "online", done, state.variables)
-    return state
-
-
-def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, hz: float = 60.0,
-          demonstration_seconds: float = 600.0, pretrain_updates: int = 50_000,
-          environment_seconds: float = 33_333.0, capacity_seconds: float = 600.0,
-          highlight: bool = True, saved_every: int = 2000, level: float = 1.0) -> dict:
-    """FlyDreamer's agent at its size (TransDreamer's dynamics, bfloat16) on the image alone: pretrained on
-    the teacher's demonstrations (FlyDreamer's `pretrain_wm` scales and behaviour cloning), then trained
-    online at train ratio 128, starting from the demonstrations' replay; the teacher, the cloned agent and
-    the online agent scored alike (world.json, pretrained.msgpack, world.msgpack), the online agent every
-    10,000 updates, and the cloned and the final agents' first drones filmed (cloned.npz, video.npz), each
-    on an evaluation race of its own, on the training families and, held out, the others. Without
-    `highlight` the next gate is not lit and the courses are loops alone (a comparison). Every race is at the
-    curriculum's `level` (its courses' difficulty and its drones' randomization), the teacher's, which the
-    online phase raises as the teacher's curriculum did (`teacher`) toward 1. Each drone
-    flies `demonstration_seconds` for the demonstrations; the agent flies `environment_seconds` online over
-    all its drones (FlyDreamer's 1M steps at 30 Hz); the replay holds `capacity_seconds` a drone (16 GB of
-    96-pixel images over 16 drones at 60 Hz). Every `saved_every` updates of either phase (about ten minutes
-    on a G4) the weights so far are written with where the run is (progress.json names the weight files it
-    goes on from, `_committed`); a run whose `out` holds them goes on from there, its replay the
-    demonstrations again and its optimizer's moments afresh."""
-
-    from dew.objectives.rl.dreamer import DreamerV3Objective, WorldModel
-    from dew.objectives.rl.tssm import TSSM
-
-    scale = hz / 30
-    length, imagination = round(64 * scale), round(15 * scale)
-    views = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed", "finishing", "teacher")
-    families = TRAINING if highlight else (("loop", 1.0),)
+def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int = 10_000,
+          environment_seconds: float = 33_333.0, level: float = 1.0) -> dict:
+    """The world phase's stages (`World.run`) in turn, each going on from its checkpoints: pretraining for
+    `pretrain_updates` updates, DAgger for `dagger_updates`, scored every 2,000, and online training for
+    `environment_seconds` of flight over all its drones (FlyDreamer's 1M steps at 30 Hz), scored every 10,000;
+    the teacher and each stage's last agent scored alike, each flying greedy (world.json), the cloned, DAgger
+    and online agents' first drones filmed (cloned.npz, dagger.npz, video.npz), each on an evaluation race
+    of its own, on the training families and, held out, the others. Every race is at the curriculum's `level`
+    (its courses' difficulty and its drones' randomization), which the scored stages raise as the teacher's
+    curriculum did (`teacher`) toward 1."""
+    families = TRAINING if world.highlight else (("loop", 1.0),)
+    path = world.out / "world.json"
+    report = json.loads(path.read_text()) if path.exists() else {
+        "drones": world.drones, "hz": world.hz, "length": world.length, "highlight": world.highlight,
+        "level": level, "teacher_run": str(world.teacher)}
+    # A phase going on goes on at the level its last committed chunk reached.
+    level = report["level"]
 
     def raced(families):
-        raced = race(drones, views, hz=hz, families=families, assets=assets, highlight=highlight)
+        raced = race(world.drones, VIEWS, hz=world.hz, families=families, assets=world.assets,
+                     highlight=world.highlight)
         raced.difficulty = raced.ramp = level
         return raced
 
-    simulator, judged, held_out = raced(families), raced(families), raced(HELD_OUT)
-    horizon = simulator.racing.max_steps
-    taught = teacher_objective()
-    held = serialization.from_bytes(taught.init(jax.random.key(0)), teacher_weights.read_bytes())
+    judged, held_out = raced(families), raced(HELD_OUT)
+    horizon = judged.racing.max_steps
 
     def judge(policy, params, memory, key, film=None):
         return {**scored(judged, policy, params, memory, key, horizon, film=film),
                 "held_out": scored(held_out, policy, params, memory, key, horizon)}
 
-    # Where an earlier run of this `out` stopped and the online scores it wrote, read before any is written.
-    progress = (json.loads((out / "progress.json").read_text()) if (out / "progress.json").exists()
-                else {"phase": "pretrain", "updates": 0, "pretrained": None, "world": None})
-    earlier = (json.loads((out / "world.json").read_text())
-               if progress["phase"] == "online" and (out / "world.json").exists() else {})
-    # A run going on keeps the online scores it wrote and every point it went on from, from its first write.
-    resumes = [*earlier.get("resumes", []), progress["updates"]] if progress["phase"] == "online" else []
-    # The points a checkpoint committed: one written past it, by a run stopped before its own, is judged anew.
-    committed = [point for point in earlier.get("online", []) if point["updates"] <= progress["updates"]]
-    report = {"online": committed, "resumes": resumes,
-              "drones": drones, "hz": hz, "length": length, "imagination": imagination, "level": level,
-              "highlight": highlight, "teacher": judge(teacher_policy(taught), held, None, jax.random.key(4))}
-    began = time.perf_counter()
-    replay = demonstrations(simulator, taught, held, round(demonstration_seconds * hz),
-                            round(capacity_seconds * hz))
-    report["demonstration_seconds"] = time.perf_counter() - began
-    print(json.dumps(report), flush=True)
-
-    dynamics = TSSM(action_size=4, stoch=32, classes=32, width=512, layers=4, heads=8, context=length,
-                    dtype=jnp.bfloat16)
-    model = WorldModel(0, 4, image=(96, 96, 3), conv_depth=64, units=1024, reads="image", auxiliary=AUXILIARY,
-                       dynamics=dynamics, dtype=jnp.bfloat16)
-    pretraining = DreamerV3Objective(model, imagination=imagination, imitation=1.0,
-                                     scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0,
-                                             **{name: 1.0 for name, _, _ in AUXILIARY}})
-    drawn = itertools.count()
-    # The replay an argument, not a constant the program would hold a copy of (16 GB).
-    sample = jax.jit(lambda replay, draw: replay.sample(jax.random.fold_in(jax.random.key(5), draw), 16,
-                                                        length))
-    windows = Loader(train=lambda partition: (jax.device_get(sample(replay, next(drawn)))
-                                              for _ in itertools.count()), val=None, records=16, batch=16)
-    began = time.perf_counter()
-    if progress["phase"] == "pretrain":
-        pretrained_variables, progress = _pretrained(out, pretraining, windows, pretrain_updates, saved_every,
-                                                     progress)
-    else:
-        pretrained_variables = _resumed(out, pretraining, progress["pretrained"])
-    (out / "pretrained.msgpack").write_bytes(serialization.to_bytes(pretrained_variables))
-    report["pretrain_seconds"] = time.perf_counter() - began
-    agent = DreamerV3Objective(model, imagination=imagination, variables=pretrained_variables)
-    report["cloned"] = judge(agent.act, pretrained_variables, agent.memory(drones), jax.random.key(7),
-                             film=out / "cloned.npz")
-    print(json.dumps(report), flush=True)
-    _written(out / "world.json", json.dumps(report, indent=1))
-
-    state = _online(out, report, progress, agent, (simulator, judged, held_out), judge, replay, level=level,
-                    length=length, steps=round(environment_seconds * hz), saved_every=saved_every)
-    (out / "world.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
-    report["online_agent"] = judge(agent.act, state.variables, agent.memory(drones), jax.random.key(9),
-                                   film=out / "video.npz")
-    _written(out / "world.json", json.dumps(report, indent=1))
+    if "teacher" not in report:
+        saved = EnvRunConfig.load(str(world.teacher))
+        with Checkpoints(str(world.teacher)) as checkpoints:
+            variables = checkpoints.variables(step=world.teacher_step, ema=False)
+        report["teacher"] = judge(teacher_policy(saved.agent(judged, variables)), variables, None,
+                                  jax.random.key(4))
+        _written(path, json.dumps(report, indent=1))
+    collecting = world.run("online", level).rollout.arguments
+    online = int(round(environment_seconds * world.hz) * collecting["train_ratio"]
+                 / (collecting["batch"] * collecting["length"]))
+    filmed = {"pretrain": "cloned.npz", "dagger": "dagger.npz", "online": "video.npz"}
+    for stage, updates, every in zip(STAGES, (pretrain_updates, dagger_updates, online), (None, 2000, 10_000),
+                                     strict=True):
+        state, agent, level = _staged(world, stage, updates, every, report, judge, (judged, held_out), level)
+        report["level"] = level
+        report[f"{stage}_agent"] = judge(agent.greedy, state.variables, agent.memory(world.drones),
+                                         jax.random.key(7 + STAGES.index(stage)),
+                                         film=world.out / filmed[stage])
+        print(json.dumps({key: value for key, value in report.items() if not isinstance(value, list)}),
+              flush=True)
+        _written(path, json.dumps(report, indent=1))
     return report
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("phase", choices=("check", "teacher", "world"))
+    parser.add_argument("phase", choices=("check", "teacher", "wrap", "world"))
     parser.add_argument("out", type=Path)
     parser.add_argument("--hz", type=float, default=60.0)
     parser.add_argument("--seconds", type=float, default=6600.0)
-    parser.add_argument("--teacher", type=Path)
+    parser.add_argument("--teacher", type=Path, help="wrap: the teacher's weights (teacher.msgpack); world: "
+                        "the teacher's run (OUT/teacher)")
+    parser.add_argument("--teacher-step", type=int)
     parser.add_argument("--assets", type=Path)
     parser.add_argument("--warm", type=Path)
-    parser.add_argument("--level", type=float, help="the curriculum's level: the teacher's first (0.2), the "
-                        "world phase's every race's (1.0)")
+    parser.add_argument("--level", type=float, help="the curriculum's level: the teacher's first (0.2), a "
+                        "wrapped teacher's and the world phase's every race's (1.0)")
     parser.add_argument("--no-highlight", action="store_true")
     parser.add_argument("--pretrain-updates", type=int, default=50_000)
+    parser.add_argument("--dagger-updates", type=int, default=10_000)
+    parser.add_argument("--dagger-ratio", type=float, default=64.0)
     parser.add_argument("--environment-seconds", type=float, default=33_333.0)
     arguments = parser.parse_args()
     arguments.out.mkdir(parents=True, exist_ok=True)
@@ -539,11 +554,15 @@ def main() -> None:
     elif arguments.phase == "teacher":
         report = teacher(arguments.out, seconds=arguments.seconds, hz=arguments.hz, warm=arguments.warm,
                          level=0.2 if arguments.level is None else arguments.level)
+    elif arguments.phase == "wrap":
+        report = wrap(arguments.out, weights=arguments.teacher, hz=arguments.hz,
+                      level=1.0 if arguments.level is None else arguments.level)
     else:
-        report = world(arguments.out, teacher_weights=arguments.teacher, assets=arguments.assets,
-                       hz=arguments.hz, pretrain_updates=arguments.pretrain_updates,
+        report = world(World(arguments.out, arguments.teacher, arguments.assets, arguments.teacher_step,
+                             hz=arguments.hz, highlight=not arguments.no_highlight,
+                             dagger_ratio=arguments.dagger_ratio),
+                       pretrain_updates=arguments.pretrain_updates, dagger_updates=arguments.dagger_updates,
                        environment_seconds=arguments.environment_seconds,
-                       highlight=not arguments.no_highlight,
                        level=1.0 if arguments.level is None else arguments.level)
     print(json.dumps({key: value for key, value in report.items() if not isinstance(value, list)}))
 
