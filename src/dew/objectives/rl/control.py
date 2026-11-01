@@ -271,8 +271,7 @@ class ControlRollout:
                      ended=np.asarray(self._ended, np.float32))
 
     def saved_shapes(self) -> Mapping[str, object] | None:
-        """`saved`'s leaves' shapes, placed on the device the environments are, before any call; None over
-        a `Simulator`."""
+        """`saved`'s leaves' shapes and dtypes, before any call; None over a `Simulator`."""
         env = self.env
         if isinstance(env, Simulator):
             return None
@@ -286,10 +285,8 @@ class ControlRollout:
 
         gathered = jax.eval_shape(collected, jax.eval_shape(self.objective.init, key), carry)
         order = jax.ShapeDtypeStruct((self.epochs * len(gathered["reward"]),), np.int32)
-        where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), {
-            "carry": carry, "returns": jax.ShapeDtypeStruct((count,), jnp.float32), "collected": gathered,
-            "order": order, "ended": jax.ShapeDtypeStruct((), jnp.float32)})
+        return {"carry": carry, "returns": jax.ShapeDtypeStruct((count,), jnp.float32), "collected": gathered,
+                "order": order, "ended": jax.ShapeDtypeStruct((), jnp.float32)}
 
     def restored(self, tree: Saved) -> None:
         """The rollout carrying on from a `saved` tree."""

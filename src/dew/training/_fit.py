@@ -973,7 +973,8 @@ def _rollout_saved(rollout: Rollout | None) -> Mapping[str, object] | None:
     return tree
 
 
-def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: int) -> None:
+def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: int,
+                     where: jax.sharding.Sharding) -> None:
     """`rollout` carrying on from the state the step it resumes from holds (`Rollout`'s `restored`, read at
     this boundary, as `saved_shapes` is: a rollout is any callable), a key read back typed, as the run's
     own key is (`request_key`); a rollout that saves none (its `saved_shapes` None, or absent) resumes as
@@ -985,9 +986,11 @@ def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: in
     if restored is None:
         raise TypeError(f"{type(rollout).__name__} saves its state and holds no `restored` to carry on "
                         "from it")
-    template = shapes()
-    if template is None:
+    shaped = shapes()
+    if shaped is None:
         return
+    # The pool's state, placed as the run's key is, every device holding it whole.
+    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), shaped)
     tree = checkpoints.rollout_state(step, template)
     if tree is None:
         _log.warning("step %d holds no state of the run's %s: it starts its environments afresh", step,

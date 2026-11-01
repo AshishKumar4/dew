@@ -27,7 +27,7 @@ import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -731,6 +731,18 @@ class DreamerV3Objective(Objective[Ratio]):
         return Ratio(total, jnp.ones(())), Aux(metrics, variables=stats)
 
 
+class Saved(TypedDict):
+    """What a `DreamerRollout` carries between calls, as a checkpoint holds it (`DreamerRollout.saved`):
+    the environment steps it took, those of them its prefills took, and with a checkpointed replay its
+    environments, replay and returns."""
+
+    taken: np.ndarray
+    prefilled: np.ndarray
+    carry: NotRequired[Carry]
+    replay: NotRequired[ReplayBuffer]
+    returns: NotRequired[jax.Array]
+
+
 @dataclass
 class DreamerRollout:
     """The trainer's rollout of a `DreamerV3Objective` (`dew.training.rollout.Rollout`): its agent acts
@@ -741,7 +753,13 @@ class DreamerRollout:
     each environment taken uniformly at random. A `replay` given (demonstrations recorded in the
     agent's convention from as many environments, `[capacity, envs, ...]`) is the replay it starts from
     and writes on, in place of the prefill. `metrics` reports the mean return of the episodes that ended
-    since the last update."""
+    since the last update.
+
+    The run's checkpoints hold the environment steps it has taken (`saved`), so a resumed run takes the
+    steps it still owes; its environments begin again and its replay is made again, from `replay` or the
+    prefill. With `checkpointed_replay`, they also hold its replay, its environments mid episode and their
+    running returns, and a resumed run samples what the uninterrupted run did, at the replay's size a
+    checkpoint (a JAX `Env`'s alone: a `Simulator`'s environments live outside JAX)."""
 
     objective: DreamerV3Objective
     env: Env | Simulator
@@ -751,13 +769,19 @@ class DreamerRollout:
     train_ratio: float = 1024.0
     prefill: int = 64
     replay: ReplayBuffer | None = None
+    checkpointed_replay: bool = False
     _live: _Live | None = field(default=None, init=False, repr=False)
     _taken: int = field(default=0, init=False, repr=False)
+    _prefilled: int = field(default=0, init=False, repr=False)
     _ended: tuple[jax.Array | float, jax.Array | int] = field(default=(0.0, 0), init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.replay is None and self.prefill < self.length:
             raise ValueError("the prefill must hold at least one window")
+        if self.checkpointed_replay and isinstance(self.env, Simulator):
+            raise ValueError("a checkpointed replay resumes with its environments mid episode, and a "
+                             "Simulator's live outside JAX: its run's checkpoints hold the steps it took "
+                             "alone")
         env = self.env
         if isinstance(env, Simulator):
             driven = DrivenSimulator(env)
@@ -781,6 +805,42 @@ class DreamerRollout:
     def environment_steps(self) -> int:
         """The steps every environment has taken so far, summed."""
         return self._taken
+
+    def saved(self) -> Saved | None:
+        """What the run's checkpoints hold of the rollout (`Rollout`'s `saved`): the environment steps it
+        has taken and those its prefills took, and with `checkpointed_replay` its replay, its environments
+        mid episode and their running returns; None before its first call."""
+        live = self._live
+        if live is None:
+            return None
+        taken, prefilled = np.asarray(self._taken, np.int64), np.asarray(self._prefilled, np.int64)
+        if not self.checkpointed_replay:
+            return Saved(taken=taken, prefilled=prefilled)
+        return Saved(taken=taken, prefilled=prefilled, carry=live.carry, replay=live.replay,
+                     returns=live.returns)
+
+    def saved_shapes(self) -> Mapping[str, object]:
+        """`saved`'s leaves' shapes and dtypes, before any call."""
+        counted = jax.ShapeDtypeStruct((), np.int64)
+        taken = {"taken": counted, "prefilled": counted}
+        env = self.env
+        if not self.checkpointed_replay or isinstance(env, Simulator):
+            return taken
+        key = jax.random.key(0)
+        count = env.reset(key)[1].reward.shape[0]
+        carry = jax.eval_shape(lambda key: self._begin(key, self.objective.memory(count)), key)
+        action = jax.ShapeDtypeStruct((count, env.action_size), jnp.float32)
+        example = {**views(carry.observation), "action": action}
+        replay = jax.eval_shape(lambda example: ReplayBuffer.empty(example, self.capacity), example)
+        returns = jax.ShapeDtypeStruct((count,), jnp.float32)
+        return {**taken, "carry": carry, "replay": replay, "returns": returns}
+
+    def restored(self, tree: Saved) -> None:
+        """The rollout carrying on from a `saved` tree: owing the steps after those it had taken, and with
+        `checkpointed_replay` from its replay and its environments as they stood."""
+        self._taken, self._prefilled = int(np.asarray(tree["taken"])), int(np.asarray(tree["prefilled"]))
+        if "replay" in tree and "carry" in tree and "returns" in tree:
+            self._live = _Live(tree["carry"], tree["replay"], tree["returns"])
 
     @property
     def held_replay(self) -> ReplayBuffer | None:
@@ -837,6 +897,8 @@ class DreamerRollout:
         returns = jnp.zeros(count)
         if self.replay is not None:
             return _Live(carry, self.replay, returns)
+        # No update owes the prefill's steps; a resumed run that fills its replay again takes them again.
+        self._prefilled += self.prefill * count
         example = {**views(carry.observation), "action": jnp.zeros((count, self.env.action_size))}
         return self._advanced(variables, _Live(carry, ReplayBuffer.empty(example, self.capacity), returns),
                               self.prefill, random=True)
@@ -847,8 +909,7 @@ class DreamerRollout:
         live = self._started(variables, act_key) if self._live is None else self._live
         owed = math.ceil((int(state.updates) + 1) * self.batch * self.length / self.train_ratio)
         envs = live.returns.shape[0]
-        prefilled = 0 if self.replay is not None else self.prefill * envs
-        due = max(owed - (self._taken - prefilled), 0)
+        due = max(owed - (self._taken - self._prefilled), 0)
         if due:
             live = self._advanced(variables, live, -(-due // envs), random=False)
         self._live = live

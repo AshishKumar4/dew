@@ -452,3 +452,51 @@ def test_an_auxiliary_head_named_as_a_world_model_loss_is_refused(name):
     DreamerV3Objective(headed("physics"))
     with pytest.raises(ValueError):
         DreamerV3Objective(headed(name))
+
+
+def test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike(tmp_path):
+    """A DreamerV3 run on targets, checkpointed every update and resumed from its third by a fresh rollout:
+    the checkpoint holds the environment steps it took, so the resumed rollout takes, update by update, the
+    steps the uninterrupted one did, its environments and replay begun again (and its prefill taken again);
+    with `checkpointed_replay` it also holds the replay, the targets mid episode and their returns, so the
+    resumed run takes the very steps and its last state is the uninterrupted run's, every leaf bit for bit,
+    the key's as its raw bits."""
+    import shutil
+
+    from dew.checkpoints import Checkpoints, Keep
+    from dew.data.dataset import Loader, replayed
+    from dew.training import Trainer
+
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+
+    def trained(directory, objective, rollout):
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout,
+                          checkpoints=Checkpoints(str(directory), keep=Keep(latest=8)))
+        return trainer.fit(data, steps=5, log_every=1, checkpoint_every=1)
+
+    def rollout(objective, checkpointed):
+        targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+        return DreamerRollout(objective, targets, capacity=400, batch=8, length=16, train_ratio=32.0,
+                              prefill=24, checkpointed_replay=checkpointed)
+
+    def resumed(directory, objective, made):
+        copied = tmp_path / f"{directory.name}-resumed"
+        shutil.copytree(directory, copied)
+        for later in (4, 5):
+            shutil.rmtree(Checkpoints(str(copied)).path(later))
+        return trained(copied, objective, made), made
+
+    def bits(state):
+        return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                           else leaf) for leaf in jax.tree.leaves(state)]
+
+    for checkpointed in (False, True):
+        objective = DreamerV3Objective(tiny())
+        uninterrupted = rollout(objective, checkpointed)
+        whole = trained(tmp_path / f"whole-{checkpointed}", objective, uninterrupted)
+        again, made = resumed(tmp_path / f"whole-{checkpointed}", objective, rollout(objective, checkpointed))
+        assert made.environment_steps == uninterrupted.environment_steps + (0 if checkpointed else 24 * 8)
+        if checkpointed:
+            for one, other in zip(bits(whole), bits(again), strict=True):
+                np.testing.assert_array_equal(one, other)

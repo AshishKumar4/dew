@@ -681,7 +681,7 @@ class Trainer(Generic[Loss, Effects]):
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
         state = restored(state, resume, self._examples)
-        _rollout_resumed(self.rollout, checkpoints, resume)
+        _rollout_resumed(self.rollout, checkpoints, resume, shardings.key)
         if (config := self._config) is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = rates_set(state, lambda held: with_rates(held, config.rates()))
