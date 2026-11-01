@@ -93,35 +93,38 @@ def signature(tree) -> frozenset:
                      for path, leaf in leaves)
 
 
-def module_path(location: ir.Location) -> str:
+def module_path(location: ir.Location, within: str | None = None) -> str:
     """The variable scope of the innermost module a product's location names (`scoped`), its path
-    joined by `/`; empty where it runs in none."""
+    joined by `/`; where it names none, the scope it runs `within` (a called function's call's), else
+    empty."""
     # A lowered operation's location names its name stack (`ir.NameLoc`), the call sites beneath it.
     segments = location.name_str.split("/") if isinstance(location, ir.NameLoc) else []
     scopes = [segment.removeprefix(SCOPE) for segment in segments if segment.startswith(SCOPE)]
-    return scopes[-1].replace("|", "/") if scopes else ""
+    if scopes:
+        return scopes[-1].replace("|", "/")
+    return within or ""
 
 
 def products(modules: list[str]) -> dict[str, list[str]]:
     """Each module path's dtypes its products' operands hold, over `modules`, StableHLO text: a product in a
-    private function (a nested `jax.jit`'s, which XLA inlines; a wide sum's, `precision.accumulated`) at the
-    path of the call that runs it, where its own location names the function's scope alone (22 of
-    test_saved_runs red, row 3193)."""
+    private function (a nested `jax.jit`'s, which XLA inlines; a wide sum's, `precision.accumulated`) at its
+    own location's path where it names one, else at the path of the call that runs it: its location names
+    the function's own scopes alone (22 of test_saved_runs red, row 3193)."""
     found: dict[str, set[str]] = {}
 
-    def walk(operation: ir.Operation, functions: dict, at: str | None = None) -> None:
+    def walk(operation: ir.Operation, functions: dict, within: str | None = None) -> None:
         for region in operation.regions:
             for block in region.blocks:
                 for inner in block.operations:
                     name = inner.operation.name
                     if name == "stablehlo.dot_general":
-                        found.setdefault(at or module_path(inner.location), set()).update(
+                        found.setdefault(module_path(inner.location, within), set()).update(
                             DTYPES[str(ir.RankedTensorType(operand.type).element_type)]
                             for operand in inner.operands)
                     elif name == "func.call":
                         callee = str(inner.operation.attributes["callee"]).lstrip("@").strip('"')
-                        walk(functions[callee], functions, at or module_path(inner.location))
-                    walk(inner.operation, functions, at)
+                        walk(functions[callee], functions, module_path(inner.location, within) or None)
+                    walk(inner.operation, functions, within)
 
     with mlir.make_ir_context():
         for text in modules:

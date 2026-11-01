@@ -196,28 +196,35 @@ def test_a_packed_projections_products_count_at_each_of_its_members():
 
 
 def test_a_called_product_is_read_at_the_scope_that_called_it(tmp_path):
-    """A product in a called program (a wide sum's, `precision.accumulated`, one private function traced once
-    for its types) is read at the scope of the call that runs it, as XLA inlines it, not at the function's
-    own (row 3193)."""
+    """A product in a called program is read at the scope of the call that runs it, as XLA inlines it: a wide
+    sum's (`precision.accumulated` on a CPU, one private function traced once for its types, its own
+    location naming no scope) at its caller's, and one under a scope of the called program's own at that
+    (row 3193)."""
     import jax.numpy as jnp
     from saved_run_products import SCOPE, products
 
     from dew.nn.precision import accumulated
 
+    @jax.jit
+    def block(x, weight):
+        with jax.named_scope(SCOPE + "layer2|inner"):
+            return x @ weight
+
     def program(x, first, second):
         with jax.named_scope(SCOPE + "layer1"):
             hidden = accumulated(jnp.dot, x, first)
         with jax.named_scope(SCOPE + "layer2"):
-            return accumulated(jnp.dot, hidden, second)
+            return block(hidden.astype(jnp.bfloat16), second)
 
-    x, w = jnp.ones((4, 8), jnp.float32), jnp.ones((8, 8), jnp.float32)
-    jax.config.update("jax_dump_ir_to", str(tmp_path))
-    try:
-        jax.jit(program)(x, w, w).block_until_ready()
-    finally:
-        jax.config.update("jax_dump_ir_to", "")
+    with jax.default_device(jax.devices("cpu")[0]):
+        x, w = jnp.ones((4, 8), jnp.float32), jnp.ones((8, 8), jnp.float32)
+        jax.config.update("jax_dump_ir_to", str(tmp_path))
+        try:
+            jax.jit(program)(x, w, w.astype(jnp.bfloat16)).block_until_ready()
+        finally:
+            jax.config.update("jax_dump_ir_to", "")
     texts = [path.read_text() for path in sorted(tmp_path.glob("*.mlir"))]
-    assert products(texts) == {"layer1": ["float64"], "layer2": ["float64"]}
+    assert products(texts) == {"layer1": ["float64"], "layer2/inner": ["bfloat16"]}
 
 
 def test_a_requests_products_are_named_by_their_variable_scopes():
