@@ -195,13 +195,14 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
     return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
-RAISES_HONORED = True
+RAISES_HONORED = False
 """Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg): a
 jaxlib with jax-ml/jax f365a65e3a (Mosaic GPU's nvJitLink disabled, jaxlib/mosaic/gpu/target.cc
-NvJitLinkMode::kDisabled; issue 42094) compiles each kernel whole, so a raise holds (this dev branch runs
-the nightly carrying it, owner 10-31; it lands with the release's pin). Before it, nvJitLink compiled
-relocatably and ptxas ignored setmaxnreg (C7504): SAMECOMPILE1-h100, two consumers' attention dK/dV spilled
-504 bytes at 168 registers where a whole-program compile holds its 232."""
+NvJitLinkMode::kDisabled; issue 42094) compiles each kernel whole, so a raise holds; it turns true with the
+pin that carries it (post42), once an H100 compile under that pin shows no C7504 (ET-HONOR-h100 under the
+venv overlay: C7504, 168 registers). Before it, nvJitLink compiled relocatably and ptxas ignored setmaxnreg
+(C7504): SAMECOMPILE1-h100, two consumers' attention dK/dV spilled 504 bytes at 168 registers where a
+whole-program compile holds its 232."""
 
 
 def entry_registers(warpgroups: int) -> int:
