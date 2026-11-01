@@ -45,7 +45,7 @@ from dew.state import TrainState, apart
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
-from dew.training.memory import climb_to, recompute_more, rung_record
+from dew.training.memory import climb_to, first_run, local_devices, memory_record, recompute_more, rung_record
 from dew.training.planning import Trials, planned, splits
 
 ROWS, SEQ = 32, 16
@@ -859,6 +859,26 @@ def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monke
     trainer.compile(state, BATCH, trials)
     assert_searched(asked(trainer), (4, None), 2)
     assert all(remat is None for _, remat, _ in asked(trainer))
+
+
+def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():
+    """A newly compiled step whose first run fails on its devices is raised as the step's, from the
+    devices' own error, with the record of the check that said it fits, where each GPU states the bytes
+    free outside XLA's pool: a collective's communicators (NCCL) take their buffers there, beside
+    cuBLAS's workspaces and the kernels loaded (row 2901)."""
+    def fail(value):
+        raise ValueError(f"the device refused {value}")
+
+    mesh = MeshSpec().build(jax.devices()[:1])
+    step = jax.jit(lambda value: jax.pure_callback(fail, jax.ShapeDtypeStruct((), jnp.float32), value))
+    compiled = step.lower(jnp.float32(0)).compile()
+    record = memory_record(compiled, local_devices(mesh), 0, fits=True)
+    assert [device["outside"] is None for device in record["devices"]] == [
+        device.platform != "gpu" for device in local_devices(mesh)]
+    assert all(device["outside"] is None or device["outside"] > 0 for device in record["devices"])
+    with pytest.raises(RuntimeError) as raised:
+        first_run(compiled(jnp.float32(0)), 0, record, mesh)
+    assert isinstance(raised.value.__cause__, jax.errors.JaxRuntimeError)
 
 
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])
