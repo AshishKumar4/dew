@@ -90,9 +90,15 @@ def test_a_mixture_builds_gpt_oss_experts_wherever_a_layer_routes():
     output = module.apply({"params": params}, arrays["hidden"])
     np.testing.assert_allclose(np.asarray(output), arrays["output"], atol=1.6e-4, rtol=0)
     for refused in (Mixture(experts=4, top_k=2, scaling=2.0), Mixture(experts=4, top_k=2, parallel=True),
-                    Mixture(experts=4, top_k=2, shared_features=8)):
+                    Mixture(experts=4, top_k=2, shared_features=8),
+                    Mixture(experts=4, top_k=2, weight_sum_epsilon=1e-6),
+                    Mixture(experts=4, top_k=2, weight_sum_min=1e-12)):
         with pytest.raises(ValueError):
             built(refused)
+    # Gemma 4's parallel router renormalizes by no bound of its own either.
+    for bound in ({"weight_sum_epsilon": 1e-6}, {"weight_sum_min": 1e-12}):
+        with pytest.raises(ValueError):
+            Mixture(experts=4, top_k=2, parallel=True, **bound)
     with pytest.raises(ValueError):
         built(Mixture(experts=4, top_k=2), swiglu_limit=7.0)
     with pytest.raises(ValueError):
