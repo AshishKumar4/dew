@@ -15,7 +15,7 @@ from test_contracts_norms import HIDDEN, STEP, plain_hidden, plain_stepped
 from dew.nn import ngpt
 from dew.nn.activations import gated_product
 
-SEEDS = {"join": 16, "hidden": 16}
+SEEDS = {"join": 16, "hidden": 16, "join, zero rate and broadcast": 16, "join, widest": 16}
 """Declared seeds for check 1."""
 
 ROWS, WIDTH = (2, 8), 64
@@ -52,6 +52,43 @@ def test_ngpts_join_reverses_as_its_formula_does(dtype):
 
     assert_as_exact(jax.jit(gradients(joined)), jax.jit(gradients(plain_stepped)), draw,
                     f"nGPT's join in {jnp.dtype(dtype).name}", seeds=SEEDS["join"])
+
+
+def test_ngpts_join_reverses_a_zero_rate_and_broadcast_operands_as_its_formula_does():
+    """The join's gradient where the rate holds zeros, its branch is one row the batch's rows share, and its
+    rate is shaped (1, width), is on par with JAX's gradient of the formula: `|alpha|`'s derivative at zero
+    as JAX takes it, and each operand's cotangent summed over the axes the join broadcast it along, in its
+    own shape."""
+    def draw(seed):
+        residual, cotangent = drawn(seed, jnp.float32, ((*ROWS, WIDTH),) * 2)
+        (branch,) = drawn(seed + 500, jnp.float32, ((1, ROWS[1], WIDTH),))
+        (alpha,) = drawn(seed + 1000, jnp.float32, ((1, WIDTH),))
+        return residual, branch, alpha.at[:, ::4].set(0), cotangent
+
+    def joined(residual, branch, alpha):
+        return ngpt.stepped(residual, branch, alpha, STEP)
+
+    assert_as_exact(jax.jit(gradients(joined)), jax.jit(gradients(plain_stepped)), draw,
+                    "nGPT's join at a zero rate, its branch and rate broadcast",
+                    seeds=SEEDS["join, zero rate and broadcast"])
+
+
+def test_ngpts_join_reverses_in_the_widest_of_its_operands():
+    """A float32 residual joined to a float64 branch by a float64 rate reverses as its formula does, in
+    float64: its gradients on par with JAX's gradient of the formula, which takes the rate and the difference
+    in float64, where a reverse in float32 would sit many orders further from the truth."""
+    def draw(seed):
+        (residual,) = drawn(seed, jnp.float32, ((*ROWS, WIDTH),))
+        branch, cotangent = drawn(seed + 500, jnp.float64, ((*ROWS, WIDTH),) * 2)
+        (alpha,) = drawn(seed + 1000, jnp.float64, ((WIDTH,),))
+        return residual, branch, alpha, cotangent
+
+    def joined(residual, branch, alpha):
+        return ngpt.stepped(residual, branch, alpha, STEP)
+
+    with jax.enable_x64(new_val=True):
+        assert_as_exact(jax.jit(gradients(joined)), jax.jit(gradients(plain_stepped)), draw,
+                        "nGPT's join toward a float64 branch", seeds=SEEDS["join, widest"])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bf16"])
