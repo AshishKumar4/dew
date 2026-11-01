@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from model_support import parameter_loss
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import FACTOR, assert_as_exact_over_orders, distance, ieee_fixture
 from residual_orders import permuted
 from scipy.special import log_softmax
@@ -32,16 +31,62 @@ def kimi_source(directory: Path) -> tuple[Pretrained, ModelInputs, dict[str, np.
     return loaded, inputs, reference
 
 
-def assert_forward_as_exact(source) -> None:
-    """The real tokens' logits as exact as the reference's from float64, with its argmax."""
-    loaded, inputs, reference = source
-    valid = reference["attention_mask"].astype(bool)
-    logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(
-        loaded.variables
-    )
-    assert_as_exact_as_the_reference(np.asarray(logits)[valid], reference["logits"][valid],
-                                     reference["logits_f64"][valid], "logits")
-    np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
+RECORDING = "recording.npz"
+"""Each fixture's check-1 evidence of its release over drawn batches (`drawn_batch`), recorded by
+tools/venv_reference.py's `kimi-k3` and `kimi-linear` sites (tools/kimi_worker.py)."""
+
+STEPPED_PREFILL = 40
+"""The prefill of the cached decode `recorded_dew`'s `stepped` scores (tools/kimi_worker.py's, the
+same)."""
+
+
+def drawn_batch(seed: int) -> dict[str, np.ndarray]:
+    """A seed's batch of the fixtures' geometry: two rows of 70 ids past the specials, past one 64-token KDA
+    chunk, the second left-padded by 9, a stream of its own for each seed."""
+    ids = np.random.default_rng([0x3755, seed]).integers(3, 512, (2, 70)).astype(np.int32)
+    mask = np.ones_like(ids)
+    ids[1, :9], mask[1, :9] = 0, 0
+    return {"input_ids": ids, "attention_mask": mask}
+
+
+VALID = drawn_batch(0)["attention_mask"].astype(bool)
+"""The positions every drawn batch scores, its padding the same for every seed."""
+
+
+def stepped_logits(model, variables, row) -> jax.Array:
+    """`row`'s logits `[tokens, vocab]` from a cached decode: its first `STEPPED_PREFILL` tokens prefilled,
+    then a token a step through the cache."""
+    state = model.apply(variables, 1, method="init_cache", mutable=["cache"])[1]
+    out, state = model.apply({**variables, **state}, row[None, :STEPPED_PREFILL], decode=True,
+                             mutable=["cache"])
+    pieces = [out[0]]
+    for index in range(STEPPED_PREFILL, row.shape[0]):
+        out, state = model.apply({**variables, **state}, row[None, index:index + 1], decode=True,
+                                 mutable=["cache"])
+        pieces.append(out[0])
+    return jnp.concatenate(pieces)
+
+
+def recorded_dew(directory: Path, leaves: tuple[str, ...]):
+    """The site's `dew(dtype, inputs)` (tests/reference_runs.py): the fixture at `directory` loaded once at
+    each dtype, its `leaves` over a drawn batch: each valid position's logits of its forward (`logits`)
+    and the first row's from its cached decode (`stepped`, `stepped_logits`)."""
+    loaded: dict[str, Pretrained] = {}
+
+    def dew(dtype, inputs) -> dict[str, jax.Array]:
+        name = jnp.dtype(dtype).name
+        if name not in loaded:
+            loaded[name] = Pretrained.load(directory, dtype=name, param_dtype=name,
+                                           attention_impl="reference")
+        model, variables = loaded[name].model, loaded[name].variables
+        ids = jnp.asarray(inputs["input_ids"], jnp.int32)
+        found = {"logits": model.apply(variables, ids,
+                                       attention_mask=jnp.asarray(inputs["attention_mask"], bool))[VALID]}
+        if "stepped" in leaves:
+            found["stepped"] = stepped_logits(model, variables, ids[0])
+        return found
+
+    return dew
 
 
 def assert_update_as_exact(source, directory: Path) -> Variables:

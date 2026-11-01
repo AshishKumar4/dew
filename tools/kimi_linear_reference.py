@@ -219,8 +219,9 @@ def main() -> None:
         again = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         assert torch.equal(again, logits), "restoring the written weights must restore the logits"
         generated, step_logits = greedy(model, input_ids, attention_mask)
+    # The forward's logits are recorded over drawn batches (tools/kimi_worker.py), not here.
     np.savez(DESTINATION / "reference.npz", input_ids=ids, attention_mask=mask,
-             logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
+             loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits, precision=matmul_precision())
     record_picks(DESTINATION)
