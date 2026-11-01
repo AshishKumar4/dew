@@ -966,6 +966,7 @@ def key_memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, gates:
     `key_memory_block` and `key_system_back` in turn, `(dA, dbeta)` the keys' system's gradient `[C, C]` fp32
     (strictly lower, before the inverse) and the write gates' `[C]`."""
     d_system, d_betas = key_values_back(value_grads, values, blocks, lower, betas, dtype, issue,
+                                        lambda products, shape=None: _summed(issue(*p) for p in products),
                                         emit=functools.partial(emit, "dv"))
     for c in range(columns):
         found = {}
@@ -992,21 +993,25 @@ def key_memory_decay(entered, leaving) -> jax.Array:
 
 
 def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower: Tile, betas, dtype,
-                    issue: Issue, *, emit: Callable[[int, jax.Array], None]) -> tuple[jax.Array, jax.Array]:
+                    issue: Issue, summed: Callable[..., jax.Array], *,
+                    emit: Callable[[int, jax.Array], None]) -> tuple[jax.Array, jax.Array]:
     """The values' part of `key_memory_gradients`: through `u = (I + L) (v beta)`, each value block `j`'s
     `d(v beta) = (I + L)^T du` ('values_merge') of the corrected values' gradient `value_grads(j)`, its
     values' gradient `beta d(v beta)` `[C, BV]` fp32 to `emit(j, dv)`, and `(dA, dbeta)`, the inverse's
     gradient's part `du (v beta)^T` `[C, C]` and the write gates' `sum(v d(v beta))`, fp32."""
-    d_system = jnp.zeros((lower.shape[0],) * 2, jnp.float32)
     d_betas = jnp.zeros(betas.shape, jnp.float32)
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
-        scaled = Transposed((value * betas[:, None]).astype(dtype))
-        d_system = d_system + issue("values_merge", value_grads(j), scaled)
         d_scaled = (value_grads(j).value().astype(jnp.float32)
                     + issue("values_merge", lower.T, value_grads(j)))
         d_betas = d_betas + jnp.sum(d_scaled * value, axis=1)
         emit(j, d_scaled * betas[:, None])
+    # The inverse's part summed into one accumulator after (`summed`), each block's gated values formed as
+    # its product stages them: an accumulator a block, summed beside each block's own gradient, an A100's
+    # launch spilled 96 bytes a thread (kda-gate6 at 306006c01).
+    d_system = summed([("values_merge", value_grads(j), lambda j=j: Transposed(
+        (values(j).value().astype(jnp.float32) * betas[:, None]).astype(dtype))) for j in range(blocks)],
+        shape=(lower.shape[0],) * 2)
     return d_system, d_betas
 
 

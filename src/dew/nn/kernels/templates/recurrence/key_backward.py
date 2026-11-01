@@ -249,7 +249,8 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: _Call):
 
             summed, beta_terms = algebra.key_values_back(
                 functools.partial(column, "value_grads", grads), functools.partial(column, "values", given),
-                blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue, emit=stored)
+                blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue, issue.summed,
+                emit=stored)
             d_system = _tile(slots, "system", square).value() + summed
             square.store(da_ref, algebra.key_system_back(d_system, lower, held.dtype, issue), row, CHUNK,
                          h * CHUNK, CHUNK, family=family, smem=landing["square"])
@@ -289,12 +290,14 @@ def _key_values_held(call: _Call) -> _Held:
 def _key_memory_held(call: _Call, keys: int) -> _Held:
     """`_key_memory_back`'s consumer thread at key block `keys`: the system's gradient and the write gates'
     carried; a key block's three memory products' sums beside a value block's fragments; then the key block's
-    decays, gated keys and their WY gradient."""
+    decays, gated keys and their WY gradient, the system's product (`algebra.key_memory_block`'s
+    'weights_merge') and its operands' fragments."""
     held, given, memories = dataclasses.replace(call.held, rows=call.rows), call.given, call.memories
     return _Held(carried=[_f32(CHUNK, CHUNK), _f32(CHUNK, 1)], phases=(
         [_f32(CHUNK, keys)] * 3
         + _fragments(call, (given, CHUNK, call.block), (memories, keys, call.block)),
-        [_f32(CHUNK, keys)] * 6 + _held(held, CHUNK, keys) * 2))
+        [_f32(CHUNK, keys)] * 6 + _held(held, CHUNK, keys) * 2 + [_f32(CHUNK, CHUNK)]
+        + _fragments(call, (held, CHUNK, CHUNK), (held, CHUNK, keys))))
 
 
 def _square_landing(keys: int) -> str:
@@ -414,11 +417,11 @@ def _key_pairs_held(call: _Call, keys: int) -> _Held:
     rolled sub-chunks (`algebra.key_decayed_pairs_back`) a key block's prefix halves, its rows' decays to
     their common points, its queries and keys, the rows' and keys' gradients carried and the rows' indices;
     in a sub-chunk's turn its keys' gate up, the keys raised, a product's sum and the operand its product
-    forms, their mask, beside a product's fragments."""
+    forms, its parts (`product.formed`) and their remainder, their mask, beside a product's fragments."""
     parted = _parted(call)
     return _Held(carried=[_f32(CHUNK, 1)], phases=(
-        [_f32(CHUNK, keys)] * 8 + _masks(CHUNK, keys) + [_f32(CHUNK, keys)] * 4 + _masks(CHUNK, keys)
-        + _fragments(call, (parted, CHUNK, CHUNK), (parted, CHUNK, keys)),))
+        [_f32(CHUNK, keys)] * 8 + _masks(CHUNK, keys) + [_f32(CHUNK, keys)] * 5 + _masks(CHUNK, keys)
+        + _held(parted, CHUNK, keys) + _fragments(call, (parted, CHUNK, CHUNK), (parted, CHUNK, keys)),))
 
 
 def gradients(run, laid_do, dht, tiles) -> tuple:
