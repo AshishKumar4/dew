@@ -128,7 +128,7 @@ def test_literals_keep_their_exact_values_and_types():
     def literal(x, n):
         return jnp.where(n > np.int32(2_000_000_011), x * 3.5, x - 1.25), n + np.int32(2_000_000_011)
 
-    x, n = rows(5, (4,))[0], jnp.asarray([2_000_000_013, 1], jnp.int32)
+    x, n = rows(5, (4,))[0], jnp.asarray([2_000_000_013, 1, 2_000_000_011, 7], jnp.int32)
     for given, got in zip(literal(x, n), jax.jit(algebra.rewritten(literal))(x, n), strict=True):
         assert given.dtype == got.dtype
         np.testing.assert_array_equal(np.asarray(given), np.asarray(got))

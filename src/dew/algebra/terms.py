@@ -42,7 +42,7 @@ class Term(Expr):
     def literal(cls, index: i64Like) -> Term: ...
 
     @classmethod
-    def bundle(cls, items: Vec[Term]) -> Term: ...
+    def bundle(cls, roots: Vec[Term]) -> Term: ...
 
     @method(cost=1)
     def binary(self, name: StringLike, other: Term, params: i64Like) -> Term: ...
@@ -122,7 +122,7 @@ def region(closed: jcore.Jaxpr) -> Region:
     depths: dict[jcore.Var, int] = {}
 
     def param(primitive: jcore.Primitive, values: Mapping) -> int:
-        key = (primitive.name, repr(sorted(values.items(), key=lambda item: item[0])))
+        key = (primitive.name, repr(sorted(values.items(), key=lambda named: named[0])))
         if key not in indexed:
             indexed[key] = len(params)
             params.append((primitive, dict(values)))
@@ -195,19 +195,19 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
     if name in SHAPES and len(equation.invars) == 1:
         return read(equation.invars[0]).shaped(name, param(primitive, equation.params))
     if name in REDUCTIONS and len(equation.invars) == 1:
-        axes = Vec[i64](*(i64(int(axis)) for axis in equation.params["axes"]))
+        axes = Vec[i64](*(i64(int(axis)) for axis in equation.params["axes"]))  # the reduced axes
         return read(equation.invars[0]).reduce(REDUCTIONS[name], axes, param(primitive, equation.params))
     return None
 
 
-def evaluated(region_: Region, chosen: Mapping[str, Term], values: list) -> list:
+def evaluated(region_: Region, chosen: Mapping[str, Term], values: list) -> list[jax.Array]:
     """The values of `region_`'s outputs over its leaves' `values` (inputs and constants first), each root as
     extraction `chosen` its form (by the root's text): each equation outside the language bound in program
     order once its inputs are known, under its protected marker where it had one, each shared term evaluated
     once."""
-    known: dict[str, object] = {}
+    known: dict[str, jax.Array] = {}
 
-    def value(term: Term) -> object:
+    def value(term: Term) -> jax.Array:
         key = str(term)
         if key not in known:
             known[key] = _value(term, value, region_, values)
@@ -217,15 +217,14 @@ def evaluated(region_: Region, chosen: Mapping[str, Term], values: list) -> list
         operands = [opaque.literals[index] if term is None else value(chosen[str(term)])
                     for index, term in enumerate(opaque.inputs)]
         primitive = opaque.equation.primitive
-        subfuns, given = primitive.get_bind_params(opaque.equation.params)
+        given = primitive.get_bind_params(opaque.equation.params)
         if protected(opaque.equation):
             with jax.named_scope(PROTECTED):
-                results = primitive.bind(*subfuns, *operands, **given)
+                made = primitive.bind(*operands, **given)
         else:
-            results = primitive.bind(*subfuns, *operands, **given)
-        for leaf, result in zip(opaque.outputs, results if primitive.multiple_results else [results],
-                                strict=True):
-            values[leaf] = result
+            made = primitive.bind(*operands, **given)
+        for leaf, output in zip(opaque.outputs, made if primitive.multiple_results else [made], strict=True):
+            values[leaf] = output
     return [region_.literal_outputs[index] if root is None else value(chosen[str(root)])
             for index, root in enumerate(region_.outputs)]
 
@@ -234,7 +233,7 @@ def _index(argument) -> int:
     return int(get_literal_value(argument))
 
 
-def _value(term: Term, value: Callable[[Term], object], region_: Region, leaves: list) -> object:
+def _value(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: list) -> jax.Array:
     """One term's value, its operands' from `value`."""
     if (args := get_callable_args(term, Term.leaf)) is not None:
         return leaves[_index(args[0])]
