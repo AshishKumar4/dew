@@ -740,6 +740,73 @@ def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_r
         assert staged >= requested > budget
 
 
+@pytest.mark.parametrize("width", [64, 128, 256])
+@pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
+def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width):
+    """The forward and a training step's backward (its forward kept, the guarded training forward's
+    rewalk among its launches) at the tiles they derive on a GPU of a 99 KB block (an RTX PRO 6000's, an
+    A10's), causal, bf16, compiled by XLA's CUDA backend for a compile-only device of it on this CPU
+    (tests/kernel_compile.py): every Triton launch within the block (a width-256 training forward derived
+    32 x 64, whose rewalk asked 114688 bytes, and XLA refused the whole program)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.bfloat16)
+
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, None, natural=True)
+
+    def backward(query, key, value, dout):
+        grads = attention_triton.backward(query, key, value, spans, None, dout, natural=True)
+        return grads.query, grads.key, grads.value
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
+                             KernelCase("backward", lambda: (backward, (shape,) * 4))], generation_name)
+    assert len(found) == 2
+    assert not failures(found), "\n".join(failures(found))
+
+
+def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down(monkeypatch):
+    """A training step's backward at width 256 on an RTX PRO 6000 (sm120), its forward's shared-memory
+    model blind to the guarded rewalk (`TritonForward.staged_bytes` the plain launch's alone): XLA refuses
+    the program at 32 x 64, whose rewalk asks 114688 bytes of a 99 KB block, naming no kernel; the run's
+    compile (`report.kept`) refuses that forward launch's config, its derivation takes the next, and the
+    program compiles, the miss recorded stepped (compiled for a compile-only device on this CPU)."""
+    import kernel_compile
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.templates import report
+
+    def plain(self, ba, config, target):
+        del target
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        streamed = (config.stages - 1) * config.block_k * (query.shape[-1] + value.shape[-1]) * 2
+        return streamed + config.block_q * (query.shape[-1] + config.block_k) * 2
+
+    monkeypatch.setattr(attention_triton.TritonForward, "staged_bytes", plain)
+    spans = template.spans(512, 512, 1, causal=True)
+    mesh = kernel_compile._device("sm120")
+    shape = jax.ShapeDtypeStruct((1, 512, 2, 256), jnp.bfloat16,
+                                 sharding=NamedSharding(mesh, PartitionSpec()))
+
+    def backward(query, key, value, dout):
+        grads = attention_triton.backward(query, key, value, spans, None, dout, natural=True)
+        return grads.query, grads.key, grads.value
+
+    def lowered():
+        with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm120")):
+            return jax.jit(backward).trace(*[shape] * 4).lower()
+
+    with report.refusals():
+        report.kept(lowered(), relower=lowered)
+        misses = [miss for miss in report.misses() if miss.shared is not None]
+        refused = [config for _, config, _ in report.refused_launches()]
+    assert [(miss.kernel, miss.shared, miss.stepped) for miss in misses] == [
+        ("attention_forward_headroom", 114688, True)], misses
+    assert refused == [attention_triton.Tiles(32, 64, 4, 2)], refused
+
+
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
 def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(target):
     """The softcap through a `jax.custom_vjp`, whose forward rule calls the hook itself as JAX's
