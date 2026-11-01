@@ -163,3 +163,23 @@ def test_a_calls_locals_go_when_its_first_program_imports_the_pass():
     done = subprocess.run([sys.executable, "-c", PINNED], capture_output=True, text=True, check=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.stdout.strip().splitlines()[-1] == "True"
+
+def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rules_read():
+    """A program whose math runs four thousand equations deep before two sums the rules join (a step's
+    backward through every layer) is rewritten in a window around those sums, the deep chain read as
+    values from outside it: the sums are joined and the program is on par with the unrewritten one, where
+    holding the whole chain as one term would pass the interpreter's recursion limit."""
+    def deep(x, y, a):
+        for _ in range(4000):
+            x = jnp.sin(x)
+        return two_sums(x, y, a)
+
+    x, y, a = rows(5, (4, 16), (4, 16), (4, 16))
+    assert reductions(jax.make_jaxpr(algebra.rewritten(deep))(x, y, a)) == 1
+
+    def draw(seed):
+        return rows(seed, (4, 16), (4, 16), (4, 16))
+
+    assert_as_exact(jax.jit(algebra.rewritten(deep)), jax.jit(deep), draw, "two sums after a deep chain",
+                    seeds=4)
+
