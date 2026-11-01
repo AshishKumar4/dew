@@ -24,6 +24,7 @@ from jax._src import api_util, config as jax_config, core as jax_core
 from jax._src.array import ArrayImpl
 from jax.sharding import Sharding
 
+from dew import algebra
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
 
@@ -185,8 +186,6 @@ class OuterProgram:
             # The algebra pass rewrites the function where it is jitted, so its lowering, its trace, its
             # executable and every relowering read one program (docs/design/algebra.md §6.7); its switch is
             # in JAX's trace context, so a held program traces afresh as it changes.
-            from dew import algebra
-
             return algebra.rewritten(self.function, static_argnums=self.numbers,
                                      static_argnames=tuple(self.names))(*args, **kwargs)
         return jax.jit(traced, **self.arguments)

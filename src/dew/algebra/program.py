@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping
 import jax
 from egglog import EGraph, Vec, get_callable_args, i64, set_
 from jax._src import config as jax_config
-from jax.core import ShapedArray
+from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
 from dew.algebra import cost, rules, terms
@@ -58,10 +58,21 @@ class AlgebraReport:
 
 @dataclasses.dataclass(frozen=True)
 class Rewrite:
-    """A program's outputs computed in their cheapest forms, and the report of the rewrite that chose them."""
+    """A region's terms (`terms.region`), each root's cheapest form by its text (`picked`, empty where none is
+    cheaper than the region as traced), and the report of the rewrite that chose them."""
 
-    outputs: list
+    region: terms.Region
+    picked: Mapping[str, terms.Term]
     report: AlgebraReport
+
+    def outputs(self, closed: jcore.Jaxpr, arguments: list) -> list:
+        """The region's outputs over `arguments`: its chosen forms evaluated, or `closed` as traced where
+        none is cheaper."""
+        if not self.picked:
+            return eval_jaxpr(closed, closed.consts, *arguments)
+        given = [*closed.consts, *arguments]
+        values = given + [None] * (self.region.leaves - len(given))
+        return terms.evaluated(self.region, self.picked, values)
 
 
 @contextlib.contextmanager
@@ -111,10 +122,10 @@ def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation:
     (`rules.may_rewrite`); evaluated as traced where none may."""
     closed = _within(closed, accurate, saturation)
     if not rules.may_rewrite(_primitives(closed)):
-        return jax.core.eval_jaxpr(closed, closed.consts, *arguments)
-    done = _region(closed, arguments, accurate=accurate, saturation=saturation)
+        return eval_jaxpr(closed, closed.consts, *arguments)
+    done = _region(closed, accurate=accurate, saturation=saturation)
     kernel_report.record_rewrite(done.report)
-    return done.outputs
+    return done.outputs(closed, arguments)
 
 
 def _primitives(jaxpr: jcore.Jaxpr) -> collections.Counter[str]:
@@ -122,9 +133,10 @@ def _primitives(jaxpr: jcore.Jaxpr) -> collections.Counter[str]:
     return collections.Counter(equation.primitive.name for equation in jaxpr.eqns)
 
 
-def _region(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> Rewrite:
-    """The outputs of `closed`, whose bodies are rewritten, over `arguments`, its roots' forms chosen together
-    from its terms saturated under the admitted rule sets, with the report of the rewrite."""
+def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> Rewrite:
+    """`closed`'s roots' forms, its bodies already rewritten, chosen together from its terms saturated under
+    the admitted rule sets where they are cheaper than the region as traced, with the report of the
+    rewrite."""
     began = time.perf_counter()
     region = terms.region(closed)
     graph = EGraph()
@@ -169,12 +181,11 @@ def _region(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation:
     if extracted is None:
         raise ValueError(f"extraction chose no bundle of the program's roots: {chosen}")
     (forms,) = extracted
-    picked = {str(root): form for root, form in zip(roots, forms.value, strict=True)}
-    values = [*closed.consts, *arguments] + [None] * (region.leaves - len(closed.consts) - len(arguments))
-    outputs = terms.evaluated(region, picked, values)
+    cheaper = after.value < before.value
+    picked = {str(root): form for root, form in zip(roots, forms.value, strict=True)} if cheaper else {}
     report = AlgebraReport(region.equations, tuple(fired), fired, (nodes, steps), iterations, _nodes(graph),
                            limited, before.value, after.value, time.perf_counter() - began)
-    return Rewrite(outputs, report)
+    return Rewrite(region, picked, report)
 
 
 BODIES = frozenset({"jit", "pjit", "closed_call", "scan", "while", "cond", "remat2", "checkpoint",
@@ -215,15 +226,13 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
         # Nothing of its own a rule may lower: the body as traced, its own bodies rewritten, never traced
         # again.
         return inner
+    done = _region(inner, accurate=accurate, saturation=saturation)
+    kernel_report.record_rewrite(done.report)
+    if not done.picked:
+        return inner
     shapes = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
               for aval in inner.in_avals if isinstance(aval, ShapedArray)]
-
-    def run(*arguments):
-        done = _region(inner, list(arguments), accurate=accurate, saturation=saturation)
-        kernel_report.record_rewrite(done.report)
-        return done.outputs
-
-    made = jax.make_jaxpr(run)(*shapes)
+    made = jax.make_jaxpr(lambda *arguments: done.outputs(inner, list(arguments)))(*shapes)
     return inner if made.consts and not inner.consts else made
 
 
