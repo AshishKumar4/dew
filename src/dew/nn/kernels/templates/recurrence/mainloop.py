@@ -1844,6 +1844,9 @@ class _Run:
     beta: jax.Array
     a: jax.Array | None
     w: jax.Array | None
+    keys: jax.Array
+    """The keys the memory takes: the laid keys under a decay a head, gated to each chunk's end
+    (`algebra.key_decayed_write`, `_weighted`'s) under one a key dimension."""
     scores: jax.Array | None
     h: jax.Array
     corrected: jax.Array
@@ -1935,6 +1938,5 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, taken,
                                       call, tiles)
         final = final.reshape(batch, heads, width, columns)[:, :, :key_width, :value_width]
-    return _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta,
-                None if per_key else a, w, scores, h, corrected, final, taken, sequences, laid,
-                unlaid)
+    return _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta, a, w, keys,
+                scores, h, corrected, final, taken, sequences, laid, unlaid)

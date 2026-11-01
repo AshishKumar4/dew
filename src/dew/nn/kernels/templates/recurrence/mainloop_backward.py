@@ -368,16 +368,26 @@ def _reverse_views(call: _Call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref, h
     the chunk `chunks - 1 - f`, a sequence's chunks from its last, walked forward; the values' where the walk
     gates them (`v_ref` given)."""
     width, value_width, given = call.width, call.value_width, call.given
-    key_columns, value_columns = h // call.group * width, h * value_width + walked
+    keyed, key_columns = _reverse_keyed(call, h)
+    value_columns = h * value_width + walked
     held = dataclasses.replace(call.held, rows=call.rows)
     return _views(lambda f: (call.chunks - 1 - f, 0),
-                  queries=given.views(q_ref, 0, call.rows, key_columns, width),
-                  keys=given.views(k_ref, 0, call.rows, key_columns, width),
+                  queries=keyed.views(q_ref, 0, call.rows, key_columns, width),
+                  keys=keyed.views(k_ref, 0, call.rows, key_columns, width),
                   **({"w": held.views(w_ref, 0, call.rows, h * width, width)} if call.delta else {}),
                   out=given.views(do_ref, 0, call.rows, value_columns, walked_width),
                   local=_value_grads(call).views(local_ref, 0, call.rows, value_columns, walked_width),
                   **({"values": given.views(v_ref, 0, call.rows, value_columns, walked_width)}
                      if v_ref is not None else {}))
+
+
+def _reverse_keyed(call: _Call, h) -> tuple[_Operand, object]:
+    """The form and columns of the queries and keys `_reverse` takes for value head `h`: the key head's as
+    given under a decay a head; under one a key dimension each value head's own, gated (`key_gated`'s
+    queries, `key_decayed_write`'s keys) and held."""
+    if call.per_key:
+        return dataclasses.replace(call.held, rows=call.rows), h * call.width
+    return call.given, h // call.group * call.width
 
 
 def _reverse_launched(call: _Call, batch: int, bv: int, walked_width: int, *, gates: bool,
@@ -391,7 +401,8 @@ def _reverse_launched(call: _Call, batch: int, bv: int, walked_width: int, *, ga
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32),
                 *((jax.ShapeDtypeStruct((value_width // bv, call.heads, call.rows), jnp.float32),)
                   * (gates + skips)))
-    blocks = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
+    keyed = _reverse_keyed(call, 0)[0]
+    blocks = _streamed(queries=((CHUNK, width), keyed), keys=((CHUNK, width), keyed),
                        **({"w": ((CHUNK, width), dataclasses.replace(call.held, rows=call.rows))}
                           if call.delta else {}),
                        out=((CHUNK, walked_width), given), local=((CHUNK, walked_width), _value_grads(call)),
@@ -473,15 +484,23 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
             def block(name, operand, i):
                 return _tile(slots, name, operand, columns=pl.ds(i * call.block, call.block))
 
-            gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             out = _tile(slots, "out", given, columns=columns)
             local = _tile(slots, "local", grads, columns=columns).value().astype(jnp.float32)
-            ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
-            grad, dv = algebra.reverse_carried(
-                grad, functools.partial(block, "keys", given),
-                functools.partial(block, "w", held) if call.delta else None,
-                functools.partial(block, "queries", given), out.value(), local, gate, low, ending,
-                ending_low, scale, held.dtype, issue)
+            keyed = _reverse_keyed(call, h)[0]
+            keys, queries = (functools.partial(block, name, keyed) for name in ("keys", "queries"))
+            weights = functools.partial(block, "w", held) if call.delta else None
+            if call.per_key:
+                # Each key slice's rows' decays across the chunk, `exp2(g_last)` a column's.
+                kept = [algebra.raised(*(family.rows_of(ref.at[last, pl.ds(h * width + i * call.block,
+                                                                            call.block)])
+                                         for ref in (hi_ref, lo_ref)))[:, None] for i in range(slices)]
+                grad, dv = algebra.key_reverse_carried(grad, keys, weights, queries, out, local, kept,
+                                                       held.dtype, issue)
+            else:
+                gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
+                ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
+                grad, dv = algebra.reverse_carried(grad, keys, weights, queries, out.value(), local, gate,
+                                                   low, ending, ending_low, scale, held.dtype, issue)
             if gates:
                 values = _tile(slots, "values", given, columns=columns).value().astype(jnp.float32)
                 dv, beta_grad = algebra.gated_values_back(dv, values, family.rows_of(beta_ref.at[h, span]))
