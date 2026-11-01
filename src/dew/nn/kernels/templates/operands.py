@@ -7,7 +7,7 @@ template's own parts move onto it."""
 import functools
 import itertools
 from collections.abc import Callable, Iterable
-from typing import Protocol, cast
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -183,9 +183,12 @@ class Issuer:
         """`lhs`'s parts in registers where its product takes it there (its buffers a count, `Issuer`'s),
         else None."""
         count = self.buffers.get(name)
-        if not isinstance(count, int) or isinstance(lhs, (Parts, product.Exact, product.Transposed)):
+        if not isinstance(count, int):
             return None
-        value = cast(jax.Array, lhs() if callable(lhs) else lhs)
+        value = lhs() if callable(lhs) else lhs
+        if not isinstance(value, jax.Array):
+            # A shared tile (`Parts`), or an operand staged its own way (`product.Exact`, `Transposed`).
+            return None
         return product.formed(value, count) if count > 1 else (value,)
 
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
