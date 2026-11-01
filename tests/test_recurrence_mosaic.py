@@ -688,11 +688,16 @@ def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.Register
 
 class Unbudgeted(template.Mosaic):
     """The recurrence template with every launch's registers held: its derivation takes the tile it would
-    where only registers refuse one (`compiled_cases`' refused tiles)."""
+    where only registers refuse one (`compiled_cases`' refused tiles), a states launch no multiprocessor
+    holds at its registers (`Launch.resident` zero) one program a multiprocessor, as it would hold were its
+    registers held."""
 
     def _held(self, ba, config) -> bool:
         del ba, config
         return True
+
+    def states_held(self, ba, tiles, target) -> int:
+        return max(super().states_held(ba, tiles, target), 1)
 
 
 NEIGHBOURS = 3
