@@ -34,7 +34,6 @@ from dew.data.dataset import (
     DataPartition,
     Loader,
     PhasedStream,
-    Reader,
     rows_of,
     stream_endless,
     stream_together,
@@ -51,7 +50,7 @@ from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
 from dew.training.diloco import regrouped
-from dew.training.evaluation import EvalSuite, Evaluation, Summary, episodic
+from dew.training.evaluation import EvalSuite, Evaluation, Split, Summary, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS
 from dew.training.observe import Observe
@@ -63,7 +62,7 @@ from dew.training.selection import Best, HeldBest
 _log = logging.getLogger(__name__)
 
 
-def validation_suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+def validation_suites(dataset: Loader, validation: Mapping[str, Split | EvalSuite] | None,
                       metrics: Sequence[Metric], eval_every: Cadence) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
     resolved: `dataset.val` alone is the one suite `val`."""
@@ -222,7 +221,7 @@ class FitPlan:
         return isinstance(every, int) and bool(every) and step % every == 0
 
     @staticmethod
-    def cadences(loader: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+    def cadences(loader: Loader, validation: Mapping[str, Split | EvalSuite] | None,
                  metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
                  written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
                  checkpoints: Checkpoints | None = None, examples: int | None = None) -> tuple[
@@ -859,13 +858,13 @@ def _first_read(loader: Loader, partition: DataPartition, position: bytes | None
 
 
 type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset
-                     | Mapping[str, Dataset | Handed | Reader | EvalSuite])
+                     | Mapping[str, Dataset | Handed | Split | EvalSuite])
 """`fit`'s validation: a chain or a Grain dataset, the split `val`, or splits by name, each a chain, a
 Grain dataset, NumPy arrays, a reader or an evaluation suite."""
 
 
 def handed_splits(
-        validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None:
+        validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Split | EvalSuite] | None:
     """`fit`'s validation with what was handed as it is read as handed (`dew.data.compile.native`): a
     Grain dataset as the split `val`, and a named split's Grain dataset or NumPy arrays as that split.
     Arrays are a split by name alone, as a mapping of splits is one by its names."""
@@ -876,7 +875,7 @@ def handed_splits(
     return {name: _handed_split(entry) for name, entry in validation.items()}
 
 
-def _handed_split(entry: Dataset | Handed | Reader | EvalSuite) -> Dataset | Reader | EvalSuite:
+def _handed_split(entry: Dataset | Handed | Split | EvalSuite) -> Dataset | Split | EvalSuite:
     """One split of `handed_splits`: read as handed where it is a Grain dataset or arrays."""
     if isinstance(entry, Mapping | pygrain.MapDataset | pygrain.IterDataset):
         return native(entry, training=False)

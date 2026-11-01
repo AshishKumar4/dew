@@ -44,7 +44,6 @@ from dew.data.dataset import (
     Loader,
     PhasedStream,
     RampedStream,
-    Reader,
     Stage,
     rows_of,
     stream_identity,
@@ -1391,7 +1390,7 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         return trained
 
-    def _plan(self, loader: Loader, held: Mapping[str, Reader | EvalSuite] | None,
+    def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
               written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
               checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,

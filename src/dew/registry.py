@@ -79,7 +79,10 @@ if TYPE_CHECKING:
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
     from dew.optim import ScheduleBase
+    from dew.rl.env import Env
+    from dew.rl.simulator import Simulator
     from dew.sampling.solvers import Solver
+    from dew.training.rollout import Rollout
 
 # A type annotation as a value: a class, a union of them, a subscripted
 # generic, a PEP 695 alias, or the None a field with no resolvable annotation
@@ -942,7 +945,7 @@ def _owned(member: Callable[..., Configured], *, called: bool) -> bool:
             and (not called or any("__call__" in vars(base) for base in member.__mro__[:-1])))
 
 
-def record_class(member: Callable[..., Configured]) -> type | None:
+def record_class(member: Callable[..., object]) -> type | None:
     """`member` when it is a dataclass built from its fields, whose fields a
     record names; None for a function, a plain class, or a dataclass whose own
     constructor takes other arguments (a metric over its base's fields), each
@@ -1001,7 +1004,7 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
     return {name: _read(function, name, value, dtypes=dtypes) for name, value in fields.items()}
 
 
-def read_arguments(member: type | Callable[..., Configured], record: Mapping[str, object], *,
+def read_arguments(member: type | Callable[..., object], record: Mapping[str, object], *,
                    declared: Mapping[str, Annotation] | None = None) -> Mapping[str, object]:
     """`record`'s fields of the dataclass `member`, or arguments of the
     function or constructor `member`, each read as `build` reads it, without
@@ -1015,7 +1018,7 @@ def read_arguments(member: type | Callable[..., Configured], record: Mapping[str
                        else _read(member, name, value, dtypes=True)) for name, value in record.items()}
 
 
-def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes: bool):
+def _read(member: type | Callable[..., object], name: str, value, *, dtypes: bool):
     """One field of the dataclass `member`, walked against its own annotation;
     or one argument of the function or constructor `member`, a record or a
     JSON list read against its parameter's annotation and a dtype's name the
@@ -1038,7 +1041,7 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
                     dtypes=dtypes, name=name)
 
 
-def argument_records(member: type | Callable[..., Configured], fields: Mapping[str, object]
+def argument_records(member: type | Callable[..., object], fields: Mapping[str, object]
                      ) -> dict[str, JSON]:
     """`fields` as records of `member`'s parameters (`parameters`): each read
     against its parameter's annotation and written back, so an alias becomes
@@ -1059,10 +1062,10 @@ def argument_records(member: type | Callable[..., Configured], fields: Mapping[s
     return records
 
 
-type Parameters = dict[str, tuple[inspect.Parameter, Callable[..., Configured]]]
+type Parameters = dict[str, tuple[inspect.Parameter, Callable[..., object]]]
 
 
-def parameters(member: type | Callable[..., Configured]) -> tuple[Parameters, bool]:
+def parameters(member: type | Callable[..., object]) -> tuple[Parameters, bool]:
     """`member`'s named parameters, each with the function that declares it,
     and whether it takes any other keyword besides.
 
@@ -1083,7 +1086,7 @@ def parameters(member: type | Callable[..., Configured]) -> tuple[Parameters, bo
     return named, bool(owners)
 
 
-def parameter_type(function: Callable[..., Configured], name: str) -> Annotation:
+def parameter_type(function: Callable[..., object], name: str) -> Annotation:
     """Resolve the annotation of one parameter of `function`, or its return
     for `name="return"`, without evaluating the others. None where it has no
     annotation. An annotation naming what the function's module does not
@@ -1332,8 +1335,10 @@ source_kinds: Aliases[type[SourceKind], SourceKind] = Aliases("source", {
 
 
 models: Aliases[type[nn.Module], nn.Module] = Aliases("model", {
+    "actor_critic": "dew.objectives.rl.control:ActorCritic",
     "causal_transformer": "dew.nn.backbones.causal_transformer:CausalTransformer",
     "diffusion_gemma": "dew.nn.diffusion_gemma:DiffusionGemma",
+    "dreamer_world_model": "dew.objectives.rl.dreamer:WorldModel",
     "edm2_unet": "dew.nn.backbones.edm2:EDM2UNet",
     "flux2_transformer": "dew.nn.backbones.flux2:Flux2Transformer",
     "flux_transformer": "dew.nn.backbones.flux:FluxTransformer",
@@ -1419,11 +1424,13 @@ metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
 })
 objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
     "block_diffusion": "dew.objectives.diffusion.block:BlockDiffusionObjective",
+    "control_ppo": "dew.objectives.rl.control:ControlPPOObjective",
     "decision": "dew.decision.objective:DecisionObjective",
     "diffusion": "dew.objectives.diffusion.objective:DiffusionObjective",
     "distillation": "dew.objectives.distillation:DistillationObjective",
     "dpo": "dew.objectives.rl.preference:DPOObjective",
     "diffusion_nft": "dew.objectives.rl.nft:DiffusionNFTObjective",
+    "dreamer_v3": "dew.objectives.rl.dreamer:DreamerV3Objective",
     "flow_grpo": "dew.objectives.rl.flow:FlowGRPOObjective",
     "grpo": "dew.objectives.rl.grpo:GRPOObjective",
     "guidance_distillation": "dew.objectives.diffusion.guidance_distillation:GuidanceDistillationObjective",
@@ -1490,9 +1497,24 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
+    "env": "dew.config.env:EnvRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
     "lm": "dew.config.lm:LMRunConfig",
 }, base="dew.config:RunConfig")
+
+
+envs: Aliases[Callable[..., Env | Simulator], Env | Simulator] = Aliases("env", {
+    "flight": "dew.rl.flight:FlightEnv",
+    "gate_race": "dew.rl.flight:GateRace",
+    "playground": "dew.rl.playground:Playground.load",
+})
+"""The environments an environment run names (`dew.config.env.EnvConfig`): a JAX `Env` class, a host
+`Simulator` class, or a function or classmethod that returns one; any other by its import path."""
+rollouts: Aliases[Callable[..., Rollout], Rollout] = Aliases("rollout", {
+    "control": "dew.objectives.rl.control:ControlRollout",
+    "dreamer": "dew.objectives.rl.dreamer:DreamerRollout",
+})
+"""The rollouts an environment run collects its batches with (`dew.config.env.RolloutConfig`)."""
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
@@ -1532,8 +1554,9 @@ class Registered(ABC):
 
     @staticmethod
     @abstractmethod
-    def _member(name: str) -> type:
-        """The class `name` names, from the kind's aliases (`models`, `objectives`, `metrics`)."""
+    def _member(name: str) -> type | Callable[..., object]:
+        """The class `name` names, from the kind's aliases (`models`, `objectives`, `metrics`), or a
+        function or classmethod that builds one (`envs`)."""
 
     def __post_init__(self) -> None:
         member = self._member(self.name)
@@ -1543,9 +1566,14 @@ class Registered(ABC):
         object.__setattr__(self, "defaults", recorded_defaults(member, self.fields, self.defaults))
 
     @property
+    def member(self) -> type | Callable[..., object]:
+        """The class, or function, `name` names (`_member`)."""
+        return self._member(self.name)
+
+    @property
     def arguments(self) -> JsonDict:
         """The arguments the class is built from, before those the caller derives (`built_arguments`)."""
-        return built_arguments(self._member(self.name), self.fields, self.defaults)
+        return built_arguments(self.member, self.fields, self.defaults)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1606,16 +1634,17 @@ class ModelConfig(Registered):
         return model
 
 
-def member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
+def member_fields(member: type | Callable[..., object]) -> Iterator[tuple[str, Configured, Annotation]]:
     """Each field `_member_flags` flags: its name, its default
     (`dataclasses.MISSING` for none) and its annotation (None where its
     module cannot resolve it). A dataclass with a constructor of its own (a
     metric over its base's fields) has that constructor's arguments, as the
     registry builds it (`record_class`)."""
-    if record_class(member) is not None:
-        for field in constructor_fields(member):
+    held = record_class(member)
+    if held is not None:
+        for field in constructor_fields(held):
             default = (field.default_factory() if callable(field.default_factory) else field.default)
-            yield field.name, default, declared_type(member, field.name)
+            yield field.name, default, declared_type(held, field.name)
         return
     for name, (parameter, owner) in parameters(member)[0].items():
         if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:
@@ -1643,7 +1672,8 @@ def default_record(name: str, declared: Configured, annotation: Annotation) -> J
     return record
 
 
-def recorded_defaults(member: type, stated: Mapping[str, object], recorded: Mapping[str, object]) -> JsonDict:
+def recorded_defaults(member: type | Callable[..., object], stated: Mapping[str, object],
+                      recorded: Mapping[str, object]) -> JsonDict:
     """The record of each field or argument `member` defaults that `stated`
     leaves out: as `recorded` holds it, or else as the class defaults it now.
     A default no record carries (a callable, say) is left to the class, and
@@ -1665,7 +1695,8 @@ def recorded_defaults(member: type, stated: Mapping[str, object], recorded: Mapp
     return {**defaults, **{name: value for name, value in recorded.items() if name not in stated}}
 
 
-def built_arguments(member: type, fields: Mapping[str, object], defaults: Mapping[str, object]) -> JsonDict:
+def built_arguments(member: type | Callable[..., object], fields: Mapping[str, object],
+                    defaults: Mapping[str, object]) -> JsonDict:
     """What a config builds `member` from beside what its caller derives:
     `fields`, over each of `defaults` the class no longer defaults the same.
     A default the class still has is left to it, so a class that treats an

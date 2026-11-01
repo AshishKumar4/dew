@@ -852,14 +852,16 @@ class GateRace:
     """A batch of `renderer.count` drones racing `racing`'s courses (`FlightEnv`, stepped on device) and seen
     through `renderer`'s cameras, as a `dew.rl.simulator.Simulator`: actions `[B, 4]` in [-1, 1];
     observations a dict of the `views` asked for (`VIEWS`), each `[B, ...]`. An episode restarts on a course
-    drawn afresh at the race's curriculum, `difficulty` and `ramp`, which may change between steps."""
+    drawn afresh at the race's curriculum, `difficulty` and `ramp`, which a race starts at and which may
+    change between steps."""
 
     action_size = 4
     _key: jax.Array
     _races: Race
 
     def __init__(self, renderer: Renderer | None, racing: Racing | None = None,
-                 views: tuple[str, ...] = VIEWS, count: int | None = None):
+                 views: tuple[str, ...] = VIEWS, count: int | None = None, difficulty: float = 1.0,
+                 ramp: float = 1.0):
         if not views or not set(views) <= set(VIEWS):
             raise ValueError(f"a gate race shows some of {VIEWS}, not {views}")
         if renderer is None and ("image" in views or count is None):
@@ -871,7 +873,7 @@ class GateRace:
                              "would see gates they do not fly through")
         self.renderer, self.racing, self.views = renderer, racing, views
         self.count = renderer.count if renderer is not None else int(count or 0)
-        self.difficulty, self.ramp = 1.0, 1.0
+        self.difficulty, self.ramp = difficulty, ramp
         shown = tuple(view for view in views if view != "image")
         env = FlightEnv(racing, shown if shown else ("passed",))
         self._env = env
