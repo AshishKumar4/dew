@@ -3,6 +3,7 @@ oracle (`stepwise_scan`)."""
 
 import functools
 import itertools
+import json
 from pathlib import Path
 
 import jax
@@ -22,9 +23,10 @@ LAYER_SHAPES = {"in_proj.weight": (72, 12), "conv1d.weight": (44, 1, 4), "conv1d
 fixture's geometry (tests/fixtures/mamba2/config.json: a hidden width of 12, four heads of six, two groups of
 five states, a 4-wide conv), two rows of 70 tokens."""
 
-LAYER_GEOMETRY = {"hidden_size": 12, "num_heads": 4, "head_dim": 6, "state_size": 5, "n_groups": 2,
-                  "conv_kernel": 4, "chunk_size": 32, "layer_norm_epsilon": 1e-5}
-"""The layer fixture's geometry (tests/fixtures/mamba2/config.json's)."""
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
+
+LAYER_GEOMETRY = json.loads((FIXTURES / "config.json").read_text())
+"""The layer fixture's geometry (tests/fixtures/mamba2/config.json)."""
 
 
 def ssd_orbit(arrays, seed):

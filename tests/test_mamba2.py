@@ -1,57 +1,53 @@
-"""Mamba-2 against the transformers 5.16.1 reference.
-
-tools/mamba2_reference.py runs `mamba2_chunk_scan`,
-`mamba2_selective_state_update` and one `Mamba2Mixer` layer
-(modeling_mamba2.py) on fixed-seed operands and writes what they produced,
-in fp32 (bf16 for the layer too) and again in float64; the tests here run
-dew's forms on the same operands and the same weights and hold each within
-tests/reference_error.py's rule of the reference's own distance from the
-float64 run. Where dew's forms are held to each other (chunked against
-recurrent, a cut sequence, chunk sizes, decoding, padding, packing), the
-one under test is held to the other's distance from dew's own float64 run
-of it. Nothing here imports torch.
+"""Mamba-2 against transformers' recorded (tools/mamba2_reference.py, `write_seeded`): its scan
+(`mamba2_chunk_scan`, `mamba2_selective_state_update`), one `Mamba2Mixer` layer and a seeded
+`Mamba2ForCausalLM` (modeling_mamba2.py) on seeded draws at each site (`ssd_support`'s), in fp32 (bf16 for
+the layer too) with their float64 truth. Each of Dew's forms (chunked or recurrent, a cut sequence, chunk
+sizes, decoding, padding, packing, forward mode, the model's padded rows and decode) is held to the site's
+recording (check 1, `assert_recorded_as_exact`), and a computation that leaves out what a site checks moves
+past its rounding (`assert_recorded_moves`). Nothing here imports torch.
 """
 
-import json
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import FACTOR, assert_as_exact, declared_seeds, indexed_recording, recording, widened
+from reference_error import (
+    assert_as_exact,
+    assert_moves,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    widened,
+)
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 from ssd_support import (
     CUTS,
+    FIXTURES,
+    LAYER_GEOMETRY,
     LAYER_SHAPES,
     PAUSED,
     PREFILL,
     SCAN_STARTS,
-    mamba2_draw,
     mamba2_layer,
     mamba2_layer_draw,
     mamba2_layer_params,
-    mamba2_layer_site_run,
     mamba2_model,
     mamba2_model_draw,
     mamba2_model_hidden,
-    mamba2_model_site_run,
     mamba2_model_variables,
     mamba2_site,
-    mamba2_starts_run,
     padded_layout,
 )
 
-from dew.accuracy import distance
 from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs
-from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
+from dew.nn.mixers.mamba2 import chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
 
-FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 SEEDED = FIXTURES / "ssd_seeded.npz"
 
 
@@ -65,30 +61,31 @@ def seeded_reference():
     return recording(SEEDED)
 
 
-@pytest.fixture(scope="module")
-def geometry():
-    return json.loads((FIXTURES / "config.json").read_text())
-
-
-def outside(wrong, reference, truth, label: str):
-    """`wrong` far outside the rule a test holds: more than FACTOR times `reference`'s RMS distance from
-    `truth`, so the test tells the computation it checks from the one that leaves its operands out."""
-    mine = distance(np.asarray(wrong), np.asarray(truth))
-    theirs = distance(np.asarray(reference), np.asarray(truth))
-    assert mine > FACTOR * theirs, f"{label}: {mine:.3e} from float64, the rule's {FACTOR} x {theirs:.3e}"
+def _recorded(reference, site):
+    """The site's declared seeds, and its draw, recorded transformers arm and truth (`indexed_recording`):
+    the truth Dew's float64 twin, which the recorder held to transformers' float64 at every seed."""
+    seeds = declared_seeds(SEEDED)[site]
+    inputs_of, twin = mamba2_site(site)
+    return seeds, *indexed_recording(reference, site, seeds, inputs_of=inputs_of,
+                                     truth_fn=jax.jit(lambda inputs: twin(site, inputs)))
 
 
 def assert_recorded_as_exact(reference, site, run=None, label: str | None = None):
     """Dew's `run(inputs)` (the site's own computation by default, Dew's float64 twin's in the inputs' dtype:
-    `ssd_support.mamba2_site`) on par with transformers' recorded at the site (check 1), its truth Dew's
-    float64 twin, which the recorder held to transformers' float64 at every seed."""
-    seeds = declared_seeds(SEEDED)[site]
-    inputs_of, twin = mamba2_site(site)
-    draw, recorded, truth = indexed_recording(reference, site, seeds, inputs_of=inputs_of,
-                                              truth_fn=jax.jit(lambda inputs: twin(site, inputs)))
+    `ssd_support.mamba2_site`) on par with transformers' recorded at the site (check 1)."""
+    seeds, draw, recorded, truth = _recorded(reference, site)
+    _, twin = mamba2_site(site)
     run = (lambda inputs: twin(site, inputs)) if run is None else run
     assert_as_exact(jax.jit(lambda index, inputs: run(inputs)), recorded, draw,
                     label or f"transformers {site}", seeds=seeds, truth_fn=truth)
+
+
+def assert_recorded_moves(reference, site, changed, label: str):
+    """`changed(inputs)`, the site's computation leaving out what it checks, moved past transformers'
+    recorded rounding at the site (`assert_moves`), so the site tells the computation it checks from it."""
+    seeds, draw, recorded, truth = _recorded(reference, site)
+    assert_moves(recorded, jax.jit(lambda index, inputs: changed(inputs)), draw, label, seeds=seeds,
+                 truth_fn=truth)
 
 
 def test_the_chunked_scan_matches_the_reference(seeded_reference):
@@ -142,36 +139,9 @@ def test_the_chunk_size_does_not_change_the_scan(seeded_reference, size):
     assert_recorded_as_exact(seeded_reference, "scan", chunked, f"a chunk of {size}")
 
 
-def layer(geometry, **overrides) -> Mamba2:
-    return Mamba2(emb_features=geometry["hidden_size"], num_heads=geometry["num_heads"],
-                  head_dim=geometry["head_dim"], state_size=geometry["state_size"],
-                  n_groups=geometry["n_groups"], conv_kernel=geometry["conv_kernel"],
-                  chunk_size=geometry["chunk_size"], norm_eps=geometry["layer_norm_epsilon"], **overrides)
-
-
-def layer_params(reference):
-    """The reference layer's state dict under the module's names: kernels
-    transposed from torch's [out, in], everything else as stored."""
-    weights = {
-        name[len("layer.") :]: value
-        for name, value in reference.items()
-        if name.startswith("layer.")
-        and name not in ("layer.hidden", "layer.output", "layer.output_bf16", "layer.output_f64")
-    }
-    return {
-        "params": {
-            "in_proj": {"kernel": jnp.asarray(weights["in_proj.weight"].T)},
-            "conv1d": {
-                "weight": jnp.asarray(weights["conv1d.weight"]),
-                "bias": jnp.asarray(weights["conv1d.bias"]),
-            },
-            "A_log": jnp.asarray(weights["A_log"]),
-            "dt_bias": jnp.asarray(weights["dt_bias"]),
-            "D": jnp.asarray(weights["D"]),
-            "norm": {"weight": jnp.asarray(weights["norm.weight"])},
-            "out_proj": {"kernel": jnp.asarray(weights["out_proj.weight"].T)},
-        }
-    }
+def fixture_layer_params(reference) -> dict:
+    """The ssd.npz layer's weights (`layer.`-prefixed torch names) under Dew's names."""
+    return mamba2_layer_params({name.removeprefix("layer."): value for name, value in reference.items()})
 
 
 def test_the_layer_matches_mamba2_mixer(seeded_reference):
@@ -243,28 +213,28 @@ that the unsplit layer against itself resolves none of them within 512 draws."""
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("row", sorted(SPLIT_ROWS))
-def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones(reference, geometry, row):
+def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones(reference, row):
     """Under a sequence axis of 4, the layer runs rows with padding as `held_scan` runs them on one
     device (`assert_split_as_whole`). A pool of processes always carries validity, so this is every
     multi-host run."""
-    assert_split_as_whole(layer(geometry), layer_params(reference), row, SPLIT_SEEDS[row],
-                          f"mamba2 split over the sequence, {row}", width=geometry["hidden_size"])
+    assert_split_as_whole(mamba2_layer(), fixture_layer_params(reference), row, SPLIT_SEEDS[row],
+                          f"mamba2 split over the sequence, {row}", width=LAYER_GEOMETRY["hidden_size"])
 
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("masked", [False, True], ids=["whole rows", "valid rows"])
-def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geometry, masked):
+def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, masked):
     """Under a sequence axis of 4, the layer's scan output carries both names a remat policy keeps it by,
     a mixer's 'context' and a recurrence's 'scan', with or without the rows' validity, as on one device
     (`Mamba2.residuals`): a checkpoint saving either name alone holds more residuals for its backward
     (the pullback's arrays, traced) than one saving nothing."""
     from dew.nn.backbones.decoder_block import RematPolicy
 
-    module = layer(geometry)
-    variables = layer_params(reference)
+    module = mamba2_layer()
+    variables = fixture_layer_params(reference)
     fields = {"valid": jnp.ones((2, 32), bool)} if masked else {}
     call = MixerCall(AttentionMetadata(coordinates=coordinates((2, 32), **fields)))
-    drawn = np.random.default_rng(0).standard_normal((2, 32, geometry["hidden_size"]))
+    drawn = np.random.default_rng(0).standard_normal((2, 32, LAYER_GEOMETRY["hidden_size"]))
     hidden = jnp.asarray(drawn, jnp.float32)
     mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
 
@@ -295,11 +265,8 @@ def test_packed_documents_run_as_if_each_ran_alone(seeded_reference):
         return {"output": module.apply(mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:1], call)}
 
     assert_recorded_as_exact(seeded_reference, "packed", packed, "the packed row")
-    arrays = mamba2_layer_draw(0)
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(mamba2_layer_site_run("packed", widened(arrays))["output"])
-    unsegmented = module.apply(mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:1])
-    outside(unsegmented, packed(arrays)["output"], truth, "the row without segment ids")
+    assert_recorded_moves(seeded_reference, "packed", lambda arrays: {"output": module.apply(
+        mamba2_layer_params(arrays), jnp.asarray(arrays["hidden"])[:1])}, "the row without segment ids")
 
 
 @pytest.mark.parametrize("form", ["chunked", "recurrent"])
@@ -316,11 +283,12 @@ def test_the_chunked_and_recurrent_forms_reset_alike(seeded_reference, form):
         return {"output": output, "final": final}
 
     assert_recorded_as_exact(seeded_reference, "starts", reset, f"{form} with starts")
-    arrays = mamba2_draw(0)
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(mamba2_starts_run(widened(arrays))["output"])
-    unreset = chunk_ssd(*scan_operands(arrays), jnp.asarray(arrays["h0"]), 32)[0]
-    outside(unreset, reset(arrays)["output"], truth, "the scan without starts")
+
+    def unreset(arrays):
+        output, final = chunk_ssd(*scan_operands(arrays), jnp.asarray(arrays["h0"]), 32)
+        return {"output": output, "final": final}
+
+    assert_recorded_moves(seeded_reference, "starts", unreset, "the scan without starts")
 
 
 def test_padded_packed_rows_reset_at_each_document(seeded_reference):
@@ -340,13 +308,13 @@ def test_padded_packed_rows_reset_at_each_document(seeded_reference):
         return {"hidden": hidden[0][valid[0]]}
 
     assert_recorded_as_exact(seeded_reference, "model_padded", padded, "the padded packed row")
-    arrays = mamba2_model_draw(0)
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(mamba2_model_site_run("model_padded", widened(arrays))["hidden"])
-    tokens = jnp.asarray(arrays["ids"])[:1, :16]
-    unsegmented = mamba2_model_hidden(model, mamba2_model_variables(arrays), tokens, attention_mask=valid)
-    unsegmented = unsegmented[0][valid[0]]
-    outside(unsegmented, padded(arrays)["hidden"], truth, "the row without segment ids")
+
+    def unsegmented(arrays):
+        tokens = jnp.asarray(arrays["ids"])[:1, :16]
+        hidden = mamba2_model_hidden(model, mamba2_model_variables(arrays), tokens, attention_mask=valid)
+        return {"hidden": hidden[0][valid[0]]}
+
+    assert_recorded_moves(seeded_reference, "model_padded", unsegmented, "the row without segment ids")
 
     valid_17, segments_17 = padded_layout(17)
     kept = valid_17[0, :-1]

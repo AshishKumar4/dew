@@ -7,6 +7,7 @@ reference and 2.9e-02 from the reference's own bfloat16 forward (which sits
 2.3e-02 from its fp32), tolerance 1e-1 on each.
 """
 
+import contextlib
 import copy
 import json
 from pathlib import Path
@@ -146,18 +147,20 @@ MAMBA2_130M_HF = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
 @pytest.mark.network
 def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     """state-spaces/mamba2-130m (mamba_ssm config and names, pickles on
-    main, loaded from SFconvertbot's refs/pr/1) against transformers 5.16.1
+    main, loaded from SFconvertbot's refs/pr/1) against transformers 5.17.0
     running AntonV/mamba2-130m-hf in fp32 on CPU, on two prompts cut to a
     common 13 tokens.
 
     Observed on CPU: fp32 4.7e-4 on logits of magnitude 170, every argmax
     equal; tolerance 1e-3, about twice that. In bfloat16 Dew hands the scan
     the conv's bf16 output, as the reference's own bfloat16 forward does, and
-    is held on par with that forward from the port in float64 over seeded rows
-    of tokens (check 1).
+    is held on par with that forward from the port's float64 twin over seeded
+    rows of tokens (check 1), run in float64 throughout (`torch_precision`:
+    transformers' mixer casts its scan's operands to fp32 itself).
     """
     import torch
     import transformers
+    from tools.torch_precision import float64, float64_twin
     tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF)
     prompts = ["The capital of France is Paris, and the capital of Germany is",
                "def fibonacci(n):\n    if n < 2:\n        return n\n    return"]
@@ -176,17 +179,17 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     assert fp32.revision == "ea6060f68a4289e9c06f80effa896629ba519216"
     assert largest(logits, reference) < 1e-3
     assert np.array_equal(logits.argmax(-1), reference.argmax(-1))
-    ports = {dtype: copy.deepcopy(port).to(dtype) for dtype in (torch.bfloat16, torch.float64)}
-
-    def logits_of(dtype):
+    def logits_of(model, precision):
         @torch.no_grad()
         def run(ids):
-            return ports[dtype](torch.from_numpy(np.asarray(ids, np.int64))).logits.to(torch.float64).numpy()
+            with precision():
+                return model(torch.from_numpy(np.asarray(ids, np.int64))).logits.to(torch.float64).numpy()
         return as_given(run)
 
     def draw(seed):
         return (np.random.default_rng(seed).integers(0, tokenizer.vocab_size, (2, 13)).astype(np.int32),)
 
     assert_as_exact(lambda ids: bf16.model.apply(bf16.variables, ids).astype(jnp.float32),
-                    logits_of(torch.bfloat16), draw, "bf16 logits against the port's in bfloat16",
-                    seeds=INTEROP_SEEDS, truth_fn=logits_of(torch.float64))
+                    logits_of(copy.deepcopy(port).to(torch.bfloat16), contextlib.nullcontext), draw,
+                    "bf16 logits against the port's in bfloat16", seeds=INTEROP_SEEDS,
+                    truth_fn=logits_of(float64_twin(port), float64))
