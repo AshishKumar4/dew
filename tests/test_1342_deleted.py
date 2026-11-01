@@ -1,5 +1,9 @@
 """CPU-sized reproduction of the row-1342 H100 banked warm-up failure."""
 
+import subprocess
+import sys
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -53,3 +57,9 @@ def test_banked_smoke_serve(release_source):
     server = Server.from_task(task, slots=2, capacity=32, admission=1)
     results = [result.host() for result in server([[100, 101, 102, 103]], 2, key=0)]
     assert results
+
+
+def test_original_eight_layer_warm_smoke():
+    subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("warm1342_debug.py")),
+         "8", "banked", "smoke"], check=True)
