@@ -5,8 +5,10 @@ run keeps, its plan, its step compiled ahead and the executable it runs, is the 
 then. A program with no template launch compiles as jit compiles it."""
 
 import dataclasses
+import gc
 import os
 import time
+import weakref
 
 import flax.linen as nn
 import jax
@@ -21,7 +23,7 @@ from process_support import fresh
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program, program
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.instrumentation import Compiles
@@ -463,3 +465,33 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
     assert len(found) == 2 and all(binary.registers > 0 and not binary.frame for binary in found)
     launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
     assert launched == [("dew_added", "0123456789")]
+
+def test_a_program_its_caller_owns_is_released_with_its_caller():
+    """A program over a closure or a bound method its caller owns (`owned_program`), as a run's placement
+    and its host phases compile, keeps no reference of Dew's: once the caller lets it go, the owner the
+    closure holds (a trainer, its objective and their arrays) is released, as no process-wide cache holds
+    the closure. A program over a module's function (`program`) is kept for every caller alike."""
+
+    class Owner:
+        """A run's stand-in, holding an array its closure reads."""
+
+        def __init__(self):
+            self.held = jnp.arange(4.0)
+
+        def scaled(self, x):
+            return x * self.held
+
+    def reading(held: Owner):
+        return lambda x: x + held.held
+
+    owner = Owner()
+    released = weakref.ref(owner)
+    closure = owned_program(reading(owner))
+    bound = owned_program(owner.scaled)
+    np.testing.assert_array_equal(np.asarray(closure(jnp.ones(4))), np.arange(4.0) + 1)
+    np.testing.assert_array_equal(np.asarray(bound(jnp.ones(4))), np.arange(4.0))
+    del owner, closure, bound
+    gc.collect()
+    assert released() is None
+    assert program(jnp.sum) is program(jnp.sum)
+
