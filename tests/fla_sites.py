@@ -29,12 +29,18 @@ RECORDED = Path(__file__).resolve().parent / "fixtures" / "fla" / "gdn_seeded.np
 LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 """A recorded site's leaves: the output and final memory, then each operand's gradient."""
 
+FORWARD = ("out", "final")
+"""A forward's site's leaves."""
+
 
 class Site(NamedTuple):
     hooks: recurrence.Hooks
     draw: Callable[[int], tuple[Chunk, tuple[jax.Array, jax.Array]]]
     """A seed's operands (their documents' starts in place) and the cotangents of the output and final
     memory."""
+    leaves: tuple[str, ...] = LEAVES
+    """The leaves its tests read, which the recorder records: a forward's site its output and final memory
+    alone, no gradient run."""
 
     def arrays(self, seed: int) -> dict[str, np.ndarray]:
         """The seed's draw as host arrays, the recording's inputs."""
@@ -105,7 +111,7 @@ def _mosaic_sites() -> dict[str, Site]:
         hooks = recurrence.Hooks(decay='scalar', scale=at['key_width'] ** -0.5, write_bound=1.0)
         sites[f"walk/{geometry}"] = Site(hooks, _with_cotangents(
             lambda seed, at=at: mosaic.draw(jnp.bfloat16, seed, **at)[0]))
-    sites["near two"] = Site(mosaic.NEAR_TWO_HOOKS, _with_cotangents(mosaic.near_two))
+    sites["near two"] = Site(mosaic.NEAR_TWO_HOOKS, _with_cotangents(mosaic.near_two), FORWARD)
     return sites
 
 
@@ -126,7 +132,7 @@ def _stability_sites() -> dict[str, Site]:
                 restored = stability.restarting(lambda given: given, regime)(operands)
                 return template_stability.bf16(restored, hooks), (out.astype(jnp.bfloat16), final)
 
-            sites[f"stability/{name}/{regime}/forward"] = Site(hooks, _with_cotangents(forward))
+            sites[f"stability/{name}/{regime}/forward"] = Site(hooks, _with_cotangents(forward), FORWARD)
             sites[f"stability/{name}/{regime}/gradient"] = Site(hooks, gradient)
     return sites
 
