@@ -2279,7 +2279,8 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
     the first step that packs or windows them or makes several rows of each, else the batch), before any
     repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
     or a streamed source's rows as its shards state them, each slice and limit before that place applied;
-    a mixture's, those in which every part it mixes comes round once (`Proportions.covering`). None where a
+    a mixture by weights, those in which every part it mixes comes round once (`Proportions.covering`). None
+    for a mixture by tokens, or where a
     step before that place drops or adds one, or keeps them by a rule not yet bound, or nothing states
     the count."""
     source = train.source
@@ -2294,6 +2295,10 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
            or (isinstance(stage, Configured) and not stage.one_to_one) for stage in prefix):
         return None
     if isinstance(source, Mixture):
+        if source.tokens is not None:
+            # A mix by tokens draws each part as its tokens fall short (`TokenDeficit`), which no count of its
+            # examples states ahead.
+            return None
         sizes = [_pass_examples(child, build.child(index)) for index, child in enumerate(source.pipelines)]
         known = [size for size in sizes if size is not None]
         if len(known) != len(sizes):
