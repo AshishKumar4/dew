@@ -227,7 +227,8 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
     ("namespace = {}\n    exec(m.__spec__.loader.get_source('m'), namespace)\n"
      "    assert namespace['unused'](2) == (2, 'one')", ("    return x, 'one'", "    return x, 'two'")),
     ("pass", ("    return x, 'one'", "    return x, 'one'\n    break")),
-], ids=["a docstring read beside its signature", "a generator's kind", "a function's code", "a module's text it executed itself",
+], ids=["a docstring read beside its signature", "a generator's kind", "a function's code",
+        "a module's text it executed itself",
         "a body that no longer compiles"])
 def test_what_a_run_sees_of_code_it_never_entered_is_its_input(ci, tmp_path, monkeypatch, cache_worker,
                                                                seen, edit):
