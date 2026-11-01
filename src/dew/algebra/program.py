@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import numpy as np
-from egglog import EGraph, String, Vec, get_callable_args, i64, set_
+from egglog import EGraph, Schedule, String, Vec, get_callable_args, i64, set_
 from jax._src import config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
@@ -258,7 +258,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     cheaper = after < before.value
     picked = {str(root): form for root, form in zip(roots, forms, strict=True)} if cheaper else {}
     report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
-                           saturated.iterations, _nodes(graph), saturated.limited, before.value, after,
+                           saturated.iterations, node_count(graph), saturated.limited, before.value, after,
                            time.perf_counter() - began)
     return Rewrite(region, picked, report)
 
@@ -268,6 +268,18 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
     computes in its operands' dtype, which broadcasts lay along one axis, which literals are powers of two or
     one, the primitives a stable rule writes), its roots bundled, the facts saturated."""
     graph = EGraph()
+    stated(graph, region)
+    roots = region.roots()
+    bundle = terms.Term.bundle(Vec[terms.Term](*roots))
+    graph.register(bundle)
+    graph.run(rules.FACTS.saturate())
+    return graph, bundle, roots
+
+
+def stated(graph: EGraph, region: terms.Region) -> None:
+    """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s): each term's
+    shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one axis, which
+    literals are powers of two or one, the primitives a stable rule writes."""
     for term, extent in region.shapes:
         graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent))))
     arithmetic = (jax.lax.add_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
@@ -289,11 +301,6 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
             graph.register(rules.exact_scale(literal))
         if np.ndim(value) == 0 and float(value) == 1.0:
             graph.register(rules.unit(literal))
-    roots = region.roots()
-    bundle = terms.Term.bundle(Vec[terms.Term](*roots))
-    graph.register(bundle)
-    graph.run(rules.FACTS.saturate())
-    return graph, bundle, roots
 
 
 @dataclasses.dataclass(frozen=True)
@@ -308,26 +315,28 @@ class Saturated:
 
 
 def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, ...],
-             saturation: Saturation) -> Saturated:
+             saturation: Saturation, facts: Schedule | None = None) -> Saturated:
     """`graph` run under the `admitted` rule sets to their fixpoint or `region`'s limits (`Saturation`), its
-    facts saturated after each set."""
+    facts saturated after each set: the engine's (`rules.FACTS`), or `facts` where a caller's rules read
+    facts of their own (the derivation's, `dew.algebra.derive`)."""
+    facts = rules.FACTS.saturate() if facts is None else facts
     fired = dict.fromkeys((admitted_rules.name for admitted_rules in admitted), 0)
     nodes, steps = saturation.limits(region)
     iterations, limited = 0, False
     while admitted:
-        if iterations == steps or _nodes(graph) > nodes:
+        if iterations == steps or node_count(graph) > nodes:
             limited = True
             break
         updated = False
         for admitted_rules in admitted:
-            graph.run(rules.FACTS.saturate())
+            graph.run(facts)
             ran = graph.run(admitted_rules.ruleset)
             fired[admitted_rules.name] += sum(ran.num_matches_per_rule.values())
             updated = updated or ran.updated
         iterations += 1
         if not updated:
             break
-    graph.run(rules.FACTS.saturate())
+    graph.run(facts)
     return Saturated(fired, (nodes, steps), iterations, limited)
 
 
@@ -384,7 +393,7 @@ def _power_of_two(value) -> bool:
     return mantissa in (0.5, -0.5)
 
 
-def _nodes(graph: EGraph) -> int:
+def node_count(graph: EGraph) -> int:
     """The rows of every table of `graph`, its nodes and its facts' (egglog states no node count of its
     own)."""
     return sum(size for _, size in graph.all_function_sizes())

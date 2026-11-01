@@ -564,13 +564,22 @@ is recorded with each compiled step (`StepCompiled`) and each `OuterProgram` com
 
 ### 6.9 Derived template forms
 
-**Drift to fix.** `derive.py` and `scan.py` do not use the e-graph. Each is a recognizer plus a fixed form:
-`derive` matches a jaxpr's walked reductions (monoids, a sum decoupled from a maximum through `exp(x - m)`);
-`scan` matches one update shape (affine in the state, rank-one corrections along the input's vector, a
-contraction readout) with its own symbolic matcher and emits one chunk algorithm. The equal-form choices this
-section expects extraction to make under a cost (a solve's factoring independent of the entering state, the
-chunk-parallel work outside the sequential carry, doubling against substitution, a per-key decay's sub-chunk
-factoring) are hard-coded or missing. The derived forms run at trace time (the generator is parked, §6.11).
+A walk's derivation (`derive.py`) runs through the e-graph. The declaration, traced at one tile, enters as
+terms. Facts saturate first: each value's walked axis, which values read no walked reduction, which reductions
+sum or take the maximum along the walk, and which values scale as `exp(-k)` with a function `k` of walked
+maxima. The derivation's readings (`Term.stepped`, `merged`, `finished`, `held`) distribute over the language
+under its rules (`decoupled`). At a walked reduction a monoid's identity holds, a sum that scales with a maximum
+rescaled by `exp(k_carried - k_new)` first. A carried state is `Term.state(index, side)`. The engine's sets the
+numerics admit saturate in the same e-graph, so a form is extracted from the language and the engine's rewrites
+together, under the program's cost. The readings cost without bound: a value no rule rewrites leaves its form
+unpriced, and the declaration is refused. Each tile shape's rewrite joins the kernel report (§6.8).
+
+**Drift to fix.** `scan.py` does not use the e-graph. It matches one update shape (affine in the state,
+rank-one corrections along the input's vector, a contraction readout) with its own symbolic matcher and emits
+one chunk algorithm. The equal-form choices this section expects extraction to make under a cost (a solve's
+factoring independent of the entering state, the chunk-parallel work outside the sequential carry, doubling
+against substitution, a per-key decay's sub-chunk factoring) are hard-coded or missing. The derived forms run
+at trace time (the generator is parked, §6.11).
 
 Derivation runs at dev time, in the generator (§6.11); its output is a checked-in module. A declaration states
 semantics only: plain JAX on whole operands, or token functions along a walked axis. It never states a

@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.algebra import derive
+from dew.algebra import SATURATION, derive
 from dew.nn import precision
 
 QUERIES, KEYS, WIDTH, TILE = 16, 96, 32, 32
@@ -130,7 +130,7 @@ def walked_whole(forms: derive.Derived):
 def test_the_derived_walk_computes_the_declared_function(name):
     """The declaration's derived step over every key tile in order, finished: on par with the whole-operand
     function against the float64 truth (check 1)."""
-    forms = derive.derive(declared(*DECLARED[name]))
+    forms = derive.derive(declared(*DECLARED[name]), accurate=False, saturation=SATURATION)
     assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(DECLARED[name][0])), draw, f"{name} walked",
                     seeds=16)
 
@@ -139,7 +139,7 @@ def test_the_derived_walk_computes_the_declared_function(name):
 def test_two_walks_merged_compute_the_declared_function(name):
     """The keys walked in two disjoint halves, each from the empty state, their states merged (a split walk's
     combine, the work scheduler's fix-up), finished: on par with the whole-operand function."""
-    forms = derive.derive(declared(*DECLARED[name]))
+    forms = derive.derive(declared(*DECLARED[name]), accurate=False, saturation=SATURATION)
     tiles = KEYS // TILE
 
     def split(q, k, v):
@@ -160,7 +160,7 @@ def unshifted(q, k, v, rows, keys):
 
 def test_sums_no_maximum_scales_walk_as_plain_sums():
     """A declaration whose walked sums read no walked maximum derives plain sums: on par with the function."""
-    forms = derive.derive(declared(unshifted))
+    forms = derive.derive(declared(unshifted), accurate=False, saturation=SATURATION)
 
     def small(seed):
         q, k, v = draw(seed)
@@ -187,7 +187,7 @@ def weights(q, k, v, rows, keys):
 def test_a_declaration_no_monoid_holds_is_refused(function):
     """A walked sum that reads the walked maximum other than through its exponent, and an output that varies
     along the walked axis, are refused before any form is built."""
-    forms = derive.derive(declared(function))
+    forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
     first = tile_of(operands(*draw(0)), 0)
     with pytest.raises(derive.Refused):
         forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
@@ -221,7 +221,8 @@ def test_a_backward_walked_over_queries_sums_dk_dv_and_maps_dq():
     each tile's own (`mapped`), the tiles' joined: on par with the whole-operand gradients."""
     axes = {"q": ("rows", "width"), "k": ("keys", "width"), "v": ("keys", "values"), "do": ("rows", "values"),
             "lse": ("rows",), "delta": ("rows",)}
-    forms = derive.derive(derive.Reduction(backward, axes, walked="rows", exponent="e"))
+    forms = derive.derive(derive.Reduction(backward, axes, walked="rows", exponent="e"),
+                          accurate=False, saturation=SATURATION)
 
     def tile(values: dict, index: int) -> dict:
         rows = slice(index * QUERY_TILE, (index + 1) * QUERY_TILE)

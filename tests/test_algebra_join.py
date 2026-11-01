@@ -1,7 +1,8 @@
-"""The derivation's forms joined to the engine (`dew.algebra.forms.rewritten`, docs/design/algebra.md §6.9):
-attention's walk and a recurrence's chunks through forms whose math the engine rewrote before evaluating,
-each held to the float64 truth (check 1) as the derived forms are (tests/test_algebra_derive.py,
-tests/test_algebra_scan.py), in the fast class and the accurate one."""
+"""The derivation joined to the engine (docs/design/algebra.md §6.9): attention's walk derived in one e-graph
+with the engine's rule sets (`dew.algebra.derive`), and a recurrence's chunks through forms whose math the
+engine rewrote before evaluating (`dew.algebra.forms.rewritten`), each held to the float64 truth (check 1) as
+the derived forms are (tests/test_algebra_derive.py, tests/test_algebra_scan.py), in the fast class and the
+accurate one."""
 
 import jax
 import jax.numpy as jnp
@@ -20,11 +21,11 @@ ACCURACY = {"fast": False, "accurate": True}
 @pytest.mark.parametrize("accurate", ACCURACY.values(), ids=ACCURACY)
 @pytest.mark.parametrize("name", ["attention", "causal", "products"])
 def test_the_rewritten_walk_computes_the_declared_function(name, accurate):
-    """Attention's derived walk with each form's math rewritten by the engine: on par with the
-    whole-operand function, against the float64 truth (check 1)."""
+    """Attention's walk derived beside the engine's sets its numerics admit: on par with the whole-operand
+    function, against the float64 truth (check 1)."""
     function, exponent = walks.DECLARED[name]
-    derived = forms.rewritten(derive.derive(walks.declared(function, exponent)), accurate=accurate,
-                              saturation=algebra.SATURATION)
+    derived = derive.derive(walks.declared(function, exponent), accurate=accurate,
+                            saturation=algebra.SATURATION)
     assert_as_exact(jax.jit(walks.walked_whole(derived)), jax.jit(walks.whole(function)), walks.draw,
                     f"{name} rewritten", seeds=8)
 
@@ -65,15 +66,16 @@ def scaled_by_a_power_of_two(q, k, v, rows, keys):
 
 
 def test_the_engine_rewrites_a_derived_walk_and_it_computes_the_declared_function():
-    """A derived walk whose logits' scale is a power of two, its forms rewritten by the engine: a rule fires
-    on a derived form (the scale moved onto an operand of the contraction, `report.rewrites`), and the walk
-    still computes the whole-operand function, against the float64 truth (check 1)."""
-    derived = forms.rewritten(derive.derive(walks.declared(scaled_by_a_power_of_two)), accurate=False,
-                              saturation=algebra.SATURATION)
+    """A derived walk whose logits' scale is a power of two: the engine's rule that moves a power-of-two scale
+    onto an operand of the contraction fires in the derivation's e-graph (`linear`, its report in
+    `report.rewrites`), and the walk still computes the whole-operand function, against the float64 truth
+    (check 1)."""
+    derived = derive.derive(walks.declared(scaled_by_a_power_of_two), accurate=False,
+                            saturation=algebra.SATURATION)
     q, k, v = walks.draw(0)
     with report.refusals():
         jax.make_jaxpr(walks.walked_whole(derived))(q, k, v)
         fired = [made.fired for made in report.rewrites()]
-    assert any(sum(counts.values()) > 0 for counts in fired), fired
+    assert any(counts.get("linear", 0) > 0 for counts in fired), fired
     assert_as_exact(jax.jit(walks.walked_whole(derived)), jax.jit(walks.whole(scaled_by_a_power_of_two)),
                     walks.draw, "power-of-two scale rewritten", seeds=8)

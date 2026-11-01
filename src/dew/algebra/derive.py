@@ -1,30 +1,66 @@
-"""Template forms derived from a declaration (docs/design/algebra.md §6.9): a reduction's math stated on
-whole operands becomes the state a kernel carries along its walked axis, that state's empty value, one tile's
-step into it, the merge of two states (a split walk's, the work scheduler's fix-up) and the outputs a finished
-state gives.
+"""Template forms derived from a declaration through the e-graph (docs/design/algebra.md §6.9): a reduction's
+math stated on whole operands becomes the state a kernel carries along its walked axis, that state's empty
+value, one tile's step into it, the merge of two states (a split walk's, the work scheduler's fix-up), the
+outputs a finished state gives and the outputs along the walked axis a tile gives alone.
 
-The derivation reads the declaration's jaxpr. A reduction along the walked axis is a monoid's: a maximum's
-(`reduce_max`) or a sum's (`reduce_sum`, and a `dot_general` contracting the walked axis, a sum of products).
-A sum whose terms read a maximum along the same axis only through `exp(x - m)` (or `exp2`) is decoupled from
-it (Neptune's correction terms): for any `m'` along the walk, `sum exp(x - m) f = exp(m' - m) sum exp(x - m')
-f`, so a tile's sum is taken at the running maximum and the running sum rescaled when the maximum grows, which
-is online softmax and its split-walk merge, derived rather than written. Every other dependence of a walked
-reduction on another is refused, named. The decoupling reorders rounding (`reorders`): a template whose
-numerics admit only exact forms keeps its hand-written ones.
+The declaration, traced at one tile, enters the e-graph as terms (`terms.region`). Facts the rules read are
+saturated first (`WALKING`): each value's walked axis (from each operand's, through the layouts, reductions
+and products that move it), which values read no walked reduction (`local`), which reductions sum or take
+the maximum along the walked axis (`summed`, `peaked`), which values are functions of walked maxima alone
+(`anchor`), and which scale as `exp(-k)` with such a value `k` (`scales`: `exp(x - k)` and what multiplies,
+selects or sums it). The derivation's rules (`DECOUPLED`) then say what a step, a merge, a finish and a
+carried state read of each value (`Term.stepped`, `merged`, `finished`, `held`): each distributes over the
+language, and at a walked reduction a monoid's identity holds (the maximum of the carried and the tile's; a
+sum's carried plus the tile's), a sum that scales with an anchor rescaled by `exp(k_carried - k_new)` first
+(Neptune's correction terms: online softmax and its split-walk merge, derived rather than written). A
+carried state is `Term.state` (its reduction's index, the side of a merge). The engine's rule sets the
+numerics admit (`rules.admitted`) saturate in the same e-graph, and extraction under the program's cost
+(`cost.model`) picks each form from both; the derivation's own constructors cost without bound, so a value no
+rule rewrites (a sum that reads a maximum otherwise, an output along the walked axis that reads a reduction)
+leaves its form unpriced, and the declaration is refused (`Refused`). Dew's products in a declaration
+(`float32_einsum`, under a wide arithmetic a choice by platform) enter as their default branch's product and
+are evaluated as Dew's (`float32_dot_general`). The decoupling reorders rounding.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+import math
+import time
+from collections.abc import Callable, Iterator, Mapping
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
-from jax import lax
+import numpy as np
+from egglog import (
+    DagCostModel,
+    EGraph,
+    Schedule,
+    String,
+    Unit,
+    Vec,
+    eq,
+    function,
+    get_callable_args,
+    get_literal_value,
+    i64,
+    rewrite,
+    rule,
+    ruleset,
+    seq,
+    set_,
+    var,
+    vars_,
+)
+from egglog.bindings import EggSmolError
 from jax.extend import core as jcore
 
-from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
+from dew.algebra import cost, program, rules, terms
+from dew.algebra.forms import Derived, Refused
+from dew.algebra.terms import Term
+from dew.nn.kernels.templates import report as kernel_report
+from dew.nn.precision import float32_dot_general
 
 Axes = tuple[str, ...]
 
@@ -42,465 +78,761 @@ class Reduction:
     exponent: Literal[2, "e"]
 
 
+# The facts the derivation reads (§6.3), each registered from a parameter's own values or saturated by
+# `WALKING`.
+
+
+@function(merge=lambda old, new: old)
+def walked(term: Term) -> i64: ...
+"""The position of the walked axis in a value."""
+
+
+@function
+def keeps(params: i64) -> Unit: ...
+"""An elementwise equation's parameters: the walked axis where its operand's is."""
+
+
+@function
+def lays(params: i64, axis: i64, to: i64) -> Unit: ...
+"""A layout change moving its operand's `axis` to `to`."""
+
+
+@function
+def reduces(params: i64, axis: i64, to: i64) -> Unit: ...
+"""A reduction over axes other than `axis`, which it moves to `to`."""
+
+
+@function
+def left_of(params: i64, axis: i64, to: i64) -> Unit: ...
+"""A product keeping its left operand's `axis` at `to`."""
+
+
+@function
+def right_of(params: i64, axis: i64, to: i64) -> Unit: ...
+"""A product keeping its right operand's `axis` at `to`."""
+
+
+@function
+def contracts_left(params: i64, axis: i64) -> Unit: ...
+"""A product contracting its left operand's `axis`."""
+
+
+@function
+def contracts_right(params: i64, axis: i64) -> Unit: ...
+"""A product contracting its right operand's `axis`."""
+
+
+@function
+def local(term: Term) -> Unit: ...
+"""A value that reads no walked reduction: a tile's own."""
+
+
+@function
+def unwalked(term: Term) -> Unit: ...
+"""A value with no walked axis that reads no walked reduction."""
+
+
+@function
+def summed(term: Term) -> Unit: ...
+"""A sum along the walked axis (a reduction, or a product contracting it) of local values."""
+
+
+@function
+def peaked(term: Term) -> Unit: ...
+"""A maximum along the walked axis of a local value."""
+
+
+@function
+def anchor(term: Term) -> Unit: ...
+"""A value of walked maxima and local values alone (`k`, which a decoupled sum subtracts in its exponent)."""
+
+
+@function
+def scales(term: Term, by: Term, name: String, exponent: i64, difference: i64) -> Unit: ...
+"""A value that scales as `exp(-by)` (`name` the exponential, `exponent` and `difference` its and its
+subtraction's parameters): `exp(x - by)` with `x` local, and what multiplies, selects or sums it with local
+values."""
+
+
+@function
+def zero(term: Term) -> Unit: ...
+"""A value of zeros (a literal, or a layout of one)."""
+
+
+@function(merge=lambda old, new: old)
+def lifts(given: Vec[i64], to: Vec[i64]) -> i64: ...
+"""The parameters of a broadcast of a value of shape `given` to `to`, its axes the leading ones."""
+
+
+@function(merge=lambda old, new: old)
+def slot(term: Term) -> i64: ...
+"""A walked reduction's index among the walk's, its carried state's (`Term.state`)."""
+
+
+def _walking():
+    """The facts' rules (the module's account)."""
+    x, y, z, k, t, base = vars_("x y z k t base", Term)
+    name, layout = vars_("name layout", String)
+    p, q, a, b, e, s = vars_("p q a b e s", i64)
+    axes = var("axes", Vec[i64])
+    walking = []
+    for constructor in ("binary", "compare"):
+        def made(left, right, params, constructor=constructor):
+            return getattr(left, constructor)(name, right, params)
+        walking += [
+            rule(eq(t).to(made(x, y, p)), eq(walked(x)).to(a), keeps(p)).then(set_(walked(t)).to(a)),
+            rule(eq(t).to(made(x, y, p)), eq(walked(y)).to(a), keeps(p)).then(set_(walked(t)).to(a)),
+            rule(eq(t).to(made(x, y, p)), local(x), local(y)).then(local(t)),
+            rule(eq(t).to(made(x, y, p)), unwalked(x), unwalked(y)).then(unwalked(t)),
+            rule(eq(t).to(made(x, y, p)), anchor(x), anchor(y)).then(anchor(t)),
+            rule(eq(t).to(made(x, y, p)), anchor(x), local(y)).then(anchor(t)),
+            rule(eq(t).to(made(x, y, p)), local(x), anchor(y)).then(anchor(t)),
+        ]
+    for one in ("unary", "convert", "shaped"):
+        def single(operand, params, one=one):
+            return operand.unary(name, params) if one == "unary" else (
+                operand.convert(params) if one == "convert" else operand.shaped(name, params))
+        walking += [
+            rule(eq(t).to(single(x, p)), local(x)).then(local(t)),
+            rule(eq(t).to(single(x, p)), unwalked(x)).then(unwalked(t)),
+            rule(eq(t).to(single(x, p)), anchor(x)).then(anchor(t)),
+        ]
+    walking += [
+        rule(eq(t).to(x.unary(name, p)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.convert(p)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.shaped(name, p)), eq(walked(x)).to(a), lays(p, a, b)).then(set_(walked(t)).to(b)),
+        rule(eq(t).to(x.select(y, z)), eq(walked(x)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.select(y, z)), eq(walked(y)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.select(y, z)), eq(walked(z)).to(a)).then(set_(walked(t)).to(a)),
+        rule(eq(t).to(x.select(y, z)), local(x), local(y), local(z)).then(local(t)),
+        rule(eq(t).to(x.select(y, z)), unwalked(x), unwalked(y), unwalked(z)).then(unwalked(t)),
+        rule(eq(t).to(x.select(y, z)), anchor(x), anchor(y), anchor(z)).then(anchor(t)),
+        rule(eq(t).to(x.select(y, z)), local(x), local(y), anchor(z)).then(anchor(t)),
+        rule(eq(t).to(x.select(y, z)), anchor(x), local(y), anchor(z)).then(anchor(t)),
+        rule(eq(t).to(x.select(y, z)), anchor(x), anchor(y), local(z)).then(anchor(t)),
+        rule(eq(t).to(x.select(y, z)), anchor(x), local(y), local(z)).then(anchor(t)),
+        # Reductions: over other axes the walked axis moves; over the walked axis alone a walked one.
+        rule(eq(t).to(x.reduce(name, axes, p)), eq(walked(x)).to(a), reduces(p, a, b)).then(
+            set_(walked(t)).to(b)),
+        rule(eq(t).to(x.reduce(name, axes, p)), eq(walked(x)).to(a), reduces(p, a, b), local(x)).then(
+            local(t)),
+        rule(eq(t).to(x.reduce(name, axes, p)), unwalked(x)).then(unwalked(t), local(t)),
+        rule(eq(t).to(x.reduce(String("sum"), axes, p)), eq(walked(x)).to(a), eq(axes).to(Vec[i64](a)),
+             local(x)).then(summed(t)),
+        rule(eq(t).to(x.reduce(String("max"), axes, p)), eq(walked(x)).to(a), eq(axes).to(Vec[i64](a)),
+             local(x)).then(peaked(t), anchor(t)),
+        # Products: a kept axis moves to its place in the product; a contracted walked axis is a walked sum.
+        rule(eq(t).to(x.dot(y, p)), eq(walked(x)).to(a), left_of(p, a, b)).then(set_(walked(t)).to(b)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), right_of(p, a, b)).then(set_(walked(t)).to(b)),
+        rule(eq(t).to(x.dot(y, p)), unwalked(x), unwalked(y)).then(unwalked(t), local(t)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(x)).to(a), left_of(p, a, b), local(x), unwalked(y)).then(
+            local(t)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), right_of(p, a, b), local(y), unwalked(x)).then(
+            local(t)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(x)).to(a), left_of(p, a, b), eq(walked(y)).to(q),
+             right_of(p, q, b), local(x), local(y)).then(local(t)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(x)).to(a), contracts_left(p, a), local(x), local(y)).then(
+            summed(t)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), local(x), local(y)).then(
+            summed(t)),
+        # Zeros, through their layouts and casts.
+        rule(eq(t).to(x.shaped(name, p)), zero(x)).then(zero(t)),
+        rule(eq(t).to(x.convert(p)), zero(x)).then(zero(t)),
+    ]
+    # What scales as exp(-k): an exponential of a local value less an anchor (or its broadcast), and what
+    # multiplies, divides, selects against zeros, sums, casts or lays it out with local values.
+    walking += [
+        rule(eq(t).to(x.binary(String("sub"), base, s).unary(name, e)), local(x),
+             eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
+             eq(name).to(String("exp"))).then(scales(t, k, name, e, s)),
+        rule(eq(t).to(x.binary(String("sub"), base, s).unary(name, e)), local(x),
+             eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
+             eq(name).to(String("exp2"))).then(scales(t, k, name, e, s)),
+    ]
+    for side in (0, 1):
+        def product(scaled, other, params, side=side):
+            return scaled.binary(String("mul"), other, params) if side == 0 else other.binary(
+                String("mul"), scaled, params)
+        walking.append(rule(eq(t).to(product(x, y, p)), scales(x, k, name, e, s), local(y)).then(
+            scales(t, k, name, e, s)))
+        walking.append(rule(eq(t).to(x.dot(y, p) if side == 0 else y.dot(x, p)), scales(x, k, name, e, s),
+                            local(y)).then(scales(t, k, name, e, s)))
+    walking += [
+        rule(eq(t).to(x.binary(String("div"), y, p)), scales(x, k, name, e, s), local(y)).then(
+            scales(t, k, name, e, s)),
+        rule(eq(t).to(x.binary(String("add"), y, p)), scales(x, k, name, e, s),
+             scales(y, k, name, e, s)).then(scales(t, k, name, e, s)),
+        rule(eq(t).to(z.select(y, x)), scales(x, k, name, e, s), zero(y), local(z)).then(
+            scales(t, k, name, e, s)),
+        rule(eq(t).to(z.select(x, y)), scales(x, k, name, e, s), zero(y), local(z)).then(
+            scales(t, k, name, e, s)),
+        rule(eq(t).to(x.convert(p)), scales(x, k, name, e, s)).then(scales(t, k, name, e, s)),
+        rule(eq(t).to(x.shaped(layout, p)), scales(x, k, name, e, s)).then(scales(t, k, name, e, s)),
+        rule(eq(t).to(x.reduce(String("sum"), axes, p)), scales(x, k, name, e, s), eq(walked(x)).to(a),
+             reduces(p, a, b)).then(scales(t, k, name, e, s)),
+        rule(eq(t).to(x.reduce(String("sum"), axes, p)), eq(walked(x)).to(a), eq(axes).to(Vec[i64](a)),
+             scales(x, k, name, e, s)).then(summed(t)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(x)).to(a), contracts_left(p, a), scales(x, k, name, e, s),
+             local(y)).then(summed(t)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s),
+             local(x)).then(summed(t)),
+    ]
+    return ruleset(*walking, name="walking")
+
+
+def _shapes():
+    """The shapes of the values the derivation's rules make: a carried state its reduction's, a value a step,
+    merge, finish or carried state reads its own, a select its operands', a lifted correction its broadcast's
+    target."""
+    x, y, z = vars_("x y z", Term)
+    side = var("side", i64)
+    extent = var("extent", Vec[i64])
+    given, to = vars_("given to", Vec[i64])
+    shape = rules.shape
+    return ruleset(
+        rule(eq(extent).to(shape(x)), eq(y).to(x.held(side))).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(x.stepped())).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
+        rule(eq(extent).to(shape(y)), eq(z).to(x.select(y, z))).then(set_(shape(x.select(y, z))).to(extent)),
+        rule(eq(y).to(x.shaped(String("broadcast_in_dim"), lifts(given, to)))).then(set_(shape(y)).to(to)),
+        name="derived shapes")
+
+
+WALKING = _walking()
+SHAPES = _shapes()
+
+
+def _decoupled():
+    """The derivation's rules (the module's account): each reading distributes over the language, and a walked
+    reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first."""
+    x, y, z, k, t = vars_("x y z k t", Term)
+    name = var("name", String)
+    p, e, s, side, a, b, lift, added, multiplied, largest, i = vars_(
+        "p e s side a b lift added multiplied largest i", i64)
+    axes = var("axes", Vec[i64])
+    given, to = vars_("given to", Vec[i64])
+    stock = rules.stock
+    shape = rules.shape
+    readings = [lambda term: term.stepped(), lambda term: term.merged(), lambda term: term.finished(),
+                lambda term: term.held(side)]
+    derived = []
+    for read in readings:
+        derived += [
+            rewrite(read(Term.leaf(p))).to(Term.leaf(p)),
+            rewrite(read(Term.literal(p))).to(Term.literal(p)),
+            rewrite(read(x.binary(name, y, p))).to(read(x).binary(name, read(y), p)),
+            rewrite(read(x.compare(name, y, p))).to(read(x).compare(name, read(y), p)),
+            rewrite(read(x.unary(name, p))).to(read(x).unary(name, p)),
+            rewrite(read(x.convert(p))).to(read(x).convert(p)),
+            rewrite(read(x.shaped(name, p))).to(read(x).shaped(name, p)),
+            rewrite(read(x.select(y, z))).to(read(x).select(read(y), read(z))),
+            # A reduction over other axes, or of no walked value, and a product contracting no walked axis.
+            rewrite(read(x.reduce(name, axes, p))).to(read(x).reduce(name, axes, p), eq(walked(x)).to(a),
+                                                      reduces(p, a, b)),
+            rewrite(read(x.reduce(name, axes, p))).to(read(x).reduce(name, axes, p), unwalked(x)),
+            rewrite(read(x.dot(y, p))).to(read(x).dot(read(y), p), unwalked(x), unwalked(y)),
+            rewrite(read(x.dot(y, p))).to(read(x).dot(read(y), p), eq(walked(x)).to(a), left_of(p, a, b),
+                                          unwalked(y)),
+            rewrite(read(x.dot(y, p))).to(read(x).dot(read(y), p), eq(walked(y)).to(a), right_of(p, a, b),
+                                          unwalked(x)),
+            rewrite(read(x.dot(y, p))).to(read(x).dot(read(y), p), eq(walked(x)).to(a), left_of(p, a, b),
+                                          eq(walked(y)).to(e), right_of(p, e, b)),
+        ]
+
+    slotted = eq(i).to(slot(t))
+    for combined, which, index in (("max", peaked, largest), ("add", summed, added)):
+        stocked = eq(index).to(stock(combined))
+        derived += [
+            rewrite(t.stepped()).to(Term.state(i, 0).binary(combined, t, index), which(t), local_of(t),
+                                    stocked, slotted),
+            rewrite(t.merged()).to(Term.state(i, 0).binary(combined, Term.state(i, 1), index), which(t),
+                                   local_of(t), stocked, slotted),
+            rewrite(t.finished()).to(Term.state(i, 0), which(t), slotted),
+        ]
+    derived.append(rewrite(t.held(side)).to(Term.state(i, side), peaked(t), slotted))
+
+    # A sum along the walked axis of values that scale with an anchor `k`: its carried value rescaled by
+    # exp(k carried - k now), lifted to its shape, beside the tile's sum at the anchor now.
+    def rescaled(carried_side, now):
+        correction = k.held(carried_side).binary(String("sub"), now, s).unary(name, e)
+        lifted = correction.shaped(String("broadcast_in_dim"), lift)
+        return Term.state(i, carried_side).binary(String("mul"), lifted, multiplied)
+
+    lifted = (eq(given).to(shape(k)), eq(to).to(shape(t)), eq(lift).to(lifts(given, to)),
+              eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), slotted)
+    for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
+                              (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
+                              (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
+        conditions = (eq(t).to(summed_term), summed(t), scales(x, k, name, e, s), *lifted)
+        derived += [
+            rewrite(t.stepped()).to(rescaled(0, k.stepped()).binary(String("add"), tile, added), *conditions),
+            rewrite(t.merged()).to(rescaled(0, k.merged()).binary(String("add"), rescaled(1, k.merged()),
+                                                                  added), *conditions),
+            rewrite(t.finished()).to(Term.state(i, 0), *conditions),
+        ]
+    return ruleset(*derived, name="decoupled")
+
+
+@function
+def local_of(term: Term) -> Unit: ...
+"""A walked reduction whose operands are local (its monoid alone, no rescaling)."""
+
+
+def _plain():
+    x, y, t = vars_("x y t", Term)
+    name = var("name", String)
+    p, a = vars_("p a", i64)
+    axes = var("axes", Vec[i64])
+    return ruleset(
+        rule(eq(t).to(x.reduce(name, axes, p)), local(x), eq(walked(x)).to(a), eq(axes).to(Vec[i64](a))).then(
+            local_of(t)),
+        rule(eq(t).to(x.dot(y, p)), local(x), local(y), summed(t)).then(local_of(t)),
+        name="plain walked")
+
+
+DECOUPLED = _decoupled()
+PLAIN = _plain()
+rules.register(rules.Rules("decoupled", "reorders", DECOUPLED, dev=True,
+                           receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py"))
+
+
+UNBOUNDED = cost.Seconds(math.inf)
+_READINGS = (Term.stepped, Term.merged, Term.finished, Term.held)
+
+
+def _priced(device: cost.Device) -> DagCostModel:
+    """The program's cost (`cost.model`), each of the derivation's readings unbounded: a form that keeps one
+    is no form."""
+    timed = cost.model(device)
+
+    def marginal(graph: EGraph, node) -> cost.Seconds:
+        if any(get_callable_args(node, reading) is not None for reading in _READINGS):
+            return UNBOUNDED
+        return timed.marginal_cost(graph, node)
+
+    return DagCostModel(marginal_cost=marginal, identity=cost.Seconds(0.0))
+
+
 @dataclasses.dataclass(frozen=True)
-class _Walked:
-    """One reduction along the walked axis: its equation, its monoid (`max` or `sum`), the walked position
-    of the axis it reduces in its input, and, for a sum, the maximum it is decoupled from (its index among
-    the walk's reductions) and whether its exponent is base 2."""
+class _Forms:
+    """A declaration's derived forms at one tile: its region, its walked reductions in order, each one's step
+    and merge, each output's finish (None for one along the walked axis) and whether it is mapped (a tile's
+    alone), the leaves' values given (the tile's operands), the region's leaves the walked operands occupy,
+    and the report of the rewrite that chose the forms."""
 
-    equation: jcore.JaxprEqn
-    monoid: str
-    decoupled: int | None
-    base2: bool
+    region: terms.Region
+    reductions: tuple[Term, ...]
+    steps: tuple[Term, ...]
+    merges: tuple[Term, ...]
+    finishes: tuple[Term | None, ...]
+    mapped: tuple[bool, ...]
+    outputs: tuple[Term | None, ...]
+    walked_leaves: frozenset[int]
+    consts: tuple
+    report: program.AlgebraReport
 
 
-def derive(declaration: Reduction) -> Derived:
-    """`declaration`'s monoid forms along its walked axis (the module's account); refused (`Refused`) where a
-    walked sum reads a walked reduction other than through a decoupled exponent."""
+def derive(declaration: Reduction, *, accurate: bool, saturation: program.Saturation) -> Derived:
+    """`declaration`'s monoid forms along its walked axis (the module's account), saturated beside the
+    engine's sets `accurate` admits under `saturation`'s limits, each tile shape's rewrite in the kernel
+    report (`report.rewrites`); refused (`Refused`) where a form keeps a reading no rule rewrites."""
     names = tuple(declaration.operands)
-    walked = {name: axes.index(declaration.walked) for name, axes in declaration.operands.items()
-              if declaration.walked in axes}
+    walked_axes = {name: axes.index(declaration.walked) for name, axes in declaration.operands.items()
+                   if declaration.walked in axes}
+    cache: dict = {}
 
-    def traced(shapes: Mapping[str, tuple[tuple[int, ...], jnp.dtype]]):
-        # Traced with jit disabled, so a jitted library function's equations (jnp.where's, matmul's) are
-        # the declaration's own, not a nested program.
-        avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-        def named(*values):
-            return declaration.function(**dict(zip(names, values, strict=True)))
-
-        with jax.disable_jit():
-            return jax.make_jaxpr(named)(*avals)
-
-    kinds: list = []  # each reduction's (monoid, decoupled maximum, base 2), shape-independent
-
-    def analysed(shapes):
-        closed = traced(shapes)
-        positions = _walked_positions(closed.jaxpr, [walked.get(name) for name in names])
-        reductions = _reductions(closed.jaxpr, positions)
-        reduced = _reading(closed.jaxpr, {reduction.equation.outvars[0] for reduction in reductions})
-        if any(isinstance(var, jcore.Var) and var in positions and var in reduced
-               for var in closed.jaxpr.outvars):
-            raise Refused("an output along the walked axis reads a walked reduction: no tile holds it")
-        kinds[:] = [(reduction.monoid, reduction.decoupled, reduction.base2) for reduction in reductions]
-        return closed, positions, reductions
+    def forms(shapes: Mapping) -> _Forms:
+        key = tuple((name, tuple(shapes[name][0]), str(shapes[name][1])) for name in names)
+        if key not in cache:
+            cache[key] = _derived(declaration, names, walked_axes, shapes, accurate, saturation)
+            kernel_report.record_rewrite(cache[key].report)
+        return cache[key]
 
     def shaped(values):
         return {name: (value.shape, value.dtype) for name, value in values.items()}
 
     def init(shapes):
-        _, _, reductions = analysed(shapes)
-        return tuple(_empty(reduction) for reduction in reductions)
+        made = forms(shapes)
+        avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
+        typed = jax.eval_shape(lambda *values: tuple(_evaluate(made.region, reduction,
+                                                               [*made.consts, *values], {})
+                                                     for reduction in made.reductions), *avals)
+        return tuple(jnp.full(aval.shape, _identity(reduction, aval.dtype), aval.dtype)
+                     for reduction, aval in zip(made.reductions, typed, strict=True))
+
+    def carried(made: _Forms, *states) -> dict:
+        return {(index, side): state[index] for side, state in enumerate(states)
+                for index in range(len(made.reductions))}
 
     def step(state, tiles):
-        closed, _, reductions = analysed(shaped(tiles))
-        return _stepped(closed, reductions, state, [tiles[name] for name in names])
+        made = forms(shaped(tiles))
+        leaves = [*made.consts, *(tiles[name] for name in names)]
+        return tuple(_evaluate(made.region, form, leaves, carried(made, state)) for form in made.steps)
 
     def merge(a, b):
-        if not kinds:
+        if not cache:
             raise Refused("a merge before the walk's state was formed (`init`)")
-        return tuple(_merged(index, a, b, kind) for index, kind in enumerate(kinds))
+        made = next(reversed(cache.values()))
+        return tuple(_evaluate(made.region, form, list(made.consts), carried(made, a, b))
+                     for form in made.merges)
 
     def finish(state, operands):
-        closed, positions, reductions = analysed(shaped(operands))
-        return _finished(closed, positions, reductions, state, [operands[name] for name in names])
+        made = forms(shaped(operands))
+        leaves = [*made.consts, *(operands[name] for name in names)]
+        outputs = [None if form is None else _evaluate(made.region, form, leaves, carried(made, state))
+                   for form in made.finishes]
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     def mapped(tiles):
-        closed, positions, _ = analysed(shaped(tiles))
-        env = environment(closed, [tiles[name] for name in names], {})
-        wanted = {var for var in closed.jaxpr.outvars if isinstance(var, jcore.Var) and var in positions}
-        evaluate(closed, env, needed=read_by(closed.jaxpr, wanted))
-        chosen = [env[var] if isinstance(var, jcore.Var) and var in wanted else None
-                  for var in closed.jaxpr.outvars]
-        return chosen[0] if len(chosen) == 1 else tuple(chosen)
+        made = forms(shaped(tiles))
+        leaves = [*made.consts, *(tiles[name] for name in names)]
+        outputs = [_evaluate(made.region, form, leaves, {}) if along and form is not None else None
+                   for form, along in zip(made.outputs, made.mapped, strict=True)]
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     return Derived(init, step, merge, finish, mapped,
-                   {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent})
+                   {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
+                    "rules": ("walking", "decoupled")})
 
 
-def _reading(jaxpr: jcore.Jaxpr, sources: set) -> set:
-    """The values that read any of `sources`, themselves included."""
-    reading = set(sources)
-    for equation in jaxpr.eqns:
-        if any(isinstance(var, jcore.Var) and var in reading for var in equation.invars):
-            reading.update(equation.outvars)
-    return reading
+def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int],
+             shapes: Mapping, accurate: bool, saturation: program.Saturation) -> _Forms:
+    """The forms at one tile's `shapes` (the module's account)."""
+    began = time.perf_counter()
+    def named(*values):
+        return declaration.function(**dict(zip(names, values, strict=True)))
+
+    avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
+    with jax.disable_jit():
+        closed = jax.make_jaxpr(_inlined(named))(*avals)
+    region = terms.region(closed)
+    graph = EGraph()
+    _register(graph, region, closed, names, walked_axes)
+    graph.run(WALKING.saturate())
+    for term in _opaque_locals(graph, region):
+        graph.register(local(term))
+    graph.run(WALKING.saturate())
+    graph.run(PLAIN.saturate())
+    found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
+    reductions = tuple({str(term): term for term in found}.values())
+    known = {str(term): extent for term, extent in region.shapes}
+    for index, reduction in enumerate(reductions):
+        graph.register(set_(slot(reduction)).to(i64(index)))
+        for side in (0, 1):
+            graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
+                Vec[i64](*(i64(size) for size in known[str(reduction)]))))
+    _lift(graph, region, reductions)
+    outputs = list(region.outputs)
+    along = [term is not None and _walked(graph, term) for term in outputs]
+    for term, is_along in zip(outputs, along, strict=True):
+        if is_along and not _holds(graph, local(term)):
+            raise Refused("an output along the walked axis reads a walked reduction: no tile holds it")
+    roots = ([reduction.stepped() for reduction in reductions]
+             + [reduction.merged() for reduction in reductions]
+             + [term.finished() for term, is_along in zip(outputs, along, strict=True)
+                if term is not None and not is_along])
+    declared = Term.bundle(Vec[Term](*region.roots()))
+    bundle = Term.bundle(Vec[Term](*roots) if roots else Vec[Term].empty())
+    graph.register(declared, bundle)
+    timed = cost.model(cost.Device.of())
+    _, before = graph.extract(declared, include_cost=True, cost_model=timed, extractor="greedy-dag")
+    facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
+    _decoupled_through(graph, region, facts)
+    saturated = program.saturate(graph, region, (*rules.admitted(accurate), rules.RULES["decoupled"]),
+                                 saturation, facts)
+    chosen, after = program.extracted(graph, bundle, _priced(cost.Device.of()))
+    if not math.isfinite(after):
+        unwritten = next(root for root, form in zip(roots, chosen, strict=True) if not _written(form))
+        raise Refused(f"no rule writes {unwritten} in the language: a walked reduction read other than by a "
+                      "monoid or a decoupled exponent")
+    report = program.AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired,
+                                   saturated.limits, saturated.iterations, program.node_count(graph),
+                                   saturated.limited, before.value, after, time.perf_counter() - began)
+    count = len(reductions)
+    steps, merges, finished = chosen[:count], chosen[count:2 * count], iter(chosen[2 * count:])
+    finishes = tuple(None if term is None or is_along else next(finished)
+                     for term, is_along in zip(outputs, along, strict=True))
+    first = len(closed.consts)
+    walked_leaves = frozenset(first + index for index, name in enumerate(names) if name in walked_axes)
+    for form in finishes:
+        if form is not None and _reads_leaves(form) & walked_leaves:
+            raise Refused("an output reads a walked operand outside every walked reduction")
+    return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
+                  walked_leaves, tuple(closed.consts), report)
 
 
-def _walked_positions(jaxpr: jcore.Jaxpr, inputs: Sequence[int | None]) -> dict:
-    """Each value's position of the walked axis (absent where it does not vary along the walk): the inputs'
-    given, carried through elementwise equations, broadcasts and layout changes that keep the axis, and
-    lost where a reduction or a contraction takes it."""
-    positions = {var: position for var, position in zip(jaxpr.invars, inputs, strict=True)
-                 if position is not None}
+def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule) -> None:
+    """The derivation's readings run through `region`'s terms alone first (`DECOUPLED`, its facts saturated
+    after each pass): each reading meets the language at the region's depth, before the engine's sets grow
+    the graph toward their limits, so a limit the engine reaches never stops a form."""
+    for _ in range(4 * max(region.depth, 1) + 8):
+        graph.run(facts)
+        if not graph.run(DECOUPLED).updated:
+            break
+    graph.run(facts)
+
+
+def _inlined(function: Callable) -> Callable:
+    """`function` with each choice by the platform a program lowers for (`lax.platform_dependent`, a `cond` on
+    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, so its product
+    enters the e-graph as one; the forms evaluate products as Dew's (`_evaluate`)."""
+    def run(*values):
+        closed = jax.make_jaxpr(function)(*values)
+        outputs = _evaluated_inline(closed.jaxpr, closed.consts, values)
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    return run
+
+
+def _evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
+    """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`_inlined`)."""
+    env: dict = {}
+
+    def read(atom):
+        return atom.val if isinstance(atom, jcore.Literal) else env[atom]
+
+    env.update(zip(jaxpr.constvars, consts, strict=True))
+    env.update(zip(jaxpr.invars, values, strict=True))
     producers = {out: equation for equation in jaxpr.eqns for out in equation.outvars}
     for equation in jaxpr.eqns:
-        name = equation.primitive.name
-        if (branch := _platform_branch(equation, producers)) is not None:
-            # A product chosen by the platform it lowers for (Dew's wide CPU sums): its default branch's.
-            inner = _walked_positions(branch.jaxpr, _given(positions, equation.invars[1:]))
-            for out, branch_out in zip(equation.outvars, branch.jaxpr.outvars, strict=True):
-                if isinstance(branch_out, jcore.Var) and branch_out in inner:
-                    positions[out] = inner[branch_out]
-            continue
-        if any(_program(value) or (isinstance(value, tuple) and any(_program(program) for program in value))
-               for value in equation.params.values()):
-            raise Refused(f"{name}: a nested program, whose equations the derivation does not read")
-        found = [positions[var] for var in equation.invars if isinstance(var, jcore.Var) and var in positions]
-        if not found:
-            continue
-        if name in ("reduce_max", "reduce_sum", "reduce_min", "argmax", "argmin"):
-            # A reduction over the walked axis is the walk's (`_reductions`); over others, the walked axis
-            # moves down past each axis reduced before it.
-            axes = equation.params["axes"]
-            if found[0] not in axes:
-                positions[equation.outvars[0]] = found[0] - sum(axis < found[0] for axis in axes)
-            continue
-        if name == "dot_general":
-            _contracted_away(equation, positions)
-            continue
-        if name == "broadcast_in_dim":
-            position = equation.params["broadcast_dimensions"][found[0]]
+        branches = equation.params.get("branches") if equation.primitive.name == "cond" else None
+        index = equation.invars[0] if equation.invars else None
+        chooser = producers.get(index) if branches and isinstance(index, jcore.Var) else None
+        if branches and chooser is not None and chooser.primitive.name == "platform_index":
+            default = branches[-1]
+            operands = [read(atom) for atom in equation.invars[1:]]
+            outs = _evaluated_inline(default.jaxpr, default.consts, operands)
+        else:
+            outs = equation.primitive.bind(*[read(atom) for atom in equation.invars], **equation.params)
+            outs = outs if equation.primitive.multiple_results else [outs]
+        env.update(zip(equation.outvars, outs, strict=True))
+    return [read(atom) for atom in jaxpr.outvars]
+
+
+def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
+    """The facts the rules read that each parameter's own values state (the engine's, `program.stated`, and
+    the derivation's own), and each input's walked axis."""
+    program.stated(graph, region)
+    elementwise = terms.BINARY | terms.COMPARISONS | terms.UNARY | {"convert_element_type"}
+    for index, (primitive, params) in enumerate(region.params):
+        name = primitive.name
+        if name in elementwise:
+            graph.register(keeps(i64(index)))
+        elif name == "broadcast_in_dim":
+            for axis, to in enumerate(params["broadcast_dimensions"]):
+                graph.register(lays(i64(index), i64(axis), i64(int(to))))
         elif name == "transpose":
-            position = list(equation.params["permutation"]).index(found[0])
-        elif len(set(found)) == 1 and name not in ("reshape", "squeeze", "expand_dims"):
-            position = found[0]
-        else:
-            raise Refused(f"the walked axis through {name} is not read here")
-        for out in equation.outvars:
-            positions[out] = position
-    return positions
-
-
-def _contracted_away(equation: jcore.JaxprEqn, positions: dict) -> None:
-    """A contraction's output's walked axis: none where it contracts the walked axis (a walked sum), else the
-    walked operand's free axis in the output's order (batch axes, then each operand's free ones)."""
-    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = equation.params["dimension_numbers"]
-    lhs, rhs = equation.invars
-    walked_lhs, walked_rhs = positions.get(lhs), positions.get(rhs)
-    if walked_lhs in lhs_contract or walked_rhs in rhs_contract:
-        return
-    lhs_free = [axis for axis in range(_rank(lhs)) if axis not in lhs_contract and axis not in lhs_batch]
-    rhs_free = [axis for axis in range(_rank(rhs)) if axis not in rhs_contract and axis not in rhs_batch]
-    if walked_lhs is not None:
-        position = (list(lhs_batch).index(walked_lhs) if walked_lhs in lhs_batch
-                    else len(lhs_batch) + lhs_free.index(walked_lhs))
-    elif walked_rhs is not None:
-        position = (list(rhs_batch).index(walked_rhs) if walked_rhs in rhs_batch
-                    else len(lhs_batch) + len(lhs_free) + rhs_free.index(walked_rhs))
-    else:
-        return
-    positions[equation.outvars[0]] = position
-
-
-def _program(value) -> bool:
-    """Whether `value` is a nested program: a jaxpr, or a closed one (a jaxpr with its constants, its type
-    JAX's own `ClosedJaxpr`, which `jax.extend` does not name)."""
-    return isinstance(value, (jcore.Jaxpr, _CLOSED))
-
-
-_CLOSED = type(jax.make_jaxpr(lambda: None)())
-"""JAX's closed jaxpr's type, as `jax.make_jaxpr` returns it."""
-
-
-def _given(positions: Mapping, atoms) -> list:
-    """Each of `atoms`' walked position, None where it has none (a literal's, or a value's along no walk)."""
-    return [positions.get(atom) if isinstance(atom, jcore.Var) else None for atom in atoms]
-
-
-def _chosen_reduction(branch: Program, given: list) -> str | None:
-    """The monoid of a platform choice's one walked reduction (its default branch's, whose value the choice
-    gives): None where it reduces nothing along the walk; refused where it reduces more than once."""
-    inner = _reductions(branch.jaxpr, _walked_positions(branch.jaxpr, given))
-    if not inner:
-        return None
-    if len(inner) != 1 or inner[0].decoupled is not None:
-        raise Refused("a platform's choice of several walked reductions, or of a decoupled one")
-    return inner[0].monoid
-
-
-def _rank(atom) -> int:
-    return len(aval(atom).shape)
-
-
-def _platform_branch(equation: jcore.JaxprEqn, producers: Mapping):
-    """The default branch of a choice by the platform a program lowers for (`lax.platform_dependent`: a
-    `cond` on a `platform_index`), whose branches compute one value each their own way (Dew's products sum
-    in float64 on a CPU under its wide arithmetic, `dew.nn.precision.accumulated`); None for any other
-    equation. Its structure is read from the default branch, and the equation itself evaluated, so each
-    platform keeps its own arithmetic."""
-    branches = equation.params.get("branches") if equation.primitive.name == "cond" else None
-    if not branches:
-        return None
-    chooser = producers.get(equation.invars[0])
-    return branches[-1] if chooser is not None and chooser.primitive.name == "platform_index" else None
-
-
-def _reductions(jaxpr: jcore.Jaxpr, positions: dict) -> list[_Walked]:
-    """The walk's reductions in program order, each sum's decoupled maximum found (`_Homogeneity`)."""
-    found: list[_Walked] = []
-    maxima: dict = {}
-    sums: set = set()
-    producers = {out: equation for equation in jaxpr.eqns for out in equation.outvars}
-    for equation in jaxpr.eqns:
-        name = equation.primitive.name
-        if name in ("reduce_max", "reduce_sum"):
-            (operand,) = equation.invars
-            if positions.get(operand) not in equation.params["axes"]:
-                continue
-            if len(equation.params["axes"]) != 1:
-                raise Refused(f"{name} over the walked axis and others at once")
-            monoid = "max" if name == "reduce_max" else "sum"
+            permutation = list(params["permutation"])
+            for axis in range(len(permutation)):
+                graph.register(lays(i64(index), i64(axis), i64(permutation.index(axis))))
+        elif name in ("squeeze", "expand_dims", "reshape"):
+            for axis, to in _moved(primitive, params, region, index):
+                graph.register(lays(i64(index), i64(axis), i64(to)))
+        elif name in terms.REDUCTIONS:
+            reduced = {int(axis) for axis in params["axes"]}
+            for axis in range(_rank_before(region, index, reduced)):
+                if axis not in reduced:
+                    graph.register(reduces(i64(index), i64(axis), i64(axis - sum(r < axis for r in reduced))))
         elif name == "dot_general":
-            (lhs_contract, rhs_contract), _ = equation.params["dimension_numbers"]
-            lhs, rhs = equation.invars
-            if positions.get(lhs) not in lhs_contract and positions.get(rhs) not in rhs_contract:
-                continue
-            monoid = "sum"
-        elif (branch := _platform_branch(equation, producers)) is not None:
-            monoid = _chosen_reduction(branch, _given(positions, equation.invars[1:]))
-            if monoid is None:
-                continue
+            (left_contracted, right_contracted), (left_batch, right_batch) = params["dimension_numbers"]
+            left_rank, right_rank = _dot_ranks(region, index)
+            left_free = [axis for axis in range(left_rank) if axis not in left_contracted and
+                         axis not in left_batch]
+            right_free = [axis for axis in range(right_rank) if axis not in right_contracted and
+                          axis not in right_batch]
+            for position, (left, right) in enumerate(zip(left_batch, right_batch, strict=True)):
+                graph.register(left_of(i64(index), i64(int(left)), i64(position)),
+                               right_of(i64(index), i64(int(right)), i64(position)))
+            for position, axis in enumerate(left_free):
+                graph.register(left_of(i64(index), i64(axis), i64(len(left_batch) + position)))
+            for position, axis in enumerate(right_free):
+                place = len(left_batch) + len(left_free) + position
+                graph.register(right_of(i64(index), i64(axis), i64(place)))
+            for axis in left_contracted:
+                graph.register(contracts_left(i64(index), i64(int(axis))))
+            for axis in right_contracted:
+                graph.register(contracts_right(i64(index), i64(int(axis))))
+    for index in range(len(closed.jaxpr.constvars)):
+        graph.register(local(Term.leaf(i64(index))), unwalked(Term.leaf(i64(index))))
+    first = len(closed.jaxpr.constvars)
+    for index, input_name in enumerate(names):
+        leaf = Term.leaf(i64(first + index))
+        graph.register(local(leaf))
+        if input_name in walked_axes:
+            graph.register(set_(walked(leaf)).to(i64(walked_axes[input_name])))
         else:
-            continue
-        decoupled, base2 = None, False
-        classified = _Homogeneity(maxima, sums, producers)
-        kinds = [classified(operand) for operand in equation.invars
-                 if _platform_branch(equation, producers) is None or operand is not equation.invars[0]]
-        kind = _Homogeneity.product(kinds, name) if name in ("dot_general", "cond") else kinds[0]
-        if monoid == "max":
-            if kind is not None:
-                raise Refused("a walked maximum of values a walked maximum scales")
-            maxima[equation.outvars[0]] = len(found)
-        else:
-            if kind is not None:
-                decoupled, base2 = kind[0], kind[1]
-            sums.add(equation.outvars[0])
-        found.append(_Walked(equation, monoid, decoupled, base2))
+            graph.register(unwalked(leaf))
+    for index, value in enumerate(region.literals):
+        literal = Term.literal(i64(index))
+        graph.register(local(literal), unwalked(literal))
+        if np.all(np.asarray(value) == 0):
+            graph.register(zero(literal))
+
+
+def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[int, int]]:
+    """A squeeze's, an expand_dims' or a reshape's moves of its operand's axes, where each axis of extent
+    other than one keeps its order: each such axis's place before and after."""
+    before, after = _operand_and_result_shapes(region, index)
+    if before is None or after is None:
+        return []
+    kept_before = [axis for axis, extent in enumerate(before) if extent != 1]
+    kept_after = [axis for axis, extent in enumerate(after) if extent != 1]
+    if [before[axis] for axis in kept_before] != [after[axis] for axis in kept_after]:
+        return []
+    return list(zip(kept_before, kept_after, strict=True))
+
+
+def _operand_and_result_shapes(region: terms.Region, index: int):
+    """The shapes of the operand and the result of a single-operand term of parameters `index`."""
+    known = {str(term): extent for term, extent in region.shapes}
+    for term, extent in region.shapes:
+        args = get_callable_args(term, Term.shaped) or get_callable_args(term, Term.reduce)
+        if args is not None and int(get_literal_value(args[-1])) == index:
+            return known.get(str(args[0])), extent
+    return None, None
+
+
+def _rank_before(region: terms.Region, index: int, reduced: set[int]) -> int:
+    before, after = _operand_and_result_shapes(region, index)
+    return len(before) if before is not None else (len(after) + len(reduced) if after is not None else 0)
+
+
+def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
+    known = {str(term): extent for term, extent in region.shapes}
+    for term, _ in region.shapes:
+        args = get_callable_args(term, Term.dot)
+        if args is not None and int(get_literal_value(args[-1])) == index:
+            return len(known[str(args[0])]), len(known[str(args[1])])
+    return 0, 0
+
+
+def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
+    """The outputs of equations outside the language (`terms.Opaque`) over local, unwalked inputs alone: local
+    themselves; an equation outside the language over a walked value is refused, its axis unknown."""
+    found = []
+    for opaque in region.opaque:
+        inputs = [term for term in opaque.inputs if term is not None]
+        if any(_walked(graph, term) for term in inputs):
+            raise Refused(f"{opaque.equation.primitive.name}: an equation outside the language over a walked "
+                          "value")
+        if all(_holds(graph, local(term)) and _holds(graph, unwalked(term)) for term in inputs):
+            for leaf in opaque.outputs:
+                found.append(Term.leaf(i64(leaf)))
+                graph.register(unwalked(Term.leaf(i64(leaf))))
     return found
 
 
-_PASSING = frozenset({"broadcast_in_dim", "convert_element_type", "reshape", "expand_dims", "squeeze"})
-"""The equations a maximum or a zero passes through unchanged in value: a broadcast, a cast, a reshape."""
-
-
-class _Homogeneity:
-    """Each value's dependence on the walk's maxima (None, free of every one, or `(maximum, base2)`: it scales
-    by `exp(m - m')` where its maximum `m` is read as `m'`), refused where a value reads a maximum otherwise:
-    a maximum is read only as `exp(x - m)` or `exp2(x - m)` with `x` free of it; a product or a quotient by a
-    free value, a sum of two values of the same maximum, a selection among them or a zero, and a change of
-    layout or type keep it; every other operation's operands are free."""
-
-    LAYOUT = frozenset({"convert_element_type", "broadcast_in_dim", "transpose", "reshape", "squeeze",
-                        "expand_dims", "neg", "reduce_precision"})
-
-    def __init__(self, maxima: dict, sums: set, producers: dict):
-        self.maxima, self.sums, self.producers, self.seen = maxima, sums, producers, {}
-
-    def __call__(self, atom):
-        if not isinstance(atom, jcore.Var):
-            return None
-        if atom in self.seen:
-            return self.seen[atom]
-        if atom in self.sums:
-            raise Refused("a walked reduction reads a walked sum: no monoid of the walk holds it")
-        if atom in self.maxima:
-            raise Refused("a walked sum reads a walked maximum other than through exp(x - m)")
-        equation = self.producers.get(atom)
-        kind = None if equation is None else self._kind(equation)
-        self.seen[atom] = kind
-        return kind
-
-    def _kind(self, equation: jcore.JaxprEqn):
-        name = equation.primitive.name
-        if name in ("exp", "exp2"):
-            shifted = self._shifted(equation.invars[0], base2=name == "exp2")
-            if shifted is not None:
-                return shifted
-        if name in self.LAYOUT:
-            return self(equation.invars[0])
-        chosen = _platform_branch(equation, self.producers) is not None
-        kinds = [self(operand) for operand in (equation.invars[1:] if chosen else equation.invars)]
-        if all(kind is None for kind in kinds):
-            return None
-        if name in ("mul", "dot_general") or chosen:
-            # A platform's choice is one of Dew's products, a product of its operands each way.
-            return self.product(kinds, name)
-        if name == "div":
-            if kinds[1] is not None:
-                raise Refused("a walked sum divides by a value scaled by a walked maximum")
-            return kinds[0]
-        if name in ("add", "sub"):
-            if kinds[0] != kinds[1]:
-                raise Refused(f"a walked sum's terms {name} values of different walked maxima")
-            return kinds[0]
-        if name == "select_n":
-            if kinds[0] is not None:
-                raise Refused("a walked sum selects by a value scaled by a walked maximum")
-            cases = {kind for operand, kind in zip(equation.invars[1:], kinds[1:], strict=True)
-                     if not _zero(operand, self.producers)}
-            if len(cases) != 1:
-                raise Refused("a walked sum selects among values of different walked maxima")
-            return next(iter(cases))
-        raise Refused(f"a walked sum reads a walked maximum through {name}")
-
-    def _shifted(self, operand, *, base2: bool):
-        """`(maximum, base2)` where `operand` is `x - m`, `m` a walked maximum or a safe shift of one
-        (`_maximum_of`) and `x` free of every maximum; None where it is not of that form."""
-        equation = self.producers.get(operand) if isinstance(operand, jcore.Var) else None
-        if equation is None or equation.primitive.name != "sub":
-            return None
-        minuend, subtrahend = equation.invars
-        maximum = self._maximum_of(subtrahend)
-        if maximum is None or self(minuend) is not None:
-            return None
-        return (self.maxima[maximum], base2)
-
-    def _maximum_of(self, atom):
-        """The walked maximum `atom` is, through value-preserving equations (`_PASSING`), or is a safe shift
-        of: a selection of it against values free of every maximum, by a predicate that reads no other
-        (`where(m == -inf, 0, m)`, a row that has seen nothing shifted by zero, whose terms are zero
-        either way); None otherwise. The step evaluates the selection at the running maximum, so a tile's
-        terms are taken at the shift the declaration states."""
-        while isinstance(atom, jcore.Var) and atom not in self.maxima:
-            producer = self.producers.get(atom)
-            if producer is None:
-                return None
-            if producer.primitive.name in _PASSING:
-                atom = producer.invars[0]
+def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
+    """Each broadcast a rescaled sum needs, an anchor's shape to the sum's (`lifts`), its parameters added to
+    the region's table: the anchor's axes its leading ones."""
+    known = {str(term): extent for term, extent in region.shapes}
+    anchors = {known[str(term)] for term, _ in region.shapes
+               if str(term) in known and _holds(graph, anchor(term))}
+    lifted = set()
+    for reduction in reductions:
+        to = known.get(str(reduction))
+        if to is None:
+            continue
+        for given in anchors:
+            if tuple(to[:len(given)]) != tuple(given) or (given, tuple(to)) in lifted:
                 continue
-            if producer.primitive.name != "select_n":
-                return None
-            predicate, *cases = producer.invars
-            found = [(case, self._maximum_of(case)) for case in cases]
-            leading = {maximum for _, maximum in found if maximum is not None}
-            if len(leading) != 1:
-                return None
-            (maximum,) = leading
-            if any(maximum_of is None and self(case) is not None for case, maximum_of in found):
-                return None
-            return maximum if self._reads_at_most(predicate, maximum) else None
-        return atom if isinstance(atom, jcore.Var) else None
-
-    def _reads_at_most(self, atom, maximum) -> bool:
-        """Whether `atom` reads no walked maximum but `maximum`, and no walked sum."""
-        if not isinstance(atom, jcore.Var):
-            return True
-        if atom in self.maxima:
-            return atom is maximum
-        if atom in self.sums:
-            return False
-        producer = self.producers.get(atom)
-        return producer is None or all(self._reads_at_most(operand, maximum) for operand in producer.invars)
-
-    @staticmethod
-    def product(kinds, name: str):
-        scaled = [kind for kind in kinds if kind is not None]
-        if len(scaled) > 1:
-            raise Refused(f"a walked sum's {name} of two values scaled by walked maxima")
-        return scaled[0] if scaled else None
+            lifted.add((given, tuple(to)))
+            params = {"shape": tuple(to), "broadcast_dimensions": tuple(range(len(given))), "sharding": None}
+            region.params.append((jax.lax.broadcast_in_dim_p, params))
+            graph.register(set_(lifts(Vec[i64](*(i64(size) for size in given)),
+                                      Vec[i64](*(i64(size) for size in to)))).to(i64(len(region.params) - 1)))
 
 
-def _zero(atom, producers: dict) -> bool:
-    """Whether `atom` is a literal zero, or a broadcast or cast of one."""
-    while isinstance(atom, jcore.Var):
-        producer = producers.get(atom)
-        if producer is None or producer.primitive.name not in _PASSING:
-            return False
-        atom = producer.invars[0]
-    return isinstance(atom, jcore.Literal) and float(atom.val) == 0
+def _walked(graph: EGraph, term: Term) -> bool:
+    """Whether a value has a walked axis (`walked`)."""
+    return graph.lookup_function_value(walked(term)) is not None
 
 
-def _empty(reduction: _Walked):
-    """A reduction's empty partial: a maximum's -inf, a sum's zero, in its output's shape and dtype."""
-    typed = aval(reduction.equation.outvars[0])
-    return jnp.full(typed.shape, -jnp.inf if reduction.monoid == "max" else 0, typed.dtype)
+def _holds(graph: EGraph, fact) -> bool:
+    try:
+        graph.check(fact)
+    except EggSmolError:
+        return False
+    return True
 
 
-def _shift(base2: bool):
-    return jnp.exp2 if base2 else jnp.exp
+def _identity(reduction: Term, dtype) -> float:
+    """A walked reduction's empty value: a sum's zero; a maximum's the dtype's least finite value, not -inf,
+    so an empty partial's correction `exp(k_carried - k_now)` is zero (or one, where nothing is seen yet),
+    never `exp(-inf + inf)`: the same for any finite data as the monoid's identity."""
+    args = get_callable_args(reduction, Term.reduce)
+    if args is not None and get_literal_value(args[1]) == "max":
+        return float(jnp.finfo(dtype).min)
+    return 0.0
 
 
-def _rescale(old_max, new_max, base2: bool, shape):
-    """The factor a sum taken at `old_max` takes to `new_max`, zero where nothing was seen (both -inf)."""
-    safe = jnp.where(jnp.isneginf(new_max), 0, new_max)
-    factor = _shift(base2)(jnp.where(jnp.isneginf(old_max), -jnp.inf, old_max - safe))
-    return lax.broadcast_in_dim(factor, shape, tuple(range(factor.ndim))) if factor.shape != shape else factor
+_LANGUAGE = (Term.binary, Term.compare, Term.unary, Term.convert, Term.shaped, Term.reduce, Term.dot,
+             Term.select)
+"""The language's constructors that read terms (`terms.Term`), a leaf's and a carried state's none."""
 
 
-def _stepped(closed, reductions, state, values):
-    """The state after one tile: each maximum the larger of its running value and the tile's; each sum its
-    running value rescaled to its maximum's new value (decoupled) plus the tile's sum, its terms read at the
-    new maximum."""
-    current = {}
-    for index, reduction in enumerate(reductions):
-        if reduction.monoid == "max":
-            tile = _evaluated(closed, reduction.equation, values, current)
-            current[reduction.equation.outvars[0]] = jnp.maximum(state[index], tile)
-    stepped = []
-    for index, reduction in enumerate(reductions):
-        if reduction.monoid == "max":
-            stepped.append(current[reduction.equation.outvars[0]])
+def _subterms(form: Term) -> Iterator[Term]:
+    """Each distinct term `form` reads through the language, itself first."""
+    seen, pending = set(), [form]
+    while pending:
+        term = pending.pop()
+        if (key := str(term)) in seen:
             continue
-        running = state[index]
-        if reduction.decoupled is not None:
-            grown = current[reductions[reduction.decoupled].equation.outvars[0]]
-            running = running * _rescale(state[reduction.decoupled], grown, reduction.base2, running.shape)
-        stepped.append(running + _evaluated(closed, reduction.equation, values, current))
-    return tuple(stepped)
+        seen.add(key)
+        yield term
+        for constructor in _LANGUAGE:
+            if (args := get_callable_args(term, constructor)) is not None:
+                pending.extend(arg for arg in args if isinstance(arg, Term))
 
 
-def _merged(index: int, a, b, kind):
-    """Two states' entry `index` joined: a maximum's the larger; a sum's each rescaled to the joined maximum
-    of the one it is decoupled from."""
-    monoid, decoupled, base2 = kind
-    if monoid == "max":
-        return jnp.maximum(a[index], b[index])
-    left, right = a[index], b[index]
-    if decoupled is not None:
-        joined = jnp.maximum(a[decoupled], b[decoupled])
-        left = left * _rescale(a[decoupled], joined, base2, left.shape)
-        right = right * _rescale(b[decoupled], joined, base2, right.shape)
-    return left + right
+def _reads_leaves(form: Term) -> set[int]:
+    """The region's leaves `form` reads."""
+    return {int(get_literal_value(args[0])) for term in _subterms(form)
+            if (args := get_callable_args(term, Term.leaf)) is not None}
 
 
-def _evaluated(closed, target: jcore.JaxprEqn, values, known: dict):
-    """`target`'s output on one tile: the declaration's equations up to it evaluated on `values`, each walked
-    reduction's output already `known` (a maximum's running value) read in place of its own."""
-    env = environment(closed, values, known)
-
-    def read(atom):
-        return atom.val if isinstance(atom, jcore.Literal) else env[atom]
-
-    for equation in closed.jaxpr.eqns:
-        if all(out in env for out in equation.outvars):
-            if equation is target:
-                break
-            continue
-        outs = equation.primitive.bind(*map(read, equation.invars), **equation.params)
-        outs = outs if equation.primitive.multiple_results else [outs]
-        if equation is target:
-            return outs[0]
-        env.update(zip(equation.outvars, outs, strict=True))
-    raise Refused("a walked reduction the evaluation never reached")
+def _written(form: Term) -> bool:
+    """Whether `form` keeps none of the derivation's readings: a form in the language."""
+    return not any(get_callable_args(term, reading) is not None for term in _subterms(form)
+                   for reading in _READINGS)
 
 
-def _finished(closed, positions, reductions, state, values):
-    """The declaration's outputs from a finished state: its equations evaluated with each walked reduction's
-    output its state's value, on the whole operands for every value the walk does not reduce."""
-    env = environment(closed, values, {reduction.equation.outvars[0]: state[index]
-                                        for index, reduction in enumerate(reductions)})
+def _evaluate(region: terms.Region, form: Term, leaves: list, carried: Mapping) -> jax.Array:
+    """A form's value: its leaves the given values (the tile's operands) and the outputs of the region's
+    equations outside the language over them, each carried state its value (`carried`, by the reduction and
+    side), each product Dew's (`float32_dot_general`), every other term the engine's (`terms.value_of`)."""
+    known: dict[str, jax.Array] = {}
+    outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
+    values = dict(enumerate(leaves))
 
-    def read(atom):
-        return atom.val if isinstance(atom, jcore.Literal) else env[atom]
+    def leaf(index: int):
+        if index not in values:
+            opaque = outside[index]
+            inputs = [literal if term is None else value(term)
+                      for term, literal in zip(opaque.inputs, opaque.literals, strict=True)]
+            outs = opaque.equation.primitive.bind(*inputs, **opaque.equation.params)
+            outs = outs if opaque.equation.primitive.multiple_results else [outs]
+            values.update(zip(opaque.outputs, outs, strict=True))
+        return values[index]
 
-    for equation in closed.jaxpr.eqns:
-        if all(out in env for out in equation.outvars):
-            continue
-        if any(isinstance(var, jcore.Var) and var in positions for var in equation.outvars):
-            continue
-        outs = equation.primitive.bind(*map(read, equation.invars), **equation.params)
-        outs = outs if equation.primitive.multiple_results else [outs]
-        env.update(zip(equation.outvars, outs, strict=True))
-    outputs = [None if isinstance(var, jcore.Var) and var in positions else read(var)
-               for var in closed.jaxpr.outvars]
-    return outputs[0] if len(outputs) == 1 else tuple(outputs)
+    def value(term: Term) -> jax.Array:
+        key = str(term)
+        if key in known:
+            return known[key]
+        if (args := get_callable_args(term, Term.leaf)) is not None:
+            made = leaf(int(get_literal_value(args[0])))
+        elif (args := get_callable_args(term, Term.state)) is not None:
+            made = carried[(int(get_literal_value(args[0])), int(get_literal_value(args[1])))]
+        elif (args := get_callable_args(term, Term.dot)) is not None:
+            left, right, index = args
+            _, given = region.params[int(get_literal_value(index))]
+            made = float32_dot_general(value(left), value(right), given["dimension_numbers"],
+                                       precision=given.get("precision"),
+                                       preferred_element_type=given.get("preferred_element_type"))
+        else:
+            made = terms.value_of(term, value, region, [leaf(index) for index in range(len(leaves))])
+        known[key] = made
+        return made
+
+    return value(form)

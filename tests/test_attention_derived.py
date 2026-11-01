@@ -11,7 +11,7 @@ import pytest
 from reference_error import assert_as_exact
 from test_algebra_derive import walked
 
-from dew.algebra import derive
+from dew.algebra import SATURATION, derive
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_portable
 from dew.nn.precision import float32_einsum
 
@@ -43,7 +43,7 @@ def tiles(values: dict, tile: int) -> dict:
 
 def derived_walk(base2: bool, mask: str, split: bool):
     """The declaration's derived forms over the key tiles in order, or in two halves merged."""
-    forms = derive.derive(algebra.declaration(base2=base2))
+    forms = derive.derive(algebra.declaration(base2=base2), accurate=False, saturation=SATURATION)
     count = KEYS // TILE
 
     def walk(values, steps):
@@ -160,7 +160,8 @@ def forward_rows(form: str):
 def derived_backward(form: str, along: str):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`)."""
-    forms = derive.derive(algebra.backward_declaration(scale=SCALE, walked=along))
+    forms = derive.derive(algebra.backward_declaration(scale=SCALE, walked=along),
+                          accurate=False, saturation=SATURATION)
     seen = seen_of(form)
     rows_of = forward_rows(form)
 
