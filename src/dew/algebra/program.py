@@ -97,7 +97,10 @@ def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation:
             break
     graph.run(rules.FACTS.saturate())
     chosen = graph.extract(bundle, cost_model=cost.model(cost.Device.of()), extractor="greedy-dag")
-    (forms,) = get_callable_args(chosen, terms.Term.bundle)
+    extracted = get_callable_args(chosen, terms.Term.bundle)
+    if extracted is None:
+        raise ValueError(f"extraction chose no bundle of the program's roots: {chosen}")
+    (forms,) = extracted
     picked = {str(root): form for root, form in zip(roots, forms.value, strict=True)}
     values = [*closed.consts, *arguments] + [None] * (region.leaves - len(closed.consts) - len(arguments))
     outputs = terms.evaluated(region, picked, values)
