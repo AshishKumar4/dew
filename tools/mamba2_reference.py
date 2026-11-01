@@ -283,10 +283,16 @@ def model_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
                                       for start, end in support.documents_of(starts)[0]])}
 
 
+PAIRED = frozenset({"starts"})
+"""The sites sized paired with Dew's arm (`record_case`'s `dew`, Dew's twin in the inputs' dtype): the
+resets' final state, which transformers compared with itself resolved within no 512 draws, only the last
+document's tokens writing it."""
+
+
 def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
     """A site's recording (`record_case`): `reference(site, inputs, dtype)` in fp32 and in torch float64 on
     each draw, Dew's float64 `twin(site, inputs)` held to the latter at every seed (the test's truth, Dew's
-    float64 path, `indexed_recording`'s `truth_fn`)."""
+    float64 path, `indexed_recording`'s `truth_fn`); sized paired with Dew's arm at `PAIRED`'s sites."""
     import jax
     from recorded_references import record_case
     from reference_error import assert_computes_the_oracle, chain_roundings, widened
@@ -307,6 +313,9 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
                                        roundings=roundings)
         return narrow, exact
 
+    if site in PAIRED:
+        return record_case(site, draw, evaluate, store_inputs=False, summary=True,
+                           dew=jax.jit(lambda inputs: twin(site, inputs)))
     return record_case(site, draw, evaluate, lambda inputs: twin(site, inputs), store_inputs=False,
                        summary=True)
 
