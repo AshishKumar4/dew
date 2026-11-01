@@ -1,0 +1,9 @@
+{
+ "bytes": 50305192,
+ "license": "MIT",
+ "path": "recordings/78a3b167d832f2fb78b801a7a1b1de06dfbb2b5e9f27c12df738754fb36e5e16.npz",
+ "reference": "fla-core-0.5.2+tilelang-0.1.15",
+ "repo": "dewml/fixtures",
+ "revision": "98f07f7bea93a30e232ba71fe09b84473dec33e0",
+ "sha256": "78a3b167d832f2fb78b801a7a1b1de06dfbb2b5e9f27c12df738754fb36e5e16"
+}

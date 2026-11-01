@@ -69,6 +69,18 @@ scalar without; one sequence and packed), sized by `seeds_for` on armada (2026-1
 PACKED = (False, True)
 
 
+def formed(forms: str, fn):
+    """`fn` under the run's `forms` (`generation.numerics`): an fp32 call on the template in three parts
+    under the accurate forms, as the portable math holds it, whose bar is the fp32 recurrence's own distance;
+    in two under the fast forms (`mainloop.FAST_PARTS`), held to recorded upstream's instead."""
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)):
+            return fn(*args, **kwargs)
+
+    return run
+
+
 def chunk_on(kernel: str, hooks, *args, **kwargs):
     """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector where it runs it,
     and for the rated scan's where that runs it: the portable math ('xla') and the recurrence template

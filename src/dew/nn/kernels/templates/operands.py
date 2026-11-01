@@ -126,11 +126,17 @@ class Issuer:
         `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
         a count) is issued so (`Family.register_products`). `into`, an accumulator the walk carries (its home,
         a warpgroup accumulator ref or a register array), takes every product in place and is returned, no
-        value read (a scaled operand takes none)."""
-        products = iter(products)
+        value read (a scaled operand takes none). A `product.Blocks` entry, a product a block of tiles in
+        memory, is issued as a loop over its blocks where the family's products read their operands from
+        registers (`Family.operands_in_registers`, whose accumulator is a value the loop carries): unrolled,
+        ptxas held every block's fragments at once, an A100's scores backward at keys and values 256 wide
+        spilling 280 bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
+        products = self._entries(products)
         first = next(products)
         family, interpret = self.call.family, self.call.interpret
-        shape = (first[1].shape[0], first[2].shape[1]) if shape is None else shape
+        if shape is None:
+            lhs, rhs = (first.left(0), first.right(0)) if isinstance(first, product.Blocks) else first[1:]
+            shape = (lhs.shape[0], rhs.shape[1])
         held: list = [first]  # the next product not yet issued, where a group stopped before it
 
         def group(acc, alone: bool):
@@ -138,6 +144,13 @@ class Issuer:
             # product alone.
             read: list = []
             while held:
+                if isinstance(held[-1], product.Blocks):
+                    # The accumulator laid out as products leave it, the loop's carry one layout.
+                    blocks = held.pop()
+                    acc = jax.lax.fori_loop(0, blocks.count, functools.partial(self._block, blocks),
+                                            family.as_tile(acc))
+                    held.extend(itertools.islice(products, 1))
+                    continue
                 name, lhs, rhs = held[-1]
                 if isinstance(lhs, product.Scaled):
                     if not alone:
@@ -161,7 +174,9 @@ class Issuer:
         def summed_group() -> jax.Array:
             # The group at the held product: a scaled product's own accumulator, restored, or the unscaled
             # products from it to the next scaled one in one.
-            scaled = held[-1][1] if isinstance(held[-1][1], product.Scaled) else None
+            # A sum of blocks is unscaled (`product.Blocks`).
+            lhs = None if isinstance(held[-1], product.Blocks) else held[-1][1]
+            scaled = lhs if isinstance(lhs, product.Scaled) else None
             part = family.summed(shape, lambda acc: group(acc, alone=scaled is not None), interpret)
             if scaled is None:
                 return part
@@ -178,6 +193,24 @@ class Issuer:
         while held:
             total = total + summed_group()
         return total
+
+    def _entries(self, products: Iterable):
+        """`products` as `summed` issues them: a `product.Blocks` it loops over as it is, more than one block
+        of tiles in memory (`Parts`) on a family whose products read registers; any other as its blocks'
+        products, one a block."""
+        for entry in products:
+            as_is = (not isinstance(entry, product.Blocks)
+                     or (entry.count > 1 and self.call.family.operands_in_registers
+                         and isinstance(entry.left(0), Parts) and isinstance(entry.right(0), Parts)))
+            if as_is:
+                yield entry
+            else:
+                yield from ((entry.name, entry.left(j), entry.right(j)) for j in range(entry.count))
+
+    def _block(self, blocks: product.Blocks, j, acc):
+        """`acc` with block `j`'s product of `blocks` issued onto it (`summed`'s loop)."""
+        left, right = blocks.left(j), blocks.right(j)
+        return self.call.family.issued(acc, left.refs, right.refs, self.call.interpret)
 
     def _registered(self, name: str, lhs) -> tuple | None:
         """`lhs`'s parts in registers where its product takes it there (its buffers a count, `Issuer`'s),
