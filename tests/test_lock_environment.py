@@ -19,13 +19,16 @@ while [ $# -gt 0 ]; do [ "$1" = -o ] && : > "$2"; shift; done
 def test_every_package_dews_index_serves_resolves_undated(tmp_path, monkeypatch):
     """Dew's package index (constraints.txt's extra index) serves its own builds of packages (JAX's,
     Qwix's), whose static pages give no upload times, so every package its root page lists resolves with no
-    date, however many the index serves: a lock dated past one of them finds none of its versions
-    (2026-10-28: qwix joined the index, and every lock check failed on "qwix==0.1.8 has no publish time")."""
+    date, however many the index serves, a dated list naming it or not: a lock dated past one of them finds
+    none of its versions (2026-10-28: qwix joined the index, and every lock check failed on "qwix==0.1.8 has
+    no publish time"; 2026-10-31: the CUDA plugins did, both undated and dated, and every version was
+    filtered)."""
     site = tmp_path / "site" / "simple"
     site.mkdir(parents=True)
     (site / "index.html").write_text('<!DOCTYPE html>\n<html><body><h1>Simple index</h1>\n'
                                      '<a href="jax/">jax</a><br>\n<a href="qwix/">qwix</a><br>\n'
-                                     '<a href="newfork/">newfork</a><br>\n</body></html>\n')
+                                     '<a href="newfork/">newfork</a><br>\n'
+                                     '<a href="jax-cuda12-plugin/">jax-cuda12-plugin</a><br>\n</body></html>\n')
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path / "site"))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -51,4 +54,8 @@ def test_every_package_dews_index_serves_resolves_undated(tmp_path, monkeypatch)
         server.shutdown()
     calls = (tmp_path / "calls").read_text().splitlines()
     assert calls and all(f"--exclude-newer-package {name}=false" in call
-                         for call in calls for name in ("jax", "qwix", "newfork")), calls
+                         for call in calls for name in ("jax", "qwix", "newfork", "jax-cuda12-plugin")), calls
+    # A package the index serves takes no date of a dated list either: both flags at once filtered every version
+    # of the CUDA plugin the index took (2026-10-31, ledger 3116: every lane's lock check failed).
+    assert not any("--exclude-newer-package jax-cuda12-plugin=20" in call for call in calls), calls
+    assert all("--exclude-newer-package jax-cuda13-plugin=20" in call for call in calls), calls
