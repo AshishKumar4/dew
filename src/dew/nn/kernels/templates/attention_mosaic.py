@@ -694,11 +694,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
-        # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless and
-        # undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's layout
-        # or keys first on one whose consumers share a key block (`split_queries`), each consumer's share of
-        # a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer its own
-        # keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`).
+        # The one launch (which `derived` takes only where `ONE_LAUNCH` holds, off for row 3180; a pinned
+        # config reaches it still) adds each tile's dQ under the first pass's D: the fast form's, a hookless
+        # and undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's
+        # layout or keys first on one whose consumers share a key block (`split_queries`), each consumer's
+        # share of a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer
+        # its own keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`).
         hooked = (self.score_mod is not None or ba.arguments["initial"] is not None
                   or ba.arguments["drop"] is not None)
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
@@ -746,7 +747,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         launches walk the largest their registers and the block hold, two stages, one consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
         at 64 x 64 with two consumers and one). The fast form of a hookless call takes one launch where one
-        holds the whole width, its dK/dV program queries first adding each tile's dQ atomically
+        holds the whole width and the one launch is derived at all (`ONE_LAUNCH`, held off by row 3180's
+        containment: until then every call takes two launches), its dK/dV program queries first adding each
+        tile's dQ atomically
         (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100:
         5.20 against 6.19 ms the two keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
