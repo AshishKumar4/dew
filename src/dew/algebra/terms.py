@@ -194,9 +194,9 @@ def spoken(equation: jcore.JaxprEqn) -> bool:
     name, arity = equation.primitive.name, len(equation.invars)
     if len(equation.outvars) != 1 or protected(equation):
         return False
-    return ((name in BINARY or name in COMPARISONS or name == "dot_general") and arity == 2
-            or (name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type")
-            and arity == 1 or name == "select_n" and arity == 3)
+    binary = name in BINARY or name in COMPARISONS or name == "dot_general"
+    unary = name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type"
+    return binary and arity == 2 or unary and arity == 1 or name == "select_n" and arity == 3
 
 
 def form_value(region_: Region, form: Term, values: list) -> jax.Array:
