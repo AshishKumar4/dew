@@ -187,13 +187,17 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
-def test_a_programs_communicators_kept_in_an_earlier_form_are_read_again(tmp_path, monkeypatch):
-    """A program's communicators kept by an earlier Dew, whose reading of a program's text may differ, are
-    not taken as this one's: the program's text is read again."""
+def test_a_programs_communicators_kept_by_another_reader_are_read_again(tmp_path, monkeypatch):
+    """A program's communicators kept by another reading of a program's text (an earlier Dew's, whose parser
+    or collective vocabulary differ) are not taken as this one's, whatever they are kept under: they are
+    kept under a digest of the reader's own code (`communicators.READER`), so the program's text is read
+    again."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    earlier = tmp_path / "dew" / "communicators" / "programs" / f"{b'step'.hex()}.json"
-    earlier.parent.mkdir(parents=True)
-    earlier.write_text(json.dumps(Collectives(groups=frozenset({(0, 1, 2, 3)})).to_json()))
+    kept = tmp_path / "dew" / "communicators" / "programs"
+    assert communicators.reader_digest() == communicators.READER
+    for earlier in (kept / f"{b'step'.hex()}.json", kept / ("0" * 16) / f"{b'step'.hex()}.json"):
+        earlier.parent.mkdir(parents=True, exist_ok=True)
+        earlier.write_text(json.dumps(Collectives(groups=frozenset({(0, 1, 2, 3)})).to_json()))
     program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
                "  %x = f32[8] parameter(0)\n"
                "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
