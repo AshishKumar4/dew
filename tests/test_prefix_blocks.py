@@ -11,6 +11,8 @@ causal one, bitwise.
 """
 
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -217,6 +219,57 @@ def test_a_prefix_runs_task_serves_the_blocks_the_run_trained_on():
     given = causal(ModelInputs(prompt, {BLOCKS_FIELD: blocks}), NEW, key=0)
     np.testing.assert_array_equal(served.tokens, given.tokens)
     np.testing.assert_array_equal(served.raw_log_probs, given.raw_log_probs)
+
+
+def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
+    """A prefix run's checkpoint read as a bundle (`Pretrained.from_run`) builds its task from the run's own
+    declaration (ledger 3007), as the run's own loader does (`TextGeneration.from_run`): its prefix and the
+    numerics its step trained in, where the bundle had built a task from the generation config its
+    export writes, which states neither. Their greedy rollouts agree bit for bit, and a bundle loaded from
+    that export, which holds no run's declaration, builds its task from the export's files."""
+    import json
+
+    from affine_run import Replaying
+
+    from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
+    from dew.interop.pretrained import Pretrained
+    from dew.nn.kernels import generation
+    from dew.nn.precision import Numerics
+    from dew.objectives.lm import Samples
+    from dew.registry import ModelConfig
+    from dew.training import Trainer
+
+    decoder = blocky()
+    greedy = Sampling(temperature=0, eos_token_ids=(VOCAB - 1,), pad_token_id=VOCAB - 2)
+    trained_in = Numerics(forms="accurate")
+    objective = LMObjective(decoder, SEQ, prefix=PREFIX, samples=Samples([1, 2, 3], NEW, sampling=greedy))
+    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), checkpoints=checkpoints)
+    tokens = np.asarray(jax.random.randint(jax.random.key(2), (jax.device_count(), SEQ + 1), 1, VOCAB))
+    stream = Loader(train=lambda partition: Replaying(lambda position: {TEXT_KEY: tokens}), val=None,
+                    records=None, batch=jax.device_count())
+    # The run's numerics, as a run sets them about its fit (`RunConfig.train`).
+    with generation.run_precision(trained_in):
+        trainer.fit(stream, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    model = dataclasses.asdict(ModelConfig.from_model(decoder))
+    record = {"objective": "lm", "data": {"seq_len": SEQ}, "model": model}
+    (tmp_path / "run.json").write_text(json.dumps(record))
+    native = TextGeneration.from_run(str(tmp_path))
+    bundle = Pretrained.from_run(str(tmp_path))
+    task = bundle.pipeline()
+    assert (task.prefix, task.precision) == (native.prefix, native.precision) == (PREFIX, trained_in)
+    prompt = jax.random.randint(jax.random.key(1), (BATCH, PROMPT), 0, VOCAB)
+    ours, theirs = task(prompt, NEW, key=0), native(prompt, NEW, key=0)
+    np.testing.assert_array_equal(ours.tokens, theirs.tokens)
+    np.testing.assert_array_equal(ours.raw_log_probs, theirs.raw_log_probs)
+    # A policy given in the run's place stops and pads where the run's does.
+    given = bundle.text_generation(sampling=Sampling(temperature=0.5)).sampling
+    assert given.temperature == 0.5
+    assert (given.eos_token_ids, given.pad_token_id) == ((VOCAB - 1,), VOCAB - 2)
+    bundle.save(tmp_path / "export")
+    assert Pretrained.load(tmp_path / "export", dtype="float32").settings is None
 
 
 def test_with_no_prefix_the_loss_is_the_causal_one_bitwise():

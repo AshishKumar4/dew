@@ -711,6 +711,28 @@ LAYER_NORM_SEEDS = 64
 """The layer norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
+def test_every_production_layer_norm_is_dews_rematerialized_one():
+    """The decoder block's exact-variance layer norm, the offset layer norm's core and Gemma 4 Unified's
+    patch norm are Dew's `LayerNorm`, rematerialized saving nothing, as every other is (ledger 3010):
+    each one's differentiated program checkpoints its normalization."""
+    from dew.nn.backbones.decoder_block import decoder_norm
+    from dew.nn.norms import OffsetLayerNorm
+    from dew.nn.vision.gemma4_unified import Gemma4UnifiedVision
+
+    def checkpoints(module: nn.Module, x: jax.Array) -> bool:
+        variables = module.init(jax.random.key(0), x)
+        traced = jax.make_jaxpr(jax.grad(lambda v: jnp.sum(module.apply(v, x) ** 2)))(variables)
+        return "checkpoint" in str(traced) or "remat" in str(traced)
+
+    x = jnp.ones((2, 8), jnp.float32)
+    built = decoder_norm("layer", epsilon=1e-5, bias=True, scale_offset=False, scale_after_cast=False,
+                         dtype=jnp.float32)
+    assert checkpoints(built(name="norm"), x)
+    assert checkpoints(OffsetLayerNorm(), x)
+    patches = Gemma4UnifiedVision().build()
+    assert patches.norm is not None and isinstance(patches.norm(), LayerNorm)
+
+
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
 def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_scale, use_bias, dtype):

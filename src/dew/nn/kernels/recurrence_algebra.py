@@ -98,9 +98,11 @@ def portable(name: str, left, right):
     return float32_matmul(left, right, exact_float32(None))
 
 
+@jax.jit
 def _cumulated(g, documents=None):
     """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)` (`compensated_add`),
-    restarting at each of packed `documents`' first positions."""
+    restarting at each of packed `documents`' first positions: one program JAX traces once for their types,
+    whose exact sums the portable math's forward and gradient each traced afresh (row 3142)."""
     zeros = jnp.zeros_like(g)
     if documents is None:
         return jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)

@@ -43,6 +43,20 @@ class Wgmma(mosaic.RingFamily):
 
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
+    held_registers = 4
+    """A consumer thread's own state beside its tiles: its lane's coordinates in its fragment and the walk's
+    counters where they diverge. Descriptors, barriers and TMA coordinates are warp-uniform and live in the
+    uniform registers (ET-BATCH1's dK/dV SASS: HGMMA gdesc[UR16], SYNCS.PHASECHK [UR17], TMA [UR48], the
+    descriptor's UIADD3.64): the tensormap pair, the barrier and the warpgroup's id (3117's census of the
+    sm90 recurrence, GEMM and attention launches). A store's staging and a hook's values are the
+    launches' own phases, not this; its addresses into the tiles it reads and writes itself are its
+    `scalar_registers`'."""
+
+    def scalar_registers(self, addressed=()) -> int:
+        # The core words and a thread's own shared-memory addresses (`mosaic.addresses`), which the
+        # recurrence's states launches and the exact normed kernel gradient spilled without (28 to 392 bytes
+        # at the four core words alone).
+        return self.held_registers + mosaic.addresses(addressed)
 
     def column_registers(self, columns: int, dtype) -> int:
         # The column layout repeats a vector over the warpgroup's four warps and eight lanes of each, so a

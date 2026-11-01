@@ -18,7 +18,7 @@ from test_attention_template import (
     geometry as core_geometry,
 )
 
-from dew.nn.attention_masks import alibi_bias
+from dew.nn.attention_masks import alibi_slopes
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -84,7 +84,7 @@ def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 
 def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> template.Hooks:
     """The hooks `names` asks for: a softcap and ALiBi as one score_mod, sinks as the initial state, an
     output gate."""
-    slopes = alibi_bias(jnp.ones((1, 1)), 4, dtype=jnp.float32).reshape(4)
+    slopes = jnp.asarray(alibi_slopes(4))
 
     def score_mod(s, q_pos, k_pos, *params):
         if "softcap" in names:
@@ -321,7 +321,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
         streams = jax.random.split(jax.random.fold_in(jax.random.key(77), seed), 6)
         params = []
         if "alibi" in names:
-            params.append(alibi_bias(jnp.ones((1, 1)), heads, dtype=jnp.float32).reshape(heads))
+            params.append(jnp.asarray(alibi_slopes(heads)))
         if "temperature" in names:
             params.append(jax.random.uniform(streams[0], (rows, heads, queries), jnp.float32, 0.5, 1.5))
         if "key" in names:

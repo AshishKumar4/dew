@@ -41,7 +41,9 @@ def scoping(variables) -> Callable:
     (`SCOPE`) in `variables`, the task's tree, beneath the branch its root was applied over: the one
     subtree of `variables["params"]` whose leaves' paths, shapes and dtypes are the root's own, empty
     where none is (a root over variables of its own). Two branches alike in every leaf cannot be told
-    apart by what a root reads, and are refused rather than merged."""
+    apart by what a root reads, and are refused rather than merged. A lifted transform's inner root
+    (`nn.remat`'s, as every Dew LayerNorm is) is no root of the task's: it holds its outer scope's path
+    and its own variables alone, so it reads beneath the branch of the call that lifted it."""
     branches: dict[frozenset, list[tuple[str, ...]]] = {}
 
     def walk(tree, path: tuple[str, ...]) -> None:
@@ -61,11 +63,21 @@ def scoping(variables) -> Callable:
             raise ValueError(f"a root reads one of the branches {found}, alike in every leaf")
         return found[0]
 
+    lifting: list[tuple[str, ...]] = []
+
     def scoped(next_fun, args, kwargs, context):
         scope = context.module.scope
-        path = () if scope is None else (*branch(scope.root), *scope.path)
-        with jax.named_scope(SCOPE + "|".join(path)):
-            return next_fun(*args, **kwargs)
+        if scope is None:
+            base, path = (), ()
+        else:
+            base = lifting[-1] if scope.root.path and lifting else branch(scope.root)
+            path = (*base, *scope.path)
+        lifting.append(base)
+        try:
+            with jax.named_scope(SCOPE + "|".join(path)):
+                return next_fun(*args, **kwargs)
+        finally:
+            lifting.pop()
 
     return scoped
 
@@ -93,32 +105,49 @@ def signature(tree) -> frozenset:
                      for path, leaf in leaves)
 
 
-def module_path(location: ir.Location) -> str:
+def module_path(location: ir.Location, within: str | None = None) -> str:
     """The variable scope of the innermost module a product's location names (`scoped`), its path
-    joined by `/`; empty where it runs in none."""
+    joined by `/`; where it names none, the scope it runs `within` (a called function's call's), else
+    empty."""
     # A lowered operation's location names its name stack (`ir.NameLoc`), the call sites beneath it.
     segments = location.name_str.split("/") if isinstance(location, ir.NameLoc) else []
     scopes = [segment.removeprefix(SCOPE) for segment in segments if segment.startswith(SCOPE)]
-    return scopes[-1].replace("|", "/") if scopes else ""
+    if scopes:
+        return scopes[-1].replace("|", "/")
+    return within or ""
 
 
 def products(modules: list[str]) -> dict[str, list[str]]:
-    """Each module path's dtypes its products' operands hold, over `modules`, StableHLO text."""
+    """Each module path's dtypes its products' operands hold, over `modules`, StableHLO text: a product in a
+    private function (a nested `jax.jit`'s, which XLA inlines; a wide sum's, `precision.accumulated`) at its
+    own location's path where it names one, else at the path of the call that runs it: its location names
+    the function's own scopes alone (22 of test_saved_runs red, row 3193)."""
     found: dict[str, set[str]] = {}
 
-    def walk(operation: ir.Operation) -> None:
+    def walk(operation: ir.Operation, functions: dict, within: str | None = None) -> None:
         for region in operation.regions:
             for block in region.blocks:
                 for inner in block.operations:
-                    if inner.operation.name == "stablehlo.dot_general":
-                        found.setdefault(module_path(inner.location), set()).update(
+                    name = inner.operation.name
+                    if name == "stablehlo.dot_general":
+                        found.setdefault(module_path(inner.location, within), set()).update(
                             DTYPES[str(ir.RankedTensorType(operand.type).element_type)]
                             for operand in inner.operands)
-                    walk(inner.operation)
+                    elif name == "func.call":
+                        callee = str(inner.operation.attributes["callee"]).lstrip("@").strip('"')
+                        walk(functions[callee], functions, module_path(inner.location, within) or None)
+                    walk(inner.operation, functions, within)
 
     with mlir.make_ir_context():
         for text in modules:
-            walk(ir.Module.parse(text).operation)
+            module = ir.Module.parse(text)
+            functions = {str(function.operation.attributes["sym_name"]).strip('"'): function.operation
+                         for function in module.body.operations if function.operation.name == "func.func"}
+            # The module's public functions, from which the private ones are called.
+            for function in functions.values():
+                attributes = function.attributes
+                if not ("sym_visibility" in attributes and "private" in str(attributes["sym_visibility"])):
+                    walk(function, functions)
     return {path: sorted(dtypes) for path, dtypes in sorted(found.items())}
 
 

@@ -275,6 +275,30 @@ def test_parts_pad_the_row_their_source_table_pads():
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
 
 
+SEED_OSS = {"architectures": ["SeedOssForCausalLM"], "attention_bias": True, "attention_dropout": 0.1,
+            "attention_out_bias": False, "bos_token_id": 0, "pad_token_id": 1, "eos_token_id": 2,
+            "head_dim": 128, "hidden_act": "silu", "hidden_size": 5120, "initializer_range": 0.02,
+            "intermediate_size": 27648, "max_position_embeddings": 524288, "mlp_bias": False,
+            "model_type": "seed_oss", "num_attention_heads": 80, "num_hidden_layers": 64,
+            "num_key_value_heads": 8, "residual_dropout": 0.1, "rms_norm_eps": 1e-06,
+            "rope_scaling": {"rope_type": "default"}, "rope_theta": 10000000.0,
+            "tie_word_embeddings": False, "torch_dtype": "bfloat16", "transformers_version": "4.55.0",
+            "use_cache": True, "vocab_size": 155136}
+"""ByteDance-Seed/Seed-OSS-36B-Instruct's config.json."""
+
+
+def test_a_deep_release_verifies_at_its_probes_cut_depth_as_at_its_own():
+    """Seed-OSS-36B's release, 64 identical layers, probes as its first two (`verify.shallow`) at its
+    probe's widths, and verifies as Qwen2's convention there as at full depth: the probe holds the
+    candidate's logits to the float64 truth on par with the source's (`verify.logits_parity`), which
+    rounding meets at any depth and width, where a fixed rounding per layer measured on narrow fixtures
+    refused it at two layers."""
+    from dew.interop.verify import VerifiedMapping, verify_mapping
+
+    verified = verify_mapping(SEED_OSS)
+    assert isinstance(verified, VerifiedMapping) and verified.family == "qwen2"
+
+
 def test_a_probe_keeps_the_depth_of_code_not_transformers_own():
     """GLM-4.7-Flash's classes subclassed under a type of their own keep their stated depth in the probe
     (`verify.shallow`), whose cut reads each layer's kind: code other than transformers' own may compute

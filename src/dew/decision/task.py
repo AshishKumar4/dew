@@ -1225,8 +1225,8 @@ class RowScoring(_DecideScoring[Encoded, None, np.ndarray]):
     request one row (`Decide._encoded`), answered by its raw `[Q, K]` logits, the passes a server of
     Jev bodies runs (`Decide.logits`)."""
 
-    def admit(self, request: Encoded) -> scoring.Scored[_Row, None]:
-        return scoring.Scored((_Row(request),), None)
+    def admit(self, request: Encoded) -> scoring.ScoringRequest[_Row, None]:
+        return scoring.ScoringRequest((_Row(request),), None)
 
     def answer(self, payload: None, outputs: Sequence[np.ndarray]) -> np.ndarray:
         return outputs[0]
@@ -1250,7 +1250,7 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
     each it refuses under its reason (`Refused`), `unfit`, `options_alike`, or `cut` under `whole`. A
     server reads them as a run reads its own (`CorpusCounts.metrics`)."""
 
-    def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Row, _Admitted]:
+    def admit(self, request: Mapping[str, object]) -> scoring.ScoringRequest[_Row, _Admitted]:
         decide = self.decide
         state, questions, images, context = decide._read_wire(request, strict=self.strict)
         try:
@@ -1271,7 +1271,7 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
-        return scoring.Scored(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
+        return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,
