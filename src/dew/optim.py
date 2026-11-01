@@ -36,6 +36,7 @@ import tyro
 from dew._hashing import fmix32
 from dew._moments import bias_corrected
 from dew._records import share
+from dew.gauss_newton import gauss_newton
 from dew.held_updates import holds_state, refuse_untold, update_applied
 from dew.laprop import laprop
 from dew.mesh import LogicalAxes
@@ -1175,7 +1176,7 @@ def power_profiles(solver: optax.GradientTransformation,
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
-Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop']
+Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop', 'gauss_newton']
 """The optimizers `OptimConfig.optimizer` names, each built by its `OPTIMIZER_MAP` entry."""
 
 STATE_OPTIMIZERS: dict[str, dict[Optimizer, Callable[..., optax.GradientTransformation]]] = {
@@ -1193,6 +1194,7 @@ OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'muon': _muon_groups,
     'muonclip': _muonclip_groups,
     'laprop': laprop,
+    'gauss_newton': gauss_newton,
 }
 
 optimizers: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(

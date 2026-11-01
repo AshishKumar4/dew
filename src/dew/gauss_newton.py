@@ -73,8 +73,10 @@ class RowEquations:
 
 
 class GaussNewtonState(NamedTuple):
-    """A Gauss-Newton update's state, which holds nothing: it marks a run whose optimizer solves its
-    objective's system (`solves_equations`)."""
+    """A Gauss-Newton update's state: the updates it has made, which its rate's schedule reads, and the
+    mark of a run whose optimizer solves its objective's system (`solves_equations`)."""
+
+    count: jax.Array
 
 
 def solves_equations(opt_state) -> bool:
@@ -84,10 +86,13 @@ def solves_equations(opt_state) -> bool:
     return holds_state(opt_state, GaussNewtonState)
 
 
-def gauss_newton(damping: float) -> optax.GradientTransformationExtraArgs:
+def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0,
+                 damping: float = 0.0) -> optax.GradientTransformationExtraArgs:
     """An update that steps by the damped Gauss-Newton solve of its objective's system (the module's
-    docstring): the update is the step, negated, in the parameters' tree and each in its own dtype, the
-    gradient it is handed aside. An update whose statistics hold fewer rows than it has (a run's last,
+    docstring), scaled by `learning_rate` (a constant, or a schedule over the updates it has made; 1.0 the
+    whole step), as an optimizer an `OptimConfig` names (`optimizer: gauss_newton`, `damping` among its
+    `optimizer_opts`): the update is the step, negated, in the parameters' tree and each in its own dtype,
+    the gradient it is handed aside. An update whose statistics hold fewer rows than it has (a run's last,
     whose stream ended inside its window) steps nothing, as a solve of part of the system is no update's.
     Its objective states the system, which `Residuals` does; any other's statistics are refused."""
     if damping < 0:
@@ -95,9 +100,9 @@ def gauss_newton(damping: float) -> optax.GradientTransformationExtraArgs:
 
     def init_fn(params) -> GaussNewtonState:
         del params
-        return GaussNewtonState()
+        return GaussNewtonState(count=jnp.zeros((), jnp.int32))
 
-    def update_fn(updates, state, params=None, *, statistics=None, **extra_args):
+    def update_fn(updates, state: GaussNewtonState, params=None, *, statistics=None, **extra_args):
         del params, extra_args
         if statistics is None:
             raise ValueError("a Gauss-Newton update was handed no statistics: a wrapper that hands its inner "
@@ -112,7 +117,9 @@ def gauss_newton(damping: float) -> optax.GradientTransformationExtraArgs:
         solved = jax.eval_shape(statistics.solved, damping)
         step = jax.lax.cond(statistics.rows >= statistics.update, statistics.solved,
                             lambda _: jnp.zeros(solved.shape, solved.dtype), damping)
-        return jax.tree.map(jnp.negative, unravel(step.astype(flat.dtype))), state
+        rate = learning_rate(state.count) if callable(learning_rate) else learning_rate
+        scaled = unravel((jnp.asarray(rate, step.dtype) * step).astype(flat.dtype))
+        return jax.tree.map(jnp.negative, scaled), GaussNewtonState(count=optax.safe_increment(state.count))
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 

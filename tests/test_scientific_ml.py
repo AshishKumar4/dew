@@ -8,6 +8,8 @@ not, each on par with NumPy's solve of the same normal equations, and the traine
 A float64 run keeps float64 through its parameters, optimizer state, loss and checkpoints.
 """
 
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -145,7 +147,7 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
     objective = LeastSquares(features)
     params = objective.init(jax.random.key(0))["params"]
     step = Step(jnp.asarray(0), jax.random.key(0), None, equations=True)
-    optimizer = gauss_newton(1e-3)
+    optimizer = gauss_newton(damping=1e-3)
     draw = least_squares_draw(rows, features, 0x6A)
 
     def dews(x, y):
@@ -169,10 +171,11 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
                     truth_fn=exact)
 
 
-def gauss_newton_arm(rows: int, features: int, accumulation: int):
-    """One update of a least-squares objective of damping 1e-3, from zero weights, of a draw's `rows`
-    rows read in `accumulation` microbatches of an accumulation window: its weights after it."""
-    trainer = Trainer(LeastSquares(features), gauss_newton(1e-3), key=0, layout=LAYOUT,
+def gauss_newton_arm(rows: int, features: int, accumulation: int, optimizer=None):
+    """One update of a least-squares objective of damping 1e-3 (by `optimizer` where given), from zero
+    weights, of a draw's `rows` rows read in `accumulation` microbatches of an accumulation window: its
+    weights after it."""
+    trainer = Trainer(LeastSquares(features), optimizer or gauss_newton(damping=1e-3), key=0, layout=LAYOUT,
                       accumulation=accumulation)
     template = jax.tree.map(jnp.copy, trainer.initial_state())
     compiled = []
@@ -197,6 +200,25 @@ UPDATES = {"primal": (64, 8, 2), "short-microbatches": (64, 16, 8), "dual": (32,
 """Each accumulated update the Gauss-Newton parity reads: its rows, its weights and its microbatches.
 Two microbatches of 32 rows over 8 weights; eight of 8 rows over 16 weights, each microbatch shorter
 than the weights though the update is not; four of 8 rows over 64 weights, the update itself shorter."""
+
+
+def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():
+    """A run whose optimizer the command line names (`--optim.optimizer gauss_newton`, its rate 0.5 and
+    its damping 1e-3 among `optimizer_opts`), built as `OptimConfig` builds every optimizer
+    (`scheduled_solver`), takes half the damped Gauss-Newton step of its batch: on par with half the float64
+    solve's step (check 1)."""
+    from dew.config import RunConfig
+
+    config = RunConfig.cli(["--optim.optimizer", "gauss_newton", "--optim.learning-rate", "0.5",
+                            "--optim.optimizer-opts", json.dumps({"damping": 1e-3})])
+    rows, features = 64, 8
+    draw = least_squares_draw(rows, features, 0x6C)
+    exact = as_given(lambda x, y: -0.5 * solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
+    configured = gauss_newton_arm(rows, features, 1, config.optim.build(1))
+    halved = gauss_newton_arm(rows, features, 1, gauss_newton(0.5, damping=1e-3))
+    label = "configured gauss-newton"
+    assert_as_exact(configured, halved, draw, label, truth_fn=exact,
+                    seeds=seeds_for(halved, draw, label, truth_fn=exact, dew_fn=configured))
 
 
 @pytest.mark.parametrize("update", sorted(UPDATES))
@@ -233,10 +255,9 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
         rows = Memory([{"x": row, "y": target} for row, target in zip(x, y, strict=True)]).repeat().batch(8)
         objective = LeastSquares(4, param_dtype=jnp.float64)
         checkpoints = Checkpoints(str(tmp_path / "run"))
-        Trainer(objective, gauss_newton(1e-12), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows,
-                                                                                                   steps=1)
-        state = Trainer(objective, gauss_newton(1e-12), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(
-            rows, steps=3)
+        solver = gauss_newton(damping=1e-12)
+        Trainer(objective, solver, key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows, steps=1)
+        state = Trainer(objective, solver, key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows, steps=3)
         floats = [leaf for leaf in jax.tree.leaves((state.variables, state.opt_state))
                   if jnp.issubdtype(leaf.dtype, jnp.floating)]
         assert floats and all(leaf.dtype == jnp.float64 for leaf in floats)
@@ -254,11 +275,11 @@ def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_re
     """A Gauss-Newton update inside `optax.MultiSteps`, which hands its inner update no extra arguments and
     pools no system across the steps it holds, is refused as its step is traced, naming the accumulation
     that pools the update's system (`Trainer(accumulation=k)`), never stepped by a system it lacks."""
-    held = optax.MultiSteps(gauss_newton(1e-3), every_k_schedule=2).gradient_transformation()
+    held = optax.MultiSteps(gauss_newton(damping=1e-3), every_k_schedule=2).gradient_transformation()
     trainer = Trainer(LeastSquares(4), held, key=0, layout=LAYOUT)
     batch = {"x": np.ones((8, 4), np.float32), "y": np.ones(8, np.float32)}
     with pytest.raises(ValueError):
         trainer.compile(trainer.initial_state(), batch)
     # Unwrapped, the same update compiles: the refusal is the wrapper's dropped statistics.
-    trainer = Trainer(LeastSquares(4), gauss_newton(1e-3), key=0, layout=LAYOUT)
+    trainer = Trainer(LeastSquares(4), gauss_newton(damping=1e-3), key=0, layout=LAYOUT)
     trainer.compile(trainer.initial_state(), batch)
