@@ -181,9 +181,13 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
     ])
 
 
+@pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_mosaic_template_holds_on_an_h100():
     """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
-    long sequence, each one's failure kept and all raised together."""
+    long sequence, each one's failure kept and all raised together, without XLA's deterministic ops: the
+    fused backward forms its cells pin add dQ atomically, which a deterministic run never derives
+    (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's `_repeat_promised`) they
+    failed as unpaired draws (row 3171)."""
     run_cells([
         *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
