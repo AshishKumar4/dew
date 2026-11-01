@@ -1404,16 +1404,21 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     assert run() == 1
 
 
+@pytest.mark.parametrize(("order", "namespace"), [
+    (("lone", "uses"), [[2, 1], [3, 1], [4, 2]]), (("uses", "lone"), [[2, 2], [3, 3], [4, 4]])],
+    ids=["lone first", "lone after uses"])
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
-        ci, tmp_path, monkeypatch, cache_worker):
+        ci, tmp_path, monkeypatch, cache_worker, order, namespace):
     """A train that loses a head loses the test modules and modules the head added, and its other
     files keep their rows (the land queue's recompose after a pull): a test module, a module in a
     package no test imported, or one beside a module a file's tests executed under a name no run
     tried to import, added or taken away runs no file again (ledger 3220: a listing of every package
     above an executed module keyed 82% of rows, and each added module reran them). An __init__.py
     added to, or taken from, a namespace package on the way to a module a file imported, which that
-    import finds, runs that file again, and only that one; a top-level package added under src/,
-    which may shadow any import, runs every file."""
+    import finds, runs that file again, and that one alone where no file of its process ran it
+    before: a file's key covers what the files before it in its process did, as what ran before it
+    may serve it from a module it left (lifetime.py), so one run after it reruns too; a top-level
+    package added under src/, which may shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
                          "src/pkg/space/sub/used.py": "def value(): return 1\n",
@@ -1436,7 +1441,7 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     out = tmp_path / "verdict.json"
 
     def run():
-        ci.task("3.12", ["tests/test_uses.py", "tests/test_lone.py"], "", out, 600.0)
+        ci.task("3.12", [f"tests/test_{name}.py" for name in order], "", out, 600.0)
         assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0, 0]
         return [len((tmp_path / f"runs-{name}").read_text()) for name in ("uses", "lone")]
 
@@ -1444,8 +1449,8 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
                ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
                ("src/other/extra.py", None, [1, 1]), ("tests/test_added.py", None, [1, 1]),
-               ("src/pkg/space/__init__.py", "", [2, 1]), ("src/pkg/space/__init__.py", None, [3, 1]),
-               ("src/top/__init__.py", "", [4, 2])]
+               ("src/pkg/space/__init__.py", "", namespace[0]),
+               ("src/pkg/space/__init__.py", None, namespace[1]), ("src/top/__init__.py", "", namespace[2])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
