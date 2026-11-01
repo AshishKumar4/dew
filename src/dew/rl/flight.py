@@ -745,6 +745,12 @@ VIEWS = ("image", "state", "gates", "airframe", "physics", "obstacles", "passed"
 """What a gate race can show: the camera's image, and the privileged views (`privileged`)."""
 
 
+def shown(views: tuple[str, ...], offered: tuple[str, ...], what: str) -> None:
+    """Refuses `views` but where they are some of the views `what` `offered`."""
+    if not views or not set(views) <= set(offered):
+        raise ValueError(f"{what} shows some of the views {offered}, not {views}")
+
+
 @struct.dataclass
 class FlightEnv:
     """One drone racing `racing`'s courses as a `dew.rl.env.Env`: actions `[4]` in [-1, 1] (`commanded`);
@@ -760,8 +766,7 @@ class FlightEnv:
     action_size = 4
 
     def __post_init__(self):
-        if not self.views or not set(self.views) <= set(VIEWS[1:]):
-            raise ValueError(f"a flight env shows some of the privileged views {VIEWS[1:]}, not {self.views}")
+        shown(self.views, VIEWS[1:], "a flight env")
 
     def observed(self, race: Race) -> dict[str, jax.Array]:
         """The privileged views of `race` asked for (`privileged`)."""
@@ -967,8 +972,43 @@ def _scene(racing: Racing, race: Race) -> Scene:
     return Scene(course.center, course.facing, course.count, lit, course.obstacles, race.camera.look)
 
 
-__all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER", "VIEWS",
-           "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene", "Seen",
-           "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
-           "drawn_course", "facings", "looking", "mounted", "nearest", "physics", "privileged", "quaternion",
-           "raced", "started", "struck"]
+__all__ = [
+    "ASPECTS",
+    "FAMILIES",
+    "GATES",
+    "INTERFACE",
+    "LAYOUTS",
+    "NEAREST",
+    "OBSTACLES",
+    "TEACHER",
+    "VIEWS",
+    "Camera",
+    "Course",
+    "FlightEnv",
+    "GateRace",
+    "Race",
+    "Racing",
+    "Renderer",
+    "Scene",
+    "Seen",
+    "Viewed",
+    "airframe",
+    "bars",
+    "cameras",
+    "commanded",
+    "corners",
+    "developed",
+    "drawn_camera",
+    "drawn_course",
+    "facings",
+    "looking",
+    "mounted",
+    "nearest",
+    "physics",
+    "privileged",
+    "quaternion",
+    "raced",
+    "shown",
+    "started",
+    "struck",
+]

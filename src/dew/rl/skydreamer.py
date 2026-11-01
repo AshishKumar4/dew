@@ -51,7 +51,7 @@ import numpy as np
 from flax import struct
 
 from dew.rl.env import TimeStep
-from dew.rl.flight import GATES, OBSTACLES, Camera, Renderer, Scene, Seen, quaternion
+from dew.rl.flight import GATES, OBSTACLES, Camera, Renderer, Scene, Seen, quaternion, shown
 from dew.rl.quadrotor import GRAVITY, Body, Flight, Quadrotor, drawn_body, flown, hovering
 
 CIRCLE = (((3.0, 0.0, 1.5), 90.0), ((0.0, 3.0, 1.5), 180.0), ((-3.0, 0.0, 1.5), 270.0),
@@ -175,8 +175,7 @@ class SkyRace:
     action_size = 4
 
     def __post_init__(self):
-        if not self.views or not set(self.views) <= set(VIEWS[1:]):
-            raise ValueError(f"a SkyDreamer race shows some of {VIEWS[1:]}, not {self.views}")
+        shown(self.views, VIEWS[1:], "a SkyDreamer race")
 
     def observed(self, lap: Lap) -> dict[str, jax.Array]:
         """The views of `lap` asked for."""

@@ -2,8 +2,9 @@
 from scratch on its race (`dew.rl.skydreamer`) from the camera's RGB image, by collective thrust and body
 rates, its world model decoding the privileged state; an environment run
 (`dew.objectives.rl.config.EnvRunConfig`) under OUT, which the tool run again goes on from, judged greedy
-every `--every` updates into OUT/base.json, on Table III's evaluation starts (each before the first gate)
-and gates (1 m in size).
+every `--every` updates into OUT/base.json against the untrained policy judged alike (`untrained`): on
+Table III's evaluation starts (each before the first gate) and gates (1 m in size), and on held-out
+episodes of the training task, each from the same seed at every judgement.
 
     python tools/skydreamer_race.py OUT --assets A [--updates 125000] [--every 12500]
 
@@ -38,6 +39,8 @@ from dew.rl.hyperlux import HyperLuxRenderer
 from dew.rl.skydreamer import Sky, SkyDreamerRace
 
 ENVIRONMENTS, PIXELS, REPLAY = 16, 64, 2_000_000
+EVALUATION_SEED, HELD_OUT_SEED = 0xE7A1, 0x5EED
+"""The seeds every judgement's episodes start from, apart from the training's (the run's key)."""
 SENSED = (("rates", 3), ("motors", 4), ("plan", 24))
 """What the encoder reads beside the image, each entry and its width."""
 DECODED = (("state", 16, 256), ("rates", 3, 256), ("motors", 4, 256))
@@ -90,11 +93,12 @@ def scored(simulator, objective, variables, key: jax.Array) -> dict:
 
 def trained(out: Path, assets: Path, updates: int, every: int) -> dict:
     """The base check trained to `updates` updates in chunks of `every`, going on from its checkpoints (its
-    replay made again), each chunk's agent judged greedy on a race of its own into OUT/base.json."""
+    replay made again), each chunk's agent and, first, the untrained policy judged greedy alike (`judged`)
+    into OUT/base.json."""
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective
 
     path = out / "base.json"
-    report = json.loads(path.read_text()) if path.exists() else {"points": []}
+    report: dict = json.loads(path.read_text()) if path.exists() else {"points": []}
     done = 0
     if (out / "base").is_dir():
         with Checkpoints(str(out / "base")) as checkpoints:
@@ -102,8 +106,18 @@ def trained(out: Path, assets: Path, updates: int, every: int) -> dict:
     prepared = run(out, assets).prepare()
     rollout, agent = prepared.rollout, prepared.objective
     assert isinstance(rollout, DreamerRollout) and isinstance(agent, DreamerV3Objective)
-    # Table III's evaluation: every start before the first gate, the gates' size 1 m.
-    judged = SkyDreamerRace(HyperLuxRenderer(ENVIRONMENTS, assets, size=PIXELS), Sky(anywhere=0.0, size=1.0))
+    # Table III's evaluation (every start before the first gate, the gates' size 1 m), and the training task.
+    evaluation = SkyDreamerRace(HyperLuxRenderer(ENVIRONMENTS, assets, size=PIXELS),
+                                Sky(anywhere=0.0, size=1.0))
+    held_out = SkyDreamerRace(HyperLuxRenderer(ENVIRONMENTS, assets, size=PIXELS))
+
+    def judged(variables) -> dict:
+        return {"evaluation": scored(evaluation, agent, variables, jax.random.key(EVALUATION_SEED)),
+                "held_out": scored(held_out, agent, variables, jax.random.key(HELD_OUT_SEED))}
+
+    if "untrained" not in report:
+        report["untrained"] = judged(agent.init(jax.random.key(0)))
+        print(json.dumps({"untrained": report["untrained"]}), flush=True)
     began, state = time.perf_counter(), None
     scored_at = {point["updates"] for point in report["points"]}
     while state is None or done < updates:
@@ -117,7 +131,7 @@ def trained(out: Path, assets: Path, updates: int, every: int) -> dict:
             continue
         point = {"updates": done, "environment_steps": rollout.environment_steps,
                  "seconds": time.perf_counter() - began, "episode_return": rollout.metrics["episode_return"],
-                 **scored(judged, agent, state.variables, jax.random.key(done))}
+                 **judged(state.variables)}
         report["points"].append(point)
         scored_at.add(done)
         print(json.dumps(point), flush=True)
