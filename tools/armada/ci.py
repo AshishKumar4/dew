@@ -116,7 +116,7 @@ import time
 import tomllib
 import types
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
@@ -1310,12 +1310,14 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
-def targeted(python: str, arguments: list[str], report: Path) -> int:
-    """pytest's exit status on `arguments` (files, node ids and options) run as a CI task runs its files
-    (`session.pytest_run`): a lane's targeted run (tmp/run_tests.py) and the gangs select as CI does, and an
-    option of their own (a `-m` after CI's) chooses instead."""
-    return subprocess.run([*session.pytest_run(python, report), *arguments],
-                          env=session.pytest_environment({}),
+def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[str] = (),
+             split: str = "") -> int:
+    """pytest's exit status on `arguments` (files, node ids and options) and `tests` in `split`'s group, run
+    as a CI task runs them (`session.pytest_run`, `selection`, `site_environment`): a lane's targeted run
+    (tmp/run_tests.py) and the gangs select as CI does, and an option of their own (a `-m` after CI's)
+    chooses instead."""
+    return subprocess.run([*session.pytest_run(python, report), *arguments, *selection(list(tests), split)],
+                          env=session.pytest_environment(site_environment(SITE.fullmatch(split))),
                           check=False).returncode
 
 
@@ -1394,16 +1396,22 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return code
 
 
-def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
-    """CI's pytest `run` over `tests`, with the plugins that record what ran (executed.py), keep one group
-    of a split file (`split`, split.py) and a release check's tests (`release`, release.py), or a check-1
-    site's test alone (`split` its group, `SITE`). A release check's pytest runs with its requirement over the
-    suite's environment, whose torch and jax it keeps: uv's overlay."""
+def selection(tests: list[str], split: str, release: str = "") -> list[str]:
+    """pytest's arguments that select `tests` as a CI task does: one group of a split file (`split`,
+    split.py), a release check's tests (`release`, release.py), or a check-1 site's test alone (`split` its
+    group, `SITE`)."""
     site = SITE.fullmatch(split)
     grouping = (["-p", "split", f"--ci-group={split}"] if split and not site else []) + (
         ["-p", "release", f"--ci-release={release}"] if release else [])
     named = [f"{name}::{site['test'].replace('.', '::')}" for name in tests] if site else tests
-    command = [*run, "-p", "executed", *named, *grouping]
+    return [*named, *grouping]
+
+
+def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+    """CI's pytest `run` over `tests`, with the plugin that records what ran (executed.py), as `selection`
+    selects them. A release check's pytest runs with its requirement over the suite's environment, whose
+    torch and jax it keeps: uv's overlay."""
+    command = [*run, "-p", "executed", *selection(tests, split, release)]
     return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
             *command[1:]] if release else command
 
@@ -2184,6 +2192,9 @@ def main() -> int:
         "pytest", help="pytest on the arguments as a CI task runs it, CI's selection first; its exit status")
     selecting.add_argument("--python", choices=PYTHONS, required=True)
     selecting.add_argument("--report", type=Path, required=True, help="where pytest writes its JUnit report")
+    selecting.add_argument("--tests", default="", help="the files --split's group is of, space-separated")
+    selecting.add_argument("--split", default="",
+                           help="--tests' group as CI names it: 1/3, a check-1 site's test or its draws")
     selecting.add_argument("arguments", nargs=argparse.REMAINDER,
                            help="after --, pytest's own: files, node ids and options")
     measuring = operations.add_parser("coverage")
@@ -2256,7 +2267,7 @@ def main() -> int:
     if args.operation == "pytest":
         # argparse keeps the `--` that sets pytest's arguments apart from these.
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-        return targeted(args.python, arguments, args.report)
+        return targeted(args.python, arguments, args.report, args.tests.split(), args.split)
     if args.operation == "gpu-lane":
         if args.tests is None and not args.network:
             parser.error("gpu-lane names its --tests; only the network lane (--network) takes every file "
