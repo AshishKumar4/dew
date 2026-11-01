@@ -34,8 +34,10 @@ from token_support import token_rows
 from whole_suite import timed
 
 from dew.distributed.batches import shard_batch
+from dew.inference.banks import HeldBanks
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
+from dew.nn.moe import EXPERT_AXES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -443,6 +445,52 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
 
     assert_as_exact(steps(deep), steps(plain), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
                     truth_fn=truth)
+
+
+BANKED_EXPERT_SEEDS = 8
+"""The banked MoE decode's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop():
+    """A scanned MoE stack decoding over a bank (`HeldBanks.place`, every run's leaves one array) hands
+    each iteration of its step's scan the run's expert kernels whole and the iteration's layer, which
+    the grouped matmul reads in place (`dew.nn.moe.Layered`): no expert stack enters a scan sliced, so
+    no layer's experts are copied out each step. Its steps decode as exactly as the plain loop's, both
+    from the loop's own float64 steps (check 1)."""
+    ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
+    routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
+    plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
+    variables = plain.init(jax.random.key(0), ids)
+    banked = HeldBanks(variables).place(scanned)
+    stacks = {tuple(leaf.shape) for path, leaf in jax.tree_util.tree_leaves_with_path(banked["params"])
+              if [entry.key for entry in path][-3:-1] in (["experts", name] for name in EXPERT_AXES)}
+    assert stacks
+
+    cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    graph = jax.make_jaxpr(lambda variables, cache: scanned.apply(
+        {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(banked, cache)
+    scans = [equation for equation in equations(graph) if equation.primitive.name == "scan"]
+    handed = [{tuple(operand.aval.shape) for operand in scan.invars[:scan.params["num_consts"]]}
+              for scan in scans]
+    sliced = [{tuple(operand.aval.shape)
+               for operand in scan.invars[scan.params["num_consts"] + scan.params["num_carry"]:]}
+              for scan in scans]
+    assert any(stacks <= whole for whole in handed) and not any(stacks & xs for xs in sliced)
+
+    def draw(seed):
+        return (np.random.default_rng([0x1342, seed]).integers(0, VOCAB, (2, 8)).astype(np.int32),)
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
+            return np.asarray(decoded(wide, widened(variables), ids)[0])
+
+    def steps(model, store):
+        return lambda ids: decoded(model, store, ids)[0]
+
+    assert_as_exact(steps(scanned, banked), steps(plain, variables), draw, "banked MoE decode steps",
+                    seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
 
 
 SOURCE_SCAN_SEEDS = 8

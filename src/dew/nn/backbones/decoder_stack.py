@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import DenyList
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import merge
@@ -29,7 +30,7 @@ from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 
 from ..hyper_connections import Carried
 from ..mla import INDEXER_COLLECTION
-from ..moe import ROUTER_COLLECTION
+from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name, run_period
@@ -309,15 +310,37 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 return step(layer, carry, per_layer_input, store)[0], None
 
             repeats = count // len(run.specs) if periodic else count
-            x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
-                           in_axes=2, length=repeats)(run, x, inputs)
+            if decode and not train and not fetching and holds_experts(run.variables.get('params', {})):
+                x = _experts_in_place(scanned, run, x, inputs, repeats)
+            else:
+                x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
+                               in_axes=2, length=repeats)(run, x, inputs)
+    return x
+
+
+def _experts_in_place(scanned, run, x, inputs, repeats: int):
+    """A decoding scan of `run` whose experts' kernels each iteration reads in place: the scan slices
+    the run's other variables and hands every iteration the experts' whole stacks with its own index
+    (`dew.nn.moe.experts_apart`, `at_iteration`), so the grouped matmul reads the iteration's layer
+    where it lies. Slicing the stack as a scan does would copy every layer's experts out every step,
+    since the matmul's kernel takes no slice of an operand in place."""
+    def indexed(layer, carried, per_layer_input):
+        carry, index = carried
+        at = nn.map_variables(scanned, BANKED_EXPERTS, trans_in_fn=lambda held: at_iteration(held, index),
+                              init=False, mutable=False)
+        return (at(layer, carry, per_layer_input)[0], index + 1), None
+
+    scan = nn.scan(indexed, variable_axes={DenyList(BANKED_EXPERTS): 0}, variable_broadcast=BANKED_EXPERTS,
+                   split_rngs={True: True}, in_axes=2, length=repeats)
+    apart = nn.map_variables(scan, ('params', BANKED_EXPERTS), trans_in_fn=experts_apart, init=False,
+                             mutable=False)
+    (x, _), _ = apart(run, (x, jnp.zeros((), jnp.int32)), inputs)
     return x
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
-              kv_store, per_layer_input, attention_metadata=None, banked: bool = False,
-              periods: Sequence[int] = ()):
+              kv_store, per_layer_input, attention_metadata=None, periods: Sequence[int] = ()):
     """Run the layers over `x`, one run at a time as `groups` says.
 
     A run of one is `layers[first]`; a longer run is one block named for its
@@ -328,16 +351,19 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     owning layers get no store, since a Python dict cannot follow writes from
     inside the loop and a provider is always a run of one.
 
-    `banked` says the store holds each run's parameters as one array
-    (`dew.inference.banks`). Those runs, and runs the layout left in host
-    memory, are read one layer at a time in `_prefetched_run`: at most two of a
-    run's layers are on the device, staging crosses run boundaries, and no fetch
+    A run whose parameters sit in host memory or stream from disk
+    (`dew.inference.banks`) is read one layer at a time in `_prefetched_run`:
+    at most two of its layers are on the device, staging crosses run
+    boundaries, and no fetch
     can be hoisted above the layer before it (it is issued inside that layer's
     iteration or ordered by the carry). Training uses the native Linen scan
     instead, with map_variables staging one row under remat, so the backward
     refetches the pinned bank rather than keeping a device copy. Each fetched
     layer binds its variables through Linen's `Module.bind`, which keeps the
-    enclosing call's intermediate-capture policy active.
+    enclosing call's intermediate-capture policy active. A run banked on the
+    device (its parameters one array a leaf, `layers_3_7`) scans as resident
+    weights do, each iteration reading its layer of the bank where it lies:
+    fetching it first would copy every layer of the bank each call.
 
     `periods` is each run's period (`StackView.periods`): a run of a longer
     one repeats its period's layers under the scan (`_run_module`), which
@@ -354,7 +380,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     streaming = any('streaming' in run.variables for run in runs)
     if streaming and train:
         raise ValueError("disk streaming is inference-only")
-    fetching = streaming or banked or any(on_host(run.variables.get('params', {})) for run in runs)
+    fetching = streaming or any(on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
