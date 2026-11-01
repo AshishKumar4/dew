@@ -28,7 +28,8 @@ COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "ragg
                "collective-broadcast", "collective-permute", "send", "recv")
 """The HLO ops that move data between devices. XLA runs some as an async
 pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
-computation that holds the op itself."""
+computation that holds the op itself. The communicators Dew keeps are read by
+this vocabulary, under a digest of it (`dew.communicators.READER`)."""
 
 
 def collective(op: str) -> str | None:

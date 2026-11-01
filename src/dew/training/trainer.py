@@ -122,7 +122,6 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
-    pooled,
     pooled_first,
     restored,
     stage_reached,
@@ -132,7 +131,6 @@ from dew.training._fit import (
 )
 from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
-from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import (
     DiLoCo,
@@ -198,7 +196,7 @@ from dew.training.planning import (
     whole_step,
 )
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
-from dew.training.rollout import Rollout, _branched, _draws_further, _reported, _rollout_metrics, rolled_out
+from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
@@ -469,9 +467,7 @@ class Trainer(Generic[Loss, Effects]):
         self._device, self._prefetch = loader.device, prefetch
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
-                                 custom_progress=self.step is not None and progress,
-                                 pooled_draws=pooled(examples) and self.rollout is not None
-                                 and _draws_further(self.rollout))
+                                 custom_progress=self.step is not None and progress)
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1141,7 +1137,11 @@ class Trainer(Generic[Loss, Effects]):
         held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        given = placed_shapes(batch, placement) if mesh is not None else batch
+        # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
+        # arrays a step compiled ahead reads (`first_step_batch`) and one over the placed arrays a run steps
+        # are two texts of one program (`dew.training.ahead.program_of`), the types of a helper call's
+        # arguments, their shardings among them, telling its functions apart in the module.
+        given = placed_shapes(batch, placement)
         lower = Routed(functools.partial(
             lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
             *apart(prepared), given, part))
@@ -1291,9 +1291,9 @@ class Trainer(Generic[Loss, Effects]):
         epochs: int | None = None,
         tokens: int | None = None,
         examples: int | None = None,
-        log_every: int | str | Counted = 100,
-        eval_every: int | str | Counted | None = None,
-        checkpoint_every: int | str | Counted | datetime.timedelta | None = None,
+        log_every: int | str = 100,
+        eval_every: int | str | None = None,
+        checkpoint_every: int | str | datetime.timedelta | None = None,
         checkpoint_final: bool = True,
         metrics: Sequence[Metric] = (),
         preview: bool = False,
@@ -1356,7 +1356,7 @@ class Trainer(Generic[Loss, Effects]):
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
         self._startup = Startup()
-        loader, held, tokens, steps, examples = run_data(
+        loader, held, tokens, steps = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
@@ -1392,7 +1392,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
-              written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
+              written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
               checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,
               scored_to: str | os.PathLike[str] | None,
               best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None,
@@ -1474,8 +1474,8 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, ahead = run.closing(interval, batch, self._examples)
-                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval, run)
+                batch, ahead = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked,
+                                          interval, run, examples=self._examples, closes=True)
                 device, _ = split_fields(batch)
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
@@ -1926,8 +1926,8 @@ class Trainer(Generic[Loss, Effects]):
                                         phase="cooldown read")
                     if batch is None:
                         break
-                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
-                                       branched)
+                    batch, _ = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
+                                          counted, branched)
                     device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)

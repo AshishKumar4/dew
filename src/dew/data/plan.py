@@ -398,6 +398,64 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
+def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], JSON]:
+    """A per-share read's saved position (its data plan and its Grain iterator's state) as `plan`, this
+    run's, reads it: the plan as `earlier_plan` translates it, and the iterator's state, where the plan
+    was written before version 8, with the counts version 8 keeps of what a read delivered (each
+    corpus's `delivered_rows`, which one that counted each row as one example held as `accepted`) and of
+    the examples refused past a held row (a causal window's carry of `_dew_refused`, none, beside its
+    `_dew_consumed`). The position's one translation; carried to 1.0 (ledger 1552)."""
+    from dew.data.mixing import COUNTER
+    from dew.data.pipeline import CONSUMED, REFUSED
+
+    written = record(saved.get("dew_data_plan"), "saved data plan")
+    iterator = json_value(saved.get("iterator"), "saved Grain iterator")
+
+    def counted(branch: JSON) -> JSON:
+        match branch:
+            case list():
+                return [counted(child) for child in branch]
+            case dict():
+                node = {name: counted(child) for name, child in branch.items()}
+            case _:
+                return branch
+        match node.get(COUNTER):
+            case {"counts": {**counts}} as counter:
+                kept: dict[str, JSON] = {"delivered_rows": counts.get("accepted", 0), **counts}
+                node[COUNTER] = {**counter, "counts": kept}
+        match node:
+            case {"parent": _, "skip": _, "held": {**held}} if CONSUMED in held and REFUSED not in held:
+                match held[CONSUMED]:
+                    case {"dtype": dtype, "tokens": list(tokens)}:
+                        zeros: list[JSON] = [0] * len(tokens)
+                        none: dict[str, JSON] = {"dtype": dtype, "tokens": zeros}
+                        carried: dict[str, JSON] = {**held, REFUSED: none}
+                        node["held"] = carried
+        return node
+
+    if written.get("version") == 7:
+        iterator = counted(iterator)
+    return earlier_plan(written, plan), iterator
+
+
+def read_alike_at_8(saved: Mapping[str, object]) -> bool:
+    """Whether version 8 reads a version 7 data plan's order as 7 did (`earlier_plan`). Version 8 reads a
+    streamed order otherwise only where it takes some of it before its loading workers (a `.take`, now
+    taken across them) or bounds it in examples (its manifest's `MarkConsumed` step, now dealt to a pool's
+    shares and its workers): alike where its read is not streamed, one reader reads it, no take reads its
+    order (no `Limit` among its stages, its mixed corpora's orders within it), or its takes are no bound in
+    examples and no loading workers read them, a corpus's own pool among them (`pools`)."""
+    order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
+    readers = topology if isinstance(topology, Mapping) else {}
+    pools = readers.get("pools", {})
+    workers = max([readers.get("workers", 0), *(pools.values() if isinstance(pools, Mapping) else ())])
+    alone = readers.get("shares", 1) == 1 and workers < 2
+    untaken = not _LIMIT.search(json.dumps(order))
+    steps = json.dumps(record(saved.get("manifest", {}), "saved data manifest").get("steps", []))
+    unbounded = "MarkConsumed" not in steps and workers < 2
+    return order.get("read") != "streamed" or alone or untaken or unbounded
+
+
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
     position's one translation, where a reader's `set_state` decodes it. A token store a Dew before row 3028
@@ -406,6 +464,8 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
+    if saved.get("version") == 7 and plan.version == 8 and read_alike_at_8(saved):
+        saved = {**saved, "version": 8}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved

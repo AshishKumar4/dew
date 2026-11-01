@@ -1849,6 +1849,29 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "    return yaml\n"), "SLOP019", (5, 17, 22, 37, 54, 81))
 
 
+def test_a_bare_jit_in_a_package_that_compiles_through_dews_compile_point_is_reported(tmp_path):
+    """SLOP025: in a package whose programs compile through `OuterProgram` (RL's, serving's), a bare
+    `jax.jit` as a decorator, a call, within functools.partial or imported by its own name, and a bare
+    `jax.pmap`, are reported; a program that compiles through `OuterProgram` is not, nor a jit in another
+    package."""
+    rollout = ("import functools\n"
+               "import jax\n"
+               "from jax import jit\n"
+               "from dew.nn.kernels.options import OuterProgram\n"
+               "@jax.jit\n"
+               "def acted(x): return x\n"
+               "stepped = jax.jit(acted)\n"
+               "partial = functools.partial(jax.jit, static_argnums=0)\n"
+               "imported = jit(acted)\n"
+               "@OuterProgram\n"
+               "def compiled(x): return x\n"
+               "mapped = jax.pmap(acted)\n")
+    for package in ("rl", "objectives/rl", "inference"):
+        assert_reported(tmp_path / package.replace("/", "-"), f"src/sparx/{package}/rollout.py", rollout,
+                        "SLOP025", (5, 7, 8, 9, 12))
+    assert _linted(tmp_path / "other", {"src/sparx/training/step.py": rollout}) == []
+
+
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):
     """SLOP012: a script that replaces or deletes the package's own functions,
     by any assignment or `setattr`, and a library that does so to anything it

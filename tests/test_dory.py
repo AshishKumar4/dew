@@ -15,12 +15,15 @@ import optax
 import pytest
 from decision_support import decision_rows
 from float64_terms import float64_forward
-from interop_support import assert_reloads, assert_same_stored_tensors
+from interop_support import assert_reloads, assert_same_stored_tensors, token_draw
+from model_support import as_stepped
 from reference_error import (
     as_given,
     assert_as_exact,
     assert_computes_the_oracle,
+    assert_rounds_where_the_reference_does,
     chain_roundings,
+    equations,
     indexed_recording,
     recording,
     seeds_for,
@@ -44,7 +47,6 @@ from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.ngpt import stepped
-from dew.nn.precision import L2NORM_EPS
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling
@@ -78,33 +80,33 @@ def changed(directory: Path, change: dict) -> Path:
     return directory
 
 
-DORY_SEEDS = {'logits': 8, 'packed': 8, 'keys': 8, 'per_loop': 8, 'last_loop': 8, 'cache': 8, 'variant': 8}
-"""Declared seeds for check 1 against the live transcription (`assert_as_the_transcription`), each
-site's the most its cases took, sized by `seeds_for` paired on armada."""
+LOGITS_SEEDS = 8
+"""The seeds each check 1 of Dory's logits against the transcription's declares: each site sized paired
+(`seeds_for`) resolves at its fewest."""
 
 
-def assert_as_the_transcription(dew, transcribed, draw, label: str, *, seeds: int) -> None:
-    """Check 1 of `dew(*inputs)` against the transcription's fp32 run over the same inputs,
-    `transcribed(torch.float32, *inputs)`, its float64 run (`transcribed(torch.float64, *inputs)`)
-    the truth: the torch reference that wrote the fixture (tools/dory_reference.py), live."""
-    def reference(*inputs):
-        return transcribed(TOOL.torch.float32, *inputs)
-
-    def truth(*inputs):
-        return transcribed(TOOL.torch.float64, *inputs)
-
-    assert_as_exact(dew, as_given(reference), draw, label, seeds=seeds, truth_fn=truth)
-
-
-def drawn_ids(site: int, shape=REFERENCE['input_ids'].shape):
-    """A draw of token ids past the tiny vocabulary's specials, of `shape`, its stream `site`'s."""
-    return lambda seed: (np.random.default_rng([0x596, site, seed]).integers(
-        12, json.loads((TINY / 'config.json').read_text())['vocab_size'], shape, dtype=np.int32),)
-
-
-def exported(loaded) -> dict[str, np.ndarray]:
-    """The loaded Dory's tensors under the checkpoint's names, writable copies the reference takes."""
+def tensors_of(loaded: Pretrained) -> dict[str, np.ndarray]:
+    """`loaded`'s weights under the checkpoint's names, as the transcription reads them."""
     return {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+
+
+def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, **fields):
+    """The transcription's float32 and float64 runs of `compute(reference, *inputs)` over `tensors`
+    (`TOOL.DoryReference` with `fields`): check 1's reference and truth arms, each run as given."""
+    arms = [TOOL.DoryReference(config, tensors, dtype, **fields) for dtype in (TOOL.torch.float32,
+                                                                              TOOL.torch.float64)]
+    return tuple(as_given(lambda *inputs, arm=arm: compute(arm, *(np.asarray(value) for value in inputs)))
+                 for arm in arms)
+
+
+def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, seeds: int, *, stream: int,
+                           config: dict | None = None, **fields) -> None:
+    """Check 1 of `dew(ids)`, Dory's logits over drawn ids of the fixture's shape, against the
+    transcription's forward (`transcribed`) over `loaded`'s weights, its float64 run the truth."""
+    config = loaded.config if config is None else config
+    reference, truth = transcribed(config, tensors_of(loaded), lambda arm, ids: arm.forward(ids), **fields)
+    assert_as_exact(dew, reference, token_draw(stream, config['vocab_size'], REFERENCE['input_ids'].shape),
+                    label, seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize('loops', [1, 2, 4])
@@ -150,49 +152,38 @@ def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
 @pytest.mark.parametrize('loops', [1, 2, 4])
 def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count(loops):
     """The tiny Dory's logits with its recurrent block run once, twice (its own count) and four
-    times, as vLLM's forward computes them (check 1 against the live transcription); the same of its
-    final states contracted with its output table, the head's matrix and its per-token gain past the
-    product, as a tiled loss scores them, and with the table's rows (`OutputTable.rows`, the head's
-    matrix rows times each token's logit gain), which a joint decision head's lexical prior gathers."""
+    times, as vLLM's forward computes them, within tests/reference_error.py's rule of its fp32 run
+    against float64; the same of its final states contracted with its output table, the head's
+    matrix and its per-token gain past the product, as a tiled loss scores them."""
     loaded = load()
-    model, tensors = loaded.model.with_passes(loops), exported(loaded)
+    model = loaded.model.with_passes(loops)
 
-    def dew(ids):
+    def logits(ids):
+        return model.apply(loaded.variables, ids)
+
+    def tabled(ids):
         table = model.apply(loaded.variables, method='output_table')
-        hidden = model.apply(loaded.variables, ids, method='hidden_states')
-        return {'logits': model.apply(loaded.variables, ids), 'table': table.logits(hidden),
-                'rows': hidden @ table.rows().T}
+        return table.logits(model.apply(loaded.variables, ids, method='hidden_states'))
 
-    def transcribed(dtype, ids):
-        logits = TOOL.DoryReference(loaded.config, tensors, dtype, loops=loops).forward(np.asarray(ids))
-        return {'logits': logits, 'table': logits, 'rows': logits}
-
-    assert_as_the_transcription(dew, transcribed, drawn_ids(loops), f'Dory logits at {loops} loops',
-                                seeds=DORY_SEEDS['logits'])
+    assert_logits_as_vllms(logits, loaded, f'Dory logits at {loops} loops', LOGITS_SEEDS,
+                           stream=0xD01, loops=loops)
+    assert_logits_as_vllms(tabled, loaded, f"Dory's output table at {loops} loops", LOGITS_SEEDS,
+                           stream=0xD02, loops=loops)
 
 
 def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     """In bf16 the first layer's keys, the projections of the same embeddings, rotate as vLLM's
     CUDA rotary does (cos and sin rounded to bf16, the turn in fp32, one rounding) and unit-norm in
-    fp32: the keys a prefill caches are as exact as the transcription's own bf16 keys (check 1,
-    its float64 keys the truth)."""
+    fp32, so the keys a prefill caches sit within a quarter of the reference's own bf16 error of
+    its keys (`assert_rounds_where_the_reference_does`); fp32 tables, which round only the turn,
+    sit a whole bf16 rounding apart."""
     loaded = Pretrained.load(TINY, dtype='bfloat16', attention_impl='xla')
-    tensors = exported(loaded)
-
-    def dew(ids):
-        cache = loaded.model.apply(loaded.variables, ids.shape[0], method=CausalTransformer.init_cache,
-                                   mutable=['cache'])[1]['cache']
-        _, written = loaded.model.apply({**loaded.variables, 'cache': cache}, ids, decode=True,
-                                        mutable=['cache'])
-        return written['cache']['layers_0']['self_attn']['cached_key'][:, :ids.shape[1]]
-
-    def transcribed(dtype, ids):
-        if dtype == TOOL.torch.float64:
-            return TOOL.DoryReference(loaded.config, tensors, dtype).first_keys(np.asarray(ids))
-        keys = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.bfloat16).first_keys(np.asarray(ids))
-        return keys.astype(jnp.bfloat16)
-
-    assert_as_the_transcription(dew, transcribed, drawn_ids(10), 'bf16 keys', seeds=DORY_SEEDS['keys'])
+    ids = REFERENCE['input_ids']
+    cache = loaded.model.apply(loaded.variables, ids.shape[0], method=CausalTransformer.init_cache,
+                               mutable=['cache'])[1]['cache']
+    _, written = loaded.model.apply({**loaded.variables, 'cache': cache}, ids, decode=True, mutable=['cache'])
+    keys = np.asarray(written['cache']['layers_0']['self_attn']['cached_key'][:, :ids.shape[1]], np.float64)
+    assert_rounds_where_the_reference_does(keys, REFERENCE['keys_bf16'], REFERENCE['keys_f64'], 'bf16 keys')
 
 
 @pytest.mark.parametrize('loops', [None, 4])
@@ -202,59 +193,63 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
     ('per_loop'), or one a recurrent layer that each pass overwrites ('last_loop', a pass reading
     its own keys for the step's tokens and the last pass's for the earlier ones), at the tiny's own
     two loops and at four, whose later passes a step runs under one scan (`looping.run_loop`). The
-    tokens are the reference's, and each step's logits over drawn prompts and continuations are as
-    exact as the live transcription's decoding under the same cache (check 1).
+    tokens are the reference's, and over drawn continuations, each step fed the token drawn for it,
+    each step's logits are on par with the transcription's decoding under the same cache (check 1).
     A per-pass cache is exact, the full forward's: the uncached logits of the whole continuation
-    hold to the transcription the same way, and the cached steps to those uncached logits. A
-    last-loop cache is the model's own approximation, held to the transcription's decoding under it."""
+    are on par with the transcription's uncached forward at the positions each step decoded, and the
+    cached steps with Dew's uncached logits at the shapes each step computes (`as_stepped`: the
+    prompt's from one forward over it, each later step's from one over the continuation up to it;
+    ledger 1543), each from the transcription's float64 decoding. A last-loop cache is the model's own
+    approximation, held to the reference's decoding under it."""
     loaded = load()
     model = with_cache(loaded.model if loops is None else loaded.model.with_passes(loops), mode)
-    variables, tensors = loaded.variables, exported(loaded)
     tag = mode if loops is None else f'{mode}_{loops}'
-    passes = {} if loops is None else {'loops': loops}
-
-    empty = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
-
-    @jax.jit
-    def stepped(cache, tokens):
-        logits, mutated = model.apply({**variables, 'cache': cache}, tokens[None], decode=True,
-                                      mutable=['cache'])
-        return logits[0, -1], mutated['cache']
-
-    def decoded(prompt, tokens):
-        """Each step's logits: the prompt's last position, then a token at a time but the last."""
-        logits, cache = stepped(empty, jnp.asarray(prompt))
-        steps = [logits]
-        for token in np.asarray(tokens)[:-1]:
-            logits, cache = stepped(cache, jnp.asarray([token]))
-            steps.append(logits)
-        return np.asarray(jnp.stack(steps))
-
     expected = REFERENCE[f'generated_{tag}']
-    np.testing.assert_array_equal(decoded(expected[:6], expected[6:]).argmax(-1), expected[6:])
+    prompt = jnp.asarray(expected[None, :6])
+    variables = loaded.variables
+    cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
+    logits, mutated = model.apply({**variables, 'cache': cache}, prompt, decode=True, mutable=['cache'])
+    steps = [np.asarray(logits[0, -1])]
+    for token in expected[6:-1]:
+        logits, mutated = model.apply({**variables, 'cache': mutated['cache']}, jnp.asarray([[token]]),
+                                      decode=True, mutable=['cache'])
+        steps.append(np.asarray(logits[0, -1]))
+    steps = np.stack(steps)
+    np.testing.assert_array_equal(steps.argmax(-1), expected[6:])
 
-    def whole(prompt, tokens):
-        joined = jnp.concatenate([jnp.asarray(prompt), jnp.asarray(tokens)[:-1]])[None]
-        return model.apply(variables, joined)[0, len(prompt) - 1:]
+    # The prompt's last row, then a row for each drawn token but the last, fed a step at a time through
+    # the cache, each step's program compiled once for every draw (`decoding`), its logits unscored.
+    programs = (*decoding(model)[:3], lambda logits: logits)
+    decoded = as_given(lambda prompt, tokens: forced(programs, variables, prompt, tokens, prompt_rows=False))
+    forward = jax.jit(lambda ids: model.apply(variables, ids))
 
-    def transcribed(dtype, prompt, tokens):
-        return TOOL.DoryReference(loaded.config, tensors, dtype, mode=mode, **passes).forced(
-            np.asarray(prompt), np.asarray(tokens), prompt_rows=False)
+    def continuation(prompt, tokens):
+        return np.concatenate([prompt, tokens[:-1]])[None]
+
+    tensors, vocabulary = tensors_of(loaded), loaded.config['vocab_size']
 
     def draw(seed):
-        rng = np.random.default_rng([0x596, 20, seed])
-        return tuple(rng.integers(12, loaded.config['vocab_size'], width, dtype=np.int32) for width in (6, 8))
+        rng = np.random.default_rng([0xD04, seed])
+        return tuple(rng.integers(12, vocabulary, length, dtype=np.int32) for length in (6, 8))
 
-    assert_as_the_transcription(as_given(decoded), transcribed, draw, f"Dory's {tag} decoding",
-                                seeds=DORY_SEEDS[mode])
+    def decoded_by(arm, prompt, tokens):
+        return arm.forced(prompt, tokens, prompt_rows=False)
+
+    reference, truth = transcribed(loaded.config, tensors, decoded_by, mode=mode, loops=loops)
+    assert_as_exact(decoded, reference, draw, f"Dory's {tag} decoding", seeds=LOGITS_SEEDS,
+                    truth_fn=truth)
     if mode == 'per_loop':
-        assert_as_the_transcription(whole, transcribed, draw, "Dory's forward over its continuation",
-                                    seeds=DORY_SEEDS[mode])
-        def truth(*inputs):
-            return transcribed(TOOL.torch.float64, *inputs)
+        whole = as_given(lambda prompt, tokens: forward(continuation(prompt, tokens))[0, 5:])
 
-        assert_as_exact(as_given(decoded), whole, draw, "Dory's per-pass cache against its forward",
-                        seeds=DORY_SEEDS['cache'], truth_fn=truth)
+        def uncached(arm, prompt, tokens):
+            return arm.forward(continuation(prompt, tokens))[0, 5:]
+
+        forward_reference, _ = transcribed(loaded.config, tensors, uncached, loops=loops)
+        assert_as_exact(whole, forward_reference, draw, "Dory's forward over its continuation",
+                        seeds=LOGITS_SEEDS, truth_fn=truth)
+        stepped = as_given(lambda prompt, tokens: as_stepped(forward, continuation(prompt, tokens), 6)[0, 5:])
+        assert_as_exact(decoded, stepped, draw, "Dory's per-pass cache against its forwards",
+                        seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
@@ -326,21 +321,21 @@ def test_packed_documents_read_only_themselves_through_every_pass(attention_impl
     passes reinject, reads another document, and the window of 5 crosses a document's start in
     every row."""
     loaded = Pretrained.load(TINY, dtype='float32', attention_impl=attention_impl)
-    segments, tensors = REFERENCE['packed_segments'], exported(loaded)
+    positions, segments = REFERENCE['packed_positions'], REFERENCE['packed_segments']
 
-    def dew(ids):
-        return loaded.model.apply(loaded.variables, ids, positions=REFERENCE['packed_positions'],
-                                  segment_ids=segments)
+    def packed(ids):
+        return loaded.model.apply(loaded.variables, ids, positions=positions, segment_ids=segments)
 
-    def transcribed(dtype, ids):
-        # Each document alone, its logits laid out where its row holds it.
-        reference = TOOL.DoryReference(loaded.config, tensors, dtype)
-        return np.stack([np.concatenate([reference.forward(np.asarray(row)[None, held == document])[0]
-                                         for document in np.unique(held)])
-                         for row, held in zip(ids, segments, strict=True)])
+    def alone(arm, ids):
+        # Each document's own logits, laid out where its row holds it.
+        return np.stack([np.concatenate([arm.forward(ids[row, segments[row] == document][None])[0]
+                                         for document in np.unique(segments[row])])
+                         for row in range(len(ids))])
 
-    assert_as_the_transcription(dew, transcribed, drawn_ids(30, segments.shape),
-                                f'Dory packed documents, {attention_impl}', seeds=DORY_SEEDS['packed'])
+    reference, truth = transcribed(loaded.config, tensors_of(loaded), alone)
+    draw = token_draw(0xD03, loaded.config['vocab_size'], REFERENCE['packed_ids'].shape)
+    assert_as_exact(packed, reference, draw, 'Dory packed documents', seeds=LOGITS_SEEDS,
+                    truth_fn=truth)
 
 
 def greedy(mode: str) -> TextGeneration:
@@ -440,7 +435,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     every gradient keeps its checkpoint name."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
-    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    tensors = tensors_of(loaded)
     cut = None if backprop_steps is None else loops - backprop_steps
 
     def shapes(dtype):
@@ -478,32 +473,20 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
 
 
 def test_a_step_computes_in_the_widest_of_its_operands():
-    """nGPT's residual step runs in the widest of its residual, its branch and its rate: a float64
-    residual and branch stepped by a float32 rate take the rate's product in float64, within float64
-    rounding of the slerp computed apart in float64 (`assert_computes_the_oracle`), where a float32
-    product of the rate would sit a float32 rounding away; and a float32 residual stepped by float64
-    operands returns its own float32."""
-    rng = np.random.default_rng(0)
+    """nGPT's residual step runs in at least fp32 of its residual, its branch and its rate: a float32
+    residual stepped toward a float64 branch by a float64 rate, or by a float64 rate alone, takes its
+    rate and its difference in float64, inside its two-pass reverse's rule as well, and rounds once to the
+    residual's float32."""
     with jax.enable_x64(new_val=True):
-        residual, branch = (rng.normal(size=(3, 8)) for _ in range(2))
-        alpha = rng.uniform(0.1, 1.0, 8).astype(np.float32)
-
-        def step(residual, branch, alpha):
-            return stepped(residual, branch, alpha, 0.3)
-
-        found = step(jnp.asarray(residual), jnp.asarray(branch), jnp.asarray(alpha))
-        roundings = chain_roundings(jax.make_jaxpr(step)(residual, branch, alpha))
-        assert np.asarray(step(jnp.asarray(residual, jnp.float32), jnp.asarray(branch),
-                               jnp.asarray(alpha, jnp.float64))).dtype == np.float32
-
-    def unit(x):
-        # nGPT's justnorm: its eps under the root (`dew.nn.precision.l2norm`).
-        return x * (np.sum(np.square(x), axis=-1, keepdims=True) + L2NORM_EPS) ** -0.5
-
-    start, end = unit(residual), unit(branch)
-    oracle = unit(start + np.abs(alpha.astype(np.float64) * 0.3) * (end - start))
-    assert np.asarray(found).dtype == np.float64
-    assert_computes_the_oracle(np.asarray(found), oracle, "nGPT's step in float64", roundings=roundings)
+        residual = jnp.ones((2, 4), jnp.float32)
+        for branch, alpha in ((jnp.ones((2, 4), jnp.float64), jnp.ones(4, jnp.float64)),
+                              (jnp.ones((2, 4), jnp.float32), jnp.ones(4, jnp.float64))):
+            traced = jax.make_jaxpr(lambda residual, branch, alpha: stepped(residual, branch, alpha, 0.5))(
+                residual, branch, alpha)
+            stepping = {equation.outvars[0].aval.dtype for equation in equations(traced)
+                        if equation.primitive.name in ("abs", "sub")}
+            assert stepping == {np.dtype(np.float64)}
+            assert traced.out_avals[0].dtype == np.float32
 
 
 def test_a_float64_model_computes_in_float64():
@@ -512,7 +495,7 @@ def test_a_float64_model_computes_in_float64():
     independent implementation of the same tensors (`assert_computes_the_oracle`), where one fp32
     rounding point on the path would sit many orders further."""
     loaded = load()
-    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    tensors = tensors_of(loaded)
     with jax.enable_x64(new_val=True):
         model = loaded.model.clone(dtype=jnp.float64)
         variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
@@ -729,11 +712,17 @@ EXAMPLES = [Example(state, {'team': INTENT}, {'team': label})
 
 
 def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
-    """The joint schema head's lexical prior gathers the output table's rows, which contracted with the
-    final states give Dory's logits (the looped stack's check). Over the release's own tokenizer it
-    trains a step that moves the head and the backbone, and the saved run answers as the live one
-    does."""
+    """The joint schema head's lexical prior gathers the output table's rows: the head's matrix
+    rows times each token's logit gain, which contracted with the final states give Dory's logits.
+    Over the release's own tokenizer it trains a step that moves the head and the backbone, and
+    the saved run answers as the live one does."""
     loaded = load(max_seq_len=1024)
+
+    def contracted(ids):
+        table = loaded.model.apply(loaded.variables, method='output_table')
+        return loaded.model.apply(loaded.variables, ids, method='hidden_states') @ table.rows().T
+
+    assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", LOGITS_SEEDS, stream=0xD05)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
@@ -770,7 +759,10 @@ def test_the_released_config_round_trips_through_dews_fields():
     its default null), and that config translates to the same fields."""
     released = json.loads((RELEASED / 'config.json').read_text())
     fields = hf_decoders.translate_config(released)
-    written = hf_decoders.export_config(models.build('causal_transformer', fields))
+    model = models.build('causal_transformer', fields)
+    assert model.num_layers == 72 and model.loop is not None and model.loop.layers == (16, 56)
+    assert model.loop.steps == 2 and model.ngpt is not None
+    written = hf_decoders.export_config(model)
     for field in DORY_FIELDS:
         assert written.get(field) == released[field], field
     assert hf_decoders.translate_config(written) == fields
@@ -802,13 +794,11 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     starts at an MLP and ends at an attention, and a loop over no layer."""
     loaded = Pretrained.load(changed(tmp_path / variant, TOOL.VARIANTS[variant]), dtype='float32',
                              attention_impl='xla')
-    tensors = exported(loaded)
 
-    def transcribed(dtype, ids):
-        return TOOL.DoryReference(loaded.config, tensors, dtype).forward(np.asarray(ids))
+    def logits(ids):
+        return loaded.model.apply(loaded.variables, ids)
 
-    assert_as_the_transcription(lambda ids: loaded.model.apply(loaded.variables, ids), transcribed,
-                                drawn_ids(50), f'Dory logits, {variant}', seeds=DORY_SEEDS['variant'])
+    assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', LOGITS_SEEDS, stream=0xD06)
 
 
 def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
@@ -928,26 +918,24 @@ def decoding(model: CausalTransformer):
     return opened, step, last, scored
 
 
-def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Array | np.ndarray:
-    """Dew's log-probabilities at each position of `prompt` followed by `tokens`, the prompt
-    prefilled and each token but the last decoded a step at a time through the cache (`programs`,
-    `decoding`'s), as a run that drew `tokens` computes them: the prompt's rows (its last alone, the
-    vocabulary over that state alone, where `prompt_rows` is False), then a row a token, each block
-    of rows scored and, run outside a trace, brought to the host as it is made, so the device never
-    holds the vocabulary over every row at once (the float64 4B's outgrow a 40 GB A100 beside its
-    cache)."""
+def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Array:
+    """Dew's rows at each position of `prompt` followed by `tokens`, scored by `programs`' last
+    (`decoding`'s, log-probabilities), the prompt prefilled and each token but the last decoded a step
+    at a time through the cache (`programs`), as a run that drew `tokens` computes them: the prompt's
+    rows (its last alone, the vocabulary over that state alone, where `prompt_rows` is False), then a
+    row a token."""
     opened, step, last, scored = programs
     ids = jnp.asarray(np.asarray(prompt, np.int32)[None])
     if prompt_rows:
         logits, written = step(variables, opened(variables), ids)
-        rows = [jax.device_get(scored(logits[0]))]
+        rows = [logits[0]]
     else:
         (_, logits), written = last(variables, opened(variables), ids)
-        rows = [jax.device_get(scored(logits))]
+        rows = [logits]
     for token in tokens[:-1]:
         logits, written = step(variables, written['cache'], jnp.asarray([[token]], jnp.int32))
-        rows.append(jax.device_get(scored(logits[0])))
-    return jnp.concatenate(rows) if isinstance(rows[0], jax.core.Tracer) else np.concatenate(rows)
+        rows.append(logits[0])
+    return scored(jnp.concatenate(rows))
 
 
 def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weights, config: dict,
@@ -962,25 +950,24 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
     programs = decoding(model)
 
     def rows(programs, variables):
-        blocks = [forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
-                  for prompt, tokens, prompt_rows in parts.values()]
-        return {'log_probabilities': (jnp.concatenate(blocks) if isinstance(blocks[0], jax.core.Tracer)
-                                      else np.concatenate(blocks))}
+        return {'log_probabilities': jnp.concatenate([
+            forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
+            for prompt, tokens, prompt_rows in parts.values()])}
 
     def dew(index, order):
         # Each order's weights placed alone, and gone from the device when the call returns.
         return jax.tree.map(np.asarray, rows(programs, jax.device_put(symmetric(weights, config, order))))
 
     # The float64 arm on the default device, a GPU's float64 units where one runs the test, its kernels
-    # chosen as a CPU's, the portable math: its weights kept on the host as stored and placed for a call
-    # alone, so the device never holds them beside an order's, each widened exactly where a product
-    # reads it, so the 4B's float64 run fits a 40 GB A100 beside its cache.
+    # chosen as a CPU's, the portable math: its weights kept on the host and placed for a call alone, so
+    # the device never holds them beside an order's.
     with jax.enable_x64(new_val=True), generation.assumed('cpu'):
         wide_programs = decoding(model.clone(dtype=jnp.float64))
+    held = widened(weights)
 
     def truth(order):
         with jax.enable_x64(new_val=True), generation.assumed('cpu'):
-            return rows(wide_programs, jax.device_put(weights))
+            return rows(wide_programs, jax.device_put(held))
 
     truth.dew_programs = True
     seeds = int(stored[f'{site}.seeds'])
@@ -1002,7 +989,7 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
     config = json.loads((TINY / 'config.json').read_text())
     ids = REFERENCE['input_ids'][0]
     for mode in ('per_loop', 'last_loop'):
-        tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+        tensors = tensors_of(loaded)
         reference = TOOL.DoryReference(config, tensors, torch.float64, mode=mode)
         # The tiny Dory's window is 5: the second prompt runs past it.
         prompts = {'sentence': (ids[:4], True), 'window': (ids, False)}
@@ -1039,11 +1026,11 @@ RELEASE_RUNS = load_tool('dory_vllm_reference').RUNS
 """The release recorder's runs: (loop count, cache mode, dtype)."""
 
 
-def the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count(run):
-    """The release's receipt run (tools/dory_release_receipt.py, a GPU job: at about three minutes a
-    recorded seed it outgrows a suite test, whose run holds the same gate on the tiny model,
-    `test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distances`):
-    NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision against vLLM's own engine running it
+@pytest.mark.network
+@pytest.mark.gpu(reason='the 4B release, held to vLLM running it on a GPU')
+@pytest.mark.parametrize('run', RELEASE_RUNS, ids=['-'.join(map(str, run)) for run in RELEASE_RUNS])
+def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count(run):
+    """NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision against vLLM's own engine running it
     (tools/dory_vllm_reference.py; its recording tests/fixtures/hf/dory-1.0-4b/recording.npz, its
     provenance inside), in bf16 at one, two and four loops and in fp32 at two, through each cache: the
     log-probabilities of a sentence's prompt and of the 256 tokens vLLM drew greedily after it, each

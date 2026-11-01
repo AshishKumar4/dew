@@ -722,8 +722,10 @@ class Transaction:
             stored = self.objective.projected(current.variables["params"], updated=False)
             if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
                 clocked = {} if self.bound is None else {"progress": self.progress(current)}
+                # Only an optimizer that solves the update's system reads its statistics (`dew.gauss_newton`).
+                solved = {"statistics": statistics} if solves_equations(current.opt_state) else {}
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk,
-                                                          statistics=statistics, **clocked)
+                                                          **solved, **clocked)
             else:
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored)
             # The update moves the weights, and each post-step effect of this update (QK-Clip's

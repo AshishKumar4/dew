@@ -140,13 +140,13 @@ def test_a_training_stream_says_it_never_runs_out_by_its_stages_read_in_turn(ord
     """A corpus of 8 cut to 4 and repeated for ever never runs out, and one repeated and then cut
     does, as one only cut does; one written with neither repeats for ever as training reads it. Its
     training stream says so, and reads on past 4 records exactly where it never runs out."""
-    from dew.data.dataset import stream_endless
+    from dew.data.dataset import stream_ends
 
     rows = _tagged(1, 8)
     written = {"take, then repeat": rows.take(4).repeat(), "repeat, then take": rows.repeat().take(4),
                "neither": rows, "take": rows.take(4)}[order]
     reader = compile(written.batch(1), loading=READ).train(DataPartition())
-    said = stream_endless(reader)
+    said = stream_ends(reader) == "never"
     assert len(_ids(reader, 6)) == (6 if endless else 4)
     assert said is endless
 
@@ -174,12 +174,12 @@ def test_a_grain_transformation_of_its_own_may_end_an_order_unless_a_repeat_foll
     """A Grain transformation of a chain's own (`grain`) may end an order a repeat made endless, as
     one that keeps the first two records does: its stream does not say it never runs out unless a
     repeat after it makes it so, and it reads what that makes."""
-    from dew.data.dataset import stream_endless
+    from dew.data.dataset import stream_ends
 
     chain = _tagged(1, 8).take(4).repeat().grain(lambda rows: rows[:2])
     reader = compile((chain.repeat() if repeated else chain).batch(1), read="indexed",
                      loading=READ).train(DataPartition())
-    said = stream_endless(reader)
+    said = stream_ends(reader) == "never"
     assert len(_ids(reader, 6)) == (6 if endless else 2)
     assert said is endless
 
@@ -187,11 +187,11 @@ def test_a_grain_transformation_of_its_own_may_end_an_order_unless_a_repeat_foll
 def test_a_streamed_mix_of_a_repeated_part_and_one_written_without_says_it_never_runs_out():
     """A stream cut per share repeats a part written without a repeat at its own root, so a mix of
     a repeated part and one written without never runs out: its stream says so and reads on."""
-    from dew.data.dataset import stream_endless
+    from dew.data.dataset import stream_ends
 
     reader = compile(mix([_tagged(1, 4).repeat(), _tagged(2, 2)], weights=(1, 1)).batch(1), read="streamed",
                      loading=READ).train(DataPartition())
-    said = stream_endless(reader)
+    said = stream_ends(reader) == "never"
     assert len(_ids(reader, 12)) == 12
     assert said
 
@@ -205,13 +205,13 @@ def test_a_part_repeated_at_its_root_and_then_cut_ends_the_mix_that_reads_it(sha
     """A read cut per share repeats a part written without a repeat at its own root, and the part's
     own limit then ends it: a mix of a repeated part and one cut to three and filtered runs out on
     every share, and its stream says so; its batch of two splits over two shares."""
-    from dew.data.dataset import stream_endless
+    from dew.data.dataset import stream_ends
 
     chain = mix([_tagged(1, 8).repeat(), _tagged(2, 8).take(3).filter(_not_201)], weights=(1, 1))
     loader = compile(chain.batch(2), read="indexed", loading=READ)
     for index in range(shares):
         reader = loader.train(DataPartition(index, shares))
-        said = stream_endless(reader)
+        said = stream_ends(reader) == "never"
         assert len(_ids(reader, 64)) < 64
         assert said is False
 
@@ -220,12 +220,12 @@ def test_a_nested_mix_cut_per_share_by_the_mix_around_it_never_runs_out():
     """A mix nested in one a filter cuts per share is cut per share too, so its part written without a
     repeat repeats at its root: the nested mix never ends, nor the one around it, whose stream says so
     and reads on past every part's records."""
-    from dew.data.dataset import stream_endless
+    from dew.data.dataset import stream_ends
 
     inner = mix([_tagged(1, 4).repeat(), _tagged(2, 2)], weights=(1, 1))
     chain = mix([inner, _tagged(3, 4).repeat()], weights=(1, 1)).filter(lambda row: True)
     reader = compile(chain.batch(1), read="indexed", loading=READ).train(DataPartition())
-    said = stream_endless(reader)
+    said = stream_ends(reader) == "never"
     assert len(_ids(reader, 24)) == 24
     assert said
 
@@ -237,63 +237,3 @@ def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_read
     loader = compile(mix([_tagged(1, 8).repeat(), _tagged(2, 4)], weights=(1, 1)).batch(1), loading=READ)
     assert loader.records == 8
     assert sorted(_ids(loader.train(DataPartition()))) == [*range(100, 104), *range(200, 204)]
-
-
-def _pulled(expansion=None):
-    """An objective pulling a weight toward its batches' real rows of `id`, over the rows its data step
-    `expansion` makes of each record, where it names one."""
-    import jax.numpy as jnp
-
-    from dew.data.pipeline import ObjectiveData
-    from dew.objectives import Aux, Objective
-
-    class Pulled(Objective):
-        def fresh_variables(self, key, held):
-            return {"params": {"w": jnp.zeros(())}}
-
-        def loss(self, variables, batch, step):
-            x = jnp.asarray(batch["id"], jnp.float32)
-            return self.row_mean(jnp.square(variables["params"]["w"] - x), batch), Aux({})
-
-        def data(self):
-            return ObjectiveData(train=() if expansion is None else (expansion,))
-
-    return Pulled()
-
-
-@pytest.mark.parametrize("read", ["memory", "streamed"])
-def test_epochs_of_a_read_whose_objective_makes_rows_of_its_examples_are_passes_over_its_examples(read):
-    """A run of two epochs over 12 records whose objective makes 1 to 3 rows of each (`Questioned`), so
-    its read has no record count: an epoch is a pass over its 12 source examples (`Loader.pass_examples`),
-    so the run trains on the examples clock to 24 of them; a config's epoch cadence is a pass's 12 examples
-    (row 1902)."""
-    import optax
-    from data_support import Questioned
-
-    from dew.config import TrainerConfig
-    from dew.data.compile import fitted
-    from dew.training import Trainer
-    from dew.training.budget import recorded
-
-    ids = np.arange(1, 13, dtype=np.int32)
-    chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(8)
-    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
-    assert (loader.records, loader.examples) == (None, 24)
-    evaluated = TrainerConfig(epochs=2, eval_every="epoch").eval_interval(loader)
-    state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
-    assert int(state.consumed) == 24
-    assert recorded(evaluated) == {"examples": 12}
-
-
-def test_epochs_of_a_read_it_packs_as_its_rows_arrive_are_passes_over_its_documents():
-    """A run of three epochs over 10 documents a pack lays out as they arrive, read per share, so its
-    read has no record count: an epoch is a pass over its 10 documents, so the run trains on the examples
-    clock to 30 of them (row 1902)."""
-    import optax
-
-    from dew.training import Trainer
-
-    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
-    chain = Pipeline(Memory(documents)).shuffle(seed=1).read("indexed").pack(8, fields=("id",)).batch(8)
-    state = Trainer(_pulled(), optax.sgd(0.01), key=0).fit(chain, epochs=3, log_every=1)
-    assert int(state.consumed) == 30

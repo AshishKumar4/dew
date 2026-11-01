@@ -36,17 +36,13 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
               accumulation: int, examples: int | None = None) -> int | None:
     """The microsteps a run takes over `loader`, the one policy for a fit's and a config's run length:
     `steps`, `epochs` of it, whose ramp stages begin where updates do, as the stream cuts them, or the
-    steps that read the `examples` it is bounded to (`Loader.example_steps`), a read with no record count
-    bounded to its epochs' source examples among them, or None where `tokens` alone bounds it. Refuses a
-    run with no length or two, and epochs of a stream with no count of either."""
+    steps that read the `examples` it is bounded to (`Loader.example_steps`), or None where `tokens`
+    alone bounds it. Refuses a run with no length or two, and epochs of a stream with no record count."""
     run_length(steps, epochs, tokens, examples)
     if examples is not None:
         return loader.example_steps(examples, accumulation)
     if epochs is None:
         return steps
-    if loader.records is None and loader.examples is not None:
-        # A read with no record count, bounded to its epochs' source examples (`fitted`).
-        return loader.example_steps(loader.examples, accumulation)
     return loader.epoch_steps(epochs, accumulation)
 
 
@@ -82,7 +78,7 @@ class Plateau:
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
 
 
-def every_step(value: Cadence | str, steps: int | None, tokens: int | None, accumulation: int, *,
+def every_step(value: int | str | None, steps: int | None, tokens: int | None, accumulation: int, *,
                name: str, examples: int | None = None) -> Cadence:
     """`value`, a cadence of steps or a share of the run such as `5%` (`dew._records.share`), resolved
     once against the run's planned length: a share of `steps` microsteps, `accumulation` an update,

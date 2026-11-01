@@ -362,7 +362,8 @@ def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_tas
 def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_held(decide):
     """A served task counts, per pass shape, the tokens its passes computed, `rows` windows of `length`
     tokens each, and the real tokens of the rows they scored (`PassTokens`, row 2772): the share of each
-    shape's, and of every pass's, reads what padding costs the server."""
+    shape's, and of every pass's, reads what padding costs the server, which reports it
+    (`ScoringServer.metrics`)."""
     from test_decision_batches import CASES
 
     task, variables = decide.scoring()
@@ -379,7 +380,8 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
     # Each pass computes its shape's windows, or more where a mesh's devices pad them (`RowPlan.count`).
     assert all(passes.windows >= passes.passes * shape.rows for shape, passes in shapes.items())
     computed = sum(passes.windows * shape.length for shape, passes in shapes.items())
-    metrics = task.passes.metrics()
+    metrics = server.metrics()
+    assert metrics == task.passes.metrics()
     assert metrics["served/real_token_share"] == sum(passes.real for passes in shapes.values()) / computed
     assert 0 < metrics["served/real_token_share"] < 1
     assert {name for name in metrics if name.endswith("/passes")} == {

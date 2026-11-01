@@ -6,13 +6,13 @@ delivered row says (`CorpusCounts.examples`): read by workers, after every batch
 import grain.python as pygrain
 import numpy as np
 import pytest
-from data_support import Fanned, Questioned
+from data_support import Fanned, Questioned, WideDraw
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import Closeable, DataPartition, Loading
-from dew.data.pipeline import ObjectiveData, Pack, Pipeline, Rejected
+from dew.data.pipeline import Configured, ObjectiveData, Pack, Pipeline, Rejected
 
 BATCH = 8
 
@@ -261,3 +261,61 @@ def test_each_batch_states_the_source_examples_read_by_then_and_a_resumed_read_g
         if isinstance(resumed, Closeable):
             resumed.close()
 
+
+
+class Cut:
+    """An objective's expansion of each record into `id % 3 + 1` rows, each cut short (`_dew_truncated`)
+    by a cut of one row removing two tokens (`_dew_cut`), as a decision layout says of a question it fit
+    by cutting its options."""
+
+    identity = "cut@1"
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question), "_dew_truncated": True,
+                      "_dew_cut": {"options": (1, 2)}} for question in range(int(element["id"]) % 3 + 1))
+
+
+class Shortened:
+    """A step that says each row was cut short (`_dew_truncated`), as a layout says of one it fit by
+    cutting."""
+
+    identity = "shortened@1"
+
+    def __call__(self, row):
+        return {**row, "_dew_truncated": True}
+
+
+def wide_draw(metadata):
+    return WideDraw()
+
+
+def test_a_memory_read_states_the_share_of_its_rows_cut_short_however_often_it_holds_them():
+    """Twelve examples a memory read holds, every one cut short (`Shortened`), with a draw configured for
+    the run, which a memory read binds between two passes that each hold the corpus and count it anew: the
+    share of its rows cut short (data/truncated) is 1.0, of the rows the last pass holds (row 1890's
+    review)."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    drawn = Configured(wide_draw, needs=(), scope="run", random=True)
+    loader = compile(Pipeline(Memory({"id": ids})).map(Shortened()).repeat(1).batch(BATCH), read="memory",
+                     objective=ObjectiveData(train=(drawn,)))
+    read_whole(loader, "id")
+    assert counted(loader) == [12]
+    assert counted(loader, "data/truncated/") == [1.0]
+
+
+@pytest.mark.parametrize("bounded", [True, False])
+def test_a_corpus_states_the_share_of_its_rows_cut_short_in_rows(bounded):
+    """Twelve examples an objective makes 1 to 3 rows of each, every row cut short, read bounded to them
+    or once: the share of the corpus's rows cut short (data/truncated) is a share of the rows it delivered,
+    all of them, 1.0, and the tokens its cuts removed are its 24 rows' two each, wherever it counts its
+    source examples, one per example's last row or one per example before the step (row 1890's
+    review)."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4))
+    # Unbounded, a training read repeats without end: it is read once.
+    loader = compile((chain if bounded else chain.repeat(1)).batch(BATCH), read="streamed",
+                     objective=ObjectiveData(train=(Cut(),)), examples=12 if bounded else None)
+    read_whole(loader, "question")
+    assert counted(loader) == [12]
+    assert counted(loader, "data/truncated/") == [1.0]
+    assert counted(loader, "data/cut_removed/") == [2 * 24]

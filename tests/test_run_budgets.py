@@ -646,16 +646,17 @@ def clocked_descent(accumulation: int):
 
 
 def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1,
-                learning_rate=None, examples: int = CLOCKED_RECORDS):
+                learning_rate=None, examples: int = CLOCKED_RECORDS, rollout=None):
     """A run bounded to `examples` examples of `x`, read in order as a stream, whose objective makes
     `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
-    batches of BATCH rows, checkpointed to `directory` where given: its final state and its tracker."""
+    batches of BATCH rows, through `rollout` where given, checkpointed to `directory` where given: its
+    final state and its tracker."""
     tracker = RecordingTracker()
     ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
     chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
     optim = OptimConfig(optimizer="adam", learning_rate=learning_rate or Linear(peak_value=PEAK,
                                                                                 end_value=CLOCKED_END))
-    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation,
+    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation, rollout=rollout,
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
     return trainer.fit(chain.batch(BATCH), examples=examples, log_every=log_every, stop=stop), tracker
 
@@ -733,9 +734,6 @@ def test_a_clocked_run_names_its_length_once():
     with pytest.raises(ValueError):
         clocked(CLOCK_LIMIT + 1, None)
     assert clocked(CLOCK_LIMIT, None) == CLOCK_LIMIT
-    # A pool's shares run out apart, and a share that ran out has nothing a rollout draws further from.
-    with pytest.raises(ValueError):
-        clocked(CLOCK_LIMIT, None, pooled_draws=True)
 
 
 def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_at_its_bound():
@@ -756,6 +754,37 @@ def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_
     np.testing.assert_array_equal(np.asarray(handed.variables["params"]["w"]),
                                   np.asarray(alone.variables["params"]["w"]))
     assert losses(rolled) == losses(plain) != []
+
+
+class DrawingFurther:
+    """A rollout that draws one batch past its step's (`draws_further`) and makes its step of that one,
+    or of the step's where the stream has run out, each its rows as host code reads them (`local_rows`)."""
+
+    draws_further = True
+
+    def __call__(self, state, batch, key, further):
+        from dew.nn.inputs import local_rows
+
+        drawn = further()
+        return {name: local_rows(column) for name, column in (batch if drawn is None else drawn).items()}
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_rollout_drawing_further_on_the_examples_clock_resumes_as_it_ran(accumulation, tmp_path):
+    """A run bounded to its CLOCKED_RECORDS examples, read as a stream no plan counts ahead, whose rollout
+    draws a batch past each step's (`DrawingFurther`): every batch it read consumes its examples, the run
+    reading ahead for its stream's end after the rollout's last draw, so it ends at its bound; paused at
+    half its examples and resumed, it trains on as the run that never paused, step for step and in its
+    weight, its checkpoint holding the position after every batch the rollout drew (row 3329)."""
+    (x,) = clocked_records(0)
+    whole, ran = clocked_fit(x, accumulation, rollout=DrawingFurther())
+    paused, before = clocked_fit(x, accumulation, directory=tmp_path, stop=Pause(0.5),
+                                 rollout=DrawingFurther())
+    resumed, after = clocked_fit(x, accumulation, directory=tmp_path, rollout=DrawingFurther())
+    assert int(paused.consumed) < int(resumed.consumed) == int(whole.consumed) == CLOCKED_RECORDS
+    np.testing.assert_array_equal(np.asarray(resumed.variables["params"]["w"]),
+                                  np.asarray(whole.variables["params"]["w"]))
+    assert losses(before) + losses(after) == losses(ran) != []
 
 
 def test_a_custom_step_trains_a_run_bounded_in_examples_whose_schedule_reads_no_progress():
