@@ -303,5 +303,6 @@ def test_an_environment_a_function_builds_is_named_again_by_its_record(name):
     held = EnvConfig(name, {"name": "CartpoleBalance"} | ({} if name == "playground" else {"count": 4}))
     run = EnvRunConfig(env=held)
     again = EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict())))
-    assert again.env is not None and again.env.member is held.member is envs[name]
+    # A classmethod is bound afresh at each read: the same function of the same class, equal, not identical.
+    assert again.env is not None and again.env.member == held.member == envs[name]
 
