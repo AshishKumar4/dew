@@ -51,7 +51,7 @@ def test_banked_smoke_serve(release_source):
         "source_deleted": embedding.is_deleted(), "placed_deleted": placed.is_deleted(),
     })
     task = TextGeneration(model, banked, None, sampling=Sampling(temperature=0))
-    server = Server.from_task(task, slots=2, capacity=128, admission=1)
+    server = Server.from_task(task, slots=8, capacity=128, admission=8)
     results = [result.host() for result in server([[100, 101, 102, 103]], 2, key=0)]
     assert results
 
