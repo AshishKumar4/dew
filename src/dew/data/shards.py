@@ -27,14 +27,11 @@ def streamed(
     epochs: int | None = 1,
     name: str | None = None,
     places: Sequence[tuple[Shard, int]] | None = None,
-    quota: int | None = None,
 ) -> grain.IterDataset:
     """The shards of `manifest` read `epochs` times over (endlessly where None), this share's part
     of them interleaved `cycle_length` at a time; or, given an endless read's bound, this share's
     `places` among the stream's first rows alone, each with the rows it reads of it (`bounded_places`),
-    so its interleave reads no later pass's rows in their stead; or, given the share's `quota` of a
-    bound over shards that state no rows, its first `quota` rows, each loading worker its own part of
-    them. An endless read of a store whose shards
+    so its interleave reads no later pass's rows in their stead. An endless read of a store whose shards
     all state they hold no row is refused, as it would read nothing forever; any other run of empty
     shards is read through, logged at each doubling from `LONG_RUN` (`logged_run`)."""
     if cycle_length < 1:
@@ -49,7 +46,7 @@ def streamed(
         return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described)
     root = _dealt(_shards(manifest, partition=partition, loading=loading), seed=seed, epochs=epochs)
     root = root[partition.cut()]
-    return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota)
+    return _ShardPass(root, manifest.reader, cycle_length, loading, described)
 
 
 def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | None, loading: Loading,
@@ -144,34 +141,25 @@ def _dealt(shards: tuple[Shard, ...], *, seed: int | None, epochs: int | None) -
 
 class _ShardPass[Place](grain.IterDataset):
     """A share's places of a stream (its shards, or `(shard, rows)` of a bound's, `bounded_places`), each
-    read by `reader`, interleaved `cycle` at a time, its first `quota` rows alone where the share's bound
-    is held in examples over shards that state no rows. A loading worker reads its slice of the places
-    (`set_slice`) and its part of the quota, every worker's count-th."""
+    read by `reader`, interleaved `cycle` at a time."""
 
     def __init__(self, root: grain.MapDataset, reader: Callable[[Place], grain.IterDataset], cycle: int,
-                 loading: Loading, name: str, quota: int | None = None):
+                 loading: Loading, name: str):
         super().__init__(root)
         self.root, self.reader = root, reader
-        self.cycle, self.loading, self.name, self.quota = cycle, loading, name, quota
+        self.cycle, self.loading, self.name = cycle, loading, name
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
         self.root = self.root[selection]
-        if self.quota is not None:
-            self.quota = len(range(*selection.indices(self.quota)))
 
     def __iter__(self) -> grain.DatasetIterator:
-        if not len(self.root) or self.quota == 0:
-            # A worker dealt no place or no row of the bound reads nothing; Grain's interleave of no
-            # dataset raises.
-            return grain.MapDataset.source(()).to_iter_dataset().__iter__()
         empty = _EmptyRun(self.name)
-        rows = experimental.InterleaveIterDataset(
+        return experimental.InterleaveIterDataset(
             self.root.map(_Reader(self.reader, empty)),
             cycle_length=self.cycle,
             num_make_iter_threads=max(self.loading.threads, 1),
             make_iter_buffer_size=self.loading.read_buffer,
-        )
-        return (rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)).__iter__()
+        ).__iter__()
 
 
 class _EmptyRun:
