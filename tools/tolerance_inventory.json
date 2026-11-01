@@ -621,10 +621,6 @@
    "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_recurrence_template_stability.py": {
-   "comparisons": 1,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_reference_runs.py": {
    "comparisons": 4,
    "lane": "Models, Serving & RL"

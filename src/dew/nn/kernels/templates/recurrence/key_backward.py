@@ -7,6 +7,7 @@ which XLA sums over a key head's value heads and cumulates over each chunk (`gra
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,16 @@ def _parted(call: _Call) -> _Operand:
     return _Operand(call.rows, FAST_PARTS, jnp.dtype(jnp.float32))
 
 
+def _value_blocks(form: _Operand, ref, row, column, call: _Call, smem) -> Callable[[int, jax.Array], None]:
+    """A store of a chunk's value block `j` `[C, block]` into `ref` in `form` at `row`, its columns from
+    `column` on (`algebra.key_scores_back`'s and `key_values_back`'s `emit`)."""
+
+    def stored(j, value):
+        form.store(ref, value, row, CHUNK, column + j * call.block, call.block, family=call.family, smem=smem)
+
+    return stored
+
+
 @_lowered_once
 def _key_scores_back(scores, do, corrected, taken, call: _Call):
     """`(dAqk [R, HV * C] fp32, dv [R, HV * Dv])`: each chunk and value head's scores' gradient and the
@@ -77,10 +88,7 @@ def _key_scores_back(scores, do, corrected, taken, call: _Call):
         def step(index, slots, carry, accumulators):
             del index
 
-            def stored(j, dv):
-                grads.store(dv_ref, dv, row, CHUNK, h * value_width + j * call.block, call.block,
-                            family=family, smem=landing["row"])
-
+            stored = _value_blocks(grads, dv_ref, row, h * value_width, call, landing["row"])
             d_scores = algebra.key_scores_back(
                 _tile(slots, "scores", held), functools.partial(_column, call, slots, "out", given),
                 functools.partial(_column, call, slots, "corrected", held), blocks, Issuer(call), emit=stored)
@@ -240,10 +248,7 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: _Call):
             lower = _tile(slots, "lower", held)
             issue = Issuer(call, {"values_merge": values, "system_merge": system})
 
-            def stored(j, grad):
-                square.store(dv_out_ref, grad, row, CHUNK, h * value_width + j * call.block, call.block,
-                             family=family, smem=landing["values"])
-
+            stored = _value_blocks(square, dv_out_ref, row, h * value_width, call, landing["values"])
             summed, beta_terms = algebra.key_values_back(
                 functools.partial(column, "value_grads", grads), functools.partial(column, "values", given),
                 blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue, issue.summed,
