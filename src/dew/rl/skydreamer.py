@@ -29,17 +29,17 @@ et al., arXiv 2501.14377, Sec III-B): its first entry the throttle, zero the dro
 1 its full thrust; the rest the body rates over the drone's rate limit; it reaches the flight controller
 `latency` seconds later (`delays`; SkyDreamer's image and action delays together are 33 and 11 ms).
 
-The policy reads the camera's image (`image`, the renderer's, `SkyDreamerRace`) and, as SkyDreamer's does,
-the body rates, the rotors' speeds (each a share of the top speed, so a decoder's squared error over them is
-of the others' size) and the flight plan (Sec II-H, Eq 12: for the next three gates, the change in position
-and yaw from the gate before, then their positions and yaws). The plan moves on as the drone crosses a gate's
+The policy reads the camera's image (`image`, the renderer's, `SkyDreamerRace`) and, as SkyDreamer's does, the
+body rates, the rotors' speeds (each a share of the top speed, so a decoder's squared error over them is of
+the others' size) and the flight plan (Sec II-H, Eq 12: for the next three gates, the change in position and
+yaw from the gate before, then their positions and yaws). The plan moves on as the drone crosses a gate's
 plane: SkyDreamer moves it at a random point from the pre-gate to the post-gate in training, and where its
 world model's decoded position passes 0.15 m before the gate in flight; here it moves at the gate. The
-privileged entries a world model decodes (`state`, Sec II-B) are the position and velocity in the world and
-in the gate headed for, and the orientation, the roll, pitch and yaw in the world and the yaw from the gate's
-heading; the camera's extrinsics are fixed and the dynamics' parameters are left out. The camera is tilted
-up 30 degrees, fixed (`Racing`'s, the owner's, where SkyDreamer's is 45 to 55), its horizontal field of view
-`fov`.
+privileged entries a world model decodes (`state`, Sec II-B) are the position and velocity in the world and in
+the gate headed for, and the orientation, the roll, pitch and yaw in the world and the yaw from the gate's
+heading; the camera's extrinsics are fixed and the dynamics' parameters are left out. The camera is tilted up
+30 degrees, fixed as a real FPV quadrotor's camera is mounted (`Racing`'s; SkyDreamer's is 45 to 55), its
+horizontal field of view `fov`.
 
 Randomization is `ramp`'s, a race's curriculum from 0 (none) to 1, as `dew.rl.flight`'s: the drone's body
 and its rotors' noise (`dew.rl.quadrotor.drawn_body`, `flown`), its rate limit, the camera's image and the
@@ -67,7 +67,7 @@ from dew.rl.flight import (
     Renderer,
     Scene,
     Seen,
-    delayed,
+    commanded,
     drawn_camera,
     gate_axes,
     quaternion,
@@ -332,24 +332,12 @@ class SkyRace:
         done = jnp.zeros((), bool)
         return lap, TimeStep(self.observed(lap), jnp.zeros(()), done, done)
 
-    def commanded(self, lap: Lap, action: jax.Array) -> tuple[Lap, jax.Array, jax.Array]:
-        """An action as the flight controller takes it, `delay` steps later (`dew.rl.flight.delayed`): the
-        collective thrust (N), the throttle's share of the hover below zero and of the span from the hover
-        to the full thrust above; the body rates (rad/s), its share of the drone's rate limit."""
-        action = jnp.clip(action, -1, 1)
-        hover = lap.body.mass * GRAVITY
-        full = self.sky.quadrotor.nominal_thrust
-        collective = hover + action[0] * jnp.where(action[0] >= 0, full - hover, hover)
-        pending, sent = delayed(lap.pending, lap.delay,
-                                jnp.concatenate([collective[None], action[1:] * lap.rate_limit]))
-        return dataclasses.replace(lap, pending=pending), sent[0], sent[1:]
-
     def step(self, lap: Lap, action: jax.Array) -> tuple[Lap, TimeStep]:
         """The drone flown a control step, then the planes it crossed in order, the frames it struck, the
         reward and whether the episode ended (the module docstring)."""
         sky = self.sky
         before = lap.flight.position
-        lap, collective, rates = self.commanded(lap, action)
+        lap, collective, rates = commanded(sky.quadrotor, lap, action)
         key, noise = jax.random.split(lap.key)
         flight, _ = flown(sky.quadrotor, lap.body, lap.flight, collective, rates, noise, sky.hz,
                           jnp.asarray(self.ramp))

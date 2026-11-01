@@ -339,7 +339,7 @@ def test_commands_carry_each_drones_throttle_rates_and_latency():
     with jax.enable_x64(new_val=True):
         race = races(RACING, 1, 64)
         actions = rng.uniform(-1.3, 1.3, (10, 64, 4))
-        step = jax.jit(jax.vmap(lambda race, action: commanded(RACING, race, action)))
+        step = jax.jit(jax.vmap(lambda race, action: commanded(RACING.quadrotor, race, action)))
         sent = []
         for action in actions:
             race, collective, rates = step(race, jnp.asarray(action))
@@ -713,6 +713,34 @@ def test_a_race_restarts_only_the_drones_it_is_told_to():
     kept, held = np.asarray(after.course.center), np.asarray(before.course.center)
     np.testing.assert_array_equal(kept[~mask], held[~mask])
     assert not np.array_equal(kept[mask], held[mask])
+
+
+def test_a_races_restarted_drones_are_drawn_at_the_curriculum_it_stands_at():
+    """A race whose curriculum changes between its steps (`difficulty` and `ramp`, as a run raises them)
+    restarts its drones on courses drawn at the curriculum it stands at now: those a race that began there
+    draws from the same keys, and not those the curriculum it left draws."""
+    def restarted(begun: float, now: float) -> list[np.ndarray]:
+        race = GateRace(None, Racing(), views=("gates", "physics"), count=4, difficulty=begun, ramp=begun)
+        race.reset(0)
+        race.difficulty = race.ramp = now
+        return jax.tree.leaves(jax.tree.map(np.asarray, race.restart(jnp.ones(4, bool))))
+
+    for same, other in zip(restarted(0.0, 1.0), restarted(1.0, 1.0), strict=True):
+        np.testing.assert_array_equal(same, other)
+    assert any(not np.array_equal(left, drawn)
+               for left, drawn in zip(restarted(0.0, 0.0), restarted(1.0, 1.0), strict=True))
+
+
+def test_a_races_programs_compile_under_the_options_the_run_holds_open():
+    """A race compiles its programs through Dew's compile point, so under an option the run holds open
+    (`compiled_with`, the accuracy gate's seam) that XLA does not know it is refused, as any program of
+    Dew's is (row 3408: its programs were bare outer programs, which took no option)."""
+    from dew.nn.kernels.options import compiled_with
+
+    with compiled_with({"xla_dew_no_such_option": True}):
+        race = GateRace(None, Racing(), views=("state", "passed"), count=4)
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            race.reset(0)
 
 
 @pytest.mark.parametrize("asked", [{"families": (("nowhere", 1.0),)}, {"layouts": ("nowhere",)},

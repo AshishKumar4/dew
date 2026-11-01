@@ -5,13 +5,14 @@ them, a resume ending where the run that never stopped ends, and each setup the 
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from recording import bits
+from affine_run import bits
 from test_env_rollout import evaluation_key
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
@@ -98,7 +99,7 @@ def assert_bitwise(one, other) -> None:
 
 
 def ppo(root: Path):
-    run = dataclasses.replace(teacher_run(root, 3), episodes=EpisodesConfig(steps=16))
+    run = dataclasses.replace(teacher_run(root, 3), episodes={"episodes": EpisodesConfig(steps=16)})
     objective = teacher_policy()
     env = Batched(FlightEnv(racing(), VIEWS), 16)
     return run, objective, ControlRollout(objective, env, unroll_length=4, epochs=1, minibatches=2)
@@ -139,23 +140,35 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
     assert_bitwise(state, saved.prepare().train("again"))
 
 
-@pytest.mark.parametrize("agent", ["ppo", "dreamer"])
+@pytest.mark.parametrize("agent", ["ppo", "dreamer", "dreamer in a simulator"])
 def test_a_runs_episodes_score_its_greedy_flights_from_the_evaluations_key(tmp_path, agent):
     """A run validated by its episodes logs at its end `episodes/return` and `episodes/steps`: the first
     episodes its greedy policy earns flown 16 steps from the key the run's key gives its last step
-    (`dew.rl.evaluation.episodes`), on its averaged weights where it keeps them; a PPO policy over the race's
-    observation, a Dreamer agent over the driven step (`Driven`) from the memory it starts with."""
+    (`dew.rl.evaluation.episodes`), on its averaged weights where it keeps them; a PPO policy over the
+    race's observation, a Dreamer agent over the driven step (`Driven`) from the memory it starts with, and
+    a Dreamer agent trained in a race a host simulator steps, flown in a race of the split's own
+    (`DrivenSimulator`)."""
     from dew.rl.env import Driven
+    from dew.rl.simulator import DrivenSimulator
     from dew.training.tracker import LocalTracker
 
-    run, objective, _ = ppo(tmp_path) if agent == "ppo" else dreamer(tmp_path)
-    run = dataclasses.replace(run, episodes=EpisodesConfig(steps=16))
+    run, objective, _ = {"ppo": ppo, "dreamer": dreamer, "dreamer in a simulator": transdreamer_race}[agent](
+        tmp_path)
+    count = 16 if agent == "ppo" else 8
+    simulated = {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": count}
+    own = EnvConfig("gate_race", simulated) if agent == "dreamer in a simulator" else None
+    split = EpisodesConfig(steps=16, env=own)
+    run = dataclasses.replace(run, episodes={"episodes": split})
     state = run.prepare().train("scored")
     logged = {name: value for _, scalars in LocalTracker(str(tmp_path / "scored" / "tracking")).scalars()
               for name, value in scalars.items() if name.startswith("episodes/")}
-    race = Batched(FlightEnv(racing(), VIEWS), 16 if agent == "ppo" else 8)
-    flown = (episodes(objective.greedy, race, 16) if agent == "ppo" else
-             episodes(objective.greedy, Driven(race), 16, memory=objective.memory))
+    if agent == "ppo":
+        race = Batched(FlightEnv(racing(), VIEWS), count)
+        flown = episodes(objective.greedy, race, 16)
+    else:
+        race = (DrivenSimulator(GateRace(None, racing(), views=VIEWS, count=count)) if own is not None
+                else Driven(Batched(FlightEnv(racing(), VIEWS), count)))
+        flown = episodes(objective.greedy, race, 16, memory=objective.memory)
     with generation.run_precision(run.trainer.precision):
         expected = flown(state.variables if state.ema is None else state.averaged,
                          evaluation_key(state.key, 3))
@@ -264,11 +277,15 @@ REFUSED = {
     "a teacher that neither labels nor demonstrates": {"teacher": True},
     "a width the environment states": {"model": ModelConfig(WORLD_MODEL,
                                                             {**TINY, "reads": "state", "action_size": 4})},
+    "an auxiliary head's width": {"model": ModelConfig(WORLD_MODEL, {**TINY, "reads": "state",
+                                                                     "auxiliary": [["teacher", 80, 8]]})},
+    "a proprioceptive entry's width": {"model": ModelConfig(WORLD_MODEL, {**TINY, "reads": "state",
+                                                                          "proprio": [["teacher", 80]]})},
     "a simulator batched again": {"env": EnvConfig("gate_race", {"renderer": None, "racing": RACING,
                                                                  "views": list(VIEWS), "count": 8}, count=8)},
-    "episodes a simulator flies": {"env": EnvConfig("gate_race", {"renderer": None, "racing": RACING,
-                                                                  "views": list(VIEWS), "count": 8}),
-                                   "episodes": EpisodesConfig(steps=4)},
+    "episodes the run's own simulator flies": {
+        "env": EnvConfig("gate_race", {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": 8}),
+        "episodes": {"episodes": EpisodesConfig(steps=4)}},
     "an unbatched environment": {"env": EnvConfig("flight", {"racing": RACING, "views": list(VIEWS)})},
     "another objective's rollout": {"rollout": RolloutConfig("control")},
     "a teacher for a rollout that takes none": {"teacher": "demonstrates", "objective": ObjectiveConfig(
@@ -277,6 +294,20 @@ REFUSED = {
     "a model beside the run it starts from": {"pretrained": True},
 }
 """Each setup an environment run refuses, as the one change to a run that prepares."""
+
+
+def test_a_world_models_named_entries_take_their_widths_from_the_environment(tmp_path):
+    """A record naming a world model's auxiliary heads by their views and units builds the model with each
+    head's width the race's view of it, one drone's flattened: the drone's state and the teacher's view."""
+    model = ModelConfig(WORLD_MODEL, {**TINY, "reads": "state", "auxiliary": [["state", 8], ["teacher", 16]]})
+    run = student(tmp_path, 1, model=model)
+    assert run.env is not None
+    race = run.env.build()
+    shown = jax.eval_shape(race.reset, jax.random.key(0))[1].observation
+    agent = run.agent(race)
+    assert isinstance(agent, DreamerV3Objective)
+    assert agent.model.auxiliary == (("state", math.prod(shown["state"].shape[1:]), 8),
+                                     ("teacher", math.prod(shown["teacher"].shape[1:]), 16))
 
 
 @pytest.mark.parametrize("change", list(REFUSED))

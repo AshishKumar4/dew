@@ -11,8 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import bits
 from flax import struct
-from recording import bits
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.objectives.base import Shown
@@ -239,6 +239,51 @@ def test_one_unbatched_environments_episode_return_is_the_reward_its_first_episo
     assert episode_return(objective, env, variables, key, 12) == earned
 
 
+def test_a_simulators_episodes_are_the_rewards_its_first_episodes_earn():
+    """`episodes` of walks a host simulator steps (`HostWalks`, drawn starts) scores each walk's first
+    episode as flown by hand a step at a time from the same seed: its undiscounted return, its steps and
+    its position where it ended, averaged over the walks; walks' rewards and positions are integers, so
+    every order sums them exactly."""
+    from dew.rl.evaluation import episodes
+    from dew.rl.simulator import simulator_start
+
+    class Seen:
+        """`HostWalks` that show their position as a view, `x`."""
+
+        action_size = 1
+
+        def __init__(self, walks: HostWalks):
+            self.walks, self.count = walks, walks.count
+
+        def reset(self, seed: int):
+            return {"x": self.walks.reset(seed)}
+
+        def step(self, action):
+            following = self.walks.step(action)
+            return TimeStep({"x": following.observation}, following.reward, following.terminated,
+                            following.truncated)
+
+        def restart(self, mask):
+            return {"x": self.walks.restart(mask)}
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, reads=("x",))
+    variables, key = objective.init(jax.random.key(0)), jax.random.key(6)
+    walks = Seen(HostWalks(16, 8, limit=3.0, drawn=True))
+    scored = episodes(objective.greedy, walks, 12, reached=("x",))(variables, key)
+    observation = simulator_start(walks, key).observation
+    earned, lasted, at = np.zeros(16), np.zeros(16), np.zeros(16)
+    going = np.ones(16, bool)
+    for _ in range(12):
+        action = objective.greedy(variables, observation, key, None)[0]
+        following = walks.step(action)
+        reward, x = np.asarray(following.reward), np.asarray(following.observation["x"])[:, 0]
+        earned, lasted = earned + np.where(going, reward, 0), lasted + going
+        at = np.where(going, x, at)
+        going &= ~(np.asarray(following.terminated) | np.asarray(following.truncated))
+        observation = {"x": jnp.asarray(following.observation["x"])}
+    assert scored == {"return": earned.mean(), "steps": lasted.mean(), "x": at.mean()}
+
+
 @pytest.mark.parametrize("asked", [{"discount": 1.5}, {"lam": -0.1}, {"clip": 0.0}])
 def test_a_discount_lambda_or_clip_outside_its_range_is_refused(asked):
     with pytest.raises(ValueError):
@@ -384,6 +429,19 @@ def test_a_simulator_outside_jax_rolls_out_as_its_env_does(policy, steps):
         observation = jnp.where(done[:, None], fresh.observation, following.observation)
     np.testing.assert_array_equal(ended.observation, observation)
     assert np.asarray(simulated.following.done).any()
+
+
+def test_a_simulators_policy_step_compiles_under_the_options_the_run_holds_open():
+    """A simulator's policy step compiles through Dew's compile point, so under an option the run holds
+    open (`compiled_with`, the accuracy gate's seam) that XLA does not know it is refused, as any program
+    of Dew's is (row 3408: the step was a bare outer program, which took no option)."""
+    from dew.nn.kernels.options import compiled_with
+    from dew.rl.simulator import simulator_rollout, simulator_start
+
+    simulator = ShardedWalks(5, 3)
+    carry = simulator_start(simulator, jax.random.key(4))
+    with compiled_with({"xla_dew_no_such_option": True}), pytest.raises(jax.errors.JaxRuntimeError):
+        simulator_rollout(simulator, pushes, {}, carry, 3)
 
 
 def test_a_driven_simulator_records_what_a_driven_env_records():

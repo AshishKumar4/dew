@@ -120,6 +120,11 @@ def raw_leaf(leaf):
         leaf.dtype, jax.dtypes.prng_key) else leaf
 
 
+def bits(state) -> list[np.ndarray]:
+    """Every leaf of a run's state on the host, a key as its raw bits, for a bit-for-bit comparison."""
+    return [np.asarray(raw_leaf(leaf)) for leaf in jax.tree.leaves(state)]
+
+
 class Features(Regression):
     """An objective whose evaluation returns its predictions as representations."""
 

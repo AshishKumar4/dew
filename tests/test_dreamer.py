@@ -2,6 +2,7 @@
 (danijar/dreamerv3 at e01491fad6434b2245a3b8ca201dd7faedcc458c) transcribed here in NumPy float64,
 an episode driver's records against the steps it took, and an agent that learns its world."""
 
+import dataclasses
 import itertools
 import math
 
@@ -10,8 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import bits
 from flax import struct
-from recording import bits
 from reference_error import assert_computes_the_oracle, chain_roundings
 from test_env_rollout import kept_as_left
 
@@ -211,6 +212,26 @@ AGENTS = {"gru": (walks(Target), lambda: tiny()), "gru-simulator": (HostTarget, 
 """Each agent's environments and world model: the block GRU's and TransDreamer's dynamics over the walk's
 position, the GRU's again over the walks simulated on the host, and TransDreamer's over the walk seen as
 pixels alone, its position predicted from the latent by an auxiliary head."""
+
+
+@pytest.mark.parametrize("agent", ["gru", "gru-simulator"])
+def test_a_rollout_writes_its_replay_in_place(agent):
+    """A Dreamer rollout's steps are written to its replay in place: the replay it held when a collection
+    began, over an environment on the device or a simulator on the host, is donated to the program that
+    writes them and deleted once it ran, so the replay is never held twice."""
+    from dew.training import Trainer
+
+    environments, model = AGENTS[agent]
+    objective = DreamerV3Objective(model())
+    rollout = DreamerRollout(objective, environments(), capacity=400, batch=8, length=16, train_ratio=8.0,
+                             prefill=24)
+    state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout).place()[0]
+    rollout(state, {}, jax.random.key(1))
+    begun = rollout.held_replay
+    assert begun is not None
+    # The next update owes steps the prefill did not take.
+    rollout(dataclasses.replace(state, updates=state.updates + 1), {}, jax.random.key(2))
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(begun.held))
 
 
 def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():

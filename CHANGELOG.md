@@ -16,6 +16,23 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   an environment run is public (`dew.objectives.rl.config.idle`), the acceptance runs of PPO and DreamerV3
   (`tools/rl_acceptance.py`) train as environment runs, and `LocalTracker.timed` reads a journal's reports
   with the second each was logged at.
+- Every RL program compiles through Dew's compile point with the options its models and the run hold open
+  (`compiled_with`, a quantized model's int8 GEMM option): a Dreamer or control rollout over an environment is
+  its objective's program (`Objective.program`, which now takes `donate_argnames` and holds the environment it
+  runs), so it is built again when the objective's model is replaced, and a gate race's, a renderer's and a
+  simulator's programs take them too; `simulator_rollout` takes the `models` its policy runs. Their per-step
+  host loops (a simulator's policy step, a race's step, views and scene, a renderer's poses, a server's row
+  state moves) run the executable they fetched once (`dew.nn.kernels.options.Fetched`), building no dispatch
+  key a step; a race keeps its programs for the curriculum it is at and makes them again where it changes.
+  Source that builds an `OuterProgram` outside `dew.nn.kernels.options` is reported (SLOP025).
+- `Residuals` no longer takes `damping`: it states its Gauss-Newton system where the run's optimizer asks
+  (`Step.equations`), and Gauss-Newton is an optimizer, `dew.gauss_newton.gauss_newton(learning_rate,
+  damping)` or `OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": ...})`. A config that
+  sets no learning rate takes the optimizer's own, Gauss-Newton's whole step (1.0), the rest's 2.7e-4;
+  param groups scale their leaves of one solve, and `clip_grads` caps its step's norm. A run that set
+  `damping` on its objective steps by its optimizer's rule instead, so give it this optimizer.
+- A scoring server reports what its task's passes cost and what it admitted and refused
+  (`ScoringServer.metrics`); the decision serving example serves them at `GET /metrics`.
 - A corpus whose objective makes several rows of each example counts its examples as `data/rows`, not the
   rows or windows made of them: a run bounded in examples counts those whose last rows were delivered, an
   example a step refused or made no row of under `data/rejected`; any other run counts the examples read

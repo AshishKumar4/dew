@@ -18,6 +18,7 @@ import pytest
 from reference_error import assert_computes_the_oracle
 
 from dew.objectives.rl.dreamer import DreamerV3Objective, WorldModel
+from dew.rl.flight import commanded
 from dew.rl.hyperlux import fisheye_map, fisheyed
 from dew.rl.quadrotor import GRAVITY, hovering
 from dew.rl.skydreamer import CIRCLE, TRACKS, Lap, Sky, SkyRace, plan
@@ -229,8 +230,9 @@ def test_an_action_commands_collective_thrust_and_body_rates_after_its_latency()
                                     np.clip(rates, -1, 1) * limit])
             held = [np.r_[hover, 0.0, 0.0, 0.0]] * delay
             for at, throttle in enumerate(throttles):
-                lap, collective, commanded = race.commanded(lap, jnp.asarray(np.r_[throttle, rates]))
-                assert_computes_the_oracle(np.r_[float(collective), np.asarray(commanded)],
+                lap, collective, rates_sent = commanded(race.sky.quadrotor, lap,
+                                                        jnp.asarray(np.r_[throttle, rates]))
+                assert_computes_the_oracle(np.r_[float(collective), np.asarray(rates_sent)],
                                            (held + wanted)[at], f"throttle {throttle}", roundings=4)
 
 

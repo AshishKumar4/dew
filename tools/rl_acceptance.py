@@ -46,6 +46,8 @@ from dew.training import LocalTracker
 
 CONTROL, DREAMER = "dew.objectives.rl.control", "dew.objectives.rl.dreamer"
 """The modules of the agents' networks and objectives, which a record names by import path."""
+SCORED = "episodes"
+"""The validation split the acceptance runs score their greedy flights on, which logs `episodes/return`."""
 
 
 class _Tracker:
@@ -82,7 +84,8 @@ def tracked(directory: Path, began: float) -> tuple[list[dict], float]:
                 for name, value in scalars.items()
             }
             curve.append({"step": step, "seconds": at - began, **named})
-    (greedy,) = [scalars["episodes/return"] for _, _, scalars in reports if "episodes/return" in scalars]
+    returns = [scalars[f"{SCORED}/return"] for _, _, scalars in reports if f"{SCORED}/return" in scalars]
+    (greedy,) = returns
     return curve, greedy
 
 
@@ -113,7 +116,9 @@ def ppo_run(
             checkpoint_every=None,
             resume="never",
         ),
-        episodes=EpisodesConfig(1000, EnvConfig("playground", playground, count=128, episode_length=1000)),
+        episodes={
+            SCORED: EpisodesConfig(1000, EnvConfig("playground", playground, count=128, episode_length=1000))
+        },
     )
 
 
@@ -182,7 +187,7 @@ def dreamer_run(
             checkpoint_every=None,
             resume="never",
         ),
-        episodes=EpisodesConfig(1000),
+        episodes={SCORED: EpisodesConfig(1000)},
     )
 
 
