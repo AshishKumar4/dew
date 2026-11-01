@@ -1320,7 +1320,8 @@ class Trainer(Generic[Loss, Effects]):
         resume: Resume = "auto",
         cooldowns: Cooldowns | None = None,
     ) -> TrainState:
-        """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says.
+        """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says;
+        return the state in its stored form, every layer of a stage-local run whole on every stage.
 
         `resume="auto"` continues the checkpointer's latest checkpoint where it holds one and otherwise
         starts afresh; "require" refuses to start afresh, for a job that must continue, and "never" refuses
@@ -1399,8 +1400,7 @@ class Trainer(Generic[Loss, Effects]):
                 raise error
         if run.preempted is not None:
             raise Preempted(run.preempted)
-        # Handed outside the trainer as a model off the mesh reads it: every layer whole.
-        return self._staging.outside(trained)
+        return self._staging.stored(trained)
 
     def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
@@ -1715,7 +1715,7 @@ class Trainer(Generic[Loss, Effects]):
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if plan.observe:
-            plan.observe.opened(current, state, complete=complete, view=self._staging.outside)
+            plan.observe.opened(current, state, complete=complete, view=self._staging.stored)
         if complete:
             return state, shardings, True
 
