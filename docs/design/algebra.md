@@ -23,7 +23,7 @@ advance: the autodiff output of the program a user composed. Nothing runs at run
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate`, run by a developer when a declaration or a rule changes | declarations: template algebra (attention's reduction, a recurrence's update), stable numeric forms, surrogate gradients' bodies | every set, with sampled error estimates (§1.5) | Python modules and their tests, checked in and reviewed like hand-written code |
-| Compile time | the program pass, once per compiled program that differentiates (§2) | the traced jaxpr of a training step or a gradient phase, its backward included | `linear`, `identities`, `reuse`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
+| Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `linear`, `identities`, `reuse`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
 - **Dev time** covers everything whose code Dew knows in advance: a template's forward and backward tiled forms,
@@ -34,12 +34,12 @@ advance: the autodiff output of the program a user composed. Nothing runs at run
   CI regenerates them and fails when the checked-in output differs (`generate --check`), so a rule change shows up
   as a reviewed diff of generated code, never as a silent change in behavior.
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
-  optimizer make, and the backward JAX's autodiff traces for it. It runs on the programs that differentiate (the
-  resident training step and the host-master gradient phase) and on nothing else: an evaluation, rollout,
-  sampling or serving program is a forward of Dew's own bodies, which dev time has already generated. Inside a
-  step, the bodies Dew owns are marked (§6.10) and stay as they are; the pass rewrites the composition and its
-  autodiff output around them. Its rule sets are the ones whose saturation is fast and whose rounding class is
-  static, so its cost is bounded by the program's size (§6.6) and it needs no sampling.
+  optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
+  seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
+  serving above all. Inside a program, the bodies Dew owns are marked (§6.10) and stay as dev time made them; the
+  pass rewrites the composition and its autodiff output around them. Its rule sets are the ones whose saturation
+  is fast and whose rounding class is static, so its cost is bounded by the program's size (§6.6) and it needs no
+  sampling.
 - **Runtime** runs nothing of the engine: a compiled program is ordinary XLA, and a generated module is ordinary
   Python.
 
@@ -173,23 +173,25 @@ fitted to them, and a rule set ships only with measured receipts.
 
 ## 2. Where it applies
 
-- **Programs (compile time):** the pass runs where a program that differentiates is jitted, so lowering, tracing,
-  compiling and relowering all read one program:
-  - the resident training step, `Trainer._jitted`'s `jax.jit(step, …)` (`dew.training.trainer`), which every
-    default `dew train` runs and the planner compiles through `compiled_if_it_fits`, jits
-    `dew.algebra.rewritten(step)`, and so does every objective's step it builds, an RL update's included;
-  - the host-master gradient phase (`dew.training.transaction`) jits its rewritten function the same way;
-  - evaluation, rollout, sampling and serving programs (`options.program`, `Objective.program`'s, the serving
-    kernel's) are forwards of Dew's own bodies and get no pass, per the owner's scope (§1.1).
-  - The traced jaxpr already holds the backward, since autodiff runs at trace time.
+- **Programs (compile time):** the pass runs where a function is jitted, so lowering, tracing, compiling and
+  relowering all read one program:
+  - `OuterProgram._jitted` jits `dew.algebra.rewritten(fn)` (`dew.nn.kernels.options`). Every outer program Dew
+    builds through it gets the pass: `options.program` for evaluation and loads, `Objective.program` for the
+    host-master step's forward and the evaluation, rollout and sample programs, and the serving kernel's step and
+    decode programs, whose tuner lowers and compiles the same function.
+  - The resident training step, `Trainer._jitted`'s `jax.jit(step, …)` (`dew.training.trainer`), which every
+    default `dew train` runs and the planner compiles through `compiled_if_it_fits`, jits the rewritten step the
+    same way, and so does every objective's step it builds, an RL update's included.
+  - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
+    `dreamer`) jit theirs the same way.
+  - A training step's traced jaxpr already holds the backward, since autodiff runs at trace time.
   - Rewrites stay within checkpoint (remat) regions and never change what a step saves.
   - The planner's gradient trace (`dew.training.footprint`) traces the same rewritten function before it prices
     the program, so the planner prices what it compiles.
   - `dew.algebra.rewritten(fn)` is a public transform, and the seam's switch (`dew.algebra.passes`, §6.7) lets the
     accuracy gate run Dew's own programs with the pass on or off per arm (§3).
-- **Template hooks (compile time):** a hook is user code Dew cannot know in advance, so its derivative, the
-  autodiff output of a hook a step differentiates, passes through the same pass before the Pallas fuser places it
-  in a kernel.
+- **Template hooks (compile time):** a hook is user code Dew cannot know in advance, a jaxpr, so it and its
+  derivative pass through the same pass before the Pallas fuser places them in a kernel.
 - **Template algebra (dev time):** a template's online, tiled and combine forms, forward and backward, are
   generated from a declaration (§6.9):
   - attention's score function, mask and reduction;
@@ -530,9 +532,9 @@ class Rewrite:
   `eval_jaxpr`) and rebuilds the output pytree. Where it is jitted, the jit options and shardings stay the
   program's own; a static argument keeps the program's Python control flow concrete (a rollout's length, a
   policy's `random`).
-- The pass sits where a differentiating program is jitted (§2): `Trainer._jitted` jits the rewritten step and the
-  host-master gradient phase its rewritten function, so lowering, compiling and every relowering read one
-  program. `footprint`'s `make_jaxpr` traces the same rewritten function.
+- The pass sits where a function is jitted (§2): `OuterProgram._jitted` jits `rewritten(fn)`, so `lower`,
+  `trace`, `compiled` and every relowering read one program; `Trainer._jitted` jits the rewritten step, the
+  host-master phases and the rollouts theirs. `footprint`'s `make_jaxpr` traces the same rewritten function.
 - `passes` is the seam's switch. `PASSES` lives in JAX's trace context, so every jit and every executable map
   that keys on `trace_context` (jit's own, `OuterProgram._keyed`) retraces when it changes: a program already held
   never runs a form traced under another switch or priced for another target. The gate opens it per arm: off for
