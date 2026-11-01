@@ -337,20 +337,19 @@ class Allocations:
     outputs: tuple
 
     def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None) -> resources.Scope:
-        """Its allocations by lifetime (`resources.shared_bytes`): a ring family's streams the program's,
-        a family whose walks scope their streams apart (`mosaic.Family.walks_scoped`) a walk's, in no more
-        slots than a walk's `steps` where they are known (`emit_pipeline` allocates no more); each output
-        staged as its family stages it (`mosaic.Family.output_staging`, the allocations `persist` makes)."""
+        """Its allocations by lifetime (`resources.shared_bytes`): its streams where its family places them
+        (`mosaic.Family.lifetimes`, in no more slots than a walk's `steps` where they are known), and each
+        output staged as its family stages it (`mosaic.Family.output_staging`, the allocations `persist`
+        makes), after the walks where the family scopes them apart, its pipeline's memory reused."""
         consumers = tiles.warpgroups
         staging = tuple(family.output_staging(self.outputs, consumers))
-        if family.walks_scoped:
-            slots = tiles.stages if steps is None else min(tiles.stages, steps)
-            walk = tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in self.blocks.values())
-            return resources.Scope(program=(self.staged,), walks=(walk,),
-                                   after=tuple((buffer.shape, buffer.dtype) for buffer in staging))
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
         streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
-        return resources.Scope(program=(streams, self.staged, staging))
+        held, walks = family.lifetimes(streams, steps)
+        if walks:
+            return resources.Scope(program=(*held, self.staged), walks=walks,
+                                   after=tuple((buffer.shape, buffer.dtype) for buffer in staging))
+        return resources.Scope(program=(*held, self.staged, staging))
 
 
 def _typed(dtype) -> jax.ShapeDtypeStruct:
