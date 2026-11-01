@@ -308,6 +308,34 @@ def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
     assert isinstance(verify.verify_mapping(config), verify.Unmapped)
 
 
+@pytest.mark.parametrize(("model_type", "fields"), [
+    # GraniteMoeHybrid's Mamba heads tile its expanded width, which its config validates (ledger 3066).
+    ("granitemoehybrid", {"mamba_n_heads": 128, "mamba_d_head": 32, "mamba_expand": 2, "mamba_n_groups": 1,
+                          "mamba_d_state": 256, "hidden_size": 2048, "num_attention_heads": 16,
+                          "num_key_value_heads": 4, "head_dim": None,
+                          "layer_types": ["mamba", "attention"], "num_hidden_layers": 2}),
+    # PhiMoE's LongRoPE states one factor per rotated pair of its 128-wide heads (ledger 3067).
+    ("phimoe", {"hidden_size": 4096, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": None,
+                "num_local_experts": 4, "num_experts_per_tok": 2, "max_position_embeddings": 131072,
+                "original_max_position_embeddings": 4096,
+                "rope_scaling": {"type": "longrope", "long_factor": [1.0 + index / 64 for index in range(64)],
+                                 "short_factor": [1.0] * 64, "original_max_position_embeddings": 4096}}),
+    # CodeGen splits its fused qkv by four groups of heads (transformers' mp_num, ledger 3068).
+    ("codegen", {"n_embd": 1024, "n_head": 16, "n_layer": 2, "rotary_dim": 32, "hidden_size": None,
+                 "num_attention_heads": None, "num_hidden_layers": None, "num_key_value_heads": None,
+                 "head_dim": None}),
+])
+def test_the_probe_shrinks_the_sizes_a_type_couples(model_type, fields):
+    """A released config whose sizes its class couples shrinks to a model transformers builds and runs,
+    so the type is probed, its verdict a mapping or a model none computes, not `ProbeUnavailable`:
+    GraniteMoeHybrid's Mamba heads and their width with its hidden size, PhiMoE's per-pair LongRoPE
+    factors with its heads' width, CodeGen's heads in its four qkv groups."""
+    from dew.interop import verify
+
+    verdict = verify.verify_mapping(tiny_config(model_type, **fields).to_dict())
+    assert isinstance(verdict, verify.VerifiedMapping | verify.Unmapped)
+
+
 def test_a_probe_whose_source_builds_no_model_is_unavailable():
     """A type whose shrunken config builds no causal LM (CWM asking for an attention backend this host
     does not install) is `ProbeUnavailable`, wherever the probe first builds it, its depth's cut

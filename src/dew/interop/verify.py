@@ -96,6 +96,11 @@ _WINDOW = 4
 # turn too little to show, so a ramp the reference applies and the convention
 # does not (or the reverse) shows only past it.
 _CONTEXT = 8
+# The groups a type splits its heads into, which its heads stay a multiple of at the probe's size:
+# CodeGen's fused qkv in four (transformers' `mp_num`).
+_HEAD_GROUPS = {'codegen': 4}
+# A rope record's per-frequency factors, one per rotated pair (Phi-3's and PhiMoE's LongRoPE).
+_FREQUENCY_FACTORS = frozenset({'long_factor', 'short_factor'})
 # Probe fields Dew never reads that would change what the reference builds or
 # runs, not what it computes: `auto_map` asks transformers to run the
 # checkpoint's own code, and the probe runs in fp32 whatever the checkpoint
@@ -332,7 +337,8 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     heads, hidden = sizes.stated('num_attention_heads'), sizes.stated('hidden_size')
     kv_heads = sizes.given('num_key_value_heads') or heads
     head_dim = sizes.given('head_dim') or hidden // heads
-    small_kv = min(kv_heads, 2)
+    # Two key heads, or as many as a type splits its heads into (`_HEAD_GROUPS`).
+    small_kv = max(min(kv_heads, 2), _HEAD_GROUPS.get(str(hf_config.get('model_type')), 1))
     small_heads = small_kv * (heads // kv_heads)
     small_hidden = small_heads * _HEAD_DIM * (1 if hidden == heads * head_dim else 2)
     # Each spelled size is written once, under the config's own key: a standard name its class
@@ -373,9 +379,22 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     for positional in ('sliding_window', 'attention_chunk_size'):
         if isinstance(hf_config.get(positional), int):
             fields[positional] = _WINDOW
+    # The rotated pairs of a probe's head: its head width, a partial rotary's share of it, halved.
+    small_head_dim = _HEAD_DIM if key('head_dim') in hf_config else small_hidden // small_heads
+    partial = _records.number(hf_config.get('partial_rotary_factor', 1.0), 'partial_rotary_factor')
+    rotary_half = int(small_head_dim * partial) // 2
     for record in ('rope_parameters', 'rope_scaling'):
         if isinstance(rope := hf_config.get(record), Mapping):
-            fields[record] = _within_probe(rope)
+            fields[record] = _within_probe(rope, rotary_half)
+    if 'mamba_n_heads' in hf_config:
+        # A Mamba mixer's heads tile its expanded width, which GraniteMoeHybrid's config validates: two
+        # heads, one group, a small state.
+        expand = _records.integer(hf_config.get('mamba_expand', 2), 'mamba_expand')
+        fields['mamba_n_heads'] = 2
+        if isinstance(hf_config.get('mamba_d_head'), int):
+            fields['mamba_d_head'] = expand * small_hidden // 2
+        fields.update({name: value for name, value in (('mamba_n_groups', 1), ('mamba_d_state', _HEAD_DIM))
+                       if name in hf_config})
     if isinstance(hf_config.get('original_max_position_embeddings'), int):
         fields['original_max_position_embeddings'] = _CONTEXT
     for key in ('pad_token_id', 'bos_token_id', 'eos_token_id'):
@@ -387,12 +406,16 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     return fields
 
 
-def _within_probe(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A rope record with the original context it states at `_CONTEXT`: a record's own, or each layer
-    type's of a record nested by layer type."""
-    if 'original_max_position_embeddings' in record:
-        return {**record, 'original_max_position_embeddings': _CONTEXT}
-    return {key: _within_probe(value) if isinstance(value, Mapping) else value
+def _within_probe(record: Mapping[str, object], half: int) -> Mapping[str, object]:
+    """A rope record with the original context it states at `_CONTEXT`, and its per-frequency factors
+    (LongRoPE's `long_factor` and `short_factor`, one per rotated pair) cut to the probe's `half` pairs:
+    a record's own, or each layer type's of a record nested by layer type."""
+    if 'original_max_position_embeddings' in record or _FREQUENCY_FACTORS & set(record):
+        cut = {name: factors[:half] for name in _FREQUENCY_FACTORS
+               if isinstance(factors := record.get(name), list)}
+        stated = 'original_max_position_embeddings' in record
+        return {**record, **({'original_max_position_embeddings': _CONTEXT} if stated else {}), **cut}
+    return {key: _within_probe(value, half) if isinstance(value, Mapping) else value
             for key, value in record.items()}
 
 
