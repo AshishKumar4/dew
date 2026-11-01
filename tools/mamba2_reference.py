@@ -285,11 +285,12 @@ def model_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
                                       for start, end in support.documents_of(starts)[0]])}
 
 
-PAIRED = frozenset({"starts", "padded"})
-"""The sites sized paired with Dew's arm (`record_case`'s `dew`, Dew's twin in the inputs' dtype), which
-transformers compared with itself resolved within no 512 draws: the resets' final state, only the last
-document's tokens writing it, and the padded rows' outputs, twelve tokens and seven (m2-seeded-rec4 at
-c868cbbc6)."""
+PAIRED = frozenset({"starts", "padded", "tangent", "model_padded", "model_scored", "model_decoded"})
+"""The sites sized paired with Dew's arm (`record_case`'s `dew`, Dew's twin in the inputs' dtype), whose
+reference compared with itself resolved within no 512 draws: the resets' final state, only the last
+document's tokens writing it, the padded rows' outputs, twelve tokens and seven (m2-seeded-rec4 at
+c868cbbc6), the tangent's 24 tokens of one row and the tiny model's (eight wide) hidden states and logits
+(m2-sizing at 4412b99f9: each unresolved in the recorder's own planning)."""
 
 
 def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
