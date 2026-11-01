@@ -280,6 +280,11 @@ def written(path, dir_fd: int | None = None, made: bool = False) -> str | None:
     # A directory made where one is already changes nothing (`os.makedirs(..., exist_ok=True)` asks of each).
     if made and os.path.lexists(name):
         return None
+    # A path of the checkout a read keys (`placed`: neither hidden nor bytecode) leaves nothing unkeyed: a
+    # later file that reads it keys what it read, which the next checkout, without it, answers otherwise.
+    root = os.environ.get("DEW_EXECUTED_ROOT")
+    if root and placed(name, os.path.join(root, "")) is not None:
+        return None
     return None if own(name) else f"{WROTE}{name}"
 
 

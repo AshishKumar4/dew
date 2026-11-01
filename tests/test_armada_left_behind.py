@@ -38,13 +38,18 @@ def test_a_write_to_the_files_own_scratch_caches_and_record_leaves_nothing(follo
         assert followed.written(str(path)) is None, path
 
 
-def test_a_write_to_the_home_shared_scratch_or_the_checkout_leaves_it_for_a_later_file(followed, tmp_path):
-    """Reviews of the reuse-keys head: /tmp/result, ~/.cache/x, .memo/result and a fixture in the checkout,
-    each a later file may read where no key holds it."""
-    for path in (tmp_path / "shared/result", os.path.expanduser("~/.cache/x"),
-                 tmp_path / "checkout/.memo/result", tmp_path / "checkout/tests/fixtures/x.json",
+def test_a_write_to_the_home_shared_scratch_or_a_hidden_directory_leaves_it_for_a_later_file(
+        followed, tmp_path, monkeypatch):
+    """Reviews of the reuse-keys head: /tmp/result, ~/.cache/x and .memo/result, each a later file may read
+    where no key holds it; a file of the checkout a read keys (a fixture, a mark in its root) leaves nothing
+    unkeyed, as the next checkout answers its read otherwise."""
+    checkout = tmp_path / "checkout"
+    monkeypatch.setenv("DEW_EXECUTED_ROOT", str(checkout))
+    for path in (tmp_path / "shared/result", os.path.expanduser("~/.cache/x"), checkout / ".memo/result",
                  tmp_path / "own/next.lifetime.log"):
         assert followed.written(str(path)) == f"{followed.WROTE}{path}", path
+    for path in (checkout / "tests/fixtures/x.json", checkout / "runs-a"):
+        assert followed.written(str(path)) is None, path
 
 
 @pytest.mark.parametrize(("argv", "in_checkout", "leaves"), [

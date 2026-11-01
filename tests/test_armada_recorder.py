@@ -266,14 +266,16 @@ def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, t
 def test_each_start_needs_its_own_record_though_two_start_alike(ci, tmp_path, monkeypatch, cache_worker):
     """Two children a file starts alike are two starts, each owing a record: two that record themselves
     keep the file's key, and one that records itself beside one that starts with no site (-S), which no
-    recorder sees, leave the file without one, so an edit to what the second ran cannot reuse its row."""
+    recorder sees, leave the file without one, so an edit to what the second ran cannot reuse its row. (The
+    unrecorded start runs last: what it may have left keys no file after it, ci.py's `left_behind`.)"""
     plain = "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_two.py": "import subprocess, sys\ndef test_two():\n" + plain * 2,
+        "test_b.py": PASSING["test_b.py"],
         "test_twice.py": "import subprocess, sys\ndef test_twice():\n" + plain
-                         + "    subprocess.run([sys.executable, '-S', 'src/other.py'], check=True)\n",
-        "test_b.py": PASSING["test_b.py"]}, {"other.py": "print('other')\n"})
-    assert reused() == [True, False, True]
+                         + "    subprocess.run([sys.executable, '-S', 'src/other.py'], check=True)\n"},
+        {"other.py": "print('other')\n"})
+    assert reused() == [True, True, False]
 
 
 MODULE = """import functools
