@@ -272,7 +272,8 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float] | None = None) -> Re
         for var in equation.outvars:
             env[var] = Term.leaf(leaves)
             shapes.append((env[var], _shape(var)))
-            _typed(dtypes, magnitudes, env[var], var, None)
+            # An equation outside the language bounds nothing: its output an unbounded value of its own.
+            _typed(dtypes, magnitudes, env[var], var, _free(free))
             outputs.append(leaves)
             leaves += 1
         opaque.append(Opaque(equation, [None if isinstance(atom, jcore.Literal) else env[atom]
@@ -345,9 +346,12 @@ def _magnitude(value) -> Magnitude | None:
 
 
 def _declared(index: int, ranges: Mapping[int, float], free) -> Magnitude | None:
-    """Input `index`'s magnitude: its declared range's, else a slot of its own (`SLOTS`; None past them)."""
-    if index in ranges:
-        return Magnitude(_log2(ranges[index]))
+    """Input `index`'s magnitude: its declared range's, else a slot of its own (`_free`)."""
+    return Magnitude(_log2(ranges[index])) if index in ranges else _free(free)
+
+
+def _free(free) -> Magnitude | None:
+    """An unbounded value's magnitude: the next slot of `free` its own (`SLOTS`; None past them)."""
     slot = next(free, None)
     return None if slot is None else Magnitude(0, tuple(int(each == slot) for each in range(SLOTS)))
 
