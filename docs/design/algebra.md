@@ -320,8 +320,8 @@ class Reduction:                     # attention, and any walk whose state is a 
     function: jax.core.ClosedJaxpr   # the math on whole operands: softmax_keys(where(seen, score(q, k), -inf)) @ v
     operands: Mapping[str, Axes]     # each operand's named axes: q (rows, d), k (keys, d), v (keys, e)
     walked: str                      # the axis the kernel walks in tiles: "keys"
+    exponent: Literal[2, "e"]        # stated by each template per call (a scale folded with log2(e)), never found
     hooks: tuple[Hook, ...] = ()     # score, mask and output hooks with their parameter kinds
-    exponent: Literal[2, "e"] = "e"  # the template's choice, not a rewrite found per call
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence
