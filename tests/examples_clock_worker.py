@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 
 import numpy as np
+from data_support import Questioned
 from multiprocess_worker import BATCH, dump_params
 from process_support import serve_mode, worker_parser
 
@@ -18,18 +19,6 @@ RECORDS = 10
 FEATURES = 3
 SHARD_ROWS = 3
 """The rows of each physical shard a streamed read deals its shares, the last one short."""
-
-
-class Questioned:
-    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
-    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`), its identity
-    stable, so a resumed run knows it for the step it saved."""
-
-    identity = "questioned@1"
-
-    def flat_map(self, element):
-        return tuple({"id": element["id"], "question": np.int32(question)}
-                     for question in range(int(element["id"]) % 3 + 1))
 
 
 def examples_clock(args) -> dict:

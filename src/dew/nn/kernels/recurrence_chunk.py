@@ -35,6 +35,7 @@ import numpy as np
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, l2norm
@@ -1209,15 +1210,6 @@ def _scan_widths(width: int) -> int:
     """A scan kernel's width for a head or state `width` (`_rated_scan`): the power of two at or past it, at
     least 16, the smallest block Triton's dot takes (`SSD_SUPPORTS`)."""
     return max(16, 1 << (width - 1).bit_length())
-
-
-RESET_DECAY = -1e4
-"""The log decay a document's first token takes in place of `A dt` in the TPU's Pallas scan: the
-state entering it is multiplied by `exp(-1e4)`, which is 0 in fp32. A step's own `A dt` is never
-positive, so every span containing a reset sums to at most this and decays to exactly 0, and a span
-without one never sees it. It stays finite because the kernel forms its segment sums as a matmul
-against a 0/1 triangle, where an infinity times 0 is a NaN; and it stays small enough that thousands
-of resets in one shard's total decay are nowhere near fp32's range."""
 
 
 def ssd_operands(x, dt, A, B, C, chunk_size: int, starts=None):

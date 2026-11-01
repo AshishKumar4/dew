@@ -1125,8 +1125,7 @@ def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
     launch whose two consumers share a key block, each its share of the columns
     (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
     interpreter."""
-    shared = attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed", shared_keys=True)
-    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256, config=shared)
+    _check_backward(call, SHAPES["interpreted"], form="fused-shared-keys", interpret=True, width=256)
 
 
 @INTERPRETS
