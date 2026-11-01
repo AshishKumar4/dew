@@ -349,11 +349,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del streams, views, lo, hi
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
-                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
+                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+                unrolled: bool = False) -> None:
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots.
         _one(consumers)
-        del in_flight
+        del in_flight, unrolled
 
         staging = self.output_staging(outputs, consumers)
 
@@ -384,11 +385,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
         # each stage back as its step ends.
-        del first, in_flight
+        del first, in_flight, unrolled
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))

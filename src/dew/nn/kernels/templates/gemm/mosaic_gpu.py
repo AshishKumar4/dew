@@ -579,9 +579,11 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                 program, start, gathered, finished)
 
             walks = (grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
+            # Its step is its products and its waits (the prologue's rewrite apart), small enough that a
+            # rotation of its ring unrolled takes fewer instructions an HGMMA (`mosaic.stepping`).
             family.persist(streams, walks, schedule, consumer, consumers=consumers,
                            axis="programs", outputs=allocations.outputs,
-                           interpret=bool(interpret), in_flight=family.in_flight)
+                           interpret=bool(interpret), in_flight=family.in_flight, unrolled=prologue is None)
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,

@@ -463,18 +463,31 @@ def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = N
         "", ENTRY.sub(lambda entry: f"{entry.group(1)}.maxnreg {cap}\n", ptx, count=1))
     if raised is not None:
         capped = RAISE.sub(f"setmaxnreg.inc.sync.aligned.u32 {raised};", capped)
+    text, took = _ptxas_text(capped, generation, relocatable)
+    used = [int(count) for count in REGISTERS.findall(text)]
+    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
+    return max(used, default=0), max(spilled, default=0), took
+
+
+def _ptxas_text(ptx: str, generation: str, relocatable: bool) -> tuple[str, bool]:
+    """ptxas's own report (`-v`) on the kernel `ptx` for the CUDA `generation`, compiled relocatably or
+    whole-program (`_ptxas`), and whether it took the kernel."""
     major, minor = capability(generation) or (0, 0)
     arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
-        source.write(capped)
+        source.write(ptx)
         source.flush()
         relocating = ("--compile-only",) if relocatable else ()
         ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", *relocating, source.name, "-o", os.devnull],
                              capture_output=True, text=True, check=False)
-    text = ran.stdout + ran.stderr
-    used = [int(count) for count in REGISTERS.findall(text)]
-    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
-    return max(used, default=0), max(spilled, default=0), ran.returncode == 0
+    return ran.stdout + ran.stderr, ran.returncode == 0
+
+
+def ptxas_notes(ptx: str, generation: str) -> str:
+    """What ptxas says of the kernel `ptx` as the GPU compiles it (`RELOCATABLE`): its registers and spills,
+    and the notes it makes of the code, a warpgroup MMA's serialization among them ("wgmma.mma_async
+    instructions are serialized"), which the gate's registers and spills do not state."""
+    return _ptxas_text(ptx, generation, RELOCATABLE)[0]
 
 
 def _assembled(ptx: str, generation: str, cap: int, *, honored: bool) -> tuple[int, int, bool]:

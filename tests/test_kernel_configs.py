@@ -210,6 +210,37 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+@lowers("sm90")
+def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
+    """The dense GEMM's mainloop at a cluster pair's 128 x 256 tile, compiled for a compile-only H100 as the
+    GPU compiles it, has its HGMMAs left running while the next step's operands are awaited: ptxas
+    serializes none (its note C7514, a wait for each HGMMA). A guard on every step of a rotation, a cond
+    between a warpgroup's products, had it serialize the walk (K40's SASS: 16 waits for 16 HGMMAs), a loop
+    the gate's registers and spills called clean."""
+    from kernel_compile import _compiled, ptxas_notes
+
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    def call():
+        def gmm(lhs, rhs, sizes):
+            return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2,
+                                                                          cluster=2),
+                                  transpose_rhs=False, out_dtype=jnp.bfloat16, dense=True,
+                                  multiprocessors=generation.gpu_target("sm90").multiprocessors)
+
+        return gmm, (jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((1, 4096, 4096), jnp.bfloat16), jax.ShapeDtypeStruct((1,), jnp.int32))
+
+    record = {"name": "dense gmm", "generation": "sm90", "limit": generation.gpu_target("sm90").shared_limit}
+    with tempfile.TemporaryDirectory(prefix="dew-dense-gemm-") as directory:
+        _compiled(support.KernelCase("dense gmm", call), "sm90", record, directory)
+        assert "error" not in record, record["error"]
+        (ptx,) = Path(directory).glob("*.ptx")
+        notes = ptxas_notes(ptx.read_text(), "sm90")
+    assert "bytes spill stores" in notes, notes
+    assert "serialized" not in notes, notes
+
+
 class _Uncounted(grouped_matmul.MosaicGmm):
     """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
     registers do not hold: a launch whose model misses."""

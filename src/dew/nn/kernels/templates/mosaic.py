@@ -248,11 +248,11 @@ def rotated(turned: Callable, lo, hi, first, stages: int) -> tuple:
     """Steps `lo` to `hi` of a ring of `stages` slots (its counters from `first`) as a loop takes them,
     `(run, start, stop)`: a rotation of the ring a trip, `run(rotation, *state) -> state` its `stages`
     steps unrolled, each at its slot, a constant, and the trip's one parity (`Turn`), so no step forms a
-    slot's address or tests a barrier's phase (CUTLASS's pipeline state steps an index and a phase; an
-    H100's 128 x 256 GEMM mainloop so took 15.5 instructions an HGMMA against CUTLASS's 13.5 and this
-    form's 10.7, K40's SASS). `turned(index, turn, *state) -> state` takes each step the range holds: a
-    trip's steps outside it (its first and last trips', where the range is not whole rotations) are
-    another walk's turns, which it skips (`taken`)."""
+    slot's address or tests a barrier's phase. `turned(index, turn, *state) -> state` takes each step the
+    range holds: a trip's steps outside it (its first and last trips', where the range is not whole
+    rotations) are another walk's turns, which it skips (`taken`). It serves where no warpgroup accumulator
+    is carried (`rotations`: a Blackwell product warp's loop); a walk that carries one takes `stepping`, whose
+    loops leave no cond between its products, which ptxas serializes them for."""
     def run(rotation, *state):
         for slot in range(stages):
             counter = rotation * stages + slot
@@ -264,9 +264,45 @@ def rotated(turned: Callable, lo, hi, first, stages: int) -> tuple:
     return run, (lo - first) // stages, (hi - first + stages - 1) // stages
 
 
+def stepping(turned: Callable, lo, hi, first, stages: int, *, unrolled: bool) -> tuple[tuple, ...]:
+    """Steps `lo` to `hi` of a ring of `stages` slots (its counters from `first`) as the loops a walk runs in
+    turn, `((run, start, stop), ...)`; `turned(index, turn, *state, before=0) -> state` takes each step at
+    its `Turn`, `before` the steps of its trip's, in its range, known to precede it. A loop of a step a trip,
+    its slot traced (`Turn.of`); or, `unrolled`, of a rotation of the ring a trip, its `stages` steps each at
+    its slot, a constant, and the trip's one parity, so no step of it forms a slot's address by arithmetic
+    or tests a barrier's phase (an H100's 128 x 256 GEMM mainloop took 15.5 instructions an HGMMA with a slot
+    formed each step, against CUTLASS's 13.5 and this form's 10.4, K40's SASS), the fewer than `stages`
+    steps before the range's whole rotations and after them one a trip. No step of a rotation is skipped by a
+    guard (`taken`): a cond between a warpgroup's products is one ptxas serializes them for (note C7514: a
+    wait after each HGMMA, 16 for 16, where the unguarded walk waits once a step, a dense 128 x 256 GEMM's
+    mainloop, whose 10.7 instructions an HGMMA were so a serialized loop's).
+
+    Unrolled only where a step is small beside its waits (a GEMM's: its products), as the copies multiply a
+    step's code: an attention or recurrence step's `stages` of them spilled 20 to 210 bytes with every slot
+    opaque (`opaque`), and 60 to 540 without, where a step a trip spilled none (K40-RING2)."""
+    def single(index, *state):
+        return turned(index, Turn.of(index - first, stages), *state)
+
+    if not unrolled:
+        return ((single, lo, hi),)
+
+    def whole(rotation, *state):
+        for slot in range(stages):
+            counter = rotation * stages + slot
+            state = turned(counter + first, Turn(counter, slot, rotation), *state, before=slot)
+        return state
+
+    # The first rotation's start at or after `lo` and the last's end at or before `hi`, the first not past
+    # `hi` and the last not before the first (a range inside one rotation takes its steps one at a time).
+    begin = jnp.minimum(lo + (first - lo) % stages, hi)
+    end = jnp.maximum(hi - (hi - first) % stages, begin)
+    return ((single, lo, begin), (whole, (begin - first) // stages, (end - first) // stages),
+            (single, end, hi))
+
+
 def rotations(lo, hi, first, stages: int, step: Callable[[jax.Array, "Turn"], None]) -> None:
     """`step(index, turn)` for each step `lo` to `hi` of a ring of `stages` slots (counters from `first`),
-    a rotation of the ring a trip (`rotated`): a loop that carries nothing (a product warp's)."""
+    a rotation of the ring a trip (`rotated`): a loop that carries nothing (a Blackwell product warp's)."""
     def turned(index, turn):
         step(index, turn)
         return ()
@@ -465,6 +501,20 @@ class Turn:
         return Turn.of(self.counter - steps, stages)
 
 
+def opaque(slot) -> jax.Array:
+    """A ring's `slot` (a Python int where a walk unrolls its steps, traced otherwise) as a value the compiler
+    cannot see through (an optimization barrier), so every address a slot makes, a barrier's and an operand
+    tile's, is formed where it is used. A slot the compiler knows (a constant, an unrolled rotation's) has
+    them formed once, ahead of the persistent loop, and held in registers for the whole kernel, its epilogue
+    too: 5 to 6 more registers live over most of a 128 x 256 forward than with a traced slot (33 against 28
+    at one multiprocessor, 38 against 32 at a cluster's pair), beside an accumulator's 128 and the packed
+    rows' 64 in an epilogue that has 168 (the GPU's compile ignores `setmaxnreg`,
+    `resources.RAISES_HONORED`). It spilled 148 bytes at the one, 2428 at the pair (K40-RING2). The
+    barrier costs the addresses' arithmetic back, 2.4 instructions an HGMMA of a dense 128 x 256 mainloop's
+    10.4 (8.1 with constant slots)."""
+    return lax.optimization_barrier(jnp.asarray(slot, jnp.int32))
+
+
 @dataclasses.dataclass(frozen=True)
 class Ring:
     """A ring of `stages` shared-memory slots one operand streams through: a producer loads step `counter`
@@ -507,20 +557,22 @@ class Ring:
     def load(self, turn: Turn, view) -> None:
         """The producer's load of `turn`'s step from `view`, once its slot is free: released by the last
         rotation's step, whose parity is the other."""
+        slot = opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[turn.slot], parity=turn.freed))
-        plgpu.copy_gmem_to_smem(view, self.smem.at[turn.slot], self.full.at[turn.slot],
+            self.consumed.at[slot], parity=turn.freed))
+        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
                                 collective_axes=self.multicast)
 
     def acquire(self, turn: Turn):
         """A consumer's wait for `turn`'s load: its slot. Each load is waited for once by each consumer, as
         every phase of a barrier is by each thread that waits on it."""
-        plgpu.barrier_wait(self.full.at[turn.slot], parity=turn.parity)
-        return self.smem.at[turn.slot]
+        slot = opaque(turn.slot)
+        plgpu.barrier_wait(self.full.at[slot], parity=turn.parity)
+        return self.smem.at[slot]
 
     def release(self, turn: Turn) -> None:
         """A consumer's release of `turn`'s slot, whose reads (and MMAs) are done."""
-        plgpu.barrier_arrive(self.consumed.at[turn.slot])
+        plgpu.barrier_arrive(self.consumed.at[opaque(turn.slot)])
 
     def drain(self, end) -> None:
         """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot
@@ -534,7 +586,7 @@ def drained(barriers, end, stages: int) -> None:
     later turn of the slot waited for: each barrier ends at the phase its waiters saw."""
     for back in range(1, stages + 1):
         turn = Turn.of(end - back, stages)
-        pl.when(turn.counter >= 0)(lambda turn=turn: plgpu.barrier_wait(barriers.at[turn.slot],
+        pl.when(turn.counter >= 0)(lambda turn=turn: plgpu.barrier_wait(barriers.at[opaque(turn.slot)],
                                                                        parity=turn.parity))
 
 
@@ -1173,7 +1225,8 @@ class Transport[Allocated, Opened](abc.ABC):
 
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
-                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
+                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+                unrolled: bool = False) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1186,18 +1239,21 @@ class Transport[Allocated, Opened](abc.ABC):
         column, most)` and, where the stored rows come in whole multiples, `least`. The family owns the
         loads, the step counter across tiles, the streams' drain, the outputs' staging and the stores'
         completion. A cluster's programs run the same tiles: where a stream is multicast (`streams`),
-        `schedule` gives each of them the same `active`, `steps` and view of it."""
+        `schedule` gives each of them the same `active`, `steps` and view of it. `walk`'s `in_flight` and
+        `unrolled` are its consumers' walks'."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
         `first`), from `start`, with fp32 accumulators of `shapes` its products issue into in place, zero
         or their `initial` values (in the accumulator's layout; None, zero). `in_flight` steps' products stay
         running past their step (0 or 1): their slots go back once they are done, a step later, so the next
-        step's operands are waited for while they run. Returns the carry and the accumulators' values."""
+        step's operands are waited for while they run. A ring's `unrolled` walk takes a rotation of its slots
+        a trip, each step at a slot it knows (`mosaic.stepping`): for a step small beside its waits (a GEMM's),
+        where a ring's slots are few. Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -1404,7 +1460,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 for shape, dtype in outputs]
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
-                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
+                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+                unrolled: bool = False) -> None:
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
@@ -1429,13 +1486,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         def consumed(smems):
             return self._tiled(rings, tiles, schedule, consumer, smems, axis=axis, interpret=interpret,
-                               in_flight=in_flight)
+                               in_flight=in_flight, unrolled=unrolled)
 
         pl.run_scoped(lambda *smems: self.roles(consumers, consumed(smems), producer), *staging,
                       collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, consumer: Callable,
-               smems, *, axis: str, interpret: bool, in_flight: int) -> Callable:
+               smems, *, axis: str, interpret: bool, in_flight: int, unrolled: bool) -> Callable:
         """`persist`'s consumers: each walks its tiles' steps at a counter running across the tiles
         (`_tile_walk`), stages its share of each output in chunks (`output_staging`: two buffers of
         `staged_columns`) and stores each by TMA, waiting only for a buffer's last store to read it before
@@ -1457,7 +1514,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 counter = carry  # the step every ring is at
                 active, steps, views, tile = schedule(loop.index)
                 walk = self._tile_walk(rings, counter, jnp.where(active, steps, 0), views, index,
-                                       interpret=interpret, in_flight=in_flight)
+                                       interpret=interpret, in_flight=in_flight, unrolled=unrolled)
                 pl.when(active)(lambda: consumer(index, tile, walk, store, active=True))
                 pl.when(~active)(lambda: consumer(index, tile, unwalked(self), store, active=False))
                 return counter + jnp.where(active, steps, 0)
@@ -1468,7 +1525,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return run
 
     def _tile_walk(self, rings: dict[str, Ring], counter, steps, views: dict, wg, *, interpret: bool,
-                   in_flight: int) -> Callable:
+                   in_flight: int, unrolled: bool) -> Callable:
         """`persist`'s walk of one tile's `steps` for consumer `wg` (its consumer's `walk(step, start,
         shapes, initial=)`), the rings at `counter`, each step's index counted from the tile's first, over
         the streams the layout gives the tile (`_tile_streams`)."""
@@ -1479,7 +1536,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 return step(at - counter, slots, carry, accumulators)
 
             return self.walk(streams, ((stepped, counter, counter + steps),), start, shapes, interpret,
-                             in_flight=in_flight, initial=initial)
+                             in_flight=in_flight, initial=initial, unrolled=unrolled)
 
         return walk
 
@@ -1495,16 +1552,16 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         del rings, end, wg
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         return self._walked(streams, segments, start, shapes, interpret, first=first, in_flight=in_flight,
-                            initial=initial)
+                            initial=initial, unrolled=unrolled)
 
     def _walked[C](self, streams: dict[str, Ring], segments, start: C, shapes: tuple, interpret: bool, *,
                    first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                   freed: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
+                   freed: Callable | None = None, unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s). Each
-        segment walks its steps a rotation of the rings at a time (`rotated`)."""
+        segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`)."""
         stages = min(ring.stages for ring in streams.values())
         if not 0 <= in_flight < stages:
             raise ValueError(f"a walk keeps fewer steps' products in flight than its rings' {stages} slots, "
@@ -1517,7 +1574,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             if freed is not None:
                 freed(turn.counter)
 
-        def turned(step, lo, index, turn: Turn, carry, accumulators):
+        def turned(step, lo, index, turn: Turn, carry, accumulators, *, before: int = 0):
             slots = Slots(streams, turn)
             carry, accumulators = step(index, slots, carry, accumulators)
             if not in_flight:
@@ -1530,11 +1587,18 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             # `in_flight` back, done now, gives back its slots.
             slots.held()
             self.settled(in_flight)
-            pl.when(index >= lo + in_flight)(lambda: given(turn.back(in_flight, stages), release=True))
+            if before >= in_flight:
+                # The step `in_flight` back is the range's too: a rotation's, past its first steps.
+                given(turn.back(in_flight, stages), release=True)
+            else:
+                pl.when(index >= lo + in_flight)(lambda: given(turn.back(in_flight, stages), release=True))
             return carry, accumulators
 
-        walked = self.accumulated(tuple(rotated(functools.partial(turned, step, lo), lo, hi, first, stages)
-                                        for step, lo, hi in segments), start, shapes, interpret, initial)
+        walked = self.accumulated(
+            tuple(loop for step, lo, hi in segments
+                  for loop in stepping(functools.partial(turned, step, lo), lo, hi, first, stages,
+                                       unrolled=unrolled)),
+            start, shapes, interpret, initial)
         # Each segment's last `in_flight` steps, their products done by the walk's end, oldest first.
         for _, lo, hi in segments:
             for back in reversed(range(in_flight)):
@@ -1694,8 +1758,8 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         return feed
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         if not isinstance(streams, Feed):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
         # The walk reads each step at the ring counter its feed loads it at, both from the feed's `lo`.
@@ -1705,7 +1769,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
             # loads behind that release, would never reach.
             raise NotImplementedError(f"{self.name}'s fed walk keeps no products in flight across segments")
         walked = self._walked(streams.rings, segments, start, shapes, interpret, first=first,
-                              in_flight=in_flight, initial=initial,
+                              in_flight=in_flight, initial=initial, unrolled=unrolled,
                               freed=streams.refilled if streams.refills else None)
         if streams.drains:
             streams.drained()

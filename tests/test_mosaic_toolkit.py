@@ -131,7 +131,8 @@ FED_STEPS = 5
 FED_ROWS, FED_WIDTH = 64, 128
 
 
-def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0):
+def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled: bool = False,
+                  in_flight: int = 0):
     """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
@@ -163,7 +164,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0):
                 return carry, (product,)
 
             return family.walk(feed, ((step, first, first + FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
-                               interpret, first=first)[1][0]
+                               interpret, first=first, unrolled=unrolled, in_flight=in_flight)[1][0]
 
         summed = family.scoped(walked, streams=allocated)
 
@@ -193,14 +194,20 @@ def _fed_expected(p, x):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("unrolled", [False, True])
+@pytest.mark.parametrize("in_flight", [0, 1])
 @pytest.mark.parametrize(("consumers", "lo"), [(1, 0), (2, 0), (2, 3)])
-def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers, lo):
+def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers, lo, in_flight,
+                                                                                  unrolled):
     """Interpreted: consumers with no producer walk every step of one ring through slot reuse (five steps
     over two slots), each its share of a step's rows, and store their sum once, twice through one scratch:
     exactly the product and its double; a walk whose steps start past 0 (a later key block's), its ring
-    counters from its own first (`first`), alike."""
+    counters from its own first (`first`), alike; a step's products running on past it or not, and the
+    walk a step a trip or a rotation of its ring a trip (`mosaic.stepping`: two whole rotations and the
+    fifth step alone)."""
     p, x = _fed_operands()
-    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers, lo=lo)
+    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers, lo=lo, unrolled=unrolled,
+                        in_flight=in_flight)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
@@ -222,6 +229,40 @@ def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
     got = jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo))(p, x)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
+
+
+@pytest.mark.parametrize("unrolled", [False, True])
+@pytest.mark.parametrize("stages", [2, 3, 4, 5])
+def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, unrolled):
+    """`mosaic.stepping`'s loops, run in turn as a walk's are, take steps `lo` to `hi` once each and in order,
+    each at its counter's slot and rotation, for every start, length and ring origin over three rotations:
+    rolled, a step a trip; unrolled, the steps taken one a trip are the fewer than `stages` before the whole
+    rotations and the fewer after them, and a rotation's steps know the steps before them in it are the
+    range's."""
+    taken = []
+
+    def turned(index, turn, *state, before=0):
+        taken.append((index, turn.slot, turn.rotation, before))
+        return state
+
+    for first in (0, 3):
+        for lo in range(first, first + 3 * stages):
+            for hi in range(lo, lo + 3 * stages + 1):
+                taken.clear()
+                singly = 0
+                for run, start, stop in mosaic.stepping(turned, lo, hi, first, stages, unrolled=unrolled):
+                    for trip in range(int(start), int(stop)):
+                        before = len(taken)
+                        run(trip)
+                        singly += len(taken) - before == 1
+                assert [step[0] for step in taken] == list(range(lo, hi)), (first, lo, hi)
+                for index, slot, rotation, before in taken:
+                    assert (slot, rotation) == ((index - first) % stages, (index - first) // stages)
+                    assert index - before >= lo, (first, lo, hi, index)
+                if unrolled:
+                    assert singly <= 2 * (stages - 1), (first, lo, hi)
+                else:
+                    assert singly == hi - lo
 
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
