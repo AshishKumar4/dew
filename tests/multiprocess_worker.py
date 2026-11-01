@@ -812,8 +812,7 @@ def mode_read_rounds(args) -> dict:
         else:
             data = compile(Pipeline(Memory(rows(BATCH))).shuffle(0).repeat().batch(BATCH), seed=0,
                            loading=Loading(workers=0))
-            flags.update(validation=compile(Pipeline(Memory(rows(BATCH))).batch(BATCH), seed=0,
-                                            loading=Loading(workers=0)),
+            flags.update(validation=Pipeline(Memory(rows(BATCH))).batch(BATCH),
                          cooldowns=Cooldowns(at=(steps,), length=steps))
         before = next(_coordination._agreements)
         state = trainer.fit(data, log_every=10 * steps, **flags)
