@@ -57,16 +57,17 @@ VALID = drawn_batch(0)["attention_mask"].astype(bool)
 
 def stepped_logits(model, variables, row) -> jax.Array:
     """`row`'s logits `[tokens, vocab]` from a cached decode: its first `STEPPED_PREFILL` tokens prefilled,
-    then a token a step through the cache."""
+    then a token a step through the cache, the steps one scan, so a trace holds one step's program."""
     state = model.apply(variables, 1, method="init_cache", mutable=["cache"])[1]
     out, state = model.apply({**variables, **state}, row[None, :STEPPED_PREFILL], decode=True,
                              mutable=["cache"])
-    pieces = [out[0]]
-    for index in range(STEPPED_PREFILL, row.shape[0]):
-        out, state = model.apply({**variables, **state}, row[None, index:index + 1], decode=True,
-                                 mutable=["cache"])
-        pieces.append(out[0])
-    return jnp.concatenate(pieces)
+
+    def step(state, token):
+        logits, state = model.apply({**variables, **state}, token[None, None], decode=True, mutable=["cache"])
+        return state, logits[0, 0]
+
+    _, steps = jax.lax.scan(step, state, row[STEPPED_PREFILL:])
+    return jnp.concatenate([out[0], steps])
 
 
 def recorded_dew(directory: Path, leaves: tuple[str, ...]):
