@@ -395,7 +395,7 @@ def write_tiny() -> None:
         arrays[f'generated_{tag}'], _ = DoryReference(CONFIG, tensors, torch.float64, mode=mode,
                                                       loops=loops).decode(ids[0, :6], 8)
 
-    # Packed rows: each document's own logits, laid out where the row holds it.
+    # Packed rows: each row's documents side by side, each restarting its positions.
     width = sum(PACKING[0])
     documents = [[rng.integers(12, CONFIG['vocab_size'], length) for length in row] for row in PACKING]
     arrays['packed_ids'] = np.stack([np.concatenate(row) for row in documents])

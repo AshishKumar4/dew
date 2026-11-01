@@ -157,6 +157,46 @@ def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_
     assert ran("-k", "nothing_matches")[0] == 5
 
 
+SITE_TEST = """import json, os
+
+
+def note(test):
+    with open(os.environ["SEEN"], "a") as out:
+        names = ("DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL")
+        out.write(json.dumps([test] + [os.environ.get(name) for name in names]) + "\\n")
+
+
+def test_site():
+    note("test_site")
+
+
+def test_other():
+    note("test_other")
+"""
+
+
+def test_a_targeted_pytest_runs_a_group_as_its_ci_task_would(ci, tmp_path, monkeypatch):
+    """`ci.py pytest --split` runs a file's group as CI's task of it does (`selection`, `site_environment`):
+    a check-1 site's map task its test alone, drawing its span into its artifacts, its judge that test
+    alone pooling from its inputs, and the file whole without a group; the lane's targeted run passes the
+    group straight through (2026-11-01: a draws task run as a split.py group failed)."""
+    seen = tmp_path / "seen.jsonl"
+    written(tmp_path, {"test_site.py": SITE_TEST})
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(seen))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("ARMADA_INPUTS", str(tmp_path / "inputs"))
+
+    def ran(split: str) -> list[list]:
+        seen.unlink(missing_ok=True)
+        assert ci.targeted("3.12", [], tmp_path / "report.xml", ["tests/test_site.py"], split) == 0
+        return [json.loads(line) for line in seen.read_text().splitlines()]
+
+    assert ran("test_site.draws-8-16") == [["test_site", "8:16", str(tmp_path / "artifacts"), None]]
+    assert ran("test_site") == [["test_site", None, None, str(tmp_path / "inputs")]]
+    assert sorted(test for test, *_ in ran("")) == ["test_other", "test_site"]
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an

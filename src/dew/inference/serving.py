@@ -137,7 +137,7 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels import generation
-from dew.nn.kernels.options import OuterProgram, compiler_options
+from dew.nn.kernels.options import compiler_options, program as outer_program
 from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
@@ -234,7 +234,7 @@ def _seed(key: int | jax.Array) -> int | jax.Array:
     return jax.random.key_data(typed)
 
 
-@OuterProgram
+@outer_program
 def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded: jax.Array,
               folds: jax.Array) -> jax.Array:
     """One fixed-width admission's key data, without a device-to-host read:
