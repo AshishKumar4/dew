@@ -15,6 +15,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `damping` on its objective steps by its optimizer's rule instead, so give it this optimizer.
 - A scoring server reports what its task's passes cost and what it admitted and refused
   (`ScoringServer.metrics`); the decision serving example serves them at `GET /metrics`.
+- A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
+  them out, a filter cuts them per share) counts an epoch as a pass over its source examples, and a
+  memory read that packs them as it holds them bounds the passes with its pack. A run bounded in
+  examples or epochs can shuffle the windows a concatenating pack or windows cut its examples across:
+  each example counts once every window holding a piece of it is drawn, and a memory read that holds
+  such windows deals them to its shares by whole examples (both were refused). A version 7 position
+  that version 8 reads otherwise says why and how the run goes on.
 - A corpus whose objective makes several rows of each example counts its examples as `data/rows`, not the
   rows or windows made of them: a run bounded in examples counts those whose last rows were delivered, an
   example a step refused or made no row of under `data/rejected`; any other run counts the examples read

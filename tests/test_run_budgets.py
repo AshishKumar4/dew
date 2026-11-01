@@ -3,6 +3,7 @@ runs out before its length."""
 
 import collections
 import dataclasses
+import itertools
 import json
 from pathlib import Path
 
@@ -315,36 +316,42 @@ def _drawn(loader, share, shares):
     return read
 
 
+@pytest.mark.parametrize("expands", [False, True])
 @pytest.mark.parametrize("shares", [1, 2])
 @pytest.mark.parametrize("layout", sorted(_SPLIT))
-def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_window_is_drawn(layout, shares):
+def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_window_is_drawn(layout, shares,
+                                                                                            expands):
     """Twelve documents of unique tokens, a run bounded to all twelve, laid across windows that cut them (a
     concatenating pack, one that starts each cut 2 tokens back, or windows over the stream) and shuffled
-    after, read as a stream or held by a memory read, by one share or two: no batch of a share takes a
-    document's count before that share has drawn every token of it, each document's tokens are one share's,
-    and the shares take every count they draw whole, no document counted twice (row 1902)."""
+    after, read as a stream or held by a memory read, by one share or two, alone or through an objective
+    that makes two rows of each window: no step's batches take a document's count before the shares have
+    drawn every token of it by that step, and the read takes every count it draws whole, none twice. A read
+    whose shares each read their own order holds each document's windows in one of them (row 1902)."""
     laid, read = _SPLIT[layout]
     chain = laid(Pipeline(Memory(_pieces(), shard_rows=3))).read(read).batch(2 * shares)
-    loader = compile(chain, read=read, examples=len(_LENGTHS))
-    owners, counted = collections.defaultdict(set), 0
-    for share in range(shares):
-        seen, consumed = set(), 0
-        for tokens, examples in _drawn(loader, share, shares):
+    objective = ObjectiveData(train=(Twice(),)) if expands else None
+    loader = compile(chain, read=read, examples=len(_LENGTHS), objective=objective)
+    drawn = [_drawn(loader, share, shares) for share in range(shares)]
+    seen, consumed, whole = set(), 0, 0
+    for step in itertools.zip_longest(*drawn, fillvalue=(set(), 0)):
+        for tokens, examples in step:
             seen |= tokens
             consumed += examples
-            whole = [index for index, length in enumerate(_LENGTHS)
-                     if all(1000 * (index + 1) + token in seen for token in range(length))]
-            assert consumed <= len(whole)
-        for token in seen:
-            owners[token // 1000].add(share)
-        assert consumed == len(whole)
-        counted += consumed
-    assert all(len(held) == 1 for held in owners.values())
-    assert counted <= len(_LENGTHS)
+        whole = sum(all(1000 * (index + 1) + token in seen for token in range(length))
+                    for index, length in enumerate(_LENGTHS))
+        assert consumed <= whole
+    assert consumed == whole
     if layout != "windows":
         # Every token of a pack's documents is laid in a window; windows leave the stream's last tokens
         # past every window out.
-        assert counted == len(_LENGTHS)
+        assert consumed == len(_LENGTHS)
+    if loader.order_records is None:
+        owners = collections.defaultdict(set)
+        for share, batches in enumerate(drawn):
+            for tokens, _ in batches:
+                for token in tokens:
+                    owners[token // 1000].add(share)
+        assert all(len(held) == 1 for held in owners.values())
 
 
 @pytest.mark.parametrize("layout", ["concat", "held"])
