@@ -515,18 +515,33 @@ def coalesced(source, destination) -> None:
 
 def _copy_layout(shape: tuple[int, ...], dtype) -> plgpu_core.SomeLayout | None:
     """`coalesced`'s layout for a 16-bit tile of `shape`, None where the copy layout tiles none of it."""
-    if len(shape) != 2 or shape[0] % 8 or jnp.dtype(dtype).itemsize != 2:
+    if len(shape) != 2 or jnp.dtype(dtype).itemsize != 2:
         return None
-    rows, width = shape[0], shape[1] * jnp.dtype(dtype).itemsize
-    for swizzle in (128, 64, 32, 16):
-        if width % swizzle:
-            continue
-        row_tiles, column_tiles = rows // 8, width // swizzle
-        # The layout's own condition: a warpgroup's four warps' tiles four down the rows, two by two, or
-        # four across.
-        if row_tiles % 4 == 0 or (row_tiles % 2 == 0 and column_tiles % 2 == 0) or column_tiles % 4 == 0:
-            return plgpu.Layout.SMEM_GMEM_COPY(tuple(shape), jnp.dtype(dtype), swizzle)
-    return None
+    swizzle = next((swizzle for swizzle in (128, 64, 32, 16) if copy_tiles(shape, dtype, swizzle)), None)
+    return None if swizzle is None else plgpu.Layout.SMEM_GMEM_COPY(tuple(shape), jnp.dtype(dtype), swizzle)
+
+
+def copy_tiles(shape: tuple[int, ...], dtype, swizzle: int) -> bool:
+    """Whether Mosaic GPU's tiled copy layout (cp.async's into a swizzled block, and `coalesced`'s) tiles a
+    `[rows, columns]` block of `dtype` staged at `swizzle` bytes: its 8-row tiles as wide as the swizzle,
+    a warpgroup's four warps' tiles four down the rows, two by two, or four across
+    (fragmented_array.tiled_copy_smem_gmem_layout, which refuses any other)."""
+    rows, width = shape[-2], shape[-1] * jnp.dtype(dtype).itemsize
+    if rows % 8 or width % swizzle:
+        return False
+    row_tiles, column_tiles = rows // 8, width // swizzle
+    return row_tiles % 4 == 0 or (row_tiles % 2 == 0 and column_tiles % 2 == 0) or column_tiles % 4 == 0
+
+
+def copied_swizzle(shape: tuple[int, ...], dtype) -> int:
+    """The swizzle, in bytes, a `[rows, columns]` block of `dtype` a program copies in with cp.async stages
+    at: its rows' widest (`widest_swizzle`), or the widest narrower one the copy layout tiles the block at
+    (`copy_tiles`) where it tiles none at that, as an A100's key memory backward's 8 rows of 64 bf16 columns,
+    one tile at 128 bytes, four at 32 (a decay a key dimension 16 wide, the recurrence stability sites)."""
+    widest = widest_swizzle(dtype, shape[-1])
+    narrower = (swizzle for swizzle in (widest, widest // 2, widest // 4)
+                if swizzle >= NARROWEST_SWIZZLE_BYTES)
+    return next((swizzle for swizzle in narrower if copy_tiles(shape, dtype, swizzle)), widest)
 
 
 @dataclasses.dataclass(frozen=True)

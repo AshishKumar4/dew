@@ -516,10 +516,11 @@ def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> di
 
 
 def spill_record(miss: report.Miss) -> dict[str, JSON]:
-    """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
+    """A kernel a compile found spilling, or a launch whose program's block XLA refused (`report.Miss`), its
+    launch's config by its text."""
     return {"kernel": miss.kernel, "op": miss.op,
             "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
-            "frame": miss.frame, "stepped": miss.stepped}
+            "frame": miss.frame, "shared": miss.shared, "stepped": miss.stepped}
 
 
 @dataclasses.dataclass

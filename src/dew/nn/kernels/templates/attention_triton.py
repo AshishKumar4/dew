@@ -22,7 +22,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra
+from dew.nn.kernels.templates import attention_algebra as algebra, report
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -334,7 +334,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
         if not spec.headroom:
             out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
-                         out_shape=out_shape, name="attention_forward")(*arrays)
+                         out_shape=out_shape, name=report.named("attention_forward"))(*arrays)
             return (tuple(out) if residuals else out[0]), None
         # The plain launch writes which rows overflowed; the second, issued only where one did, walks again
         # only the programs with one, its outputs the plain launch's (`_forward_kernel`): ordinary inputs
@@ -343,13 +343,13 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         flagged = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
         *out, flags = launch(functools.partial(kernel, guard="flag"), in_specs=in_specs,
                              out_specs=[*out_specs, per_row], out_shape=[*out_shape, flagged],
-                             name="attention_forward")(*arrays)
+                             name=report.named("attention_forward"))(*arrays)
         first = len(arrays) + 1
 
         def rewalked(out):
             return tuple(launch(functools.partial(kernel, guard="rewalk"),
                                 in_specs=[*in_specs, per_row, *out_specs], out_specs=out_specs,
-                                out_shape=out_shape, name="attention_forward_headroom",
+                                out_shape=out_shape, name=report.named("attention_forward_headroom"),
                                 input_output_aliases={first + index: index for index in range(len(out))},
                                 )(*arrays, flags, *out))
 
@@ -369,14 +369,28 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         every stage but the one in use, the query tile, and the weights' tile on its way to the second
         product, which shares the query tile's memory where the block is 128 queries of heads at most
         128 wide. Fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: equal on all 48
-        configs it refused on either GPU, and every config it compiled within the budget)."""
+        configs it refused on either GPU, and every config it compiled within the budget).
+
+        A training forward whose sums can overflow (`algebra.headroom`) launches again where a row did
+        (`_forward_kernel`'s guard 'rewalk'), and its live rows take their split sums from a second walk of
+        the keys (`algebra.normalized_pass`), whose key and value tiles Triton stages beside the query and
+        weights tiles and the first walk's key stages (its IR at 32 x 64, width 256: Q, the first walk's
+        K stage, the second's K and V, 114688 bytes, past a 99 KB block, where the plain launch asks 90112):
+        the larger of the two launches. Exact at 32 x 32 and 64 x 32, width 256; the A100's compile-only
+        device asked up to 512 bytes more at width 128 and 8192 at 128 x 64, width 64, each within every
+        GPU's block (et-fsmem-cpu); a compile's refusal steps the launch down (`report.kept`)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
         streamed = (config.stages - 1) * config.block_k * (width + value_width) * size
         query_tile, weights = config.block_q * width * size, config.block_q * config.block_k * size
         shared = config.block_q >= 128 and width <= 128
-        return streamed + (max(query_tile, weights) if shared else query_tile + weights)
+        plain = streamed + (max(query_tile, weights) if shared else query_tile + weights)
+        if not (ba.arguments.get("residuals") and algebra.headroom(value.dtype)):
+            return plain
+        key_stages = (config.stages - 1) * config.block_k * width * size
+        normalized = config.block_k * (width + value_width) * size
+        return max(plain, query_tile + weights + key_stages + normalized)
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         """The fp32 words a thread holds live across the walk, the program's spread over its threads: the
@@ -855,7 +869,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                split=sums is not None, accurate=accurate, interpret=interpret)
     out = pl.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
-        out_shape=out_shape, interpret=interpret, name="attention_dq",
+        out_shape=out_shape, interpret=interpret, name=report.named("attention_dq"),
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
     )(*arrays)
     return tuple(out)
@@ -914,7 +928,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                block_q=block_q, accurate=accurate, interpret=interpret)
     out = pl.pallas_call(
         kernel, grid=(keys // block_k, batch, heads), in_specs=in_specs, out_specs=out_specs,
-        out_shape=out_shape, input_output_aliases=aliases, interpret=interpret, name="attention_dkv",
+        out_shape=out_shape, input_output_aliases=aliases, interpret=interpret,
+        name=report.named("attention_dkv"),
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
     )(*arrays)
     return tuple(out)
