@@ -138,7 +138,7 @@ class Ring:
         """The load warp's turn: each operand's `views` entry into the turn's stage, once the products
         have read the stage's last ones (the rotation before, of the other parity)."""
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[turn.slot], parity=jnp.logical_not(turn.parity)))
+            self.consumed.at[turn.slot], parity=turn.freed))
         for view, buffer, barrier in zip(views, self.buffers, self.loaded, strict=True):
             plgpu.copy_gmem_to_smem(view, buffer.at[turn.slot], barrier.at[turn.slot])
 
@@ -192,7 +192,7 @@ class Tensor:
         """The product warp's turn: the turn's accumulator once the turn `count` before has been read
         out of it."""
         pl.when(turn.counter >= self.shape.count)(lambda: plgpu.barrier_wait(
-            self.read_done.at[turn.slot], parity=jnp.logical_not(turn.parity)))
+            self.read_done.at[turn.slot], parity=turn.freed))
         return columns(self.tmem, turn.slot * self.shape.columns, self.shape.columns)
 
     def issued(self, turn: mosaic.Turn) -> None:
