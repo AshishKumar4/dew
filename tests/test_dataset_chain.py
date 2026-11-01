@@ -819,13 +819,16 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
         assert counts["data/chunks_per_record/asked"] == 24 / 12
 
 
-def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples():
-    """A memory read of the 12 records, in their order and unbounded, whose objective makes 24 rows of
-    them (`Questioned`) before a draw of its own: it makes those rows as it holds the corpus, before
-    the reader opens, and the corpus's rows (data/rows) are its 12 source examples, as many as it
-    held, however many rows the reader has read (row 1944)."""
-    data = compile(_asked("memory", shuffled=False).batch(2), read="memory", loading=READ,
-                   objective=ObjectiveData(train=(Questioned(), WideDraw())))
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples(workers):
+    """A memory read of the 12 records, in their order and unbounded, read alone or by loading workers,
+    whose objective makes 24 rows of them (`Questioned`), then draws (`WideDraw`) and refuses 4 of those
+    rows (`ThirdQuestionRefused`): it makes the rows as it holds the corpus, before the reader opens,
+    which reads them on through the draw and the refusal, and the corpus's rows (data/rows) are its 12
+    source examples, as many as it held, however many rows the reader has read (row 1944)."""
+    data = compile(_asked("memory", shuffled=False).batch(2), read="memory",
+                   loading=dataclasses.replace(READ, workers=workers),
+                   objective=ObjectiveData(train=(Questioned(), WideDraw(), ThirdQuestionRefused())))
     stream = data.train(DataPartition())
     try:
         for read in (3, 12):
