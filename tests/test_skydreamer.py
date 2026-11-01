@@ -202,9 +202,10 @@ def test_an_action_commands_collective_thrust_and_body_rates():
 
 
 def test_a_world_model_reads_its_proprioceptive_entries_beside_its_image():
-    """An agent whose world model reads proprioceptive entries beside its image acts apart on two drones that
-    see the same image and differ in those entries alone, where one reading the image alone acts alike; and
-    its loss over windows of such observations, the posterior scanned over each, is finite."""
+    """A world model reading proprioceptive entries beside its image sets apart, in its posterior's
+    log-probabilities, two drones that see the same image and differ in those entries alone, where one
+    reading the image alone holds them alike; its agent acts on such steps, and its loss over windows of them,
+    the posterior scanned over each, is finite."""
     from dew.objectives.base import Step
 
     proprio = (("rates", 3), ("plan", 5))
@@ -226,8 +227,12 @@ def test_a_world_model_reads_its_proprioceptive_entries_beside_its_image():
     for reading, apart in ((proprio, True), ((), False)):
         objective = DreamerV3Objective(WorldModel(0, 4, proprio=reading, **shared), imagination=3)
         variables = objective.init(jax.random.key(0))
+        bound = objective.model.bind(variables)
+        tokens = bound.embed(bound.seen(step["observation"]))
+        posterior = np.asarray(bound.posterior(jnp.zeros((2, 32)), tokens))
+        assert (not np.array_equal(posterior[0], posterior[1])) == apart
         acted, _, _ = objective.greedy(variables, step, jax.random.key(1), objective.memory(2))
-        assert (not np.array_equal(np.asarray(acted[0]), np.asarray(acted[1]))) == apart
+        assert np.isfinite(np.asarray(acted)).all() and np.asarray(acted).shape == (2, 4)
         if reading:
             step_of = Step(jnp.zeros((), jnp.int32), jax.random.key(2), None)
             ratio, _ = objective.loss(variables, windows, step_of)
