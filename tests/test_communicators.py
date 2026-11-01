@@ -483,3 +483,29 @@ def test_import_dew_connects_nccls_peers_at_creation_unless_told_otherwise(set_b
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True,
                           env={**env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
     assert json.loads(done.stdout.strip().splitlines()[-1]) == expected
+
+def a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): a program compiled through Dew's compile point
+    (`options.program`) on this host's GPU is admitted against the sizing the process holds: refused before
+    it runs, naming the GPU's bytes, where the room left outside XLA's pool holds less than the runtime
+    needs, and admitted with its code held to what the GPU has free where the room holds it."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import options
+
+    gpu = jax.devices("gpu")[0]
+    ordinal = gpu.local_hardware_id if gpu.local_hardware_id is not None else gpu.id
+    needs = Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={ordinal: 2**20},
+                  seconds=1.0)
+    rows = jax.device_put(jnp.ones(8), gpu)
+    held = communicators.held()
+    try:
+        communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: 1}, {ordinal: 1}))
+        with pytest.raises(CommunicatorRoom) as refused:
+            options.program(lambda x: x * 3.0).compiled(rows)
+        assert refused.value.room == {ordinal: 1}
+        communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: GIB}, {ordinal: GIB}))
+        assert float(options.program(lambda x: x * 5.0)(rows)[0]) == 5.0
+    finally:
+        communicators.hold(held)
+
