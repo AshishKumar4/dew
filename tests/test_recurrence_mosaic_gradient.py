@@ -251,9 +251,18 @@ def test_a_value_row_split_by_its_blocks_takes_every_column_interpreted():
                            tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
                            family=bundles.of('sm80', jnp.bfloat16), interpret=True)
 
+    def widened(fn):
+        # Each arm's output at fp32 at least, the draws' cotangents'.
+        def run(given: Chunk):
+            out, final = fn(given)
+            return out.astype(jnp.promote_types(out.dtype, jnp.float32)), final
+        return run
+
     with generation.assumed('sm80'):
         assert trained(draws(0)[0], hooks)
         tiles = template.MOSAIC.derived(template_call(draws(0)[0], hooks), generation.gpu_target('sm80'))
-        assert_as_exact(with_gradients(planned), with_gradients(functools.partial(chunk_on, 'xla', hooks)),
-                        draws, "the template's gradient over a value row split by its blocks, an A100's plan",
-                        seeds=FEWEST_SEEDS, truth_fn=with_gradients(functools.partial(token_by_token, hooks)))
+        assert_as_exact(with_gradients(widened(planned)),
+                        with_gradients(widened(functools.partial(chunk_on, 'xla', hooks))), draws,
+                        "the template's gradient over a value row split by its blocks, an A100's plan",
+                        seeds=FEWEST_SEEDS,
+                        truth_fn=with_gradients(widened(functools.partial(token_by_token, hooks))))
