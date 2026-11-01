@@ -15,7 +15,7 @@ import logging
 import os
 import shutil
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from dew.builds import CUDA_BUILDS, PACKAGE_INDEX, QUERY, listed_gpus, newest_build, runs_on
 from dew.pool import answered, cuda_driver, runs_on_gpu
@@ -441,21 +441,24 @@ def gpu_memory(ordinal: int) -> tuple[int, int] | None:
         cuda.cuDevicePrimaryCtxRelease_v2(device)
 
 
-def gpu_name(ordinal: int) -> str | None:
-    """The visible GPU `ordinal`'s name, as the CUDA driver reports it (`NVIDIA H100 80GB HBM3`)."""
-    cuda, device, name = cuda_driver(), ctypes.c_int(), ctypes.create_string_buffer(256)
+def _reported(ordinal: int, size: int, call: Callable[[ctypes.CDLL], Callable[..., int]]) -> str | None:
+    """The text a CUDA driver `call` writes of the visible GPU `ordinal`, at most `size` bytes, None where no
+    driver answers."""
+    cuda, device, text = cuda_driver(), ctypes.c_int(), ctypes.create_string_buffer(size)
     if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
         return None
-    return None if cuda.cuDeviceGetName(name, len(name), device) else name.value.decode()
+    return None if call(cuda)(text, len(text), device) else text.value.decode()
+
+
+def gpu_name(ordinal: int) -> str | None:
+    """The visible GPU `ordinal`'s name, as the CUDA driver reports it (`NVIDIA H100 80GB HBM3`)."""
+    return _reported(ordinal, 256, lambda cuda: cuda.cuDeviceGetName)
 
 
 def gpu_place(ordinal: int) -> str | None:
     """The visible GPU `ordinal`'s PCI bus id, as the CUDA driver reports it (`0000:18:00.0`): where it sits,
     which its links to the other GPUs follow."""
-    cuda, device, place = cuda_driver(), ctypes.c_int(), ctypes.create_string_buffer(32)
-    if cuda is None or cuda.cuInit(0) or cuda.cuDeviceGet(ctypes.byref(device), ordinal):
-        return None
-    return None if cuda.cuDeviceGetPCIBusId(place, len(place), device) else place.value.decode()
+    return _reported(ordinal, 32, lambda cuda: cuda.cuDeviceGetPCIBusId)
 
 
 def nccl_version() -> int | None:
