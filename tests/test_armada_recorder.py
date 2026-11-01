@@ -456,12 +456,12 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
     assert found == [f"3.12:{name}" for name in names]
 
 
-def test_a_file_that_digests_dews_source_keys_on_what_it_ran_not_on_every_source_file(ci, tmp_path, monkeypatch,
-                                                                                       cache_worker):
-    """`dew.cache.package_digest` reads every source file of the package only to name the records Dew's caches
-    keep (the rung cache's, a verified mapping's, a saved source's export), and each file's process has a cache
-    directory of its own (ci.py's `alone`), so no record another file wrote serves it: its reads are no input
-    (followed.py's `DIGEST`). A file that calls it runs again for an edit of the code it ran, the digest's
+def test_a_file_that_digests_dews_source_keys_on_what_it_ran_not_on_every_source_file(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """`dew.cache.package_digest` reads every source file of the package only to name the records Dew's
+    caches keep (the rung cache's, a verified mapping's, a saved source's export), and each file's process has
+    a cache directory of its own (ci.py's `alone`), so no record another file wrote serves it: its reads are no
+    input (followed.py's `DIGEST`). A file that calls it runs again for an edit of the code it ran, the digest's
     own included, and not for one of a module it never ran, nor for a release's version (train 396 reused 1
     of 2,279 rows for its version bump; ledger 3220: the digest keyed 37-45% of rows on every source file)."""
     import shutil
