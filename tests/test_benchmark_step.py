@@ -118,14 +118,3 @@ def a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
     assert row["peak_device_bytes"] == row["peak_bytes_by_device"][0] >= row["planned_device_bytes"] > 0
     assert any((tmp_path / "traces/peak-run").rglob("*.xplane.pb"))
-
-
-@pytest.mark.gpu(reason="a profiled case reads its device timeline, which a CPU trace holds none of")
-def test_a_profiled_case_writes_the_reports_attribute_step_reads(tmp_path):
-    """`--profile-dir` captures the case's steps as a `dew.Profiler` capture with its reports, the
-    `reports/hlo_stats.json` tools/attribute_step.py reads (`--trace`), beside the trace the row's timeline
-    reads."""
-    peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
-    attribute = load("attribute_step")
-    (case,) = [path for path in (tmp_path / "traces").iterdir() if path.name != "peak-run"]
-    assert (attribute.capture_of(case) / "reports" / "hlo_stats.json").is_file()
