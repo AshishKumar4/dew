@@ -189,6 +189,30 @@ def region(closed: jcore.Jaxpr) -> Region:
                   max(depths.values(), default=0), len(jaxpr.eqns))
 
 
+def spoken(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` is of the language (`_term` makes a term of it) and outside every protected region."""
+    name, arity = equation.primitive.name, len(equation.invars)
+    if len(equation.outvars) != 1 or protected(equation):
+        return False
+    return ((name in BINARY or name in COMPARISONS or name == "dot_general") and arity == 2
+            or (name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type")
+            and arity == 1 or name == "select_n" and arity == 3)
+
+
+def form_value(region_: Region, form: Term, values: list) -> jax.Array:
+    """One chosen `form`'s value over `region_`'s leaves' `values` (a region of the language alone, whose
+    leaves are its inputs), each shared term evaluated once."""
+    known: dict[str, jax.Array] = {}
+
+    def value(term: Term) -> jax.Array:
+        key = str(term)
+        if key not in known:
+            known[key] = _value(term, value, region_, values)
+        return known[key]
+
+    return value(form)
+
+
 def _shape(atom) -> tuple[int, ...]:
     """An array value's shape; a value of no shape (a token, a key's) has none the rules read."""
     return tuple(atom.aval.shape) if isinstance(atom.aval, ShapedArray) else ()
