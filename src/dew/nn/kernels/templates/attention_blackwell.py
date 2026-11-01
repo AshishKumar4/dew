@@ -274,8 +274,7 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     acc = TCGEN05.load_columns(scratch.acc_tmem, 0, value_width)
     TCGEN05.loaded()
     # The denominator to the epilogue's row layout through shared memory, which relayouts it.
-    scratch.l_smem[...] = total
-    total = plgpu.load(scratch.l_smem, layout=STORED.reduce(1))
+    total = TCGEN05.relaid(total, scratch.l_smem, STORED.reduce(1))
     out, _, _ = algebra.finish(spec, algebra.Partial(acc, m, total), initial=False)
     mosaic.stored((out,), (out_ref.at[block.row, pl.ds(block.first, rows), block.head],), smem=scratch.o_smem,
                   wait=False)
@@ -322,14 +321,13 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                key_stages.scratch(), value_stages.scratch(), scores.scratch(target),
                mosaic_sm100.operand_columns(rows, block_k, dtype), signals.scratch(),
                mosaic_sm100.accumulator_columns(rows, value_width), signals.scratch(),
-               mosaic_sm100.operand((rows, value_width), dtype, value_width),
-               plgpu.SMEM((rows,), jnp.float32))
+               mosaic_sm100.operand((rows, value_width), dtype, value_width), mosaic_sm100.vector(rows))
     rows_type = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
     out, maxima, over = TCGEN05.kernel(
         kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type,
                           rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
-        interpret=plgpu.InterpretGPUParams() if interpret else None,
+        interpret=mosaic.interpreted(interpret),
         # A name a form (the default's fold and its natural rewalk compile apart), and the guard's rerun of
         # the plain launch its own (`algebra.walked_launches`' `again`).
         name="attention_forward_tcgen05" + ("_natural" if spec.natural else "") + ("_kept" if kept else ""),
