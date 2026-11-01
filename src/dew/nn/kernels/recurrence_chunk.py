@@ -1566,7 +1566,8 @@ def selective_kernel(x, A, B, C) -> str:
     `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]`, on the target, reported as its route."""
     from .templates import bundles
 
-    # A GPU's family where a bundle claims it (consumer Blackwell's and tcgen05's have none yet).
+    # A GPU's family where a bundle claims it (consumer Blackwell's, mma.sync fed by TMA, has one; tcgen05
+    # has none in a route yet).
     on_gpu = generation.backend() == 'gpu'
     bundled = on_gpu and bundles.of(generation.device_generation(), x.dtype) is not None
     family = generation.family(generation.device_generation()) if bundled else None

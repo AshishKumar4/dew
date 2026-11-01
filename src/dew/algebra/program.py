@@ -25,6 +25,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import cost, rules, terms
 from dew.cache import ALGEBRA, Passes
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 
 
@@ -78,13 +79,13 @@ def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
         yield
 
 
-def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation,
-              static_argnums: int | tuple[int, ...] = (), static_argnames: str | tuple[str, ...] = ()
-              ) -> Callable:
+def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tuple[int, ...] = (),
+              static_argnames: str | tuple[str, ...] = ()) -> Callable:
     """`fn` with its program rewritten where the switch is on (`passes`): its static arguments bound as the
     jit around it binds them (`static_argnums`, `static_argnames`), traced over the others, its terms
-    saturated under the rule sets its numerics admit (`rules.admitted`) and its values evaluated in their
-    cheapest forms. Its arguments, outputs and their structure are `fn`'s."""
+    saturated under the rule sets the run's numerics admit (`rules.admitted`: the `exact` sets alone under
+    the accurate forms, `generation.numerics`, which the trace context keys) and its values evaluated in
+    their cheapest forms. Its arguments, outputs and their structure are `fn`'s."""
     # The static positions and names as jit resolves them: each given, and its other spelling read from the
     # signature's positional parameters, so a static argument passed either way is bound.
     numbers = {static_argnums} if isinstance(static_argnums, int) else set(static_argnums)
@@ -115,6 +116,7 @@ def rewritten(fn: Callable, *, accurate: bool = False, saturation: Saturation,
 
         named = {name: value for name, value in kwargs.items() if name not in names}
         closed, shaped = jax.make_jaxpr(bound, return_shape=True)(dynamic, named)
+        accurate = generation.numerics().forms == "accurate"
         done = rewrite(closed, jax.tree.leaves((dynamic, named)), accurate=accurate, saturation=saturation)
         return jax.tree.unflatten(jax.tree.structure(shaped), done)
     return run

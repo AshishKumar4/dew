@@ -267,7 +267,7 @@ ALGEBRA = jax.make_user_context(default_value=Passes())
 under another, and the accuracy gate opens it per arm (docs/design/algebra.md §6.7)."""
 
 DERIVED = jax.make_user_context(default_value=False)
-"""Whether the templates take their algebra's derived forms (`dew.algebra.derived`) in place of their
+"""Whether the templates take their algebra's derived forms (`dew.algebra.forms.derived`) in place of their
 hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
 other, and check 1 drives both (docs/design/algebra.md §6.9)."""
 

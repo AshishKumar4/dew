@@ -38,9 +38,9 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
            saturation: program.Saturation, admits: Callable[[Callable, Callable], bool]) -> Choice:
     """`function`'s form chosen for operands of `operands`' shapes and dtypes: the cheapest candidate the gate
     admits (`admits(candidate, reference)`, whether `candidate` is as exact as `reference` from the float64
-    truth): under default numerics against the form as written; under `--precision accurate` against every
-    other candidate, so a choice is never less accurate than any form proposed, the form as written among
-    them."""
+    truth): under default numerics against the form as written; under the accurate numerics
+    (`precision="accurate"`) against every other candidate, so a choice is never less accurate than any form
+    proposed, the form as written among them."""
     closed, shaped = jax.make_jaxpr(function, return_shape=True)(*operands)
     region = terms.region(closed)
     graph, bundle, roots = program.graphed(region)

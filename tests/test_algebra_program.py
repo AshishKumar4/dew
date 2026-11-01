@@ -12,10 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, equations
-from test_algebra import rows, two_sums
+from test_algebra import count, rows, two_sums
 
 from dew import algebra
-from dew.nn.kernels import options
+from dew.nn.kernels import generation, options
 from dew.nn.kernels.templates import report
 
 
@@ -88,6 +88,23 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
 
     assert_as_exact(called(rewritten), called(plain), lambda seed: rows(seed, (8, 64), (8, 64), (8, 64)),
                     f"a static count passed {pass_n}", seeds=16)
+
+
+def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
+    """Under the run's accurate numerics (`precision="accurate"`, `generation.run_precision`) the pass admits
+    the `exact` sets alone (docs/design/algebra.md §1.4): two products of a shared operand, summed, which the
+    default numerics join into one, stay two (`dot_general` counted) and compute what they compute."""
+    from dew.nn.precision import ACCURATE
+
+    def contracted(a, x, y):
+        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
+        return jnp.einsum("rk,rk->r", a, x) + jnp.einsum("rk,rk->r", a, y)
+
+    operands_ = rows(1, (8, 64), (8, 64), (8, 64))
+    with generation.run_precision(ACCURATE):
+        accurate = jax.make_jaxpr(algebra.rewritten(contracted))(*operands_)
+    default = jax.make_jaxpr(algebra.rewritten(contracted))(*operands_)
+    assert (count(accurate, "dot_general"), count(default, "dot_general")) == (2, 1)
 
 
 def test_products_with_a_shared_operand_join_into_one():

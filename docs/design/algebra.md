@@ -127,7 +127,7 @@ inferred. A bare custom derivative in `src/dew` fails a slop check, not a defaul
   - **linear scans** and **error-free transforms** (dev time; §6.9).
 - **Rounding:** a rewrite that rounds identically (`exact`) always applies. One that reorders rounding (`reorders`:
   linearity, hoisting, distributivity) applies at compile time under default numerics and never under
-  `--precision accurate`. The compile-time pass estimates no error per program: a `reorders` rule is admitted
+  the accurate numerics (`precision="accurate"`). The compile-time pass estimates no error per program: a `reorders` rule is admitted
   under default numerics on the strength of its own gate, the default form's contract for its rounding class
   (§3), and a program's error is otherwise unknown, so nothing at compile time compares it to a parity. At dev
   time a reordering form is admitted under accurate numerics only where its sampled error meets the declared
@@ -147,7 +147,7 @@ floating-point expressions:
   rows), as check 1 measures error.
 - **The declared accuracy** is the precision policy's (`dew.nn.precision`), read once:
   - default numerics: check 1 at the gate's parity (§3) against the form as written;
-  - `--precision accurate`: check 1 at the gate's parity against the most accurate candidate measured.
+  - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against the most accurate candidate measured.
 - **Among the candidates that meet it,** the generator takes the cheapest by time (§1.6). A candidate that
   misses it is never chosen, however cheap.
 - **At compile time no candidate is measured;** admission is by rounding class alone (§1.4).
@@ -450,8 +450,10 @@ def admitted(numerics, mode: Mode) -> tuple[Rules, ...]   # the sets a mode and 
 - A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
 - Each rule's check 1 site names the rule (§3).
 - A rewrite's result carries its rounding class (§6.3).
-- At compile time, under default numerics, the compile-time sets are admitted; under `--precision accurate`, only
-  the `exact` ones, since the pass estimates no error.
+- At compile time, under default numerics, the compile-time sets are admitted; under the accurate numerics
+  (`precision="accurate"`), only the `exact` ones, since the pass estimates no error. The pass reads the run's
+  numerics where it traces (`generation.numerics`, in JAX's trace context), so a program held across the two
+  traces afresh.
 - At dev time every set is admitted, and the declared accuracy (§1.5) decides which forms extraction may take.
 
 ### 6.5 Cost and extraction

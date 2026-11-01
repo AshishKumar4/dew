@@ -345,8 +345,8 @@ def heads(primitive: str, operands: Sequence[str | None]) -> bool:
 
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
-    under `--precision accurate`; the dev-time sets (`Rules.dev`) only where `dev`, whose choice measures
-    each candidate's error instead."""
+    under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`,
+    whose choice measures each candidate's error instead."""
     return tuple(rules for rules in RULES.values()
                  if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact"))
 

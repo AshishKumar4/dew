@@ -50,8 +50,6 @@ def of(generation_name: str, dtype) -> mosaic.Family | None:
     return None
 
 
-
-
 def layouts(generation_name: str, dtype) -> tuple[mosaic.Family, ...]:
     """The bundles a launch on a device of `generation_name` may take for operands of `dtype`, in preference
     order: its instruction family's (`of`) first, a producer's layout, whose loads overlap no consumer's
