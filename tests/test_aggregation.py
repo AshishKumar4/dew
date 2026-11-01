@@ -165,3 +165,68 @@ def test_a_greedy_step_is_the_agents_step_without_its_draw():
         np.testing.assert_array_equal(np.asarray(remembered.previous), np.asarray(greedy))
         state, following = driven.step(carry.state, greedy)
         carry = Carry(state, following.observation, carry.key, remembered)
+
+
+@pytest.mark.parametrize("simulated", [False, True])
+@pytest.mark.parametrize("taught", [False, True])
+def test_a_demonstrated_prefill_writes_the_demonstrators_actions_and_a_teachers_labels(simulated, taught):
+    """A Dreamer rollout whose prefill a pilot demonstrates, over targets in JAX or simulated on the host,
+    writes each prefill step with the pilot's action at its observation, and, given a second pilot as its
+    teacher, that one's action as its label; the agent then acts on from the memory it started with, its
+    own steps the pilot's actions no more."""
+    objective = DreamerV3Objective(tiny())
+    env = HostTarget() if simulated else Batched(TimeLimit(Target(), episode_length=20), 8)
+    teacher = Teacher(pilot, {"gain": jnp.asarray(0.5)}) if taught else None
+    rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=8.0, prefill=24,
+                             demonstrator=Teacher(pilot, {"gain": jnp.asarray(0.75)}), teacher=teacher)
+    dreamer_fit(None, objective, rollout, 2)
+    replay = rollout.held_replay
+    assert replay is not None
+    filled = int(replay.filled)
+    assert filled > 24
+    held = jax.device_get(replay.held)
+    observation, action = np.asarray(held["observation"][:filled]), np.asarray(held["action"][:filled])
+
+    def piloted(gain):
+        return np.clip(gain * 2 * (1 - observation), -1, 1).astype(np.float32)
+
+    np.testing.assert_array_equal(action[:24], piloted(0.75)[:24])
+    assert not np.array_equal(action[24:], piloted(0.75)[24:])
+    assert (LABEL in held) == taught
+    if taught:
+        np.testing.assert_array_equal(np.asarray(held[LABEL][:filled]), piloted(0.5))
+
+
+@pytest.mark.parametrize("demonstrated", [False, True])
+def test_a_prefill_flown_a_window_at_a_time_writes_the_replay_one_pass_writes(demonstrated):
+    """A prefill of 24 steps over targets that restart within it, uniform or demonstrated by a PPO policy's
+    draws, flown in windows of 8 writes the replay, every leaf bit for bit, that one flown in one window of
+    24 writes: each window carries the environments, their keys and the replay on from where the last left
+    them. Pretraining on it (`train_ratio` infinite) takes no step past the prefill."""
+    policy = ControlPPOObjective(ActorCritic(1, (8,), (8,)), 1)
+    demonstrator = Teacher(policy.act, policy.init(jax.random.key(4))) if demonstrated else None
+
+    def prefilled(length):
+        objective = DreamerV3Objective(tiny())
+        rollout = DreamerRollout(objective, Batched(TimeLimit(Target(), episode_length=20), 8), capacity=400,
+                                 batch=8, length=length, train_ratio=float("inf"), prefill=24,
+                                 demonstrator=demonstrator)
+        dreamer_fit(None, objective, rollout, 2)
+        assert rollout.environment_steps == 24 * 8
+        return jax.device_get(rollout.held_replay)
+
+    for one, other in zip(jax.tree.leaves(prefilled(8)), jax.tree.leaves(prefilled(24)), strict=True):
+        np.testing.assert_array_equal(one, other)
+
+
+def test_a_demonstrator_beside_a_given_replay_is_refused():
+    """A demonstrator flies the prefill, which a replay given to the rollout replaces: a rollout given both
+    is refused, and either alone is not."""
+    objective = DreamerV3Objective(tiny())
+    env = Batched(TimeLimit(Target(), episode_length=20), 8)
+    seeded = demonstration_replay(demonstrations(8, 20, 3))
+    demonstrator = Teacher(pilot, {"gain": jnp.asarray(0.75)})
+    DreamerRollout(objective, env, replay=seeded)
+    DreamerRollout(objective, env, demonstrator=demonstrator)
+    with pytest.raises(ValueError):
+        DreamerRollout(objective, env, replay=seeded, demonstrator=demonstrator)

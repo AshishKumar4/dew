@@ -776,7 +776,12 @@ class DreamerRollout:
     environment's observation, every step the rollout takes, the prefill's too, is written with the
     teacher's action at it, its label (`dew.rl.aggregation.labelled`), which an objective that `imitates`
     it learns: DAgger, the replay aggregating the student's steps beside the teacher's own flights it
-    was given, labelled alike.
+    was given, labelled alike. Given a `demonstrator` (a `Teacher` too, a policy of the environment's
+    observation, such as a teacher flying its policy's draws, DART), it flies the prefill in place of the
+    uniform actions, so the replay starts from its demonstrations, labelled where there is a teacher; the
+    agent's memory passes through its steps untouched, as through the uniform ones. The prefill is flown
+    `length` steps at a time, so a long prefill of images holds one window's flight beside the replay, not
+    its whole.
 
     The run's checkpoints hold the environment steps it has taken (`saved`), so a resumed run takes the
     steps it still owes; its environments begin again and its replay is made again, from `replay` or the
@@ -797,6 +802,7 @@ class DreamerRollout:
     replay: ReplayBuffer | None = None
     checkpointed_replay: bool = False
     teacher: Teacher | None = None
+    demonstrator: Teacher | None = None
     _live: _Live | None = field(default=None, init=False, repr=False)
     _taken: int = field(default=0, init=False, repr=False)
     _prefilled: int = field(default=0, init=False, repr=False)
@@ -811,6 +817,8 @@ class DreamerRollout:
             raise ValueError("a checkpointed replay resumes with its environments mid episode, and a "
                              "Simulator's live outside JAX: its run's checkpoints hold the steps it took "
                              "alone")
+        if self.replay is not None and self.demonstrator is not None:
+            raise ValueError("a demonstrator flies the prefill, which a replay given to the rollout replaces")
         held = None if self.replay is None else self.replay.held
         if held is not None and (isinstance(held, Mapping) and LABEL in held) != (self.teacher is not None):
             raise ValueError("a replay given to a rollout holds the steps it writes: each with its teacher's "
@@ -894,10 +902,19 @@ class DreamerRollout:
         return jax.random.uniform(key, shape, minval=-1, maxval=1), {}, memory
 
     def _policy(self, random: bool) -> Policy:
-        """The collection's policy: uniform for the prefill, else the agent's draws; each step labelled
-        by the teacher where there is one, the policy then reading the agent's and the teacher's
-        variables (`_acting`)."""
+        """The collection's policy: for the prefill the demonstrator's where there is one, else uniform; else
+        the agent's draws; each step labelled by the teacher where there is one, the policy then reading
+        what acts beside the teacher's variables (`_acting`)."""
         acting = self._uniform if random else self.objective.act
+        demonstrator = self.demonstrator
+        if random and demonstrator is not None:
+            def demonstrated(params: Params, observed: Observation, key: jax.Array, memory: Memory):
+                # The demonstrator acts in the environment, from the observation the driven step holds; the
+                # agent's memory passes through, as the uniform prefill passes it.
+                action, _, _ = demonstrator.policy(params, views(observed)["observation"], key, None)
+                return action, {}, memory
+
+            acting = demonstrated
         if self.teacher is None:
             return acting
         teacher = self.teacher.policy
@@ -908,10 +925,11 @@ class DreamerRollout:
 
         return labelled(acting, taught)
 
-    def _acting(self, variables: Variables) -> Variables:
-        """What the collection's policy reads (`_policy`): the agent's variables, beside the teacher's
-        where there is one (`dew.rl.aggregation.paired`)."""
-        return variables if self.teacher is None else paired(variables, self.teacher.variables)
+    def _acting(self, variables: Variables, random: bool) -> Variables:
+        """What the collection's policy reads (`_policy`): the agent's variables, or the demonstrator's
+        for the prefill it flies, beside the teacher's where there is one (`dew.rl.aggregation.paired`)."""
+        acting = self.demonstrator.variables if random and self.demonstrator is not None else variables
+        return acting if self.teacher is None else paired(acting, self.teacher.variables)
 
     def _kept(self, replay: ReplayBuffer, returns: jax.Array,
               recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
@@ -959,8 +977,10 @@ class DreamerRollout:
         # No update owes the prefill's steps; a resumed run that fills its replay again takes them again.
         self._prefilled += self.prefill * count
         example = self._step_example(carry.observation, count)
-        return self._advanced(variables, _Live(carry, ReplayBuffer.empty(example, self.capacity), returns),
-                              self.prefill, random=True)
+        live = _Live(carry, ReplayBuffer.empty(example, self.capacity), returns)
+        for flown in range(0, self.prefill, self.length):
+            live = self._advanced(variables, live, min(self.length, self.prefill - flown), random=True)
+        return live
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         act_key, sample_key = jax.random.split(key)
@@ -1013,7 +1033,7 @@ class DreamerRollout:
         return self._sample(replay, key)
 
     def _advanced(self, variables: Variables, live: _Live, steps: int, *, random: bool) -> _Live:
-        live, total, count = self._roll(self._acting(variables), live, steps=steps, random=random)
+        live, total, count = self._roll(self._acting(variables, random), live, steps=steps, random=random)
         self._taken += steps * live.returns.shape[0]
         # Read when the metrics are, so the host does not wait for each advance to finish.
         self._ended = (total, count)
