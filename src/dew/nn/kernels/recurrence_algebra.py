@@ -43,7 +43,7 @@ import numpy as np
 
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.templates.attention_algebra import power2
-from dew.nn.kernels.templates.product import Exact, Transposed
+from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul, two_product
 
 from . import recurrence
@@ -618,24 +618,6 @@ TileLoad = Callable[..., Tile]
 """A load of a `Tile` (the backward's operands)."""
 
 
-class Blocks(NamedTuple):
-    """`count` products named `name` to sum, `left(j) @ right(j)` a block `j` (tiles in memory): one a
-    block, which a mainloop may issue as a loop over `j`, its operands' fragments loaded a block at a time
-    (`templates.recurrence.issuing.Issuer.summed`), where unrolled ptxas held every block's at once."""
-
-    name: str
-    left: Callable[..., "Operand"]
-    right: Callable[..., "Operand"]
-    count: int
-
-
-def expanded(products) -> list:
-    """`products`, `(name, left, right)` and `Blocks`, as a list of `(name, left, right)`, a product a
-    block."""
-    return [product for entry in products
-            for product in ([(entry.name, entry.left(j), entry.right(j)) for j in range(entry.count)]
-                            if isinstance(entry, Blocks) else [entry])]
-
 Operand = jax.Array | Tile | Transposed | Exact
 """A product's operand (`Issue`'s): registers, a tile in memory, or registers taken transposed."""
 
@@ -850,6 +832,21 @@ def factored_range(floor: float, sub: int = SUB) -> bool:
     return -floor * sub * math.log2(math.e) < PAIR_CEILING
 
 
+def _laid_references(reference: Callable[[int, int], tuple], c, index: jax.Array, chunk: int,
+                     sub: int) -> tuple:
+    """Key block `c`'s sub-chunks' common points laid over their rows, each half `[C, BK]` (`separated`):
+    sub-chunk `s`'s first token's prefix (`reference(s, c)`) on its rows from its own on, a sub-chunk a
+    rolled turn. Read at static rows, their addresses were hoisted to the kernel's start and held through it
+    (260 of an H100's 475 registers at the peak)."""
+
+    def laid(s, below):
+        halves = separated(*reference(s, c))
+        return tuple(jnp.where(index >= s * sub, half[None, :], under)
+                     for half, under in zip(halves, below, strict=True))
+
+    return jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
+
+
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
                       gates: Callable[[int], tuple],
                       reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
@@ -890,17 +887,7 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
         # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
-
-        def laid(s, below):
-            # Each sub-chunk's reference laid over its rows from its own on, read in a rolled turn: read at
-            # static rows, their addresses were hoisted to the kernel's start and held through it (260 of an
-            # H100's 475 registers at the peak).
-            halves = separated(*reference(s, c))
-            return tuple(jnp.where(index >= s * sub, half[None, :], under)
-                         for half, under in zip(halves, below, strict=True))
-
-        start = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
-        down = rows(c) * between(prefix, start)
+        down = rows(c) * between(prefix, _laid_references(reference, c, index, chunk, sub))
         return jax.lax.fori_loop(0, chunk // sub, lambda s, total: (
             total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
 
@@ -1204,15 +1191,7 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
     for c in range(columns):
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
-
-        def laid(s, below, c=c, index=index):
-            # Each sub-chunk's reference laid over its rows from its own on (`key_decayed_pairs`').
-            halves = separated(*reference(s, c))
-            return tuple(jnp.where(index >= s * sub, half[None, :], under)
-                         for half, under in zip(halves, below, strict=True))
-
-        down = between(prefix, jax.lax.fori_loop(0, chunk // sub, laid,
-                                                 (jnp.zeros(index.shape, jnp.float32),) * 2))
+        down = between(prefix, _laid_references(reference, c, index, chunk, sub))
         key = keys(c)
 
         def turn(s, carried, c=c, prefix=prefix, index=index, down=down, key=key):

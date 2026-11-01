@@ -30,6 +30,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
+from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
 from dew.training._lowering import kernel_calls, triton_kernels
@@ -463,18 +464,31 @@ def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = N
         "", ENTRY.sub(lambda entry: f"{entry.group(1)}.maxnreg {cap}\n", ptx, count=1))
     if raised is not None:
         capped = RAISE.sub(f"setmaxnreg.inc.sync.aligned.u32 {raised};", capped)
+    text, took = _ptxas_text(capped, generation, relocatable)
+    used = [int(count) for count in REGISTERS.findall(text)]
+    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
+    return max(used, default=0), max(spilled, default=0), took
+
+
+def _ptxas_text(ptx: str, generation: str, relocatable: bool) -> tuple[str, bool]:
+    """ptxas's own report (`-v`) on the kernel `ptx` for the CUDA `generation`, compiled relocatably or
+    whole-program (`_ptxas`), and whether it took the kernel."""
     major, minor = capability(generation) or (0, 0)
     arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
-        source.write(capped)
+        source.write(ptx)
         source.flush()
         relocating = ("--compile-only",) if relocatable else ()
         ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", *relocating, source.name, "-o", os.devnull],
                              capture_output=True, text=True, check=False)
-    text = ran.stdout + ran.stderr
-    used = [int(count) for count in REGISTERS.findall(text)]
-    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
-    return max(used, default=0), max(spilled, default=0), ran.returncode == 0
+    return ran.stdout + ran.stderr, ran.returncode == 0
+
+
+def ptxas_notes(ptx: str, generation: str) -> str:
+    """What ptxas says of the kernel `ptx` as the GPU compiles it (`RELOCATABLE`): its registers and spills,
+    and the notes it makes of the code, a warpgroup MMA's serialization among them ("wgmma.mma_async
+    instructions are serialized"), which the gate's registers and spills do not state."""
+    return _ptxas_text(ptx, generation, RELOCATABLE)[0]
 
 
 def _assembled(ptx: str, generation: str, cap: int, *, honored: bool) -> tuple[int, int, bool]:
@@ -808,3 +822,20 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
             text = text if len(text) <= 1600 else f"{text[:800]} ... {text[-800:]}"
             record["error"] = f"{type(error).__name__}: {text}"
     return found
+
+
+class Uncounted(grouped_matmul.MosaicGmm):
+    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
+    registers do not hold: a launch whose model misses. Its first tile is a paired product's widest, 128 x
+    256, two accumulators of 128 registers a thread, which spills in every compile whatever its walk's
+    addresses take (the paired 128 x 128 tile this launch took first spilled 16 bytes in the process's own
+    compile only while its walk held a stage's addresses in registers, and none since the walk forms them
+    where it uses them: `mosaic.opaque`); a narrower tile comes once a compile has refused a tile of its
+    launch (`report.refused_launches`, the relowering's proposals included)."""
+
+    def registers(self, ba, config):
+        return 0
+
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and (
+            config.block_n == 256 or bool(report.refused_launches()))

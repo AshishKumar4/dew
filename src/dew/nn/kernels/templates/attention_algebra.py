@@ -214,6 +214,12 @@ class Coords(NamedTuple):
     drop: Draw | None = None
     keys_first: bool = False
     tile_keys: int | None = None
+    key_start: jax.Array | None = None
+    """Where given, `k_pos` as `key_start + key_offsets`: a start each thread holds across a row (its first
+    key and the key bits its lane decides) and offsets its registers decide, constants the compiler folds
+    into each compare, so a row's bound takes the start once (`seen`; FA3's causal mask, against a key place
+    formed whole per entry: 36 bit operations a diagonal tile's trip at width 128 on an H100)."""
+    key_offsets: jax.Array | None = None
 
     def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
@@ -848,14 +854,23 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
                                                            coords.queries(end, like), ids)
                                                     for start, end in coords.spans))
     elif spec.form == "causal":
-        visible = coords.k_pos <= coords.q_pos
+        visible = _keys_before(coords, coords.q_pos + 1)
     if spec.form != "spans" and spec.keys % coords.key_count(like):
         # A tile past the call's last key reads padding.
-        visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
+        past = _keys_before(coords, spec.keys)
+        visible = past if visible is None else visible & past
     if spec.form != "spans" and spec.queries is not None:
         rows = coords.q_pos < spec.queries
         visible = rows if visible is None else visible & rows
     return visible
+
+
+def _keys_before(coords: Coords, bound) -> jax.Array:
+    """Whether each key's place lies before `bound`: against its offsets past the row's start where the
+    coordinates split its places (`Coords.key_start`), one subtraction a row."""
+    if coords.key_offsets is None:
+        return coords.k_pos < bound
+    return coords.key_offsets < bound - coords.key_start
 
 
 def places_read(spec: Forward, *, masked: bool, hooked: tuple[bool, bool], dropped: bool,
@@ -975,7 +990,7 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
     return state if live is None else headroomed(state, live)
 
 
-Parts = tuple[tuple[jax.Array, jax.Array | None], ...]
+Parts = tuple[jax.Array | product.Scaled, ...]
 """A product's parts as a mainloop issues them (`cotangent_parts`, `weights_parts`): each a narrowed
 operand with the power of two its product takes back (None: none)."""
 
@@ -1029,7 +1044,7 @@ def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p
     `p * multiplier` narrowed at the scale `weights_parts` gives them."""
     if multiplier is not None:
         return products_of(weights_parts(p * multiplier, value.dtype), value, dot, chunk)
-    return products_of(((narrow(p, value.dtype), None),), value, dot, chunk)
+    return products_of((narrow(p, value.dtype),), value, dot, chunk)
 
 
 def products_of(parts: Parts, value: jax.Array, dot: Callable[[jax.Array, jax.Array], jax.Array],
@@ -1041,10 +1056,14 @@ def products_of(parts: Parts, value: jax.Array, dot: Callable[[jax.Array, jax.Ar
         return (summed_products(parts, value, dot),)
     count = value.shape[0] // chunk
     values = jnp.split(value, count, axis=0)
-    pieces = [jnp.split(part, count, axis=-1) for part, _ in parts]
-    return tuple(summed_products(tuple((piece[index], exponent) for piece, (_, exponent) in zip(pieces, parts,
-                                                                                               strict=True)),
-                                 values[index], dot)
+    def pieces(part):
+        # A part's chunks of keys, a scaled one's each at its scale.
+        if isinstance(part, product.Scaled):
+            return [product.Scaled(piece, part.exponent) for piece in jnp.split(part.value, count, axis=-1)]
+        return jnp.split(part, count, axis=-1)
+
+    split = [pieces(part) for part in parts]
+    return tuple(summed_products(tuple(chunks[index] for chunks in split), values[index], dot)
                  for index in range(count))
 
 
@@ -1081,7 +1100,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     if held is None and keys.accumulate is not None:
         # The weights the walk accumulates dropped where the call drops (`_times`' parts); the denominator
         # the undropped weights'.
-        parts = (((narrow(p, value.dtype), None),) if multiplier is None
+        parts = ((narrow(p, value.dtype),) if multiplier is None
                  else weights_parts(p * multiplier, value.dtype))
         # `carry_factor`'s plain factor, each query's broadcast over its sums as the mainloop holds them.
         acc = keys.accumulate(state.acc, lambda acc: keys.coords.queries(factor, acc) * acc, parts, value)
@@ -1105,7 +1124,7 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
     at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
     others, own_tile = anchor_split(narrow(p, dtype), at_anchor)
     if multiplier is None:
-        return ((others, None),), others, own_tile, anchor
+        return (others,), others, own_tile, anchor
     parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, dtype)
     # The anchor's multiplier by its query's vector and its key's, no unit axis (a Mosaic program's lowers
     # none beside a tile).
@@ -2093,8 +2112,8 @@ def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     """The parts a tile's score cotangents `[bq, bk]` (fp32, scaled) take to their product with an operand of
-    `dtype` (`cotangent_product`), each narrowed to it, with the power of two its product takes back (None:
-    none), so a mainloop may issue their products into one accumulator. An fp32 operand's part is the
+    `dtype` (`cotangent_product`), each narrowed to it, a `product.Scaled` where its product takes a power of
+    two back, so a mainloop may issue the others' products into one accumulator. An fp32 operand's part is the
     cotangents themselves. The fast form (`accurate` False) narrows bf16's cotangents to bf16 for one product,
     FlashAttention's. fp16's take the accurate form's two products in both forms: one fp16 product of
     cotangents that cancel against equal keys near fp16's largest leaves a gradient past it once it returns in
@@ -2111,26 +2130,24 @@ def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     return tuple(formed_parts(cotangents, dtype, accurate=accurate))
 
 
-def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool
-                 ) -> Iterator[tuple[jax.Array, jax.Array | None]]:
+def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Iterator[jax.Array | product.Scaled]:
     """`cotangent_parts` a part at a time, each formed only as it is taken: a mainloop that retires each
     part's product before taking the next (`Family.register_products`' `retired`) holds one part's registers
     beside the cotangents, not every part's."""
     if dtype == jnp.float32:
-        yield cotangents, None
+        yield cotangents
         return
     if dtype == jnp.bfloat16:
         # The leading part saturates at bf16's largest: an fp32 cotangent past it by more than half its ulp
         # rounds to infinity in bf16, an infinite product, or a NaN against a zero operand. The accurate
         # form's later parts take the difference whole, the fast form's one part is within 2^-8 of it.
-        for part in product.bf16_parts(cotangents, 3 if accurate else 1, saturating=1):
-            yield part, None
+        yield from product.bf16_parts(cotangents, 3 if accurate else 1, saturating=1)
         return
     scaled, high_exponent = _scaled(cotangents)
     high = scaled.astype(dtype)
-    yield high, high_exponent
+    yield product.Scaled(high, high_exponent)
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
-    yield low, low_exponent + high_exponent
+    yield product.Scaled(low, low_exponent + high_exponent)
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
@@ -2144,16 +2161,17 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
 
 def summed_products(parts: Parts, operand: jax.Array,
                     dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
-    """The sum of `parts`' products with `operand` by `dot` (`cotangent_parts`, `weights_parts`), each taken
-    back by its power of two, in order."""
-    def taken(part: jax.Array, exponent: jax.Array | None) -> jax.Array:
-        product = dot(part, operand)
-        return product if exponent is None else power2(product, exponent)
+    """The sum of `parts`' products with `operand` by `dot` (`cotangent_parts`, `weights_parts`), a scaled
+    one's taken back by its power of two, in order."""
+    def taken(part) -> jax.Array:
+        if isinstance(part, product.Scaled):
+            return power2(dot(part.value, operand), part.exponent)
+        return dot(part, operand)
 
-    (first, first_exponent), *rest = parts
-    total = taken(first, first_exponent)
-    for part, exponent in rest:
-        total = total + taken(part, exponent)
+    first, *rest = parts
+    total = taken(first)
+    for part in rest:
+        total = total + taken(part)
     return total
 
 
@@ -2162,8 +2180,8 @@ def weights_parts(weights: jax.Array, dtype) -> Parts:
     fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`), which its product takes
     back."""
     if dtype == jnp.float16:
-        return (_fp16_scaled(weights),)
-    return ((weights.astype(dtype), None),)
+        return (product.Scaled(*_fp16_scaled(weights)),)
+    return (weights.astype(dtype),)
 
 
 def weights_product(weights: jax.Array, operand: jax.Array,
@@ -2175,8 +2193,10 @@ def weights_product(weights: jax.Array, operand: jax.Array,
 def narrowed(x: jax.Array, dtype) -> jax.Array:
     """`x` (fp32) narrowed to `dtype` at the scale `weights_parts` gives it, held in fp32: the values a
     product takes, which a dropped weight's (`x * multiplier`) overflow at the 16-bit scale never meets."""
-    (part, exponent), = weights_parts(x, dtype)
-    return part.astype(jnp.float32) if exponent is None else power2(part.astype(jnp.float32), exponent)
+    (part,) = weights_parts(x, dtype)
+    if isinstance(part, product.Scaled):
+        return power2(part.value.astype(jnp.float32), part.exponent)
+    return part.astype(jnp.float32)
 
 
 

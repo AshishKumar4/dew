@@ -9,6 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 from collections.abc import Callable
+from typing import Self
 
 import jax
 import jax.numpy as jnp
@@ -91,7 +92,7 @@ class Streams:
 class MmaIssuer(mosaic.Issuer[jax.Array]):
     """mma.sync's issuer and home for operands of `dtype`: accumulators in registers, products synchronous,
     each operand loaded into its fragments from shared memory (ldmatrix), its warps `m_warps` along a tile's
-    rows and the rest along its columns (JAX's `MMALayouts`; `Mma.for_tile`)."""
+    rows and the rest along its columns (JAX's `MMALayouts`; `specialized`)."""
 
     dtype: jnp.dtype
 
@@ -109,6 +110,18 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     operands_in_registers = True
 
     products_overlap = False
+
+    def specialized(self, rows: int, columns: int) -> Self:
+        # Its warps split `m_warps` along a warpgroup's `rows` and the rest along its `columns` (`MMALayouts`;
+        # each product states it, `plgpu.mma`'s `m_warps`): of the splits whose atom, `m_warps * 16` rows by
+        # `(4 // m_warps) * 8` columns, divides the share, the one reading its operands from shared memory
+        # fewest times a step, each warp reading its rows' share whole and its columns' share whole
+        # (`rows * (4 // m) + columns * m`), the most along the rows on a tie. A 128 x 128 share so splits
+        # 2 x 2 (512 reads a step, where four warps along its rows read 640), each warp holding half the
+        # right operand's fragments.
+        splits = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
+        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, -m)) if splits else 4
+        return dataclasses.replace(self, m_warps=m_warps)
 
     @property
     def transposed_rows(self) -> int:
@@ -132,20 +145,22 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
 
-    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
-        # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`; D64's
-        # K in QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80). An ordinary one
-        # slices its rows' 8-row tiles.
-        return self._staged_depth(depth) if transposed else self.fragment_depth(depth)
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
+        # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`), one
+        # instruction's at the narrowest swizzle (a stream staged so by `streams`' `swizzles`: D64's K in
+        # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80). An ordinary one slices
+        # its rows' 8-row tiles.
+        return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int) -> int:
         return self._staged_depth(depth)
 
-    def _staged_depth(self, depth: int) -> int:
-        """The depth a load of a stage whose rows are `depth` deep takes: one tile of the widest swizzle its
-        row bytes allow (`swizzled`, `_depth_granule`), the whole depth where it is narrower."""
-        widest = mosaic.swizzle_columns(self.dtype, mosaic.widest_swizzle(self.dtype, depth))
-        return max(self.fragment_depth(depth), min(depth, widest))
+    def _staged_depth(self, depth: int, swizzle: int | None = None) -> int:
+        """The depth a load of a stage whose rows are `depth` deep takes: one tile of its `swizzle` (bytes;
+        the widest its row bytes allow where None, `swizzled`, `_depth_granule`), the whole depth where it
+        is narrower."""
+        swizzle = mosaic.widest_swizzle(self.dtype, depth) if swizzle is None else swizzle
+        return max(self.fragment_depth(depth), min(depth, mosaic.swizzle_columns(self.dtype, swizzle)))
 
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
 
@@ -276,6 +291,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
 
+    adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
+
     @property
     @abc.abstractmethod
     def lhs(self) -> plgpu_core.SomeLayout:
@@ -332,15 +349,16 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi) -> None:
-        del streams, views, lo, hi
+    def stream(self, streams, views, lo, hi, *, adds: tuple | None = None) -> None:
+        del streams, views, lo, hi, adds
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
-                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
+                consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
+                unrolled: bool = False) -> None:
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots.
         _one(consumers)
-        del in_flight
+        del in_flight, unrolled
 
         staging = self.output_staging(outputs, consumers)
 
@@ -371,11 +389,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
         # each stage back as its step ends.
-        del first, in_flight
+        del first, in_flight, unrolled
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))
@@ -460,19 +478,6 @@ class Mma(MmaIssuer, CpAsync):
     # one program took 1.04 to 1.50 of one's time on an A100 (CONSUMERS1), their shared copies leaner or
     # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
     consumers = 1
-
-    @classmethod
-    def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
-        """The bundle for a warpgroup's `rows` x `columns` of a tile, its warps split `m_warps` along the
-        rows and the rest along the columns (`MMALayouts`; each product states it, `plgpu.mma`'s
-        `m_warps`): of the splits whose atom, `m_warps * 16` rows by `(4 // m_warps) * 8` columns, divides
-        it, the one reading its operands from shared memory fewest times a step, each warp reading its
-        rows' share whole and its columns' share whole (`rows * (4 // m) + columns * m`), the most along
-        the rows on a tie. A 128 x 128 tile so splits 2 x 2 (512 reads a step, where four warps along its
-        rows read 640), each warp holding half the right operand's fragments."""
-        splits = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
-        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, -m)) if splits else 4
-        return cls(jnp.dtype(dtype), m_warps)
 
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
 

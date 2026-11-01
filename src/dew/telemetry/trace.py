@@ -24,7 +24,8 @@ from pathlib import Path
 # with `ncclKernel_` before NCCL 2.19.
 NCCL_COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
 
-COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
+COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "ragged-all-to-all",
+               "collective-broadcast", "collective-permute", "send", "recv")
 """The HLO ops that move data between devices. XLA runs some as an async
 pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
 computation that holds the op itself."""

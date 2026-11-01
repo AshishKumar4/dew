@@ -17,8 +17,10 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _coords,
     _rows,
     _Spans,
+    issued_into,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -42,7 +44,9 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
               plgpu.SMEM((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
-    return scoped, family.streams(blocks, stages, consumers)
+    # The logits' and dP's products read the keys and values transposed.
+    return scoped, family.streams(blocks, stages, consumers,
+                                  swizzles=transposed_swizzles(config, "keys", "values"))
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
              rows, accumulators):
@@ -90,12 +94,12 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate)
     # dQ's (and the keyed sums') products against the program's share of the keys' columns (`share`).
     k_columns = k_slot.at[:, pl.ds(*share)]
-    dq_acc = family.register_products(dq_acc, parts, k_columns, walk.interpret)
+    dq_acc = issued_into(family, dq_acc, parts, k_columns, walk.interpret)
     if keyed is None:
         return rows, (dq_acc,)
     factor, keyed_parts = keyed
     if factor is None:
-        keyed_acc = family.register_products(keyed_accs[0], keyed_parts, k_columns, walk.interpret)
+        keyed_acc = issued_into(family, keyed_accs[0], keyed_parts, k_columns, walk.interpret)
     else:
         # The keyed sums rescaled by their row factor, then the tile's products added in place.
         keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),
