@@ -412,22 +412,25 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
     iterator = json_value(saved.get("iterator"), "saved Grain iterator")
 
     def counted(branch: JSON) -> JSON:
-        if isinstance(branch, list):
-            return [counted(child) for child in branch]
-        if not isinstance(branch, dict):
-            return branch
-        node = {name: counted(child) for name, child in branch.items()}
-        counter = node.get(COUNTER)
-        if isinstance(counter, dict) and isinstance(counter.get("counts"), dict):
-            counts = counter["counts"]
-            node[COUNTER] = {**counter, "counts": {"delivered_rows": counts.get("accepted", 0), **counts}}
-        held = node.get("held")
-        if {"parent", "skip", "held"} <= node.keys() and isinstance(held, dict) and CONSUMED in held \
-                and REFUSED not in held and isinstance(held[CONSUMED], dict):
-            consumed = held[CONSUMED]
-            tokens = consumed.get("tokens")
-            none = [0] * (len(tokens) if isinstance(tokens, list) else 0)
-            node["held"] = {**held, REFUSED: {"dtype": consumed.get("dtype"), "tokens": none}}
+        match branch:
+            case list():
+                return [counted(child) for child in branch]
+            case dict():
+                node = {name: counted(child) for name, child in branch.items()}
+            case _:
+                return branch
+        match node.get(COUNTER):
+            case {"counts": {**counts}} as counter:
+                kept: dict[str, JSON] = {"delivered_rows": counts.get("accepted", 0), **counts}
+                node[COUNTER] = {**counter, "counts": kept}
+        match node:
+            case {"parent": _, "skip": _, "held": {**held}} if CONSUMED in held and REFUSED not in held:
+                match held[CONSUMED]:
+                    case {"dtype": dtype, "tokens": list(tokens)}:
+                        zeros: list[JSON] = [0] * len(tokens)
+                        none: dict[str, JSON] = {"dtype": dtype, "tokens": zeros}
+                        carried: dict[str, JSON] = {**held, REFUSED: none}
+                        node["held"] = carried
         return node
 
     if written.get("version") == 7:

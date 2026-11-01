@@ -734,9 +734,6 @@ def test_a_clocked_run_names_its_length_once():
     with pytest.raises(ValueError):
         clocked(CLOCK_LIMIT + 1, None)
     assert clocked(CLOCK_LIMIT, None) == CLOCK_LIMIT
-    # A pool reads its batches together, which a rollout drawing further from its own share would leave.
-    with pytest.raises(ValueError):
-        clocked(CLOCK_LIMIT, None, pooled_draws=True)
 
 
 def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_at_its_bound():

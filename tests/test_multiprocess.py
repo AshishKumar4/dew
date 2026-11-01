@@ -179,6 +179,30 @@ def assert_trained_once(reports: list[dict], *, clocked: bool = True) -> None:
 
 
 @pytest.mark.distributed
+@pytest.mark.parametrize("refusing", [False, True])
+@pytest.mark.parametrize("deal", ["records", "shards"])
+def test_a_pools_rollout_drawing_further_on_the_examples_clock_ends_at_its_bound_and_resumes_as_it_ran(
+        tmp_path, deal, refusing):
+    """Two processes bounded to CLOCKED examples, each share reading its own, through a rollout that draws a
+    batch past each step's (`--further`), each draw a pooled read (`FitRun.further`), every fifth record's
+    rows refused or none: the pool ends at one step on both processes with its bound consumed once, its
+    clock the pool's, the look-ahead for its streams' end read after the rollout's last draw and what that
+    end leaves unconsumed credited to the pool's first row; paused at half its examples and resumed, it
+    ends where the run that never paused does, to its parameters (row 3329)."""
+    flags = {"deal": deal, "further": True, **({"refusing": True} if refusing else {})}
+    reports = clocked_pool(tmp_path / "whole", 2, **flags)
+    assert len({report["step"] for report in reports}) == 1
+    assert [report["consumed"] for report in reports] == [CLOCKED] * 2
+    logged = reports[0]["logged"]
+    assert logged == sorted(logged) and logged[-1] == CLOCKED
+    paused = clocked_pool(tmp_path / "paused", 2, pause=0.5, **flags)
+    assert [report["step"] for report in paused] == [report["step"] for report in reports]
+    for index in range(2):
+        assert_same_parameters(dumped_params(tmp_path / "paused" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
 @pytest.mark.parametrize("deal", ["order", "records", "shards"])
 def test_a_pool_bounded_in_examples_trains_its_bound_once_however_its_read_deals_it(tmp_path, deal):
     """Two processes bounded to CLOCKED examples of ten records, read in one global order, as records each

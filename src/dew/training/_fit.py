@@ -441,14 +441,17 @@ class FitRun:
     def further(self, interval: Interval) -> Callable[[], Batch | None]:
         """A read of the training stream's next batch for a rollout that draws past its step's
         (`Rollout.draws_further`): from inside the step's hold on placements (`read_held`), agreed as a
-        step's read after its first is (`agrees`), its wait counted in `interval`; None where the stream
-        ran out on every process. Its position is the stream's after it, which the step saves as any
-        read's."""
+        step's read after its first is (`agrees`), or pooled as a pool's step's read is (`pooled_read`), its
+        wait counted in `interval`; None where the stream ran out on every process. Its position is the
+        stream's after it, which the step saves as any read's."""
         def read() -> Batch | None:
             assert self.train is not None
             asked = time.perf_counter()
             held = iter(self.train.read_held, None)
-            batch = agreed_next("rollout read", held) if self.agrees(first=False) else next(held, None)
+            if self.pooled:
+                batch = pooled_read(self, held, phase="rollout read")
+            else:
+                batch = agreed_next("rollout read", held) if self.agrees(first=False) else next(held, None)
             interval.waited += time.perf_counter() - asked
             return batch
 
@@ -481,16 +484,15 @@ CLOCK_LIMIT = 2 ** 31 - 1
 
 
 def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = False,
-            pooled_draws: bool = False, bound_ends: bool = True) -> int | None:
+            bound_ends: bool = True) -> int | None:
     """The examples bound of a run that no plan counts steps ahead of, which keeps its progress in the
     examples its batches consume (`TrainState.consumed`), its schedule and cadences reading it; None for
     a run counted otherwise. The transaction hands the run's optimizer that progress, which a custom
     step's update is not handed: one whose schedule reads it (`custom_progress`, a schedule over the
     whole run) is refused. A rollout's batch consumes what the batches it read did
     (`dew.training.rollout.clocked_rollout`), the run reading ahead for its stream's end after the
-    rollout's last draw; a pool's run, whose reads are pooled, reads ahead before its rollout, so one of
-    a rollout that draws further batches (`pooled_draws`), each from its own share, is refused. Its
-    progress reaches its end where its read ends at its bound (`Loader.bound_ends`), so a
+    rollout's last draw. Its progress reaches its end where its read ends at its bound
+    (`Loader.bound_ends`), so a
     take or slice after the bound, which would end it first, is refused, as is a bound past what the
     clock counts."""
     if examples is None or steps is not None:
@@ -500,11 +502,6 @@ def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = 
                          "progress, which a custom step='s update is not handed, and this optimizer's "
                          "schedule decays over the whole run: give the schedule its own decay_steps, or "
                          "give steps=")
-    if pooled_draws:
-        raise ValueError("a pool's run bounded in examples reads its batches together, each process's "
-                         "share of one pooled read, which a rollout's further draws from its own share would "
-                         "leave: "
-                         "read the data in one global order its plan counts, or give steps=")
     if not bound_ends:
         raise ValueError("a run bounded in examples that no plan counts ahead ends where its bound does, "
                          "which its schedule's end reads; a take or slice after the bound would end it "

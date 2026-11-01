@@ -354,3 +354,17 @@ def test_a_draw_is_scored_by_any_finite_reward_float_takes():
         raise OSError("the verifier service is down")
 
     assert scored_draw("task", 0, call, "text", record, unreachable).status is Status.INFRA_ERROR
+
+
+def test_a_rollout_reads_a_placed_column_as_the_block_its_process_holds():
+    """A column placed over a mesh of rows by sequence (2 by 4 devices), each device a part of a row block
+    and a stretch of its sequence: the block a rollout reads of it (`_held`) is every part laid where it
+    stands, the column whole on one process (row 3329's review)."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.training.rollout import _held
+
+    mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 4), ("rows", "sequence"))
+    column = np.arange(4 * 8, dtype=np.int32).reshape(4, 8)
+    placed = jax.device_put(column, NamedSharding(mesh, PartitionSpec("rows", "sequence")))
+    np.testing.assert_array_equal(_held(placed), column)
