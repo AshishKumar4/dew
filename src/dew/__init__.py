@@ -124,11 +124,7 @@ _EXPORTS = {
 }
 
 
-__getattr__ = _lookup(__name__, _EXPORTS)
-
-
-def __dir__() -> list[str]:
-    return list(__all__)
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 
 # Written from _EXPORTS (tools/gen_exports.py), so a type checker, an editor

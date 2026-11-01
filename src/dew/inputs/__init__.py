@@ -29,7 +29,7 @@ _EXPORTS = {
     "T5Text": "dew.inputs.encoders", "TextCondition": "dew.inputs.spec",
     "encode_conditions": "dew.inputs.spec", "unit_range": "dew.inputs.spec",
 }
-__getattr__ = _lookup(__name__, _EXPORTS)
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 __all__ = [
     "AudioCondition",
@@ -46,7 +46,3 @@ __all__ = [
     "encode_conditions",
     "unit_range",
 ]
-
-
-def __dir__() -> list[str]:
-    return list(__all__)

@@ -19,11 +19,7 @@ _EXPORTS = {
     "StableDiffusionVAE": "dew.nn.autoencoders.sd_vae",
 }
 
-__getattr__ = _lookup(__name__, _EXPORTS)
-
-
-def __dir__() -> list[str]:
-    return list(__all__)
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 __all__ = [
     "AutoEncoder",

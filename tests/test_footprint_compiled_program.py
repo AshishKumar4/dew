@@ -426,7 +426,7 @@ def test_a_derived_footprint_traces_its_loss_once():
     """The derivation reads a loss's pullback residuals and its gradient program's peak from one trace of
     its forward and backward (row 2440): the loss runs once as it is traced, where it ran once for each,
     and each term is what tracing it alone derives."""
-    from dew.training.footprint import LOWERED, _residuals, derived_terms
+    from dew.training.footprint import LOWERED, Peak, _residuals, bounded_below, derived_terms
 
     traced = []
     weights = jax.ShapeDtypeStruct((64, 32), jnp.float32)
@@ -446,4 +446,11 @@ def test_a_derived_footprint_traces_its_loss_once():
     # (row 3200), lowered as a GPU's CUDA lowers it.
     closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(weights, rows)
     assert residuals == _residuals(compiled(closed.jaxpr, LOWERED["gpu"]), jax.tree.leaves(shapes), "gpu")
-    assert peak == gradient_peak(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0))
+
+    def gradient(weights, rows):
+        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, rows), weights, has_aux=True)
+        return pullback(jnp.ones_like(outputs))
+
+    # The gradient program traced alone, as gradient_peak traced it before the shared trace (row 3218).
+    program = compiled(jax.make_jaxpr(gradient)(weights, rows).jaxpr, LOWERED["gpu"])
+    assert peak == Peak(peak_bytes(program, "gpu", Workspace(0, 0)), not bounded_below(program, "gpu"))

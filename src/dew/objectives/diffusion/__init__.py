@@ -29,7 +29,7 @@ _EXPORTS = {
     "MeanFlowObjective": "dew.objectives.diffusion.few_step",
     "ShortcutObjective": "dew.objectives.diffusion.few_step",
 }
-__getattr__ = _lookup(__name__, _EXPORTS)
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 __all__ = [
     "VALIDATION_SAMPLES",
@@ -44,7 +44,3 @@ __all__ = [
     "MeanFlowObjective",
     "ShortcutObjective",
 ]
-
-
-def __dir__() -> list[str]:
-    return list(__all__)

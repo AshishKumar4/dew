@@ -11,7 +11,6 @@ import json
 import math
 import os
 import posixpath
-import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
@@ -33,6 +32,7 @@ from dew._records import integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
 from dew.data.declared import Declared, HeldFile, mirrored
+from dew.data.once import locked_cached_property
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
 from dew.data.storage import (
@@ -1041,23 +1041,18 @@ class _Paths:
 class _ArrowFragment:
     source: Files
     index: int
-    lock: threading.RLock = field(default_factory=threading.RLock, compare=False, repr=False)
 
-    @property
+    @locked_cached_property
     def table(self) -> pa.Table:
-        with self.lock:
-            if "_table" not in self.__dict__:
-                fragment, source = self.source.fragments[self.index], self.source
-                held = (source._arrow_files[2][fragment.path],) if source._versioned else ()
-                with source._versions_held(held):
-                    table = fragment.to_table(
-                        schema=self.source.arrow.schema,
-                        columns=list(self.source.columns) if self.source.columns is not None else None,
-                        filter=self.source.where,
-                    )
-                # Kept once its file is found at its version after the read too.
-                self.__dict__["_table"] = table
-            return self.__dict__["_table"]
+        fragment, source = self.source.fragments[self.index], self.source
+        held = (source._arrow_files[2][fragment.path],) if source._versioned else ()
+        # Kept once its file is found at its version after the read too, as the hold ends.
+        with source._versions_held(held):
+            return fragment.to_table(
+                schema=self.source.arrow.schema,
+                columns=list(self.source.columns) if self.source.columns is not None else None,
+                filter=self.source.where,
+            )
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -1067,10 +1062,6 @@ class _ArrowFragment:
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"source": self.source, "index": self.index}
-
-    def __setstate__(self, state: Mapping[str, object]) -> None:
-        self.__dict__.update(state)
-        self.__dict__["lock"] = threading.RLock()
 
 
 class _ArrowRecords:

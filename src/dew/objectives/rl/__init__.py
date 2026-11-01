@@ -95,7 +95,7 @@ _EXPORTS = {
     "Transcript": "dew.objectives.rl.sessions", "pack": "dew.objectives.rl.sessions",
     "EnvironmentSource": "dew.objectives.rl.sources", "PromptSource": "dew.objectives.rl.sources",
 }
-__getattr__ = _lookup(__name__, _EXPORTS)
+__getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 
 __all__ = [
     "ADVANTAGES_KEY",
@@ -150,7 +150,3 @@ __all__ = [
     "session_of",
     "task_ids",
 ]
-
-
-def __dir__() -> list[str]:
-    return list(__all__)
