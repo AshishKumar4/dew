@@ -202,6 +202,26 @@ Two microbatches of 32 rows over 8 weights; eight of 8 rows over 16 weights, eac
 than the weights though the update is not; four of 8 rows over 64 weights, the update itself shorter."""
 
 
+@pytest.mark.parametrize("named", ["gauss_newton", "dew.gauss_newton:gauss_newton"])
+def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named):
+    """Gauss-Newton under two param groups, by its name or its import path: one damped solve over every
+    weight, each group's leaves of it scaled by the group's rate, so the kernels' step is half the solve's,
+    on par with the float64 solve so scaled (check 1), as the ungrouped run at that rate steps."""
+    from dew.optim import OptimConfig, ParamGroup
+
+    config = OptimConfig(optimizer=named, learning_rate=0.5, optimizer_opts={"damping": 1e-3},
+                         param_groups=(ParamGroup("kernels", ("*kernel",)),
+                                       ParamGroup("rest", ("*",), learning_rate_multiplier=0.5)))
+    rows, features = 64, 8
+    draw = least_squares_draw(rows, features, 0x6D)
+    exact = as_given(lambda x, y: -0.5 * solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
+    grouped = gauss_newton_arm(rows, features, 1, config.build(1))
+    halved = gauss_newton_arm(rows, features, 1, gauss_newton(0.5, damping=1e-3))
+    label = f"grouped gauss-newton {named}"
+    assert_as_exact(grouped, halved, draw, label, truth_fn=exact,
+                    seeds=seeds_for(halved, draw, label, truth_fn=exact, dew_fn=grouped))
+
+
 def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():
     """A run whose optimizer the command line names (`--optim.optimizer gauss_newton`, its rate 0.5 and
     its damping 1e-3 among `optimizer_opts`), built as `OptimConfig` builds every optimizer

@@ -2354,7 +2354,7 @@ class OptimConfig:
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
         # Gauss-Newton's one solve spans every parameter: each group scales its leaves of its direction.
         solved = None
-        if self.param_groups and self.optimizer == 'gauss_newton':
+        if self.param_groups and make is gauss_newton:
             damping = opts.pop('damping', 0.0)
             if not isinstance(damping, int | float):
                 raise ValueError(f"Gauss-Newton's damping is a number, got {damping!r}")

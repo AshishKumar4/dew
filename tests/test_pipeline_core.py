@@ -2436,3 +2436,19 @@ def test_a_repeat_after_the_batch_replays_its_first_pass_draws_included(read):
         assert head + batches(resumed, 2) == expected
     finally:
         resumed.close()
+
+
+@pytest.mark.parametrize(("bounded", "workers", "alike"),
+                         [(False, 0, True), (False, 2, False), (True, 0, False)])
+def test_a_version_7_streamed_plan_of_two_shares_reads_as_8s_where_8_reads_its_takes_alike(
+        bounded, workers, alike):
+    """A version 7 plan of a streamed read of two shares that takes some of its order (its order's `Limit`):
+    version 8 reads it as 7 did where no loading workers read it and it is no bound in examples (its
+    manifest's steps hold no `MarkConsumed`); with workers, or bounded in examples, 8 deals the take or the
+    bound otherwise (row 3350's review)."""
+    from dew.data.plan import read_alike_at_8
+
+    steps = [{"identity": "Map(step=MarkConsumed())"}] if bounded else []
+    saved = {"version": 7, "order": {"read": "streamed", "stages": ["Limit(count=5)"]},
+             "topology": {"shares": 2, "share": 0, "workers": workers}, "manifest": {"steps": steps}}
+    assert read_alike_at_8(saved) is alike

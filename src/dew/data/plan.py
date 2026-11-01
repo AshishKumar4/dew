@@ -438,6 +438,23 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
     return earlier_plan(written, plan), iterator
 
 
+def read_alike_at_8(saved: Mapping[str, object]) -> bool:
+    """Whether version 8 reads a version 7 data plan's order as 7 did (`earlier_plan`). Version 8 reads a
+    streamed order otherwise only where it takes some of it before its loading workers (a `.take`, now
+    taken across them) or bounds it in examples (its manifest's `MarkConsumed` step, now dealt to a pool's
+    shares and its workers): alike where its read is not streamed, one reader reads it, no take reads its
+    order (no `Limit` among its stages, and no members), or its takes are no bound in examples and no
+    loading workers read them."""
+    order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
+    readers = topology if isinstance(topology, Mapping) else {}
+    workers = readers.get("workers", 0)
+    alone = readers.get("shares", 1) == 1 and workers < 2
+    untaken = not _LIMIT.search(json.dumps(order)) and not saved.get("members")
+    steps = json.dumps(record(saved.get("manifest", {}), "saved data manifest").get("steps", []))
+    unbounded = "MarkConsumed" not in steps and workers < 2
+    return order.get("read") != "streamed" or alone or untaken or unbounded
+
+
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
     position's one translation, where a reader's `set_state` decodes it. A token store a Dew before row 3028
@@ -446,20 +463,7 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
-    # Version 8 reads a streamed order otherwise only where it takes some of it before its loading
-    # workers (a `.take`, now taken across them) or bounds it in examples (`MarkConsumed`, now dealt to a
-    # pool's shares and its workers): a version 7 plan reads as 8's where its read is not streamed, or one
-    # reader reads it, or no take reads its order (no `Limit` among its stages or its members'), or its
-    # takes are no bound in examples and no loading workers read them.
-    order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
-    readers = topology if isinstance(topology, Mapping) else {}
-    workers = readers.get("workers", 0)
-    alone = readers.get("shares", 1) == 1 and workers < 2
-    stages = json.dumps(order) + json.dumps(saved.get("members", {}))
-    untaken = not _LIMIT.search(stages)
-    unbounded = "MarkConsumed" not in stages and workers < 2
-    if saved.get("version") == 7 and plan.version == 8 and (order.get("read") != "streamed" or alone
-                                                            or untaken or unbounded):
+    if saved.get("version") == 7 and plan.version == 8 and read_alike_at_8(saved):
         saved = {**saved, "version": 8}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:

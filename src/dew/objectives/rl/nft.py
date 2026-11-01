@@ -198,7 +198,8 @@ class DiffusionNFTObjective(DiffusionObjective):
             metrics["velocity_kl"] = jnp.mean(drift)
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        return Ratio(per_row.sum(), jnp.asarray(rows, per_row.dtype)), Aux(metrics)
+        # A sample of a repeated source row (`VALID_ROWS`, `real_samples`) weighs nothing in the mean.
+        return self.row_mean(per_row, batch), Aux(metrics)
 
     def _rows(self, batch: Batch) -> int:
         """One sample per source row, which a prompt-only batch has too."""
