@@ -93,7 +93,8 @@ def test_a_gpu_extra_that_resolves_otherwise_for_aarch64_fails_the_lock(tmp_path
     assert "locks/cuda12.txt resolves otherwise for aarch64" in done.stderr
 
 
-@pytest.mark.parametrize("python", ["3.12", "3.13", "3.14"])
+# 3.12 is the locks' own Python, whose lock fails first, with uv's own word.
+@pytest.mark.parametrize("python", ["3.13", "3.14"])
 def test_a_gpu_extra_that_does_not_install_on_a_python_pyproject_admits_fails_the_lock(
         tmp_path, monkeypatch, python):
     """Each GPU extra resolves on every Python from requires-python's floor to the newest classifier, on
