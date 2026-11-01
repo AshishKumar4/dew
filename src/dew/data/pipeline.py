@@ -47,14 +47,6 @@ last row a step makes of it, the next row kept where a step rejects or makes non
 window's is its rows' sum. A batch's sum is the source examples its dispatch consumes
 (`dew.batch.EXAMPLES_CONSUMED`)."""
 
-REFUSED = "_dew_refused"
-"""The part of a row's `CONSUMED` that are source examples a step rejected or made no row of, which the row
-carries on (`Owed`): consumed, and none of them trained. It travels with `CONSUMED` through every step, so a
-count of the examples delivered rows complete takes their difference (`dew.data.mixing.CorpusCounts`)."""
-
-ACCOUNTS = (CONSUMED, REFUSED)
-"""A row's two counts of source examples, which every step carries together, as integers no batch stacks."""
-
 
 @dataclasses.dataclass(frozen=True)
 class MarkConsumed:
@@ -62,7 +54,7 @@ class MarkConsumed:
     is read in (`CONSUMED`), set where the bound is (`dew.data.compile`)."""
 
     def __call__(self, element: Batch) -> Batch:
-        return {**element, CONSUMED: 1, REFUSED: 0}
+        return {**element, CONSUMED: 1}
 
 
 @dataclasses.dataclass
@@ -78,13 +70,11 @@ class Owed:
         self.examples += consumed
 
     def paid(self, row: Batch) -> Batch:
-        """`row`, kept, taking the examples owed (`CONSUMED`), every one refused (`REFUSED`), none owed
-        after it."""
+        """`row`, kept, taking the examples owed (`CONSUMED`), none owed after it."""
         owed, self.examples = self.examples, 0
         if not owed:
             return row
-        return {**row, CONSUMED: owed + integer(row.get(CONSUMED, 0), "a row's consumed examples"),
-                REFUSED: owed + integer(row.get(REFUSED, 0), "a row's refused examples")}
+        return {**row, CONSUMED: owed + integer(row.get(CONSUMED, 0), "a row's consumed examples")}
 
 
 type Cuts = Mapping[str, tuple[int, int]]

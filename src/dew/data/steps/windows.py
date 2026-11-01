@@ -15,7 +15,7 @@ import numpy as np
 
 from dew._records import integer, integers, record
 from dew.batch import Batch
-from dew.data.pipeline import ACCOUNTS, CONSUMED, Windows
+from dew.data.pipeline import CONSUMED, Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import aligned
@@ -112,7 +112,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         self._read, self._windows = parent, windows
         self._held: Batch = {name: np.zeros(0, np.int32) for name in windows.fields}
         self._skip = 0
-        # The leading held tokens whose counts of examples a window already took (`ACCOUNTS`).
+        # The leading held tokens whose consumed examples a window already took (`CONSUMED`).
         self._credited = 0
 
     def __next__(self) -> Batch:
@@ -133,10 +133,10 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         # The window holds its view's first `length + 1` tokens, its inputs and their targets.
         end, kept = self._skip + windows.length + 1, self._skip + windows.stride
         if CONSUMED in self._held:
-            # Each token's counts go to the first window that holds it, the tokens a stride skips going
+            # Each token's count goes to the first window that holds it, the tokens a stride skips going
             # to the window after them; a token past every window the stream makes is consumed by none.
-            emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : end]))
-                                     for name in ACCOUNTS if name in self._held}}
+            owned = self._held[CONSUMED][self._credited : end]
+            emitted = {**emitted, CONSUMED: int(np.sum(owned))}
             self._credited = max(0, end - kept)
         self._held = {name: value[kept:] for name, value in self._held.items()}
         self._skip = max(0, windows.stride - windows.size)
