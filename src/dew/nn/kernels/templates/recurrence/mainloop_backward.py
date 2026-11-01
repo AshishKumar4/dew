@@ -1007,12 +1007,12 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             beta = family.rows_of(beta_ref.at[h, span])
+            issue = Issuer(call, dict.fromkeys(("inverse_t", "inverse_dx", "inverse_l"), staged))
             d_l = algebra.system_gradient(
                 _tile(slots, "lower", held), functools.partial(column, "keys", given), width // call.block,
                 functools.partial(column, "values", given), value_width // call.block,
                 functools.partial(column, "w_grads", held), functools.partial(column, "u_grads", held), beta,
-                gate, low, held.dtype, Issuer(call, dict.fromkeys(("inverse_t", "inverse_dx", "inverse_l"),
-                                                                   staged)),
+                gate, low, held.dtype, issue, issue.summed,
                 laid=(family.columns_of(column_hi_ref.at[h, span]),
                       family.columns_of(column_lo_ref.at[h, span])))
             held.store(dl_ref, d_l, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])

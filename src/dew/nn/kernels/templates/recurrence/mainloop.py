@@ -810,9 +810,10 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True, appli
             def block(name, c):
                 return _tile(slots, name, call.given, columns=pl.ds(c * call.block, call.block))
 
-            product = functools.reduce(jnp.add, (Issuer(call)("intra", key, key.T)
-                                                 for key in map(functools.partial(block, "keys"),
-                                                                range(width // call.block))))
+            # The key blocks' products into one accumulator: an accumulator a block, an H100's solve at keys
+            # 256 wide spilled 224 bytes a thread (wide-sm90 at 8d1145e66).
+            product = Issuer(call).summed([("intra", key, key.T) for key in map(
+                functools.partial(block, "keys"), range(width // call.block))])
             system = algebra.keyed(product, gate, low, betas, *columns)
             lower = algebra.solved(system, _merging(merges, call))
             if keeps:

@@ -1231,27 +1231,29 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
 
 
 def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, blocks: int, w_grads: TileLoad,
-                    u_grads: TileLoad, beta, gate, low, dtype, issue: Issue, *,
-                    laid: tuple | None = None) -> jax.Array:
+                    u_grads: TileLoad, beta, gate, low, dtype, issue: Issue,
+                    summed: Callable[..., jax.Array], *, laid: tuple | None = None) -> jax.Array:
     """The WY representation's backward (fla's prepare_wy_repr_bwd) under a decay a head, its system's part:
     with the inverse `X = I + lower` (`lower` its strictly lower part, a tile), `w = X (k beta exp2(g))` and
     `u = X (v beta)`, from `w`'s and `u`'s gradients `w_grads(c)` and `u_grads(j)`: `dX = dw (k beta
     exp2 g)^T + du (v beta)^T` ('inverse_dx') and `dL = -X^T tril(dX, -1) X^T` gated by `exp2(g_s - g_t)`
     ('inverse_t', 'inverse_l'), in `dtype`, which `keys_gradient` takes. `X^T dw` and `X^T du` and what
-    they give are `keys_gradient`'s and `values_gradient`'s."""
+    they give are `keys_gradient`'s and `values_gradient`'s. `dX`'s key and value blocks issued into one
+    accumulator (`summed`, the mainloop's): an accumulator a block, an H100's launch at keys and values 256
+    wide spilled 264 bytes a thread (wide-sm90 at 8d1145e66)."""
     def transposed_inverse(m):
         """`X^T m`, the diagonal outside the product."""
         return m + issue("inverse_t", lower.T, m.astype(dtype))
 
     decay = raised(gate, low)
-    d_x = None
-    for c in range(columns):
-        scaled = keys(c).value().astype(jnp.float32) * (beta * decay)[:, None]
-        d_x = _added(d_x, issue("inverse_dx", w_grads(c), Transposed(scaled.astype(dtype))))
-    for j in range(blocks):
-        scaled = (values(j).value().astype(jnp.float32) * beta[:, None]).astype(dtype)
-        d_x = _added(d_x, issue("inverse_dx", u_grads(j), Transposed(scaled)))
-    assert d_x is not None, "a chunk's keys and values take at least a block each"
+
+    def scaled(load, scale):
+        return lambda: Transposed((load().value().astype(jnp.float32) * scale[:, None]).astype(dtype))
+
+    keyed = [("inverse_dx", w_grads(c), scaled(functools.partial(keys, c), beta * decay))
+             for c in range(columns)]
+    valued = [("inverse_dx", u_grads(j), scaled(functools.partial(values, j), beta)) for j in range(blocks)]
+    d_x = summed(keyed + valued, shape=(lower.shape[0],) * 2)
     lag = _lags(d_x.shape)
     strict = lag > 0
     d_x = jnp.where(strict, d_x, 0.0)
