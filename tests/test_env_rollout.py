@@ -2,6 +2,8 @@
 (`dew.objectives.rl.control`): each held to a step-by-step loop, an exact index bookkeeping or a
 float64 transcription of the arithmetic, apart from Dew's code."""
 
+import contextlib
+import copy
 import itertools
 
 import jax
@@ -219,6 +221,24 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
     assert after > before, (before, after)
 
 
+def test_one_unbatched_environments_episode_return_is_the_reward_its_first_episode_earns():
+    """`episode_return` of one environment, unbatched, is the reward its greedy policy's first episode
+    earns, summed as the episode is flown by hand a step at a time; walks' rewards are integers, so
+    every order sums them exactly."""
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9)
+    variables = objective.init(jax.random.key(0))
+    env, key = TimeLimit(Walk(limit=4.0), episode_length=8), jax.random.key(6)
+    carry = start(env, key)
+    state, observation, earned = carry.state, carry.observation, 0.0
+    for _ in range(12):
+        state, following = env.step(state, objective.greedy(variables, observation, key, None)[0])
+        earned += float(following.reward)
+        if bool(following.terminated | following.truncated):
+            break
+        observation = following.observation
+    assert episode_return(objective, env, variables, key, 12) == earned
+
+
 @pytest.mark.parametrize("asked", [{"discount": 1.5}, {"lam": -0.1}, {"clip": 0.0}])
 def test_a_discount_lambda_or_clip_outside_its_range_is_refused(asked):
     with pytest.raises(ValueError):
@@ -266,6 +286,19 @@ class HostWalks:
         self.x = np.where(mask, self.starts(), self.x).astype(np.float32)
         self.steps = np.where(mask, 0, self.steps)
         return self.x[:, None].copy()
+
+
+class KeptWalks(HostWalks):
+    """`HostWalks` that a cooldown branch steps and then leaves as the run left them (`branch`): their
+    positions, steps and draws."""
+
+    @contextlib.contextmanager
+    def branch(self):
+        kept = self.x.copy(), self.steps.copy(), copy.deepcopy(self.rng)
+        try:
+            yield
+        finally:
+            self.x, self.steps, self.rng = kept
 
 
 class ShardedWalks(HostWalks):
@@ -470,6 +503,38 @@ def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path)
         np.testing.assert_array_equal(one, other)
 
 
+def test_a_control_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():
+    """A PPO run on walks a simulator steps, with a cooldown at its fourth update whose branch collects
+    steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the rollout keeps
+    its state and the simulator its own walks (their `branch()`, `dew.rl.simulator.branched`). A simulator
+    with no `branch()` is refused the cooldown."""
+    from dew.data.dataset import Loader, replayed
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite, Trainer
+    from dew.training.cooldown import Cooldowns
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
+    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
+    data = Loader(train=unread, val=None, records=8, batch=8)
+    flights = {"flight": EvalSuite(Episodes(episodes(objective.greedy, Batched(TimeLimit(
+        Walk(limit=50.0), episode_length=8), 8), 8), {"return": Shown(better="higher")}), every=8)}
+
+    def trained(walks, **options):
+        # A cooldown scales the rate the optimizer's state holds.
+        trainer = Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=3e-3),
+                          key=jax.random.key(5),
+                          rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
+        return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
+
+    plain = resumed_bits(trained(KeptWalks(16, 8, limit=50.0, drawn=True)))
+    cooldowns = Cooldowns(at=(4,), length=2)
+    cooled = trained(KeptWalks(16, 8, limit=50.0, drawn=True), cooldowns=cooldowns)
+    for one, other in zip(plain, resumed_bits(cooled), strict=True):
+        np.testing.assert_array_equal(one, other)
+    with pytest.raises(TypeError):
+        trained(HostWalks(16, 8, limit=50.0, drawn=True), cooldowns=cooldowns)
+
+
 @struct.dataclass
 class Seen(Walk):
     """`Walk` observed through named views: its `position`, its `distance` from the origin, and the `push`
@@ -553,10 +618,13 @@ def test_a_split_scored_by_its_episodes_reports_its_averaged_weights_first_episo
     assert flown_by_hand(objective, state.variables, key, 32, 12) != expected
 
 
-def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path):
-    """A PPO run on walks validated by its episodes every other update keeps, as its best checkpoint
-    (`Best("flight/return")`, better higher as its `Episodes` declares), a step whose logged return is the
-    highest any evaluation logged."""
+@pytest.mark.parametrize("selected", ["by name", "by metric", "by its only metric"])
+def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path, selected):
+    """A PPO run on walks validated by its episodes every other update keeps, as its best checkpoint (better
+    higher as its `Episodes` declares), a step whose logged return is the highest any evaluation logged:
+    selected by the score's name (`Best("flight/return")`), by its metric (`Best(split.metrics[0])`, the
+    very one the run declares), or by that metric where the suite asks for it alone, which logs it alone
+    though the episodes report every score they declare."""
     from dew.checkpoints import Checkpoints, Keep
     from dew.data.dataset import Loader, replayed
     from dew.rl.evaluation import episodes
@@ -567,7 +635,10 @@ def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path):
                                     reads=("position",))
     walks = Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 32)
     flown = episodes(objective.greedy, walks, 12, reached=("distance", "push"))
-    suite = EvalSuite(Episodes(flown, SHOWN), every=2)
+    split = Episodes(flown, SHOWN)
+    asked = split.metrics[:1] if selected == "by its only metric" else ()
+    suite = EvalSuite(split, metrics=asked, every=2)
+    best = Best("flight/return") if selected == "by name" else Best(split.metrics[0])
     unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
     data = Loader(train=unread, val=None, records=8, batch=8)
     tracker = LocalTracker(str(tmp_path / "tracked"))
@@ -576,34 +647,38 @@ def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path):
                              unroll_length=8, epochs=2, minibatches=2)
     Trainer(objective, optax.adam(3e-2), key=jax.random.key(5), rollout=rollout, tracker=tracker,
             checkpoints=checkpoints).fit(data, steps=8, log_every=2, validation={"flight": suite},
-                                         best=Best("flight/return"), checkpoint_every=2)
+                                         best=best, checkpoint_every=2)
     returns = {step: scalars["flight/return"] for step, scalars in tracker.scalars()
                if "flight/return" in scalars}
+    flown_names = {name for _, scalars in tracker.scalars() for name in scalars if name.startswith("flight/")}
     tracker.close()
     checkpoints.wait()
     assert sorted(returns) == [2, 4, 6, 8]
     assert returns[checkpoints.best] == max(returns.values())
+    assert flown_names == ({"flight/return"} if asked else {f"flight/{name}" for name in SHOWN})
 
 
-def test_a_pool_is_refused_a_rollout_that_checkpoints_its_state_as_its_trainer_is_made(tmp_path):
-    """Every process of a pool of two is refused a trainer over a rollout that checkpoints the state it
-    carries, as the trainer is made, before it restores or steps (each process holds its own environments,
-    a checkpoint the pool's tree); a rollout that carries none, a plain function, is made there."""
+def test_a_pool_is_refused_a_rollout_that_checkpoints_its_state_as_its_run_starts(tmp_path):
+    """A trainer over a rollout that checkpoints the state it carries, made from an integer seed before
+    its process joins a pool (made without opening JAX's backend, which a pool forms only before), is
+    refused as its fit starts, before it restores or steps, on every process of a pool of two, and
+    trains on a pool of one: each process holds its own environments, a checkpoint the pool's tree."""
     from pathlib import Path
 
     from process_support import run_pool
 
-    reports = run_pool("made", tmp_path, 2, script=Path(__file__).with_name("rollout_state_worker.py"),
-                       devices=1, timeout=300)
-    for report in reports:
-        assert report["processes"] == 2
-        assert report["stateful"] is not None and report["stateless"] is None
+    script = Path(__file__).with_name("rollout_state_worker.py")
+    pooled = run_pool("fitted", tmp_path / "two", 2, script=script, devices=1, timeout=300)
+    alone = run_pool("fitted", tmp_path / "one", 1, script=script, devices=1, timeout=300)
+    assert pooled == [{"processes": 2, "refused": "ValueError"}] * 2
+    assert alone == [{"processes": 1, "refused": None}]
 
 
 def test_a_pools_split_scored_by_its_episodes_agrees_and_fails_together(tmp_path):
     """A pool of two evaluates a split scored by its episodes as one: every process reports process 0's
-    scores and one event key; a scorer that fails on one process alone fails the evaluation on both, that
-    process raising its own error and its peer a `PeerFailure`, rather than leaving the peer waiting."""
+    scores and one event key; a scorer that fails on one process alone, or reports there fewer scores than
+    its split declares, fails the evaluation on both, that process raising its own error and its peer a
+    `PeerFailure`, rather than leaving the peer waiting."""
     from pathlib import Path
 
     from process_support import run_pool
@@ -613,5 +688,7 @@ def test_a_pools_split_scored_by_its_episodes_agrees_and_fails_together(tmp_path
     assert reports[0]["scores"] == reports[1]["scores"] and set(reports[0]["scores"]) == {"flight/return",
                                                                                           "flight/steps"}
     assert reports[0]["event"] == reports[1]["event"]
-    assert [report["failed"] for report in reports] == ["PeerFailure", "RuntimeError"]
+    peer, failing = (report["failed"] for report in reports)
+    assert peer == {"raising": "PeerFailure", "incomplete": "PeerFailure"}
+    assert failing == {"raising": "RuntimeError", "incomplete": "ValueError"}
 

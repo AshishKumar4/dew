@@ -31,7 +31,7 @@ from dew.batch import Batch, Variables
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
 from dew.rl.evaluation import episodes, first_episodes
-from dew.rl.simulator import Simulator, rollout_start, simulator_rollout, simulator_start
+from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout, simulator_start
 from dew.rl.surrogate import clipped_surrogate_terms
 
 if TYPE_CHECKING:
@@ -252,10 +252,13 @@ class ControlRollout:
     def branch(self, name: str) -> Iterator[None]:
         """A cooldown branch's calls (`Rollout`'s `branch`), after which the rollout stands as the run left
         it: its environments mid episode, the collection it serves and their order. Nothing it carries is
-        donated, so what the run left is kept as it is."""
-        kept = (self._carry, self._returns, self._collected, self._order, self._ended)
+        donated, so what the run left is kept as it is; a begun `Simulator` keeps its own environments
+        (`dew.rl.simulator.branched`)."""
+        env, kept = self.env, (self._carry, self._returns, self._collected, self._order, self._ended)
         try:
-            yield
+            with (branched(env) if isinstance(env, Simulator) and self._carry is not None
+                  else contextlib.nullcontext()):
+                yield
         finally:
             self._carry, self._returns, self._collected, self._order, self._ended = kept
 

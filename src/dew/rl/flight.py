@@ -49,7 +49,9 @@ The world frame is x forward, y left, z up (FLU), the body frame forward, left, 
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+from collections.abc import Iterator
 from functools import partial
 from typing import Protocol
 
@@ -912,6 +914,17 @@ class GateRace:
     def step(self, action: jax.Array) -> TimeStep:
         self._races, step = self._stepped(self._env_now(), self._races, jnp.asarray(action))
         return TimeStep(self._observed(step.observation), step.reward, step.terminated, step.truncated)
+
+    @contextlib.contextmanager
+    def branch(self) -> Iterator[None]:
+        """A cooldown branch's steps (`dew.rl.simulator.branched`), after which every race and the key its
+        images' noise is drawn from stand as the run left them: no step donates them, so keeping them
+        keeps them."""
+        kept = self._races, self._key
+        try:
+            yield
+        finally:
+            self._races, self._key = kept
 
 
 def _scene(racing: Racing, race: Race) -> Scene:

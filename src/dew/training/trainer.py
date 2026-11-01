@@ -316,7 +316,7 @@ class Trainer(Generic[Loss, Effects]):
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
-        self.tracker, self.step, self.rollout = tracker, step, _rollout_admitted(rollout)
+        self.tracker, self.step, self.rollout = tracker, step, rollout
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
@@ -2172,15 +2172,15 @@ class Trainer(Generic[Loss, Effects]):
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
                    preview: bool, stated: Dataset | Loader | Handed, loss: bool) -> None:
-        """The refusals `fit` makes before it places anything: validation
-        nothing reads, and a pipeline's batch, whose placement could take minutes or run out of memory before
-        the error. Every other mesh's batch is checked with its stream (`check_stream`), a ramp's at each of
-        its stages. The checkpoints learn why no record rebuilds a run of
-        this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
+        """The refusals `fit` makes before it places anything: validation nothing reads, a rollout that
+        checkpoints its state in a pool (`_rollout_admitted`), and a pipeline's batch, whose placement could
+        take minutes or run out of memory before the error. Every other mesh's batch is checked with its
+        stream (`check_stream`), a ramp's at each of its stages. The checkpoints learn why no record rebuilds
+        a run of this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
         if self.checkpoints is not None:
-            given = {"a custom step (step=)": self.step, "a rollout (rollout=)": self.rollout,
-                     "a tracker (tracker=)": self.tracker, "recording each step's draws (record=True)":
-                     self.record or None}
+            given = {"a rollout (rollout=)": _rollout_admitted(self.rollout),
+                     "a custom step (step=)": self.step, "a tracker (tracker=)": self.tracker,
+                     "recording each step's draws (record=True)": self.record or None}
             self.checkpoints.python_run(unrecorded_parts(
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))

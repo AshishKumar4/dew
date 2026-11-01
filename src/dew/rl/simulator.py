@@ -11,11 +11,17 @@ A simulator steps every environment and restarts the episodes it is told to (`Si
 driver decides when an ended episode restarts: `simulator_rollout` restarts it at once, recording what
 `env_rollout` records, the same `Transition` and `Carry`; `DrivenSimulator` restarts it a step later, as
 `Driven` drives an `Env` for a world-model learner. `rollout_start` starts either kind of environment.
+
+A cooldown branch steps a rollout's environments and then leaves them as the run left them
+(`dew.training.Rollout`'s `branch`). An `Env`'s are arrays the rollout keeps; a simulator keeps its own,
+which it puts back where it has a `branch()` (`Branching`), and one with none is refused the branch.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
+from collections.abc import Iterator
 from typing import Protocol, overload, runtime_checkable
 
 import jax
@@ -74,6 +80,27 @@ class Simulator(Stepped, Protocol):
     environment's observation, the selected ones' their new episodes' first."""
 
     def restart(self, mask: jax.Array) -> Observation: ...
+
+
+@runtime_checkable
+class Branching(Protocol):
+    """A simulator a cooldown branch steps and then leaves as the run left it: `branch()`, a context after
+    which its environments stand as they did as it was entered. They live outside JAX, where no rollout
+    can keep them, so a simulator keeps them itself (`branched`)."""
+
+    def branch(self) -> contextlib.AbstractContextManager[None]: ...
+
+
+@contextlib.contextmanager
+def branched(simulator: Stepped) -> Iterator[None]:
+    """`simulator` stepped in a cooldown branch and then left as the run left it, by its own `branch()`
+    (`Branching`); a simulator with none is refused the branch."""
+    if not isinstance(simulator, Branching):
+        raise TypeError(f"a cooldown branch steps {type(simulator).__name__}'s environments and then leaves "
+                        "them as the run left them, which a simulator does by its own branch(), and it has "
+                        "none")
+    with simulator.branch():
+        yield
 
 
 type Handed = jax.Array | np.ndarray | Shared
@@ -197,6 +224,17 @@ class DrivenSimulator:
         self._last = step.done
         return driven_step(step, restarted)
 
+    @contextlib.contextmanager
+    def branch(self) -> Iterator[None]:
+        """A cooldown branch's steps (`branched`), after which the simulator and the episodes it is to
+        restart stand as the run left them."""
+        last = self._last
+        try:
+            with branched(self.simulator):
+                yield
+        finally:
+            self._last = last
+
 
 def rollout_start(env: Env | Simulator, key: jax.Array, memory: Memory = None) -> Carry:
     """A rollout's carry at fresh episodes of `env`, an `Env` (`start`) or a `Simulator`
@@ -204,5 +242,5 @@ def rollout_start(env: Env | Simulator, key: jax.Array, memory: Memory = None) -
     return simulator_start(env, key, memory) if isinstance(env, Simulator) else start(env, key, memory)
 
 
-__all__ = ["DrivenSimulator", "Handed", "Shared", "Simulator", "Stepped", "received", "rollout_start",
-           "simulator_rollout", "simulator_start", "taken"]
+__all__ = ["Branching", "DrivenSimulator", "Handed", "Shared", "Simulator", "Stepped", "branched", "received",
+           "rollout_start", "simulator_rollout", "simulator_start", "taken"]

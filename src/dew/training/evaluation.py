@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import os
 import sys
 import time
@@ -84,17 +85,20 @@ class Episodes:
     split's scores by name (`dew.rl.evaluation.episodes`), each declared with how it shows (`scores`,
     the split's metrics, `EpisodeScore`). It goes where a reader goes (`EvalSuite(Episodes(...))`), and
     `Evaluation.run` scores it on the averaged weights where the run keeps them, on every process and
-    agreed (a scorer that fails on one fails the evaluation on all), process 0's scores the pool's, each
-    named `<split>/<name>` as a data split's; a warming pass flies to compile and keeps none. Its key is
+    agreed (a scorer that fails on one, or reports other scores than `scores` declares, fails the
+    evaluation on all), process 0's scores the pool's, each of the metrics asked for (all of `metrics`
+    unless a suite names fewer) named `<split>/<name>` as a data split's; a warming pass flies to compile
+    and keeps none. Its key is
     the evaluation's event key (`_event`: the run's key folded with 'EVAL' and the step) folded with
     'EPIS'. It reads no batches, so a run's data metrics and loss are not its."""
 
     score: Callable[[Variables, jax.Array], Mapping[str, float]]
     scores: Mapping[str, Shown]
 
-    @property
+    @functools.cached_property
     def metrics(self) -> tuple[Metric, ...]:
-        """The split's metrics: one `EpisodeScore` a declared score."""
+        """The split's metrics: one `EpisodeScore` a declared score, made once, so a selection given one
+        (`Best(split.metrics[0])`) reads the very metric the run declares."""
         return tuple(EpisodeScore(name, shown) for name, shown in self.scores.items())
 
 
@@ -345,24 +349,30 @@ class Evaluation:
                   warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array] | None
                   ) -> Evaluation:
         """`run`'s evaluation of a split scored by its episodes: its metrics checked and agreed as a data
-        split's are (`_agree_configuration`), its clocks, key and training values as well (`_event`), the
-        flight run on every process and agreed, each declared score read off process 0's (`EpisodeScore`)
-        and named `<split>/<name>`, a score the split did not declare refused; a warming pass flies once
-        to compile and keeps none."""
+        split's are (`_agree_configuration`), each one reading the flight's scores (`Flown`), its clocks,
+        key and training values as well (`_event`); then, on every process and agreed, the flight, its
+        scores held to those the split declares and each metric asked for read off them (`EpisodeScore`)
+        and named `<split>/<name>`, process 0's the pool's; a warming pass flies once to compile and keeps
+        none."""
         started = time.perf_counter()
         _agree_configuration(metrics, episodes, split, loss=False, training=training is not None, warm=warm)
+        unread = [metric.name for metric in metrics if not issubclass(metric.reads, Flown)]
+        if unread:
+            raise ValueError(f"the {split} split is scored by its episodes, which its metrics read (Flown); "
+                             f"{unread} read none")
         event_step, context, event_words, training_scores = _event(key, step, schedule_step, None, training,
                                                                    updates)
-        flown = agreed(f"{split} episodes", lambda: Flown(dict(episodes.score(variables, _folded(
-            context.key, 0x45504953)))))
-        declared = {metric.name for metric in metrics}
-        if set(flown.scores) - declared:
-            raise ValueError(f"the {split} split's episodes report {sorted(set(flown.scores) - declared)}, "
-                             f"which it does not declare: {sorted(declared)}")
-        # A split's episodes read no batch: each of its metrics reads the one artifact the flight made.
-        scores = {} if warm else {f"{split}/{metric.name}": metric.finalize(metric(flown, {}))
-                                  for metric in metrics}
-        scores.update(training_scores)
+
+        def flown() -> dict[str, float]:
+            reported = Flown(dict(episodes.score(variables, _folded(context.key, 0x45504953))))
+            if set(reported.scores) != set(episodes.scores):
+                raise ValueError(f"the {split} split's episodes report {sorted(reported.scores)}, and it "
+                                 f"declares {sorted(episodes.scores)}")
+            # A split's episodes read no batch: each of its metrics reads the one artifact the flight made.
+            return {} if warm else {f"{split}/{metric.name}": metric.finalize(metric(reported, {}))
+                                    for metric in metrics}
+
+        scores = {**agreed(f"{split} episodes", flown), **training_scores}
         scores, elapsed = broadcast_from_process_zero((scores, time.perf_counter() - started))
         return cls(event_step, split, scores, 0, 0, event_words, elapsed, ())
 

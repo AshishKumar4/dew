@@ -25,18 +25,22 @@ def first_episodes(following: TimeStep) -> jax.Array:
 
 def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Memory] | None = None,
              reached: Sequence[str] = ()) -> Callable[[Params, jax.Array], dict[str, float]]:
-    """A scorer of `policy` in fresh environments of `env`, a batched `Env`, flown `steps` steps without
-    restarting (`dew.rl.env.env_rollout`, one jitted program): called with the policy's variables and a
-    key, it returns the first episodes' mean `return` and `steps`, and for each observation view in
-    `reached` the mean of its value at each first episode's last step. `memory(count)` is a recurrent
-    policy's starting state over `count` environments (`DreamerV3Objective.memory`)."""
-    count = env.reset(jax.random.key(0))[1].reward.shape[0]
+    """A scorer of `policy` in fresh environments of `env`, flown `steps` steps without restarting
+    (`dew.rl.env.env_rollout`, one jitted program): called with the policy's variables and a key, it
+    returns the first episodes' mean `return` and `steps`, and for each observation view in `reached` the
+    mean of its value at each first episode's last step. `env` is batched, or one environment, scored as a
+    batch of one. `memory(count)` is a recurrent policy's starting state over a batched env's `count`
+    environments (`DreamerV3Objective.memory`)."""
+    reward = jax.eval_shape(env.reset, jax.random.key(0))[1].reward
+    count = reward.shape[0] if reward.ndim else 1
     starting = None if memory is None else memory(count)
 
     @jax.jit
     def scored(variables: Params, key: jax.Array) -> dict[str, jax.Array]:
         taken = env_rollout(env, policy, variables, start(env, key, starting), steps, reset=False)[1]
-        following = taken.following
+        # One environment's steps `[T]` taken as a batch of one's `[T, 1]`.
+        following = (taken.following if reward.ndim
+                     else jax.tree.map(lambda leaf: leaf[:, None], taken.following))
         inside = first_episodes(following)
         scores = {"return": jnp.mean(jnp.sum(jnp.where(inside, following.reward, 0), axis=0)),
                   "steps": jnp.mean(jnp.sum(inside, axis=0).astype(jnp.float32))}

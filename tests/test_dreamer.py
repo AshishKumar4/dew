@@ -2,6 +2,8 @@
 (danijar/dreamerv3 at e01491fad6434b2245a3b8ca201dd7faedcc458c) transcribed here in NumPy float64,
 an episode driver's records against the steps it took, and an agent that learns its world."""
 
+import contextlib
+import copy
 import itertools
 import math
 
@@ -191,6 +193,16 @@ class HostTarget:
         self.x = np.where(mask, self.rng.uniform(-1, 1, self.count), self.x).astype(np.float32)
         self.steps = np.where(mask, 0, self.steps)
         return self.x[:, None].copy()
+
+    @contextlib.contextmanager
+    def branch(self):
+        """A cooldown branch's steps, after which the targets, their steps and draws stand as the run left
+        them (`dew.rl.simulator.branched`)."""
+        kept = self.x.copy(), self.steps.copy(), copy.deepcopy(self.rng)
+        try:
+            yield
+        finally:
+            self.x, self.steps, self.rng = kept
 
 
 def walks(walk):
@@ -560,6 +572,32 @@ def test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps
     owed = [math.ceil(updates * 8 * 16 / 32.0) for updates in (3, 5)]
     taken = resumed.environment_steps - 24 * 8 - owed[0]
     assert owed[1] - owed[0] <= taken < owed[1] - owed[0] + 8
+
+
+def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():
+    """A DreamerV3 run on targets a simulator steps, with a cooldown at its third update whose branch
+    collects steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the
+    branch runs on copies of the rollout's replay, and the simulator keeps its own targets and the driver
+    the episodes it is to restart (`DrivenSimulator.branch`)."""
+    from dew.objectives.base import Shown
+    from dew.rl.evaluation import episodes
+    from dew.training import Episodes, EvalSuite
+    from dew.training.cooldown import Cooldowns
+
+    objective = DreamerV3Objective(tiny())
+    flights = {"flight": EvalSuite(Episodes(episodes(objective.act, Driven(Batched(TimeLimit(
+        Target(), episode_length=20), 4)), 20, memory=objective.memory), {"return": Shown(better="higher")}),
+        every=6)}
+    options = {"optimizer": optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), "validation": flights}
+
+    def simulated():
+        return DreamerRollout(objective, HostTarget(), capacity=400, batch=8, length=16, train_ratio=32.0,
+                              prefill=24)
+
+    plain = bits(dreamer_fit(None, objective, simulated(), 6, **options))
+    cooled = dreamer_fit(None, objective, simulated(), 6, cooldowns=Cooldowns(at=(3,), length=2), **options)
+    for one, other in zip(plain, bits(cooled), strict=True):
+        np.testing.assert_array_equal(one, other)
 
 
 def test_a_dreamer_runs_cooldown_leaves_its_replay_as_the_run_left_it(tmp_path):

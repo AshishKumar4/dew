@@ -60,7 +60,8 @@ class Rollout(Protocol):
     (`dew.training._fit._rollout_saved`), and a resume hands it back, placed
     as the run's key is (`_rollout_resumed`), so a resumed run samples the
     batches the run that never stopped did. It is the pool's: a run of several
-    processes is refused one as the trainer is made (`_rollout_admitted`). The
+    processes with a checkpointer is refused one as its fit starts
+    (`_rollout_admitted`). The
     contract is the post-training spec's (docs/design/post-training.md, §14).
     """
 
