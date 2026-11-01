@@ -91,10 +91,8 @@ def _mosaic_sites() -> dict[str, Site]:
     import test_recurrence_mosaic as mosaic
 
     sites = {}
-    for case, shape in mosaic.SHAPES.items():
-        hooks = recurrence.Hooks(decay='vector' if shape.get('per_key') else 'scalar',
-                                 scale=shape['key_width'] ** -0.5,
-                                 floor=mosaic.FLOOR if shape.get('per_key') else None, write_bound=1.0)
+    for case in mosaic.SHAPES:
+        hooks = mosaic.case_hooks(case)
         for label, dtype in mosaic.DTYPES.items():
             for geometry, interpreted in (('cpu', True), ('gpu', False)):
                 at = mosaic.geometry_on(case, interpreted)

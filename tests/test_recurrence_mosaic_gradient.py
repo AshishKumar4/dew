@@ -19,6 +19,7 @@ from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
     SHAPES,
+    case_hooks,
     draw,
     geometry,
     interpreted,
@@ -40,21 +41,18 @@ pytestmark = pytest.mark.kernel
 
 INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
                         ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept'),
-                        ('packed documents', 'bf16', 'kept')}
+                        ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept')}
 """The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
-and two key heads' groups, packed documents, its forward's memories kept and recomputed, and an fp32
-call's gradient refused. Interpreted, the whole grid took 5.4 times these (7828 against 1452
-seconds)."""
-
-GRADIENT_CASES = [case for case, shape in SHAPES.items() if not shape.get('per_key')]
-"""The cases whose gradient the mainloop takes: a decay a head's (the gated delta rule's)."""
+and two key heads' groups, packed documents, its forward's memories kept and recomputed, under a decay a key
+dimension (`key_backward`'s), and an fp32 call's gradient refused. Interpreted, the whole grid took 5.4 times
+these (7828 against 1452 seconds)."""
 
 REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': ((), DELTA_RULE_RESIDUALS)}
 """The remat rungs a gradient case runs under, each the names its layers recompute (`recomputing`) and those a
 checkpoint saves (`decoder_block.RematPolicy.save`, None for no checkpoint): the forward's memories kept,
 recomputed in the backward, or kept by their names under a checkpoint saving the delta rule's (row 2023)."""
 
-GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES]
+GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in SHAPES]
 """The gradient's cases, the CPU's (`INTERPRETED_GRADIENT`) and the GPU flow's."""
 
 
@@ -86,14 +84,15 @@ ledger 2127), which the whole suite runs (`timed`)."""
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
-    backward (`mainloop_backward.gradients`, fla's DAG) against recorded fla-core's (`fla_sites`), from
+    backward (`mainloop_backward.gradients`, fla's DAG; under a decay a key dimension fla_kda's,
+    `key_backward`) against recorded fla-core's (`fla_sites`: chunk_gated_delta_rule's, chunk_kda's), from
     the forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under
     a checkpoint saving the delta rule's names kept by them. A call the template refuses is checked refused
     and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take,
     an fp32 call's or one whose launches the device does not hold (`Mosaic.trains`), the rule refuses as it is
     traced: the delta rule's selector gives it the port or the portable math, whose check 1
     test_recurrence_chunk holds (row 1926: no kernel falls back inside itself)."""
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
+    hooks = case_hooks(case)
 
     # Packed documents bounded as a layer bounds them (`PACKED_DOCUMENTS`).
     bound = {'max_segments': PACKED_DOCUMENTS} if SHAPES[case].get('packed') else {}

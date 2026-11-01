@@ -108,6 +108,14 @@ interpreted gradient of one sequence took 300 to 390 s and of packed documents 5
 unresolved within 40 seeds, its extra seeds taking 784 and 934 s."""
 
 
+def case_hooks(case: str) -> recurrence.Hooks:
+    """Case `case`'s rule: the gated delta rule with a decay a head, or a key dimension under `FLOOR` (Kimi
+    delta attention's), its queries scaled by `Dk^-1/2`."""
+    per_key = SHAPES[case].get('per_key')
+    return recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
+                            floor=FLOOR if per_key else None, write_bound=1.0)
+
+
 def geometry(case: str) -> dict:
     """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed off a GPU of a family a bundle
     claims (`geometry_on`)."""
@@ -261,9 +269,7 @@ def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     between launches rounded to bf16 put the final memory 1e-3 from float64, which the fp32 recurrence holds
     to 6e-8. A call the template refuses is checked refused and its arithmetic on the mainloop's rule
     (`on_the_mainloop`)."""
-    per_key = SHAPES[case].get('per_key')
-    hooks = recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
-                             floor=FLOOR if per_key else None, write_bound=1.0)
+    hooks = case_hooks(case)
     label = f'the mosaic forward, {case} in {jnp.dtype(dtype).name}'
     exact = on_the_mainloop(hooks, case, dtype, forms='accurate') if dtype == jnp.float32 else None
     if exact is not None:
