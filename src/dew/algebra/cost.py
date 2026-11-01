@@ -101,7 +101,7 @@ def stable(device: Device, bytes_per_element: int = 4) -> DagCostModel:
                 # Each operation's name follows its first operand.
                 name = get_literal_value(args[1])
                 risk = RISK.get(name if isinstance(name, str) else "", 0.0)
-                return Seconds(timed.marginal_cost(graph, node) + risk)
+                return timed.marginal_cost(graph, node) + Seconds(risk)
         return timed.marginal_cost(graph, node)
 
     return DagCostModel(marginal_cost=marginal, identity=Seconds(0.0))
