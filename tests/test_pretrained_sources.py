@@ -322,8 +322,9 @@ def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
     ("phi3", {"hidden_size": 3072, "num_attention_heads": 24, "num_key_value_heads": 8, "head_dim": None,
               "max_position_embeddings": 131072, "original_max_position_embeddings": 4096,
               "rope_parameters": {"rope_type": "longrope", "partial_rotary_factor": 0.75,
-                                  "rope_theta": 10000.0, "long_factor": [1.0 + index / 48 for index in range(48)],
-                                  "short_factor": [1.0] * 48, "original_max_position_embeddings": 4096}}),
+                                  "rope_theta": 10000.0, "short_factor": [1.0] * 48,
+                                  "long_factor": [1.0 + index / 48 for index in range(48)],
+                                  "original_max_position_embeddings": 4096}}),
     # PhiMoE's LongRoPE states one factor per rotated pair of its 128-wide heads (ledger 3067).
     ("phimoe", {"hidden_size": 4096, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": None,
                 "num_local_experts": 4, "num_experts_per_tok": 2, "max_position_embeddings": 131072,
