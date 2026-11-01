@@ -571,6 +571,36 @@ def released(rings: dict[str, Ring], counter) -> None:
         ring.release(counter)
 
 
+@dataclasses.dataclass(frozen=True)
+class Walk:
+    """A program's walk of its tile, its steps storing what it computes (no carry or accumulator past them):
+    the family's loads of its streams' `views` (`viewed`) and its consumer's walk of `step` over its `steps`
+    steps (one by default), or of its `segments` `(step, lo, hi)` where given (a launch's own walk, a step
+    of its own for some of them). Where a `prologue` is given, the consumer runs it before its walk waits on
+    the streams' first tiles, and each step takes what it returns (`loaded`): its own loads from global
+    memory in flight beside the streams', not after them. A launch runs it on its roles (`Transport.run`),
+    a persistent launch's tile through `persist`'s walk (`persisted`)."""
+
+    views: dict
+    step: Callable
+    steps: int = 1
+    prologue: Callable | None = None
+    segments: tuple = ()
+
+    def stepped(self) -> tuple:
+        """Its segments, each step given its prologue's value, the prologue run here (in the consumer)."""
+        loaded = None if self.prologue is None else self.prologue()
+        return tuple((step if loaded is None else functools.partial(step, loaded=loaded), lo, hi)
+                     for step, lo, hi in (self.segments or ((self.step, 0, self.steps),)))
+
+    def persisted(self, walk: Callable) -> None:
+        """Its one step walked by a persistent tile's `walk(step, start, shapes)` (`Transport.persist`'s)."""
+        if self.segments:
+            raise ValueError("a persistent tile walks its one step, not segments of its own")
+        ((step, _, _),) = self.stepped()
+        walk(step, None, ())
+
+
 class Issuer[Accumulator](abc.ABC):
     """An instruction family's issuer and accumulator home (design §6): its products (`product` into a fresh
     accumulator, `products`, `register_products` and `issued` in place, `settled`), the accumulator's home
@@ -992,6 +1022,17 @@ class Transport[Allocated, Opened](abc.ABC):
         walked = walk(streams, lo, hi, streamed[0])
         self.passed(streams, hi, streamed[1], first=streamed[0], between=between)
         return walked
+
+    def run(self, allocated: Allocated, walk: Walk, interpret: bool) -> None:
+        """`walk` on a program's roles: the producer's loads of its views into `allocated`'s streams (opened
+        here) where the family has one, and its consumer's walk of them, fed by the producer or by its own
+        loads (`fed`)."""
+        streams = self.opened(allocated, walk.views)
+
+        def consumer(wg):
+            self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), (), (), interpret)
+
+        self.roles(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
