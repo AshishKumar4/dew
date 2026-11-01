@@ -80,11 +80,12 @@ from etils import epath
 from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
-from dew import _records, position
+from dew import _records
 from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._hashing import fmix32
 from dew._records import JSON, duration, json_value, record, share
 from dew.batch import PARAMETER_ROOTS, Variables
+from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.served import unpacked
 from dew.cleanup import attempted
 from dew.files import write_atomically
@@ -219,18 +220,6 @@ def location(directory: str) -> epath.Path:
     """
     path = epath.Path(directory)
     return path if is_uri(directory) else path.resolve()
-
-
-def _step_record(deltas: list[str], control: dict | None, rung: JSON, artifact: JSON,
-                 boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> dict:
-    """What a persistent and a local save both record of a step: its EMA deltas, its control
-    state, its rung, its inference artifact and its boxed axes."""
-    return {"ema_deltas": deltas, "control": copy.deepcopy(control or {}), "rung": rung, "artifact": artifact,
-            "boxed": _boxed_record(boxed)}
-
-
-def _processes(count: int) -> str:
-    return f"{count} process" + ("es" if count != 1 else "")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -445,79 +434,6 @@ def _check_shared(directory: str) -> None:
             f"directory has to be one every process reads and writes, on a shared "
             f"filesystem or in a bucket. Each host's own disk can hold local checkpoints "
             f"beside it (local_directory).")
-
-
-def gather_positions(saved: bytes, share: DataPartition) -> dict:
-    """Gather every process's iterator position into the checkpoint's `position` table.
-
-    'rows' is a uint8 [process_count, longest] array with one row per
-    process, 'lengths' the unpadded length of each, and 'shares' the
-    `[index, count]` of the data share each process read. A process reports
-    the position it holds, and Orbax writes a host array from process 0
-    alone, so the rows are gathered onto every process before a save. The
-    rows differ in length, so their lengths are stored with them.
-
-    There is one row per process whatever kind the position is. A global
-    position is the same bytes on every process, and gathering it lets
-    `read_position` check that the rows agree before another partition reads it.
-    """
-    told = from_every_process([saved.hex(), share.index, share.count])
-    every = [bytes.fromhex(hexed) for hexed, _, _ in told]
-    # The integer width a jax array of int64 takes, as the table's always had.
-    integer = jax.dtypes.canonicalize_dtype(np.int64)
-    lengths = np.asarray([len(entry) for entry in every], integer)
-    rows = np.zeros((len(every), int(lengths.max())), np.uint8)
-    for row, entry in zip(rows, every, strict=True):
-        row[:len(entry)] = np.frombuffer(entry, np.uint8)
-    return {'rows': rows, 'lengths': lengths,
-            'shares': np.asarray([[index, count] for _, index, count in told], integer)}
-
-
-def _row(table: dict, index: int) -> bytes:
-    """Return one row of a `gather_positions` table, without its padding."""
-    row = np.asarray(table['rows'][index], np.uint8)
-    return row[:int(table['lengths'][index])].tobytes()
-
-
-def read_position(table: dict, where: str, share: DataPartition) -> bytes:
-    """Read the position the reader of `share` resumes from, out of a saved table.
-
-    A global position is a record count over an order that is the same at
-    any partition, so every row is a valid position for every reader;
-    `dew.position` declares that property and `read_position` relies on it.
-    A share's own offset resumes only readers of that same share, whichever
-    processes they are, and any other reader is refused with the shares named.
-    """
-    written = len(table['lengths'])
-    # Row order, not set order: bytes hash differently per interpreter, and
-    # which of the refusals below a broken checkpoint gets is a diagnostic.
-    rows = [_row(table, index) for index in range(written)]
-    if position.translates(rows[0]):
-        if any(row != rows[0] for row in rows[1:]):
-            raise ValueError(
-                f"The checkpoint at {where} holds a global data position that "
-                f"differs between the {_processes(written)} that wrote it. A global "
-                f"position is one place in one order, so those processes read "
-                f"different orders and no single one of their positions is this "
-                f"run's.")
-        return rows[0]
-    held = [(int(index), int(count)) for index, count in np.asarray(table['shares'])]
-    mine = [row for row, written_share in zip(rows, held, strict=True)
-            if written_share == (share.index, share.count)]
-    if not mine:
-        raise ValueError(
-            f"The checkpoint at {where} holds data positions for the shares "
-            f"{sorted(set(held))} (index, count), and this reader reads share "
-            f"{share.index} of {share.count}. A position is where one share of "
-            f"the data stopped and cannot be translated to another share, so "
-            f"resume it on a mesh whose processes read those shares: {position.PER_SHARE}.")
-    if any(row != mine[0] for row in mine[1:]):
-        raise ValueError(
-            f"The checkpoint at {where} holds positions for share {share.index} "
-            f"of {share.count} that differ between the processes that read it; "
-            f"a share's readers read the same records, so no one of them is "
-            f"where the share stopped.")
-    return mine[0]
 
 
 def _written_in_place(tree: Mapping[str, object]) -> bool:
@@ -1118,11 +1034,6 @@ class _ProfileSteps(preservation.PreservationPolicy):
         return [checkpoint.step in self.steps for checkpoint in checkpoints]
 
 
-def _boxed_record(boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> list[dict[str, list[str | None]]]:
-    """The boxed axes as a step's metadata holds them, one path and its names each."""
-    return [{"path": list(path), "names": list(names)} for path, names in (boxed or {}).items()]
-
-
 class Checkpoints:
     """Manages the checkpoints of one run in one directory.
 
@@ -1541,8 +1452,10 @@ class Checkpoints:
         rung: JSON = None,
         artifact: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
+        rollout: Mapping[str, object] | None = None,
     ) -> None:
-        """Write `state` under `step`, asynchronously.
+        """Write `state` under `step`, asynchronously, a train state with its rollout's tree of arrays where
+        it holds one (`rollout`), which `rollout_state` reads back.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
@@ -1581,13 +1494,16 @@ class Checkpoints:
             self._identify_run()
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
-                    or artifact is not None):
+                    or artifact is not None or rollout is not None):
                 raise ValueError("a mapping is saved as it is: it takes no data position, share, "
-                                 "weights-only split, rung or artifact, which a train state's save records")
+                                 "weights-only split, rung, artifact or rollout, which a train state's save "
+                                 "records")
             profiles, state_tree, frozen, deltas = None, dict(state), {}, []
         else:
             profiles = None if weights_only else _power_profiles(state.opt_state)
-            state_tree, frozen = self._frozen(self._item(state, saved, share))
+            if weights_only and rollout is not None:
+                raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
+            state_tree, frozen = self._frozen(self._item(state, saved, share, rollout))
             state_tree, deltas = _with_ema_deltas(state_tree)
             if weights_only:
                 from dew.state import MODEL_STATE
@@ -1612,7 +1528,7 @@ class Checkpoints:
                 scores[f'checkpoint/rank/{rank.metric}'] = rank.score
                 rules[rank.metric] = dataclasses.asdict(rank)
         custom = {
-            **_step_record(deltas, control, rung, artifact, boxed),
+            **step_record(deltas, control, rung, artifact, boxed),
             "profiles": profile_metadata,
             "rankings": rules,
             "primary": primary or (rankings[0].metric if rankings else None),
@@ -1827,8 +1743,10 @@ class Checkpoints:
         rung: JSON = None,
         artifact: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
+        rollout: Mapping[str, object] | None = None,
     ) -> None:
-        """Write `state` under `step` to this process's local directory, asynchronously.
+        """Write `state` under `step` to this process's local directory, asynchronously, with its
+        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole).
 
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
@@ -1836,7 +1754,7 @@ class Checkpoints:
         placement raises before it reads shards from directories that do not
         hold them.
         """
-        state_tree = self._item(state, saved, share)
+        state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = _grid({name: leaf for name, leaf in state_tree.items() if name != 'position'})
         state_tree, deltas = _with_ema_deltas(state_tree)
@@ -1851,7 +1769,7 @@ class Checkpoints:
                 args=ocp.args.PyTreeSave(state_tree),
                 force=True,
                 custom_metadata={
-                    **_step_record(deltas, control, rung, artifact, boxed),
+                    **step_record(deltas, control, rung, artifact, boxed),
                     "processes": jax.process_count(),
                     "placement": written,
                     "grid": grid,
@@ -1862,10 +1780,12 @@ class Checkpoints:
                 local.wait_until_finished()
 
     @staticmethod
-    def _item(state: TrainState, saved: bytes | None,
-              share: DataPartition | None) -> dict[str, StateLeaf]:
+    def _item(state: TrainState, saved: bytes | None, share: DataPartition | None,
+              rollout: Mapping[str, object] | None = None) -> dict[str, StateLeaf]:
         from dew.state import CHECKPOINTED
         state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
+        if rollout is not None:
+            state_tree['rollout'] = dict(rollout)
         if saved is not None:
             if share is None:
                 raise ValueError(
@@ -2039,6 +1959,21 @@ class Checkpoints:
         table = (_from_table_record(self._from_holder(recovery[1], lambda: _table_record(read())))
                  if from_local and recovery is not None and recovery[0] == step else read())
         return read_position(table, self.source(step), share)
+
+    def rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None:
+        """The rollout's tree the step at `step` holds (`save`'s `rollout`), read alone and placed as
+        `template`'s leaves (`jax.ShapeDtypeStruct`s) are; None for a step saved without one."""
+        from_local = step == self._local_latest()
+        metadata = _item_metadata(self._step_metadata(step, local=from_local))
+        if 'rollout' not in metadata:
+            return None
+        wanted = {'rollout': dict(template)}
+        _refuse_reshaped(wanted, metadata, self.source(step))
+        checkpointer = self._open_local() if from_local else self._open()
+        restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+            item=wanted, partial_restore=True,
+            restore_args=jax.tree.map(lambda want: _read(want, want.dtype), wanted)))
+        return _placed(dict(restored['rollout']), wanted['rollout'])
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
@@ -2217,8 +2152,8 @@ class Checkpoints:
             if processes == jax.process_count() and not moved:
                 return
             if processes != jax.process_count():
-                difference = (f"written by {_processes(processes or 0)}, and this run has "
-                              f"{_processes(jax.process_count())}")
+                difference = (f"written by {counted_processes(processes or 0)}, and this run has "
+                              f"{counted_processes(jax.process_count())}")
             else:
                 difference = (f"written with {moved[0]} placed as "
                               f"{written.get('placement', {}).get(moved[0])}, and this run "

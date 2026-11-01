@@ -49,6 +49,21 @@ class Rollout(Protocol):
     the branch's own (`cooldown-<step>`, the step it branches at), after which
     the rollout stands as the run left it (`_branched`). One without it is
     called alike there.
+
+    A rollout whose next batches depend on state it carries between calls (its
+    environments mid episode, a collection it serves in minibatches, a replay)
+    may have `saved()`, that state as a mapping of arrays (host arrays of 32
+    bits or fewer a leaf, which the trainer places), None before its first
+    call; `saved_shapes()`, its leaves' shapes and dtypes, readable before any
+    call; `restored(tree)`, which carries on from a saved tree; and
+    `branch(name)`, so a cooldown branch leaves that state as the run left it.
+    Each checkpoint of the run holds the run's rollout's tree beside its state
+    (`dew.training._fit._rollout_saved`), and a resume hands it back, placed
+    as the run's key is (`_rollout_resumed`), so a resumed run samples the
+    batches the run that never stopped did. It is the pool's: a run of several
+    processes with a checkpointer is refused one as its fit starts
+    (`_rollout_admitted`). The
+    contract is the post-training spec's (docs/design/post-training.md, §14).
     """
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
