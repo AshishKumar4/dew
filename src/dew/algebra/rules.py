@@ -48,6 +48,14 @@ def plain(params: i64) -> Unit: ...
 operands' dtype, so a rule may move it past the arithmetic beside it (`program.rewrite` states it)."""
 
 
+@function
+def exact_scale(term: Term) -> Unit: ...
+"""Holds where a term is a scalar literal of a power of two: a multiply by it rounds nothing (but past the
+dtype's range), so moving it through a contraction leaves every rounding as it was (`program.rewrite`
+states it). A scale of any other value moved so reorders rounding, which the gate refused on the gated delta
+rule's adjoint (1.575 times the reference's error, past 1.5): it waits for error-aware extraction (§1.5)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Rules:
     """A named set of rules: its rounding class (`exact`: each rewrite rounds as the form it replaces;
@@ -86,23 +94,22 @@ def _facts() -> Ruleset:
 def _linear() -> Ruleset:
     """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
     distributivity over operands of one shape, a product's bilinearity (two products sharing an operand, one
-    product of the summed others, and a scalar scale of the product on either operand instead), each over
-    arithmetic in its operands' dtype (`plain`), and a
-    value a broadcast lays along every axis but a sum's
-    taken out of the sum where the other factor has the product's shape (the broadcast's extent along the axis
-    the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
+    product of the summed others, and a power of two's scale of the product on either operand instead), each
+    over arithmetic in its operands' dtype (`plain`), and a value a broadcast lays along every axis but a
+    sum's taken out of the sum where the other factor has the product's shape (the broadcast's extent along
+    the axis the product's or 1, as an elementwise product broadcasts a unit axis): each reorders rounding."""
     x, y, a = vars_("x y a", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
     scalar = Vec[i64].empty()
     return ruleset(
-        # A contraction scaled by a scalar: the scale on either operand, the product linear in each.
+        # A contraction scaled by a power of two: the scale on either operand, the product linear in each.
         rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
-            x.binary("mul", a, multiplied).dot(y, params), eq(shape(a)).to(scalar), plain(params),
-            plain(multiplied)),
+            x.binary("mul", a, multiplied).dot(y, params), eq(shape(a)).to(scalar), exact_scale(a),
+            plain(params), plain(multiplied)),
         rewrite(x.dot(y, params).binary("mul", a, multiplied)).to(
-            x.dot(y.binary("mul", a, multiplied), params), eq(shape(a)).to(scalar), plain(params),
-            plain(multiplied)),
+            x.dot(y.binary("mul", a, multiplied), params), eq(shape(a)).to(scalar), exact_scale(a),
+            plain(params), plain(multiplied)),
         rewrite(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)).to(
             x.binary("add", y, added).reduce("sum", axes, params), eq(shape(x)).to(shape(y)), plain(added)),
         rewrite(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)).to(
