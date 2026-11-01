@@ -97,16 +97,17 @@ def device_bytes(tree) -> int:
 
 
 CHEAP = frozenset({
-    "add", "and", "bitcast_convert_type", "broadcast_in_dim", "ceil", "clamp", "clz", "eq", "ne", "lt", "le",
-    "gt", "ge", "complex", "concatenate", "convert_element_type", "copy", "copy_p", "dynamic_slice",
-    "dynamic_update_slice", "floor", "imag", "iota", "is_finite", "max", "min", "mul", "neg", "not", "or",
-    "xor", "pad", "population_count", "real", "reduce_precision", "reshape", "squeeze", "expand_dims", "rev",
-    "round", "select_n", "shift_left", "shift_right_arithmetic", "shift_right_logical", "slice", "sub",
-    "transpose", "integer_pow", "square", "name"})
+    "add", "add_any", "and", "bitcast_convert_type", "broadcast_in_dim", "ceil", "clamp", "clz", "eq", "ne",
+    "lt", "le", "gt", "ge", "complex", "concatenate", "convert_element_type", "copy", "copy_p",
+    "dynamic_slice", "dynamic_update_slice", "floor", "imag", "iota", "is_finite", "max", "min", "mul", "neg",
+    "not", "or", "xor", "pad", "population_count", "real", "reduce_precision", "reshape", "squeeze",
+    "expand_dims", "rev", "round", "select_n", "shift_left", "shift_right_arithmetic", "shift_right_logical",
+    "slice", "sub", "transpose", "integer_pow", "square", "name"})
 """The primitives XLA's CPU fusion takes for cheap, which it duplicates into each consumer rather than
 keep a buffer of (`InstructionFusion::IsExpensive`, xla/service/instruction_fusion.cc: every elementwise
 op but division, the transcendentals and their kin, and the layout ops), an integer power and a square
-lowering to its multiplies, and a checkpoint's name, which computes nothing."""
+lowering to its multiplies, a cotangent sum, which JAX lowers to one `add` (`add_jaxvals_lowering`,
+jax/_src/interpreters/mlir.py), and a checkpoint's name, which computes nothing."""
 
 REAL_CHEAP = frozenset({"abs", "sign", "sin", "cos", "tan", "sinh"})
 """The primitives XLA's CPU fusion takes for cheap over real elements alone (`IsExpensive`)."""
@@ -186,14 +187,20 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
     below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
     forward and backward, as JAX lowers it for `lowering` (`compiled`; `platform`'s own name where none
-    is given, a GPU's CUDA's)."""
+    is given, a GPU's CUDA's). Each gradient is held while it is made, no longer (`peak_bytes`'s
+    `consumed`): the step reads it there into the buffers the state donates, the optimizer's update or the
+    accumulator's sum written in place (the donated state's outputs alias its arguments,
+    `HloInputOutputAliasConfig`), and XLA's memory-minimizing schedule runs a consumer that frees its
+    operand as soon as it is ready (`ListScheduler::BytesFreedIfScheduled`,
+    xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
+    xla/service/gpu/gpu_hlo_schedule.cc)."""
     def gradient(params, *arguments):
         outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
         return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
 
     program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
     lowered = compiled(program, lowering or LOWERED.get(platform, platform))
-    return Peak(peak_bytes(lowered, platform, workspace), not bounded_below(lowered, platform))
+    return Peak(peak_bytes(lowered, platform, workspace, consumed=True), not bounded_below(lowered, platform))
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
@@ -211,7 +218,8 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
 
 
 def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
-               slicing: Slicing | None = None, carried: frozenset = frozenset()) -> int:
+               slicing: Slicing | None = None, carried: frozenset = frozenset(), *,
+               consumed: bool = False) -> int:
     """The most bytes `program` holds at once beside its inputs, its equations run in their traced
     order. A value XLA keeps a buffer of (`Frontier`) is held from the equation that computes it to the
     last that reads it, an output to the end. An equation that takes its operands from memory
@@ -221,12 +229,20 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     it runs, its body read with what it slices of the loop it runs in (`slicing`). A loop's carried
     value is one buffer from its initial value, where that is a buffer of the program's the loop reads
     last, to its result, its body's returned value of it among them (`carry`; `carried`, the values
-    `program`, a loop's body, returns into it). No schedule XLA picks is modelled: a compile
-    confirms."""
+    `program`, a loop's body, returns into it). With `consumed`, an output is held while the equation
+    that makes it runs, as an update that reads it there holds it (`gradient_peak`). No schedule XLA
+    picks is modelled: a compile confirms."""
     frontier = Frontier(program, platform, returned=True)
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
-    last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
+    if consumed:
+        # The program's outputs are read where they are made, by an update that writes the buffers the
+        # state donates (the optimizer's, or the accumulator's): each is held while its equation runs.
+        made_at = {out: index for index, equation in enumerate(program.eqns) for out in equation.outvars}
+        for kept in frontier.reading(program.outvars):
+            last.setdefault(kept, made_at.get(kept, 0))
+    else:
+        last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
     sliced = (slicing or Slicing()).within(program)
     live, held, most = 0, set(), 0
     for index, equation in enumerate(program.eqns):
@@ -236,7 +252,10 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
-            operands = 0 if frontier.fusing(equation) else sum(
+            # A barrier's results are its operands' own storage: the buffers made for its fused operands
+            # are the ones it holds, not a second set read beside them.
+            barrier = equation.primitive.name == "optimization_barrier"
+            operands = 0 if frontier.fusing(equation) or barrier else sum(
                 device_share(value) for value in {value for value in equation.invars if computed(value)}
                 if frontier.made_for(value))
             products = 0 if not cublas_product(equation) else (
@@ -338,12 +357,24 @@ class Frontier:
                                            for value in {read for read in equation.invars if computed(read)})
         self.readers.update({value for value in program.outvars if computed(value)})
         self.reads: dict[jcore.Var, frozenset[jcore.Var]] = {}
+        # An optimization barrier defines no value: its results are its operands' own
+        # (`HloDataflowAnalysis::UpdateOptimizationBarrierValueSet`,
+        # xla/hlo/analysis/hlo_dataflow_analysis.cc).
+        self.forwards = {out: operand for equation in program.eqns
+                         if equation.primitive.name == "optimization_barrier"
+                         for out, operand in zip(equation.outvars, equation.invars, strict=True)}
+
+    def stored(self, operand) -> bool:
+        """Whether `operand` is held in a buffer: an input, or a value computed into one."""
+        return computed(operand) and (operand in self.inputs or not self.fused(operand))
 
     def view(self, value) -> bool:
         """Whether `value` is another value's storage: a shape primitive's of a value held or read
         (`VIEWS`), or a transpose's of a value the program computes into a buffer and reads nowhere
         else (`TRANSPOSES`)."""
         equation = self.producers.get(value)
+        if value in self.forwards:
+            return self.stored(self.forwards[value])
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
@@ -358,6 +389,8 @@ class Frontier:
         if not computed(value) or value in self.inputs:
             return False
         equation = self.producers.get(value)
+        if value in self.forwards:
+            return self.stored(self.forwards[value])
         if equation is None or not recomputed(equation, self.platform):
             return False
         return value not in self.outputs or self.view(value)
@@ -373,8 +406,12 @@ class Frontier:
 
     def fusing(self, equation: jcore.JaxprEqn) -> bool:
         """Whether `equation` computes its result within a fusion that recomputes its operands' fused
-        chains as it reads them: an elementwise one's (`recomputed`) or a reduction's."""
-        return recomputed(equation, self.platform) or equation.primitive.name.startswith(("reduce_", "arg"))
+        chains as it reads them: an elementwise one's (`recomputed`) or a reduction's, a variadic
+        `reduce` among them, which XLA fuses into its own kernel whatever its operands' number
+        (`PriorityFusion::ChooseKind`, `CanFuseWithNativeEmitter`,
+        xla/backends/gpu/transforms/priority_fusion.cc)."""
+        name = equation.primitive.name
+        return recomputed(equation, self.platform) or name == "reduce" or name.startswith(("reduce_", "arg"))
 
     def reading(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds: each value's own, or for one fused, those it is
