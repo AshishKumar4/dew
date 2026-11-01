@@ -769,6 +769,11 @@ def mode_fit(args) -> dict:
         "local_steps": None if args.local_dir is None else sorted(
             int(step) for step in checkpoints._open_local().all_steps()),
         "dataset_state": final_position,
+        # Each probe's derived residuals (`dew.training.footprint`), None where the process's own device,
+        # a CPU here, judges no footprint (row 3093).
+        "derived_residuals": [probe["derived"]["residuals"]
+                              for probe in (trainer.plan or {}).get("probes", [])
+                              if probe.get("derived") is not None],
     }
 
 

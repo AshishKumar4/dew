@@ -19,7 +19,8 @@ Each step draws a batch of eta uniform in [0, c) from its key and minimizes the 
 in float64, with Adam at 1e-4 decayed to zero by a cosine over the run (epsilon 1e-15). `--model pyramid`
 (the default) reads U~ through a 12-level Fourier feature pyramid, grids of 2 to 4096 points of 4
 channels, at the coordinate (eta + c) / (2c), into a tanh MLP of width 20 and four layers; `--model mlp`
-is that MLP alone, on eta. `--damping` steps by Gauss-Newton instead of Adam (`Residuals`), damped as
+is that MLP alone, on eta. `--damping` steps by Gauss-Newton instead of Adam
+(`dew.gauss_newton.gauss_newton`, the residuals' system its objective states), damped as
 Levenberg-Marquardt's.
 
 The run writes `metrics.json` to `--out`: on the grid eta_i = c (i + 1/2) / 1000, the mean of F^2 and
@@ -43,6 +44,7 @@ import tyro
 from flax import linen as nn
 
 from dew.data import Memory
+from dew.gauss_newton import gauss_newton
 from dew.nn.fourier import FourierPyramid
 from dew.objectives.base import Step
 from dew.objectives.residuals import Residuals
@@ -91,9 +93,8 @@ class Profile(nn.Module):
 class BurgersProfile(Residuals):
     """The profile equation's residual F and its derivative in eta at points each step draws in [0, c)."""
 
-    def __init__(self, model: Profile, damping: float | None = None):
+    def __init__(self, model: Profile):
         self.model = self.bind_model(model)
-        self.damping = damping
 
     def fresh_variables(self, key, held):
         return self.model.init(key, jnp.zeros((1,), jnp.float64))
@@ -147,8 +148,8 @@ class Config:
 def main(config: Config) -> dict[str, float]:
     levels = 0 if config.model == "mlp" else 4 if config.smoke else 12
     steps, batch = (20, 64) if config.smoke else (config.steps, config.batch)
-    objective = BurgersProfile(Profile(pyramid=levels), damping=config.damping)
-    optimizer = (optax.sgd(1.0) if config.damping is not None else
+    objective = BurgersProfile(Profile(pyramid=levels))
+    optimizer = (gauss_newton(config.damping) if config.damping is not None else
                  optax.adam(optax.cosine_decay_schedule(config.learning_rate, steps), eps=1e-15))
     points = Memory([{"point": np.zeros((), np.float64)}] * batch).repeat().batch(batch)
     trainer = Trainer(objective, optimizer, key=config.seed)

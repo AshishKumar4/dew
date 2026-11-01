@@ -36,7 +36,7 @@ import tyro
 from dew._hashing import fmix32
 from dew._moments import bias_corrected
 from dew._records import share
-from dew.held_updates import refuse_untold, update_applied
+from dew.held_updates import holds_state, refuse_untold, update_applied
 from dew.laprop import laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
@@ -565,8 +565,7 @@ def clips_qk(opt_state) -> bool:
     """Whether an optimizer state holds a QK-Clip's (`QKClipState`), however the optimizer composes it:
     a run then asks its objective for the step's attention logit maxima (`dew.objectives.Step.qk_stats`)
     and hands them to the update."""
-    return any(isinstance(node, QKClipState) for node in jax.tree.leaves(
-        opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+    return holds_state(opt_state, QKClipState)
 
 
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
@@ -589,7 +588,8 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     def init_fn(params) -> QKClipState:
         return QKClipState(jnp.zeros([], jnp.int32), _rescales(params, None, tau))
 
-    def update_fn(updates, state, params=None, qk_stats=None):
+    def update_fn(updates, state, params=None, qk_stats=None, **extra_args):
+        del extra_args
         if params is None:
             return updates, state
         return updates, state._replace(steps=optax.safe_increment(state.steps),
@@ -2278,22 +2278,28 @@ class OptimConfig:
     Empty keeps none.
     """
 
+    def schedules(self) -> list[tuple[str, ScheduleBase]]:
+        """The schedules its solvers run, by where the config holds them: its learning rate's, or each
+        param group's rate (`ParamGroup.rate`, the config's own where the group names none) and b1."""
+        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
+        for group in self.param_groups:
+            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
+            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
+        return [(name, schedule) for name, schedule in held if isinstance(schedule, ScheduleBase)]
+
+    def reads_progress(self) -> bool:
+        """Whether a run that counts no updates ahead (one bounded in examples) hands its optimizer its
+        progress: a schedule of its whose horizon is the run's (`ScheduleBase.run_relative`)."""
+        return any(schedule.run_relative() for _, schedule in self.schedules())
+
     def warmups(self, steps: int | None, clocked: bool = False) -> dict[str, int | str | float]:
         """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
         its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
         run's plan records it; a schedule with no warmup of steps is not among them. A `clocked` run
         counts no updates ahead, so a warmup over the run's progress is recorded as written, its share
         of the examples the run consumes (`ScheduleBase.progressed`)."""
-        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
-        for group in self.param_groups:
-            # The schedules the group's solver runs (`ParamGroup.rate`): the config's own where the
-            # group names none.
-            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
-            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
         warmups: dict[str, int | str | float] = {}
-        for name, schedule in held:
-            if not isinstance(schedule, ScheduleBase):
-                continue
+        for name, schedule in self.schedules():
             if clocked and schedule.run_relative():
                 written = schedule.written_warmup()
                 if written:

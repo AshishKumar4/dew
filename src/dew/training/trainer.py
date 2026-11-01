@@ -32,13 +32,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew._coordination import (
-    agree_process_phase,
-    agreed,
-    agreed_next,
-    agreed_same,
-    broadcast_from_process_zero,
-)
+from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking, Resume
@@ -53,7 +47,6 @@ from dew.data.dataset import (
     Reader,
     Stage,
     rows_of,
-    stream_endless,
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
@@ -129,7 +122,6 @@ from dew.training._fit import (
     handed_splits,
     pooled,
     pooled_first,
-    pooled_read,
     restored,
     stage_reached,
     unrecorded_parts,
@@ -203,7 +195,7 @@ from dew.training.planning import (
     whole_step,
 )
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
-from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
+from dew.training.rollout import Rollout, _branched, _draws_further, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
@@ -472,8 +464,10 @@ class Trainer(Generic[Loss, Effects]):
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
         """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
         self._device, self._prefetch = loader.device, prefetch
-        self._examples = clocked(examples, steps, custom=self.step is not None,
-                                 rollout=self.rollout is not None, bound_ends=loader.bound_ends)
+        progress = self._config is not None and self._config.reads_progress()
+        self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
+                                 custom_progress=self.step is not None and progress,
+                                 pooled_draws=pooled(examples) and _draws_further(self.rollout))
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1471,7 +1465,7 @@ class Trainer(Generic[Loss, Effects]):
                 # The first read restores the stream's position and opens its reader on the prefetch
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
-                batch = waited_read(run, interval, agree=not (seen and run.endless))
+                batch = waited_read(run, interval, agree=run.agrees(first=not seen))
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
@@ -1518,8 +1512,8 @@ class Trainer(Generic[Loss, Effects]):
                 position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
-                interval.count(batch, measured_flops, loss, finite, committed, aux)
-                run.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                interval.count(batch, measured_flops, loss, finite, committed, aux,
+                               run.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
@@ -1757,9 +1751,10 @@ class Trainer(Generic[Loss, Effects]):
             # corpus, and none reads a record before all agree it is one.
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
-        run.endless, run.pooled = stream_endless(source), pooled(self._examples)
+        run.opened(source, self._examples)
         self._marked = marked(run.partition, self._counted_batch)
-        prepare = self._marked if self.rollout is None else None
+        prepare = self._marked if self.rollout is None else functools.partial(
+            consumption_counted, clocked=self._examples is not None, marks_rows=False)
         if run.pooled:
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
@@ -1922,9 +1917,8 @@ class Trainer(Generic[Loss, Effects]):
                     if schedule_ended(ends, lambda: branched.clock.read) or (cut := run.notice.reached()):
                         break
                     self._scheduled(plan, branched)
-                    assert branched.train is not None
-                    batch = (pooled_read(branched, branched.train, phase="cooldown read") if branched.pooled
-                             else agreed_next("cooldown read", branched.train))
+                    batch = waited_read(branched, counted, agree=branched.agrees(first=not done),
+                                        phase="cooldown read")
                     if batch is None:
                         break
                     batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
@@ -1935,8 +1929,8 @@ class Trainer(Generic[Loss, Effects]):
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                     cooled, loss, aux, finite, _, committed = step(
                         rates_set(cooled, functools.partial(scaled_rates, held=held, factor=factor)), device)
-                    counted.count(batch, None, loss, finite, committed, aux)
-                    branched.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                    counted.count(batch, None, loss, finite, committed, aux,
+                                  branched.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                     done, branched.current = done + 1, branched.current + 1
             finally:
                 self._stage_starts = starts

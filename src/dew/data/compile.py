@@ -74,7 +74,6 @@ from dew.data.dataset import (
     take_batch,
 )
 from dew.data.facts import merge_facts
-from dew.data.holdout import selecting
 from dew.data.lowering import (
     _as_iter,
     _Build,
@@ -339,17 +338,6 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
-def _stores(source: Source) -> Iterator[Source]:
-    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
-    selects from."""
-    for _, selected in selecting(source):
-        if isinstance(selected, Concatenate):
-            for part in selected.sources:
-                yield from _stores(part)
-        else:
-            yield selected
-
-
 def _token_stores(source: Source) -> Iterator[TokenFiles]:
     """The token stores `source` reads, through every view and a concatenation's parts."""
     for each in beneath(source, typing.get_args(Rows.__value__)):
@@ -447,9 +435,9 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
     bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`); in a
-    pool, a read in one order takes the bound before it cuts its shares, and a read whose shares each
-    read records of their own takes on each its part of the pool's first `examples`
-    (`dew.data.lowering._Build.bounded`). Refuses a bound it cannot place: a repeat with a count before
+    pool, a read in one order takes the bound before it cuts its shares, and a read whose shares, or a
+    share's loading workers, each read records of their own takes on each its part of the pool's first
+    `examples` (`dew.data.lowering._Build.bound_at`). Refuses a bound it cannot place: a repeat with a count before
     it, or any repeat after it, the batch's included, a mixed corpus that packs on its own, and phases,
     which end by steps. A chain without a batch is left for `compile` to refuse."""
     if examples < 1:
@@ -1413,10 +1401,17 @@ elements, or arrays whole."""
 
 
 class _Whole:
-    """The same batch every step, the arrays a run was handed whole; its position the steps read."""
+    """The same batch every step, the arrays a run was handed whole; its position the steps read. It
+    never runs out (`Identified.endless`), and names what it reads as a stream Dew names no further does:
+    by its type (`stream_identity`)."""
+
+    endless = True
 
     def __init__(self, batch: Batch):
         self.batch, self.read = batch, 0
+
+    def identity(self) -> str:
+        return type(self).__name__
 
     def __iter__(self):
         return self
@@ -1448,10 +1443,16 @@ def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
 
 class _Shared(Forwarding):
     """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
-    the stream's."""
+    the stream's; `endless` where it reads a map dataset repeated without end (`native`), which says
+    so of nothing it reads."""
 
-    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool):
-        self._source, self.partition, self.held = batches, partition, held
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool,
+                 endless: bool = False):
+        self._source, self.partition, self.held, self._endless = batches, partition, held, endless
+
+    @property
+    def endless(self) -> bool:
+        return self._endless or super().endless
 
     def __iter__(self):
         return self
@@ -1476,10 +1477,11 @@ def native(handed: Handed, *, training: bool) -> Reader:
         if training:
             return lambda partition: _Shared(_Whole(batch), partition, held=False)
         return lambda partition: iter([_share(batch, partition, held=True)])
+    repeated = training and isinstance(handed, pygrain.MapDataset)
     stream: pygrain.IterDataset = (
         (handed.repeat() if training else handed).to_iter_dataset() if isinstance(handed, pygrain.MapDataset)
         else handed)
-    return lambda partition: _Shared(iter(stream), partition, held=not training)
+    return lambda partition: _Shared(iter(stream), partition, held=not training, endless=repeated)
 
 
 def native_loader(handed: Handed) -> Loader:

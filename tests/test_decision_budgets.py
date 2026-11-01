@@ -396,12 +396,14 @@ def _run(backbone: Path, count: int, *, stated: bool = False, **budgets) -> Fitt
 def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cut(backbone, count):
     """A fresh lettered run (a real tokenizer) over 77 or 151 intents lays out its questions whole at
     the run's own budgets: its layout holds every option's line as its text, and the run's data counters
-    count no cut of a question and refuse no example. The same run declaring each option's line its
-    shortest line's length less three tokens cuts the end every intent's name shares
-    ("_of_the_customer") from each, keeping the index that tells it apart: it counts that cut of every
-    example's options, in examples, rows and tokens, and refuses none. Declaring each line three tokens,
-    which keep its label alone, leaves every option alike: training leaves each example out under that
-    reason, counted."""
+    count no cut of a question and refuse no example. The same run declaring each option's line the
+    longest line's tokens before the end every intent's name shares ("_of_the_customer", the tokens every
+    line ends with) cuts some of that end from each line longer than that, the longest among them,
+    keeping the index that tells each apart, however its tokenizer spells an index (GPT-2's "12" one
+    token, Qwen3.5's a token a digit, which leaves its lines of two digits longer): it counts that cut of
+    every example's options, in examples, rows and tokens, and refuses none. Declaring each line three
+    tokens, which keep its label alone, leaves every option alike: training leaves each example out
+    under that reason, counted."""
     objective, dataset, summary = _run(backbone, count).prepare().train("x")
     [counts] = dataset.counts.values()
     assert counts.accepted == count and counts.refused == {}
@@ -417,9 +419,14 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
     # Each question budget whole, as the run states none.
     assert summary["capacities"]["question"] == {"tokens": None, "from": "whole"}
     assert summary["capacities"]["option"] == {"tokens": None, "from": "whole"}
-    shortest = min(end - start for start, end in row.questions[0].options)
-    _, declared, stated = _run(backbone, count, option_tokens=shortest - 3).prepare().train("x")
-    assert stated["capacities"]["option"] == {"tokens": shortest - 3, "from": "stated"}
+    spans = [tuple(row.tokens[start:end]) for start, end in row.questions[0].options]
+    shared = 0
+    while len({span[len(span) - shared - 1:] for span in spans}) == 1:
+        shared += 1
+    kept = max(map(len, spans)) - shared
+    assert shared > 0
+    _, declared, stated = _run(backbone, count, option_tokens=kept).prepare().train("x")
+    assert stated["capacities"]["option"] == {"tokens": kept, "from": "stated"}
     [cut] = declared.counts.values()
     assert cut.accepted == count and cut.refused == {}
     assert cut.cut_examples["options"] == cut.cut_rows["options"] == count
@@ -432,14 +439,21 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
 @pytest.mark.parametrize("count", [77, 151])
 def test_a_runs_readout_holds_the_labels_its_datas_questions_ask(backbone, count):
     """A fresh lettered run whose data states its question's options holds as many labels as they are,
-    one more where its objective adds "none of the above", and reports the count and its origin."""
+    one more where its objective adds "none of the above" to them (a floor of options at most theirs),
+    and reports the count and its origin."""
     objective, _, summary = _run(backbone, count, stated=True).prepare().train("x")
     assert summary["capacities"]["labels"] == {"count": count, "from": "data"}
     assert len(objective.model.head.label_ids) == count
-    noted = dataclasses.replace(_run(backbone, count, stated=True), objective=dataclasses.replace(
-        DecisionRunConfig().objective, fields={"none_of_the_above": 0.25}))
-    _, _, augmented = noted.prepare().train("x")
-    assert augmented["capacities"]["labels"] == {"count": count + 1, "from": "data"}
+    def noted(**fields):
+        held = dataclasses.replace(_run(backbone, count, stated=True), objective=dataclasses.replace(
+            DecisionRunConfig().objective, fields={"none_of_the_above": 0.25, **fields}))
+        return held.prepare().train("x")[2]["capacities"]["labels"]
+
+    assert noted() == {"count": count + 1, "from": "data"}
+    # A floor above the data's widest question draws no "none of the above", so it adds no label; one at
+    # it does (row 2937).
+    assert noted(none_of_the_above_options=count + 1) == {"count": count, "from": "data"}
+    assert noted(none_of_the_above_options=count) == {"count": count + 1, "from": "data"}
 
 
 def test_a_runs_readout_takes_every_label_where_a_split_leaves_its_options_unknown(backbone):

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import grain.python as grain
 import numpy as np
 import pytest
+from data_support import Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
@@ -765,6 +766,89 @@ def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
     assert {name for name in counts if name.startswith("data/rows/")} == {
         "data/rows/train-1", "data/rows/train-2", "data/rows/train-3"}
     assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
+
+
+class ThirdQuestionRefused:
+    """An objective's step after `Questioned` that refuses each record's third question's row."""
+
+    identity = "third-question-refused@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("third question") if int(row["question"]) == 2 else row
+
+
+def _asked(read: str, *, shuffled: bool = True) -> Dataset:
+    """12 records, ids 1 to 12, each with `id % 3 + 1` pairs of tokens, as `read` reads them: in one
+    order or each share its own, shuffled where `shuffled`."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    tokens = [np.arange(2 * (int(record) % 3 + 1), dtype=np.int32) for record in ids]
+    chain = Memory([{"id": record, "tokens": held} for record, held in zip(ids, tokens, strict=True)],
+                   shard_rows=4).named("asked")
+    if not shuffled:
+        return chain
+    return chain.shuffle(seed=3, window=12) if read == "streamed" else chain.shuffle(seed=3)
+
+
+@pytest.mark.parametrize("expansion", ["questions", "chunks"])
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read, workers, expansion):
+    """A training read bounded to its 12 records, in one order or each share its own, read alone or by
+    loading workers, through an objective's step that makes 24 rows of them, a question's each
+    (`Questioned`) or a chunk of two tokens each (`text.Chunks`), and one that refuses 4 of those
+    (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are its 12 source examples,
+    counted before the step makes rows of them, and not the rows it delivers again after; its
+    rejections are the rows refused after it (row 1944)."""
+    steps = ((Questioned(), ThirdQuestionRefused()) if expansion == "questions"
+             else (text.Chunks(2, fields=("tokens",)),))
+    data = compile(_asked(read).batch(2), objective=ObjectiveData(train=steps), read=read,
+                   loading=dataclasses.replace(READ, workers=workers), examples=12)
+    stream = data.train(DataPartition())
+    try:
+        rows = sum(len(batch["id"]) for batch in stream)
+        counts = data.statistics()
+    finally:
+        stream.close()
+    assert counts["data/rows/asked"] == 12
+    if expansion == "questions":
+        assert rows == 24 - 4 == 20
+        assert counts["data/rejected/asked/third question"] == 4
+    else:
+        assert rows == 24
+
+
+def wide_draw(metadata):
+    return WideDraw()
+
+
+def questioned(metadata):
+    return Questioned()
+
+
+@pytest.mark.parametrize("then", ["draw", "configured draw", "configured expansion"])
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples(workers, then):
+    """A memory read of the 12 records, in their order and unbounded, read alone or by loading workers,
+    whose objective makes 24 rows of them (`Questioned`), then draws (`WideDraw`, written, or configured
+    for the run, which a memory read binds between two passes that each hold the corpus) or makes rows of
+    those rows in turn (a `Questioned` configured for the run), and refuses rows of the third question
+    (`ThirdQuestionRefused`): it makes the rows as it holds the corpus, before the reader opens, which
+    reads them on, and the corpus's rows (data/rows) are its 12 source examples, as many as it held,
+    however many rows the reader has read (row 1944)."""
+    step = {"draw": WideDraw(), "configured draw": Configured(wide_draw, needs=(), scope="run", random=True),
+            "configured expansion": Configured(questioned, needs=(), scope="run", expands=True)}[then]
+    data = compile(_asked("memory", shuffled=False).batch(2), read="memory",
+                   loading=dataclasses.replace(READ, workers=workers),
+                   objective=ObjectiveData(train=(Questioned(), step, ThirdQuestionRefused())))
+    stream = data.train(DataPartition())
+    try:
+        for read in (3, 12):
+            for _ in range(read):
+                next(stream)
+            assert data.statistics()["data/rows/asked"] == 12
+    finally:
+        stream.close()
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
