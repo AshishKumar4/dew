@@ -1,6 +1,6 @@
 """Float-range and nested-derivative contracts of the recurrences' seams: the chunked delta rule, its ports
-and template, the decode step, the SSD port and the TPU scan, the short convolution (ledger 2641; the
-harness is tests/contract_support.py)."""
+and template, the decode step, the SSD port and the TPU scan, the short convolution, and the chunk forms
+`dew.algebra.scan` derives (ledger 2641; the harness is tests/contract_support.py)."""
 
 import functools
 import itertools
@@ -10,9 +10,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
+from dew.algebra import scan
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates import mosaic_sm90
 from dew.nn.kernels.templates.recurrence import mainloop, selective
@@ -390,3 +391,59 @@ def test_the_short_conv_holds_every_order(edge):
 
     assert_contract(kernel, primals, direction, cotangent, f"the short conv {edge}", truth_fn=plain,
                     plain_fn=plain)
+
+
+def _gated(h, q, k, v, g, beta):
+    """The delta rule decayed per key, each key's old value corrected toward the new one: `g` a scalar (the
+    gated delta rule) or a vector of the keys' own (Kimi's delta attention)."""
+    del q
+    decayed = jnp.exp(g)[..., None] * h if g.ndim else jnp.exp(g) * h
+    return decayed + beta * jnp.outer(k, v - k @ decayed)
+
+
+def _read(h, q, k, v, g, beta):
+    del k, v, g, beta
+    return q @ h
+
+
+@pytest.mark.parametrize("per_key", [False, True], ids=["gated_delta", "kimi_delta"])
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
+    """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
+    key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
+    derivatives (the decays' range sums, `_decays_of`; the corrected inputs' substitution, `_substituted`):
+    the primal, the reverse derivative and reverse over reverse finite wherever float64 is a normal float32
+    and the token-by-token scan's are, at queries, keys and values whose products near float32's ends.
+    Forward mode does not run: both are custom VJPs (`FORWARD_ORDERS`)."""
+    tokens, chunk, keys_, values = 24, 8, 4, 6
+    draws = jax.random.split(jax.random.key(3311 + per_key), 7)
+    scale = EDGES[edge]
+    q, k, v = (jax.random.normal(d, (tokens, n)) * scale for d, n in zip(draws[:3], (keys_, keys_, values),
+                                                                         strict=True))
+    g = -jax.nn.softplus(jax.random.normal(draws[3], (tokens, keys_) if per_key else (tokens,)))
+    beta = jax.nn.sigmoid(jax.random.normal(draws[4], (tokens,)))
+    axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
+            "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
+    forms = scan.derive_scan(scan.Scan(_gated, _read, axes, walked="time",
+                                       state=((keys_, values), jnp.float32)))
+
+    def derived(q, k, v, g, beta):
+        values_ = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+        state, outputs = forms.init({}), []
+        for index in range(tokens // chunk):
+            part = {name: value[index * chunk:(index + 1) * chunk] for name, value in values_.items()}
+            outputs.append(forms.mapped(part, state))
+            state = forms.step(state, part)
+        return jnp.concatenate(outputs)
+
+    def tokenwise(q, k, v, g, beta):
+        def one(h, token):
+            h = _gated(h, *token)
+            return h, _read(h, *token)
+        return jax.lax.scan(one, jnp.zeros((keys_, values), q.dtype), (q, k, v, g, beta))[1]
+
+    primals = (q, k, v, g, beta)
+    direction = tuple(jax.random.normal(draws[5], x.shape) for x in primals)
+    cotangent = jax.random.normal(draws[6], (tokens, values))
+    assert_contract(derived, primals, direction, cotangent, f"the derived delta rule {edge}",
+                    truth_fn=tokenwise, plain_fn=tokenwise, without=FORWARD_ORDERS)
