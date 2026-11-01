@@ -962,7 +962,13 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
     # back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the remainder each
     # part after the first is formed from (`product.formed`): without it the model stated 232 registers
     # where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (3 + (group > 1) + (grads.parts > 1))
+    # Where products read registers, a [C, C] tile more a key block and a value block past two: an A100's
+    # need was 224 registers at keys and values 128 wide, and it spilled 184, 256 and 280 bytes a thread at
+    # keys 128 and values 256, keys 256 and values 128, both 256 (wide-kv at e1f928585, 8 heads), where
+    # the model stated 216 at each.
+    widened = (max(0, width // call.block - 2) + max(0, value_width // call.block - 2)
+               if call.family.operands_in_registers else 0)
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (3 + (group > 1) + (grads.parts > 1) + widened)
                                + _held(grads, CHUNK, CHUNK)
                                + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
