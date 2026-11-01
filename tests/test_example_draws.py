@@ -184,7 +184,10 @@ def few_step(kind, **fields):
 def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
     """MeanFlow's intervals and dropped conditions and a shortcut model's level grid, times and dropped
     conditions are each example's by its place among the update's examples: an update read as two
-    halves gives every example the draws and the role its whole batch gives it, to the bit."""
+    halves, drawing what its whole batch drew (the whole's tape of its draws), gives every example the
+    role its whole batch gives it, to the bit. The draws themselves are each example's own on any layout
+    by their bits, and their floats by check 1 (`test_each_example_draws_its_own_bits_under_any_key_
+    implementation`): a half's program may round a lane of a float draw otherwise (ledger 1364)."""
     objective = few_step(kind)
     params = objective.init(jax.random.PRNGKey(0))
     leaves, tree = jax.tree.flatten(params["params"])
@@ -196,21 +199,23 @@ def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
     batch = {"image": np.asarray(images, np.uint8),
              **objective.inputs.tokenize([str(row) for row in range(rows)])}
 
-    def recorded(*parts: slice) -> dict[str, np.ndarray]:
+    def recorded(*parts: slice, tape=None) -> tuple[dict[str, np.ndarray], dict[str, str]]:
         recorder = Recorder()
         for part in parts:
             step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
                         example_index=jnp.asarray(np.arange(rows)[part], jnp.int32), example_count=rows,
-                        recorder=recorder)
+                        recorder=recorder, tape=tape)
             objective.loss(params, jax.tree.map(lambda value, part=part: value[part], batch), step)
-        return recorder.tape(rows)
+        return recorder.tape(rows), recorder.kinds
 
-    whole, halves = recorded(slice(0, rows)), recorded(slice(0, rows // 2), slice(rows // 2, rows))
+    whole, kinds = recorded(slice(0, rows))
+    drawn = {name: value for name, value in whole.items() if kinds[name] == "sample"}
+    halves, _ = recorded(slice(0, rows // 2), slice(rows // 2, rows), tape=drawn)
     roles = {"meanflow": {"interval end", "interval start", "dropped conditions"},
              "shortcut": {"level grid", "data times", "dropped conditions"}}[kind]
     assert roles <= set(whole) and set(halves) == set(whole)
-    for name, value in whole.items():
-        np.testing.assert_array_equal(halves[name], value, err_msg=name)
+    for name in roles:
+        np.testing.assert_array_equal(halves[name], whole[name], err_msg=name)
 
 
 HALVES_ROWS, HALVES_SEEDS = 32, 128
