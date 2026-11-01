@@ -12,7 +12,7 @@ from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import Closeable, DataPartition, Loading
-from dew.data.pipeline import ObjectiveData, Pack, Pipeline, Rejected
+from dew.data.pipeline import Configured, ObjectiveData, Pack, Pipeline, Rejected
 
 BATCH = 8
 
@@ -273,6 +273,27 @@ class Cut:
     def flat_map(self, element):
         return tuple({"id": element["id"], "question": np.int32(question), "_dew_truncated": True,
                       "_dew_cut": {"options": (1, 2)}} for question in range(int(element["id"]) % 3 + 1))
+
+
+def cut(metadata):
+    return Cut()
+
+
+@pytest.mark.parametrize("bounded", [True, False])
+def test_a_memory_read_states_the_share_of_its_rows_cut_short_however_often_it_holds_them(bounded):
+    """Twelve examples a memory read makes 1 to 3 rows of each as it holds them, every row cut short, by an
+    objective's step configured for the run, which a memory read binds between two passes that each hold
+    the corpus: the share of its rows cut short (data/truncated) is 1.0, of the rows the last pass holds,
+    and the tokens its cuts removed are its 24 rows' two each (row 1890's review)."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}))
+    loader = compile((chain if bounded else chain.repeat(1)).batch(BATCH), read="memory",
+                     objective=ObjectiveData(train=(Configured(cut, needs=(), scope="run", expands=True),)),
+                     examples=12 if bounded else None)
+    read_whole(loader, "question")
+    assert counted(loader) == [12]
+    assert counted(loader, "data/truncated/") == [1.0]
+    assert counted(loader, "data/cut_removed/") == [2 * 24]
 
 
 @pytest.mark.parametrize("bounded", [True, False])
