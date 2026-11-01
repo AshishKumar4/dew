@@ -10,7 +10,8 @@ test('the architecture page shows each of its figures inline, so each follows th
 		.map(([, alt, name]) => ({ alt, name }));
 	assert.deepEqual(figures.map((figure) => figure.name),
 		['architecture-flow', 'architecture-pass', 'architecture-template', 'architecture-derived', 'architecture-cost']);
-	const page = read('dist/reference/architecture/index.html');
+	// Astro writes an apostrophe in an attribute as a character reference.
+	const page = read('dist/reference/architecture/index.html').replace(/&#x27;|&#39;/g, "'");
 	for (const { alt, name } of figures) {
 		// The page's figure is the asset's markup under the alt text, which says what it shows there (scripts/lib.mjs).
 		const label = alt.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
