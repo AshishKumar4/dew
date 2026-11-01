@@ -147,8 +147,9 @@ print(json.dumps("dew.training.trainer" in sys.modules))
 IMAGE_GENERATION = ("dew.data.images", "dew.data.audio", "dew.data.video", "dew.diffusion.presets",
                     "dew.nn.vision", "dew.nn.autoencoders", "dew.objectives.diffusion",
                     "dew.inference.images",
-                    *(f"dew.nn.backbones.{name}" for name in ("dit", "edm2", "flux", "flux2", "mmdit",
-                                                              "qwen_image", "sd3", "ssm_dit", "unet")))
+                    *(f"dew.nn.backbones.{name}" for name in (
+                        "dit", "edm2", "flux", "flux2", "mmdit", "qwen_image", "sd3", "ssm_dit", "unet",
+                        "unet3d", "unet_condition", "uvit", "video_dit", "wan", "z_image")))
 """Image generation's and media's modules: shared diffusion math (`dew.diffusion.process`, its schedules)
 and text encoders are any domain's."""
 
@@ -224,9 +225,9 @@ def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():
 @pytest.mark.parametrize(("package", "read"), [("dew.sampling", "text.Sampling"),
                                                ("dew.nn.backbones", "dit.SimpleDiT"),
                                                ("dew.data", "images.DecodeImage"),
-                                               ("dew.data", "presets.SFT"),
+                                               ("dew.data", "presets.sft"),
                                                ("dew.diffusion", "presets.EDM"),
-                                               ("dew.diffusion", "discrete.MaskedDiffusion")])
+                                               ("dew.diffusion", "discrete.DiscreteProcess")])
 def test_a_lazy_packages_modules_read_through_it_as_an_eager_packages_did(package, read):
     """A lazily exporting package (`dew._exports`) reads each of its modules that defines an export as
     its attribute, in a fresh interpreter that imported the package alone, as its eager imports bound

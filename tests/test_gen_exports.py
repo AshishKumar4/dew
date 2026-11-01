@@ -105,3 +105,23 @@ def test_an_export_moved_to_another_module_is_read_from_there(tmp_path):
     assert generate(root) == 0
     assert consumed(root, "runtime")["area"] == 3.0
     assert consumed(root, "static")["bound"]["area"]
+
+
+def test_a_package_exporting_its_own_module_binds_it_from_a_relative_path(tmp_path):
+    """A package that exports its own module of a name (`"measures": "sparx.measures"`), rewritten from a path
+    relative to where the tool runs, imports the module itself where a type checker reads it, and lists it
+    for a star import."""
+    root = tree(tmp_path)
+    package = root / "sparx" / "__init__.py"
+    package.write_text(package.read_text().replace('"area": "sparx.measures"',
+                                                   '"area": "sparx.measures", "measures": "sparx.measures"'))
+    done = subprocess.run([sys.executable, str(TOOL), "sparx"], cwd=root, capture_output=True, text=True,
+                          timeout=120)
+    assert done.returncode == 0, done.stderr
+    script = ("import importlib, sys, typing\ntyping.TYPE_CHECKING = True\nimport sparx\n"
+              "print(sparx.measures is importlib.import_module('sparx.measures'),\n"
+              "      'measures' in sparx.__all__)\n")
+    read = subprocess.run([sys.executable, "-c", script], cwd=root, env={"PYTHONPATH": str(root)},
+                          capture_output=True, text=True, check=True)
+    assert read.stdout.split() == ["True", "True"]
+
