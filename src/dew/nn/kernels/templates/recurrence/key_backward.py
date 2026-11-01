@@ -191,8 +191,10 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, v, memory, dh, a, beta, ta
 
             return (d_system, d_betas), accumulators
 
+        # The carries laid out as their sums are: splats, Mosaic GPU's layout inference ran out of its
+        # search's fuel (kda-lower4-sm90 at 739b21575).
         _walk(streams, views, step, call, steps=steps,
-              carry=(jnp.zeros((CHUNK, CHUNK), jnp.float32), jnp.zeros((CHUNK,), jnp.float32)))
+              carry=(family.as_tile(family.zeros((CHUNK, CHUNK))), family.as_row(family.zeros((CHUNK,)))))
 
     tiles = _streamed(out=((CHUNK, value_width), given), corrected=((CHUNK, value_width), held),
                       value_grads=((CHUNK, value_width), grads), values=((CHUNK, value_width), given),
@@ -301,7 +303,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
 
             return d_betas, accumulators
 
-        _walk(streams, views, step, call, steps=steps, carry=jnp.zeros((CHUNK,), jnp.float32))
+        _walk(streams, views, step, call, steps=steps, carry=family.as_row(family.zeros((CHUNK,))))
 
     tiles = _streamed(scores=((CHUNK, CHUNK), square), system=((CHUNK, CHUNK), square),
                       queries=((CHUNK, keys), given), keys=((CHUNK, keys), given),

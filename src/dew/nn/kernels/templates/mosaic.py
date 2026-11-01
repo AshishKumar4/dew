@@ -1044,6 +1044,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """`vector` `[rows]` in a row's layout, whatever its own."""
         return plgpu.layout_cast(vector, self.row)
 
+    def as_tile(self, value: jax.Array) -> jax.Array:
+        """`value` `[rows, columns]` in the accumulator's layout, whatever its own."""
+        return plgpu.layout_cast(value, self.layout)
+
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     """A family whose loads a producer warpgroup issues by TMA into `Ring`s, beside one or two consumer
