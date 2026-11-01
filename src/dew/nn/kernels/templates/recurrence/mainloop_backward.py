@@ -60,30 +60,32 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
             floor: float | None = None, target: generation.GpuTarget | None = None,
-            rounded: bool = False, wide: bool = False, ranged: bool = False) -> tuple[Launch, ...]:
+            rounded: bool = False, wide: bool = False, ranged: bool = False, skip=None) -> tuple[Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
     `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
     planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
     (`_kernel`); with `backward`, the fast backward's too (`gradients`). A `wide` call's output lands in
     fp32 (`forward`'s): planned in the operands' dtype, the SSD's output launch asked 16 KB past its plan
-    (204800 bytes against 188544 on an H100's compile, the resource gate's)."""
+    (204800 bytes against 188544 on an H100's compile, the resource gate's). A `skip` (`[HV]`, its shape)
+    fused into the output and reverse walk is planned with them: its reverse walk holds a tile more."""
     found: list[Launch] = []
 
-    def run(q, k, v, g, beta, h0, starts):
+    def run(q, k, v, g, beta, h0, starts, skip):
         token = _PLANNED.set(found)
         try:
             out, final, (inverse, kept) = kept_forward(q, k, v, g, beta, h0, tiles=tiles, starts=starts,
                                                        max_segments=max_segments, delta=delta, family=family,
-                                                       floor=floor, rounded=rounded, wide=wide, ranged=ranged)
+                                                       floor=floor, rounded=rounded, wide=wide, ranged=ranged,
+                                                       skip=skip)
             if backward:
                 gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                           max_segments=max_segments, family=family, inverse=inverse, kept=kept, delta=delta,
-                          floor=floor, rounded=rounded, ranged=ranged)
+                          floor=floor, rounded=rounded, ranged=ranged, skip=skip)
         finally:
             _PLANNED.reset(token)
 
     with contextlib.nullcontext() if target is None else generation.assumed(target):
-        jax.eval_shape(run, q, k, v, g, beta, h0, starts)
+        jax.eval_shape(run, q, k, v, g, beta, h0, starts, skip)
     return tuple(found)
 
 
@@ -115,18 +117,19 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family,
                    target: generation.GpuTarget, starts=None, max_segments: int | None = None,
                    delta: bool = True, floor: float | None = None, rounded: bool = False,
-                   ranged: bool = False) -> bool:
+                   ranged: bool = False, skip=None) -> bool:
     """Whether the fast backward's launches (`gradients`'s, past the forward's) hold on `family`'s bundle at
     `tiles` on `target`, planned there and within its block's shared memory (`holds`); where they do not, the
     rule's gradient is the portable math's. Planned on the device's own target off a GPU, an interpreted
     call's states launch held no program at the interpreted target's shared budget (`Launch.resident`)."""
     shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (q, k, v, g, beta, h0,
-                                                                                    starts)]
-    *operands, starts = shapes
+                                                                                    starts, skip)]
+    *operands, starts, skip = shapes
     forward = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                      delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target)
+                      delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target, skip=skip)
     both = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target)
+                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target,
+                   skip=skip)
     return holds(both[len(forward):], family, generation.shared_budget(target))
 
 
@@ -631,12 +634,13 @@ def _query_key_views(call: _Call, keyed: tuple, served: tuple, memory: tuple, *,
 
 
 def _query_key_split(call: _Call) -> int:
-    """`_query_key`'s value columns a program takes of each value head: all of them, halved while its
-    streams (each step's values, output gradient and corrected values' gradient `[C, vq]`, its memories
-    `[block, vq]`, the queries', keys' and scores' gradient's blocks) are past the block's shared memory
-    (`generation.shared_budget`), whole blocks (`_Call.block`) at least: an fp32 call's two parts at
-    Qwen3.5-27B's widths took 237824 bytes and a 256-wide value row's 215040 on an A100, past its 166912
-    (fp32-plan-sm90 at cdcd620ef, wide-backward)."""
+    """`_query_key`'s value columns a program takes of each value head: the widest whole number of blocks
+    (`_Call.block`) dividing the value width whose streams (each step's values, output gradient and
+    corrected values' gradient `[C, vq]`, its memories `[block, vq]`, the queries', keys' and scores'
+    gradient's blocks) fit the block's shared memory (`generation.shared_budget`), a block where none does:
+    an fp32 call's two parts at Qwen3.5-27B's widths took 237824 bytes and a 256-wide value row's 215040 on
+    an A100, past its 166912 (fp32-plan-sm90 at cdcd620ef, wide-backward). Halved instead, 192 columns took
+    96, a block and a half, and the split's programs read no column past their first block's."""
     held, memories, given = call.held, call.memories, call.given
 
     def streamed(vq: int) -> int:
@@ -647,10 +651,9 @@ def _query_key_split(call: _Call) -> int:
         return landed + sum(rows * columns * jnp.dtype(operand.stored).itemsize * operand.parts
                             for operand, rows, columns in operands)
 
-    vq, budget = call.value_width, generation.shared_budget(call.target)
-    while vq > call.block and streamed(vq) > budget:
-        vq //= 2
-    return vq
+    budget = generation.shared_budget(call.target)
+    widths = [vq for vq in range(call.value_width, 0, -call.block) if call.value_width % vq == 0]
+    return next((vq for vq in widths if streamed(vq) <= budget), call.block)
 
 
 def _gradient_stored(call: _Call, kind: str, block: int, grad, *, weights: Sequence, sums: dict, first,
