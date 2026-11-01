@@ -170,7 +170,9 @@ def in_view(gates: np.ndarray, airframe: np.ndarray) -> np.ndarray:
     """Whether the next gate's centre lies in the camera's field of view, from the `gates` view (its corners
     in the body frame) and the `airframe` view (the camera's uptilt and field of view, its 5th and 6th): in
     front of the camera, its angles across and up from the camera's axis (the body's forward pitched up by
-    the uptilt) within half the field of view."""
+    the uptilt) within half the field of view, a square image's. The mount's roll and yaw, which no view
+    shows, are left out: drawn within `Racing.mount_spread` (5 degrees), they move the field's edges by at
+    most that."""
     center = np.asarray(gates, np.float64)[..., :12].reshape(*np.shape(gates)[:-1], 4, 3).mean(-2)
     uptilt, fov = np.asarray(airframe, np.float64)[..., 4], np.asarray(airframe, np.float64)[..., 5]
     depth = center[..., 0] * np.cos(uptilt) + center[..., 2] * np.sin(uptilt)
