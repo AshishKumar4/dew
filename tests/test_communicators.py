@@ -5,6 +5,7 @@ Dew left them refused before it runs, never left to stall in a collective. The m
 GPUs, which a two-GPU run of the check makes; here it is the child's report, as the parent reads it."""
 
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -23,8 +24,15 @@ from dew.devices import POOL_NAMES, pool_bound
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30
 
-NEEDS = Needs(collective={2: GIB}, exchanged={2: GIB // 4}, permuted={2: (GIB, GIB // 2, GIB // 2)},
-              runtime={0: GIB // 2, 1: GIB // 2}, seconds=4.0)
+def connected(gpus: int, send: int, receive: int) -> dict[tuple[int, int], dict[int, int]]:
+    """Each directed pair of `gpus` GPUs connected by `send` bytes on its source and `receive` on its
+    target, as NCCL's direct peer transports allocate."""
+    return {(source, target): {source: send, target: receive}
+            for source, target in itertools.permutations(range(gpus), 2)}
+
+
+NEEDS = Needs(collective={2: GIB}, exchanged={2: GIB // 4}, permuted={2: GIB},
+              connections=connected(2, GIB // 2, GIB // 2), runtime={0: GIB // 2, 1: GIB // 2}, seconds=4.0)
 """Two GPUs' measurement: a collective's communicator over both takes 1 GiB on each, an all-to-all's
 connections to its peer a quarter more, a permute's communicator 1 GiB on each member and half a GiB for
 each send and each receive, the runtime half."""
@@ -37,8 +45,9 @@ all-to-all's connections to every peer, and a permute along every pair."""
 MEMORY = {0: (79 * GIB, 80 * GIB), 1: (76 * GIB, 80 * GIB)}
 """Each GPU's free and total bytes before the backend opens: 79 and 76 of 80 GiB free."""
 
-FOUR = Needs(collective={2: GIB, 4: 2 * GIB}, exchanged={2: GIB // 4, 4: GIB // 2},
-             permuted={4: (GIB, GIB // 4, GIB // 8)}, runtime=dict.fromkeys(range(4), GIB // 2), seconds=8.0)
+FOUR = Needs(collective={2: GIB, 4: 2 * GIB}, exchanged={2: GIB // 4, 4: GIB // 2}, permuted={4: GIB},
+             connections=connected(4, GIB // 4, GIB // 8), runtime=dict.fromkeys(range(4), GIB // 2),
+             seconds=8.0)
 """Four GPUs' measurement: a collective's communicator over two of them 1 GiB on each, over all four 2 GiB;
 a permute's over four 1 GiB on each member, a quarter for each send and an eighth for each receive."""
 
@@ -193,7 +202,7 @@ summed = jax.shard_map(lambda part: jax.lax.psum(part, "pair"), mesh=mesh, in_sp
                        out_specs=PartitionSpec())
 ids = [communicators.ordinal(device) for device in mesh.devices.flat]
 options.program(summed).compiled(jnp.ones(4))
-tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, runtime=dict.fromkeys(ids, 0), seconds=1.0)
+tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, connections={}, runtime=dict.fromkeys(ids, 0), seconds=1.0)
 communicators.hold(Sizing(tight, 0.95, 0.9, dict.fromkeys(ids, 2**30), dict.fromkeys(ids, 2**29)))
 try:
     options.program(summed).compiled(jnp.ones(4))
@@ -275,18 +284,27 @@ def test_a_measurement_kept_in_an_earlier_form_is_measured_afresh(tmp_path, monk
     assert taken == [configuration]
 
 
-def test_a_permutes_costs_are_the_most_any_pair_of_its_clique_took():
+def test_a_permutes_connections_are_charged_to_every_gpu_that_holds_their_buffers():
     """A permute's communicator is measured connecting every directed pair of its clique in turn, the first
-    making the communicator, as NCCL picks each peer's transport apart (GPU buffers for one over NVLink or
-    PCIe peer access, host memory for one through shared memory): its send and receive costs are the most
-    any pair's source and target gave, so a clique whose first pair connects cheaply is charged for its
-    dearest, and its base is what the first run took beside its pair's own connections."""
+    making the communicator, as NCCL picks each peer's transport apart: GPU buffers on a pair over NVLink or
+    PCIe peer access, host memory for one through shared memory, and a third GPU's buffers for one it
+    routes through that GPU (`P2P_INTERMEDIATE`). Each later pair keeps the bytes every GPU gave as it
+    connected, so one routed through GPU 2 is charged there, as often as such pairs are made; the base is
+    the most a GPU gave as the first pair made the communicator, which holds that pair's own connection."""
     mib = 2**20
-    runs = [(0, 1, {0: 64 * mib + mib, 1: 64 * mib + mib, 2: 64 * mib, 3: 64 * mib}),
-            (1, 0, {0: mib, 1: mib, 2: 0, 3: 0}),
+    runs = [(0, 1, {0: 65 * mib, 1: 65 * mib, 2: 64 * mib, 3: 64 * mib}),
+            (1, 0, {0: 0, 1: 0, 2: 8 * mib, 3: 0}),
             (2, 3, {0: 0, 1: 0, 2: 40 * mib, 3: 24 * mib}),
-            (3, 2, {0: 0, 1: 0, 2: 24 * mib, 3: 40 * mib})]
-    assert communicators.peer_costs(runs) == (64 * mib, 40 * mib, 24 * mib)
+            (0, 3, {0: mib, 1: 0, 2: 8 * mib, 3: mib})]
+    base, connections = communicators.peer_costs(runs)
+    assert base == 65 * mib
+    assert connections == {(1, 0): {2: 8 * mib}, (2, 3): {2: 40 * mib, 3: 24 * mib},
+                           (0, 3): {0: mib, 2: 8 * mib, 3: mib}}
+    needs = Needs(collective={}, exchanged={}, permuted={4: base}, connections=connections,
+                  runtime={}, seconds=1.0)
+    routed = Collectives(permutes={(0, 1, 2, 3): frozenset({(1, 0), (0, 3)})})
+    assert needs.needed(routed, range(4), runtime=False) == {0: 65 * mib + mib, 1: 65 * mib,
+                                                            2: 65 * mib + 16 * mib, 3: 65 * mib + mib}
 
 
 def test_a_hosts_gpus_are_counted_by_its_cuda_driver_without_nvidia_smi(tmp_path):
