@@ -13,6 +13,8 @@ import programs from '../data/programs.json';
 import cells from '../../snippets/cells.json';
 import { colabUrl } from '../../scripts/colab-notebooks.mjs';
 import tutorials from '../generated/tutorial-cards.json';
+import posts from '../generated/posts.json';
+import { latest, shown } from '../latest.mjs';
 import { live } from '../live.mjs';
 import '../styles/landing.css';
 
@@ -45,6 +47,8 @@ const moe = JSON.parse(readPublic('examples', 'moe-mesh', 'moe-mesh.json'));
 const lora = JSON.parse(readPublic('examples', 'sd15-lora', 'manifest.json'));
 const videos = Object.values(JSON.parse(readPublic('gallery', 'wan-2.1', 'manifest.json')).clips) as { video: string; poster: string; prompt: string }[];
 const gallery = JSON.parse(readPublic('gallery', 'dew-176m', 'manifest.json'));
+// The newest tutorials and posts, from their own sources (src/latest.mjs): what a reader who came back looks for.
+const newest = latest(tutorials, posts, 4);
 const tries = [
 	...(live.endpoint && live.turnstileSitekey ? [{ name: 'Live sampler', what: 'Edit the cell and run it on a CPU kernel.', href: '/sample/' }] : []),
 	{ name: 'Colab notebook', what: 'Load the model and sample it on a GPU.', href: 'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb' },
@@ -66,6 +70,14 @@ const rewardPoints = reward.map((row) => `${40 + (row.step - 1) / Math.max(1, re
 				<img src={`/gallery/dew-176m/${image.file}`} width="256" height="256" alt={image.prompt} loading="lazy" decoding="async" />
 				<figcaption>{image.prompt}</figcaption>
 			</figure>)}</div>
+		</section>
+		<section class="band latest" data-reveal>
+			<h2 class="band-title">Latest tutorials and posts</h2>
+			<ol class="latest-list">{newest.map((entry) => <li><a class="latest-link" href={`/${entry.slug}/`}>
+				<span class="latest-meta"><span>{entry.kind}</span>{entry.published && <time datetime={entry.published}>{shown(entry.published)}</time>}</span>
+				<span class="latest-title">{entry.title}</span>
+				<span class="latest-text">{entry.description}</span>
+			</a></li>)}</ol>
 		</section>
 		<section class="band landing-videos" data-reveal>
 			<h2 class="band-title">Video</h2>

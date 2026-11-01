@@ -86,6 +86,10 @@ export const groups = [
 		generated: 'tutorials',
 	},
 	{
+		items: [{ source: 'docs/posts.md', slug: 'posts', label: 'Overview' }],
+		generated: 'posts',
+	},
+	{
 		items: [
 			{ source: 'docs/examples.md', slug: 'examples', label: 'Example scripts' },
 			{ source: 'docs/guides/end-to-end.md', slug: 'examples/end-to-end', label: 'End-to-end runs' },

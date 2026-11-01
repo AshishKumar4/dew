@@ -526,6 +526,56 @@ header.header {
 	overflow: hidden;
 }
 
+/* The posts overview: newest first, each its date over its title and line. */
+
+.post-list {
+	display: grid;
+	gap: 0.75rem;
+	margin: 2rem 0 0;
+	padding: 0;
+	list-style: none;
+}
+
+.post-list li {
+	margin: 0;
+}
+
+.post-link {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3rem;
+	padding: 0.9rem 1rem;
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.75rem;
+	background: var(--dew-surface);
+	color: inherit;
+	text-decoration: none;
+	transition: border-color 120ms ease;
+}
+
+.post-link:hover {
+	border-color: color-mix(in srgb, var(--dew-accent-fill) 55%, var(--dew-rule));
+}
+
+.post-link time {
+	font: 600 0.7rem var(--__sl-font-mono);
+	letter-spacing: 0.05em;
+	color: var(--dew-muted);
+}
+
+.post-title {
+	font-weight: 620;
+	font-size: 1rem;
+	line-height: 1.35;
+	color: var(--sl-color-white);
+}
+
+.post-text {
+	font-size: 0.85rem;
+	line-height: 1.5;
+	color: var(--sl-color-gray-3);
+}
+
 /* API reference pages. */
 
 .api-meta {
