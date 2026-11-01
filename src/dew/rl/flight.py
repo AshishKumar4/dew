@@ -510,9 +510,15 @@ def commanded(racing: Racing, race: Race, action: jax.Array) -> tuple[Race, jax.
     full = racing.quadrotor.nominal_thrust
     collective = hover + action[0] * jnp.where(action[0] >= 0, full - hover, hover)
     command = jnp.concatenate([collective[None], action[1:] * race.rate_limit])
-    pending = jnp.concatenate([command[None], race.pending[:-1]])
-    sent = pending[race.delay]
+    pending, sent = delayed(race.pending, race.delay, command)
     return dataclasses.replace(race, pending=pending), sent[0], sent[1:]
+
+
+def delayed(pending: jax.Array, delay: jax.Array, command: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A command sent after `delay` control steps: the commands `pending` `[D + 1, ...]`, newest first, with
+    `command` pushed, and the one `delay` steps old, which the flight controller takes now."""
+    pending = jnp.concatenate([command[None], pending[:-1]])
+    return pending, pending[delay]
 
 
 def bars(racing: Racing) -> np.ndarray:
@@ -981,6 +987,6 @@ def _scene(racing: Racing, race: Race) -> Scene:
 
 __all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER", "VIEWS",
            "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene", "Seen",
-           "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
-           "drawn_course", "facings", "gate_axes", "looking", "mounted", "nearest", "physics", "privileged",
-           "quaternion", "raced", "shown", "started", "struck"]
+           "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "delayed", "developed",
+           "drawn_camera", "drawn_course", "facings", "gate_axes", "looking", "mounted", "nearest", "physics",
+           "privileged", "quaternion", "raced", "shown", "started", "struck"]
