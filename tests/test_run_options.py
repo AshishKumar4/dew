@@ -237,7 +237,7 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
     witnessed = witness(0, len(units)) if pooled is None else [unit for _, _, payload in pooled
                                                               for unit in payload]
     held = {option for *_, holding in witnessed for option in holding}
-    assigned = {option for _, option in units}
+    assigned = {option for _, option, _ in units}
     assert held <= assigned, f"DecideSettings' options no run here is assigned: {sorted(held - assigned)}"
     assert_every_option_witnessed(DecideSettings, [(names, failures, exports)
                                                    for names, failures, exports, _ in witnessed])
