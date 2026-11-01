@@ -148,14 +148,15 @@ FOREIGN = {
     "dew.config": ("dew.data.images", "dew.data.audio", "dew.data.video"),
     "dew.config.lm": ("dew.data.images", "dew.data.audio", "dew.data.video", "dew.diffusion.presets",
                       "dew.nn.vision", "dew.nn.autoencoders", "dew.objectives.diffusion"),
-    "dew.config.diffusion": ("dew.nn.backbones.causal_transformer", "dew.nn.moe", "dew.nn.mla",
-                             "dew.objectives.lm", "dew.data.chat"),
+    "dew.config.diffusion": ("dew.nn.backbones.causal_transformer", "dew.nn.mla", "dew.objectives.lm",
+                             "dew.data.chat"),
     "dew.decision.config": ("dew.data.images", "dew.data.video", "dew.diffusion.presets",
                             "dew.nn.autoencoders", "dew.inference.images"),
 }
 """Each run configuration's module and the modules outside its domain it must not import: an LM's no image
 diffusion, vision tower, autoencoder or media data; a diffusion model's no decoder language model or chat
-data; a decision task's no image generation or autoencoder (row 2042)."""
+data, its text encoders' decoder blocks its own; a decision task's no image generation or autoencoder
+(row 2042)."""
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
