@@ -24,6 +24,7 @@ from reference_error import (
     assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
     chain_roundings,
+    equations,
     indexed_recording,
     recording,
     seeds_for,
@@ -409,14 +410,15 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
 def test_a_step_computes_in_the_widest_of_its_operands():
     """nGPT's residual step runs in at least fp32 of its residual, its branch and its rate: a float32
     residual stepped toward a float64 branch by a float64 rate, or by a float64 rate alone, takes its
-    rate and its difference in float64 and rounds once to the residual's float32."""
+    rate and its difference in float64, inside its two-pass reverse's rule as well, and rounds once to the
+    residual's float32."""
     with jax.enable_x64(new_val=True):
         residual = jnp.ones((2, 4), jnp.float32)
         for branch, alpha in ((jnp.ones((2, 4), jnp.float64), jnp.ones(4, jnp.float64)),
                               (jnp.ones((2, 4), jnp.float32), jnp.ones(4, jnp.float64))):
             traced = jax.make_jaxpr(lambda residual, branch, alpha: stepped(residual, branch, alpha, 0.5))(
                 residual, branch, alpha)
-            stepping = {equation.outvars[0].aval.dtype for equation in traced.jaxpr.eqns
+            stepping = {equation.outvars[0].aval.dtype for equation in equations(traced)
                         if equation.primitive.name in ("abs", "sub")}
             assert stepping == {np.dtype(np.float64)}
             assert traced.out_avals[0].dtype == np.float32
