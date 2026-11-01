@@ -414,7 +414,7 @@ class _Held:
 
 def _addressed(staging: tuple, landing: dict) -> list:
     """The shared tiles a launch's consumer thread reads and writes through its registers, each `(shape,
-    dtype)` a role's own (`resources.addresses`): its staging tiles and its stores' landings."""
+    dtype)` a role's own (`mosaic.addresses`): its staging tiles and its stores' landings."""
     staged = [(tile.shape, tile.dtype) for tile in jax.tree.leaves(staging, is_leaf=lambda leaf: hasattr(
         leaf, "shape"))]
     return staged + list(landing.values())

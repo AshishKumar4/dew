@@ -66,6 +66,10 @@ dependencies = [
     # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
     # typeguard==2.13.3, which tyro excludes.
     "tokamax>=0.0.15",
+    # dew.algebra: the program rewrite pass (docs/design/algebra.md) saturates
+    # an e-graph of each outer program's jaxpr with egglog's rules, on by
+    # default; 14.0.0 is the release the pass is written against.
+    "egglog==14.0.0",
 ]
 license = "MIT"
 # Third-party code Dew carries keeps its notice: each file translated or

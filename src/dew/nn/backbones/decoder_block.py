@@ -94,8 +94,9 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
         if kind == 'layer' and offset:
             return OffsetLayerNorm(epsilon=eps, use_bias=bias, dtype=dtype, name=name)
         if kind == 'layer':
-            return nn.LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
-                                dtype=dtype, name=name)
+            # Torch's exact variance, rematerialized as every Dew LayerNorm is (ledger 3010).
+            return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
+                             dtype=dtype, name=name)
         return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, dtype=dtype, name=name)
 
     return build

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import pytest
 
-from dew.inference import Engine, Scored, ScoringServer
+from dew.inference import Engine, ScoringRequest, ScoringServer
 
 
 @dataclass(frozen=True)
@@ -24,8 +24,8 @@ class Named:
     short: int = 0
     width: int = 64
 
-    def admit(self, request: str) -> Scored[str, str]:
-        return Scored(tuple(request), self.name)
+    def admit(self, request: str) -> ScoringRequest[str, str]:
+        return ScoringRequest(tuple(request), self.name)
 
     def planned(self) -> "Counted":
         return Counted(self.width)

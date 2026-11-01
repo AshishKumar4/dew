@@ -182,6 +182,10 @@ def test_a_loaded_source_takes_dex_by_the_papers_recipe():
     # A run's checkpoint keeps the extension, and reads back as a bundle of the decoder it extends.
     rebuilt = PretrainedDecoder.from_model(loaded.model, loaded.variables)
     assert rebuilt.model.dex == loaded.model.dex
+    # The bundle's declaration is the model it holds, its extension included, which the record it was
+    # loaded as states nothing of (ledger 3009).
+    assert loaded.declaration.build() == loaded.model and source.declaration.build() == source.model
+    assert loaded.model_config == source.model_config
 
 
 def exported_site(directory: Path, dtype: str):

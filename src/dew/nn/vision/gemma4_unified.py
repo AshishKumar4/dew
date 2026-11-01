@@ -12,6 +12,7 @@ from flax import linen as nn
 
 from dew import _records
 from dew.interop.weights import in_params
+from dew.nn.norms import LayerNorm
 from dew.registry import Record
 
 from .common import TowerBase, TowerGeometry, TowerLayout
@@ -31,7 +32,7 @@ class Gemma4UnifiedVision(TowerBase):
         return AxialPatchEmbedding(
             self.mm_embed_dim, self.patch_size * self.pooling_kernel_size, self.mm_posemb_size,
             use_bias=True, table_axis=1, position_validity="axis",
-            norm=functools.partial(nn.LayerNorm, epsilon=1e-5, use_fast_variance=False),
+            norm=functools.partial(LayerNorm, epsilon=1e-5, use_fast_variance=False),
             initializer=nn.initializers.zeros)
 
     def geometry(self) -> TowerGeometry:
