@@ -85,6 +85,27 @@ def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] 
     return row
 
 
+def test_the_tool_runs_as_a_reader_runs_it_with_none_of_the_suites_settings(tmp_path):
+    """The tool a test runs runs in the environment a reader's process has (`outside_suite`): none of the
+    settings the suite gives itself (its simulated devices and their threads, its matmul precision, its wide
+    CPU arithmetic) reach it or its peak processes, whose context records what each saw (row 2784)."""
+    from lane_environment import configured
+
+    suite = sorted(set(configured({})) - {"JAX_PLATFORMS"})
+    (tmp_path / "marking.py").write_text(
+        "import contextlib, json, os\n"
+        "@contextlib.contextmanager\n"
+        "def marked():\n"
+        f"    names = {suite!r}\n"
+        f"    with open({str(tmp_path / 'seen.jsonl')!r}, 'a') as file:\n"
+        "        seen = {name: os.environ[name] for name in names if name in os.environ}\n"
+        "        print(json.dumps(seen), file=file)\n"
+        "    yield\n")
+    peak_row(tmp_path, "cpu", "--within", "marking:marked")
+    seen = [json.loads(line) for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
+    assert suite and len(seen) == 3 and seen == [{}] * 3, seen
+
+
 def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context(tmp_path):
     """The tool's peak memory comes from a process of the case's own that loaded every program from a cache
     and compiled nothing (a compile there refuses the run), one high-water a device, the bytes XLA planned
