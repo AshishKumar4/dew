@@ -512,13 +512,18 @@ class Extraction:
   exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing).
   A template's instructions price through the same record. No per-operation price exists anywhere else.
 - A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts:
-  - XLA's fusion (`cost.fused`), for the compile-time pass over a program and error-aware extraction. Reductions
-    and products read their operands once from device memory, and elementwise work fuses into its consumer.
-    Each unit's work runs at the whole device's rate, in series with the memory traffic.
+  - XLA's fusion (`cost.fused`), for the compile-time pass over a program and error-aware extraction. A
+    program's operands are read from device memory once, however many reductions read them (XLA's fusion
+    reads a sibling reduction's inputs once), and elementwise work fuses into its consumer. Each unit's work
+    runs at the whole device's rate, in series with the memory traffic.
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
-    takes (`derive`, `carry.split`). A tile's work runs on its program with its units overlapped, through the
-    toolkit's `program_seconds`. Its operands are staged by the walk, so its device bytes are the launch's,
-    which the template's own `cost` states.
+    takes (`derive`, `carry.split`). A tile's work runs on its program with its units overlapped, the longest
+    unit's time. Its operands are staged by the walk, so its device bytes are the launch's.
+- Where a rewrite is one XLA makes itself (`Rules.xla`: commutativity, which its HloCSE ignores; the sums'
+  linearity, which its multi-output fusion matches), the model does not decide its profit: the pass takes it
+  only where XLA's own cost analysis of the compiled candidate is lower (`program.xla_seconds`). A pass whose
+  admitted sets are all XLA's (the accurate numerics') does not run. The e-graph decides for the algebra XLA
+  does not derive (distribution, factoring through contractions, scale folds).
 - Extraction for a template's interface prices candidates through the tile walk; the compile-time pass prices
   them through XLA's fusion. Each shared term is priced once either way.
 - The tile walk does not yet read registers (the liveness pass) or the walk's rings when pricing a candidate.

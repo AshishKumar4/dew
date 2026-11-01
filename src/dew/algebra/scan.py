@@ -40,6 +40,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.extend import core as jcore
 
@@ -72,7 +73,8 @@ class Scan:
     reads, marking each token a zero state enters (a packed document's first). `ranges` bounds operands by
     name, a magnitude (l2-normalised keys 1, a sigmoid's gate 1) or an interval (a log decay's `(-inf, 0)`),
     the range facts a reordering's new intermediates are held under (docs/design/algebra.md §6.3); an operand
-    it names none of is unbounded. Its decays (the exponentials of its update's exponents) are at most 1: its
+    it names none of is unbounded, and the state is where it names "state" (a bound on its entering value).
+    Its decays (the exponentials of its update's exponents) are at most 1: its
     exponents are at most zero, as a gated recurrence's log decays are."""
 
     update: Callable
@@ -196,7 +198,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
             avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
             splits[key] = carry.split(functools.partial(_chunk, bool(affine.corrections)), h, avals, (1,),
                                       saturation=saturation,
-                                      ranges=_ranges(declaration, names, chunk, affine, B.shape[0]))
+                                      ranges=_ranges(declaration, names, chunk, affine, B.shape[0]),
+                                      state_range=declaration.ranges.get("state"))
         return Prepared((natural, splits[key].prepare(*given)), splits[key])
 
     def step(state, prepared):
@@ -267,8 +270,12 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
                 if name in declaration.ranges}
     region = terms.region(closed, declared)
     bounded = {}
-    for index, output in enumerate(region.outputs):
-        magnitude = None if output is None else region.magnitudes.get(str(output))
+    for index, (output, literal) in enumerate(zip(region.outputs, region.literal_outputs, strict=True)):
+        if output is None:
+            # A literal output (a delta rule's unit correction scale) bounds itself.
+            bounded[DECAYS + 1 + index] = float(np.max(np.abs(np.asarray(literal, np.float64))))
+            continue
+        magnitude = region.magnitudes.get(str(output))
         if magnitude is not None and not any(magnitude.degrees):
             bounded[DECAYS + 1 + index] = 2.0 ** magnitude.log2
     # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries

@@ -164,6 +164,11 @@ class Rules:
     """Whether it runs at dev time alone, where each candidate's error is measured before it is taken
     (`dew.algebra.error.choose`): a set whose forms are chosen for their accuracy, at a cost the program pass
     would never pay."""
+    xla: bool = False
+    """Whether XLA derives the set's rewrites itself: its HloCSE ignores a commutative operation's operand
+    order, its multi-output fusion reads two sibling reductions' inputs once. A pass whose admitted sets are
+    all XLA's is skipped (`program.rewritten`); a rewrite only XLA's sets fired is taken only where XLA's own
+    cost analysis of the compiled candidate is lower (`program._windowed`)."""
 
 
 def _facts() -> Ruleset:
@@ -222,15 +227,15 @@ def _stable() -> Ruleset:
 
 
 def _linear() -> Ruleset:
-    """Linearity of sums (two sums along one axis of operands of one shape, one sum of their terms),
-    distributivity over operands of one shape, a product's bilinearity (two products sharing an operand, one
-    product of the summed others, and a power of two's scale of the product on either operand instead), each
-    over arithmetic in its operands' dtype (`plain`), and a value a broadcast lays along every axis but a
-    sum's taken out of the sum where the other factor has the product's shape (the broadcast's extent along
-    the axis the product's or 1, as an elementwise product broadcasts a unit axis), and a matrix product of
-    an operand scaled along its kept axis (a dequant's row or column scale) as the product scaled: each
-    reorders rounding, and each fires only where every intermediate it makes is under a magnitude the program
-    as written reaches (`dominated`, §6.3), each stating its own (`made`)."""
+    """Distributivity over operands of one shape (the sums' linearity is `_joined`'s), a product's bilinearity
+    (two products sharing an operand, one product of the summed others, and a power of two's scale of the
+    product on either operand instead), each over arithmetic in its operands' dtype (`plain`), and a value a
+    broadcast lays along every axis but a sum's taken out of the sum where the other factor has the product's
+    shape (the broadcast's extent along the axis the product's or 1, as an elementwise product broadcasts a
+    unit axis), and a matrix product of an operand scaled along its kept axis (a dequant's row or column
+    scale) as the product scaled: each reorders rounding, and each fires only where every intermediate it
+    makes is under a magnitude the program as written reaches (`dominated`, §6.3), each stating its own
+    (`made`)."""
     x, y, a, t = vars_("x y a t", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
@@ -247,9 +252,6 @@ def _linear() -> Ruleset:
     facts, power, degrees = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
     new = x.binary("add", y, added)
     sets += [
-        rule(eq(t).to(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)),
-             eq(shape(x)).to(shape(y)), plain(added), *facts, *dominated(power, degrees, "new")).then(
-            union(t).with_(new.reduce("sum", axes, params)), *made(new, power, degrees)),
         rule(eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
              eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
              *dominated(power, degrees, "new")).then(
@@ -300,6 +302,22 @@ def _linear() -> Ruleset:
     return ruleset(*sets, name="linear")
 
 
+def _joined() -> Ruleset:
+    """Two sums along one axis of operands of one shape as one sum of their terms (linearity), in their
+    operands' dtype (`plain`), where the new sum is under a magnitude the program reaches (`dominated`):
+    a rewrite XLA's multi-output fusion matches itself (it reads the sibling reductions' inputs once)."""
+    x, y, t = vars_("x y t", Term)
+    axes = var("axes", Vec[i64])
+    params, added = vars_("params added", i64)
+    facts, power, degrees = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
+    new = x.binary("add", y, added)
+    return ruleset(
+        rule(eq(t).to(x.reduce("sum", axes, params).binary("add", y.reduce("sum", axes, params), added)),
+             eq(shape(x)).to(shape(y)), plain(added), *facts, *dominated(power, degrees, "new")).then(
+            union(t).with_(new.reduce("sum", axes, params)), *made(new, power, degrees)),
+        name="joined")
+
+
 def _identities() -> Ruleset:
     """Commutativity of addition and multiplication: each rounds as the form it replaces."""
     x, y = vars_("x y", Term)
@@ -319,10 +337,11 @@ def register(rules: Rules) -> None:
     RULES[rules.name] = rules
 
 
-register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1"))
+register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1", xla=True))
 register(Rules("stable", "bounded", _stable(), dev=True,
                receipt="docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba"))
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
+register(Rules("joined", "reorders", _joined(), receipt="docs/design/algebra.md §1; ledger 1308", xla=True))
 
 
 HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),

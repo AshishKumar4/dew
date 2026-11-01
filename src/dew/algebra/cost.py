@@ -52,14 +52,20 @@ def made(graph: EGraph, operands) -> int:
 
 
 def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4) -> Work:
-    """`node`'s work alone (the cost vocabulary, the module's account): a product's tensor-core FLOPs (its
-    result's elements by its contraction's length, twice) and the bytes its operands are read in; a
-    reduction's CUDA-core operations, one an element of its operand, and the bytes of the operand it reads;
-    a conversion's conversions and a special function's exponentials, one an element of their result; any
-    other elementwise node's CUDA-core operations; a layout change none."""
+    """`node`'s work alone (the cost vocabulary, the module's account): an operand's (a leaf's) bytes, read
+    from device memory once however many values read it (extraction prices a shared node once), and nothing
+    else of device memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too) and
+    keeps its fused intermediates on chip; a product's tensor-core FLOPs (its result's elements by its
+    contraction's length, twice) and the bytes its operands are staged in (the tile walk's); a reduction's
+    CUDA-core operations, one an element of its operand; a conversion's conversions and a special
+    function's exponentials, one an element of their result; any other elementwise node's CUDA-core
+    operations; a layout change none."""
+    if (args := get_callable_args(node, Term.leaf)) is not None:
+        # The leaf's own shape from its region (a callback may read no table at a node it was not given).
+        extent = region.extents.get(str(Term.leaf(args[0])))
+        return Work() if extent is None else Work(device_bytes=math.prod(extent) * bytes_per_element)
     if (args := get_callable_args(node, Term.reduce)) is not None:
-        elements = made(graph, args[:1])
-        return Work(operations=elements, device_bytes=elements * bytes_per_element)
+        return Work(operations=made(graph, args[:1]))
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand) for operand in args[:2])
         if left is None or right is None:
@@ -72,8 +78,7 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4) -> Wor
                 * math.prod(size for axis, size in enumerate(right)
                             if axis not in (*right_contracted, *right_batch)))
         read = (math.prod(left) + math.prod(right)) * bytes_per_element
-        return Work(flops=2.0 * math.prod(left[axis] for axis in batch) * free * length, device_bytes=read,
-                    shared_bytes=read)
+        return Work(flops=2.0 * math.prod(left[axis] for axis in batch) * free * length, shared_bytes=read)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1]))
     if (args := get_callable_args(node, Term.unary)) is not None:

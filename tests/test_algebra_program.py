@@ -15,6 +15,7 @@ from reference_error import assert_as_exact, equations
 from test_algebra import count, rows, two_sums
 
 from dew import algebra
+from dew.algebra import cost, program, terms
 from dew.nn.kernels import generation, options
 from dew.nn.kernels.templates import report
 
@@ -98,29 +99,62 @@ def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
 
     def contracted(a, x, y):
         a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
-        return jnp.einsum("rk,rk->r", a, x) + jnp.einsum("rk,rk->r", a, y)
+        return jnp.dot(a, x) + jnp.dot(a, y)
 
-    operands_ = rows(1, (8, 64), (8, 64), (8, 64))
-    with generation.run_precision(ACCURATE):
+    operands_ = rows(1, (256, 64), (64, 64), (64, 64))
+    with generation.run_precision(ACCURATE), report.refusals():
         accurate = jax.make_jaxpr(algebra.rewritten(contracted))(*operands_)
+        # Its numerics admit commutativity alone, which XLA's HloCSE takes already: no pass runs.
+        assert not report.rewrites()
     default = jax.make_jaxpr(algebra.rewritten(contracted))(*operands_)
     assert (count(accurate, "dot_general"), count(default, "dot_general")) == (2, 1)
 
 
+def test_two_sums_xla_reads_once_are_priced_as_xla_prices_them():
+    """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`) against one sum of their terms: the model
+    reads each operand once either way (XLA's fusion does, its cost analysis 65,564 bytes against 65,540),
+    so neither is cheaper for the bytes it reads; the join is XLA's own rewrite (`rules.Rules.xla`), taken
+    only where XLA's analysis of the compiled program is cheaper, and the program computes what it computes
+    (check 1)."""
+    def two(x, y):
+        return jnp.sum(jnp.tanh(x), axis=-1) + jnp.sum(jnp.tanh(y), axis=-1)
+
+    def one(x, y):
+        return jnp.sum(jnp.tanh(x) + jnp.tanh(y), axis=-1)
+
+    shapes = ((64, 128), (64, 128))
+    operands_ = rows(3, *shapes)
+
+    def read(fn) -> float:
+        # The device bytes the model prices the program as traced at (`cost.work`).
+        region = terms.region(jax.make_jaxpr(fn)(*operands_))
+        graph, bundle, _ = program.graphed(region)
+        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(cost.target())))
+        return price.work.device_bytes
+
+    assert read(two) == read(one) == 2 * 64 * 128 * 4
+    written = jax.make_jaxpr(algebra.rewritten(two))(*operands_)
+    if count(written, "reduce_sum") == 1:
+        assert program.xla_seconds(written) < program.xla_seconds(jax.make_jaxpr(two)(*operands_))
+    assert_as_exact(jax.jit(algebra.rewritten(two)), jax.jit(two), lambda seed: rows(seed, *shapes),
+                    "two sums", seeds=16)
+
+
 def test_products_with_a_shared_operand_join_into_one():
-    """Two products with one shared operand (`dot_general`), summed, become one product of the shared operand
-    with the summed other, their operands bounded (tanh's) so the range facts bound the new sum (§6.3): a
-    contraction is bilinear, so the rewritten program reads the shared rows once."""
+    """Two matrix products with one shared operand (`dot_general`), summed, become one product of the shared
+    operand with the summed other, their operands bounded (tanh's) so the range facts bound the new sum
+    (§6.3): a contraction is bilinear, and the product's FLOPs halved outweigh the sum's operations."""
     def contracted(a, x, y):
         a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
-        return jnp.einsum("rk,rk->r", a, x) + jnp.einsum("rk,rk->r", a, y)
+        return jnp.dot(a, x) + jnp.dot(a, y)
 
-    a, x, y = rows(1, (8, 64), (8, 64), (8, 64))
-    after = jax.make_jaxpr(algebra.rewritten(contracted))(a, x, y)
+    shapes = ((256, 64), (64, 64), (64, 64))
+    after = jax.make_jaxpr(algebra.rewritten(contracted))(*rows(1, *shapes))
     assert sum(equation.primitive.name == "dot_general" for equation in equations(after)) == 1
 
     def draw(seed):
-        return rows(seed, (8, 64), (8, 64), (8, 64))
+        return rows(seed, *shapes)
 
     assert_as_exact(jax.jit(algebra.rewritten(contracted)), jax.jit(contracted), draw, "two products",
                     seeds=16)

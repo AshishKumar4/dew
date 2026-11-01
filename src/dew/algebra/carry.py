@@ -175,15 +175,17 @@ class Split(NamedTuple):
 
 
 def split(function: Callable, state, operands: Sequence, carried: Sequence[int], *,
-          saturation: program.Saturation, ranges: Mapping[int, float] | None = None) -> Split:
+          saturation: program.Saturation, ranges: Mapping[int, float] | None = None,
+          state_range: float | None = None) -> Split:
     """`function(state, *operands)`, a tuple of outputs, at `state`'s and `operands`' shapes and dtypes, split
     by extraction (the module's account): its outputs at `carried` the carry's, its others emitted, the
-    operands' magnitudes bounded by `ranges` (by place among `operands`; the state's none), which the
-    reorderings' new intermediates are held under (§6.3). Refused (`Refused`) where an equation outside the
-    language reads the state."""
+    operands' magnitudes bounded by `ranges` (by place among `operands`) and the state's by `state_range`,
+    which the reorderings' new intermediates are held under (§6.3). Refused (`Refused`) where an equation
+    outside the language reads the state."""
     with jax.disable_jit():
         closed = jax.make_jaxpr(forms.inlined(function))(state, *operands)
-    region = terms.region(closed, {1 + index: bound for index, bound in (ranges or {}).items()})
+    declared = {1 + index: bound for index, bound in (ranges or {}).items()}
+    region = terms.region(closed, declared if state_range is None else {**declared, 0: state_range})
     first = len(closed.jaxpr.constvars)
     graph = EGraph()
     program.stated(graph, region)

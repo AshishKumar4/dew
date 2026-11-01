@@ -102,8 +102,11 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
     @functools.wraps(fn)
     def run(*args, **kwargs):
         # Under `jax.disable_jit` a program runs as Python, its values concrete, so nothing is traced to
-        # rewrite.
-        if not ALGEBRA.value.on or jax_config.disable_jit.value:
+        # rewrite; where the run's numerics admit XLA's own rewrites alone (`Rules.xla`: the accurate forms'
+        # commutativity, which XLA's HloCSE ignores already), the pass would leave the program as it is.
+        accurate = generation.numerics().forms == "accurate"
+        if (not ALGEBRA.value.on or jax_config.disable_jit.value
+                or all(sets.xla for sets in rules.admitted(accurate))):
             return fn(*args, **kwargs)
         statics = {number % len(args) for number in numbers if -len(args) <= number < len(args)}
         fixed = {name: value for name, value in kwargs.items() if name in names}
@@ -116,7 +119,6 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
 
         named = {name: value for name, value in kwargs.items() if name not in names}
         closed, shaped = jax.make_jaxpr(bound, return_shape=True)(dynamic, named)
-        accurate = generation.numerics().forms == "accurate"
         done = rewrite(closed, jax.tree.leaves((dynamic, named)), accurate=accurate, saturation=saturation)
         return jax.tree.unflatten(jax.tree.structure(shaped), done)
     return run
@@ -180,8 +182,29 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
                                      for equation in traced.jaxpr.eqns]
     if not spliced:
         return jaxpr
-    return _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
-                                     for kept in spliced.get(id(equation), [equation])]))
+    rewritten = _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
+                                          for kept in spliced.get(id(equation), [equation])]))
+    fired = {name for name, count in done.report.fired.items() if count}
+    if fired and all(rules.RULES[name].xla for name in fired) and (
+            jaxpr.constvars or xla_seconds(rewritten) >= xla_seconds(jaxpr)):
+        # Only XLA's own rewrites fired: XLA's cost analysis of the compiled program decides, not the model
+        # (a body whose constants it does not hold is not compiled alone: kept as it is).
+        return jaxpr
+    return rewritten
+
+
+def xla_seconds(jaxpr: jcore.Jaxpr | jcore.ClosedJaxpr) -> float:
+    """`jaxpr`'s seconds by XLA's own cost analysis of its compiled program (its FLOPs, transcendentals and
+    bytes accessed) at the pass's device's rates (`cost.Fused`): the price of a rewrite XLA would match
+    itself, which the e-graph's model cannot see XLA's fusion of."""
+    closed = jaxpr if isinstance(jaxpr, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(jaxpr, ())
+    avals = list(closed.in_avals)
+    analysis = jax.jit(jcore.jaxpr_as_fun(closed)).lower(*avals).compile().cost_analysis()
+    analysis = (analysis[0] if isinstance(analysis, list) else analysis) or {}
+    rates = cost.fused(cost.target())
+    return (analysis.get("flops", 0.0) / rates.operations
+            + analysis.get("transcendentals", 0.0) / rates.exponentials
+            + analysis.get("bytes accessed", 0.0) / rates.bandwidth)
 
 
 def _live(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:

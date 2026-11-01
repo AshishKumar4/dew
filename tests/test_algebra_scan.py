@@ -274,17 +274,18 @@ def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, ope
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"),
                          [(gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)],
                          ids=["gated_delta", "kimi_delta"])
-def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_values_are_bounded(
+def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_state_is_bounded(
         update_fn, operands, draw_fn):
-    """The delta rule's split (`carry.split`), its keys, write gates, log decays and values ranged (unit
-    keys, gates under 1, decays at most 1, values under the draws' 8): its carry (`step` over a chunk's
-    prepared values) reads the state through one product, a matrix the chunk prepared times the state, the
-    solve, the decays and every other product among the prepared values. With no range on its values, the
-    solve's distribution over them may overflow where the chunk's own values do not (§6.3), and the carry
-    keeps it: more than one product reads the state."""
+    """The delta rule's split (`carry.split`), its keys, write gates, log decays and values ranged (unit keys,
+    gates under 1, decays at most 1, values under the draws' 8): where its entering state is ranged too
+    (`Scan.ranges`' "state"), its carry (`step` over a chunk's prepared values) reads the state through one
+    product, a matrix the chunk prepared times the state, the solve, the decays and every other product among
+    the prepared values. With no range on the state, the solve's distribution over `W h` makes an
+    intermediate of the state's magnitude no number bounds (§6.3), and the carry keeps it: more than one
+    product reads the state."""
     names = ("q", "k", "v", "g", "beta")
     chunk = {name: value[:CHUNK] for name, value in zip(names, draw_fn(0), strict=True)}
-    ranges = {"k": 1.0, "beta": 1.0, "g": (-np.inf, 0.0)}
+    ranges = {"k": 1.0, "beta": 1.0, "g": (-np.inf, 0.0), "v": 8.0}
 
     def carried_products(declared: dict) -> list[str]:
         forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
@@ -295,7 +296,7 @@ def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_val
             jnp.zeros((KEY, VALUE)))
         return list(_primitives(carry.jaxpr))
 
-    bounded = carried_products({**ranges, "v": 8.0})
+    bounded = carried_products({**ranges, "state": 64.0})
     assert bounded.count("dot_general") == 1, bounded
     assert not any(name.startswith("custom_vjp") for name in bounded), bounded
     assert carried_products(ranges).count("dot_general") > 1
