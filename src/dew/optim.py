@@ -2278,22 +2278,28 @@ class OptimConfig:
     Empty keeps none.
     """
 
+    def schedules(self) -> list[tuple[str, ScheduleBase]]:
+        """The schedules its solvers run, by where the config holds them: its learning rate's, or each
+        param group's rate (`ParamGroup.rate`, the config's own where the group names none) and b1."""
+        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
+        for group in self.param_groups:
+            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
+            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
+        return [(name, schedule) for name, schedule in held if isinstance(schedule, ScheduleBase)]
+
+    def reads_progress(self) -> bool:
+        """Whether a run that counts no updates ahead (one bounded in examples) hands its optimizer its
+        progress: a schedule of its whose horizon is the run's (`ScheduleBase.run_relative`)."""
+        return any(schedule.run_relative() for _, schedule in self.schedules())
+
     def warmups(self, steps: int | None, clocked: bool = False) -> dict[str, int | str | float]:
         """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
         its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
         run's plan records it; a schedule with no warmup of steps is not among them. A `clocked` run
         counts no updates ahead, so a warmup over the run's progress is recorded as written, its share
         of the examples the run consumes (`ScheduleBase.progressed`)."""
-        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
-        for group in self.param_groups:
-            # The schedules the group's solver runs (`ParamGroup.rate`): the config's own where the
-            # group names none.
-            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
-            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
         warmups: dict[str, int | str | float] = {}
-        for name, schedule in held:
-            if not isinstance(schedule, ScheduleBase):
-                continue
+        for name, schedule in self.schedules():
             if clocked and schedule.run_relative():
                 written = schedule.written_warmup()
                 if written:

@@ -158,6 +158,19 @@ def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
     return any(_drops(stage) or isinstance(stage, Native) for stage in pipeline.stages[:batched])
 
 
+def _streamed_take(pipeline: Pipeline, read: str) -> bool:
+    """Whether a streamed read takes a count of its rows before its batch (a take, or a run's bound in
+    examples, `examples_bound`), in it or in a corpus it mixes: each of its loading workers reads its
+    own slice of the shards, so the take counts the rows they hand on together, in the reading process
+    (`_Build.pooled`), where a worker's own take would read that many of its slice."""
+    if read != "streamed":
+        return False
+    if any(_streamed_take(child, read) for child in children(pipeline)):
+        return True
+    batched = _until(pipeline.stages, (BatchStage,))
+    return any(isinstance(stage, Limit) for stage in pipeline.stages[:batched])
+
+
 def _carried(pipeline: Pipeline, consumed: int, *, marked: bool) -> int:
     """Where a pooled read's loading workers hand its rows to the reading process (`_Build.pooled`):
     at its first stage from `consumed` that can't carry a dropped record as a marker. Record steps
@@ -1450,7 +1463,8 @@ class _Build:
         # An elastic read by index reads its inputs as workers do (`_InputOrder`), none of them too,
         # so its position is the same whatever their count; after its batch they would read every
         # count-th of its rows. A streamed one reads without them (`compile._refuse_inelastic`).
-        pooled = (count or written) and _dropping(pipeline, self.lowering)
+        pooled = (count or written) and (_dropping(pipeline, self.lowering)
+                                         or _streamed_take(pipeline, self.read))
         ordered = self.elastic and self.read != "streamed"
         if self.global_order or not self.training or not (ordered or pooled):
             return self
@@ -1748,8 +1762,10 @@ class _Build:
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
             if index < ran:
                 continue
-            if index < carried and isinstance(stage, Native) and not isinstance(rows, pygrain.MapDataset):
-                # What a Grain step drops from a stream leaves no marker: the workers hand on before it.
+            streamed = not isinstance(rows, pygrain.MapDataset)
+            if index < carried and isinstance(stage, (Native, Limit)) and streamed:
+                # What a Grain step drops from a stream leaves no marker, and a take of a stream counts
+                # what every worker reads (`_streamed_take`): the workers hand on before either.
                 carried = index
             if index == carried and pool is not None:
                 rows = self.handed(rows, pipeline, partition, pool, carried,

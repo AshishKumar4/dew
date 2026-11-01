@@ -120,6 +120,7 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
+    pooled,
     pooled_first,
     restored,
     stage_reached,
@@ -194,7 +195,7 @@ from dew.training.planning import (
     whole_step,
 )
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
-from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
+from dew.training.rollout import Rollout, _branched, _draws_further, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
@@ -463,8 +464,10 @@ class Trainer(Generic[Loss, Effects]):
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
         """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
         self._device, self._prefetch = loader.device, prefetch
-        self._examples = clocked(examples, steps, custom=self.step is not None,
-                                 rollout=self.rollout is not None, bound_ends=loader.bound_ends)
+        progress = self._config is not None and self._config.reads_progress()
+        self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
+                                 custom_progress=self.step is not None and progress,
+                                 pooled_draws=pooled(examples) and _draws_further(self.rollout))
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1750,7 +1753,8 @@ class Trainer(Generic[Loss, Effects]):
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
         run.opened(source, self._examples)
         self._marked = marked(run.partition, self._counted_batch)
-        prepare = self._marked if self.rollout is None else None
+        prepare = self._marked if self.rollout is None else functools.partial(
+            consumption_counted, clocked=self._examples is not None, marks_rows=False)
         if run.pooled:
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))

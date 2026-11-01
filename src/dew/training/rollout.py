@@ -9,9 +9,11 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 import jax
+import numpy as np
 from jax.sharding import Mesh
 
-from dew.batch import Batch
+from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
+from dew.data.dataset import rows_of
 from dew.objectives.base import Metric, Shown
 
 if TYPE_CHECKING:
@@ -61,7 +63,8 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
                marked: Callable[[Batch], Batch], interval: Interval, run: FitRun) -> Batch:
     """`batch` sampled through `rollout`, its host preparation `marked` and placed on `mesh`
     (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
-    (`FitRun.held`); without a rollout, the batch as it is.
+    (`FitRun.held`); without a rollout, the batch as it is. In a run on the examples clock the
+    batch it makes consumes the examples of the batches it read (`clocked_rollout`).
 
     Host-side and untraceable: sampling, scoring, advantages. The key folds the
     step key once more, keeping the rollout's draws off the step's stream; both
@@ -74,11 +77,73 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
         return batch
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-    further = {"further": run.further(interval)} if _draws_further(rollout) else {}
+    read = [batch]
+    further = {"further": _kept(run.further(interval), read)} if _draws_further(rollout) else {}
     with run.held():
-        batch = shard_batch(mesh, marked(rollout(state, batch, key, **further)))
+        made = rollout(state, _unclocked(batch), key, **further)
+        batch = shard_batch(mesh, counted(marked(clocked_rollout(made, read)), read))
     interval.rollout_seconds += time.perf_counter() - began
     return batch
+
+
+CLOCK = (EXAMPLES_CONSUMED, CONSUMED_COUNT, CLOSES_WINDOW)
+"""The fields a batch of a run on the examples clock carries for the run's progress, which the batch it
+makes of it carries instead (`clocked_rollout`): none reaches the rollout."""
+
+
+def _unclocked(batch: Batch) -> Batch:
+    """`batch` as a rollout reads it: without the fields of the run's clock (`CLOCK`)."""
+    return {name: value for name, value in batch.items() if name not in CLOCK}
+
+
+def _kept(read: Callable[[], Batch | None], kept: list[Batch]) -> Callable[[], Batch | None]:
+    """`read`, each batch it reads kept in `kept` and handed on without the clock's fields."""
+    def reading() -> Batch | None:
+        batch = read()
+        if batch is None:
+            return None
+        kept.append(batch)
+        return _unclocked(batch)
+    return reading
+
+
+def counted(batch: Batch, read: Sequence[Batch]) -> Batch:
+    """A rollout's prepared `batch` holding what the batches it `read` consumed, as they counted it
+    (`ConsumedCount`, a pool's whole count where its reads are pooled); as it is in a run on another
+    clock."""
+    if CONSUMED_COUNT not in read[0]:
+        return batch
+    return {**batch, CONSUMED_COUNT: ConsumedCount(sum(each[CONSUMED_COUNT].examples for each in read))}
+
+
+def _held(column) -> int:
+    """The examples this process's rows of a consumed `column` hold: a placed column's shards it holds,
+    each rows' once, or a host column whole."""
+    if not isinstance(column, jax.Array):
+        return int(np.sum(np.asarray(column)))
+    shards = {str(shard.index): shard.data for shard in column.addressable_shards}
+    return int(sum(np.sum(np.asarray(data)) for data in shards.values()))
+
+
+def clocked_rollout(made: Batch, read: Sequence[Batch]) -> Batch:
+    """The batch a rollout `made` of the batches it `read` (the step's, then each it drew further), as a
+    run on the examples clock steps it: consuming the examples they consumed (`EXAMPLES_CONSUMED`, each
+    read batch's `ConsumedCount`), all on its first row, as a step sums them over its rows, and closing
+    the update window where the step's batch does (`CLOSES_WINDOW`); a batch read with no real row (a
+    pool's share whose stream ran out, `dew.training._fit.pooled_read`) makes one with none. A pool's
+    process counts the rows it holds, so the step's sum over the pool's rows counts each once. A run on
+    another clock reads no count: its rollout's batch is as made."""
+    first = read[0]
+    if CONSUMED_COUNT not in first:
+        return made
+    consumed = np.zeros(rows_of(made), np.int32)
+    consumed[0] = sum(_held(each[EXAMPLES_CONSUMED]) for each in read)
+    clocked = {**made, EXAMPLES_CONSUMED: consumed}
+    if CLOSES_WINDOW in first:
+        clocked[CLOSES_WINDOW] = first[CLOSES_WINDOW]
+    if VALID_ROWS in first and not np.any(np.asarray(first[VALID_ROWS])):
+        clocked[VALID_ROWS] = np.zeros(len(consumed), bool)
+    return clocked
 
 
 def _draws_further(rollout: Rollout) -> bool:

@@ -481,20 +481,30 @@ CLOCK_LIMIT = 2 ** 31 - 1
 """The most examples a clock counts: the devices hold it as int32 (`TrainState.consumed`)."""
 
 
-def clocked(examples: int | None, steps: int | None, *, custom: bool, rollout: bool,
-            bound_ends: bool = True) -> int | None:
+def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = False,
+            pooled_draws: bool = False, bound_ends: bool = True) -> int | None:
     """The examples bound of a run that no plan counts steps ahead of, which keeps its progress in the
     examples its batches consume (`TrainState.consumed`), its schedule and cadences reading it; None for
-    a run counted otherwise. The transaction hands the run's optimizer that progress and the batches
-    carry the count, which a `custom` step or a `rollout`'s batches do not: refused there. Its progress
-    reaches its end where its read ends at its bound (`Loader.bound_ends`), so a take or slice after
-    the bound, which would end it first, is refused, as is a bound past what the clock counts."""
+    a run counted otherwise. The transaction hands the run's optimizer that progress, which a custom
+    step's update is not handed: one whose schedule reads it (`custom_progress`, a schedule over the
+    whole run) is refused. A rollout's batch consumes what the batches it read did
+    (`dew.training.rollout.clocked_rollout`), but a pool's shares run out apart, and a share that ran
+    out has nothing to draw further from, so a pool's rollout that draws further (`pooled_draws`) is
+    refused. Its progress reaches its end where its read ends at its bound (`Loader.bound_ends`), so a
+    take or slice after the bound, which would end it first, is refused, as is a bound past what the
+    clock counts."""
     if examples is None or steps is not None:
         return None
-    if custom or rollout:
-        raise ValueError("a run bounded in examples that no plan counts ahead reads its progress off the "
-                         "examples its batches consume, which a custom step= or a rollout does not carry; "
-                         "give steps=, or read the data in a global order its plan counts")
+    if custom_progress:
+        raise ValueError("a run bounded in examples that no plan counts ahead hands its optimizer the run's "
+                         "progress, which a custom step='s update is not handed, and this optimizer's "
+                         "schedule decays over the whole run: give the schedule its own decay_steps, or "
+                         "give steps=")
+    if pooled_draws:
+        raise ValueError("a pool's run bounded in examples reads on until every share's stream has run out, "
+                         "a share that ran out stepping an emptied batch, which holds nothing a rollout "
+                         "can draw further from: read the data in one global order its plan counts, or "
+                         "give steps=")
     if not bound_ends:
         raise ValueError("a run bounded in examples that no plan counts ahead ends where its bound does, "
                          "which its schedule's end reads; a take or slice after the bound would end it "
@@ -585,11 +595,12 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
             "or leave eval_every unset")
 
 
-def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
+def consumption_counted(batch: Batch, *, clocked: bool, marks_rows: bool = True) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start, and each marks its real rows (`VALID_ROWS`). A run on another clock, one
-    bounded in examples whose plan counts its steps ahead, keeps no count: none rides to its step."""
+    its start, and each marks its real rows (`VALID_ROWS`) where it `marks_rows`, as a step's batch does;
+    a rollout's read keeps its rows as read. A run on another clock, one bounded in examples whose plan
+    counts its steps ahead, keeps no count: none rides to its step."""
     if not clocked:
         return batch if EXAMPLES_CONSUMED not in batch else {
             name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
@@ -598,7 +609,7 @@ def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
     counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
-    if VALID_ROWS not in batch:
+    if VALID_ROWS not in batch and marks_rows:
         # A clocked read ends at its bound, in a short batch filled and marked: each of its batches marks
         # its real rows, so every one is the same tree, the run's one program.
         counted_batch[VALID_ROWS] = np.ones(len(np.asarray(batch[EXAMPLES_CONSUMED])), bool)
