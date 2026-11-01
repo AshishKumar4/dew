@@ -40,16 +40,19 @@ Operand = Ref | jax.Array
 """A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
 
 
-def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0) -> plgpu.CompilerParams:
+def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0,
+                    resident: int = 1) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
     exp2 and FlashAttention's are). A block's warpgroups reduce at once, so each takes its own scratch: a
     consumer's planned reductions its share of the kernel's allocations (`Family.column_sums`), the
     implicit ones its arithmetic forms (a unit row a hook slices) an equal share of `reduction_scratch`
     bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
-    lower rather than share one."""
+    lower rather than share one. `resident`, the programs a multiprocessor holds at once, caps each thread's
+    registers so that many fit its register file (CUDA's `__launch_bounds__` minimum blocks, Mosaic GPU's
+    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=reduction_scratch)
+                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident)
 
 
 CLUSTER = "cluster"
@@ -121,14 +124,14 @@ def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
-           reduction_scratch: int = 0) -> Callable:
+           reduction_scratch: int = 0, resident: int = 1) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(dependent(entry, interpret), out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
-                         compiler_params=compiler_params(approx_math=approx_math,
+                         compiler_params=compiler_params(approx_math=approx_math, resident=resident,
                                                          reduction_scratch=reduction_scratch),
                          interpret=interpreted(interpret),
                          kernel_name=report.named(name), cost_estimate=cost, **clustered)
