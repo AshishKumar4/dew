@@ -100,8 +100,9 @@ sensed rates and rotor speeds, each two layers of 256 then its width."""
 def run(out: Path, assets: Path, drones: int = ENVIRONMENTS, setting: Setting = BASE) -> EnvRunConfig:
     """The recipe's run under OUT (the module docstring) over `drones` drones seen through HyperLux's cameras
     over `assets`, racing the `setting`'s race."""
-    sky = {f.name: getattr(setting.sky, f.name) for f in dataclasses.fields(Sky)
-           if f.name != "quadrotor" and getattr(setting.sky, f.name) != f.default}
+    # The race's fields set otherwise than Sky's defaults, as a record holds them (a tuple as a list).
+    sky = {f.name: list(value) if isinstance(value, tuple) else value for f in dataclasses.fields(Sky)
+           if f.name != "quadrotor" and (value := getattr(setting.sky, f.name)) != f.default}
     race = {"renderer": setting.renderer(assets, drones),
             **({"sky": {"class": "dew.rl.skydreamer:Sky", "fields": sky}} if sky else {})}
     return EnvRunConfig(
