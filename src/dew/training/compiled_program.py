@@ -84,8 +84,11 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
     (`_shard_map_lowering_shardy`, jax/_src/shard_map.py, makes no manual computation of it), and each
     `platform_dependent` conditional the branch `lowering` keeps, inline, no conditional around it
     (`_cond_lowering`, jax/_src/lax/control_flow/conditionals.py, keeps the branches whose platforms
-    hold the lowering's, and lowers a sole branch as the computation itself); through every program an
-    equation runs but a native Pallas kernel's, which XLA never sees (`opaque`)."""
+    hold the lowering's, and lowers a sole branch as the computation itself), and each nested `jit` inline,
+    a private function XLA's call inliner runs in its caller (a wide sum's, `precision.accumulated`, traced
+    once for its types: called, its GEMMs were no fusion's of the slices that read them, 10 of
+    test_derived_plan's fits red, row 3193); through every program an equation runs but a native Pallas
+    kernel's, which XLA never sees (`opaque`)."""
     renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
     equations: list[jcore.JaxprEqn] = []
 
@@ -99,6 +102,8 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
         if name == "shard_map" and math.prod(params["mesh"].shape[axis]
                                              for axis in params["newly_manual_axes"]) == 1:
             body = params["jaxpr"]
+        elif name in ("pjit", "jit"):
+            body, consts = params["jaxpr"].jaxpr, params["jaxpr"].consts
         elif name == "pallas_call" and params["interpret"]:
             run = functools.partial(interpreter(params.pop("interpret")), **params)
             traced = jax.make_jaxpr(run)(*(value.aval for value in equation.invars))
