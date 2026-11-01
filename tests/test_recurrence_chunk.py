@@ -209,7 +209,7 @@ def test_the_derived_forms_are_as_exact_as_the_recurrence_token_by_token(hooks):
     math's draws of one sequence (check 1): the accuracy check the derived forms are taken behind."""
     dew = jax.jit(functools.partial(chunk_on, 'derived', hooks, chunk_size=CHUNK))
     reference = jax.jit(functools.partial(token_by_token, hooks))
-    assert_as_exact(dew, reference, functools.partial(draw, hooks, False), f'{hooks} derived',
+    assert_as_exact(dew, reference, lambda seed: draw(hooks, packed=False, seed=seed), f'{hooks} derived',
                     seeds=SEEDS[hooks, False])
 
 
