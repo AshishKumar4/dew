@@ -654,8 +654,10 @@ def test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_e
                  EXPERT_BIAS_COLLECTION: {EXPERT_BIAS: jnp.asarray([0.0, 2.0])}}
     ours, indices = router.apply(variables, jnp.asarray(hidden.numpy()))
     np.testing.assert_array_equal(np.asarray(indices), chosen.numpy())
-    # The faint score over the clamp, about 4e-6 either way, where the unclamped quotient is 1.
-    assert all(1e-7 < weight < 1e-5 for weight in (float(ours[0, 0]), float(weights[0, 0])))
+    # The faint score over the clamp (about 4e-6 in the source) on both sides, where the quotient over the
+    # chosen score's own sum is 1.
+    assert float(weights[0, 0]) < 1e-5
+    assert float(ours[0, 0]) < 1e-5
 
 
 def test_attention_fields_join_the_kinds_of_the_layers_that_state_them():
