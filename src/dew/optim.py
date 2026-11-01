@@ -1234,10 +1234,16 @@ def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
         if params is None:
             raise ValueError("the trust ratio reads the parameters; pass them to the update")
 
+        def norm(leaf: jax.Array, stacked: int) -> jax.Array:
+            # Each stored layer's norm over its own values, kept against its layers' axes: the values
+            # flattened to one axis, as `optax.safe_norm` takes one axis or two.
+            flat = leaf.reshape((*leaf.shape[:stacked], -1))
+            held = optax.safe_norm(flat, min_norm, axis=-1, keepdims=True)
+            return held.reshape((*leaf.shape[:stacked], *(1,) * (leaf.ndim - stacked)))
+
         def scaled(path, update, param):
-            axes = tuple(range(_layers_of(path)[1], update.ndim))
-            param_norm = optax.safe_norm(param, min_norm, axis=axes, keepdims=True)
-            update_norm = optax.safe_norm(update, min_norm, axis=axes, keepdims=True)
+            stacked = _layers_of(path)[1]
+            param_norm, update_norm = norm(param, stacked), norm(update, stacked)
             ratio = trust_coefficient * param_norm / (update_norm + eps)
             # A layer whose parameters or update are zero would never move: it keeps its update.
             return update * jnp.where((param_norm == 0.0) | (update_norm == 0.0),
