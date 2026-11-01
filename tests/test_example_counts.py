@@ -133,7 +133,7 @@ class Refusing:
                      for question in range(int(element["id"]) % 3 + 1))
 
 
-@pytest.mark.parametrize(("read", "workers"), [("memory", 0), ("streamed", 0), ("streamed", 2)])
+@pytest.mark.parametrize(("read", "workers"), [("memory", 0), ("streamed", 0), ("memory", 2)])
 def test_a_corpus_counts_the_examples_it_kept_apart_from_those_it_refused(read, workers):
     """Twenty-one examples, every fifth refused whole by the objective, read by `workers` loading workers:
     the corpus counts the seventeen it kept as `data/rows` and the four it refused under their reason,
