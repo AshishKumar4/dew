@@ -29,19 +29,8 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
-from dew.rl.env import (
-    Carry,
-    Env,
-    Memory,
-    Observation,
-    Params,
-    TimeStep,
-    Transition,
-    Tree,
-    env_rollout,
-    start,
-    view,
-)
+from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
+from dew.rl.evaluation import episodes, first_episodes
 from dew.rl.simulator import Simulator, rollout_start, simulator_rollout, simulator_start
 from dew.rl.surrogate import clipped_surrogate_terms
 
@@ -380,30 +369,19 @@ class ControlRollout:
         return jax.tree.map(lambda values: values[rows], collected)
 
 
-def _first_episodes_return(following: TimeStep) -> jax.Array:
-    """The mean undiscounted return of each environment's first episode in a rollout's steps `[T, envs]`,
-    the steps after it ended unread."""
-    after = (jnp.cumsum(following.done, 0) - following.done) > 0
-    return jnp.mean(jnp.sum(jnp.where(after, 0, following.reward), axis=0))
-
-
 def episode_return(objective: ControlPPOObjective, env: Env | Simulator, params: Variables, key: jax.Array,
                    steps: int, *, greedy: bool = True) -> float:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the policy, its deterministic action where `greedy`: the whole
-    episode where `steps` is an episode's length."""
+    episode where `steps` is an episode's length. An `Env`'s is the one scorer of first episodes'
+    (`dew.rl.evaluation.episodes`)."""
     policy = objective.greedy if greedy else objective.act
     if isinstance(env, Simulator):
         _, taken = simulator_rollout(env, policy, params, simulator_start(env, key), steps, reset=False)
-        return float(_first_episodes_return(taken.following))
-
-    @jax.jit
-    def run(params: Variables, key: jax.Array) -> jax.Array:
-        _, taken = env_rollout(env, policy, params, start(env, key), steps, reset=False)
-        return _first_episodes_return(taken.following)
-
-    return float(run(params, key))
+        following = taken.following
+        return float(jnp.mean(jnp.sum(jnp.where(first_episodes(following), following.reward, 0), axis=0)))
+    return episodes(policy, env, steps)(params, key)["return"]
 
 
-__all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "episode_return", "tanh_normal_entropy",
-           "tanh_normal_log_prob"]
+__all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "Saved", "episode_return",
+           "tanh_normal_entropy", "tanh_normal_log_prob"]

@@ -78,8 +78,8 @@ def validation_suites(dataset: Loader, validation: Mapping[str, Reader | EvalSui
     suites = {}
     for name, entry in validation.items():
         suite = entry if isinstance(entry, EvalSuite) else EvalSuite(entry)
-        # A split scored by its episodes reads no batches: fit's metrics are its data splits'.
-        inherited = () if episodic(suite.data) else tuple(metrics)
+        # A split scored by its episodes scores what they declare; fit's metrics are its data splits'.
+        inherited = suite.data.metrics if episodic(suite.data) else tuple(metrics)
         suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or inherited,
                                  eval_every if suite.every is None else suite.every)
     return suites
@@ -594,7 +594,7 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
     objective's validation loss, a checkpointer's or a held best's) and no preview a tracker takes
     (`previewed`). Only an objective with no validation loss (Flow-GRPO's) and none of the rest would
     open nothing and report nothing, and that contradiction is refused before the run does any work."""
-    if not suite.metrics and not read and not previewed and not episodic(suite.data):
+    if not suite.metrics and not read and not previewed:
         raise ValueError(
             f"{name} is scored every {suite.every} steps and nothing consumes it: "
             "pass metrics to score it, preview=True with a tracker to sample from it, "

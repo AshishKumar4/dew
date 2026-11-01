@@ -571,6 +571,7 @@ def test_a_dreamer_runs_cooldown_leaves_its_replay_as_the_run_left_it(tmp_path):
     from recording import preempting
 
     from dew.checkpoints import Checkpoints
+    from dew.objectives.base import Shown
     from dew.rl.evaluation import episodes
     from dew.training import Episodes, EvalSuite, Preempted
     from dew.training.cooldown import Cooldowns
@@ -578,7 +579,8 @@ def test_a_dreamer_runs_cooldown_leaves_its_replay_as_the_run_left_it(tmp_path):
     objective = DreamerV3Objective(tiny())
     # The agent acts on the steps its driver records (`Driven`).
     flights = {"flight": EvalSuite(Episodes(episodes(objective.act, Driven(Batched(TimeLimit(
-        Target(), episode_length=20), 4)), 20, memory=objective.memory)), every=6)}
+        Target(), episode_length=20), 4)), 20, memory=objective.memory),
+        {"return": Shown(better="higher"), "steps": Shown()}), every=6)}
     options = {"optimizer": optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), "validation": flights}
     plain = bits(dreamer_fit(None, objective, dreamer_targets(objective, checkpointed=True), 6, **options))
     cooldowns = Cooldowns(at=(3,), length=2)

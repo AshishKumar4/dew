@@ -45,14 +45,57 @@ from dew.training.tracker import write_artifact
 
 
 @dataclass(frozen=True)
+class Flown:
+    """The scores a split's episodes earned in one evaluation, by name: the artifact every
+    `EpisodeScore` of the split reads."""
+
+    scores: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class EpisodeScore:
+    """A score a split's episodes report (`Episodes`), declared as any metric is, so a selection, a stop
+    or a summary reads it as a data split's (`Best("flight/return")`): its `name` and how it shows
+    (`shown`, which way is better). A pass holds one artifact, the episodes' `Flown` scores, which it
+    reads its own entry of."""
+
+    name: str
+    shown: Shown
+
+    @property
+    def reads(self) -> type:
+        return Flown
+
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> float:
+        if not isinstance(artifact, Flown):
+            raise TypeError(f"{self.name} reads a split's episodes (Flown), not a {type(artifact).__name__}")
+        return float(artifact.scores[self.name])
+
+    def merge(self, accumulated: float, contribution: float, /) -> float:
+        return contribution
+
+    def finalize(self, accumulated: float, /) -> float:
+        return accumulated
+
+
+@dataclass(frozen=True)
 class Episodes:
     """A split scored by flying a policy, not by reading records: `score(variables, key)` returns the
-    split's scores by name (`dew.rl.evaluation.episodes`). It goes where a reader goes
-    (`EvalSuite(Episodes(...))`), and `Evaluation.run` scores it on the averaged weights where the run
-    keeps them, each score named `<split>/<name>`, as a data split's; a warming pass compiles its
-    episodes and keeps no score. It reads no batches, so a run's metrics and loss are not its."""
+    split's scores by name (`dew.rl.evaluation.episodes`), each declared with how it shows (`scores`,
+    the split's metrics, `EpisodeScore`). It goes where a reader goes (`EvalSuite(Episodes(...))`), and
+    `Evaluation.run` scores it on the averaged weights where the run keeps them, on every process and
+    agreed (a scorer that fails on one fails the evaluation on all), process 0's scores the pool's, each
+    named `<split>/<name>` as a data split's; a warming pass flies to compile and keeps none. Its key is
+    the evaluation's event key (`_event`: the run's key folded with 'EVAL' and the step) folded with
+    'EPIS'. It reads no batches, so a run's data metrics and loss are not its."""
 
     score: Callable[[Variables, jax.Array], Mapping[str, float]]
+    scores: Mapping[str, Shown]
+
+    @property
+    def metrics(self) -> tuple[Metric, ...]:
+        """The split's metrics: one `EpisodeScore` a declared score."""
+        return tuple(EpisodeScore(name, shown) for name, shown in self.scores.items())
 
 
 type Split = Reader | Episodes
@@ -263,7 +306,8 @@ class Evaluation:
         key = request_key(key)
         if episodic(batches):
             return cls._episodes(batches, averaged if averaged is not None else variables, key=key, step=step,
-                                 schedule_step=schedule_step, updates=updates, split=split, warm=warm)
+                                 schedule_step=schedule_step, updates=updates, split=split, warm=warm,
+                                 metrics=metrics or batches.metrics, training=training)
         if isinstance(batches, Dataset):
             batches = held(batches, objective=objective.data())
         started = time.perf_counter()
@@ -298,14 +342,27 @@ class Evaluation:
     @classmethod
     def _episodes(cls, episodes: Episodes, variables: Variables, *, key: jax.Array, step: int | jax.Array,
                   schedule_step: int | jax.Array | None, updates: int | jax.Array | None, split: str,
-                  warm: bool) -> Evaluation:
-        """`run`'s evaluation of a split scored by its episodes: the evaluation's clocks and key agreed as a
-        data split's are (`_event`), its scores named `<split>/<name>`, process 0's flight broadcast to
-        the pool; a warming pass flies once to compile and keeps none."""
+                  warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array] | None
+                  ) -> Evaluation:
+        """`run`'s evaluation of a split scored by its episodes: its metrics checked and agreed as a data
+        split's are (`_agree_configuration`), its clocks, key and training values as well (`_event`), the
+        flight run on every process and agreed, each declared score read off process 0's (`EpisodeScore`)
+        and named `<split>/<name>`, a score the split did not declare refused; a warming pass flies once
+        to compile and keeps none."""
         started = time.perf_counter()
-        event_step, context, event_words, _ = _event(key, step, schedule_step, None, None, updates)
-        flown = episodes.score(variables, _folded(context.key, 0x45504953))
-        scores = {} if warm else {f"{split}/{name}": float(value) for name, value in flown.items()}
+        _agree_configuration(metrics, episodes, split, loss=False, training=training is not None, warm=warm)
+        event_step, context, event_words, training_scores = _event(key, step, schedule_step, None, training,
+                                                                   updates)
+        flown = agreed(f"{split} episodes", lambda: Flown(dict(episodes.score(variables, _folded(
+            context.key, 0x45504953)))))
+        declared = {metric.name for metric in metrics}
+        if set(flown.scores) - declared:
+            raise ValueError(f"the {split} split's episodes report {sorted(set(flown.scores) - declared)}, "
+                             f"which it does not declare: {sorted(declared)}")
+        # A split's episodes read no batch: each of its metrics reads the one artifact the flight made.
+        scores = {} if warm else {f"{split}/{metric.name}": metric.finalize(metric(flown, {}))
+                                  for metric in metrics}
+        scores.update(training_scores)
         scores, elapsed = broadcast_from_process_zero((scores, time.perf_counter() - started))
         return cls(event_step, split, scores, 0, 0, event_words, elapsed, ())
 
