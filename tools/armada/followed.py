@@ -249,18 +249,19 @@ def own(name: str) -> bool:
     """Whether absolute path `name` is this file's own to write, which no later file of the task reads: its
     scratch and caches (ci.py's `alone`: TMPDIR, `PRIVATE`), uv's cache of packages by their digests, compiled
     bytecode, the devices, and the harness's own record of its run (its log and its children's, its
-    collection's account, its JUnit report)."""
-    import tempfile
-
+    collection's account, its JUnit report). Its scratch read from TMPDIR and tempfile's settled directory,
+    never asked of `tempfile.gettempdir`, whose first answer writes a probe file under a lock this hook,
+    called within it, would wait on for ever."""
     if name.startswith(("/dev/", "/proc/")) or "__pycache__" in name.split(os.sep):
         return True
     log = os.environ.get("DEW_EXECUTED_LOG")
-    places = [tempfile.gettempdir(), *(where for where in (
-        os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR"), os.environ.get(CHILDREN),
-        log and f"{log}.children") if where)]
+    settled = getattr(sys.modules.get("tempfile"), "tempdir", None)
+    places = [where for where in (
+        os.environ.get("TMPDIR"), settled, os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR"),
+        os.environ.get(CHILDREN), log and f"{log}.children") if where]
     exact = {os.path.abspath(path) for path in (log, os.environ.get("DEW_COLLECTED"),
                                                 os.environ.get("DEW_EXECUTED_REPORT")) if path}
-    return name in exact or any(beneath(name, where) for where in places)
+    return name in exact or any(name == os.path.realpath(where) or beneath(name, where) for where in places)
 
 
 @unprobed

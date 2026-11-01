@@ -20,6 +20,7 @@ def followed(tmp_path, monkeypatch):
     for name in ("tmp", "caches"):
         (own / name).mkdir(parents=True)
     monkeypatch.setattr(tempfile, "tempdir", str(own / "tmp"))
+    monkeypatch.setenv("TMPDIR", str(own / "tmp"))
     monkeypatch.setenv(module.PRIVATE, str(own / "caches"))
     monkeypatch.setenv("DEW_EXECUTED_LOG", str(own / "0.lifetime.log"))
     monkeypatch.setenv("DEW_COLLECTED", str(own / "0.collected.json"))
