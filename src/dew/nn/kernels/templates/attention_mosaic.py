@@ -375,9 +375,12 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     """A step's score-hook parameters (`params`, each its `Kind` and dtype), live beside its logits: a
     TILE's `[bq, bk]` tile, a KEY's vector in the accumulator's column layout and a QUERY's in its row
     layout (`Family.column_registers`, `row_registers`); a HEAD's scalar no tile; each in the dtype its kernel
-    loads it (`kept_dtype`). With `grads`, a backward launch's gradients of them too, fp32, where it forms
-    them: a TILE's tile a step and a KEY's carried across its walk in the dK/dV launch (`grads="keys"`), a
-    QUERY's carried in the dQ launch (`grads="queries"`, `DQ_GRADS`). A `keys_first` step's
+    loads it (`kept_dtype`). With `grads`, a backward launch's gradients of them too, fp32, where it carries
+    them: a KEY's across its walk in the dK/dV launch (`grads="keys"`), a QUERY's in the dQ launch
+    (`grads="queries"`, `DQ_GRADS`); a TILE's gradient is the step's score cotangents through the hook's
+    slope, formed in their place and stored, no tile beside them (an A100's dK/dV under a tile bias at
+    64 x 64, width 64: 255 registers unspilled and none spilled at a cap of 247, where its tile beside them
+    priced 280). A `keys_first` step's
     tile lays its keys along its rows, so a KEY's vector is in the row layout and a QUERY's in the column.
     Returns the step's tiles and the vectors' registers."""
     keys, queries = ((family.row_registers, family.column_registers) if keys_first
@@ -385,8 +388,7 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     step, vectors = [], 0
     for kind, dtype in params:
         if kind is Kind.TILE:
-            grad = [(block_q, block_k, jnp.float32)] if grads == "keys" else []
-            step += [(block_q, block_k, dtype), *grad]
+            step.append((block_q, block_k, dtype))
         elif kind is Kind.KEY:
             vectors += keys(block_k, dtype) + (keys(block_k, jnp.float32) if grads == "keys" else 0)
         elif kind is Kind.QUERY:
@@ -694,11 +696,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
-        # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless and
-        # undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's layout
-        # or keys first on one whose consumers share a key block (`split_queries`), each consumer's share of
-        # a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer its own
-        # keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`).
+        # The one launch (which `derived` takes only where `ONE_LAUNCH` holds, off for row 3180; a pinned
+        # config reaches it still) adds each tile's dQ under the first pass's D: the fast form's, a hookless
+        # and undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's
+        # layout or keys first on one whose consumers share a key block (`split_queries`), each consumer's
+        # share of a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer
+        # its own keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`).
         hooked = (self.score_mod is not None or ba.arguments["initial"] is not None
                   or ba.arguments["drop"] is not None)
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
@@ -746,7 +749,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         launches walk the largest their registers and the block hold, two stages, one consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
         at 64 x 64 with two consumers and one). The fast form of a hookless call takes one launch where one
-        holds the whole width, its dK/dV program queries first adding each tile's dQ atomically
+        holds the whole width and the one launch is derived at all (`ONE_LAUNCH`, held off by row 3180's
+        containment: until then every call takes two launches), its dK/dV program queries first adding each
+        tile's dQ atomically
         (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100:
         5.20 against 6.19 ms the two keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
