@@ -218,7 +218,7 @@ class Released(pygrain.MapDataset):
     def __init__(self, rows: pygrain.MapDataset, order: pygrain.MapDataset, *, prefix: bool = False):
         super().__init__(rows)
         self._rows, self._order, self._prefix = rows, order, prefix
-        self._spans: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._spans: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         # The passes tabled, the one read last and the one before, as a read ahead crosses between them.
         self._tables: dict[int, np.ndarray] = {}
 
@@ -247,36 +247,38 @@ class Released(pygrain.MapDataset):
             self._tables[epoch] = table
         return {**row, CONSUMED: int(table[0, place]), REFUSED: int(table[1, place])}
 
-    def _units(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Each unit's counts, whether it is kept, and the first unit of its span (`SINCE`)."""
+    def _units(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Each unit's counts, consumed and refused, and whether its row is kept."""
         if self._spans is None:
-            counts = [(accounts(row), isinstance(row, Mapping)) for row in map(self._rows.__getitem__,
-                                                                                range(len(self._rows)))]
-            consumed = np.asarray([held[0] for held, _ in counts], np.int64)
-            refused = np.asarray([held[1] for held, _ in counts], np.int64)
-            kept = np.asarray([keeps for _, keeps in counts], bool)
-            since, last = np.arange(len(counts)), 0
-            for unit in np.flatnonzero((consumed != 0) | (refused != 0)):
-                since[unit] = last
-                last = last if self._prefix else int(unit)
-            self._spans = consumed, refused, kept, since
+            rows = [self._rows[unit] for unit in range(len(self._rows))]
+            counts = np.asarray([accounts(row) for row in rows], np.int64).reshape(-1, 2)
+            self._spans = counts[:, 0], counts[:, 1], np.asarray([isinstance(row, Mapping) for row in rows])
         return self._spans
 
     def _released(self, epoch: int) -> np.ndarray:
-        """The counts each place of pass `epoch` of the order releases, consumed and refused. A count with
-        no kept row from its place on is the stream's last, which its end credits (`dew.training._fit`)."""
-        consumed, refused, kept, since = self._units()
+        """The counts each place of pass `epoch` of the order releases, consumed and refused: a counting
+        unit's at the place its span's last unit is read, each span running from the counting unit before
+        it (or the first unit, `prefix`) through it. A count with no kept row from its place on is the
+        stream's last, which its end credits (`dew.training._fit.drained`)."""
+        consumed, refused, kept = self._units()
         units = len(consumed)
         drawn = np.asarray([self._order[epoch * units + place] for place in range(units)], np.int64)
         place_of = np.empty(units, np.int64)
         place_of[drawn] = np.arange(units)
-        # The next kept row at or after each place, past the end where none is.
-        next_kept = np.full(units + 1, units, np.int64)
-        for place in range(units - 1, -1, -1):
-            next_kept[place] = place if kept[drawn[place]] else next_kept[place + 1]
+        counting = np.flatnonzero((consumed != 0) | (refused != 0))
         released = np.zeros((2, units), np.int64)
-        for unit in np.flatnonzero((consumed != 0) | (refused != 0)):
-            at = next_kept[int(place_of[since[unit]:unit + 1].max())]
-            if at < units:
-                released[:, at] += (consumed[unit], refused[unit])
+        if not len(counting):
+            return released
+        if self._prefix:
+            last = np.maximum.accumulate(place_of)[counting]
+        else:
+            # Span k runs from counting unit k - 1 (the first unit for k = 0) through counting unit k.
+            starts = np.concatenate([[0], counting[:-1]])
+            last = np.maximum(np.maximum.reduceat(place_of[:counting[-1] + 1], starts), place_of[counting])
+        kept_places = np.flatnonzero(kept[drawn])
+        at = np.searchsorted(kept_places, last)
+        placed = at < len(kept_places)
+        targets = kept_places[at[placed]]
+        np.add.at(released[0], targets, consumed[counting][placed])
+        np.add.at(released[1], targets, refused[counting][placed])
         return released
