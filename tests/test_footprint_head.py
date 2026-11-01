@@ -226,15 +226,13 @@ def test_a_gradient_is_consumed_where_it_is_made_only_by_an_update_that_reads_it
 def test_a_step_consumes_a_gradient_where_it_is_made_only_into_device_resident_state():
     """A step whose optimizer state and EMA are in device memory updates each gradient where it is made;
     one whose EMA is fetched from the host fetches it behind one barrier over every gradient
-    (`Transaction.past`), which holds them all (`consumed_where_made`)."""
-    def placed(layout):
-        trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout)
+    (`Transaction.past`), and one whose loss is dynamically scaled commits only once every gradient is
+    known finite, either holding them all (`consumed_where_made`)."""
+    device, host = Layout(min_shard=1, tolerance=1.0), Layout(min_shard=1, tolerance=1.0, host=("ema",))
+    for layout, scaled, consumed in ((device, False, True), (host, False, False), (device, True, False)):
+        trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
+                          dynamic_scale=scaled)
         state, _, _ = trainer.place()
-        return trainer, state
-
-    for layout, consumed in ((Layout(min_shard=1, tolerance=1.0), True),
-                             (Layout(min_shard=1, tolerance=1.0, host=("ema",)), False)):
-        trainer, state = placed(layout)
         assert consumed_where_made(trainer.optimizer, state, 1) is consumed
 
 
