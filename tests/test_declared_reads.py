@@ -236,10 +236,14 @@ def test_an_index_whose_lease_waits_holds_no_other_index_back(tmp_path):
     read = []
     reader = threading.Thread(target=lambda: read.append(quick.values.tolist()))
     reader.start()
-    reader.join(10)
-    release.set()
-    waiting.join(60)
-    assert read == [list(range(8))]
+    try:
+        reader.join(10)
+        # Read while the other index's lease still waits.
+        assert read == [list(range(8))]
+    finally:
+        release.set()
+        waiting.join(60)
+        reader.join(60)
 
 
 def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is_read():
