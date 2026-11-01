@@ -1,6 +1,6 @@
 """What the data suites share: Grain's flags parsed for its worker processes, a caption reader that
-hands the words back, the caption templates and host augmentation the image suites draw from, and a
-random step that draws a wide integer."""
+hands the words back, the caption templates and host augmentation the image suites draw from, a
+random step that draws a wide integer, and an objective's expansion of a record into rows of it."""
 
 import dataclasses
 import itertools
@@ -33,6 +33,18 @@ def keep_captions(captions):
 
 
 @dataclasses.dataclass(frozen=True)
+class Questioned:
+    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
+    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`), its identity
+    stable, so a resumed run knows it for the step it saved."""
+
+    identity = "questioned@1"
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question)}
+                     for question in range(int(element["id"]) % 3 + 1))
+
+
 class WideDraw(grain.RandomMapTransform):
     """A record's draw of an integer below 2**32, which its generator makes."""
 

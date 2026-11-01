@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import grain.python as grain
 import numpy as np
 import pytest
+from data_support import Questioned
 from sampling_gate import assert_draws_as_declared
 
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
@@ -765,17 +766,6 @@ def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
     assert {name for name in counts if name.startswith("data/rows/")} == {
         "data/rows/train-1", "data/rows/train-2", "data/rows/train-3"}
     assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
-
-
-class Questioned:
-    """An objective's step that makes `id % 3 + 1` rows of each record (a decision layout's row a
-    question), marked as one (`FlatMap.examples`) where an objective appends it."""
-
-    identity = "questioned@1"
-
-    def flat_map(self, element):
-        return tuple({"id": element["id"], "question": np.int32(question)}
-                     for question in range(int(element["id"]) % 3 + 1))
 
 
 class ThirdQuestionRefused:
