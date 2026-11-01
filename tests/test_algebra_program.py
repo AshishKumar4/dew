@@ -121,3 +121,20 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     assert made.fired.get("linear", 0) > 0
     assert made.after < made.before
     assert made.seconds > 0
+
+def test_a_program_the_rules_cannot_rewrite_is_kept_as_traced():
+    """A program whose math no rule's left side reads (no sum of two reductions, products or contractions,
+    no reduction of a product), in its own body or in a scan's, is left as traced: none of its regions is
+    saturated or recorded, and its scan's body is the one it traced, so a program of many such bodies pays
+    the pass nothing (row 3279's rollout pool paid 20 to 40 ms a region)."""
+    def stepped(x):
+        return jax.lax.scan(lambda carry, row: (jnp.tanh(carry + row), carry * 2.0), x[0], x)[1]
+
+    x = rows(4, (6, 8))[0]
+    with report.refusals():
+        before = jax.make_jaxpr(stepped)(x)
+        after = jax.make_jaxpr(algebra.rewritten(stepped))(x)
+        assert report.rewrites() == ()
+    [scan] = [equation for equation in after.jaxpr.eqns if equation.primitive.name == "scan"]
+    [traced] = [equation for equation in before.jaxpr.eqns if equation.primitive.name == "scan"]
+    assert str(scan.params["jaxpr"]) == str(traced.params["jaxpr"])
