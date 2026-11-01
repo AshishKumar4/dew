@@ -35,8 +35,9 @@ def outputs(model: torch.nn.Module, inputs: dict[str, np.ndarray], device: str,
     """`model`'s leaves over a batch: each valid position's logits of its forward (`logits`) and, where
     `stepped`, its first row's first `STEPPED_PREFILL` positions from one forward over them and each later
     one from a forward over the row up to it (`stepped`)."""
-    ids = torch.tensor(inputs["input_ids"], device=device)
-    mask = torch.tensor(inputs["attention_mask"], device=device)
+    # 64-bit, as each tool's fixture batch hands them (`kimi_k3_reference.fixture_on_gpu`).
+    ids = torch.tensor(inputs["input_ids"], dtype=torch.long, device=device)
+    mask = torch.tensor(inputs["attention_mask"], dtype=torch.long, device=device)
     with torch.no_grad():
         logits = model(input_ids=ids, attention_mask=mask, use_cache=False).logits.cpu().numpy()
         found = {"logits": logits[inputs["attention_mask"].astype(bool)]}
@@ -66,7 +67,6 @@ def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], co
             tool.load_weights(model, tensors)
             return model
 
-        released, twin = tool.released_modules(), tool.remote_modules()
     else:
         import kimi_linear_reference as tool
 
@@ -77,7 +77,10 @@ def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], co
             tool.load_weights(model, tensors)
             return model
 
-        released, twin = tool.released_modules(), tool.patched()
+    # One import of the modules for both runs: each tool's `truth` builds its twin from the same modules
+    # (K3's `remote_modules`, Kimi Linear's `patched`), which `released_modules` imports once, its own
+    # change only to fla's GPU kernels.
+    released = tool.released_modules()
     config = json.loads((tool.DESTINATION / "config.json").read_text())
     tensors = load_file(str(tool.DESTINATION / "model.safetensors"))
     # The twin holds K3's MXFP4 experts exactly (kimi_k3_reference.truth's condition).
@@ -87,12 +90,12 @@ def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], co
 
     def wide_context() -> contextlib.ExitStack:
         stack = contextlib.ExitStack()
-        stack.enter_context(installed(twin[-1]))
+        stack.enter_context(installed(released[-1]))
         stack.enter_context(float64())
         return stack
 
     with wide_context():
-        wide = built(*twin[:2], torch.float64).eval()
+        wide = built(*released[:2], torch.float64).eval()
     return narrow, wide, wide_context
 
 
