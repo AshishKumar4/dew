@@ -327,6 +327,86 @@ def test_a_hoisted_index_chain_longer_than_ptxas_recomputes_is_held_across_its_l
     assert found[False][1] <= 255 < found[True][1]
 
 
+def _offsets_loop(mask: int, modulus: int | None = None, places: tuple[int, ...] = (8,)) -> str:
+    """A launch of 128 threads whose loop reads, for each of `places` (a register's place in a tile), the
+    offsets of the pair of adjacent columns it holds: each column's index its lane's place (`(lane % 4) * 2`,
+    bits 1 and 2) beside the register's, taken modulo a tile's `modulus` where given, a chain over the thread
+    id longer than `RECOMPUTED`, masked by `mask`."""
+    tile = f"%tile = arith.constant {modulus} : i32" if modulus else ""
+    constants = "\n          ".join(
+        f"%place{k} = arith.constant {place} : i32" for k, place in enumerate(places))
+    chains, steps, row = [], [], "%row"
+    for k in range(len(places)):
+        first = f"%first{k} = arith.addi %own, %place{k} : i32"
+        if modulus:
+            first = (f"%placed{k} = arith.addi %own, %place{k} : i32\n"
+                     f"              %first{k} = arith.remui %placed{k}, %tile : i32")
+        chains.append(f"{first}\n"
+                      f"              %second{k} = arith.addi %first{k}, %next : i32\n"
+                      f"              %columns{k} = vector.from_elements %first{k}, %second{k} "
+                      ": vector<2xi32>\n"
+                      f"              %offsets{k} = arith.andi %columns{k}, %mask : vector<2xi32>")
+        steps.append(f"%behind{k} = arith.cmpi slt, %offsets{k}, {row} : vector<2xi32>\n"
+                     f"                %kept{k} = arith.select %behind{k}, {row}, %offsets{k} "
+                     ": vector<2xi1>, vector<2xi32>")
+        row = f"%kept{k}"
+    chained, stepped = "\n              ".join(chains), "\n                ".join(steps)
+    return f"""
+      module {{
+        func.func @kernel(%bound: vector<2xi32>) {{
+          %zero = arith.constant 0 : index
+          %one = arith.constant 1 : index
+          %steps = arith.constant 16 : index
+          %threads = arith.constant 128 : index
+          %four = arith.constant 4 : i32
+          %two = arith.constant 2 : i32
+          %next = arith.constant 1 : i32
+          {constants}
+          {tile}
+          %mask = arith.constant dense<{mask}> : vector<2xi32>
+          gpu.launch blocks(%bx, %by, %bz) in (%gx = %one, %gy = %one, %gz = %one)
+            threads(%tx, %ty, %tz) in (%sx = %threads, %sy = %one, %sz = %one) {{
+              %thread = gpu.thread_id x
+              %id = arith.index_cast %thread : index to i32
+              %lane = arith.remui %id, %four : i32
+              %own = arith.muli %lane, %two : i32
+              {chained}
+              %last = scf.for %i = %zero to %steps step %one iter_args(%row = %bound) -> (vector<2xi32>) {{
+                {stepped}
+                scf.yield {row} : vector<2xi32>
+              }}
+              llvm.inline_asm has_side_effects "", "r" %last : (vector<2xi32>) -> ()
+              gpu.terminator
+            }}
+          return
+        }}
+      }}
+    """
+
+
+def test_a_hoisted_index_chain_every_thread_computes_alike_takes_no_register():
+    """Masking the lane's bits off a column's index (-7 clears bits 1 and 2) leaves the register's place, the
+    same constant in every thread: LLVM folds it from the bits it knows of the thread id and ptxas compares
+    against it as an immediate, as the sm90 fused dK/dV backward's causal mask does (32 offsets, SASS
+    `ISETP.GT.AND P4, PT, R12, 0x8`, where the pass held them across the loop, 262 registers against ptxas's
+    232). Masking only one lane bit (-3) leaves the offsets differing by thread: a chain longer than ptxas
+    recomputes, held across the loop, its pair of registers. A tile a power of two wide folds as well; one
+    of 28 columns takes a multiply-high remainder, which LLVM folds against no known bit: held."""
+    folded, varying, wide, odd = (analyzed(_offsets_loop(mask, modulus)).total
+                                  for mask, modulus in ((-7, None), (-3, None), (-7, 32), (-7, 28)))
+    assert (varying - folded, wide - folded, odd - folded) == (2, 0, 2)
+
+
+def test_hoisted_index_chains_equal_in_every_thread_are_one_register():
+    """Masking a column's index down to its lane's bits (6) leaves the thread's own place, the same in a
+    pair's two columns and in each register's pair: one value, which LLVM merges (the fused forward's 32
+    such bases are one `and.b32 %r10, %r92, 6` in its PTX, where the pass held 64 registers). Registers at
+    two places whose lane bits differ (8 and 10) are two values."""
+    constant, shared, distinct = (analyzed(_offsets_loop(mask, None, places)).total
+                                  for mask, places in ((-7, (8, 16)), (6, (8, 16)), (6, (8, 10))))
+    assert (shared - constant, distinct - constant) == (1, 2)
+
+
 _TIED_SCALAR = """
   module {
     func.func @kernel(%x: f32) -> f32 {
