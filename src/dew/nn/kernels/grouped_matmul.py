@@ -423,7 +423,6 @@ class _Triton(_GroupedLaunch[Tile]):
         """The elements of both operand tiles one depth step loads."""
 
 
-@dataclasses.dataclass(frozen=True)
 def _product_sides(ba) -> tuple[int, int]:
     """A product's output: its tokens by its kernel's width."""
     kernel = ba.arguments['kernel']
@@ -436,6 +435,7 @@ def _gradient_sides(ba) -> tuple[int, int]:
     return ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
 
 
+@dataclasses.dataclass(frozen=True)
 class Gmm(_Triton):
     """Each group's rows of `tokens` `[rows, in]` times its matrix of
     `kernel` `[groups, in, out]`, or of its transpose with `trans_rhs`."""
