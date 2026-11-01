@@ -10,18 +10,16 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import product
+from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
     CHUNK,
     FAST_PARTS,
     Work,
-    _axis,
     _Call,
     _column,
     _column_scratch,
@@ -40,7 +38,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _taken,
     _tile,
     _views,
-    _walk,
 )
 
 
@@ -69,9 +66,9 @@ def _key_scores_back(scores, do, corrected, taken, call: _Call):
     grads, square = _value_grads(call), _fp32(call)
     blocks = value_width // call.block
 
-    def program(s_ref, do_ref, v_ref, taken_ref, ds_ref, dv_ref, *, streams, staging, landing):
+    def program(at, s_ref, do_ref, v_ref, taken_ref, ds_ref, dv_ref, *, streams, staging, landing):
         del staging
-        n, h = _axis("chunks"), _axis("heads")
+        n, h = at["chunks"], at["heads"]
         row = n * CHUNK
         views = _views(scores=held.views(s_ref, row, CHUNK, h * CHUNK, CHUNK),
                        out=given.views(do_ref, row, CHUNK, h * value_width, value_width),
@@ -91,7 +88,7 @@ def _key_scores_back(scores, do, corrected, taken, call: _Call):
                          smem=landing["square"])
             return carry, accumulators
 
-        _walk(streams, views, step, call)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(scores=((CHUNK, CHUNK), held), out=((CHUNK, value_width), given),
                       corrected=((CHUNK, value_width), held))
@@ -128,11 +125,11 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, memory, dh, a, beta, taken
     steps, blocks = width // keys, value_width // call.block
     staging, landing = _key_memory_staged(call, keys)
 
-    def program(q_ref, k_ref, hi_ref, lo_ref, do_ref, v_new_ref, dv_ref, h_ref, dh_ref, a_ref, beta_ref,
+    def program(at, q_ref, k_ref, hi_ref, lo_ref, do_ref, v_new_ref, dv_ref, h_ref, dh_ref, a_ref, beta_ref,
                 taken_ref, dq_ref, dk_ref, dg_ref, da_ref, db_ref, *, streams, staging, landing):
         squared = landing[_square_landing(keys)]
         weights, scratch = staging
-        n, h = lax.axis_index("chunks"), lax.axis_index("heads")
+        n, h = at["chunks"], at["heads"]
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
         keyed, memory_row = h // call.group * width, (n * call.heads + h) * width
         views = {**_views(lambda i: (0, 0),
@@ -183,7 +180,7 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, memory, dh, a, beta, taken
 
         # The carries laid out as their sums are: splats, Mosaic GPU's layout inference ran out of its
         # search's fuel (kda-lower4-sm90 at 739b21575).
-        _walk(streams, views, step, call, steps=steps,
+        return mosaic.Walk(views, step, steps=steps,
               carry=(family.as_tile(family.zeros((CHUNK, CHUNK))), family.as_row(family.zeros((CHUNK,)))))
 
     tiles = _streamed(out=((CHUNK, value_width), given), corrected=((CHUNK, value_width), held),
@@ -227,10 +224,10 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: _Call):
         call), _fp32(call)
     blocks = value_width // call.block
 
-    def program(dv_ref, v_ref, a_ref, beta_ref, system_ref, taken_ref, dv_out_ref, da_ref, db_ref, *, streams,
-                staging, landing):
+    def program(at, dv_ref, v_ref, a_ref, beta_ref, system_ref, taken_ref, dv_out_ref, da_ref, db_ref, *,
+                streams, staging, landing):
         values, system = staging
-        n, h = _axis("chunks"), _axis("heads")
+        n, h = at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         views = _views(value_grads=grads.views(dv_ref, row, CHUNK, h * value_width, value_width),
                        values=given.views(v_ref, row, CHUNK, h * value_width, value_width),
@@ -257,7 +254,7 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: _Call):
             db_ref.at[h, span][...] = beta_terms
             return carry, accumulators
 
-        _walk(streams, views, step, call)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(value_grads=((CHUNK, value_width), grads), values=((CHUNK, value_width), given),
                       lower=((CHUNK, CHUNK), held), system=((CHUNK, CHUNK), square))
@@ -327,10 +324,10 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
                       functools.partial(_key_pairs_staged, call))
     steps = width // keys
 
-    def program(q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
+    def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
                 db_ref, *, streams, staging, landing):
         pairs, squares, referenced = staging
-        n, h = lax.axis_index("chunks"), lax.axis_index("heads")
+        n, h = at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         keyed = h // call.group * width
         views = {**_views(lambda i: (0, 0), scores=square.views(ds_ref, row, CHUNK, h * CHUNK, CHUNK),
@@ -385,7 +382,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
 
             return d_betas, accumulators
 
-        _walk(streams, views, step, call, steps=steps, carry=family.as_row(family.zeros((CHUNK,))))
+        return mosaic.Walk(views, step, steps=steps, carry=family.as_row(family.zeros((CHUNK,))))
 
     tiles = _streamed(scores=((CHUNK, CHUNK), square), system=((CHUNK, CHUNK), square),
                       queries=((CHUNK, keys), given), keys=((CHUNK, keys), given),

@@ -10,7 +10,6 @@ from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -25,7 +24,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Tiles,
     Work,
     _addressed,
-    _axis,
     _block_stored,
     _Call,
     _column,
@@ -54,7 +52,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _vector_blocks,
     _vector_views,
     _views,
-    _walk,
     _walk_stores,
     kept_forward,
 )
@@ -303,9 +300,9 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     vb = _value_block(call, functools.partial(_local_back_held, call),
                       functools.partial(_local_back_staged, call))
 
-    def program(q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
+    def program(at, q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
-        n, h = _axis("chunks"), _axis("heads")
+        n, h = at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         keyed = h // call.group * width
         views = _views(queries=given.views(q_ref, row, CHUNK, keyed, width),
@@ -340,7 +337,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
                 scale, given.dtype, issue, issue.summed, emit=stored, laid=laid)
             return carry, accumulators
 
-        _walk(streams, views, step, call, prologue=None if streamed else lambda: read(None))
+        return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
 
     tiles = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
                       out=((CHUNK, value_width), given))
@@ -475,12 +472,12 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
     assert gates or not skips, "the walk adds a skip where it gates the values"
     assert call.per_key == (memory is not None), "the walk takes the memories under a decay a key dimension"
 
-    def program(q_ref, k_ref, w_ref, do_ref, local_ref, hi_ref, lo_ref, dht_ref, seq_ref, v_ref, beta_ref,
+    def program(at, q_ref, k_ref, w_ref, do_ref, local_ref, hi_ref, lo_ref, dht_ref, seq_ref, v_ref, beta_ref,
                 *refs, streams, staging, landing):
         skip_ref, refs = (refs[0], refs[1:]) if skips else (None, refs)
         entered_ref, (dh_ref, dv_ref, dh0_ref, *gated_ref) = (refs[0], refs[1:]) if call.per_key else (None,
                                                                                                          refs)
-        j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
+        j, s, h = at["blocks"], at["sequences"], at["heads"]
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
         roled = _roled(staging, landing, walkers)
         walked = j * walked_width
@@ -574,7 +571,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                    # (fp32-plan-sm90 at cdcd620ef, wide-backward).
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2), work=work,
                    held=_reverse_held(call, bv, gates=gates, skips=skips), consumers=walkers,
-                   live=lambda refs: refs[8][lax.axis_index("sequences"), 1] > 0,
+                   live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
                    staging=(*_staging(held, (call.block, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
                    once=finals,
                    landing={**_memory_landing(call, bv), "corrected": grads.landing(CHUNK, bv),
@@ -748,12 +745,12 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     splits, blocks, group = value_width // vq, vq // call.block, call.group
     keyed_width, key_blocks = call.heads // group * width, width // call.block
 
-    def program(q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
+    def program(at, q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
                 beta_ref, dq_ref, dk_ref, dw_ref, after_ref, leaving_ref, memory_ref, *, streams, staging,
                 landing):
         del staging
-        c, n, keyed = lax.axis_index("blocks"), lax.axis_index("chunks"), lax.axis_index("heads")
-        split = lax.axis_index("values")
+        c, n, keyed = at["blocks"], at["chunks"], at["heads"]
+        split = at["values"]
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
         key_columns = keyed * width + c * call.block
         first = keyed * group
@@ -824,7 +821,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
             return carry, accumulators
 
         # Without the delta rule the scores' products the first step's alone.
-        _walk(streams, views, step, call, steps=group, segments=() if call.delta else (
+        return mosaic.Walk(views, step, steps=group, segments=() if call.delta else (
             (step, 0, 1), (functools.partial(step, scores=False), 1, group)))
 
     tiles, out_type = _query_key_launched(call, vq)
@@ -883,9 +880,9 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
     blocks = value_width // call.block
     group = 1 if call.delta else call.group
 
-    def program(q_ref, k_ref, v_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref,
+    def program(at, q_ref, k_ref, v_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref,
                 beta_ref, ds_ref, decay_ref, *, streams, staging, landing):
-        n, head = _axis("chunks"), _axis("heads")
+        n, head = at["chunks"], at["heads"]
         first = head * group
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         keyed = first // call.group * width
@@ -942,7 +939,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
 
         read = _prefix_reader(family, streamed, vectors, first, span)
         prologue = None if streamed or group > 1 else lambda: read(None)
-        _walk(streams, views, step, call, steps=group, prologue=prologue)
+        return mosaic.Walk(views, step, steps=group, prologue=prologue)
 
     tiles = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
                       values=((CHUNK, value_width), held), out=((CHUNK, value_width), given))
@@ -981,9 +978,9 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
     width, value_width, family = call.width, call.value_width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
-    def program(a_ref, k_ref, v_ref, dw_ref, du_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref,
-                taken_ref, dl_ref, *, streams, staging, landing):
-        n, h = _axis("chunks"), _axis("heads")
+    def program(at, a_ref, k_ref, v_ref, dw_ref, du_ref, hi_ref, lo_ref, beta_ref, column_hi_ref,
+                column_lo_ref, taken_ref, dl_ref, *, streams, staging, landing):
+        n, h = at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         (staged,) = staging
         views = _views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
@@ -1010,7 +1007,7 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
             held.store(dl_ref, d_l, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             return carry, accumulators
 
-        _walk(streams, views, step, call)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(lower=((CHUNK, CHUNK), held), keys=((CHUNK, width), given),
                       values=((CHUNK, value_width), given), w_grads=((CHUNK, width), held),
@@ -1039,8 +1036,9 @@ def _values_back(a, v, du, beta, taken, call: _Call):
     value_width, family = call.value_width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
-    def program(a_ref, v_ref, du_ref, beta_ref, taken_ref, dv_ref, dbeta_ref, *, streams, staging, landing):
-        n, h = _axis("chunks"), _axis("heads")
+    def program(at, a_ref, v_ref, du_ref, beta_ref, taken_ref, dv_ref, dbeta_ref, *, streams, staging,
+                landing):
+        n, h = at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         (staged,) = staging
         views = _views(lower=held.views(a_ref, row, CHUNK, h * CHUNK, CHUNK),
@@ -1060,7 +1058,7 @@ def _values_back(a, v, du, beta, taken, call: _Call):
                 emit=stored)
             return carry, accumulators
 
-        _walk(streams, views, step, call)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(lower=((CHUNK, CHUNK), held), values=((CHUNK, value_width), given),
                       u_grads=((CHUNK, value_width), held))
@@ -1090,9 +1088,9 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
     width, family = call.width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
 
-    def program(a_ref, k_ref, dw_ref, dl_ref, hi_ref, lo_ref, beta_ref, taken_ref, dk_ref, dbeta_ref,
+    def program(at, a_ref, k_ref, dw_ref, dl_ref, hi_ref, lo_ref, beta_ref, taken_ref, dk_ref, dbeta_ref,
                 after_ref, decay_ref, *, streams, staging, landing):
-        c, n, h = _axis("blocks"), _axis("chunks"), _axis("heads")
+        c, n, h = at["blocks"], at["chunks"], at["heads"]
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         staged, *summing = staging
         column = c * call.block
@@ -1123,7 +1121,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
             after_ref.at[c, h, span][...] = after
             return carry, accumulators
 
-        _walk(streams, views, step, call)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(lower=((CHUNK, CHUNK), held), keys=((CHUNK, call.block), given),
                       w_grads=((CHUNK, call.block), held), system=((CHUNK, CHUNK), held))

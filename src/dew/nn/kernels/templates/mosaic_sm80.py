@@ -6,6 +6,7 @@ accumulator the walk carries in registers. An accumulator's value is the next pr
 registers (the fork's relayout, jax 0.11.2.post13 and later), as FlashAttention-2 reuses its fragments.
 Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is a dtype's (`Mma`)."""
 
+import abc
 import dataclasses
 from collections.abc import Callable
 
@@ -87,47 +88,27 @@ class Streams:
 
 
 @dataclasses.dataclass(frozen=True)
-class Mma(mosaic.Family):
-    """mma.sync's bundle for operands of `dtype`: one compute warpgroup a program and no producer
-    (`emit_pipeline` issues its loads), accumulators in registers, products synchronous, its warps
-    `m_warps` along a tile's rows and the rest along its columns (JAX's `MMALayouts`; `for_tile`)."""
+class MmaIssuer(mosaic.Issuer[jax.Array]):
+    """mma.sync's issuer and home for operands of `dtype`: accumulators in registers, products synchronous,
+    each operand loaded into its fragments from shared memory (ldmatrix), its warps `m_warps` along a tile's
+    rows and the rest along its columns (JAX's `MMALayouts`; `Mma.for_tile`)."""
 
     dtype: jnp.dtype
+
     m_warps: int = 4
 
-    name = "mma.sync"
     rows = 16
-    # One consumer warpgroup a program; a multiprocessor runs two programs (`programs`). Two consumers in
-    # one program took 1.04 to 1.50 of one's time on an A100 (CONSUMERS1), their shared copies leaner or
-    # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
-    consumers = 1
+
     # Its kernels take hooks and exact sums (their side loads, vector reads and running sum lower), but
     # its register model does not count what they hold, and its derived tiles spilled (ns-regs2: sm86's
     # normed forward 16 bytes, exact sums 136).
     counts_hooks = False
-    walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
-    bounded_loads = False
-    role_rows = 4 * 16
-    operands_in_registers = True
-    # A step loading ahead of the one consumed leaves cp.async's latency unhidden: two steps 64 deep stalled
-    # on barriers 1.1-1.5 an issue against XLA's 0.3-0.7 (FS-NCU-DW2-a100), and 32-deep steps three
-    # deep took dense products 4-8% less time than 64 deep two (FS-DENSE-STEPS1-a100).
-    loads_ahead = 2
-    products_overlap = False
-    stores_through_registers = True
 
-    @classmethod
-    def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
-        """The bundle for a warpgroup's `rows` x `columns` of a tile, its warps split `m_warps` along the
-        rows and the rest along the columns (`MMALayouts`; each product states it, `plgpu.mma`'s
-        `m_warps`): of the splits whose atom, `m_warps * 16` rows by `(4 // m_warps) * 8` columns, divides
-        it, the one reading its operands from shared memory fewest times a step, each warp reading its
-        rows' share whole and its columns' share whole (`rows * (4 // m) + columns * m`), the most along
-        the rows on a tie. A 128 x 128 tile so splits 2 x 2 (512 reads a step, where four warps along its
-        rows read 640), each warp holding half the right operand's fragments."""
-        splits = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
-        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, -m)) if splits else 4
-        return cls(jnp.dtype(dtype), m_warps)
+    role_rows = 4 * 16
+
+    operands_in_registers = True
+
+    products_overlap = False
 
     @property
     def transposed_rows(self) -> int:
@@ -165,17 +146,16 @@ class Mma(mosaic.Family):
         row bytes allow (`swizzled`, `_depth_granule`), the whole depth where it is narrower."""
         widest = mosaic.swizzle_columns(self.dtype, mosaic.widest_swizzle(self.dtype, depth))
         return max(self.fragment_depth(depth), min(depth, widest))
-    most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
-    copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
+
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
+
     column_scratch = 0  # its column sums take its kernels' reduction scratch
 
-    def registers(self, consumers: int) -> int:
-        # Each role at a thread's whole budget: two warpgroups' 256 threads hold 255 each of a
-        # multiprocessor's 64K registers.
-        _one(consumers)
-        return 255
-
+    @property
+    def lane_columns(self) -> int:
+        # A thread holds two adjacent columns of each 8 (lane % 4 times two) in its warp's 8 of each
+        # `n_warps * 8` (`MMALayouts`' accumulator tiling).
+        return 6 | 8 * (4 // self.m_warps - 1)
 
     def column_registers(self, columns: int, dtype) -> int:
         # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a
@@ -190,24 +170,6 @@ class Mma(mosaic.Family):
         # Each of the `m_warps` row warps' 16-row tiles a thread's two rows (`MMALayouts`' accumulator
         # tiling), so a thread holds two of each `m_warps * 16` rows.
         return -(-rows * 2 * jnp.dtype(dtype).itemsize // (self.m_warps * 16 * 4))
-
-    def column_unit(self, dtype) -> int:
-        # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
-        # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
-        # columns; row 2078's probe: every attention launch on sm80 at 64-column tiles).
-        del dtype
-        return resources.THREADS // 2
-
-    def stores_columns(self, columns: int, rows: int) -> bool:
-        # Its store ladder reloads each rung's rows from shared memory through registers, whose strided
-        # layout wants a multiple of a role's threads in elements: its least rung, `rows` of `columns`, must
-        # hold one (BC-RAGGED-STORE: a grouped call's one-row rung at 64 columns finds no layout, a dense
-        # call's rungs of 8 rows do; UNIT64-2: a 192-column row, a thread and a half's, none either).
-        return rows * columns % resources.THREADS == 0
-
-    def depths(self, dtype) -> tuple[int, ...]:
-        # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
-        return tuple(mosaic.swizzle_columns(dtype, swizzle) for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
     @property
     def layout(self):
@@ -229,6 +191,109 @@ class Mma(mosaic.Family):
     def rhs(self):
         return plgpu.Layout.MMA_RHS(self.dtype, m_warps=self.m_warps)
 
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        # One warpgroup a program: Mosaic GPU's own reduction across its warps, through the scratch its
+        # kernels' parameters reserve (`reduction_scratch`).
+        del scratch, interpret
+        return value.sum(axis=0)
+
+    def held(self, ref):
+        # A resident operand stays in shared memory between products, not beside every loop carry.
+        return ref
+
+    def _left(self, lhs):
+        """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's
+        (an accumulator's, the fork's relayout) cast."""
+        if isinstance(lhs, jax.Array):
+            return plgpu.layout_cast(lhs.astype(self.dtype), self.lhs)
+        return plgpu.load(lhs, layout=self.lhs)
+
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+        out = self.products(self.zeros(shape), lhs, rhs, interpret=False)
+        if then is not None:
+            then()
+        return out
+
+    def products(self, acc, lhs, rhs, interpret: bool):
+        if interpret:
+            # mma has no rule on a CPU: its sum, in fp32.
+            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        # The left operand loads a whole swizzle tile of its depth at a time (`lhs_fragment_depth`), as a
+        # transposed left operand loaded in instruction slices took the A100's kernel gradient 7% slower
+        # (FS-DENSE-AB1); the right loads only the fragments the next instructions consume, as narrow as
+        # its staging allows (`_depth_granule`), which took its input gradient 12% faster. A register operand
+        # (an accumulator's value) is cast once and sliced.
+        instruction = self.fragment_depth(int(rhs.shape[0]))
+        lhs_depth = max(_depth_granule(lhs, 1, instruction), self.lhs_fragment_depth(int(lhs.shape[1])))
+        rhs_depth = _depth_granule(rhs, 0, instruction)
+        held = self._left(lhs) if isinstance(lhs, jax.Array) else None
+        lefts: dict[int, jax.Array] = {}
+        rights: dict[int, jax.Array] = {}
+        for start in range(0, rhs.shape[0], instruction):
+            left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
+            if held is None and left_at not in lefts:
+                lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
+            if right_at not in rights:
+                rights[right_at] = plgpu.load(rhs.at[pl.ds(right_at, rhs_depth)], layout=self.rhs)
+            left = held[:, start:start + instruction] if held is not None else lefts[left_at][
+                :, start - left_at:start - left_at + instruction]
+            right = rights[right_at][start - right_at:start - right_at + instruction]
+            acc = plgpu.mma(acc, left, right, m_warps=self.m_warps)
+        return acc
+
+    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+        del interpret
+        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
+
+    def register_products(self, acc, parts, rhs, interpret: bool):
+        for formed in parts:
+            acc = self.products(acc, mosaic.unscaled_part(formed), rhs, interpret)
+        return acc
+
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
+        return self.register_products(scale(acc), parts, rhs, interpret)
+
+    def settled(self, pending: int = 0) -> None:
+        del pending
+
+
+class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
+    """The execution policy before Hopper (`mosaic.Transport`): one compute warpgroup a program and no
+    producer, its loads `emit_pipeline`'s cp.async copies into each walk's own slots, its accumulators in
+    the pipeline's carry (a register home), its output stored through registers. A family whose issuer half
+    an issuer composed with it gives (`Mma`)."""
+
+    walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
+
+    bounded_loads = False
+
+    # A step loading ahead of the one consumed leaves cp.async's latency unhidden: two steps 64 deep stalled
+    # on barriers 1.1-1.5 an issue against XLA's 0.3-0.7 (FS-NCU-DW2-a100), and 32-deep steps three
+    # deep took dense products 4-8% less time than 64 deep two (FS-DENSE-STEPS1-a100).
+    loads_ahead = 2
+
+    stores_through_registers = True
+
+    copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
+
+    @property
+    @abc.abstractmethod
+    def lhs(self) -> plgpu_core.SomeLayout:
+        """The layout a tile loaded through registers takes (`loaded`): its issuer's left operand's."""
+
+    def registers(self, consumers: int) -> int:
+        # Each role at a thread's whole budget: two warpgroups' 256 threads hold 255 each of a
+        # multiprocessor's 64K registers.
+        _one(consumers)
+        return 255
+
+    def stores_columns(self, columns: int, rows: int) -> bool:
+        # Its store ladder reloads each rung's rows from shared memory through registers, whose strided
+        # layout wants a multiple of a role's threads in elements: its least rung, `rows` of `columns`, must
+        # hold one (BC-RAGGED-STORE: a grouped call's one-row rung at 64 columns finds no layout, a dense
+        # call's rungs of 8 rows do; UNIT64-2: a 192-column row, a thread and a half's, none either).
+        return rows * columns % resources.THREADS == 0
+
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
@@ -237,7 +302,8 @@ class Mma(mosaic.Family):
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups
         _one(consumers, clustered=cluster > 1)
-        built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+        built = plgpu.kernel(mosaic.dependent(entry, interpret), out_type=out_type, grid=grid,
+                             grid_names=grid_names,
                              compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                              interpret=mosaic.interpreted(interpret),
                              kernel_name=report.named(name), cost_estimate=cost)
@@ -256,10 +322,10 @@ class Mma(mosaic.Family):
         _one(consumers, clustered=bool(multicast))
         return Pipeline(blocks, stages, dict(swizzles or {}))
 
-    def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
-        # `emit_pipeline` allocates a walk's slots in its own scope.
-        return (), (tuple(plgpu.SMEM((streams.stages, *shape), dtype)
-                          for shape, dtype in streams.blocks.values()),)
+    def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
+        # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.
+        slots = streams.stages if steps is None else min(streams.stages, steps)
+        return (), (tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in streams.blocks.values()),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -312,9 +378,7 @@ class Mma(mosaic.Family):
         del first, in_flight
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
-        initial = (None,) * len(shapes) if initial is None else initial
-        carry = (start, tuple(self.zeros(shape) if value is None else value
-                              for shape, value in zip(shapes, initial, strict=True)))
+        carry = (start, self.started(shapes, initial))
         for step, lo, hi in segments:
             if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
                 # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
@@ -379,75 +443,49 @@ class Mma(mosaic.Family):
         else:
             plgpu.atomic_add(view, value, optimized=False)
 
-    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
-        # One warpgroup a program: Mosaic GPU's own reduction across its warps, through the scratch its
-        # kernels' parameters reserve (`reduction_scratch`).
-        del scratch, interpret
-        return value.sum(axis=0)
-
     def published(self) -> None:
         # Its products read shared memory through ldmatrix, the warpgroup's own loads, which the store's
         # automatic barriers order.
         pass
 
-    def held(self, ref):
-        # A resident operand stays in shared memory between products, not beside every loop carry.
-        return ref
 
-    def _left(self, lhs):
-        """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's
-        (an accumulator's, the fork's relayout) cast."""
-        if isinstance(lhs, jax.Array):
-            return plgpu.layout_cast(lhs.astype(self.dtype), self.lhs)
-        return plgpu.load(lhs, layout=self.lhs)
+@dataclasses.dataclass(frozen=True)
+class Mma(MmaIssuer, CpAsync):
+    """mma.sync's bundle: its issuer and register home (`MmaIssuer`) on `emit_pipeline`'s cp.async policy
+    (`CpAsync`)."""
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        out = self.products(self.zeros(shape), lhs, rhs, interpret=False)
-        if then is not None:
-            then()
-        return out
+    name = "mma.sync"
 
-    def products(self, acc, lhs, rhs, interpret: bool):
-        if interpret:
-            # mma has no rule on a CPU: its sum, in fp32.
-            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        # The left operand loads a whole swizzle tile of its depth at a time (`lhs_fragment_depth`), as a
-        # transposed left operand loaded in instruction slices took the A100's kernel gradient 7% slower
-        # (FS-DENSE-AB1); the right loads only the fragments the next instructions consume, as narrow as
-        # its staging allows (`_depth_granule`), which took its input gradient 12% faster. A register operand
-        # (an accumulator's value) is cast once and sliced.
-        instruction = self.fragment_depth(int(rhs.shape[0]))
-        lhs_depth = max(_depth_granule(lhs, 1, instruction), self.lhs_fragment_depth(int(lhs.shape[1])))
-        rhs_depth = _depth_granule(rhs, 0, instruction)
-        held = self._left(lhs) if isinstance(lhs, jax.Array) else None
-        lefts: dict[int, jax.Array] = {}
-        rights: dict[int, jax.Array] = {}
-        for start in range(0, rhs.shape[0], instruction):
-            left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
-            if held is None and left_at not in lefts:
-                lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
-            if right_at not in rights:
-                rights[right_at] = plgpu.load(rhs.at[pl.ds(right_at, rhs_depth)], layout=self.rhs)
-            left = held[:, start:start + instruction] if held is not None else lefts[left_at][
-                :, start - left_at:start - left_at + instruction]
-            right = rights[right_at][start - right_at:start - right_at + instruction]
-            acc = plgpu.mma(acc, left, right, m_warps=self.m_warps)
-        return acc
+    # One consumer warpgroup a program; a multiprocessor runs two programs (`programs`). Two consumers in
+    # one program took 1.04 to 1.50 of one's time on an A100 (CONSUMERS1), their shared copies leaner or
+    # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
+    consumers = 1
 
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        del interpret
-        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
+    @classmethod
+    def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
+        """The bundle for a warpgroup's `rows` x `columns` of a tile, its warps split `m_warps` along the
+        rows and the rest along the columns (`MMALayouts`; each product states it, `plgpu.mma`'s
+        `m_warps`): of the splits whose atom, `m_warps * 16` rows by `(4 // m_warps) * 8` columns, divides
+        it, the one reading its operands from shared memory fewest times a step, each warp reading its
+        rows' share whole and its columns' share whole (`rows * (4 // m) + columns * m`), the most along
+        the rows on a tie. A 128 x 128 tile so splits 2 x 2 (512 reads a step, where four warps along its
+        rows read 640), each warp holding half the right operand's fragments."""
+        splits = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
+        m_warps = min(splits, key=lambda m: (rows * (4 // m) + columns * m, -m)) if splits else 4
+        return cls(jnp.dtype(dtype), m_warps)
 
-    def register_products(self, acc, parts, rhs, interpret: bool):
-        for formed in parts:
-            acc = self.products(acc, mosaic.unscaled_part(formed), rhs, interpret)
-        return acc
+    most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
 
-    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
-        return self.register_products(scale(acc), parts, rhs, interpret)
+    def column_unit(self, dtype) -> int:
+        # Its stores move rows through registers, laid over the role's threads (`stores_columns`): half a
+        # role's threads at least, each holding an element (UNIT64-2: every sm8x GEMM form lowers at 64
+        # columns; row 2078's probe: every attention launch on sm80 at 64-column tiles).
+        del dtype
+        return resources.THREADS // 2
 
-    def settled(self, pending: int = 0) -> None:
-        del pending
+    def depths(self, dtype) -> tuple[int, ...]:
+        # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
+        return tuple(mosaic.swizzle_columns(dtype, swizzle) for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

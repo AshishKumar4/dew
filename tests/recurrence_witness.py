@@ -48,6 +48,7 @@ from op_certificates import (
 )
 
 from dew.nn.kernels import recurrence_algebra
+from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop
 
 CHUNK = mainloop.CHUNK
@@ -395,7 +396,7 @@ def interpreted_lane() -> Lane:
     from certified import lane
 
     return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes,
-                mainloop.block_of(mainloop.INTERPRETED))
+                mainloop.block_of(bundles.INTERPRETED))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -464,7 +465,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: mainloop.kept_forward(
                 *x, tiles=tiles, starts=starts, max_segments=max_segments, scale=k.shape[-1] ** -0.5,
-                family=mainloop.family_of(dtype) or mainloop.INTERPRETED,
+                family=mainloop.family_of(dtype) or bundles.INTERPRETED,
                 interpret=generation.backend() != "gpu"))(*x)
 
         kept_o, kept_final, (a, (w, h, c)) = kept(*operands)

@@ -7,7 +7,7 @@ over one sequence a row and packed documents, value heads over fewer key heads, 
 off a block's width, bf16 and fp32 operands and lengths off the chunks, and every hook combination the
 mainloop takes (a decay a head or none, with and without the delta rule, Mamba2's rated decay, the skip and
 the norm) on the chunked op's own draws (`test_recurrence_chunk`). Off such a GPU the cases run in Mosaic
-GPU's interpreter on the wgmma bundle (`mainloop.INTERPRETED`) at one row of a shorter length
+GPU's interpreter on the wgmma bundle (`bundles.INTERPRETED`) at one row of a shorter length
 (`INTERPRETED_LENGTH`), whose products are the dots they compute: coverage of the mainloop's algebra and its
 roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
@@ -233,7 +233,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
         jax.eval_shape(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)), operands)
-    family = mainloop.family_of() or mainloop.INTERPRETED
+    family = mainloop.family_of() or bundles.INTERPRETED
     if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, hooks.floor):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
