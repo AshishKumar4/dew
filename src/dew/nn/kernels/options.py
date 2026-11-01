@@ -306,7 +306,10 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     options and arguments, which every call with the same reuses, so a quantized model and another never
     share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's, a
     load's or a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
-    `step`), but an objective's (`Objective.program`), which its cache keeps as long as the objective."""
+    `step`), but those whose owner keeps them as long as itself: an objective's (`Objective.program`),
+    and the RL rollouts', each built over its own environment and policy (`dew.objectives.rl.control`'s
+    and `dew.objectives.rl.dreamer`'s rollouts, `dew.rl.flight.GateRace`'s and `dew.rl.hyperlux`'s
+    programs, `dew.rl.simulator`'s policy step)."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
