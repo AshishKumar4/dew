@@ -398,6 +398,43 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
+def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], JSON]:
+    """A per-share read's saved position (its data plan and its Grain iterator's state) as `plan`, this
+    run's, reads it: the plan as `earlier_plan` translates it, and the iterator's state, where the plan
+    was written before version 8, with the counts version 8 keeps of what a read delivered (each
+    corpus's `delivered_rows`, which one that counted each row as one example held as `accepted`) and of
+    the examples refused past a held row (a causal window's carry of `_dew_refused`, none, beside its
+    `_dew_consumed`). The position's one translation; carried to 1.0 (ledger 1552)."""
+    from dew.data.mixing import COUNTER
+    from dew.data.pipeline import CONSUMED, REFUSED
+
+    written = record(saved.get("dew_data_plan"), "saved data plan")
+    iterator = json_value(saved.get("iterator"), "saved Grain iterator")
+
+    def counted(branch: JSON) -> JSON:
+        if isinstance(branch, list):
+            return [counted(child) for child in branch]
+        if not isinstance(branch, dict):
+            return branch
+        node = {name: counted(child) for name, child in branch.items()}
+        counter = node.get(COUNTER)
+        if isinstance(counter, dict) and isinstance(counter.get("counts"), dict):
+            counts = counter["counts"]
+            node[COUNTER] = {**counter, "counts": {"delivered_rows": counts.get("accepted", 0), **counts}}
+        held = node.get("held")
+        if {"parent", "skip", "held"} <= node.keys() and isinstance(held, dict) and CONSUMED in held \
+                and REFUSED not in held and isinstance(held[CONSUMED], dict):
+            consumed = held[CONSUMED]
+            tokens = consumed.get("tokens")
+            none = [0] * (len(tokens) if isinstance(tokens, list) else 0)
+            node["held"] = {**held, REFUSED: {"dtype": consumed.get("dtype"), "tokens": none}}
+        return node
+
+    if written.get("version") == 7:
+        iterator = counted(iterator)
+    return earlier_plan(written, plan), iterator
+
+
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
     position's one translation, where a reader's `set_state` decodes it. A token store a Dew before row 3028

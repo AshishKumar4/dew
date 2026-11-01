@@ -162,10 +162,6 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             )
             for name, tokens in held.items()
         }
-        # A position saved before rows carried the examples refused past them holds no count of those.
-        carried = len(next(iter(self._held.values()), ()))
-        self._held.update({name: np.zeros(carried, np.int32) for name in ACCOUNTS
-                           if name in self._windows.fields and name not in self._held})
         skip = state["skip"]
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")

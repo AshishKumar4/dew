@@ -171,8 +171,7 @@ class CorpusCounts:
         self.attempted = integer(state["attempted"], "attempted")
         self.accepted = integer(state["accepted"], "accepted")
         self.truncated = integer(state["truncated"], "truncated")
-        # A position saved before rows were counted apart from examples counted each row as one.
-        self.delivered_rows = integer(state.get("delivered_rows", state["accepted"]), "delivered_rows")
+        self.delivered_rows = integer(state["delivered_rows"], "delivered_rows")
         self.chunks = integer(state["chunks"], "chunks")
         self.chunk_records = integer(state["chunk_records"], "chunk_records")
         self.rejected = Counter(
@@ -255,7 +254,7 @@ class _KeepAccepted:
         return False
 
 
-_COUNTER = "dew.corpus_counts"
+COUNTER = "dew.corpus_counts"
 """Where a counting iterator's position keeps its corpus's counts, beside its parent's position:
 a key of Dew's own, which `state_counts` and `rewound` find and no Grain position holds."""
 
@@ -271,7 +270,7 @@ class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
         return next(self._read)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), _COUNTER: self._counted()}
+        return {"parent": self._read.get_state(), COUNTER: self._counted()}
 
     def _counted(self) -> Mapping[str, object]:
         # A counter that counts no rows says so (`CorpusCounts.rows`); any other counts them.
@@ -281,7 +280,7 @@ class _CountedIterator[Element](pygrain.DatasetIterator[Element]):
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "counted parent"))
-        self._restore(record(state[_COUNTER], "corpus counter"))
+        self._restore(record(state[COUNTER], "corpus counter"))
 
     def _restore(self, counted: Mapping[str, object]) -> None:
         self._counts.restore(record(counted["counts"], "corpus counts"))
@@ -720,8 +719,8 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
             self._group.started(self._index, None if counted is None else record(counted, "mixed corpus"))
             return
         parent = record(state["parent"], "mixed corpus")
-        if set(parent) <= {_COUNTER}:
-            self._group.started(self._index, parent if parent.get(_COUNTER) is not None else None)
+        if set(parent) <= {COUNTER}:
+            self._group.started(self._index, parent if parent.get(COUNTER) is not None else None)
         else:
             self._group.restore(self._index, parent)
 
@@ -768,7 +767,7 @@ class _NamedTuple(Protocol):
 
 def rewound(start: Mapping[str, object], current: Mapping[str, object]) -> Mapping[str, object]:
     """`start`, the position a repeat rewinds its pass to, with each counter's counts as `current`
-    holds them (`_COUNTER`: its counts, run of rejections and warning): a pass read again goes on
+    holds them (`COUNTER`: its counts, run of rejections and warning): a pass read again goes on
     counting the corpus, where a restored position replaces its counts. Every other part of a
     position is the iterator's own and is left as `start` has it. A mix's corpus the pass had not
     opened at its start (`_MixRead`'s `_UNOPENED`) is rewound to that, carrying the position it holds
@@ -778,8 +777,8 @@ def rewound(start: Mapping[str, object], current: Mapping[str, object]) -> Mappi
     shared = [key for key in start if key in current]
     parts = _rewound_parts([start[key] for key in shared], [current[key] for key in shared])
     kept = {**start, **dict(zip(shared, parts, strict=True))}
-    if _COUNTER in start and _COUNTER in current:
-        kept[_COUNTER] = current[_COUNTER]
+    if COUNTER in start and COUNTER in current:
+        kept[COUNTER] = current[COUNTER]
     return kept
 
 
@@ -813,7 +812,7 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
         counted: dict[str, CorpusCounts] = {}
         rowless: CorpusCounts | None = None
         if isinstance(branch, Mapping):
-            node = branch.get(_COUNTER)
+            node = branch.get(COUNTER)
             if isinstance(node, Mapping):
                 corpus = text(node["corpus"], "corpus")
                 counts = CorpusCounts(corpus, text(node["label"], "label"),
@@ -833,7 +832,7 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
                         _added(independent, counts)
                 _nested(counted, independent)
             for name, child in branch.items():
-                if name not in ("iterators_in_use_states", "future_states", _COUNTER):
+                if name not in ("iterators_in_use_states", "future_states", COUNTER):
                     _nested(counted, visit(child))
         elif isinstance(branch, (tuple, list)):
             for child in branch:

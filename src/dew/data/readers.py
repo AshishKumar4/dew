@@ -29,7 +29,7 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import Plan, earlier_plan
+from dew.data.plan import Plan, earlier_position
 
 
 @dataclasses.dataclass(frozen=True)
@@ -216,9 +216,10 @@ class _PerShare(Forwarding):
                 "the saved position is an elastic read's, and this read is per share; resume it with "
                 ".elastic() on the chain")
         decoded = record(json.loads(state), "saved per-share position") if held is None else held
-        saved = earlier_plan(record(decoded.get("dew_data_plan"), "saved data plan"), self._plan)
-        self._plan.check(saved, resume=self._resume)
-        saved = record(decoded.get("iterator"), "saved Grain iterator")
+        # The saved position's one translation (`earlier_position`), then its check.
+        written, iterator = earlier_position(decoded, self._plan)
+        self._plan.check(written, resume=self._resume)
+        saved = record(iterator, "saved Grain iterator")
         self.close()
         self._saved = saved
         self._statistics.counts = MappingProxyType({})
