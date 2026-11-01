@@ -134,6 +134,26 @@ def test_literals_keep_their_exact_values_and_types():
         np.testing.assert_array_equal(np.asarray(given), np.asarray(got))
 
 
+def test_products_that_widen_keep_their_widening():
+    """Products that widen their operands (an explicit `out_dtype`) are not factored: the sum the factoring
+    would add in the narrow dtype overflows where the program's sum of widened products does not."""
+    def widened(a, x, y):
+        return (jax.lax.mul(a, x, out_dtype=jnp.float32) + jax.lax.mul(a, y, out_dtype=jnp.float32))
+
+    a, x = jnp.asarray(1.0, jnp.float16), jnp.asarray(40000.0, jnp.float16)
+    assert float(jax.jit(algebra.rewritten(widened))(a, x, x)) == float(widened(a, x, x)) == 80000.0
+
+
+def test_a_weak_literal_stays_weak():
+    """A Python scalar the program adds stays weakly typed through the rewrite, so the result promotes with a
+    narrower array as the program's does."""
+    def plus_one(x):
+        return x + 1.0
+
+    rewritten = jax.jit(algebra.rewritten(plus_one))(1.0)
+    assert (rewritten + jnp.ones(2, jnp.float16)).dtype == (plus_one(1.0) + jnp.ones(2, jnp.float16)).dtype
+
+
 def test_custom_derivatives_survive_the_rewrite():
     """A program calling a function with a custom JVP or a custom VJP computes the same values rewritten, and
     the rewritten program differentiates through the same rule."""
