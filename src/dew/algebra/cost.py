@@ -8,6 +8,7 @@ takes (`walk`). Each shared value is priced once over the extracted DAG (egglog'
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Callable
 
@@ -86,13 +87,15 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4) -> Wor
     return Work()
 
 
-@dataclasses.dataclass(frozen=True)
+@functools.total_ordering
+@dataclasses.dataclass(frozen=True, eq=False)
 class Seconds:
     """A form's work and the seconds its schedule gives it, as extraction adds and compares it (egglog's
-    `ComparableAdd`): the work summed, the seconds the schedule's of the sum."""
+    `ComparableAdd`): the work summed, compared by the seconds the schedule gives the sum alone (two works
+    of one time are equal, so every pair compares)."""
 
     work: Work
-    schedule: Callable[[Work], float] = dataclasses.field(compare=False, repr=False)
+    schedule: Callable[[Work], float] = dataclasses.field(repr=False)
 
     @property
     def value(self) -> float:
@@ -101,11 +104,14 @@ class Seconds:
     def __add__(self, other: Seconds) -> Seconds:
         return Seconds(self.work + other.work, self.schedule)
 
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Seconds) and self.value == other.value
+
     def __lt__(self, other: Seconds) -> bool:
         return self.value < other.value
 
-    def __le__(self, other: Seconds) -> bool:
-        return self.value <= other.value
+    def __hash__(self) -> int:
+        return hash(self.value)
 
 
 def fused(facts: generation.GpuTarget) -> Callable[[Work], float]:

@@ -18,6 +18,7 @@ alone (`Split.carry`, `Split.emit`). The association reorders rounding.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
@@ -144,7 +145,8 @@ CARRIED = rules.Rules("carried", "reorders", _carried(), receipt="docs/design/al
 """The split's rules, never among the engine's sets (`rules.admitted`)."""
 
 
-@dataclasses.dataclass(frozen=True)
+@functools.total_ordering
+@dataclasses.dataclass(frozen=True, eq=False)
 class Priced:
     """A carried form's price, compared in order: its work that reads the state (once a chunk, in sequence),
     then the rest (every chunk's at once), each in seconds under the template's tile walk (`cost.walk`)."""
@@ -155,11 +157,17 @@ class Priced:
     def __add__(self, other: Priced) -> Priced:
         return Priced(self.sequential + other.sequential, self.parallel + other.parallel)
 
-    def __lt__(self, other: Priced) -> bool:
-        return (self.sequential.value, self.parallel.value) < (other.sequential.value, other.parallel.value)
+    def key(self) -> tuple[float, float]:
+        return self.sequential.value, self.parallel.value
 
-    def __le__(self, other: Priced) -> bool:
-        return (self.sequential.value, self.parallel.value) <= (other.sequential.value, other.parallel.value)
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Priced) and self.key() == other.key()
+
+    def __lt__(self, other: Priced) -> bool:
+        return self.key() < other.key()
+
+    def __hash__(self) -> int:
+        return hash(self.key())
 
 
 def _carry_priced(region: terms.Region, schedule) -> DagCostModel:
