@@ -68,10 +68,13 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "fused-shared-dq",
-                  "fused-producer-dq", "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
-accurate."""
+RAISED_FORMS = ("fused-shared-dq", "fused-producer-dq")
+"""The backward's forms whose consumers hold more registers than a warpgroup's even share, legal only where
+the GPU's compile honors their raise (`resources.RAISES_HONORED`)."""
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
+                  *(RAISED_FORMS if resources.RAISES_HONORED else ()), "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
+where raises hold (`RAISED_FORMS`), and the accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
