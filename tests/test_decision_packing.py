@@ -337,9 +337,21 @@ def decided(objective, variables, batch, segments: int):
 # The joint arm's float64 truth over the seeds its gradients need is numeric work at model size, a GPU's
 # (BIBLE §8): on armada it took 705 s of CPU, the suite's whole critical path; the others take 187 s and 36 s.
 # The joint arm runs in the models' GPU flow (tests/test_gpu_models.py).
-@pytest.mark.parametrize("arm", ["marker", "parallel"])
-@pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
+@pytest.mark.check1_shards(seeds=8, per_task=8)
+def test_a_packed_window_of_marked_rows_decides_each_row_as_the_row_alone():
+    """A packed window decides each row as the row alone (`packed_rows_decided_alone`) through the
+    marker arm, its seeds drawn by CI's map tasks (`check1_shards`)."""
+    packed_rows_decided_alone("marker")
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=8)
+def test_a_packed_window_of_parallel_rows_decides_each_row_as_the_row_alone():
+    """A packed window decides each row as the row alone (`packed_rows_decided_alone`) through the
+    parallel arm, its seeds drawn by CI's map tasks (`check1_shards`)."""
+    packed_rows_decided_alone("parallel")
+
+
+def packed_rows_decided_alone(arm: str) -> None:
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives alone where its window packed it,
     through Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within

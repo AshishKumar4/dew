@@ -446,7 +446,7 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     # Training pads every row to the layout's max_len, which holds every row whole; the release serves up
     # to 16384. The runs score no split, which nothing here reads.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
-                                  layout=JointLayout(max_len=256))
+                                  layout=JointLayout(max_len=512))
     data = decision_rows(examples, 8, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
     runs, states = [], []
