@@ -105,7 +105,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 
 ## Algebraic optimization
 
-Dew derives the cheapest form of its own math ([design](design/algebra.md)): one e-graph engine (`dew.algebra`) rewrites every compiled program at `options.program`, derives the templates' algebra from declarations, and searches fusions toward generated megakernels; everything built at once, measured together.
+Dew derives the cheapest form of its own math ([design](design/algebra.md)): one e-graph engine (`dew.algebra`) rewrites every compiled program at its seam, `OuterProgram`, derives the templates' algebra from declarations, and searches fusions toward generated megakernels; everything built at once, measured together.
 
 ## Data
 

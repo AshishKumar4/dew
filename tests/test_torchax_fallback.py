@@ -614,14 +614,15 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
 
 def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
     """OpenAI GPT's layers compute their attention in their own code, asking transformers' attention
-    interface nothing: tier 3 runs that attention as transformers does, so it names no Dew kernel
-    (`attention_impl`) and reads no packed rows (`Lacks`)."""
+    interface nothing: the torchax route, which a load asks for though the type has a family of its own,
+    runs that attention as transformers does, so it names no Dew kernel (`attention_impl`) and reads no
+    packed rows (`Lacks`)."""
     torch.manual_seed(0)
     config = transformers.OpenAIGPTConfig(n_embd=64, n_layer=2, n_head=4, vocab_size=TINY["vocab_size"],
                                           n_positions=64)
     transformers.OpenAIGPTLMHeadModel(config).save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32")
+        loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     assert loaded.model.graph.attention_impl is None
     ids, segments, _, _ = packed_rows(0)
     with pytest.raises(Lacks):
@@ -629,7 +630,7 @@ def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_pack
                            method="logits")
     # Refused before the load warns of its tier.
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+        Pretrained.load(tmp_path, dtype="float32", fallback="torchax", attention_impl="reference")
 @pytest.mark.parametrize("route", ["tier 3", "fallback"])
 def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_path):
     """Without its weights a tier-3 source is built from its config alone, its weight files never read

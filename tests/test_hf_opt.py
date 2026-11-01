@@ -4,8 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from interop_support import fixture_ids, token_draw, transformers_arms, transformers_model
-from reference_error import assert_as_exact, seeds_for
+from interop_support import (
+    assert_exported_decoder_follows_transformers,
+    fixture_ids,
+    token_draw,
+    transformers_arms,
+    transformers_model,
+)
+from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
 from dew.sampling import Sampling, generate
@@ -69,24 +75,9 @@ def test_an_opt_350m_shaped_decoder_computes_transformers_logits(variant, tmp_pa
     torch.manual_seed(0)
     OPTForCausalLM(config).eval().save_pretrained(tmp_path / "source")
     loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
-    reference, truth = transformers_arms(transformers_model(tmp_path / "source"),
-                                         lambda model, ids: model(ids, use_cache=False).logits)
-    draw = token_draw(0x350, 96, (2, 9))
-    seeds = seeds_for(reference, draw, "OPT-350m logits", truth_fn=truth)
-    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw,
-                    "OPT-350m logits", seeds=seeds, truth_fn=truth)
-    loaded.save(tmp_path / "export")
-    # Both read by the same class on the same attention, so the export's weights and config alone differ.
-    exported, source = (transformers_model(tmp_path / name) for name in ("export", "source"))
-    ids = torch.as_tensor(np.asarray(draw(0)[0]), dtype=torch.long)
-    with torch.no_grad():
-        np.testing.assert_array_equal(exported(ids, use_cache=False).logits.numpy(),
-                                      source(ids, use_cache=False).logits.numpy())
-        drawn = source.generate(ids[:1, :4], max_new_tokens=6, min_new_tokens=6, do_sample=False)
-    generated = generate(loaded.model, loaded.variables, np.asarray(ids[:1, :4]), 6, key=0,
-                         sampling=Sampling(temperature=0))
-    # Both hold the prompt and its continuation.
-    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
+    assert_exported_decoder_follows_transformers(loaded, tmp_path, token_draw(0x350, 96, (2, 9)),
+                                                 "OPT-350m logits",
+                                                 lambda model, ids: model(ids, use_cache=False).logits)
 
 
 def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_and_keeps_loop_norms():
