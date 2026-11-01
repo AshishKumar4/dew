@@ -31,10 +31,11 @@ WEIGHTS = {"web": 0.7, "code": 0.2, "chat": 0.1}
 
 
 def tokenizer():
-    """The mixture's tokenizer at its pinned commit, which every step names by its files' hash."""
-    from transformers import AutoTokenizer
+    """The mixture's tokenizer at its pinned commit, which every step names by its files' hash, through
+    Dew's one loader (`load_tokenizer`)."""
+    from dew.data.text import load_tokenizer
 
-    return AutoTokenizer.from_pretrained(TOKENIZER, revision=TOKENIZER_REVISION)
+    return load_tokenizer(TOKENIZER, revision=TOKENIZER_REVISION)
 
 
 def sources(tok) -> dict[str, Pipeline]:
