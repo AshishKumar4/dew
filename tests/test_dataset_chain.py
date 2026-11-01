@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import grain.python as grain
 import numpy as np
 import pytest
-from data_support import Questioned
+from data_support import Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
@@ -778,29 +778,62 @@ class ThirdQuestionRefused:
         return Rejected("third question") if int(row["question"]) == 2 else row
 
 
+def _asked(read: str, *, shuffled: bool = True) -> Dataset:
+    """12 records, ids 1 to 12, each with `id % 3 + 1` pairs of tokens, as `read` reads them: in one
+    order or each share its own, shuffled where `shuffled`."""
+    ids = np.arange(1, 13, dtype=np.int32)
+    tokens = [np.arange(2 * (int(record) % 3 + 1), dtype=np.int32) for record in ids]
+    chain = Memory([{"id": record, "tokens": held} for record, held in zip(ids, tokens, strict=True)],
+                   shard_rows=4).named("asked")
+    if not shuffled:
+        return chain
+    return chain.shuffle(seed=3, window=12) if read == "streamed" else chain.shuffle(seed=3)
+
+
+@pytest.mark.parametrize("expansion", ["questions", "chunks"])
 @pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read, workers):
+def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read, workers, expansion):
     """A training read bounded to its 12 records, in one order or each share its own, read alone or by
-    loading workers, through an objective's step that makes 24 rows of them (`Questioned`) and one that
-    refuses 4 of those (`ThirdQuestionRefused`): the corpus's rows (data/rows) are its 12 source
-    examples, counted before the step makes rows of them, and not the 20 rows it delivers again after,
-    and its rejections are the rows refused after it (row 1944)."""
-    ids = np.arange(1, 13, dtype=np.int32)
-    chain = Memory({"id": ids}, shard_rows=4).named("asked")
-    chain = chain.shuffle(seed=3, window=12) if read == "streamed" else chain.shuffle(seed=3)
-    loading = dataclasses.replace(READ, workers=workers)
-    data = compile(chain.batch(2), objective=ObjectiveData(train=(Questioned(), ThirdQuestionRefused())),
-                   read=read, loading=loading, examples=12)
+    loading workers, through an objective's step that makes 24 rows of them, a question's each
+    (`Questioned`) or a chunk of two tokens each (`text.Chunks`), and one that refuses 4 of those
+    (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are its 12 source examples,
+    counted before the step makes rows of them, and not the rows it delivers again after; its
+    rejections are the rows refused after it, and its chunks a record are the step's (row 1944)."""
+    steps = ((Questioned(), ThirdQuestionRefused()) if expansion == "questions"
+             else (text.Chunks(2, fields=("tokens",)),))
+    data = compile(_asked(read).batch(2), objective=ObjectiveData(train=steps), read=read,
+                   loading=dataclasses.replace(READ, workers=workers), examples=12)
     stream = data.train(DataPartition())
     try:
         rows = sum(len(batch["id"]) for batch in stream)
         counts = data.statistics()
     finally:
         stream.close()
-    assert rows == sum(int(record) % 3 + 1 for record in ids) - 4 == 20
     assert counts["data/rows/asked"] == 12
-    assert counts["data/rejected/asked/third question"] == 4
+    if expansion == "questions":
+        assert rows == 24 - 4 == 20
+        assert counts["data/rejected/asked/third question"] == 4
+    else:
+        assert rows == 24
+        assert counts["data/chunks_per_record/asked"] == 24 / 12
+
+
+def test_a_memory_read_that_makes_its_rows_as_it_holds_them_counts_its_source_examples():
+    """A memory read of the 12 records, in their order and unbounded, whose objective makes 24 rows of
+    them (`Questioned`) before a draw of its own: it makes those rows as it holds the corpus, before
+    the reader opens, and the corpus's rows (data/rows) are its 12 source examples, as many as it
+    held, however many rows the reader has read (row 1944)."""
+    data = compile(_asked("memory", shuffled=False).batch(2), read="memory", loading=READ,
+                   objective=ObjectiveData(train=(Questioned(), WideDraw())))
+    stream = data.train(DataPartition())
+    try:
+        for read in (3, 12):
+            for _ in range(read):
+                next(stream)
+            assert data.statistics()["data/rows/asked"] == 12
+    finally:
+        stream.close()
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
