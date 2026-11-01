@@ -519,7 +519,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                 before_store()
                 memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
                                smem=lands[f"memory{i}"], wait=False)
-                if call.per_key:
+                if entered_ref is not None:
                     rows = pl.ds(memory(n, i), call.block)
                     gated_ref[0].at[column // bv, rows][...] = algebra.key_memory_decay(
                         family.tile_of(entered_ref.at[rows, pl.ds(column, bv)]), part)
@@ -811,7 +811,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
                 @pl.when(split == 0)
                 def _():
                     keys, queries = whole("keys", given, 0), whole("queries", given, 0)
-                    for kind, lhs, rhs in (("dq", ds, keys), ("dk", product.Transposed(ds), queries)):
+                    for kind, lhs, rhs in (("dq", ds, keys), ("dk", ds.T, queries)):
                         family.store_wait(0)
                         family.added(issue("scores_dq", lhs, rhs), sums[kind], call.interpret,
                                      smem=landing["sums"])
