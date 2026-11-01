@@ -360,10 +360,10 @@ def _seen(observation: Observation, names: tuple[str, ...]) -> tuple[int, ...]:
 
 
 def _idle() -> Loader:
-    """The loader of a run whose rollout makes every batch whole (§14): one empty row a step, the same each
-    time it opens (`replayed`), so a resume reads on, with no record count, so no cadence is an epoch of
-    it."""
-    return Loader(train=replayed(lambda partition: itertools.repeat({"step": np.zeros((1,), np.float32)})),
+    """The loader of a run whose rollout makes every batch whole (§14): a batch of no records, one value for
+    the step, which any mesh places whole, the same each time it opens (`replayed`), so a resume reads on;
+    with no record count, so no cadence is an epoch of it."""
+    return Loader(train=replayed(lambda partition: itertools.repeat({"step": np.zeros((), np.float32)})),
                   val=None, records=None, batch=1)
 
 

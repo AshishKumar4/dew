@@ -81,7 +81,7 @@ def world_model(**fields) -> WorldModel:
 
 
 def idle() -> Loader:
-    return Loader(train=replayed(lambda partition: itertools.repeat({"step": np.zeros((1,), np.float32)})),
+    return Loader(train=replayed(lambda partition: itertools.repeat({"step": np.zeros((), np.float32)})),
                   val=None, records=None, batch=1)
 
 
