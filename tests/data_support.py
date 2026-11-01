@@ -32,7 +32,6 @@ def keep_captions(captions):
     return {"caption": np.asarray(captions)}
 
 
-@dataclasses.dataclass(frozen=True)
 class Questioned:
     """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
     layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`), its identity
@@ -45,6 +44,7 @@ class Questioned:
                      for question in range(int(element["id"]) % 3 + 1))
 
 
+@dataclasses.dataclass(frozen=True)
 class WideDraw(grain.RandomMapTransform):
     """A record's draw of an integer below 2**32, which its generator makes."""
 

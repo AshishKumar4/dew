@@ -340,8 +340,9 @@ def _counts_rows(pipeline: Pipeline, at: int) -> bool:
     corpus's rows: not past an objective's step that makes rows of source examples, which the corpus
     counted before it (`FlatMap.examples`, `CorpusCounts.rows`), a memory read's as it held them where it
     ran the step (`_written`)."""
-    return not any(isinstance(stage, FlatMap) and stage.examples
-                   for stage in _written(pipeline.source, pipeline.stages[:at]))
+    source, stages = pipeline.source, pipeline.stages[:at]
+    ran = stages if isinstance(source, (Mixture, Phases)) else _written(source, stages)
+    return not any(isinstance(stage, FlatMap) and stage.examples for stage in ran)
 
 
 def _unplaced(value: Record) -> Record:
