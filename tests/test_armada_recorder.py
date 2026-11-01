@@ -541,6 +541,82 @@ def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
     assert reused() == [True, False]
 
 
+@pytest.mark.parametrize("reading", [
+    "assert open({path!r}, 'a+').read() == '' or True",
+    "import os\n    assert os.path.exists({path!r})",
+    "import os\n    assert {name!r} in os.listdir({folder!r})",
+    "import subprocess\n    assert subprocess.run(['cat', {path!r}], capture_output=True,"
+    " text=True).stdout == '1'",
+], ids=["append", "probe", "listing", "native"])
+def test_a_file_that_takes_what_another_left_in_shared_scratch_by_any_way_has_no_key(
+        ci, tmp_path, monkeypatch, cache_worker, reading):
+    """A file that takes what another file of its task left in shared scratch has no key however it takes it
+    (review of the reuse-keys head): an open that keeps what was there (an append), a probe of whether it is
+    there, a listing of its directory, or a native tool's read, which no audit hook sees (watched.py's
+    leavings); as a plain read has none, an edit to the writer's helper would otherwise leave the second
+    file's row standing. The writer keeps its key."""
+    folder = tmp_path.parent / f"{tmp_path.name}-shared"
+    shared = folder / "result.txt"
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "build.py": "def build(): return 1\n",
+        "test_writer.py": f"import os\nfrom build import build\ndef test_writer():\n"
+                          f"    os.makedirs({str(folder)!r}, exist_ok=True)\n"
+                          f"    open({str(shared)!r}, 'w').write(str(build()))\n",
+        "test_reader.py": "def test_reader():\n    " + reading.format(
+            path=str(shared), name=shared.name, folder=str(folder)) + "\n"}, {})
+    assert reused() == [True, False]
+
+
+def test_a_file_reading_what_another_left_in_a_hidden_directory_of_the_checkout_has_no_key(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A file that reads what another file of its task wrote in a hidden directory of the checkout, which no
+    record keys by its content, has no key (review of the reuse-keys head: .memo/result); the writer keeps its
+    key."""
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "build.py": "def build(): return 1\n",
+        "test_writer.py": "import os\nfrom build import build\ndef test_writer():\n"
+                          "    os.makedirs('.memo', exist_ok=True)\n"
+                          "    open('.memo/result', 'w').write(str(build()))\n",
+        "test_reader.py": "def test_reader():\n    assert open('.memo/result').read() == '1'\n"}, {})
+    assert reused() == [True, False]
+
+
+def test_a_marker_a_deselected_test_carries_is_its_files_input(ci, tmp_path, monkeypatch, cache_worker):
+    """A marker a test carries by a helper's alias is its file's input though the run's selection sets the
+    test aside (review of the reuse-keys head): with --strict-markers the helper's import fails the file's
+    collection once the marker's registration goes, so the file's row reruns."""
+    project = ("[project]\nname = 'x'\n\n[tool.pytest.ini_options]\n"
+               "addopts = \"--strict-markers -m 'not tidy'\"\nmarkers = [\"tidy: {}\"]\n")
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "helpers_marks.py": "import pytest\ntidy = pytest.mark.tidy\n",
+        "test_mixed.py": "from helpers_marks import tidy\ndef test_plain():\n    pass\n"
+                         "@tidy\ndef test_tidy():\n    pass\n"}, {})
+    assert reused() == [True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
+    assert reused() == [False]
+
+
+def test_a_store_linked_beneath_the_files_caches_to_one_elsewhere_is_no_private_store(
+        ci, tmp_path, monkeypatch):
+    """A store Dew's digest reads consult (`CACHES`) that resolves outside the file's own caches is no
+    private one, though its path lies beneath them by a link (review of the reuse-keys head), so its digest
+    reads are keyed (followed.py's `private`). JAX's own setting aside: none is imported here."""
+    followed = ci.followed
+    monkeypatch.setitem(sys.modules, "jax", None)
+    own, elsewhere = tmp_path / "caches", tmp_path / "foreign"
+    own.mkdir()
+    elsewhere.mkdir()
+    (own / "rungs").symlink_to(elsewhere)
+    monkeypatch.setenv(followed.PRIVATE, str(own))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(own))
+    for name in followed.CACHES:
+        monkeypatch.setenv(name, str(own / "plain"))
+    assert followed.private()
+    monkeypatch.setenv(followed.CACHES[0], str(own / "rungs"))
+    assert not followed.private()
+
+
 def test_only_what_another_process_of_the_task_made_in_shared_scratch_is_read_outside_the_checkout(
         ci, tmp_path, monkeypatch):
     """A file in the machine's shared scratch or the user's home that was there before the task began no
