@@ -363,9 +363,66 @@ def write_seeded() -> None:
     print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
 
 
+def write_interop() -> None:
+    """state-spaces/mamba2-130m's site ('interop'): transformers' port of it (AntonV/mamba2-130m-hf) on seeded
+    rows of tokens (`ssd_support.mamba2_interop_draw`), its logits in bfloat16 and in its float64 twin, on the
+    GPU where there is one; Dew's float64 load held to the latter at every seed (the test's truth), the
+    count sized paired with Dew's bfloat16 load, whose logits' errors are heavy-tailed across draws alike.
+
+    PYTHONPATH=src:tests:tools python tools/mamba2_reference.py interop   (the Hub's two checkpoints)
+    """
+    import copy
+
+    import jax
+    import jax.numpy as jnp
+    import ssd_support as support
+    from recorded_references import provenance, record_case, save
+    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+    from torch_precision import float64_twin
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf",
+                                                           revision=support.MAMBA2_130M_HF)
+    assert tokenizer.vocab_size >= support.INTEROP_VOCAB, tokenizer.vocab_size
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    port = Mamba2ForCausalLM.from_pretrained("AntonV/mamba2-130m-hf", revision=support.MAMBA2_130M_HF,
+                                             dtype=torch.float32).eval()
+    narrow, twin = copy.deepcopy(port).to(device, torch.bfloat16), float64_twin(port).to(device)
+
+    @torch.no_grad()
+    def logits(model, inputs):
+        ids = torch.from_numpy(inputs["ids"].astype(np.int64)).to(device)
+        return {"logits": model(ids).logits.double().cpu().numpy()}
+
+    exact_run = jax.jit(support.mamba2_130m_logits(support.mamba2_130m(jnp.float64)))
+    with jax.enable_x64(new_val=True):
+        roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(support.mamba2_interop_draw(0))))
+
+    def evaluate(inputs):
+        with float64():
+            exact = logits(twin, inputs)
+        with jax.enable_x64(new_val=True):
+            found = np.asarray(exact_run(widened(inputs))["logits"])
+        assert_computes_the_oracle(found, exact["logits"], "transformers float64 interop logits",
+                                   roundings=roundings)
+        return logits(narrow, inputs), exact
+
+    stored = record_case("interop", support.mamba2_interop_draw, evaluate, store_inputs=False, summary=True,
+                         dew=jax.jit(support.mamba2_130m_logits(support.mamba2_130m(jnp.bfloat16))))
+    stored["provenance"] = provenance(
+        f"transformers {transformers.__version__}", transformers_record()["revision"], device,
+        "PYTHONPATH=src:tests:tools python tools/mamba2_reference.py interop",
+        truth="transformers reference in torch float64 through tools/torch_precision.py")
+    destination = SSD / "interop_seeded.npz"
+    written = save(destination, stored, reference=f"transformers {transformers.__version__}",
+                   license="Apache-2.0")
+    print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["seeded"]:
         write_seeded()
+    elif sys.argv[1:] == ["interop"]:
+        write_interop()
     elif sys.argv[1:] == ["float64"]:
         write_float64()
     else:

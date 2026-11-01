@@ -1,6 +1,7 @@
 """Fresh SSD inputs and exact head, channel and state-coordinate orbits, and the recurrence's float64
 oracle (`stepwise_scan`)."""
 
+import contextlib
 import functools
 import itertools
 import json
@@ -246,6 +247,47 @@ def mamba2_layer_site_draw(seed):
     shape = (1, TANGENT_TOKENS, arrays["hidden"].shape[-1])
     arrays["direction"] = rng.standard_normal(shape).astype(np.float32)
     return arrays
+
+
+MAMBA2_130M = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
+"""state-spaces/mamba2-130m's revision (mamba_ssm's config and names, pickles on main; SFconvertbot's
+refs/pr/1)."""
+
+MAMBA2_130M_HF = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
+"""AntonV/mamba2-130m-hf's revision: transformers' port of state-spaces/mamba2-130m."""
+
+INTEROP_TOKENS = (2, 13)
+"""The 'interop' site's rows of token ids."""
+
+INTEROP_VOCAB = 50000
+"""The ids the 'interop' site draws its tokens below: every one a GPT-NeoX tokenizer's own (its 50254, which
+the recorder checks)."""
+
+
+def mamba2_interop_draw(seed):
+    """The 'interop' site's rows of token ids (`INTEROP_TOKENS`), each below `INTEROP_VOCAB`."""
+    return {"ids": np.random.default_rng(np.random.SeedSequence([seed, 130])).integers(
+        0, INTEROP_VOCAB, INTEROP_TOKENS).astype(np.int32)}
+
+
+def mamba2_130m(dtype):
+    """state-spaces/mamba2-130m through Dew's interop (`Pretrained.load`), computing and stored in `dtype`
+    (float64 loaded under `jax.enable_x64`, which its runs take too)."""
+    from dew.interop.pretrained import Pretrained
+
+    wide = jnp.dtype(dtype) == jnp.float64
+    with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
+        return Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype=dtype,
+                               param_dtype=dtype)
+
+
+def mamba2_130m_logits(loaded):
+    """The 'interop' site's computation on `loaded` (`mamba2_130m`): a draw's logits, fp32 where narrower."""
+    def run(inputs):
+        logits = loaded.model.apply(loaded.variables, jnp.asarray(inputs["ids"]))
+        return {"logits": logits.astype(jnp.promote_types(logits.dtype, jnp.float32))}
+
+    return run
 
 
 HF_TINY = Path(__file__).resolve().parent / "fixtures" / "hf" / "mamba2-tiny"

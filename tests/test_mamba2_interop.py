@@ -7,16 +7,16 @@ reference and 2.9e-02 from the reference's own bfloat16 forward (which sits
 2.3e-02 from its fp32), tolerance 1e-1 on each.
 """
 
-import contextlib
-import copy
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from safetensors.numpy import load_file, save_file
+from ssd_support import MAMBA2_130M_HF, mamba2_130m, mamba2_130m_logits, mamba2_interop_draw
 
 from dew.interop.mamba2 import config_from_hf
 from dew.interop.pretrained import Pretrained
@@ -138,10 +138,9 @@ def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors
     assert config_from_hf(saved) == config_from_hf(json.loads((FIXTURE / "config.json").read_text()))
 
 
-INTEROP_SEEDS = 8
-"""The declared rows of tokens of the bf16 checkpoint against the port's own bf16 forward (check 1)."""
-MAMBA2_130M = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
-MAMBA2_130M_HF = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
+INTEROP = Path(__file__).resolve().parent / "fixtures" / "mamba2" / "interop_seeded.npz"
+"""transformers' bf16 and float64 logits of state-spaces/mamba2-130m's port on seeded rows of tokens, recorded
+(tools/mamba2_reference.py's `write_interop`)."""
 
 
 @pytest.mark.network
@@ -154,14 +153,13 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     Observed on CPU: fp32 4.7e-4 on logits of magnitude 170, every argmax
     equal; tolerance 1e-3, about twice that. In bfloat16 Dew hands the scan
     the conv's bf16 output, as the reference's own bfloat16 forward does, and
-    is held on par with that forward from the port's float64 twin over seeded
-    rows of tokens (check 1), run in float64 throughout (`torch_precision`:
-    transformers' mixer casts its scan's operands to fp32 itself).
+    is held on par with that forward, recorded over seeded rows of tokens
+    ('interop', `ssd_support.mamba2_interop_draw`), from float64 (check 1):
+    its truth Dew's float64 load, which the recorder held to the port's
+    float64 twin at every seed.
     """
     import torch
     import transformers
-
-    from tools.torch_precision import float64, float64_twin
     tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF)
     prompts = ["The capital of France is Paris, and the capital of Germany is",
                "def fibonacci(n):\n    if n < 2:\n        return n\n    return"]
@@ -172,25 +170,16 @@ def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
     with torch.no_grad():
         reference = port(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
 
-    fp32 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype="float32")
-    bf16 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M,
-                           dtype="bfloat16", param_dtype="bfloat16")
-
+    fp32 = mamba2_130m(jnp.float32)
     logits = np.asarray(fp32.model.apply(fp32.variables, ids), np.float32)
     assert fp32.revision == "ea6060f68a4289e9c06f80effa896629ba519216"
     assert largest(logits, reference) < 1e-3
     assert np.array_equal(logits.argmax(-1), reference.argmax(-1))
-    def logits_of(model, precision):
-        @torch.no_grad()
-        def run(ids):
-            with precision():
-                return model(torch.from_numpy(np.asarray(ids, np.int64))).logits.to(torch.float64).numpy()
-        return as_given(run)
 
-    def draw(seed):
-        return (np.random.default_rng(seed).integers(0, tokenizer.vocab_size, (2, 13)).astype(np.int32),)
-
-    assert_as_exact(lambda ids: bf16.model.apply(bf16.variables, ids).astype(jnp.float32),
-                    logits_of(copy.deepcopy(port).to(torch.bfloat16), contextlib.nullcontext), draw,
-                    "bf16 logits against the port's in bfloat16", seeds=INTEROP_SEEDS,
-                    truth_fn=logits_of(float64_twin(port), float64))
+    seeds = declared_seeds(INTEROP)["interop"]
+    draw, recorded, truth = indexed_recording(
+        recording(INTEROP), "interop", seeds, inputs_of=mamba2_interop_draw,
+        truth_fn=jax.jit(mamba2_130m_logits(mamba2_130m(jnp.float64))))
+    bf16 = mamba2_130m_logits(mamba2_130m(jnp.bfloat16))
+    assert_as_exact(jax.jit(lambda index, inputs: bf16(inputs)), recorded, draw,
+                    "bf16 logits against the port's recorded in bfloat16", seeds=seeds, truth_fn=truth)
