@@ -105,7 +105,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 
 ## Algebraic optimization
 
-Dew derives the cheapest form of its own math ([design](design/algebra.md)): one e-graph engine (`dew.algebra`) rewrites every compiled program at its seam, `OuterProgram`, derives the templates' algebra from declarations, and searches fusions toward generated megakernels; everything built at once, measured together.
+Dew derives the cheapest form of its own math ([design](design/algebra.md)): one e-graph engine (`dew.algebra`) in two modes. At dev time a generator derives the templates' algebra, stable numeric forms and surrogate bodies into checked-in, reviewed modules, with error-aware extraction; at compile time a small, fast pass rewrites each program's autodiff output where it is jitted; nothing runs at runtime. Every custom derivative declares its class, so the engine sees through kernels' glue and never undoes numerics or surrogate rules. [3225–3232, 3256–3266, 3272–3275]
 
 ## Data
 
