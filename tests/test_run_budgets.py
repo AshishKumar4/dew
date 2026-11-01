@@ -3,10 +3,14 @@ runs out before its length."""
 
 import collections
 import dataclasses
+import json
+from pathlib import Path
 
 import grain.python as grain
 import jax.numpy as jnp
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from examples_clock_worker import Questioned
 from recording import RecordingTracker
@@ -15,7 +19,7 @@ from test_barren_reads import Untouched
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
-from dew.data import Memory, text
+from dew.data import Files, Memory, text
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import ObjectiveData, Pipeline
@@ -137,6 +141,89 @@ def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examp
     assert sum(read.values()) == examples
     assert collections.Counter(read.values()) == collections.Counter(
         {passes + 1: rest, passes: RECORDS - rest} if passes else {1: rest})
+
+
+SHARDED_RECORDS = 15
+"""The ids, 1 to 15, that the sharded sources of the worker reads below hold, in five physical shards of
+three rows."""
+
+
+def sharded_records(kind: str, directory: Path) -> Pipeline:
+    """The ids in five physical shards of three rows: held in memory, or in five files of `kind` ("jsonl",
+    whose shards state no row count, or "parquet", whose footers state it)."""
+    ids = np.arange(1, SHARDED_RECORDS + 1, dtype=np.int32)
+    if kind == "memory":
+        return Pipeline(Memory({"id": ids}, shard_rows=3))
+    for part in range(5):
+        rows = [{"id": int(record)} for record in ids[part * 3:(part + 1) * 3]]
+        if kind == "jsonl":
+            (directory / f"part-{part}.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        else:
+            pq.write_table(pa.Table.from_pylist(rows), directory / f"part-{part}.parquet")
+    return Pipeline(Files(str(directory / f"part-*.{kind}"), format=kind))
+
+
+def bound_read(
+        chain: Pipeline, examples: int, workers: int, shares: int = 1) -> tuple[collections.Counter, int]:
+    """The real ids that the `shares` of a pool, each read in turn, hand out of a streamed training read of
+    `chain` bounded to `examples`, in batches of four read by `workers` loading workers, and the examples
+    their batches consume (`EXAMPLES_CONSUMED`)."""
+    loader = compile(chain.batch(4), read="streamed", examples=examples, loading=Loading(workers=workers))
+    read: collections.Counter = collections.Counter()
+    consumed = 0
+    for index in range(shares):
+        stream = loader.train(DataPartition(index=index, count=shares))
+        try:
+            for batch in stream:
+                real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+                read.update(np.asarray(batch["id"])[real].tolist())
+                consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+        finally:
+            if isinstance(stream, Closeable):
+                stream.close()
+    return read, consumed
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("kind", ["memory", "parquet"])
+@pytest.mark.parametrize("examples", [15, 7, 20])
+def test_a_bounded_streamed_read_of_stated_shards_hands_out_each_example_once_a_pass_whatever_its_workers(
+        examples, kind, workers, tmp_path):
+    """A streamed read of five shards of three rows that state their rows, bounded to `examples` of its 15
+    examples, hands out each example once for each pass its bound reaches and consumes exactly its bound,
+    and the examples are those a read without workers hands out. Workers change how a stream is read and
+    leave the examples a run sees as they were (`Loading`)."""
+    chain = sharded_records(kind, tmp_path)
+    read, consumed = bound_read(chain, examples, workers)
+    assert sum(read.values()) == consumed == examples
+    assert max(read.values()) == -(-examples // SHARDED_RECORDS)
+    if workers:
+        assert read == bound_read(chain, examples, 0)[0]
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("examples", [15, 7])
+def test_a_bounded_streamed_read_of_unstated_shards_consumes_its_bound_whatever_its_workers(
+        examples, workers, tmp_path):
+    """The same read over five files of jsonl, whose shards state no rows, so a bound reaches its examples
+    by count and not by place: its loading workers hand out the bound's examples between them, as many as
+    it names and each consumed once, and no worker reads a bound of its own."""
+    read, consumed = bound_read(sharded_records("jsonl", tmp_path), examples, workers)
+    assert sum(read.values()) == consumed == examples
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("kind", ["memory", "jsonl"])
+@pytest.mark.parametrize("examples", [15, 7])
+def test_a_pools_bounded_streamed_read_is_dealt_between_its_workers_as_between_its_shares(
+        examples, kind, workers, tmp_path):
+    """Two shares of a pool, each read by `workers` loading workers, hand out between them exactly the
+    bound's examples, each consumed once, and where the shards state their rows each example goes to one
+    share and one of its workers."""
+    read, consumed = bound_read(sharded_records(kind, tmp_path), examples, workers, shares=2)
+    assert sum(read.values()) == consumed == examples
+    if kind == "memory":
+        assert max(read.values()) == 1
 
 
 POOLED = 3
