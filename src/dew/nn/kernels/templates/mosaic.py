@@ -1074,6 +1074,11 @@ class Issuer[Accumulator](abc.ABC):
         """`vector` `[rows]` in a row's layout, whatever its own."""
         return plgpu.layout_cast(vector, self.row)
 
+    def as_tile(self, value: jax.Array) -> jax.Array:
+        """`value` `[rows, columns]` in the accumulator's layout, whatever its own (a walk's carry, a TF32
+        product's accumulator on mma.sync)."""
+        return plgpu.layout_cast(value, self.layout)
+
 
 class Transport[Allocated, Opened](abc.ABC):
     """An execution policy (design §6): who loads a program's operands and how (`streams`, `opened`,
