@@ -266,8 +266,11 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
         return grads.query, grads.key, grads.value
 
     accurate = False
-    op, ba, config = attention._gated_backward("sm90", width, accurate, "none")
-    with generation.assumed("sm90"):
+    op, ba, _ = attention._gated_backward("sm90", width, accurate, "none")
+    # The one launch its two consumers feed (FlashAttention 3's), pinned: the derivation takes it where the
+    # one launch is allowed (`attention_mosaic.ONE_LAUNCH`, held off for row 3180).
+    config = attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed")
+    with generation.assumed("sm90"), attention._pinned(backward=config):
         models = attention._backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
 

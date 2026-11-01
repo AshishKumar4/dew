@@ -20,6 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+from dew.nn.kernels.templates.axes import named, placed
 from dew.nn.sharding import per_shard
 
 
@@ -51,10 +52,10 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
                                    epilogue_axes, 'rows', block_m)
     blocks = {'rows': (block_m, 0), 'depth': (padded_depth, None), 'columns': (block_n, 1)}
 
-    def spec(axes):
-        return pl.BlockSpec(tuple(blocks[axis][0] for axis in axes),
-                            lambda i, j: tuple(0 if blocks[axis][1] is None else (i, j)[blocks[axis][1]]
-                                               for axis in axes))
+    def spec(side_axes):
+        return pl.BlockSpec(named(side_axes, {axis: block for axis, (block, _) in blocks.items()}),
+                            lambda i, j: named(side_axes, {axis: 0 if grid is None else (i, j)[grid]
+                                                           for axis, (_, grid) in blocks.items()}))
 
     matrix_spec = (pl.BlockSpec((block_n, padded_depth), lambda i, j: (j, 0)) if transpose_rhs
                    else pl.BlockSpec((padded_depth, block_n), lambda i, j: (0, j)))
@@ -122,9 +123,10 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, pr
                                    prologue_axes, 'rows', block_m)
     blocks = {'rows': (padded, None), 'depth': (block_k, 0)}
 
-    def spec(axes):
-        return pl.BlockSpec(tuple(blocks[axis][0] for axis in axes),
-                            lambda i, j: tuple(i if blocks[axis][1] == 0 else 0 for axis in axes))
+    def spec(side_axes):
+        return pl.BlockSpec(named(side_axes, {axis: block for axis, (block, _) in blocks.items()}),
+                            lambda i, j: named(side_axes, {axis: i if grid == 0 else 0
+                                                           for axis, (_, grid) in blocks.items()}))
 
     kernel = functools.partial(_tgmm_kernel, rows=rows, block_m=block_m, prologue=prologue,
                                prologue_axes=prologue_axes, exact_sums=exact_sums)
@@ -206,5 +208,4 @@ def _padded_on(sides: tuple, axes_of: tuple, axis_name: str, block: int) -> tupl
 def _cut(refs, axes_of: tuple, stepped: str, span) -> list:
     """Each side tile of a step: its block cut to `span` along the `stepped` launch axis, whole along the
     others."""
-    return [ref[tuple(span if axis == stepped else slice(None) for axis in axes)]
-            for ref, axes in zip(refs, axes_of, strict=True)]
+    return [ref[placed(side_axes, {stepped: span})] for ref, side_axes in zip(refs, axes_of, strict=True)]
