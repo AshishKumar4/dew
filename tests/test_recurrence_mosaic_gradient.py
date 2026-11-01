@@ -245,9 +245,15 @@ def test_a_value_row_split_by_its_blocks_takes_every_column_interpreted():
         return given, (jax.random.normal(keys[0], given.value.shape),
                        jax.random.normal(keys[1], (1, 1, 64, 192)))
 
+    def planned(given: Chunk):
+        # The A100's own tiles and plan, its launches interpreted.
+        return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
+                           tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
+                           family=bundles.of('sm80', jnp.bfloat16), interpret=True)
+
     with generation.assumed('sm80'):
         assert trained(draws(0)[0], hooks)
-        assert_as_exact(with_gradients(functools.partial(chunk_on, 'mosaic_gpu', hooks)),
-                        with_gradients(functools.partial(chunk_on, 'xla', hooks)), draws,
-                        "the template's gradient over a value row split by its blocks, an A100's plan",
+        tiles = template.MOSAIC.derived(template_call(draws(0)[0], hooks), generation.gpu_target('sm80'))
+        assert_as_exact(with_gradients(planned), with_gradients(functools.partial(chunk_on, 'xla', hooks)),
+                        draws, "the template's gradient over a value row split by its blocks, an A100's plan",
                         seeds=FEWEST_SEEDS, truth_fn=with_gradients(functools.partial(token_by_token, hooks)))
