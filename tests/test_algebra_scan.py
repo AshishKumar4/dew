@@ -6,6 +6,8 @@ through its derived step and outputs (and Mamba-2's two walks merged), each held
 (check 1) against the token-by-token scan, with packed documents' resets too (`Scan.reset`), across which no
 gradient flows; and updates no chunk form here holds, refused."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -124,11 +126,12 @@ def test_an_update_no_chunk_form_holds_is_refused(refused):
         forms.step(forms.init({}), chunk_of(operands(*draw(0)), 0))
 
 
-def gated_delta(h, q, k, v, g, beta):
+def gated_delta(h, q, k, v, g, beta, exponential=jnp.exp):
     """The gated delta rule: the state decayed and its key's old value corrected toward the new one,
-    `h = exp(g) (h - beta k (k^T h)) + beta k v^T`."""
+    `h = exp(g) (h - beta k (k^T h)) + beta k v^T`, its decay `exponential(g)` (`jnp.exp2`: in base 2, fla's
+    gates)."""
     del q
-    return jnp.exp(g) * (h - beta * k[:, None] * (k @ h)[None, :]) + beta * k[:, None] * v[None, :]
+    return exponential(g) * (h - beta * k[:, None] * (k @ h)[None, :]) + beta * k[:, None] * v[None, :]
 
 
 def gated_delta_written_as_error(h, q, k, v, g, beta):
@@ -312,14 +315,25 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
                     f"{update_fn.__name__} adjoint", seeds=16)
 
 
+def kimi_draw_float16(seed):
+    """As `kimi_draw`, each key's decay's exponent in float16 (a narrow gate's own dtype)."""
+    q, k, v, g, beta = kimi_draw(seed)
+    return q, k, v, g.astype(jnp.float16), beta
+
+
 RESETTING = {
     "ssd": (update, readout, OPERANDS, (STATE, WIDTH), draw, ("x", "dt", "B", "C"),
             {"rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}),
     "gated_delta": (gated_delta, gated_readout, GATED, (KEY, VALUE), gated_draw, tuple(GATED), {}),
+    "gated_delta_base2": (functools.partial(gated_delta, exponential=jnp.exp2), gated_readout, GATED,
+                          (KEY, VALUE), gated_draw, tuple(GATED), {}),
     "kimi_delta": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw, tuple(GATED), {}),
+    "kimi_delta_float16": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw_float16, tuple(GATED),
+                           {}),
 }
 """Each rule a reset walk is derived for: its update and readout, operands, state, draw, token operands and
-constants."""
+constants. A decay in base 2, and exponents in float16, whose partials' sum of several resets passes its
+largest."""
 
 
 def resets_of(seed) -> jax.Array:
@@ -378,6 +392,27 @@ def test_a_reset_walk_in_chunks_computes_the_token_scan_of_each_document(rule):
 
     assert_as_exact(jax.jit(derived), jax.jit(tokens_run),
                     lambda seed: (resets_of(seed), *RESETTING[rule][4](seed)), f"{rule} reset walk", seeds=16)
+
+
+def test_two_reset_walks_merged_give_the_final_state():
+    """Mamba-2's tokens with resets in both halves (`resets_of`), walked in two halves, the second from a zero
+    state, merged: the final state on par with the token scan's that zeroes the state at each, against the
+    float64 truth (check 1), a reset in the second half leaving the first's state none of its weight."""
+    forms, values, chunked, tokens_run = resetting("ssd")
+    half = TOKENS // CHUNK // 2
+
+    def merged(first, *tokens):
+        given = values(first, tokens)
+        states = []
+        for chunks in (range(half), range(half, 2 * half)):
+            state = forms.init({})
+            for index in chunks:
+                state = forms.step(state, chunked(given, index))
+            states.append(state)
+        return forms.finish(forms.merge(*states), given)
+
+    assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: tokens_run(*xs)[1]),
+                    lambda seed: (resets_of(seed), *draw(seed)), "ssd reset merged", seeds=16)
 
 
 @pytest.mark.parametrize("rule", RESETTING)

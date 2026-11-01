@@ -33,8 +33,9 @@ def _staging(block: tuple, swizzle: int | None) -> tuple:
 
 def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
-    bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    return mosaic.swizzle_transforms(dtype, mosaic.widest_swizzle(dtype, shape[-1]))
+    bytes allow and its cp.async copy tiles (`mosaic.copied_swizzle`), swizzled (bank-conflict-free
+    ldmatrix), as jax's Ampere examples stage their operands."""
+    return mosaic.swizzle_transforms(dtype, mosaic.copied_swizzle(shape, dtype))
 
 
 def _depth_granule(ref, axis: int, instruction: int) -> int:
@@ -257,8 +258,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        del interpret
-        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
+        return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs, interpret)
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         for formed in parts:

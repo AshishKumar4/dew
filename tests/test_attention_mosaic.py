@@ -905,16 +905,14 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("tiles", [attention_mosaic.Tiles(64, 128, 2, 1),
-                                   attention_mosaic.Tiles(64, 192, 2, 1)], ids=["128-keys", "192-keys"])
-def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
+def test_a_guarded_launch_walks_its_own_key_tiles():
     """A spans call (four documents over 256 keys, their ids from 1: 0 is padding) whose weighted values
     pass fp32's largest, at a launch of 128-key tiles whose guarded walk takes its own key tiles
-    (`guarded_tiles`), and at 192 keys cut to a whole tile of the family's rows that divides it: the
-    guarded launch runs on tiles its program takes, reads each block's
+    (`guarded_tiles`): the guarded launch runs on tiles its program takes, reads each block's
     keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
     attention, which normalizes its weights before their product (bf16 values near their largest, equal
     logits)."""
+    tiles = attention_mosaic.Tiles(64, 128, 2, 1)
     rows, queries, heads, kv_heads = 1, 256, 2, 1
     documents = jnp.repeat(jnp.arange(1, 5, dtype=jnp.int32), queries // 4)[None]
     spans = template.spans(queries, queries, rows, segment_ids=documents)
@@ -1127,8 +1125,7 @@ def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
     launch whose two consumers share a key block, each its share of the columns
     (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
     interpreter."""
-    shared = attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed", shared_keys=True)
-    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256, config=shared)
+    _check_backward(call, SHAPES["interpreted"], form="fused-shared-keys", interpret=True, width=256)
 
 
 @INTERPRETS

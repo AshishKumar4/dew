@@ -164,6 +164,64 @@ def test_what_a_gpu_has_spent_already_is_not_charged_to_a_program_again():
     assert resident.held == Collectives(groups=frozenset({(0, 1, 2, 3), (0, 1), (2, 3)}))
 
 
+def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
+    """A program's code takes its GPUs' memory outside XLA's pool as it first runs and leaves as its
+    executable is released, neither of which a process sees: at every admission, a program whose new
+    communicators fit what its GPUs have free now but not with its code is refused, naming the bytes its code
+    and communicators need and the bytes free, an executable admitted again (loaded again, perhaps) charged
+    its code again; the room, which holds what stays made, never holds code."""
+    room = dict.fromkeys(range(4), 4 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    pair = Collectives(groups=frozenset({(0, 1)}))
+    resident = communicators.Resident()
+    step = communicators.Loaded(b"step", (0, 1, 2, 3), GIB)
+    resident.admit(every, FOUR, room, lambda gpu: 3 * GIB, step)
+    with pytest.raises(CommunicatorRoom) as again:
+        resident.admit(every, FOUR, room, lambda gpu: GIB // 2, step)
+    assert again.value.needed == dict.fromkeys(range(4), GIB)
+    assert again.value.room == dict.fromkeys(range(4), GIB // 2)
+    resident.admit(every, FOUR, room, lambda gpu: GIB, step)
+    evaluation = communicators.Loaded(b"eval", (0, 1), GIB // 2)
+    with pytest.raises(CommunicatorRoom):
+        resident.admit(pair, FOUR, room, lambda gpu: GIB, evaluation)
+    resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
+
+
+def test_a_programs_communicators_kept_in_an_earlier_form_are_read_again(tmp_path, monkeypatch):
+    """A program's communicators kept by an earlier Dew, whose reading of a program's text may differ, are
+    not taken as this one's: the program's text is read again."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    earlier = tmp_path / "dew" / "communicators" / "programs" / f"{b'step'.hex()}.json"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_text(json.dumps(Collectives(groups=frozenset({(0, 1, 2, 3)})).to_json()))
+    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+               "  %x = f32[8] parameter(0)\n"
+               "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+    assert communicators.collectives_kept(b"step", (0, 1, 2, 3), lambda: program) == Collectives(
+        groups=frozenset({(0, 1), (2, 3)}))
+
+
+def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeypatch):
+    """A program's communicators are read from its text once per executable, kept in Dew's cache by its
+    fingerprint as positions in its device assignment, so a warm start that loads it from the compilation
+    cache reads no text, and the same executable over other GPUs maps them to those."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+               "  %x = f32[8] parameter(0)\n"
+               "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+    read = []
+
+    def text():
+        read.append(1)
+        return program
+
+    first = communicators.collectives_kept(b"step", (0, 1, 2, 3), text)
+    again = communicators.collectives_kept(b"step", (3, 2, 1, 0), text)
+    assert read == [1]
+    assert first == Collectives(groups=frozenset({(0, 1), (2, 3)}))
+    assert again == Collectives(groups=frozenset({(3, 2), (1, 0)}))
+
+
 def test_programs_admitted_at_once_are_held_together():
     """Two programs compiled at once, each of whose communicators fits the room alone and not with the
     other's, are admitted one at a time: one is admitted and the other refused."""
@@ -193,7 +251,7 @@ ADMITTED = """
 import jax, jax.numpy as jnp, numpy as np
 from jax.sharding import Mesh, PartitionSpec
 from dew import communicators
-from dew.communicators import CommunicatorRoom, Needs, Sizing
+from dew.communicators import Needs, Sizing
 from dew.nn.kernels import options
 
 mesh = Mesh(np.array(jax.devices()[:2]), ("pair",))
@@ -204,24 +262,66 @@ options.program(summed).compiled(jnp.ones(4))
 tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, connections={}, runtime=dict.fromkeys(ids, 0),
               seconds=1.0)
 communicators.hold(Sizing(tight, 0.95, 0.9, dict.fromkeys(ids, 2**30), dict.fromkeys(ids, 2**29)))
-try:
-    options.program(summed).compiled(jnp.ones(4))
-except CommunicatorRoom as refused:
-    print(sorted(refused.needed.values()))
+options.program(summed).compiled(jnp.ones(4))
+print("compiled")
 """
 """A fresh process of two CPU devices compiling one all-reduce through `options.program`, then holding a
-sizing that left too little room for its communicator and compiling it again."""
+sizing that left too little room for its communicator over two GPUs and compiling it again."""
 
 
-def test_every_program_dew_compiles_is_admitted_where_it_sized_the_pool():
-    """A program compiled through Dew's one compile point (`dew.nn.kernels.templates.report.compiled`, which
-    every outer program, step and evaluation passes) is admitted against the room the process's sizing left,
-    refused before it runs where its communicator needs more, naming the bytes; a process that holds no
-    sizing admits every program."""
+def test_a_cpu_program_takes_none_of_the_gpus_room():
+    """A program loaded on CPU devices makes no NCCL communicator and holds no GPU code, so a process whose
+    sizing leaves its GPUs too little room for the same all-reduce over two of them compiles it on two CPU
+    devices, admitted against nothing."""
     done = subprocess.run([sys.executable, "-c", ADMITTED], capture_output=True, text=True, check=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE),
                                "XLA_FLAGS": "--xla_force_host_platform_device_count=2"})
-    assert json.loads(done.stdout.strip().splitlines()[-1]) == [GIB, GIB]
+    assert done.stdout.strip().splitlines()[-1] == "compiled"
+
+
+AHEAD = """
+import jax, jax.numpy as jnp, numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from dew import communicators
+from dew.communicators import Needs, Sizing
+from dew.nn.kernels import options
+from dew.training.ahead import compile_only_gpus
+
+mesh = Mesh(np.array(compile_only_gpus("sm90", 2)), ("pair",))
+summed = jax.shard_map(lambda part: jax.lax.psum(part, "pair"), mesh=mesh, in_specs=PartitionSpec("pair"),
+                       out_specs=PartitionSpec())
+tight = Needs(collective={2: 2**30}, exchanged={}, permuted={}, connections={}, runtime={0: 0, 1: 0},
+              seconds=1.0)
+communicators.hold(Sizing(tight, 0.95, 0.9, {0: 2**30, 1: 2**30}, {0: 2**29, 1: 2**29}))
+rows = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec("pair")))
+options.program(summed).compiled(rows)
+print("compiled ahead")
+"""
+"""A process holding a sizing too small for a pair's communicator, compiling an all-reduce ahead for two
+compile-only GPUs that this host does not have."""
+
+
+def test_a_program_compiled_ahead_for_absent_gpus_is_not_admitted_here():
+    """A program compiled ahead for GPUs this process has not (`compile_only_gpus`) is never loaded here, so
+    its communicators take none of this host's room: a process whose sizing would refuse the same program on
+    its own GPUs compiles it ahead."""
+    done = subprocess.run([sys.executable, "-c", AHEAD], capture_output=True, text=True, check=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
+    assert done.stdout.strip().splitlines()[-1] == "compiled ahead"
+
+
+def test_a_process_prepared_again_keeps_the_sizing_its_pool_was_made_with():
+    """Once the backend has opened, the pool keeps the share its first preparation sized, so a second
+    preparation (a sweep's next run, a profile after a run) keeps that sizing and admits every later
+    program against it, never holding nothing."""
+    room = dict.fromkeys(range(2), GIB)
+    sizing = communicators.Sizing(NEEDS, 0.95, 0.9, room, room)
+    held = communicators.held()
+    communicators.hold(sizing)
+    try:
+        assert communicators.sized_pool(cuda=True, opened=True) is sizing
+    finally:
+        communicators.hold(held)
 
 
 def test_the_sized_pool_is_recorded_with_what_it_left_room_for(monkeypatch):
@@ -383,3 +483,29 @@ def test_import_dew_connects_nccls_peers_at_creation_unless_told_otherwise(set_b
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True,
                           env={**env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
     assert json.loads(done.stdout.strip().splitlines()[-1]) == expected
+
+def a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): a program compiled through Dew's compile point
+    (`options.program`) on this host's GPU is admitted against the sizing the process holds: refused before
+    it runs, naming the GPU's bytes, where the room left outside XLA's pool holds less than the runtime
+    needs, and admitted with its code held to what the GPU has free where the room holds it."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import options
+
+    gpu = jax.devices("gpu")[0]
+    ordinal = gpu.local_hardware_id if gpu.local_hardware_id is not None else gpu.id
+    needs = Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={ordinal: 2**20},
+                  seconds=1.0)
+    rows = jax.device_put(jnp.ones(8), gpu)
+    held = communicators.held()
+    try:
+        communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: 1}, {ordinal: 1}))
+        with pytest.raises(CommunicatorRoom) as refused:
+            options.program(lambda x: x * 3.0).compiled(rows)
+        assert refused.value.room == {ordinal: 1}
+        communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: GIB}, {ordinal: GIB}))
+        assert float(options.program(lambda x: x * 5.0)(rows)[0]) == 5.0
+    finally:
+        communicators.hold(held)
+

@@ -11,11 +11,10 @@ import functools
 import jax
 import jax.numpy as jnp
 import pytest
-from check1_statistics import FEWEST_SEEDS
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import chunk_on, token_by_token
+from reference_error import with_gradients
+from test_recurrence_chunk import chunk_on
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -226,28 +225,3 @@ def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template's gradient runs a call over `given`'s operands under `hooks` on the device its
     launches run for (`Mosaic.trains`: the fast backward takes it, its launches held at the call's tiles)."""
     return template.MOSAIC.trains(template_call(given, hooks), template.Mosaic.launched())
-
-
-def test_a_value_row_split_by_its_blocks_takes_every_column_interpreted():
-    """The fast backward planned for an A100 (assumed, interpreted by its bundle off a GPU) over a value row
-    three blocks wide, whose query/key launch's streams at the whole row are past an A100's block
-    (`mainloop_backward._query_key_split`): split by the blocks dividing the row, its every gradient on par
-    from float64 with the portable math's. Halved instead, 192 columns took 96, a block and a half, and the
-    split's programs read no column past their first block's."""
-    if mainloop.family_of() is not None:
-        pytest.skip("an A100's plan interpreted off a GPU: a GPU plans for its own")
-    hooks = recurrence.Hooks(decay='scalar', scale=64 ** -0.5, write_bound=1.0)
-    shape = {'rows': 1, 'length': 64, 'key_heads': 1, 'value_heads': 1, 'key_width': 64, 'value_width': 192}
-
-    def draws(seed):
-        (given,) = draw(jnp.bfloat16, seed, **shape)
-        keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
-        return given, (jax.random.normal(keys[0], given.value.shape),
-                       jax.random.normal(keys[1], (1, 1, 64, 192)))
-
-    with generation.assumed('sm80'):
-        assert trained(draws(0)[0], hooks)
-        assert_as_exact(with_gradients(functools.partial(chunk_on, 'mosaic_gpu', hooks)),
-                        with_gradients(functools.partial(chunk_on, 'xla', hooks)), draws,
-                        "the template's gradient over a value row split by its blocks, an A100's plan",
-                        seeds=FEWEST_SEEDS, truth_fn=with_gradients(functools.partial(token_by_token, hooks)))

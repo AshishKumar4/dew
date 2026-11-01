@@ -40,6 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
+from dew.nn.derivatives import surrogate
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -813,6 +814,21 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
+PROTECTED = "dew_protected"
+"""The name scope an error-free transform's equations carry, which survives autodiff in each traced equation's
+name stack: `dew.algebra` never rewrites them, as reassociation would cancel the residual they keep."""
+
+
+def _protected(transform: Callable) -> Callable:
+    """`transform` traced under `PROTECTED`'s name scope."""
+    @functools.wraps(transform)
+    def traced(*args, **kwargs):
+        with jax.named_scope(PROTECTED):
+            return transform(*args, **kwargs)
+    return traced
+
+
+@_protected
 def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
     total = left + right
@@ -820,6 +836,7 @@ def two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
+@_protected
 def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
                 rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
@@ -972,6 +989,7 @@ def divided(numerator, rate):
     return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 
+@_protected
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
@@ -986,6 +1004,7 @@ def compensated_add(left, right):
     return two_sum(total, dropped + left_lo + right_lo)
 
 
+@_protected
 def compensated_difference(later, earlier):
     """`later - earlier` of two double-float values, rounded once: the halves'
     differences summed, so the difference of two near values (a range of a
@@ -1096,10 +1115,8 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
                          tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
     return _compensated_sum(primals[0], axes), jnp.sum(tangents[0], axes)
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
-def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
-    """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
-    straight-through tangent that is never rounded a second time.
+def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
+    """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
 
     The rounding is the cast itself, subnormals included. The barrier keeps
     `xla_allow_excess_precision` from deleting the round trip under jit, and
@@ -1112,10 +1129,10 @@ def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
-@rounded_operand.defjvp
-def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
-                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
-    return jnp.asarray(rounded_operand(primals[0], dtype)), tangents[0]
+rounded_operand = surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
+                            nondiff_argnums=(1,))
+"""The value `x` takes in `dtype`, held in `x`'s own dtype (`_rounded`), with a straight-through
+derivative (`dew.nn.derivatives.surrogate`): its tangent is `x`'s, never rounded a second time."""
 
 
 def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool:
