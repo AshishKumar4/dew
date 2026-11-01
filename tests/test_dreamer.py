@@ -10,8 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import bits
 from flax import struct
-from recording import bits
 from reference_error import assert_computes_the_oracle, chain_roundings
 from test_env_rollout import kept_as_left
 

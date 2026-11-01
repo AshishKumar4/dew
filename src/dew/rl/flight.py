@@ -52,7 +52,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from collections.abc import Iterator
-from typing import Protocol
+from typing import Any, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -501,17 +501,39 @@ def started(racing: Racing, key: jax.Array, difficulty: jax.Array, ramp: jax.Arr
                 difficulty=difficulty, ramp=ramp)
 
 
-def commanded(racing: Racing, race: Race, action: jax.Array) -> tuple[Race, jax.Array, jax.Array]:
+class Commanded(Protocol):
+    """A drone a flight controller commands (`commanded`): its drawn `body`, its `rate_limit`, its latency in
+    whole control steps (`delay`) and the commands `pending` (`delayed`), a dataclass whose `pending` a
+    command replaces."""
+
+    __dataclass_fields__: ClassVar[dict[str, Any]]
+
+    @property
+    def body(self) -> Body: ...
+
+    @property
+    def rate_limit(self) -> jax.Array: ...
+
+    @property
+    def delay(self) -> jax.Array: ...
+
+    @property
+    def pending(self) -> jax.Array: ...
+
+
+def commanded[D: Commanded](quadrotor: Quadrotor, drone: D,
+                            action: jax.Array) -> tuple[D, jax.Array, jax.Array]:
     """A drone's action `[4]` in [-1, 1] as the flight controller takes it after the drone's latency: the
     collective thrust (N), the throttle's share of the hover below zero and of the span from the hover to the
-    nominal drone's full thrust above; the body rates (rad/s), its share of the drone's rate limit."""
+    nominal `quadrotor`'s full thrust above; the body rates (rad/s), its share of the drone's rate limit. The
+    drone, a gate race's (`Race`) or any other with its fields, comes back with the command pushed."""
     action = jnp.clip(action, -1, 1)
-    hover = race.body.mass * GRAVITY
-    full = racing.quadrotor.nominal_thrust
+    hover = drone.body.mass * GRAVITY
+    full = quadrotor.nominal_thrust
     collective = hover + action[0] * jnp.where(action[0] >= 0, full - hover, hover)
-    command = jnp.concatenate([collective[None], action[1:] * race.rate_limit])
-    pending, sent = delayed(race.pending, race.delay, command)
-    return dataclasses.replace(race, pending=pending), sent[0], sent[1:]
+    command = jnp.concatenate([collective[None], action[1:] * drone.rate_limit])
+    pending, sent = delayed(drone.pending, drone.delay, command)
+    return dataclasses.replace(drone, pending=pending), sent[0], sent[1:]
 
 
 def delayed(pending: jax.Array, delay: jax.Array, command: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -790,7 +812,7 @@ class FlightEnv:
 
     def flown(self, race: Race, action: jax.Array) -> tuple[Race, jax.Array]:
         """The race after the drone flies a control step under `action`, and its path through it."""
-        race, collective, rates = commanded(self.racing, race, action)
+        race, collective, rates = commanded(self.racing.quadrotor, race, action)
         key, noise = jax.random.split(race.key)
         flight, path = flown(self.racing.quadrotor, race.body, race.flight, collective, rates, noise,
                              self.racing.hz, race.ramp)
@@ -986,7 +1008,7 @@ def _scene(racing: Racing, race: Race) -> Scene:
 
 
 __all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER", "VIEWS",
-           "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene", "Seen",
-           "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "delayed", "developed",
+           "Camera", "Commanded", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene",
+           "Seen", "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "delayed", "developed",
            "drawn_camera", "drawn_course", "facings", "gate_axes", "looking", "mounted", "nearest", "physics",
            "privileged", "quaternion", "raced", "shown", "started", "struck"]

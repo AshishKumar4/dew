@@ -339,7 +339,7 @@ def test_commands_carry_each_drones_throttle_rates_and_latency():
     with jax.enable_x64(new_val=True):
         race = races(RACING, 1, 64)
         actions = rng.uniform(-1.3, 1.3, (10, 64, 4))
-        step = jax.jit(jax.vmap(lambda race, action: commanded(RACING, race, action)))
+        step = jax.jit(jax.vmap(lambda race, action: commanded(RACING.quadrotor, race, action)))
         sent = []
         for action in actions:
             race, collective, rates = step(race, jnp.asarray(action))

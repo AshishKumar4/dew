@@ -60,9 +60,8 @@ from dew.objectives.rl.config import EnvConfig, EnvRunConfig, RolloutConfig, Tea
 from dew.optim import Linear, OptimConfig
 from dew.registry import ModelConfig
 
-AUXILIARY = (("state", 13, 512), ("gates", 24, 512), ("airframe", 6, 256), ("physics", 20, 256),
-             ("obstacles", 12, 256))
-"""The world model's auxiliary heads: each privileged view, its width and its head's units."""
+AUXILIARY = (("state", 512), ("gates", 512), ("airframe", 256), ("physics", 256), ("obstacles", 256))
+"""The world model's auxiliary heads: each privileged view and its head's units, its width the race's."""
 CONTROL, DREAMER = "dew.objectives.rl.control", "dew.objectives.rl.dreamer"
 """The modules the teacher's and the agent's networks and objectives are named from."""
 TRAINING = (("loop", 0.4), ("chain", 0.6))
@@ -396,7 +395,7 @@ class World:
                 "views": list(VIEWS), "difficulty": level, "ramp": level}
         imagination = round(15 * self.hz / 30)
         cloned = {"imagination": imagination, "imitation": 1.0, "scales": {
-            "policy": 0.0, "value": 0.0, "replay_value": 0.0, **{name: 1.0 for name, _, _ in AUXILIARY}}}
+            "policy": 0.0, "value": 0.0, "replay_value": 0.0, **{name: 1.0 for name, _ in AUXILIARY}}}
         objective = {"pretrain": cloned, "dagger": {**cloned, "imitates": "label"},
                      "online": {"imagination": imagination}}[stage]
         ratio = {"pretrain": math.inf, "dagger": self.dagger_ratio, "online": 128.0}[stage]

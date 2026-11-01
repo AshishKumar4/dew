@@ -99,13 +99,18 @@ def episodes(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int,
     last step. `memory(count)` is a recurrent policy's starting state (`DreamerV3Objective.memory`)."""
     flown = flights(policy, env, steps, memory=memory)
 
-    def score(variables: Params, key: jax.Array) -> dict[str, float]:
+    def means(variables: Params, key: jax.Array) -> dict[str, jax.Array]:
         following = flown(variables, key)
         rows = first_episode_rows(following, {name: view(following.observation, name) for name in reached})
         # The return at the reward's own width; counts and views as floats.
-        means = {"return": jnp.mean(rows["return"]),
-                 **{name: jnp.mean(rows[name].astype(jnp.float32)) for name in ("steps", *reached)}}
-        return {name: float(value) for name, value in jax.device_get(means).items()}
+        return {"return": jnp.mean(rows["return"]),
+                **{name: jnp.mean(rows[name].astype(jnp.float32)) for name in ("steps", *reached)}}
+
+    # A JAX Env's flight and its reading are one program; a host-stepped flight is read as it lands.
+    read = means if isinstance(env, Simulator | DrivenSimulator) else OuterProgram(means)
+
+    def score(variables: Params, key: jax.Array) -> dict[str, float]:
+        return {name: float(value) for name, value in jax.device_get(read(variables, key)).items()}
 
     return score
 

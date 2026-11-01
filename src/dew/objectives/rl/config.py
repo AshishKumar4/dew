@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 from collections.abc import Callable, Mapping, Sequence
-from typing import Annotated, ClassVar, Self
+from typing import Annotated, ClassVar, Self, TypedDict
 
 import jax
 import numpy as np
@@ -249,6 +249,7 @@ class EnvRunConfig(RunConfig):
         Variables that do not fit the agent are refused."""
         model = self.trained_model()
         observation = _observed(env)
+        model = dataclasses.replace(model, fields={**model.fields, **_filled(observation, model.fields)})
         declared = {field.name for field in dataclasses.fields(models[model.name])}
         derived: dict[str, Configured] = {"action_size": env.action_size}
         if declared & {"observation_size", "image"}:
@@ -350,6 +351,40 @@ def _observed(env: Env | Simulator) -> Observation:
     if isinstance(env, Simulator):
         return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), received(env.reset(0)))
     return jax.eval_shape(env.reset, jax.random.key(0))[1].observation
+
+
+class Filled(TypedDict, total=False):
+    """A world model's proprioceptive entries and auxiliary heads with their widths (`_filled`)."""
+
+    proprio: tuple[tuple[str, int], ...]
+    auxiliary: tuple[tuple[str, int, int], ...]
+
+
+def _filled(observation: Observation, fields: Mapping[str, object]) -> Filled:
+    """A world model's proprioceptive entries (`proprio`, by name) and auxiliary heads (`auxiliary`, each its
+    entry's name and its units) as its record names them, each with the width of the environment's view of
+    it, one environment's flattened; a record that states a width is refused, the environment declaring
+    it."""
+    def width(name: str) -> int:
+        return int(np.prod(np.shape(view(observation, name))[1:]))
+
+    filled: Filled = {}
+    proprio = fields.get("proprio")
+    if proprio is not None:
+        if not isinstance(proprio, Sequence) or not all(isinstance(entry, str) for entry in proprio):
+            raise ValueError(f"a record names a world model's proprioceptive entries, whose widths the "
+                             f"environment declares: {proprio}")
+        filled["proprio"] = tuple((name, width(name)) for name in proprio)
+    auxiliary = fields.get("auxiliary")
+    if auxiliary is not None:
+        heads = list(auxiliary) if isinstance(auxiliary, Sequence) else [auxiliary]
+        if not all(isinstance(head, Sequence) and not isinstance(head, str) and len(head) == 2
+                   for head in heads):
+            raise ValueError(f"a record names each auxiliary head's entry and its units, the environment "
+                             f"declaring its width: {auxiliary}")
+        filled["auxiliary"] = tuple((str(head[0]), width(str(head[0])), int(head[1])) for head in heads
+                                    if isinstance(head, Sequence))
+    return filled
 
 
 def _reads(arguments: Mapping[str, object]) -> tuple[str, ...]:

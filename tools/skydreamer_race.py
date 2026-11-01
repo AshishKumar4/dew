@@ -89,12 +89,12 @@ REALISM = Setting(Sky(tracks=("circle", "inverted_loop", "ladder"), fov=120.0, l
                   judging="untrained at each level; each track's Table III evaluation and held-out training "
                           "episodes at the level trained at, fixed seeds")
 """Toward a real FPV quadrotor's flight (the module docstring)."""
-SENSED = (("rates", 3), ("motors", 4), ("plan", 24))
-"""What the encoder reads beside the image, each entry and its width."""
-DECODED = (("state", 16, 256), ("rates", 3, 256), ("motors", 4, 256))
+SENSED = ("rates", "motors", "plan")
+"""What the encoder reads beside the image, each entry's width the race's."""
+DECODED = (("state", 256), ("rates", 256), ("motors", 256))
 """What the informed world model decodes, in the image's place (SkyDreamer Sec II-B: the information variable
 leaves the image out, and the flight plan is no observation of the drone): the privileged state and the
-sensed rates and rotor speeds, each two layers of 256 then its width."""
+sensed rates and rotor speeds, each two layers of its units then its entry's width."""
 
 
 def run(out: Path, assets: Path, drones: int = ENVIRONMENTS, setting: Setting = BASE) -> EnvRunConfig:
@@ -108,7 +108,7 @@ def run(out: Path, assets: Path, drones: int = ENVIRONMENTS, setting: Setting = 
     return EnvRunConfig(
         env=EnvConfig("skydreamer", race),
         model=ModelConfig("dew.objectives.rl.dreamer:WorldModel", {
-            "reads": "image", "proprio": [list(entry) for entry in SENSED],
+            "reads": "image", "proprio": list(SENSED),
             "auxiliary": [list(head) for head in DECODED], "deter": 2048, "hidden": 256, "stoch": 32,
             "classes": 16, "blocks": 8, "units": 256, "conv_depth": 16, "dtype": "bfloat16"}),
         objective=ObjectiveConfig("dew.objectives.rl.dreamer:DreamerV3Objective",
