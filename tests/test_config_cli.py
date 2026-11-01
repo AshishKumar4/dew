@@ -449,8 +449,7 @@ def test_param_groups_on_the_command_line_read_their_schedules_as_records():
     """A group's schedule is the record that names it, as the run's record
     writes it, and the config's own rate is one value: a number, or a schedule's record that steps
     per epoch by its `every`."""
-    from dew.optim import ParamGroup
-    from dew.schedules import Cosine, OneCycle
+    from dew.optim import Cosine, OneCycle, ParamGroup
     groups = [{"name": "delays", "patterns": ["*/delay"], "bounds": [0, 24],
                "schedule": {"class": "cosine",
                             "fields": {"peak_value": 0.1, "warmup_steps": 0, "every": 40}}},
@@ -479,7 +478,7 @@ class _Schedules(RunConfig):
 def test_a_mapping_of_class_records_reads_from_one_flag_and_round_trips_its_record():
     """#45: each schedule is the record that names it, read from one JSON
     object on the command line and written back by the run's record."""
-    from dew.schedules import Exponential, Linear
+    from dew.optim import Exponential, Linear
 
     given = {"sigma": {"class": "linear", "fields": {"peak_value": 0.5, "warmup_steps": 0, "end_value": 0.1}},
              "delay": {"class": "exponential", "fields": {"init_value": 10.0, "end_value": 1.0, "every": 4}}}

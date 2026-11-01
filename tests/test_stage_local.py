@@ -26,8 +26,9 @@ from dew.lora import LoRA
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig, ParamGroup, scale_by_m3, weight_decay_mask
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Inspection, Layout, MeshSpec, Trainer
 from dew.training.diloco import DiLoCo
+from dew.training.inspection import inspected
 from dew.training.rollout import rolled_out
 
 pytestmark = pytest.mark.mesh
@@ -370,4 +371,42 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
                   key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
                   layout=Layout(min_shard=TINY_SHARD), diloco=DiLoCo(every=2, rate=0.7, momentum=0.9),
                   tracker=None)
+    assert not run.staging.sites
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_stage_local_runs_inspection_reports_each_stored_layer_by_its_name():
+    """An inspection of a stage-local run selects and summarizes each stored layer its stacked leaves hold,
+    by the layer's own name: a path naming one layer reports that layer, and a glob reports each layer it
+    matches apart, the scalars and values the same pipeline with every layer whole on every stage logs."""
+    watched = Inspection(paths=("layers_0/self_attn/q_proj/kernel", "*mlp/up_proj/kernel"),
+                         targets=("params",), every=1)
+    logged = []
+    for stage_local in (True, False):
+        run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer="adamw", learning_rate=1e-2),
+                      key=jax.random.key(0), mesh=STAGED, layout=Layout(min_shard=TINY_SHARD,
+                                                                         stage_local=stage_local),
+                      inspection=watched, tracker=None)
+        logged.append(inspected(run, stream().train(None).__next__(), steps=1))
+    local, replicated = logged
+    assert sorted(local) == sorted(replicated)
+    named = {"params/layers_0/self_attn/q_proj/kernel/rms", "params/layers_3/mlp/up_proj/kernel/rms"}
+    assert named <= set(local)
+    assert local == replicated
+
+
+@pytest.mark.mesh(devices=8)
+def test_m3_given_dimension_numbers_keeps_every_layer_whole_and_trains():
+    """M3 given its matrices' dimension numbers, which may name a stored layer's axes or a stacked leaf's as
+    their caller wrote them, keeps every layer whole on every stage (`M3GivenState`), as M3 by its own
+    default does not: the given form steps as the replicated pipeline does."""
+    given = optax.multi_transform(
+        {"m3": optax.chain(scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=2,
+                                       weight_dimension_numbers=lambda tree: jax.tree.map(
+                                           lambda _: optax.contrib.MuonDimensionNumbers(), tree)),
+                           optax.scale_by_learning_rate(1e-2)),
+         "adam": optax.adam(1e-2)},
+        lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params)))
+    run = trainer(decoder(), given, STAGED, 8, ema=None)
+    assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
     assert not run.staging.sites

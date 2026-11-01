@@ -480,7 +480,7 @@ class Transaction:
         frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way. `examples`
         is a run's bound in source examples, where it counts no updates ahead: each update hands its
         optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
-        which a schedule over the run reads (`dew.schedules.ScheduleBase.progressed`).
+        which a schedule over the run reads (`dew.optim.ScheduleBase.progressed`).
         """
         self.fetch = fetch
         self.record = record

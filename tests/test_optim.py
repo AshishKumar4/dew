@@ -40,9 +40,16 @@ from dew.nn.kernels.generation import run_precision
 from dew.nn.precision import ACCURATE, Numerics
 from dew.optim import (
     OPTIMIZER_MAP,
+    Cosine,
+    Exponential,
+    Linear,
+    OneCycle,
     OptimConfig,
     Optimizer,
     ParamGroup,
+    Power,
+    PowerTail,
+    ScheduleBase,
     clips_qk,
     laprop,
     learning_rate,
@@ -54,7 +61,6 @@ from dew.optim import (
     weight_decay_mask,
     with_rates,
 )
-from dew.schedules import Cosine, Exponential, Linear, OneCycle, Power, PowerTail, ScheduleBase
 from dew.training import MeshSpec
 from tools.muonclip_reference import clip_mla_reference, clip_qk_kernel, clip_scale
 

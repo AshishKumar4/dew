@@ -59,8 +59,7 @@ from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig
-from dew.schedules import Cosine, Power
+from dew.optim import Cosine, OptimConfig, Power
 from dew.state import CHECKPOINTED, TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
@@ -987,8 +986,7 @@ from dew.cache import enable_compilation_cache
 from dew.optim import OptimConfig
 from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Checkpoints, Layout, Trainer
-from dew.optim import ParamGroup
-from dew.schedules import Cosine
+from dew.optim import Cosine, ParamGroup
 
 root, grouped = sys.argv[1], sys.argv[2] == "grouped"
 enable_compilation_cache(root + "/cache")
@@ -1457,7 +1455,7 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
     whose batches are its states' and keys' (`NoisedTargets`), the branch trains on what the rollout
     draws from the branch's own states, as the decayed run trains on what it draws from its own, and
     the run draws from its states again from the step it branched at."""
-    from dew.schedules import Linear
+    from dew.optim import Linear
     from dew.telemetry.records import FitStarted
     from dew.training.cooldown import Cooldowns
 
@@ -1522,7 +1520,7 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best)
     weights-only best would have kept the step's weights alone; the resume runs the branch again first,
     recording the score an uninterrupted run records, and trains on to the parameters a run with no
     cooldown reaches, bit for bit."""
-    from dew.schedules import Linear
+    from dew.optim import Linear
     from dew.training import Best
     from dew.training.cooldown import Cooldowns
 
@@ -1558,7 +1556,7 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     where the run writes no final checkpoint or its best's weights alone: the resume runs it,
     recording what an uninterrupted run records, and completes the run, and a fit of the completed run
     runs nothing again."""
-    from dew.schedules import Linear
+    from dew.optim import Linear
     from dew.training import Best
     from dew.training.cooldown import Cooldowns
 
@@ -1589,7 +1587,7 @@ def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_dev
     """A branch of a run with no token schedule asks the devices for nothing between its steps: a
     branch three times as long reads from the devices as often as a short one, its tokens left
     uncounted on the host, as the run's own steps leave them."""
-    from dew.schedules import Linear
+    from dew.optim import Linear
     from dew.training.cooldown import Cooldowns
 
     stable, reads = Linear(2.0 ** -4, decay_start=64, decay_steps=128), []

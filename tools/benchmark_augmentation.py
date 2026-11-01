@@ -31,8 +31,7 @@ from dew import Trainer
 from dew.data import Hub, Loading, images, presets
 from dew.data.compile import compile as compile_data
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
-from dew.optim import OptimConfig
-from dew.schedules import Cosine
+from dew.optim import Cosine, OptimConfig
 
 FLOWERS, REVISION = "dpdl-benchmark/oxford_flowers102", "544b55c9af69a05742ead7571cd7ae23cfcd758b"
 SIZE, STAGED, BATCH, CLASSES = 64, 80, 64, 102

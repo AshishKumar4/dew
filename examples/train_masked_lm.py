@@ -38,9 +38,8 @@ from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, t
 from dew.data.compile import iterate
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import Perplexity
-from dew.optim import OptimConfig
+from dew.optim import Cosine, OptimConfig
 from dew.registry import ModelConfig
-from dew.schedules import Cosine
 from dew.training import Evaluation, MeshSpec
 
 SMOKE_TEXT = (

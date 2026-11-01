@@ -13,7 +13,7 @@
 		"wall_seconds": 65.3,
 		"script_sha256": "49a413250bef22ecc4f9bb7f78c021d4294bee148899d7ac8de6bdba9726bfe0",
 		"description": "Tiny Shakespeare from winglian/tiny-shakespeare, 1% of its records held out by content hash, freshly initialized weights, real recorded training",
-		"cell_sha256": "05a3cb06cacf6a93fa2f8e845eb1c16a5710f9107893a31782cae0a3f46f01d8"
+		"cell_sha256": "2c621eef9c0fefe092625def27e11283b67cde4dc906c4b1ae8bc7f6d51b0fc8"
 	},
 	"hero": {
 		"returncode": 0,

@@ -230,7 +230,7 @@ class FitPlan:
         share of them, and of a run bounded to `examples` no pass counts steps ahead of, each time its
         consumed examples pass a multiple of that share (`dew.training.budget.every_step`). A schedule's
         warmup may be a share too
-        (`dew.schedules.Cosine.warmup_steps`), and the start records what each resolved to
+        (`dew.optim.Cosine.warmup_steps`), and the start records what each resolved to
         (`recorded`)."""
         def cadence(value, name: str) -> Cadence:
             return every_step(value, steps, tokens, accumulation, name=name, examples=examples)

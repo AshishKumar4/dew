@@ -107,8 +107,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.lm import LMObjective
     from dew.objectives.routing import ExpertBalance
-    from dew.optim import OptimConfig, ParamGroup
-    from dew.schedules import Cosine
+    from dew.optim import Cosine, OptimConfig, ParamGroup
     from dew.training import MeshSpec, Trainer
     from dew.training.planning import Trials
 
@@ -287,7 +286,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
                    "mesh": dict(run.trainer.device_mesh.shape),
                    "optimizer": "optax.chain(clip_by_global_norm, adamw) via OptimConfig.build, "
                                 "its gradient norm the trainer's commit telemetry",
-                   "schedule": "dew.schedules.Cosine", "ema": None,
+                   "schedule": "dew.optim.Cosine", "ema": None,
                    "model_config": to_record(ModelConfig.from_model(run.trainer.objective.model),
                                              ModelConfig)},
         "versions": built_from,

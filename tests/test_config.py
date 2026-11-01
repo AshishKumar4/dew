@@ -566,8 +566,7 @@ class Spec(Base):
 def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     """A run's record reads back the schedule it names, its tail and the muP
     groups included."""
-    from dew.optim import ParamGroup
-    from dew.schedules import Power, PowerTail
+    from dew.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(learning_rate=Power(peak_value=0.01, warmup_steps=5, a=4.0, c=16.0,
@@ -580,8 +579,7 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
 def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     """A run's record reads back each group's schedules, `every` included,
     its bounds, and the config's own one-cycle schedule."""
-    from dew.optim import ParamGroup
-    from dew.schedules import Cosine, Exponential, OneCycle
+    from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
     momentum = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=40)
     config = RunConfig(
         trainer=TrainerConfig(steps=1),

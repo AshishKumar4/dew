@@ -35,8 +35,7 @@ from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Objective
-from dew.optim import OptimConfig
-from dew.schedules import Cosine
+from dew.optim import Cosine, OptimConfig
 from dew.training import Trainer
 from dew.training.runtime import prepare_process
 
