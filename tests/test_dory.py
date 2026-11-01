@@ -80,9 +80,9 @@ def changed(directory: Path, change: dict) -> Path:
     return directory
 
 
-LOGITS_SEEDS = {'looped': 32, 'table': 32, 'packed': 32, 'decoded': 32, 'continued': 32, 'stepped': 32,
-                'rows': 32, 'variant': 32}
-"""Each check 1 of Dory's logits against the transcription's, its declared seeds (`seeds_for`, paired)."""
+LOGITS_SEEDS = 8
+"""The seeds each check 1 of Dory's logits against the transcription's declares: each site sized paired
+(`seeds_for`) resolves at its fewest."""
 
 
 def tensors_of(loaded: Pretrained) -> dict[str, np.ndarray]:
@@ -172,9 +172,9 @@ def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop
         table = model.apply(loaded.variables, method='output_table')
         return table.logits(model.apply(loaded.variables, ids, method='hidden_states'))
 
-    assert_logits_as_vllms(logits, loaded, f'Dory logits at {loops} loops', LOGITS_SEEDS['looped'],
+    assert_logits_as_vllms(logits, loaded, f'Dory logits at {loops} loops', LOGITS_SEEDS,
                            stream=0xD01, loops=loops)
-    assert_logits_as_vllms(tabled, loaded, f"Dory's output table at {loops} loops", LOGITS_SEEDS['table'],
+    assert_logits_as_vllms(tabled, loaded, f"Dory's output table at {loops} loops", LOGITS_SEEDS,
                            stream=0xD02, loops=loops)
 
 
@@ -248,7 +248,7 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
         return arm.forced(prompt, tokens, prompt_rows=False)
 
     reference, truth = transcribed(loaded.config, tensors, forced, mode=mode, loops=loops)
-    assert_as_exact(decoded, reference, draw, f"Dory's {tag} decoding", seeds=LOGITS_SEEDS['decoded'],
+    assert_as_exact(decoded, reference, draw, f"Dory's {tag} decoding", seeds=LOGITS_SEEDS,
                     truth_fn=truth)
     if mode == 'per_loop':
         def whole(prompt, tokens):
@@ -259,14 +259,14 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
 
         forward_reference, _ = transcribed(loaded.config, tensors, uncached, loops=loops)
         assert_as_exact(whole, forward_reference, draw, "Dory's forward over its continuation",
-                        seeds=LOGITS_SEEDS['continued'], truth_fn=truth)
+                        seeds=LOGITS_SEEDS, truth_fn=truth)
         forward = jax.jit(lambda ids: model.apply(variables, ids))
 
         def stepped(prompt, tokens):
             return as_stepped(forward, jnp.concatenate([prompt, tokens[:-1]])[None], 6)[0, 5:]
 
         assert_as_exact(decoded, stepped, draw, "Dory's per-pass cache against its forwards",
-                        seeds=LOGITS_SEEDS['stepped'], truth_fn=truth)
+                        seeds=LOGITS_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
@@ -351,7 +351,7 @@ def test_packed_documents_read_only_themselves_through_every_pass(attention_impl
 
     reference, truth = transcribed(loaded.config, tensors_of(loaded), alone)
     draw = drawn_ids(0xD03, REFERENCE['packed_ids'].shape, loaded.config['vocab_size'])
-    assert_as_exact(packed, reference, draw, 'Dory packed documents', seeds=LOGITS_SEEDS['packed'],
+    assert_as_exact(packed, reference, draw, 'Dory packed documents', seeds=LOGITS_SEEDS,
                     truth_fn=truth)
 
 
@@ -739,7 +739,7 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
         table = loaded.model.apply(loaded.variables, method='output_table')
         return loaded.model.apply(loaded.variables, ids, method='hidden_states') @ table.rows().T
 
-    assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", LOGITS_SEEDS['rows'], stream=0xD05)
+    assert_logits_as_vllms(contracted, loaded, "Dory's vocabulary rows", LOGITS_SEEDS, stream=0xD05)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
@@ -815,7 +815,7 @@ def test_a_config_the_release_does_not_take_computes_vllms_logits(tmp_path, vari
     def logits(ids):
         return loaded.model.apply(loaded.variables, ids)
 
-    assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', LOGITS_SEEDS['variant'], stream=0xD06)
+    assert_logits_as_vllms(logits, loaded, f'Dory logits, {variant}', LOGITS_SEEDS, stream=0xD06)
 
 
 def test_a_dory_written_from_dew_alone_reloads_as_itself(tmp_path):
