@@ -3,10 +3,10 @@ by its real tokenizer (`real_tokenizers.backbone_reading`, GPT-2's), a task of s
 examples each ask two questions, trained through `dew train` in each cell of a pairwise covering set of
 the workflow's decision axes (the head and its layout, context through cross-attention, consistency
 groups) and run bounds (an examples budget, a share of one). Each cell holds the conservation contract
-(docs/design/testing.md), observed from the run's own outcome: its bound counts source examples, whatever
-rows its layout makes of each; every input example is trained, held out or reported under the reason the
-run's own layout refuses it for, never dropped silently; and its saved task holds each axis the cell sets
-and answers over every option its data asks."""
+(docs/design/testing.md), observed from the run's own counts: its bound counts source examples, whatever
+rows its layout makes of each; the examples it reads are counted once each, as trained or as refused under
+the reason the run's own layout refuses them for, so none goes uncounted; and its saved task holds each
+axis the cell sets and answers over every option its data asks."""
 
 import dataclasses
 import json
@@ -221,9 +221,9 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
         stride = max(later - earlier for earlier, later in zip([0, *clock], clock, strict=False))
         wanted = math.ceil(SHARE * kept(cell))
         assert wanted <= consumed < wanted + stride
-    # Every training example is trained or reported under the reason the layout refuses it for, never both:
-    # the corpus counts the kept ones its bound consumed (all of them, or as far as a share's reading ahead
-    # went) apart from the refused ones.
+    # The examples read are counted once each, as trained or as refused under the reason the layout refuses
+    # them for: a bound of every kept example reads one pass, whose counts add to the examples written; a
+    # share's counts reach as far as its reading ahead went.
     refused = {key.rsplit("/", 1)[1]: int(value) for key, value in last.items()
                if key.startswith("data/rejected/")}
     delivered = sum(int(value) for key, value in last.items() if key.startswith("data/rows/"))

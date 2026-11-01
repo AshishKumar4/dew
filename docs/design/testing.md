@@ -30,7 +30,7 @@ The whole flow, once: load or build the model → train several steps on real-sh
 - export then reload is identical;
 - loaded checkpoints match their reference (HF transformers, diffusers) within the float64 gate.
 - a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling);
-- conservation: a bound in examples counts source examples, whatever rows a layout makes of each; every input example is trained once, held out, or reported under the reason it was refused, never two of these and never silently dropped (`data/rows` counts the examples kept, `data/rejected` the ones refused); and the saved task holds every axis the run sets.
+- conservation: a bound in examples counts source examples, whatever rows a layout makes of each; the examples a run reads are counted once each, as trained (`data/rows`) or as refused under their reason (`data/rejected`), so a run that reads its data whole counts every example written; and the saved task holds every axis the run sets.
 
 An exact cache's decode agrees with full forward under the numerical rule below. A cache explicitly defined as approximate is compared with the reference implementation's own decode under that same cache. Approximate and exact cache claims remain distinct.
 
