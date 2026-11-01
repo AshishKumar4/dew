@@ -157,8 +157,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/environments.py", description=__doc__.split("\n\n")[0])
     parser.add_argument("tree", type=Path, nargs="?")
     parser.add_argument("--lock", default=None,
-                        help="cpu, cuda12, cuda13, cuda12-aarch64 or cuda13-aarch64; "
-                             "by default this machine's (machine_lock)")
+                        help="cpu, cuda12, cuda13, cuda12-aarch64 or cuda13-aarch64; by default this machine's "
+                             "(machine_lock)")
     parser.add_argument("--reference", default=None,
                         help="a reference environment's name, its installation after --")
     parser.add_argument("--python", default="3.12", help="a reference environment's Python")

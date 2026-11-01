@@ -207,8 +207,7 @@ def test_a_gpu_machine_installs_its_drivers_lock_for_its_machine(tmp_path, machi
     program = ("import platform, sys; platform.machine = lambda: sys.argv[1]; "
                f"sys.path.insert(0, {str(REPO_ROOT / 'tools')!r}); import environments; "
                "print(environments.machine_lock())")
-    found = subprocess.run([sys.executable, "-c", program, machine], capture_output=True, text=True,
-                           check=True, env={**os.environ, "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"})
-    found = found.stdout.strip()
+    found = subprocess.run([sys.executable, "-c", program, machine], capture_output=True, text=True, check=True,
+        env={**os.environ, "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}).stdout.strip()
     assert found == lock
     assert (REPO_ROOT / "locks" / f"{lock}.txt").is_file()
