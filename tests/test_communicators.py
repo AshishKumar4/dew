@@ -259,7 +259,8 @@ def test_a_process_prepared_again_keeps_the_sizing_its_pool_was_made_with():
     """Once the backend has opened, the pool keeps the share its first preparation sized, so a second
     preparation (a sweep's next run, a profile after a run) keeps that sizing and admits every later
     program against it, never holding nothing."""
-    sizing = communicators.Sizing(NEEDS, 0.95, 0.9, dict.fromkeys(range(2), GIB), dict.fromkeys(range(2), GIB))
+    room = dict.fromkeys(range(2), GIB)
+    sizing = communicators.Sizing(NEEDS, 0.95, 0.9, room, room)
     held = communicators.held()
     communicators.hold(sizing)
     try:
