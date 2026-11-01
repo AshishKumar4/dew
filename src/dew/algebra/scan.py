@@ -70,11 +70,11 @@ class Scan:
     `readout(h, **token)` that token's output from the state after it, each in plain JAX on one token's
     operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype.
     `reset`, where given, names an operand of `operands`, booleans along the walked axis alone that neither
-    reads, marking each token a zero state enters (a packed document's first). `ranges` bounds operands'
-    magnitudes by name (l2-normalised keys 1, a sigmoid's gate 1), the range facts a reordering's new
-    intermediates are held under (docs/design/algebra.md §6.3); an operand it names none of is unbounded. Its
-    decays (the exponentials of its update's exponents) are at most 1: its exponents are at most zero, as a
-    gated recurrence's log decays are."""
+    reads, marking each token a zero state enters (a packed document's first). `ranges` bounds operands by
+    name, a magnitude (l2-normalised keys 1, a sigmoid's gate 1) or an interval (a log decay's `(-inf, 0)`),
+    the range facts a reordering's new intermediates are held under (docs/design/algebra.md §6.3); an operand
+    it names none of is unbounded. Its decays (the exponentials of its update's exponents) are at most 1: its
+    exponents are at most zero, as a gated recurrence's log decays are."""
 
     update: Callable
     readout: Callable
@@ -82,7 +82,7 @@ class Scan:
     walked: str
     state: tuple[tuple[int, ...], jnp.dtype]
     reset: str | None = None
-    ranges: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)

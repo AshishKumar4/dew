@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import NamedTuple, Protocol
 
@@ -796,7 +797,8 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
     reset = None if starts is None else "first"
     declared = axes if reset is None else {**axes, reset: ("time",)}
-    ranges = {} if bound is None else {"k": 1.0, "beta": bound}
+    # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it.
+    ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound})}
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
                                        state=((width, columns), dtype), reset=reset, ranges=ranges),
                              saturation=SATURATION)

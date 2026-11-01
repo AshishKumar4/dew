@@ -161,9 +161,9 @@ def protected(equation: jcore.JaxprEqn) -> bool:
     return PROTECTED in str(equation.source_info.name_stack)
 
 
-SLOTS = 4
-"""The operands without a declared range a region's magnitudes name apart (`Magnitude.degrees`); a value of
-a fifth has none (None)."""
+SLOTS = 6
+"""The unbounded values a region's magnitudes name apart (`Magnitude.degrees`: its operands without a
+declared range, its equations' outside the language); a value of a seventh has none (None)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -194,10 +194,11 @@ NOTHING = -(2 ** 20)
 """A zero's `Magnitude.log2`: under every other."""
 
 
-def region(closed: jcore.Jaxpr, ranges: Mapping[int, float] | None = None) -> Region:
+def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]] | None = None) -> Region:
     """`closed`'s equations as terms: each of the language a constructor over its inputs' terms, each other
     one (and each protected one, `protected`) a leaf for each output, after its inputs' terms. Each term's
-    magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index; an input
+    magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index: a bound on
+    its magnitude, or an interval `(low, high)`, whose `high` at most 0 bounds its exponential by 1; an input
     with none takes a slot of its own) and its equations'."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
@@ -218,8 +219,13 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float] | None = None) -> Re
     magnitudes: dict[str, Magnitude | None] = {}
     leaves = 0
     free = iter(range(SLOTS))
+    declared = dict(ranges or {})
     given = [*(_magnitude(value) for value in closed.consts),
-             *(_declared(index, ranges or {}, free) for index in range(len(jaxpr.invars)))]
+             *(_declared(index, declared, free) for index in range(len(jaxpr.invars)))]
+    # The values at most 0 (an operand declared so, and the layouts and conversions of one), whose
+    # exponential is at most 1.
+    nonpositive = {var for index, var in enumerate(jaxpr.invars)
+                   if isinstance(interval := declared.get(index), tuple) and interval[1] <= 0}
     for var, magnitude in zip([*jaxpr.constvars, *jaxpr.invars], given, strict=True):
         env[var] = Term.leaf(leaves)
         shapes.append((env[var], _shape(var)))
@@ -252,6 +258,8 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float] | None = None) -> Re
             env[out] = read(source).shaped("broadcast_in_dim", param(equation.primitive, composed))
             shapes.append((env[out], _shape(out)))
             _typed(dtypes, magnitudes, env[out], out, magnitudes[str(env[source])])
+            if source in nonpositive:
+                nonpositive.add(out)
             laid[out] = (source, composed["broadcast_dimensions"])
             depths[out] = depths.get(source, 0) + 1
             continue
@@ -263,8 +271,12 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float] | None = None) -> Re
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
-            _typed(dtypes, magnitudes, term, out,
-                   _bounded(equation, [magnitude_of(atom) for atom in equation.invars]))
+            operands = [magnitude_of(atom) for atom in equation.invars]
+            name = equation.primitive.name
+            if name in KEEPING_SIGN and equation.invars[0] in nonpositive:
+                nonpositive.add(out)
+            exponentiated = name in ("exp", "exp2") and equation.invars[0] in nonpositive
+            _typed(dtypes, magnitudes, term, out, UNIT if exponentiated else _bounded(equation, operands))
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -293,6 +305,8 @@ KEEPING_MAGNITUDE = frozenset({"neg", "abs", "convert_element_type", "reduce_max
                                "ceil", "round"}) | SHAPES
 """The language's equations whose output is no larger in magnitude than their operand's."""
 UNIT = Magnitude(0)
+KEEPING_SIGN = frozenset({"convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
+"""The language's equations whose output is at most 0 where their operand is."""
 
 
 def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magnitude | None:
@@ -345,9 +359,14 @@ def _magnitude(value) -> Magnitude | None:
     return Magnitude(_log2(largest)) if math.isfinite(largest) else None
 
 
-def _declared(index: int, ranges: Mapping[int, float], free) -> Magnitude | None:
-    """Input `index`'s magnitude: its declared range's, else a slot of its own (`_free`)."""
-    return Magnitude(_log2(ranges[index])) if index in ranges else _free(free)
+def _declared(index: int, ranges: Mapping[int, float | tuple[float, float]], free) -> Magnitude | None:
+    """Input `index`'s magnitude: its declared range's (an interval's larger end's magnitude), else a slot of
+    its own (`_free`)."""
+    declared = ranges.get(index)
+    if declared is None:
+        return _free(free)
+    largest = max(abs(declared[0]), abs(declared[1])) if isinstance(declared, tuple) else declared
+    return Magnitude(_log2(largest)) if math.isfinite(largest) else _free(free)
 
 
 def _free(free) -> Magnitude | None:

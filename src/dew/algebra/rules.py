@@ -82,7 +82,8 @@ def degree(term: Term, slot: i64Like) -> i64: ...
 
 
 @function
-def reaches(log2: i64Like, d0: i64Like, d1: i64Like, d2: i64Like, d3: i64Like) -> Unit: ...
+def reaches(log2: i64Like, d0: i64Like, d1: i64Like, d2: i64Like, d3: i64Like, d4: i64Like,
+            d5: i64Like) -> Unit: ...
 """A magnitude a value of the program as written reaches (`program.stated`): a reordering's new intermediate
 under one of them is a value no larger than one the program computes already (§6.3, `dominated`)."""
 
