@@ -5,8 +5,10 @@
 # another CUDA loads its own cuDNN over JAX's. Dew's CUDA extra is the locks' one difference, by driver: locks/cpu.txt for CI and every host
 # without a GPU, for each Python and platform; locks/cuda12.txt for a driver below 580 (CUDA 12.8: the
 # A100 nodes, Colab's T4 and L4) and locks/cuda13.txt for 580 on (the H100 SXM nodes, Colab's G4), for the
-# Python 3.12 of a Linux GPU host, x86_64 or aarch64 (a GH200's Grace), whose pins are the same. A host installs
-# the one its driver reads: tools/install_environment.sh.
+# Python 3.12 of a Linux x86_64 GPU host, and locks/cuda12-aarch64.txt and cuda13-aarch64.txt for an
+# aarch64 one (a GH200's Grace), whose CUDA plugin is the release's own until Dew's aarch64 build joins it
+# (pyproject.toml's cuda extras). A host installs the one its driver and machine read: machine_lock in
+# tools/environments.py.
 # Usage, from the checkout: sh tools/lock_environment.sh
 set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
@@ -60,13 +62,9 @@ lock cpu --universal --torch-backend cpu --extra kernel-compile
 gpu="--python-platform x86_64-manylinux_2_35"
 lock cuda12 --extra cuda12 --torch-backend cpu $gpu
 lock cuda13 --extra cuda13 --torch-backend cpu $gpu
-# Each GPU lock serves aarch64 too: resolved for it from the lock's own pins (uv prefers an output's pins), it
-# pins the same, which this holds, so a GH200 installs it.
-# The aarch64 resolutions are the check's alone: gone however it ends.
-trap 'rm -f locks/cuda12-aarch64.txt locks/cuda13-aarch64.txt' EXIT
+# Each GPU lock's aarch64 one, resolved from the x86_64 lock's own pins (uv prefers an output's pins), so the two
+# differ where a package does by machine alone (the CUDA plugin) and nowhere else.
 for extra in cuda12 cuda13; do
   cp "locks/$extra.txt" "locks/$extra-aarch64.txt"
   lock "$extra-aarch64" --extra "$extra" --torch-backend cpu --python-platform aarch64-manylinux_2_35
-  diff "locks/$extra.txt" "locks/$extra-aarch64.txt" >&2 || {
-    echo "locks/$extra.txt resolves otherwise for aarch64: lock it for each machine" >&2; exit 1; }
 done

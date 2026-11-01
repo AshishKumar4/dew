@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from tool_support import REPO_ROOT, load
 
 environments = load("environments")
@@ -189,3 +191,23 @@ def test_a_checkout_named_after_the_separator_is_built(tmp_path):
     assert python.parents[1].name.startswith("cpu-")
     assert asked.read_text().splitlines()[-1] == f"installed cpu -q --python {python}"
 
+
+
+@pytest.mark.parametrize(("machine", "driver", "lock"), [
+    ("x86_64", "580.105.08, 9.0", "cuda13"), ("x86_64", "570.148.08, 8.0", "cuda12"),
+    ("aarch64", "580.105.08, 9.0", "cuda13-aarch64"), ("aarch64", "570.148.08, 9.0", "cuda12-aarch64")])
+def test_a_gpu_machine_installs_its_drivers_lock_for_its_machine(tmp_path, machine, driver, lock):
+    """A GPU host installs the lock of the newest CUDA build its driver runs, an aarch64 host (a GH200's
+    Grace) its aarch64 lock, whose CUDA plugin is the release's own until Dew's aarch64 build joins it
+    (pyproject.toml's cuda extras), and every lock it names exists in the checkout."""
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text(f"#!/bin/sh\necho '{driver}'\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    program = ("import platform, sys; platform.machine = lambda: sys.argv[1]; "
+               f"sys.path.insert(0, {str(REPO_ROOT / 'tools')!r}); import environments; "
+               "print(environments.machine_lock())")
+    found = subprocess.run([sys.executable, "-c", program, machine], capture_output=True, text=True, check=True,
+        env={**os.environ, "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}).stdout.strip()
+    assert found == lock
+    assert (REPO_ROOT / "locks" / f"{lock}.txt").is_file()

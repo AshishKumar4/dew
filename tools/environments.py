@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A checkout's own locked environment, or a reference's, built once and shared.
 
-    python tools/environments.py TREE [--lock cpu|cuda12|cuda13] [--cache DIR]
+    python tools/environments.py TREE [--lock cpu|cuda12|cuda13|cuda12-aarch64|cuda13-aarch64] [--cache DIR]
     python tools/environments.py --reference NAME [--python 3.12] [--cache DIR] -- INSTALL...
 
 The first prints the Python of TREE's environment: TREE's `locks/<lock>.txt`
@@ -25,6 +25,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -54,14 +55,18 @@ def _builds():
 
 def machine_lock() -> str:
     """The lock this machine installs: the newest of JAX's CUDA builds its
-    NVIDIA driver and GPUs run (`dew.builds`), else cpu, where
+    NVIDIA driver and GPUs run (`dew.builds`), its aarch64 lock on an aarch64
+    host (a GH200's Grace: tools/lock_environment.sh), else cpu, where
     Dew's own runtime check speaks for a GPU no build runs on
     (`dew.devices.cpu_only_refusal`)."""
     builds = _builds()
     if shutil.which("nvidia-smi") is None:
         return "cpu"
     answer = subprocess.run(builds.QUERY, capture_output=True, text=True)
-    return builds.newest_build(builds.listed_gpus(answer.stdout if answer.returncode == 0 else None)) or "cpu"
+    build = builds.newest_build(builds.listed_gpus(answer.stdout if answer.returncode == 0 else None))
+    if build is None:
+        return "cpu"
+    return f"{build}-aarch64" if platform.machine() == "aarch64" else build
 
 
 def built(venv: Path, python: str, install: Callable[[Path], list[str]], cwd: Path | None = None) -> Path:
@@ -151,7 +156,9 @@ def main() -> int:
     cut = argv.index("--") if "--" in argv else len(argv)
     parser = argparse.ArgumentParser(prog="tools/environments.py", description=__doc__.split("\n\n")[0])
     parser.add_argument("tree", type=Path, nargs="?")
-    parser.add_argument("--lock", default=None, help="cpu, cuda12 or cuda13; by default this machine's")
+    parser.add_argument("--lock", default=None,
+                        help="cpu, cuda12, cuda13, cuda12-aarch64 or cuda13-aarch64; by default this machine's "
+                             "(machine_lock)")
     parser.add_argument("--reference", default=None,
                         help="a reference environment's name, its installation after --")
     parser.add_argument("--python", default="3.12", help="a reference environment's Python")
