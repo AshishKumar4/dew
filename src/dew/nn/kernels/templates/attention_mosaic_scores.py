@@ -22,9 +22,10 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 
 def split_queries(family: mosaic.Family) -> bool:
     """Whether the dK/dV program's consumers share one key block and split each slot's queries between them:
-    on a layout whose consumers feed their own rings (`mosaic.ConsumerFed`), each consumer's step its share
-    of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own keys."""
-    return isinstance(family, mosaic.ConsumerFed)
+    on a layout whose consumers feed their own rings (`Transport.feeds_itself`), each consumer's step its
+    share of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own
+    keys."""
+    return family.feeds_itself
 
 @dataclasses.dataclass(frozen=True)
 class _Backward:
@@ -119,7 +120,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
                                                      functools.partial(scores, masked=True))
     else:
         exponentials, weights, cotangents = scores(masked=masked)
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+    part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
+                                                         accurate=False))
     return algebra.value_weights(exponentials, weights, do_slot.dtype), part
 
 
