@@ -26,7 +26,6 @@ import jax
 import jax.numpy as jnp
 import optax
 import tokamax
-from huggingface_hub import hf_hub_download
 
 from dew import cache
 from dew.interop import sources
@@ -43,14 +42,13 @@ def model_of(arguments) -> CausalTransformer:
     local directory's, or a Hub repo's, of which nothing else is read but its
     tensors' names, from their headers, where a quantized wrapper's selection
     needs them."""
-    local = Path(arguments.config) / "config.json"
-    path = local if local.is_file() else hf_hub_download(arguments.config, "config.json",
-                                                         revision=arguments.revision)
-    config = json.loads(Path(path).read_text())
+    # One snapshot, the config's and the headers' commit alike (`snapshot(weights=False)`).
     source = sources.SourceReference(arguments.config, arguments.revision)
+    root = source.metadata()
+    config = json.loads((root / "config.json").read_text())
 
     def inventory():
-        stored = sources.stored_tensors(source, source.metadata())
+        stored = sources.stored_tensors(source, root)
         return None if stored is None else stored.keys()
 
     # A wrapper's decoder as its load reads it: the wrapper's head policy and overrides, its quantized
