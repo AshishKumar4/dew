@@ -70,7 +70,6 @@ if TYPE_CHECKING:
     from dew.inputs import InputSpec
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
-    from dew.rl.env import Env
     from dew.sampling.guidance import Guidance
     from dew.state import TrainState
 
@@ -78,6 +77,15 @@ if TYPE_CHECKING:
 
 
 type Initializer = Partial
+
+
+class Stepping(Protocol):
+    """An environment a rollout's program steps (`dew.rl.env.Env`, `Driven`), which a program holds by
+    identity, named here by the one member every environment shares, as only `dew.rl` and
+    `dew.objectives.rl` import `dew.rl` (docs/design/architecture.md)."""
+
+    @property
+    def action_size(self) -> int: ...
 """An objective's `init` with its held variables bound as `Partial` children,
 which a JIT takes as arguments (`Objective.initializer` says why)."""
 
@@ -1017,7 +1025,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 donate_argnames: tuple[str, ...] = (),
-                holds: tuple[DeviceStep | AutoEncoder | Guidance | Env, ...] = (),
+                holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (),
                 modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
