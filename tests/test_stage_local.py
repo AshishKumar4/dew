@@ -304,10 +304,12 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
 def test_an_optax_transform_that_may_read_a_leaf_whole_is_refused_over_stages():
     """Over two stages, Adam given as optax builds it places its state, and Adafactor, whose factored
     moments read a leaf's last two axes, is refused before anything is placed: over a stacked run it
-    would factor the stages' layers as one matrix. Over one stage, Adafactor places."""
+    would factor the stages' layers as one matrix. Over one stage, or over two with every layer whole on
+    every stage (`Layout.stage_local`), the replicated layout the refusal names, Adafactor places."""
     model = decoder()
     trainer(model, optax.adam(1e-3), STAGED, 8, ema=None).place()
     trainer(model, optax.adafactor(1e-3), MeshSpec(fsdp=2), 2, ema=None).place()
+    trainer(model, optax.adafactor(1e-3), STAGED, 8, ema=None, stage_local=False).place()
     refused = trainer(model, optax.adafactor(1e-3), STAGED, 8, ema=None)
     with pytest.raises(LayoutRefused):
         refused.place()
