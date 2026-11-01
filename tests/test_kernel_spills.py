@@ -431,6 +431,29 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
         report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
 
 
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("statics", [False, True], ids=["dynamic", "static"])
+def test_a_program_called_under_another_mesh_of_its_shape_runs_on_that_meshs_devices(statics):
+    """A program called under two meshes of one shape over other devices runs on each mesh's own devices,
+    as jit does: its executable is keyed by the mesh in place, its dynamic and its static calls alike
+    (ledger 3452), where under the second mesh it ran the first's executable on the first's devices."""
+    from jax.sharding import AxisType, Mesh, PartitionSpec
+
+    def function(x, scale=1):
+        return jax.lax.with_sharding_constraint(x, PartitionSpec("x")) * scale + 1
+
+    devices = jax.devices()
+    meshes = [Mesh(np.asarray(devices[start:start + 2]), ("x",), axis_types=(AxisType.Auto,))
+              for start in (0, 2)]
+    compiled = program(function, **({"static_argnames": "scale"} if statics else {}))
+    given, scale = np.arange(8, dtype=np.float32), 2 if statics else 1
+    for mesh in meshes:
+        with jax.set_mesh(mesh):
+            ran = compiled(given, **({"scale": scale} if statics else {}))
+        assert ran.sharding.device_set == set(mesh.devices.flat)
+        np.testing.assert_array_equal(np.asarray(ran), given * scale + 1)
+
+
 @lowers("sm90")
 def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
     """A program of a Pallas-Triton launch feeding a Mosaic GPU kernel and an XLA fusion, compiled for an
