@@ -268,20 +268,34 @@ def write_seeded(worker: Worker, names: list[str], out: Path) -> None:
 
 def merged(units: list[Path]) -> Path:
     """The recording's units (`write_seeded`'s, their sites disjoint) joined and saved as the fixture, its
-    provenance the units' own, which must agree."""
+    provenance the units' own, which must agree but for the device: fla autotunes each device's configs, so
+    where units ran on more than one, the provenance names each device's sites (`devices`)."""
     from fetched_fixtures import save
 
     stored: dict[str, np.ndarray] = {}
+    devices: dict[str, list[str]] = {}
+    common = None
     for unit in units:
         with np.load(unit, allow_pickle=False) as part:
+            recorded = json.loads(str(part["provenance"]))
+            device = recorded.pop("device")
+            if common is not None and recorded != common:
+                raise ValueError(f"{unit} was recorded under another provenance: {recorded}")
+            common = recorded
             for key, value in part.items():
-                if key == "provenance" and key in stored:
-                    if str(stored[key]) != str(value):
-                        raise ValueError(f"{unit} was recorded under another provenance: {value}")
-                elif key in stored:
+                if key == "provenance":
+                    continue
+                if key in stored:
                     raise ValueError(f"{unit} records {key} again")
                 stored[key] = value
-    return save(FIXTURE, stored, reference=json.loads(str(stored["provenance"]))["reference"], license="MIT")
+                site = key.split(".", 1)[0]
+                if site not in devices.setdefault(device, []):
+                    devices[device].append(site)
+    assert common is not None, "a fixture merges at least one unit"
+    named = {"device": next(iter(devices))} if len(devices) == 1 else {"device": " and ".join(devices),
+                                                                       "devices": devices}
+    stored["provenance"] = np.asarray(json.dumps({**common, **named}))
+    return save(FIXTURE, stored, reference=common["reference"], license="MIT")
 
 
 def main() -> None:
