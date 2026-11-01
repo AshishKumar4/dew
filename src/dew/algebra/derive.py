@@ -531,12 +531,18 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
 
     def slots(shapes) -> tuple[tuple[str, tuple[int, ...]], ...]:
         made = forms(shapes)
-        return tuple((str(get_literal_value(get_callable_args(reduction, Term.reduce)[1])),
-                      made.region.shape(reduction)) for reduction in made.reductions)
+        return tuple((_monoid(reduction), made.region.shape(reduction)) for reduction in made.reductions)
 
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
                     "rules": ("walking", "decoupled")}, slots=slots)
+
+
+def _monoid(reduction: Term) -> str:
+    """A walked reduction's monoid: a maximum's `max`; a sum's, or a product's contracting the walked axis,
+    `sum`."""
+    args = get_callable_args(reduction, Term.reduce)
+    return "max" if args is not None and get_literal_value(args[1]) == "max" else "sum"
 
 
 def _accumulated(form: Term, index: int) -> tuple[Term, Term, Term] | None:
@@ -806,8 +812,7 @@ def _holds(graph: EGraph, fact) -> bool:
 def _identity(reduction: Term, dtype) -> float:
     """A walked reduction's empty value, its monoid's identity: a sum's zero; a maximum's -inf (its dtype's
     least value where it has no infinity). A correction never reads it unshifted (`least`)."""
-    args = get_callable_args(reduction, Term.reduce)
-    if args is None or get_literal_value(args[1]) != "max":
+    if _monoid(reduction) != "max":
         return 0.0
     return -math.inf if jnp.issubdtype(dtype, jnp.floating) else float(jnp.iinfo(dtype).min)
 
