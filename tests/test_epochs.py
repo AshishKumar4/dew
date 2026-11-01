@@ -237,3 +237,63 @@ def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_read
     loader = compile(mix([_tagged(1, 8).repeat(), _tagged(2, 4)], weights=(1, 1)).batch(1), loading=READ)
     assert loader.records == 8
     assert sorted(_ids(loader.train(DataPartition()))) == [*range(100, 104), *range(200, 204)]
+
+
+def _pulled(expansion=None):
+    """An objective pulling a weight toward its batches' real rows of `id`, over the rows its data step
+    `expansion` makes of each record, where it names one."""
+    import jax.numpy as jnp
+
+    from dew.data.pipeline import ObjectiveData
+    from dew.objectives import Aux, Objective
+
+    class Pulled(Objective):
+        def fresh_variables(self, key, held):
+            return {"params": {"w": jnp.zeros(())}}
+
+        def loss(self, variables, batch, step):
+            x = jnp.asarray(batch["id"], jnp.float32)
+            return self.row_mean(jnp.square(variables["params"]["w"] - x), batch), Aux({})
+
+        def data(self):
+            return ObjectiveData(train=() if expansion is None else (expansion,))
+
+    return Pulled()
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_epochs_of_a_read_whose_objective_makes_rows_of_its_examples_are_passes_over_its_examples(read):
+    """A run of two epochs over 12 records whose objective makes 1 to 3 rows of each (`Questioned`), so
+    its read has no record count: an epoch is a pass over its 12 source examples (`Loader.pass_examples`),
+    so the run trains on the examples clock to 24 of them; a config's epoch cadence is a pass's 12 examples
+    (row 1902)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.config import TrainerConfig
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+    from dew.training.budget import recorded
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(4)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.records, loader.examples) == (None, 24)
+    evaluated = TrainerConfig(epochs=2, eval_every="epoch").eval_interval(loader)
+    state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 24
+    assert recorded(evaluated) == {"examples": 12}
+
+
+def test_epochs_of_a_read_it_packs_as_its_rows_arrive_are_passes_over_its_documents():
+    """A run of three epochs over 10 documents a pack lays out as they arrive, read per share, so its
+    read has no record count: an epoch is a pass over its 10 documents, so the run trains on the examples
+    clock to 30 of them (row 1902)."""
+    import optax
+
+    from dew.training import Trainer
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).shuffle(seed=1).read("indexed").pack(8, fields=("id",)).batch(2)
+    state = Trainer(_pulled(), optax.sgd(0.01), key=0).fit(chain, epochs=3, log_every=1)
+    assert int(state.consumed) == 30
