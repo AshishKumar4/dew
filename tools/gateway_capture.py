@@ -193,12 +193,12 @@ class _Recorded(BaseHTTPRequestHandler):
 def capture_stops(name: str, bin: Path, out: Path) -> None:
     import openai
     from huggingface_hub import hf_hub_download
-    from transformers import AutoTokenizer
 
+    from dew.data.text import load_tokenizer
     from dew.inference import OpenAICompletion, OpenAIRolloutServer
     from dew.sampling import Sampling
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    tokenizer = load_tokenizer(MODEL)
     # The chat template's ids as a list: Transformers 5 answers a BatchEncoding unless told not to.
     prompt = list(tokenizer.apply_chat_template([{"role": "user", "content": "Say hello."}],
                                                 add_generation_prompt=True, tokenize=True, return_dict=False))

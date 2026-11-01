@@ -503,6 +503,27 @@ def widest_swizzle(dtype, columns: int) -> int:
     return plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
 
 
+def addresses(tiles) -> int:
+    """The registers a thread holds for its own addresses into the shared-memory tiles `tiles` (each
+    `(shape, dtype)`) it reads or writes through registers: one for each swizzle pattern its accesses to a
+    tile take, the swizzle its rows' width fills (`widest_swizzle`) over the bytes one pattern covers, and
+    one for a vector. A 16-bit tile moves in ldmatrix or stmatrix rows, two patterns at a 128-byte swizzle
+    and one at 64; a 32-bit one in each lane's own columns (an accumulator's), four at 128 bytes. A ring
+    slot's offset is an immediate, so a tile costs this once whatever its stages. A tile read by descriptor
+    or TMA costs none: its base is a uniform register (3117's census on the sm90 recurrence and GEMM kernel
+    gradient: the SSD, GDN and KDA states launches' staging and landing tiles 5 to 10, the exact normed
+    kernel gradient's rewrite 8, its statistics vector 1 and its output staging 4, each a SASS address
+    register of one pattern)."""
+    def patterns(shape: tuple, dtype) -> int:
+        itemsize = jnp.dtype(dtype).itemsize
+        # A vector, or rows of no whole 16-byte chunk, stage unswizzled: one pattern.
+        if len(shape) < 2 or shape[-1] * itemsize % 16:
+            return 1
+        return max(1, widest_swizzle(dtype, shape[-1]) // (64 if itemsize == 2 else 32))
+
+    return sum(patterns(tuple(shape), dtype) for shape, dtype in tiles)
+
+
 def swizzle_columns(dtype, swizzle: int) -> int:
     """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
     slice a load of a block swizzled along that axis takes."""

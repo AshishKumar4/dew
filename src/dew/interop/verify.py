@@ -51,6 +51,7 @@ from dew import _records
 from dew.cache import package_digest
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
+from dew.nn import precision
 from dew.nn.blocks import padded_row
 from dew.objectives.base import Variables
 from dew.registry import models
@@ -103,16 +104,6 @@ _CONTEXT = 8
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoder_parts.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
-# fp32 rounding between Dew and transformers on a registered family, in eps
-# per layer per unit of the largest reference logit. The thirteen dense and
-# routed tier-1 tiny fixtures (tests/fixtures/hf, written by
-# tools/hf_reference.py with the probe's weight recipe) measure from 1.44
-# (gemma3-tiny) to 6.46 (llama31-tiny: 9.89e-06 over two layers, logits up
-# to 6.43). The probe's bound is twice the largest, as the
-# released-checkpoint tests derive theirs. A field that changes the
-# computation moves the probe's logits by tenths or more: Granite's
-# multipliers by 4.2, SmolLM3's NoPE layers by 1.7.
-_ROUNDING = 6.46
 # How much farther the source's float32 gradient of any parameter may be from the float64 truth than
 # Dew's own float32 gradient of it is (`gradient_parity`, each parameter's pooled over its elements on
 # the probe's draw). Two float32 roundings of one gradient put the ratio near one: tools/gradient_parity.py
@@ -123,6 +114,19 @@ _ROUNDING = 6.46
 # 2896): a draw's rounding spread stays orders of magnitude below it, and any backward that moves a
 # gradient by more than about 3.5e-4 of itself, the square root of eps, is above it.
 _GRADIENT_PARITY = float(np.finfo(np.float32).eps) ** -0.5
+# How much farther the source's float32 logits on the probe may be from the float64 truth than the
+# candidate's, element by element (`logits_parity`: the largest errors' ratio), the candidate's float32 run
+# as users run it (`precision.FP32_SUMS`). Two float32 roundings of one computation measure 0.70 to 1.57
+# (armada IGPAR8): over the released configs tier 2 verifies at their probes' cut depths and widths (Hy3,
+# LFM2.5-230M, LFM2-24B-A2B, Seed-OSS-36B, SmolLM3, Hunyuan-A13B, OLMo 2, GLM-4.7-Flash, StableLM,
+# ERNIE 4.5, Granite 4.1, OLMoE), over tools/gradient_parity.py's types and composition, and over the
+# tests' sources, StableLM's tiny config the largest. The bound is twice the largest. A computation the
+# candidate does not share moves it by its effect over the candidate's own rounding, which grows with the
+# probe as the source's does: logits scaled by 1 + 1e-5 put it at 6.6 to 10.6, by 1 + 1e-4 at 65 to 111,
+# and one logit moved by 1e-4 at 11 to 17 (tools/gradient_parity.py's Seed-OSS, Llama and Qwen3-MoE at
+# logits up to 6.8, armada IGSENS), where a fixed rounding per layer refused Seed-OSS's own rounding at a
+# 2-layer cut of its 64 layers.
+_LOGITS_PARITY = 3.14
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
@@ -473,9 +477,11 @@ class VerifiedMapping:
     reference: str
     """The transformers class and release the probe ran."""
     error: float
-    """max |Δlogits| between Dew's convention route and the reference, fp32."""
+    """How much farther the reference's fp32 logits on the probe are from the float64 truth than Dew's
+    route's (`logits_parity`)."""
     bound: float
-    """What fp32 rounding alone reaches on the probe (`_ROUNDING`)."""
+    """The ratio past which another computation, not rounding, sets the reference apart
+    (`_LOGITS_PARITY`)."""
     inert: tuple[str, ...]
     """The config fields the convention does not read, which changed nothing on the probe's shrunken
     instance: a field whose effect starts past a context the probe never reaches (one `shrink` does not
@@ -521,8 +527,8 @@ class VerifiedMapping:
                  if self.family == PARTS else f"as the registered {self.family!r} family")
         warnings.warn(
             f"tier 2: verified mapping: model_type {self.model_type!r} loads {loads}; "
-            f"{self.reference} agrees on a random shrunken instance to max "
-            f"|Δlogits| {self.error:.2e} in fp32 (bound {self.bound:.2e}); it does not read the config "
+            f"{self.reference}'s fp32 logits on a random shrunken instance are {self.error:.3g} times as far "
+            f"from the float64 truth as its own (bound {self.bound:.2f}); it does not read the config "
             f"fields {list(self.inert)}, which changed nothing on that instance",
             VerifiedMappingWarning, stacklevel=3)
         return record
@@ -672,7 +678,7 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
 
 def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.Module,
                record: decoder_parts.DecoderFields, inert: set[str], name: str, expected: np.ndarray,
-               checkpoint: Path, layers: int, pad: int | None) -> tuple[float, float]:
+               checkpoint: Path, pad: int | None) -> tuple[float, float]:
     """One candidate against the reference's saved checkpoint: its error and
     the bound, or `_Mismatch` naming how it differs. `pad` is the row the
     reference's own table pads (its `padding_idx`, which torch counts from
@@ -695,17 +701,47 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     except (KeyError, ValueError) as error:
         # A candidate's reading of tensors it does not hold disqualifies that candidate alone.
         raise _Mismatch(f"its tensors do not fill {convention}'s model ({error})") from error
-    # `_ROUNDING` was measured at fp32 matmul precision; a GPU's default runs
-    # fp32 matmuls in TF32, which alone misses it.
-    with jax.default_matmul_precision("highest"):
-        actual = np.asarray(model.apply(variables, probe_ids(_VOCAB)))
-    error = float(np.abs(actual - expected).max())
-    bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.abs(expected).max())
-    if not error <= bound:
-        raise _Mismatch(f"{name} and {convention} disagree on a random shrunken instance by max "
-                        f"|Δlogits| {error:.2e} in fp32, over the bound {bound:.2e}, so its config "
-                        f"fields {sorted(inert)} or its modeling compute something {convention} does not")
-    return error, bound
+    parity = logits_parity(expected, model, record, variables, probe_ids(_VOCAB))
+    if not parity <= _LOGITS_PARITY:
+        raise _Mismatch(f"{name}'s fp32 logits on a random shrunken instance are {parity:.3g} times as far "
+                        f"from the float64 truth as {convention}'s, past the {_LOGITS_PARITY:.2f} that tells "
+                        f"rounding from another computation, so its config fields {sorted(inert)} or its "
+                        f"modeling compute something {convention} does not")
+    return parity, _LOGITS_PARITY
+
+
+def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.DecoderFields,
+                  variables: Variables, ids: np.ndarray) -> float:
+    """How much farther the source's float32 logits over `ids` (`expected`) are from the float64 truth
+    than the candidate's float32 logits are, element by element: the source's largest error over the
+    candidate's, the candidate's floored at the half ulp float32 carries of the truth's largest logit,
+    the truth the candidate's decoder of the same record and weights in float64, as `gradient_parity`'s.
+    Two float32 roundings of one computation sit near one, the candidate's rounding growing with the
+    probe's depth and width as the source's does; a computation the candidate does not share puts the
+    source as far from the truth as it moves any logit. A non-finite logit on either side is no
+    rounding: infinite. The candidate's float32 runs as a user's process runs it: its products summed in
+    float32 (`precision.FP32_SUMS`), not in TF32 on a GPU, nor in float64 as a test process's wide CPU
+    arithmetic sums them (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than
+    users get and the ratio past what users' rounding reaches."""
+
+    def logits(dtype: str, network: nn.Module, algorithm: str) -> np.ndarray:
+        held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
+        with jax.default_matmul_precision(algorithm):
+            return np.asarray(network.apply(held, ids), np.float64)
+
+    ours = logits('float32', model, precision.FP32_SUMS)
+    with jax.enable_x64(new_val=True):
+        wide = models.build('causal_transformer',
+                            {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
+        truth = logits('float64', wide, 'highest')
+    expected = np.asarray(expected, np.float64)
+    if not all(np.isfinite(values).all() for values in (expected, ours, truth)):
+        return math.inf
+    eps = float(np.finfo(np.float32).eps)
+    floor = eps / 2 * float(np.abs(truth).max())
+    return float(np.abs(expected - truth).max()) / max(float(np.abs(ours - truth).max()), floor,
+                                                       np.finfo(np.float64).tiny)
+
 
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
@@ -823,9 +859,9 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
     transformers builds its class for the type from `shrink(hf_config)` with
     random weights (`scatter_weights`) and saves it as safetensors; each
     `CONVENTIONS` candidate whose reading takes the real config loads that
-    directory and runs the same ids in fp32. The first whose max |Δlogits|
-    is within twice `_ROUNDING` eps per layer per unit of the reference's
-    largest logit is the mapping. When several read the config and match,
+    directory and runs the same ids in fp32. The first whose logits are as
+    near the float64 truth as the reference's, within `_LOGITS_PARITY`
+    (`logits_parity`), is the mapping. When several read the config and match,
     the `CONVENTIONS` order is the tie-break: each computed the probe's
     logits, so any of them is sound. With none, the type is `Unmapped`, with
     every candidate's reason and the shrunken config. A type transformers has
@@ -929,7 +965,6 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             raise _unavailable(model_type, f"its config states no {error.args[0]!r} the probe shrinks it "
                                "by") from error
         fields = shallow(source, shrunk)
-        layers = _Sizes.of(fields, source).stated('num_hidden_layers')
         config, size, name = _reference_config(source, fields)
         # A candidate that builds another architecture is dismissed on its
         # parameter count before its own model is run.
@@ -982,7 +1017,7 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
                 for convention, family, model, record, inert in sized:
                     try:
                         error, bound = _agreement(convention, family, model, record, inert, name, expected,
-                                                  Path(scratch), layers, pad)
+                                                  Path(scratch), pad)
                         if convention == PARTS:
                             assert assembly is not None
                             _trained(reference, assembly, family, record, name)

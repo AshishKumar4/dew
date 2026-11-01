@@ -50,7 +50,7 @@ UNNORMED = MODEL.clone(qk_norm=False)
 
 SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 8, "shared decode": 8, "shared scan": 8,
                 "alternating scan": 8, "context read mla": 8, "context read kpool": 8,
-                "context read v4": 8}
+                "context read v4": 8, "context read normed after rotation": 8}
 """Check 1's declared seeds for each site of the file, sized paired by `seeds_for` on armada at
 57359d708 (job IGXSIZE) and, for the IDEFICS read and the alternating scan, at 0268ed035 (IGXSIZE3)."""
 
@@ -506,6 +506,24 @@ def test_an_attention_of_its_own_reads_a_context_through_its_own_projections(kin
         {**variables, "params": params}, ids, conditioning=conditioning)))(variables["params"])
     gates = [np.asarray(leaf) for path, leaf in flat_tree(gradients).items() if "alpha_" in path]
     assert len(gates) == 2 and all(np.isfinite(gate).all() and np.all(gate != 0) for gate in gates)
+
+
+def test_a_layer_norming_its_rotated_heads_norms_a_contexts_heads_alike():
+    """A layer that norms each head's queries and keys after their rotation (Hunyuan's,
+    `qk_norm_after_rotary`) reads a context, which it turns by no positions, through the same norms as
+    one that norms them before: its query normed then scaled, the context's keys normed, its read and its
+    pullback on par with that layer's from its float64 (check 1)."""
+    from dew.nn.mixers.attention import AttentionMixer
+
+    def layer(*, after):
+        return AttentionMixer(qk_norm_after_rotary=after).build(MixerContext(
+            emb_features=CONTEXT_WIDTH, num_heads=2, num_kv_heads=2, head_dim=8, max_seq_len=16,
+            norm_eps=1e-5, attention_scale=0.3))(name="self_attn")
+
+    before, after = layer(after=False), layer(after=True)
+    site = "context read normed after rotation"
+    assert_as_exact(context_read(after), context_read(before), context_draw(before), site,
+                    seeds=SHARED_SEEDS[site])
 
 
 HF = Path(__file__).parent / "fixtures" / "hf"

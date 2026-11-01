@@ -222,13 +222,16 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         reference."""
         return self.actor.build_task(part(variables, "policy"), processor=processor)
 
-    def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Return the critic's value of each packed id's prefix, at least float32, placed by `onto_ids`.
+    def values(self, variables: Variables, batch: Mapping[str, object],
+               progress: Progress = END) -> jax.Array:
+        """Return the critic's value of each packed id's prefix, at least float32, placed by `onto_ids`, at
+        the run's `progress` where the critic reads it: a rollout's baseline at the updates the run
+        committed (`PPORollout`), as the loss scores it at the step's, and `END` outside a run.
 
         A critic that does not return one value per input position raises
         `ValueError`.
         """
-        return self._critic_scores(variables, batch)[0]
+        return self._critic_scores(variables, batch, progress=progress)[0]
 
     def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, qk_stats: bool = False,
                        progress: Progress = END) -> tuple[jax.Array, Variables | None]:
@@ -427,5 +430,7 @@ class PPORollout:
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
         critic = self.objective.program("values", self.objective.values)
-        values = agreed("PPO critic values", lambda: local_rows(critic(state.variables, device)))
+        # The critic at the run's committed updates, the progress its loss trains it at (ledger 3008).
+        values = agreed("PPO critic values",
+                        lambda: local_rows(critic(state.variables, device, Progress(state.updates))))
         return {**projected, **self._targets(np.asarray(values), projected, episodes)}
