@@ -171,8 +171,8 @@ def _load(block: _Block, scratch: _Scratch, q_ref, k_ref, v_ref, *, group: int, 
         @pl.when(index < block.steps)
         def _():
             tile = (block.row, pl.ds(index * tiles.block_k, tiles.block_k), kv_head)
-            scratch.keys.load(index, (k_ref.at[tile],))
-            scratch.values.load(index, (v_ref.at[tile],))
+            scratch.keys.load(scratch.keys.turn(index), (k_ref.at[tile],))
+            scratch.values.load(scratch.values.turn(index), (v_ref.at[tile],))
 
     # Each stage's last releases, observed so its barriers end where they began (`Ring.drain`).
     scratch.keys.drain(1, block.steps)
@@ -185,7 +185,7 @@ def _products(block: _Block, scratch: _Scratch) -> None:
     plgpu.barrier_wait(scratch.q_loaded)
 
     def values(index):
-        (v_smem,), consumed = scratch.values.acquire(index)
+        (v_smem,), consumed = scratch.values.acquire(scratch.values.turn(index))
         plgpu.barrier_wait(scratch.p_full)
         plgpu.tcgen05_mma(scratch.acc_tmem, scratch.p_tmem, v_smem, consumed, accumulate=index > 0)
         plgpu.tcgen05_commit_arrive(scratch.o_done)
@@ -194,10 +194,11 @@ def _products(block: _Block, scratch: _Scratch) -> None:
     def _(index):
         @pl.when(index < block.steps)
         def _():
-            (k_smem,), consumed = scratch.keys.acquire(index)
-            s_tmem = scratch.scores.acquire(index)
+            (k_smem,), consumed = scratch.keys.acquire(scratch.keys.turn(index))
+            scores = scratch.scores.turn(index)
+            s_tmem = scratch.scores.acquire(scores)
             plgpu.tcgen05_mma(s_tmem, scratch.q_smem, k_smem.T, consumed, accumulate=False)
-            scratch.scores.issued(index)
+            scratch.scores.issued(scores)
             pl.when(index > 0)(functools.partial(values, index - 1))
 
     values(block.steps - 1)
@@ -225,7 +226,7 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
 
     def step(index, carry: tuple[jax.Array, jax.Array], *, masked):
         m, total = carry
-        read = scratch.scores.read(index, PART, layout=TMEM)
+        read = scratch.scores.read(scratch.scores.turn(index), PART, layout=TMEM)
         # The row's new maximum over the tile's parts, and the factor the state before takes to it.
         new = m
         for part in range(parts):
@@ -254,7 +255,7 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
             plgpu.async_store_tmem(mosaic_sm100.columns(scratch.p_tmem, part * PART, PART),
                                    algebra.narrow(weights, dtype))
         # The next S may overwrite this one once it is read out (`Tensor.release`).
-        scratch.scores.release(index)
+        scratch.scores.release(scratch.scores.turn(index))
         plgpu.commit_tmem()
         plgpu.barrier_arrive(scratch.p_full)
         return m, total

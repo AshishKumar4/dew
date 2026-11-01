@@ -130,29 +130,29 @@ class Ring:
     loaded: tuple[state_types.AbstractRef, ...]
     consumed: state_types.AbstractRef
 
-    def slot(self, turn):
-        return lax.rem(turn, self.stages)
+    def turn(self, counter) -> mosaic.Turn:
+        """Step `counter`'s turn of the ring."""
+        return mosaic.Turn.of(counter, self.stages)
 
-    def load(self, turn, views: tuple) -> None:
+    def load(self, turn: mosaic.Turn, views: tuple) -> None:
         """The load warp's turn: each operand's `views` entry into the turn's stage, once the products
-        have read the stage's last ones."""
-        slot = self.slot(turn)
-        pl.when(turn >= self.stages)(functools.partial(plgpu.barrier_wait, self.consumed.at[slot]))
+        have read the stage's last ones (the rotation before, of the other parity)."""
+        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
+            self.consumed.at[turn.slot], parity=jnp.logical_not(turn.parity)))
         for view, buffer, barrier in zip(views, self.buffers, self.loaded, strict=True):
-            plgpu.copy_gmem_to_smem(view, buffer.at[slot], barrier.at[slot])
+            plgpu.copy_gmem_to_smem(view, buffer.at[turn.slot], barrier.at[turn.slot])
 
-    def acquire(self, turn) -> tuple:
+    def acquire(self, turn: mosaic.Turn) -> tuple:
         """The product warp's turn: each operand's stage once loaded, and the barrier its products
         release it at."""
-        slot = self.slot(turn)
         for barrier in self.loaded:
-            plgpu.barrier_wait(barrier.at[slot])
-        return tuple(buffer.at[slot] for buffer in self.buffers), self.consumed.at[slot]
+            plgpu.barrier_wait(barrier.at[turn.slot], parity=turn.parity)
+        return tuple(buffer.at[turn.slot] for buffer in self.buffers), self.consumed.at[turn.slot]
 
     def drain(self, tiles, steps: int | jax.Array) -> None:
-        """The load warp's last releases, which no later load waited for (`drain`), after `tiles` tiles of
-        `steps` turns each."""
-        drain(self.consumed, tiles * steps, self.stages)
+        """The load warp's last releases, which no later load waited for (`mosaic.drained`), after `tiles`
+        tiles of `steps` turns each."""
+        mosaic.drained(self.consumed, tiles * steps, self.stages)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,48 +184,39 @@ class Tensor:
     done: state_types.AbstractRef
     read_done: state_types.AbstractRef
 
-    def index(self, turn):
-        return lax.rem(turn, self.shape.count)
+    def turn(self, counter) -> mosaic.Turn:
+        """Turn `counter` round the accumulators (`mosaic.Turn`, its slot the accumulator's index)."""
+        return mosaic.Turn.of(counter, self.shape.count)
 
-    def acquire(self, turn):
+    def acquire(self, turn: mosaic.Turn):
         """The product warp's turn: the turn's accumulator once the turn `count` before has been read
         out of it."""
-        index = self.index(turn)
-        pl.when(turn >= self.shape.count)(functools.partial(plgpu.barrier_wait, self.read_done.at[index]))
-        return columns(self.tmem, index * self.shape.columns, self.shape.columns)
+        pl.when(turn.counter >= self.shape.count)(lambda: plgpu.barrier_wait(
+            self.read_done.at[turn.slot], parity=jnp.logical_not(turn.parity)))
+        return columns(self.tmem, turn.slot * self.shape.columns, self.shape.columns)
 
-    def issued(self, turn) -> None:
+    def issued(self, turn: mosaic.Turn) -> None:
         """The product warp's turn's products all issued: the reader may wait on them."""
-        plgpu.tcgen05_commit_arrive(self.done.at[self.index(turn)])
+        plgpu.tcgen05_commit_arrive(self.done.at[turn.slot])
 
-    def read(self, turn, chunk: int, layout=STORED) -> Callable[[int], jax.Array]:
+    def read(self, turn: mosaic.Turn, chunk: int, layout=STORED) -> Callable[[int], jax.Array]:
         """The reading warpgroup's turn: once its products are done, each `chunk`-column slice of its
         accumulator by its index, loaded from tensor memory in `layout`."""
-        index = self.index(turn)
-        plgpu.barrier_wait(self.done.at[index])
-        first = index * self.shape.columns
+        plgpu.barrier_wait(self.done.at[turn.slot], parity=turn.parity)
+        first = turn.slot * self.shape.columns
         return lambda part: plgpu.async_load_tmem(columns(self.tmem, first + part * chunk, chunk),
                                                   layout=layout)
 
-    def release(self, turn) -> None:
+    def release(self, turn: mosaic.Turn) -> None:
         """The reading warpgroup's turn read out: its accumulator free for the turn `count` after."""
         plgpu.wait_load_tmem()
-        plgpu.barrier_arrive(self.read_done.at[self.index(turn)])
+        plgpu.barrier_arrive(self.read_done.at[turn.slot])
 
     def drain(self, turns) -> None:
-        """The product warp's last reads, which no later product waited for (`drain`)."""
-        drain(self.read_done, turns, self.shape.count)
+        """The product warp's last reads, which no later product waited for (`mosaic.drained`)."""
+        mosaic.drained(self.read_done, turns, self.shape.count)
 
 
 def columns(tmem, first, count: int):
     """Columns `first` to `first + count` of tensor memory `tmem`, every row."""
     return tmem.at[:, pl.ds(first, count)]
-
-
-def drain(barriers: state_types.AbstractRef, turns, slots: int) -> None:
-    """The completions of the last `slots` of `turns` turns taken round `barriers`, one a slot, which no
-    later turn of the slot waited for: each barrier ends at the phase its waiters saw."""
-    for back in range(1, slots + 1):
-        turn = turns - back
-        slot = lax.rem(jnp.maximum(turn, 0), slots)
-        pl.when(turn >= 0)(functools.partial(plgpu.barrier_wait, barriers.at[slot]))

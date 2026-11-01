@@ -175,22 +175,24 @@ def _load(tile: _Tile, lhs_gmem, rhs_gmem, scratch: _Scratch, *, tiles: Tiles, s
     def _(step):
         depths = pl.ds(step * block_k, block_k)
         block = matrix.at[columns, depths] if shape.transpose_rhs else matrix.at[depths, columns]
-        scratch.ring.load(tile.first + step, (lhs_gmem.at[pl.ds(tile.info.block_start, block_m), depths],
-                                              block))
+        scratch.ring.load(scratch.ring.turn(tile.first + step),
+                          (lhs_gmem.at[pl.ds(tile.info.block_start, block_m), depths], block))
 
 
 def _products(tile: _Tile, scratch: _Scratch, *, shape: _Shape) -> None:
     """The product warp: each step's product into the tile's accumulator once its stage is loaded,
-    releasing the stage when read, once the accumulator's tile before last is read out."""
-    acc = scratch.tensor.acquire(tile.done)
+    releasing the stage when read, once the accumulator's tile before last is read out; the steps a
+    rotation of the ring at a time, each at its stage as a constant (`mosaic.rotations`)."""
+    turn = scratch.tensor.turn(tile.done)
+    acc = scratch.tensor.acquire(turn)
 
-    @pl.loop(0, shape.steps)
-    def _(step):
-        (a_smem, b_smem), consumed = scratch.ring.acquire(tile.first + step)
+    def step(index, at: mosaic.Turn):
+        (a_smem, b_smem), consumed = scratch.ring.acquire(at)
         plgpu.tcgen05_mma(acc, a_smem, b_smem.T if shape.transpose_rhs else b_smem, consumed,
-                          accumulate=step > 0)
+                          accumulate=index > tile.first)
 
-    scratch.tensor.issued(tile.done)
+    mosaic.rotations(tile.first, tile.first + shape.steps, 0, scratch.ring.stages, step)
+    scratch.tensor.issued(turn)
 
 
 def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes, *, tiles: Tiles,
@@ -216,8 +218,9 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
 
     @pl.when(tile.computes)
     def _():
-        store(scratch.tensor.read(tile.done, chunk_n))
-        scratch.tensor.release(tile.done)
+        turn = scratch.tensor.turn(tile.done)
+        store(scratch.tensor.read(turn, chunk_n))
+        scratch.tensor.release(turn)
 
     pl.when(~tile.computes)(lambda: store(lambda chunk: plgpu.layout_cast(
         jnp.zeros((tiles.block_m, chunk_n), jnp.float32), mosaic_sm100.STORED)))

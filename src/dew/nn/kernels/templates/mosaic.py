@@ -243,6 +243,38 @@ def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) ->
             between()
 
 
+def rotated(turned: Callable, lo, hi, first, stages: int) -> tuple:
+    """Steps `lo` to `hi` of a ring of `stages` slots (its counters from `first`) as a loop takes them,
+    `(run, start, stop)`: a rotation of the ring a trip, `run(rotation, *state) -> state` its `stages`
+    steps unrolled, each at its slot, a constant, and the trip's one parity (`Turn`), so no step forms a
+    slot's address or tests a barrier's phase (CUTLASS's pipeline state steps an index and a phase; an
+    H100's 128 x 256 GEMM mainloop so took 15.5 instructions an HGMMA against CUTLASS's 13.5 and this
+    form's 10.7, K40's SASS). `turned(index, turn, *state) -> state` takes each step the range holds: a
+    trip's steps outside it (its first and last trips', where the range is not whole rotations) are
+    another walk's turns, which it skips (`taken`)."""
+    def run(rotation, *state):
+        parity = rotation % 2 == 1
+        for slot in range(stages):
+            counter = rotation * stages + slot
+            index = counter + first
+            step = functools.partial(turned, index, Turn(counter, slot, parity))
+            state = taken((index >= lo) & (index < hi), step, *state)
+        return state
+
+    return run, (lo - first) // stages, (hi - first + stages - 1) // stages
+
+
+def rotations(lo, hi, first, stages: int, step: Callable[[jax.Array, "Turn"], None]) -> None:
+    """`step(index, turn)` for each step `lo` to `hi` of a ring of `stages` slots (counters from `first`),
+    a rotation of the ring a trip (`rotated`): a loop that carries nothing (a product warp's)."""
+    def turned(index, turn):
+        step(index, turn)
+        return ()
+
+    run, start, stop = rotated(turned, lo, hi, first, stages)
+    pl.loop(start, stop)(run)
+
+
 def taken(active, step: Callable, *state):
     """`step(*state)` where `active`, `state` as it is otherwise (`lax.cond`): its arrays carried through the
     branch, its refs (a warpgroup accumulator's) read where they are; `step` returns `state`'s structure,
@@ -390,7 +422,7 @@ class Turn:
     load: its slot, `counter % stages`, and its rotation's parity, `counter // stages % 2`, the phase of the
     slot's barriers its waits take. Every slot's barriers complete one phase a rotation, so the one parity
     serves them all (`plgpu.barrier_wait`'s `parity`), with no phase tracked a barrier. Python ints where a
-    walk knows them (a rotation unrolled, its slots constant: `RingFamily._rotated`), traced otherwise."""
+    walk knows them (a rotation unrolled, its slots constant: `rotated`), traced otherwise."""
     counter: jax.Array | int
     slot: jax.Array | int
     parity: jax.Array | bool
@@ -468,11 +500,17 @@ class Ring:
     def drain(self, end) -> None:
         """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot
         it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
-        release is seen."""
-        for back in range(self.stages):
-            turn = self.turn(end - 1 - back)
-            pl.when(turn.counter >= 0)(lambda turn=turn: plgpu.barrier_wait(self.consumed.at[turn.slot],
-                                                                           parity=turn.parity))
+        release is seen (`drained`)."""
+        drained(self.consumed, end, self.stages)
+
+
+def drained(barriers, end, stages: int) -> None:
+    """The completions of the last `stages` of `end` turns round `barriers`, a slot's each (`Turn`), which no
+    later turn of the slot waited for: each barrier ends at the phase its waiters saw."""
+    for back in range(1, stages + 1):
+        turn = Turn.of(end - back, stages)
+        pl.when(turn.counter >= 0)(lambda turn=turn: plgpu.barrier_wait(barriers.at[turn.slot],
+                                                                       parity=turn.parity))
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
@@ -1434,7 +1472,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                    first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
                    freed: Callable | None = None) -> tuple[C, tuple[jax.Array, ...]]:
         """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s). Each
-        segment walks its steps a rotation of the rings at a time (`_rotated`)."""
+        segment walks its steps a rotation of the rings at a time (`rotated`)."""
         stages = min(ring.stages for ring in streams.values())
         if not 0 <= in_flight < stages:
             raise ValueError(f"a walk keeps fewer steps' products in flight than its rings' {stages} slots, "
@@ -1463,36 +1501,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             pl.when(index >= lo + in_flight)(lambda: given(turn.back(in_flight, stages), release=True))
             return carry, accumulators
 
-        rotated = tuple(self._rotated(functools.partial(turned, step, lo), lo, hi, first, stages)
-                        for step, lo, hi in segments)
-        walked = self.accumulated(rotated, start, shapes, interpret, initial)
+        walked = self.accumulated(tuple(rotated(functools.partial(turned, step, lo), lo, hi, first, stages)
+                                        for step, lo, hi in segments), start, shapes, interpret, initial)
         # Each segment's last `in_flight` steps, their products done by the walk's end, oldest first.
         for _, lo, hi in segments:
             for back in reversed(range(in_flight)):
                 pl.when(hi - back > lo)(lambda hi=hi, back=back: given(Turn.of(hi - 1 - back - first, stages),
                                                                        release=True))
         return walked
-
-    @staticmethod
-    def _rotated(turned: Callable, lo, hi, first, stages: int) -> tuple:
-        """A walk's segment of steps `lo` to `hi` (ring counters from `first`) as `accumulated` loops it: a
-        rotation of the rings a trip, `stages` steps unrolled, each at its slot, a constant, and the trip's
-        one parity (`Turn`), so no step forms a slot's address or tests a barrier's phase (CUTLASS's
-        pipeline state steps an index and a phase; an H100's 128 x 256 GEMM mainloop so took 15.5
-        instructions an HGMMA against CUTLASS's 13.5 and an unrolled one's 10.6, UnevenWolverine's SASS).
-        `turned(index, turn, carry, accumulators)` takes each step the segment holds: a trip's steps
-        outside it (its first and last trips', where its bounds are not a rotation's) are another walk's
-        turns, which it skips (`taken`)."""
-        def run(rotation, carry, accumulators):
-            parity = rotation % 2 == 1
-            for slot in range(stages):
-                counter = rotation * stages + slot
-                index = counter + first
-                step = functools.partial(turned, index, Turn(counter, slot, parity))
-                carry, accumulators = taken((index >= lo) & (index < hi), step, carry, accumulators)
-            return carry, accumulators
-
-        return run, (lo - first) // stages, (hi - first + stages - 1) // stages
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)
