@@ -30,7 +30,7 @@ def smoke_weights(model):
             jnp.bfloat16), shapes, keys))())
 
 
-@pytest.mark.parametrize("release_source", [False, True], ids=["keep-source", "delete-source"])
+@pytest.mark.parametrize("release_source", [False, True], ids=["keep-source", "drop-source"])
 def test_banked_smoke_serve(release_source):
     model = smoke_model()
     source = smoke_weights(model)
@@ -45,8 +45,7 @@ def test_banked_smoke_serve(release_source):
         "placed_deleted": placed.is_deleted(),
     })
     if release_source:
-        for leaf in jax.tree.leaves(source):
-            leaf.delete()
+        del source
     print("embedding after deletion:", {
         "source_deleted": embedding.is_deleted(), "placed_deleted": placed.is_deleted(),
     })
