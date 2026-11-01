@@ -192,7 +192,8 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 HARNESS = "tools/armada/"
-"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
+"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this
+file."""
 SHARED = ("constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
           "tools/armada/lifetime.py", "tools/armada/watched.py")
@@ -1373,8 +1374,8 @@ def targeted(python: str, arguments: list[str], report: Path) -> int:
 
 def flow_cells(cases) -> dict[str, dict]:
     """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
-    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an empty
-    object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
+    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an
+    empty object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
     unqualified, and a reused row keeps its counts (ledger 2643)."""
     return {node_of(case): json.loads(item.get("value") or "null") for case in cases
             for item in case.iter("property") if item.get("name") == "cells"}
