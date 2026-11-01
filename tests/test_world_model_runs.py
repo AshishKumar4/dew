@@ -19,14 +19,14 @@ from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.lora import LoRA
 from dew.nn.kernels import generation
-from dew.objectives.world_model import CausalTokenizer, Dynamics, TokenizerObjective, WorldModelObjective
+from dew.objectives.world_model import TokenizerObjective, WorldModelObjective
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 from dew.state import TrainState
 from dew.training import Trainer
 
 WORLD = "dew.objectives.world_model"
-WINDOW, SIZE, BATCH = 4, 8, 4
+WINDOW, SIZE, BATCH = 4, 8, 8
 """A clip's frames, a frame's side in pixels and a batch's clips."""
 TOKENIZER = {"patch": 4, "width": 16, "depth": 1, "heads": 2, "latents": 4, "bottleneck": 4}
 DYNAMICS = {"spatial": 2, "width": 16, "depth": 1, "heads": 2, "levels": 3, "frames": WINDOW}
@@ -35,7 +35,7 @@ OPTIM = OptimConfig(optimizer="adam", learning_rate=1e-3)
 TOKENIZER_STEPS, DYNAMICS_STEPS = 3, 2
 
 
-def videos(rows: int = 8, size: int = SIZE, seed: int = 0) -> np.ndarray:
+def videos(rows: int = 16, size: int = SIZE, seed: int = 0) -> np.ndarray:
     return np.random.default_rng(seed).uniform(-1, 1, (rows, WINDOW, size, size, 1)).astype(np.float32)
 
 
@@ -182,19 +182,17 @@ def test_a_world_model_run_refuses_a_setup_it_cannot_train(stages, other_frames,
 
 
 def test_a_command_line_names_the_stage_its_record_does(tmp_path):
-    """A dynamics stage named on the command line, its model's and objective's fields one flag each and its
-    tokenizer turned on by its flags (`--tokenizer.`), is the stage its record states."""
+    """A dynamics stage named on the command line, its model's fields one flag each and its tokenizer turned
+    on by its flags (`--tokenizer.`), is the stage its record states."""
     args = ["--model", f"{WORLD}:Dynamics", "--model.spatial", "2", "--model.width", "16",
-            "--model.depth", "1",
-            "--model.heads", "2", "--model.levels", "3", "--model.frames", str(WINDOW),
-            "--objective", f"{WORLD}:WorldModelObjective", "--objective.shortcut", "False",
+            "--model.depth", "1", "--model.heads", "2", "--model.levels", "3",
+            "--model.frames", str(WINDOW), "--objective", f"{WORLD}:WorldModelObjective",
             "--tokenizer.run", str(tmp_path / "tokenizer"), "--tokenizer.step", "3",
             "--optim.optimizer", "adam", "--optim.learning-rate", "1e-3",
             "--trainer.checkpoint-dir", str(tmp_path), "--trainer.steps", "2", "--trainer.log-every", "1",
             "--trainer.multi-host", "False"]
-    stated = dynamics_run(tmp_path, None, tmp_path / "tokenizer")
     stated = dataclasses.replace(
-        stated, data=None, tokenizer=TokenizerConfig(str(tmp_path / "tokenizer"), 3),
-        objective=ObjectiveConfig(f"{WORLD}:WorldModelObjective", {"shortcut": False}),
+        dynamics_run(tmp_path, None, tmp_path / "tokenizer"), data=None,
+        tokenizer=TokenizerConfig(str(tmp_path / "tokenizer"), 3),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=2, log_every=1, multi_host=False))
     assert WorldModelRunConfig.cli(args) == stated

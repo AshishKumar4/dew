@@ -88,8 +88,8 @@ class WorldModelRunConfig(RunConfig):
             model = self.model.build(**self.numerics_fields(), **self.derived({"frame": frame}))
             objective = self.objective.build(model=model)
         elif issubclass(kind, WorldModelObjective):
-            tokenizer, weights = self.tokenized(frame)
             self.trains(kind)
+            tokenizer, weights = self.tokenized(frame)
             widths = {"latents": tokenizer.latents, "bottleneck": tokenizer.bottleneck,
                       "action_size": action_size}
             model = self.model.build(**self.numerics_fields(), **self.derived(widths))
