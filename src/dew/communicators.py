@@ -331,7 +331,6 @@ class Resident:
 
     def __init__(self) -> None:
         self.held = Collectives()
-        self.loaded: set[bytes] = set()
         self.lock = threading.Lock()
 
     def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
@@ -347,30 +346,28 @@ class Resident:
         and what is free now refuses a program whose own communicators cannot fit even beside the earlier
         ones all made. A program's code (`loaded`) loads as it first runs and leaves as its executable is
         released, which no process can see either, so it is held to what is free now beside the
-        communicators it adds, an executable's the first time it is admitted, and the room holds what stays
-        made."""
+        communicators it adds, at every admission (an executable admitted again over-counts its code alone),
+        and the room holds what stays made. Each refusal names the comparison that failed."""
         with self.lock:
             held = self.held | made
-            new = loaded is not None and loaded.fingerprint not in self.loaded
             needed = needs.needed(held, room, runtime=True)
             added = needs.needed(made, room, runtime=False, made=self.held)
-            if loaded is not None and new:
-                for gpu in set(loaded.gpus) & set(added):
-                    added[gpu] += loaded.code
+            for gpu in set(loaded.gpus if loaded is not None else ()) & set(added):
+                added[gpu] += loaded.code if loaded is not None else 0
             now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
-            short = (any(needed[gpu] > room[gpu] for gpu in room)
-                     or any(added[gpu] > now[gpu] for gpu in now))
-            if short:
-                new = made.beyond(self.held)
-                raise CommunicatorRoom(f"the compiled program's collectives add {len(new.groups)} collective "
-                                       f"groups, {len(new.exchanges)} exchanges and "
-                                       f"{sum(map(len, new.permutes.values()))} permute connections to the "
-                                       "process's, which its GPUs have too little room for outside XLA's "
-                                       f"pool; lower {fraction_name()} by the shortfall over the GPU's bytes",
-                                       needed, {gpu: min(room[gpu], now.get(gpu, room[gpu])) for gpu in room})
+            new = made.beyond(self.held)
+            adds = (f"the compiled program's collectives add {len(new.groups)} collective groups, "
+                    f"{len(new.exchanges)} exchanges and {sum(map(len, new.permutes.values()))} permute "
+                    "connections to the process's")
+            if any(needed[gpu] > room[gpu] for gpu in room):
+                raise CommunicatorRoom(f"{adds}, which with the runtime's need more room than Dew left "
+                                       f"outside XLA's pool; lower {fraction_name()} by the shortfall over "
+                                       "the GPU's bytes", needed, room)
+            if any(added[gpu] > now[gpu] for gpu in now):
+                raise CommunicatorRoom(f"{adds}, which with its code need more than its GPUs have free "
+                                       "outside XLA's pool now", {gpu: added[gpu] for gpu in now},
+                                       {gpu: now[gpu] for gpu in now})
             self.held = held
-            if loaded is not None:
-                self.loaded.add(loaded.fingerprint)
 
 
 @dataclasses.dataclass(frozen=True)

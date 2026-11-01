@@ -166,18 +166,24 @@ def test_what_a_gpu_has_spent_already_is_not_charged_to_a_program_again():
 
 def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     """A program's code takes its GPUs' memory outside XLA's pool as it first runs and leaves as its
-    executable is released, neither of which a process sees: a program whose new communicators fit what its
-    GPUs have free now but not with its code is refused, an executable admitted again is not charged its
-    code again, and the room, which holds what stays made, never holds code."""
+    executable is released, neither of which a process sees: at every admission, a program whose new
+    communicators fit what its GPUs have free now but not with its code is refused, naming the bytes its code
+    and communicators need and the bytes free, an executable admitted again (loaded again, perhaps) charged
+    its code again; the room, which holds what stays made, never holds code."""
     room = dict.fromkeys(range(4), 4 * GIB)
     every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
     pair = Collectives(groups=frozenset({(0, 1)}))
     resident = communicators.Resident()
-    resident.admit(every, FOUR, room, lambda gpu: 3 * GIB, communicators.Loaded(b"step", (0, 1, 2, 3), GIB))
-    resident.admit(every, FOUR, room, lambda gpu: 0, communicators.Loaded(b"step", (0, 1, 2, 3), GIB))
-    with pytest.raises(CommunicatorRoom):
-        resident.admit(pair, FOUR, room, lambda gpu: GIB, communicators.Loaded(b"eval", (0, 1), GIB // 2))
+    step = communicators.Loaded(b"step", (0, 1, 2, 3), GIB)
+    resident.admit(every, FOUR, room, lambda gpu: 3 * GIB, step)
+    with pytest.raises(CommunicatorRoom) as again:
+        resident.admit(every, FOUR, room, lambda gpu: GIB // 2, step)
+    assert again.value.needed == dict.fromkeys(range(4), GIB)
+    assert again.value.room == dict.fromkeys(range(4), GIB // 2)
+    resident.admit(every, FOUR, room, lambda gpu: GIB, step)
     evaluation = communicators.Loaded(b"eval", (0, 1), GIB // 2)
+    with pytest.raises(CommunicatorRoom):
+        resident.admit(pair, FOUR, room, lambda gpu: GIB, evaluation)
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
