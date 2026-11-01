@@ -99,3 +99,185 @@ engine serves three uses: whole programs, the templates' algebra, and the search
 - Mirage (joint search over algebra, schedules and kernels, with randomized equivalence checks);
 - Constable (equality saturation inside XLA, costed against the real compiler's fusion);
 - FlexAttention (variants as declared functions).
+
+## 6. Interface
+
+Draft, 2026-11-01. Every part of the work builds against this section, so a change to it is a change to the design.
+The engine runs egglog 14.0.0 (MIT; wheels for CPython 3.12–3.14 on Linux, macOS and Windows), pinned exactly,
+because its Python API is still marked as subject to change.
+
+### 6.1 Modules
+
+| Module | Holds |
+|---|---|
+| `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
+| `dew.algebra.facts` | Facts about each value (e-class analyses) |
+| `dew.algebra.rules` | `Rules`, the registry and the sets: `linear`, `identities`, `reuse`, `decoupled` |
+| `dew.algebra.cost` | `Price`, `CostModel` and DAG extraction |
+| `dew.algebra.program` | The pass at `options.program` and its report |
+| `dew.algebra.derive` | Template declarations and their derived forms |
+
+### 6.2 Terms
+
+`Term` is one egglog sort, `class Term(Expr)`. Each constructor is one jaxpr primitive of the language in §1, with
+the primitive's parameters as primitive sorts:
+
+- shapes, axes and permutations as `Vec[i64]`;
+- dtypes as `String`;
+- literals as `f64` together with their dtype.
+
+```python
+class Term(Expr):
+    @classmethod
+    def input(cls, index: i64Like) -> Term: ...                 # a region's argument
+    @classmethod
+    def literal(cls, value: f64Like, dtype: StringLike) -> Term: ...
+    @classmethod
+    def opaque(cls, equation: i64Like, output: i64Like) -> Term: ...  # never rewritten (§1)
+    def __add__(self, other: Term) -> Term: ...                 # add, sub, mul, div, max, min, ...
+    def unary(self, name: StringLike) -> Term: ...             # neg, exp, log, sqrt, rsqrt, abs, sign
+    def convert(self, dtype: StringLike) -> Term: ...
+    def broadcast(self, shape: Vec[i64], dimensions: Vec[i64]) -> Term: ...
+    def reshape(self, shape: Vec[i64]) -> Term: ...
+    def transpose(self, permutation: Vec[i64]) -> Term: ...
+    def reduce(self, monoid: StringLike, axes: Vec[i64]) -> Term: ...   # "sum" | "max"
+    @classmethod
+    def dot(cls, lhs: Term, rhs: Term, contracting: Vec[i64], batch: Vec[i64], result: StringLike) -> Term: ...
+    @classmethod
+    def select(cls, predicate: Term, true: Term, false: Term) -> Term: ...
+```
+
+- `terms.region(jaxpr, equations) -> (Term roots, Leaves)` converts a region of equations:
+  - every equation outside the language becomes `opaque`;
+  - every value the region reads but does not compute becomes an `input`.
+- `terms.rebuilt(roots, leaves) -> jax.core.Jaxpr` converts an extracted term back to equations.
+- A region is a maximal set of equations of the language. It never crosses:
+  - a checkpoint (remat) boundary;
+  - an opaque equation;
+  - a scan or while body (those are regions of their own).
+
+### 6.3 Facts
+
+Each fact is an egglog `@function` from `Term` to a primitive sort. Its `merge` is the lattice join, and its rules
+derive it from its arguments' facts.
+
+| Fact | Sort | Join | Read by |
+|---|---|---|---|
+| `shape(t)` | `Vec[i64]` | equal or fail | every rule that names an axis |
+| `dtype(t)` | `String` | equal or fail | casts, rounding |
+| `constant_axes(t)` | `Set[i64]` | union | hoisting a scalar out of a reduction |
+| `sharded_axes(t)` | `Map[i64, String]` (axis to mesh axes) | equal or fail | a sum over a sharded axis is a collective |
+| `tiled_axis(t)` | `i64` (−1 for none) | equal or fail | the toolkit's derived forms |
+| `combine(t, axis)` | `String` (the monoid that joins two tiles: `sum`, `max`, `logsumexp`, `moments`) | equal or fail | the work scheduler's fix-up |
+
+Two notes on the table:
+- "equal or fail" means members of one e-class that disagree raise, naming the rule that united them.
+- The inputs' facts come from the traced avals and their shardings.
+
+### 6.4 Rules
+
+```python
+@dataclass(frozen=True)
+class Rules:
+    name: str                                # "linear", "identities", "reuse", "decoupled", ...
+    rounding: Literal["exact", "reorders"]   # "reorders": applied under default numerics only
+    ruleset: egglog.Ruleset
+    receipt: str                             # the measurement it ships with: a ledger row and its receipts
+
+RULES: Mapping[str, Rules]                   # every registered set, by name
+def register(rules: Rules) -> None: ...
+def admitted(numerics) -> tuple[Rules, ...]  # the sets a program's precision policy allows
+```
+
+- A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
+- Each rule's float64 identity test names the rule (§3).
+- `--precision accurate` admits only `exact` sets.
+
+### 6.5 Cost and extraction
+
+```python
+@dataclass(frozen=True, order=True)
+class Price:                # compared in this order (§1)
+    bytes: int              # passes over large tensors, each elementwise op fused into its consumer
+    depth: int              # the longest chain of dependent reductions
+    collectives: int
+    flops: int
+
+class CostModel(Protocol):
+    def price(self, node: Node, facts: Facts) -> Price: ...    # the node alone; extraction prices sharing
+
+def extracted(graph: egglog.EGraph, roots: Sequence[Term], cost: CostModel) -> Extraction: ...
+
+@dataclass(frozen=True)
+class Extraction:
+    roots: tuple[Term, ...]
+    price: Price                     # the region's cost, each shared value priced once
+    fired: Mapping[str, int]         # rule set name: the extracted nodes it introduced
+```
+
+- A cost model prices a node alone. Extraction composes the prices over the chosen DAG: `bytes`,
+  `collectives` and `flops` add up with each shared e-class counted once, and `depth` is the longest path of
+  reductions.
+- Extraction reads the e-graph through egglog's serialization. A DAG extractor prices each shared e-class once.
+  egglog's `greedy-dag` is the baseline it has to beat.
+- Ties break by node order in the serialization, which is deterministic with one thread.
+- `fired` comes from the nodes each set's run added, recorded between runs of the sets.
+- A device's cost model is calibrated against measured profiles, its parameters measured on that device.
+
+### 6.6 Saturation
+
+```python
+@dataclass(frozen=True)
+class Saturation:
+    iterations: int = 32
+    nodes: int = 200_000    # checked between iterations (egglog has no node limit)
+```
+
+- Sets run in registry order, one iteration each, until no set changes the graph or a limit is reached.
+- The e-graph runs with one thread, so the same input gives the same output.
+
+### 6.7 The program pass
+
+```python
+def rewritten(closed: jax.core.ClosedJaxpr, *, numerics, cost: CostModel,
+              saturation: Saturation = Saturation()) -> Rewrite: ...
+
+@dataclass(frozen=True)
+class Rewrite:
+    closed: jax.core.ClosedJaxpr     # same inputs, outputs, avals and shardings
+    report: AlgebraReport
+```
+
+- `options.program` (`OuterProgram`) traces its function with `jax.make_jaxpr`, rewrites the result, and jits a
+  function that evaluates the rewritten jaxpr (`jax.core.eval_jaxpr`). The jit options and shardings stay the
+  program's own.
+- The program's compiler options gain `algebra`: the admitted set names, or none. It joins the program's cache
+  key, so a rewritten program and an unrewritten one never share an executable.
+- The planner prices the rewritten program: `footprint`'s traced gradient passes through `rewritten` before it is
+  priced.
+
+### 6.8 The compile report
+
+`AlgebraReport` is recorded with each compiled step (`StepCompiled`) and each `options.program` compile. It holds:
+- the regions rewritten;
+- the price before and after;
+- the rule sets that fired, with counts;
+- the saturation's iterations and node count, and whether a limit stopped it;
+- the pass's seconds.
+
+### 6.9 Derived template forms
+
+```python
+@dataclass(frozen=True)
+class Declaration:
+    function: jax.core.ClosedJaxpr   # attention's score function, mask and reduction, or a state update
+    roles: Mapping[str, str]         # which inputs are queries, keys, values, state, ...
+    reduction: str                   # the reduction's monoid
+    tiled_axis: int
+
+def derive(declaration: Declaration, forms: Sequence[str]) -> Mapping[str, Callable]: ...
+```
+
+- `forms` names the forms wanted, among `online`, `tiled`, `combine` and `backward`.
+- Each derived form has the signature of its oracle in `attention_algebra` or `recurrence_algebra`, so it replaces
+  that oracle in place once it matches it in float64 and in kernel speed (§2).
