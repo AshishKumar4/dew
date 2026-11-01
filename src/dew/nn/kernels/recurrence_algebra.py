@@ -617,6 +617,25 @@ backward's loads a `Tile`."""
 TileLoad = Callable[..., Tile]
 """A load of a `Tile` (the backward's operands)."""
 
+
+class Blocks(NamedTuple):
+    """`count` products named `name` to sum, `left(j) @ right(j)` a block `j` (tiles in memory): one a
+    block, which a mainloop may issue as a loop over `j`, its operands' fragments loaded a block at a time
+    (`templates.recurrence.issuing.Issuer.summed`), where unrolled ptxas held every block's at once."""
+
+    name: str
+    left: Callable[..., "Operand"]
+    right: Callable[..., "Operand"]
+    count: int
+
+
+def expanded(products) -> list:
+    """`products`, `(name, left, right)` and `Blocks`, as a list of `(name, left, right)`, a product a
+    block."""
+    return [product for entry in products
+            for product in ([(entry.name, entry.left(j), entry.right(j)) for j in range(entry.count)]
+                            if isinstance(entry, Blocks) else [entry])]
+
 Operand = jax.Array | Tile | Transposed | Exact
 """A product's operand (`Issue`'s): registers, a tile in memory, or registers taken transposed."""
 
@@ -1180,12 +1199,12 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
     keys' side (`chunk_scores`'), mamba_ssm's `dCB = (dout x^T) dt` (`_chunk_scan_bwd_dcb`)."""
     column_gate, column_low = (gate, low) if laid is None else laid
     pair_decay = decayed(gate, low, column_gate, column_low)
-    ds = summed([("values_ds", out_grads(j), values(j).T) for j in range(blocks)])
+    ds = summed([Blocks("values_ds", out_grads, lambda j: values(j).T, blocks)])
     if column_scale is not None:
         ds = ds * column_scale[None, :]
     lag = _lags(ds.shape)
     ds = jnp.where(lag >= 0, ds * pair_decay, 0.0) * scale
-    scores = summed([("local_t", queries(c), keys(c).T) for c in range(columns)])
+    scores = summed([Blocks("local_t", queries, lambda c: keys(c).T, columns)])
     return ds.astype(dtype), jnp.where(lag > 0, ds * scores, 0.0)
 
 

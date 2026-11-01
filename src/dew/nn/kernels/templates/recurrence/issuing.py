@@ -3,13 +3,13 @@ as the parts its products take (`Parts`), and the algebra's products (`recurrenc
 the family, a register operand staged first (`Issuer`)."""
 
 import functools
-import itertools
 from collections.abc import Iterable
 from typing import Protocol
 
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product
 
 
@@ -115,20 +115,42 @@ class Issuer:
         issued, so `products` may form them one at a time (`algebra.key_decayed_pairs`), a staging into a
         tile an issued product may still read waiting for the products in flight first
         (`Family.settled`). An operand may be a callable forming it then, where `shape`, the sum's, is
-        given."""
-        products = iter(products)
-        first = next(products)
+        given. A `Blocks` entry (`algebra.Blocks`, a product a block of tiles in memory) is issued as a loop
+        over its blocks where the family's products read their operands from registers
+        (`Family.operands_in_registers`, whose accumulator is a value the loop carries): unrolled, ptxas held
+        every block's fragments at once, an A100's scores backward at keys and values 256 wide spilling 280
+        bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
+        products = list(products)
         family, interpret = self.call.family, self.call.interpret
 
         def issued(acc):
             read: list = []
-            for name, lhs, rhs in itertools.chain([first], products):
-                left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
-                acc = family.issued(acc, left, right, interpret)
+            for entry in products:
+                if isinstance(entry, algebra.Blocks) and self._rolls(entry):
+                    # The accumulator laid out as products leave it, the loop's carry one layout.
+                    block = functools.partial(self._block, entry)
+                    acc = jax.lax.fori_loop(0, entry.count, block, family.as_tile(acc))
+                    continue
+                for name, lhs, rhs in algebra.expanded([entry]):
+                    left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
+                    acc = family.issued(acc, left, right, interpret)
             return acc
 
-        shape = (first[1].shape[0], first[2].shape[1]) if shape is None else shape
+        if shape is None:
+            (_, lhs, rhs), *_ = algebra.expanded(products[:1])
+            shape = (lhs.shape[0], rhs.shape[1])
         return family.summed(shape, issued, interpret)
+
+    def _rolls(self, blocks: "algebra.Blocks") -> bool:
+        """Whether `summed` issues `blocks` as a loop: more than one, on a family whose products read
+        registers, each operand a tile in memory (a `Parts`, which a block index slices)."""
+        return (blocks.count > 1 and self.call.family.operands_in_registers
+                and isinstance(blocks.left(0), Parts) and isinstance(blocks.right(0), Parts))
+
+    def _block(self, blocks: "algebra.Blocks", j, acc):
+        """`acc` with block `j`'s product of `blocks` issued onto it (`summed`'s loop)."""
+        left, right = blocks.left(j), blocks.right(j)
+        return self.call.family.issued(acc, left.refs, right.refs, self.call.interpret)
 
     def _registered(self, name: str, lhs) -> tuple | None:
         """`lhs`'s parts in registers where its product takes it there (its buffers a count, `Issuer`'s),
