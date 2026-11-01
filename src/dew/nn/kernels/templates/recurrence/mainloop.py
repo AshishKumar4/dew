@@ -1023,10 +1023,10 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                 return block("gates", gates, c), block("lows", gates, c)
 
             def shifted(c):
-                """Key block `c`'s keys and prefix halves staged below `SUB` rows of any values (a pair they
-                reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`)."""
+                """Key block `c`'s keys and separated prefix staged below `SUB` rows of any values (a pair
+                they reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`)."""
                 (tiles,) = padded
-                for i, value in enumerate((operand("keys")(c), *gated(c))):
+                for i, value in enumerate((operand("keys")(c), *algebra.separated(*gated(c)))):
                     tiles.at[i, pl.ds(algebra.SUB, CHUNK)][...] = value
                 return lambda e: tuple(family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK)])
                                        for i in range(3))
