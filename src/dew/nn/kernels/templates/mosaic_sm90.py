@@ -28,6 +28,11 @@ class WgmmaIssuer(mosaic.Issuer):
     products_overlap = True
     in_flight = 1
 
+    @property
+    def lane_columns(self) -> int:
+        # A thread holds two adjacent columns of each 8 (the WGMMA layout's lane % 4 times two).
+        return 6
+
     def held(self, ref):
         # An operand every step reads stays in shared memory, which its products read.
         return ref

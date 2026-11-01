@@ -151,6 +151,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     column_scratch = 0  # its column sums take its kernels' reduction scratch
 
+    @property
+    def lane_columns(self) -> int:
+        # A thread holds two adjacent columns of each 8 (lane % 4 times two) in its warp's 8 of each
+        # `n_warps * 8` (`MMALayouts`' accumulator tiling).
+        return 6 | 8 * (4 // self.m_warps - 1)
+
     def column_registers(self, columns: int, dtype) -> int:
         # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a
         # thread's two columns a row (jax/experimental/mosaic/gpu/mma.py:63, `MMALayouts`' accumulator
