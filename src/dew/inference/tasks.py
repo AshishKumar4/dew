@@ -42,12 +42,13 @@ from dew.batch import (
     token_validity,
 )
 from dew.cache import persist_compilations
+from dew.data.text import Tokenizer
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
+from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, pad_token_rows, request_key
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
@@ -737,13 +738,50 @@ def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelC
     return config.with_dtype(dtype_name(resolve_dtype(dtype)))
 
 
+@dataclass(frozen=True)
+class RunProcessor:
+    """Adapts a run's tokenizer to the `Processor` interface a task uses.
+
+    Calling it encodes each text prompt and left-pads the rows into
+    `ModelInputs`; a text run takes no images or audio. `decode` returns one
+    string per token row.
+    """
+
+    tokenizer: Tokenizer
+
+    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
+                 audio: Media | None = None) -> ModelInputs:
+        if images is not None or audio is not None:
+            raise ValueError("a text run takes no images or audio")
+        rows = [text] if isinstance(text, str) else list(text)
+        ids = [self.tokenizer.encode(row) for row in rows]
+        tokens, fields = pad_token_rows(ids)
+        return ModelInputs(jnp.asarray(tokens), jax.tree.map(jnp.asarray, fields))
+
+    def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
+        return [self.tokenizer.decode(row) for row in np.asarray(tokens)]
+
+    def encode(self, text: str, *, specials: bool) -> list[int]:
+        """`text`'s ids from the run's tokenizer, with the special tokens it adds around a sequence
+        where `specials`, and none otherwise."""
+        return self.tokenizer.encode(text, add_special_tokens=specials)
+
+    def spelling(self, ids: Sequence[int]) -> str:
+        """The text the run's tokenizer decodes `ids` to, its special tokens spelled out."""
+        return self.tokenizer.decode(list(ids))
+
+    @property
+    def bos_id(self) -> int | None:
+        """The id the run's tokenizer starts a sequence with, or None."""
+        return self.tokenizer.bos_id
+
+
 def recorded_tokenizer(processor: Processor | None) -> str | None:
     """The tokenizer name a run's record keeps for `processor`, which
     `_saved_processor` rebuilds through `tokenizer_for`: a run tokenizer's
     own name, byte or Hugging Face. Any other processor records none, and the
     run loads as weights that take ids."""
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.loading import RunProcessor
 
     if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
         return processor.tokenizer.name
@@ -763,7 +801,6 @@ def _saved_processor(settings: TaskSettings, config: ModelConfig) -> Processor |
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
-    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
