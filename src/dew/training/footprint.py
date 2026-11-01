@@ -208,27 +208,38 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
 def consumed_where_made(optimizer: optax.GradientTransformation | None, state: TrainState,
                         window: int) -> bool:
     """Whether the step reads each gradient where it is made into the buffers its state donates, so it
-    holds none beside another (`gradient_peak`'s `consumed`): with its optimizer's state in device memory,
-    a window of several microbatches sums each into its accumulator's leaf, and a window of one updates
-    each by `optimizer`, where its update reads each gradient into its own leaf's results alone
-    (`leaf_local`). A state fetched from the host is fetched behind one barrier over every gradient
-    (`Transaction.past`), and an update that reads them together (clipping by the global norm) holds
-    them all until it has read the last."""
-    if any(jax.typeof(leaf).memory_space != jax.memory.Space.Device
-           for leaf in jax.tree.leaves(state.opt_state)):
+    holds none beside another (`gradient_peak`'s `consumed`): with the state it commits (`COMMIT_FIELDS`,
+    the optimizer's and the EMA) in device memory, a window of several microbatches sums each into its
+    accumulator's gradient leaf in device memory, and a window of one updates each by `optimizer`, where
+    its update reads each gradient into its own leaf's results alone (`leaf_local`). A committed state
+    fetched from the host is fetched behind one barrier over every gradient (`Transaction.past`), a window
+    that replays its microbatches keeps their gradients for the replay, and an update that reads them
+    together (clipping by the global norm) holds them all until it has read the last."""
+    def in_device(tree) -> bool:
+        return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
+
+    if not in_device((state.opt_state, state.ema)):
         return False
     if window > 1:
-        return True
+        accumulated = None if state.accumulation is None else state.accumulation.gradient
+        return accumulated is not None and in_device(accumulated)
     params, opt_state = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
                                      (state.variables["params"], state.opt_state))
-    return optimizer is not None and leaf_local(optimizer.update, params, opt_state, params)
+    return optimizer is not None and leaf_local(optimizer, params, opt_state)
 
 
-def leaf_local(update: Callable, gradients, state, params) -> bool:
-    """Whether `update(gradients, state, params)` reads each leaf of `gradients` into results that read no
-    other gradient's leaf: no reduction, product or concatenation across them. An equation running a
-    program of its own (a call, a loop) is read as reading every operand into each result."""
-    program = jax.make_jaxpr(update)(gradients, state, params).jaxpr
+def leaf_local(optimizer: optax.GradientTransformation, gradients, state) -> bool:
+    """Whether `optimizer`'s update of `gradients` from `state`, over parameters of their shapes, reads each
+    leaf of `gradients` into results that read no other gradient's leaf: no reduction, product or
+    concatenation across them. An update taking extra arguments is handed the run's progress and no
+    statistics of attention logits, as a step without them hands it (`Transaction.commit`). An equation
+    running a program of its own (a call, a loop) is read as reading every operand into each result."""
+    def update(gradients, state, params, progress):
+        if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+            return optimizer.update(gradients, state, params, qk_stats=None, progress=progress)
+        return optimizer.update(gradients, state, params)
+
+    program = jax.make_jaxpr(update)(gradients, state, gradients, jax.ShapeDtypeStruct((), np.float32)).jaxpr
     leaves = len(jax.tree.leaves(gradients))
     reads: dict[jcore.Var, frozenset[int]] = {
         value: frozenset([index]) for index, value in enumerate(program.invars[:leaves])}
@@ -237,7 +248,6 @@ def leaf_local(update: Callable, gradients, state, params) -> bool:
                                    for value in equation.invars if computed(value)))
         reads.update(dict.fromkeys(equation.outvars, read))
     return all(len(reads.get(value, frozenset())) <= 1 for value in program.outvars if computed(value))
-
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
