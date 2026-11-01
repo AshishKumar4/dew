@@ -587,7 +587,7 @@ def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(
     run's generation never makes, is far off."""
     from dew.data.text import ByteTokenizer
     from dew.eval.harness import DewLM
-    from dew.inference.loading import RunProcessor
+    from dew.inference.tasks import RunProcessor
 
     decoder = blocky()
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
