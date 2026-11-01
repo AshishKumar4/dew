@@ -210,8 +210,11 @@ body lacks: the child imports no more of the standard library than it must."""
 TOP = "<module>"
 """The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
 IMPORTED = "import:"
-"""What a top-level module a run imported is recorded under (executed.py): a helper of that name under
-tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
+"""What a module a run imported, or tried to, is recorded under (executed.py), by its top-level name and, for
+a submodule, its dotted name: a helper of the top-level name under tests/, which leads sys.path, would
+shadow it, and a module, package or namespace of the dotted name under src/ or tools/ is what the import
+finds, so ci.py's `contents` keys whether each exists (not the listing of every directory above a module
+the run executed, which a module added under a name no run tried moved for every row: ledger 3220)."""
 
 
 def opening(recorded: Callable[[str], None], root: str) -> None:
@@ -366,13 +369,16 @@ def closed_imports(seen: set[str], root: str):
 
 def imports(write: Callable[[str], None]):
     """The import system's first finder that passes each module imported by name, a statement's or
-    `importlib.import_module`'s, to `write` as the top-level name a helper under tests/ would shadow
-    (`IMPORTED`); it finds nothing itself."""
+    `importlib.import_module`'s, found or not, to `write` (`IMPORTED`): its top-level name, which a helper
+    under tests/ would shadow, and a submodule's dotted name, whose module, package or namespace the import
+    finds; it finds nothing itself."""
 
     class Imports:
         @staticmethod
         def find_spec(name, path=None, target=None):
             write(f"{IMPORTED}{name.partition('.')[0]}")
+            if "." in name:
+                write(f"{IMPORTED}{name}")
 
     return Imports
 
@@ -409,6 +415,8 @@ def follow() -> None:
     write("began", time.time())
     for name in list(sys.modules):
         write("file", f"{IMPORTED}{name.partition('.')[0]}")
+        if "." in name:
+            write("file", f"{IMPORTED}{name}")
 
     def started(code, offset):
         if code.co_name == OPENED[0] and code.co_filename.endswith(OPENED[1]):

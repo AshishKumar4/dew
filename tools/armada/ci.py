@@ -314,9 +314,18 @@ def contents(name: str) -> bytes:
         path, _, executed = name.partition(followed.CODE)
         return unit(path, executed) if Path(path).is_file() else b"missing"
     if name.startswith("import:"):
-        # A top-level module a run imported (followed.py's `IMPORTED`): whether a helper under tests/, which
-        # leads sys.path, would shadow it, a module or a package of that name.
+        # A module a run imported or tried to (followed.py's `IMPORTED`): a top-level one, whether a helper
+        # under tests/, which leads sys.path, would shadow it, a module or a package of that name; a
+        # submodule, what its import finds under src/ or tools/, a module, a package, a namespace or an
+        # extension of that name.
         module = name.removeprefix("import:")
+        if "." in module:
+            *parents, last = module.split(".")
+            return b"".join(b"1" if candidate.exists() else b"0" for root in ("src", "tools")
+                            for candidate in (Path(root, *parents, f"{last}.py"), Path(root, *parents, last,
+                                                                                         "__init__.py"),
+                                              Path(root, *parents, last),
+                                              *sorted(Path(root, *parents).glob(f"{last}.*.so"))))
         return b"".join(b"1" if path.exists() else b"0"
                         for path in (Path("tests", f"{module}.py"), Path("tests", module, "__init__.py")))
     path = Path(name)
@@ -367,9 +376,12 @@ def units(path: str) -> dict[str, bytes] | bytes:
 def digested(source: bytes, path: str) -> dict[str, bytes] | None:
     """The digest of each unit of module text `source` (`unit`), or None where it does not compile
     (`compiled`): a body left out would hide what fails it. The top level holds, beside its text with each
-    outermost function's body left out but its docstring, what compiling a body makes of the code around it
-    (`shapes`): whether a function is a generator or a coroutine, and the cells a class body makes for its
-    methods (super())."""
+    outermost function reduced to what defining it runs (its decorators, and its defaults and annotations
+    that evaluate code: `inert`), what compiling a body makes of the code around it (`shapes`): whether a
+    function is a generator or a coroutine, and the cells a class body makes for its methods (super()). A
+    function's name, parameters, docstring and body are its own unit's, keyed for the runs that entered it:
+    an edited docstring of one function moved every row that imported its module (ledger 3220: train 395's
+    two docstring edits moved 84% of rows)."""
     code = compiled(source, path)
     if isinstance(code, str):
         return None
@@ -377,8 +389,8 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
     found: dict[str, list[str]] = collections.defaultdict(list)
 
     class Hollow(ast.NodeTransformer):
-        """The module's top level: each outermost function's text kept under its name, its body left out but
-        its docstring, which the function value shows without running."""
+        """The module's top level: each outermost function's text kept under its name, and left at the top
+        level as what defining it runs, its decorators and the defaults and annotations that evaluate code."""
 
         def __init__(self) -> None:
             self.scope: list[str] = []
@@ -391,8 +403,15 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
 
         def visit_FunctionDef(self, node):
             found[".".join([*self.scope, node.name])].append(ast.dump(node))
-            documented = ast.get_docstring(node, clean=False) is not None
-            node.body = [*node.body[:1 if documented else 0], ast.Pass()]
+            arguments = node.args
+            parameters = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs, arguments.vararg,
+                          arguments.kwarg)
+            annotations = [each.annotation for each in parameters if each is not None]
+            evaluated = [part for part in (*arguments.defaults, *arguments.kw_defaults, node.returns,
+                                           *annotations) if part is not None and not inert(part)]
+            node.args = ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[],
+                                      kwarg=None, defaults=evaluated)
+            node.returns, node.body = None, [ast.Pass()]
             return node
 
         visit_AsyncFunctionDef = visit_FunctionDef
@@ -400,6 +419,27 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
     top = ast.dump(Hollow().visit(tree)) + json.dumps(shapes(code))
     digests = {name: hashlib.sha256("\n".join(dumps).encode()).digest() for name, dumps in found.items()}
     return {**digests, followed.TOP: hashlib.sha256(top.encode()).digest()}
+
+
+def inert(expression: ast.expr) -> bool:
+    """Whether evaluating `expression` (a default or an annotation) runs none of the module's code: a constant
+    or a name, and the attributes, operators, subscripts and displays of those, whose value a run that calls
+    the function reads through the function's own unit (`digested`)."""
+    if isinstance(expression, ast.Constant | ast.Name):
+        return True
+    if isinstance(expression, ast.Attribute):
+        return inert(expression.value)
+    if isinstance(expression, ast.Tuple | ast.List | ast.Set):
+        return all(map(inert, expression.elts))
+    if isinstance(expression, ast.BoolOp):
+        return all(map(inert, expression.values))
+    if isinstance(expression, ast.BinOp):
+        return inert(expression.left) and inert(expression.right)
+    if isinstance(expression, ast.UnaryOp):
+        return inert(expression.operand)
+    if isinstance(expression, ast.Subscript):
+        return inert(expression.value) and inert(expression.slice)
+    return False
 
 
 def compiled(source: bytes, path: str) -> types.CodeType | str:
@@ -498,7 +538,7 @@ def packages(path: str) -> tuple[str, ...]:
     """The directories under src/ or tools/ above module `path` whose entries an import of it reads
     (`inputs`), none for any other path. A function of the path's text alone, kept: a plan asks it of each of
     a row's ~3,000 inputs for every row."""
-    if not path.startswith(("src/", "tools/")) or not path.endswith(".py") or path.startswith(HARNESS):
+    if not path.startswith("tools/") or not path.endswith(".py") or path.startswith(HARNESS):
         return ()
     return tuple(str(parent) for parent in Path(path).parents
                  if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src"))
