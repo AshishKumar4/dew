@@ -39,11 +39,12 @@ from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Exact, Transposed
-from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul
+from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul, two_product
 
 from . import recurrence
 
@@ -163,6 +164,25 @@ def decays(g, documents=None):
     # the decay gradient.
     whole, part = (jnp.where(inclusive, x, 0.0) for x in (whole, part))
     return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(whole) * jnp.exp(part), 0.0)
+
+
+LOG2_E = math.log2(math.e)
+"""log2(e) to double precision, the prefix's base-2 scale (fla's RCP_LN2 is 1.93e-8 short of it)."""
+
+
+@jax.jit
+def prefix(g):
+    """The decay's prefix within each chunk, compensated, in base 2: `g` `[..., C, H]` (natural log) to `(hi,
+    lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,
+    `precision.two_product`, plus its product with the rounding's remainder) summed compensated
+    (`precision.compensated_add`), so a difference of two positions is as precise as its own range. One
+    program JAX traces once for `g`'s type: its exact sums traced afresh, each layer's forward, its kept
+    forward in the backward and its gradient's preparation each paid them, 226 s of Qwen3.5-4B's 1208 s
+    ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
+    scale = np.float32(LOG2_E)
+    scaled, error = two_product(g, jnp.full_like(g, scale), bit_split=True)
+    error = error + g * float(np.float32(LOG2_E - float(scale)))
+    return jax.lax.associative_scan(compensated_add, (scaled, error), axis=g.ndim - 2)
 
 
 def raised(whole, part):
@@ -1020,15 +1040,16 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
 
 
 def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
-    """The write gate's gradient on a tile of values gated, `u = v beta`, from `u_grad`, fp32: the values'
-    own, `du beta`, and beta's, `sum(v du)` over the tile's columns."""
-    return u_grad * beta[:, None], jnp.sum(u_grad * values, axis=1)
+    """The write gate's gradient on values gated, `u = v beta`, from `u_grad` `[..., V]`, fp32: the values'
+    own, `du beta`, and beta's `[...]`, `sum(v du)` over the last axis's columns."""
+    return u_grad * beta[..., None], jnp.sum(u_grad * values, axis=-1)
 
 
 def skipped_back(out_grad, values, skip) -> tuple[jax.Array, jax.Array]:
-    """The skip `y += D v`'s gradient on a tile of values from the output's gradient `out_grad`, fp32: the
-    values' own, `D do`, and the skip's own rows, `sum(v do)` over the tile's columns."""
-    return skip * out_grad, jnp.sum(out_grad * values, axis=1)
+    """The skip `y += D v`'s gradient on values from the output's gradient `out_grad` `[..., V]`, fp32: the
+    values' own, `D do` (`skip` broadcasting), and the skip's own rows `[...]`, `sum(v do)` over the last
+    axis's columns."""
+    return skip * out_grad, jnp.sum(out_grad * values, axis=-1)
 
 
 def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, beta, dtype, issue: Issue, *,
@@ -1110,6 +1131,18 @@ def summed_back(pairs, after, leaving=None, issue: Issue = portable,
     above = 0.0 if leaving is None else leaving[:, None]
     terms = jnp.where(lag >= 0, through + after[:, None], above)
     return jnp.sum(terms, axis=0) if columns is None else columns(terms)
+
+
+def summed_ranges(after, leaving):
+    """`summed_back`'s ranges' part over the last axis, a chunk's tokens, from each token's terms summed
+    across launches: `sum_{s >= t} after + sum_{j < t} leaving` each token's, `after` from it to the chunk's
+    end and `leaving` from the chunk's start to before it, both cumulative sums. `leaving`'s sum before each
+    token takes no token's own term added and taken away: a token's own `leaving` is order one where the
+    terms before it are `exp(-30)`'s under steep decays, which the sum rounded away (an H100's decay gradient
+    under decays near zero 140 times the port's distance from float64, whose `leaving` enters its strictly
+    lower pairs, fla `chunk_bwd_dqkwg`; SE-numerics-h100-fd61e11eeb)."""
+    before = jnp.concatenate((jnp.zeros_like(leaving[..., :1]), jnp.cumsum(leaving[..., :-1], -1)), -1)
+    return jnp.flip(jnp.cumsum(jnp.flip(after, -1), -1), -1) + before
 
 
 def summed_pairs(pairs, issue: Issue = portable, columns: Callable[[jax.Array], jax.Array] | None = None):

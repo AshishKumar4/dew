@@ -194,13 +194,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     # The query/key launch's range terms each token's through them (`algebra.summed_back`'s ranges' part):
     # `after` from each token to the chunk's end, `leaving` from its start to before it.
     after, leaving = (x.sum(0).reshape(heads, chunks, CHUNK) for x in (after, leaving))
-    after = after + after_w
-    # `leaving`'s sum before each token, never its own term added and taken away: a token's own `leaving` is
-    # order one where the terms before it are `exp(-30)`'s under steep decays, which the sum rounded away
-    # (an H100's decay gradient under decays near zero 140 times the port's distance from float64, whose
-    # `leaving` enters its strictly lower pairs, fla `chunk_bwd_dqkwg`; SE-numerics-h100-fd61e11eeb).
-    before = jnp.concatenate((jnp.zeros_like(leaving[..., :1]), jnp.cumsum(leaving[..., :-1], -1)), -1)
-    ranges = jnp.flip(jnp.cumsum(jnp.flip(after, -1), -1), -1) + before
+    ranges = algebra.summed_ranges(after + after_w, leaving)
     dg = ((decay_pairs + decay_w).reshape(heads, chunks, CHUNK) + ranges
           + (memory * jnp.exp2(ending))[..., None])
     dg, dbeta = dg.reshape(heads, rows).T, dbeta.T if delta else dbeta
@@ -350,10 +344,11 @@ def _gate_back(run, call: _Call, dv2, gated: list, laid_do, skip) -> tuple:
     rows, heads, columns = call.rows, call.heads, call.value_width
     du = dv2.astype(jnp.float32).reshape(rows, heads, columns)
     values = call.given.joined(run.v).reshape(rows, heads, columns)
-    dv, dbeta, dskip = du * run.beta.T[:, :, None], jnp.sum(du * values, -1), None
+    (dv, dbeta), dskip = algebra.gated_values_back(du, values, run.beta.T), None
     if skip is not None:
         read = call.given.joined(laid_do).reshape(rows, heads, columns)
-        dv, dskip = dv + skip.astype(jnp.float32)[:, None] * read, jnp.sum(read * values, (0, 2))
+        skipped, dskip = algebra.skipped_back(read, values, skip.astype(jnp.float32)[:, None])
+        dv, dskip = dv + skipped, dskip.sum(0)
     return dv.reshape(rows, heads * columns), dbeta, dskip
 
 
