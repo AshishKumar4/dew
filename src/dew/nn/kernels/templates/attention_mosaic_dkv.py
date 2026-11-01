@@ -509,9 +509,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
     staged_logits = program.tiles.staged_logits
     # A shared dQ's queries' places streamed beside their statistics (`_dkv_step`'s chunks).
-    leaves, treedef = jax.tree.flatten((
-        spans, _keys_last(score_params, kinds), drop, None if staged_logits else scaled,
-        jnp.arange(queries, dtype=jnp.int32) if program.tiles.shared_dq else None))
+    places = jnp.arange(queries, dtype=jnp.int32) if program.tiles.shared_dq else None
+    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop,
+                                        None if staged_logits else scaled, places))
 
     tiled = Kind.TILE in graded
 
@@ -529,21 +529,14 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
-        views = _views_of(named, row, head)
-        if program.tiles.shared_dq:
-            # Its queries' statistics streamed beside them, a step's block of each (`STATISTICS`).
-            views.update({name: (ref.at[row, head], lambda j: (j,))
-                          for name, ref in zip(STATISTICS, stat_refs, strict=True)})
-            views["positions"] = (positions_ref, lambda j: (j,))
+        views = _dkv_views(named, stat_refs, positions_ref, (row, head), shared_dq=tiles.shared_dq)
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         holders = 1 if split else consumers
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(holders)])
 
-        def rows_of(q_first, rows):
-            # `rows` queries' statistics from `q_first` in a column's layout, the tiles' queries its columns.
-            return tuple(family.columns_of(ref.at[row, head, pl.ds(q_first, rows)]) for ref in stat_refs)
+        rows_of = functools.partial(_statistics_of, family, stat_refs, (row, head))
 
         def consumer(index):
             holder = 0 if split else index
@@ -589,17 +582,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                         (out_smem, dv_smem, rows_smem), index, walk.interpret)
             return None
 
-        def producer():
-            box = _outbox(walk, fused_stages)
-            share = width // consumers
-
-            def targets(step):
-                # A step's dQ tile, a share of its columns each consumer's (`_fused_adds`).
-                rows = dq_ref.at[0, row, pl.ds(step * block_q, block_q), head]
-                return tuple(rows.at[:, pl.ds(index * share, share)] for index in range(consumers))
-
-            family.stream(streams, views, *streamed, adds=None if box is None else (box, targets))
-
+        producer = functools.partial(_dkv_producer, walk, streams, views, streamed, dq_ref, (row, head),
+                                     fused_stages, width)
         return family.roles(consumers, consumer, producer)
 
     scoped, rings = _dkv_allocations(family, program.tiles, width, value_width, query.dtype, stages=stages,
@@ -619,6 +603,40 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     graded_params = [param for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
     return _dkv_launched(walk, launch, operands, graded, [param.shape for param in graded_params],
                          key.shape[1])
+
+def _dkv_views(named: dict, stat_refs: list, positions_ref, place: tuple, *, shared_dq: bool) -> dict:
+    """The streams' views of a dK/dV program's batch row and head (`place`): its queries, output cotangents
+    and logits where staged (`named`), and a shared dQ's queries' statistics and places, a step's block of
+    each (`STATISTICS`)."""
+    views = _views_of(named, *place)
+    if shared_dq:
+        views.update({name: (ref.at[place], lambda j: (j,))
+                      for name, ref in zip(STATISTICS, stat_refs, strict=True)})
+        views["positions"] = (positions_ref, lambda j: (j,))
+    return views
+
+
+def _statistics_of(family: mosaic.Family, stat_refs: list, place: tuple, q_first, rows: int) -> tuple:
+    """`rows` queries' statistics from `q_first` of a batch row and head (`place`) in a column's layout, the
+    tiles' queries its columns."""
+    return tuple(family.columns_of(ref.at[*place, pl.ds(q_first, rows)]) for ref in stat_refs)
+
+
+def _dkv_producer(walk: _Backward, streams, views: dict, streamed: tuple, dq_ref, place: tuple,
+                  fused_stages: list, width: int) -> None:
+    """A dK/dV program's producer: its streams' loads, and a shared dQ's adds where it makes them
+    (`_outbox`), a step's dQ tile a share of its columns each consumer's (`_fused_adds`)."""
+    program, consumers = walk.program, walk.consumers
+    block_q, share = program.tiles.block_q, width // consumers
+    box = _outbox(walk, fused_stages)
+    row, head = place
+
+    def targets(step):
+        rows = dq_ref.at[0, row, pl.ds(step * block_q, block_q), head]
+        return tuple(rows.at[:, pl.ds(index * share, share)] for index in range(consumers))
+
+    program.family.stream(streams, views, *streamed, adds=None if box is None else (box, targets))
+
 
 def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], shapes: list,
                   keys_padded: int) -> tuple[jax.Array, ...]:
