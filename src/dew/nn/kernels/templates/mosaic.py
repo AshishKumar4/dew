@@ -1252,8 +1252,8 @@ class Transport[Allocated, Opened](abc.ABC):
         or their `initial` values (in the accumulator's layout; None, zero). `in_flight` steps' products stay
         running past their step (0 or 1): their slots go back once they are done, a step later, so the next
         step's operands are waited for while they run. A ring's `unrolled` walk takes a rotation of its slots
-        a trip, each step at a slot it knows (`mosaic.stepping`): for a step small beside its waits (a GEMM's),
-        where a ring's slots are few. Returns the carry and the accumulators' values."""
+        a trip, each step at a slot it knows (`mosaic.stepping`): for a step small beside its waits (a
+        GEMM's), where a ring's slots are few. Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:

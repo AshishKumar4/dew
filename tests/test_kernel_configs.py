@@ -229,7 +229,8 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
                                   multiprocessors=generation.gpu_target("sm90").multiprocessors)
 
         return gmm, (jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
-                     jax.ShapeDtypeStruct((1, 4096, 4096), jnp.bfloat16), jax.ShapeDtypeStruct((1,), jnp.int32))
+                     jax.ShapeDtypeStruct((1, 4096, 4096), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((1,), jnp.int32))
 
     record = {"name": "dense gmm", "generation": "sm90", "limit": generation.gpu_target("sm90").shared_limit}
     with tempfile.TemporaryDirectory(prefix="dew-dense-gemm-") as directory:
