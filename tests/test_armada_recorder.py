@@ -545,16 +545,17 @@ def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
     "assert open({path!r}, 'a+').read() == '' or True",
     "import os\n    assert os.path.exists({path!r})",
     "import os\n    assert {name!r} in os.listdir({folder!r})",
-    "import subprocess\n    assert subprocess.run(['cat', {path!r}], capture_output=True,"
-    " text=True).stdout == '1'",
+    "import subprocess\n    assert 'text' in subprocess.run(['file', '-b', {path!r}], capture_output=True,"
+    " text=True, check=True).stdout",
 ], ids=["append", "probe", "listing", "native"])
 def test_a_file_that_takes_what_another_left_in_shared_scratch_by_any_way_has_no_key(
         ci, tmp_path, monkeypatch, cache_worker, reading):
     """A file that takes what another file of its task left in shared scratch has no key however it takes it
     (review of the reuse-keys head): an open that keeps what was there (an append), a probe of whether it is
-    there, a listing of its directory, or a native tool's read, which no audit hook sees (watched.py's
-    leavings); as a plain read has none, an edit to the writer's helper would otherwise leave the second
-    file's row standing. The writer keeps its key."""
+    there, a listing of its directory, or a read by a native tool a file may run and keep its key (`file`,
+    one of followed.py's `TOOLS`), which no audit hook sees (watched.py's leavings); as a plain read has none,
+    an edit to the writer's helper would otherwise leave the second file's row standing. The writer keeps
+    its key."""
     folder = tmp_path.parent / f"{tmp_path.name}-shared"
     shared = folder / "result.txt"
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
