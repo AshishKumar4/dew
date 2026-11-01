@@ -68,7 +68,7 @@ from dew.rl.env import (
     view,
     views,
 )
-from dew.rl.evaluation import episodes, first_episode_rows
+from dew.rl.evaluation import episodes
 from dew.rl.replay import ReplayBuffer, Steps
 from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
 
@@ -1138,14 +1138,9 @@ def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variabl
                     steps: int) -> float:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the agent's draws from fresh episodes: the whole episode where
-    `steps` is its length. Read as every first episode is (`dew.rl.evaluation.first_episode_rows`; an
-    `Env`'s by `dew.rl.evaluation.episodes`)."""
-    if isinstance(env, Simulator):
-        driven = DrivenSimulator(env)
-        carry = simulator_start(driven, key, objective.memory(env.count))
-        _, recorded = simulator_rollout(driven, objective.act, variables, carry, steps, reset=False)
-        return float(jnp.mean(first_episode_rows(recorded.following)["return"]))
-    return episodes(objective.act, Driven(env), steps, memory=objective.memory)(variables, key)["return"]
+    `steps` is its length (`dew.rl.evaluation.episodes`, the environment driven for the agent)."""
+    driven = DrivenSimulator(env) if isinstance(env, Simulator) else Driven(env)
+    return episodes(objective.act, driven, steps, memory=objective.memory)(variables, key)["return"]
 
 
 __all__ = ["AUXILIARY_SCALE", "AgentMemory", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout",

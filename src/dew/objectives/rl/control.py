@@ -31,8 +31,8 @@ from dew.batch import Batch, Variables
 from dew.nn.kernels.options import OuterProgram
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
-from dew.rl.evaluation import episodes, first_episode_rows
-from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout, simulator_start
+from dew.rl.evaluation import episodes
+from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout
 from dew.rl.surrogate import clipped_surrogate_terms
 
 if TYPE_CHECKING:
@@ -377,13 +377,8 @@ def episode_return(objective: ControlPPOObjective, env: Env | Simulator, params:
                    steps: int, *, greedy: bool = True) -> float:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the policy, its deterministic action where `greedy`: the whole
-    episode where `steps` is an episode's length, read as every first episode is
-    (`dew.rl.evaluation.first_episode_rows`; an `Env`'s by `dew.rl.evaluation.episodes`)."""
-    policy = objective.greedy if greedy else objective.act
-    if isinstance(env, Simulator):
-        _, taken = simulator_rollout(env, policy, params, simulator_start(env, key), steps, reset=False)
-        return float(jnp.mean(first_episode_rows(taken.following)["return"]))
-    return episodes(policy, env, steps)(params, key)["return"]
+    episode where `steps` is an episode's length (`dew.rl.evaluation.episodes`)."""
+    return episodes(objective.greedy if greedy else objective.act, env, steps)(params, key)["return"]
 
 
 __all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "Saved", "episode_return",

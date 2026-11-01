@@ -173,20 +173,17 @@ def _written(path: Path, text: str) -> None:
 def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
            film: Path | None = None) -> dict:
     """Each drone's first episode under `policy` (reading the driven step whole) over `steps` steps from
-    fresh episodes of `simulator`, an evaluation race of its own (`_first_episodes`); with `film`, the first
-    four drones' camera images after each step written there `[steps, 4, H, W, 3]`."""
-    from dew.rl.env import view, views
-    from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
+    fresh episodes of `simulator`, an evaluation race of its own (`dew.rl.evaluation.flights`,
+    `_first_episodes`); with `film`, the first four drones' camera images after each step written there
+    `[steps, 4, H, W, 3]`. `memory` is the policy's starting state over the race's drones."""
+    from dew.rl.env import view
+    from dew.rl.evaluation import flights
+    from dew.rl.simulator import DrivenSimulator
 
-    driven = DrivenSimulator(simulator)
-    _, taken = simulator_rollout(driven, policy, params, simulator_start(driven, key, memory), steps,
-                                 reset=False)
-    following = taken.following
+    following = flights(policy, DrivenSimulator(simulator), steps, memory=lambda count: memory)(params, key)
     if film is not None:
-        frames = view(views(following.observation)["observation"], "image")
-        np.savez_compressed(film, frames=np.asarray(frames)[:, :4])
-    passed = view(views(following.observation)["observation"], "passed")
-    return _first_episodes(following, passed, simulator.racing.crash_penalty)
+        np.savez_compressed(film, frames=np.asarray(view(following.observation, "image"))[:, :4])
+    return _first_episodes(following, view(following.observation, "passed"), simulator.racing.crash_penalty)
 
 
 def _first_episodes(following, passed, crash_penalty: float) -> dict:

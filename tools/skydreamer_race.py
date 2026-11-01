@@ -123,21 +123,16 @@ def run(out: Path, assets: Path, drones: int = ENVIRONMENTS, setting: Setting = 
 
 def scored(simulator, objective, variables, key: jax.Array) -> dict:
     """Each drone's first episode flying `objective`'s greedy policy from fresh episodes of `simulator`
-    for one episode's steps: its return, gates passed, whether it ended (a crash: the race ends no episode
-    otherwise but by its cut) and its steps, averaged over the drones."""
-    from dew.rl.env import view, views
-    from dew.rl.evaluation import first_episode_rows
-    from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
+    for one episode's steps (`dew.rl.evaluation.flights`): its return, gates passed, whether it ended (a
+    crash: the race ends no episode otherwise but by its cut) and its steps, averaged over the drones."""
+    from dew.rl.env import view
+    from dew.rl.evaluation import first_episode_rows, flights
+    from dew.rl.simulator import DrivenSimulator
 
     driven = DrivenSimulator(simulator)
-    steps = simulator.sky.steps
-    _, taken = simulator_rollout(driven, objective.greedy, variables,
-                                 simulator_start(driven, key, objective.memory(simulator.count)), steps,
-                                 reset=False)
-    following = taken.following
-    # A driven step holds the environment's observation, whose `passed` view counts the gates.
-    passed = view(views(following.observation)["observation"], "passed")
-    rows = jax.device_get(first_episode_rows(following, {"passed": passed}))
+    flown = flights(objective.greedy, driven, simulator.sky.steps, memory=objective.memory)
+    following = flown(variables, key)
+    rows = jax.device_get(first_episode_rows(following, {"passed": view(following.observation, "passed")}))
     gates = np.asarray(rows["passed"])
     return {"return": float(rows["return"].mean()), "gates": float(gates.mean()),
             "gates_max": int(gates.max()), "crashed": float(rows["terminated"].mean()),
