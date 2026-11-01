@@ -456,8 +456,8 @@ def _block_threads(op) -> tuple[int, ...] | None:
     if launch is None:
         return None
     view = launch.opview
-    sizes = tuple(_constant(size) for size in (view.blockSizeX, view.blockSizeY, view.blockSizeZ))
-    return None if None in sizes else sizes
+    sizes = [_constant(size) for size in (view.blockSizeX, view.blockSizeY, view.blockSizeZ)]
+    return tuple(size for size in sizes if size is not None) if None not in sizes else None
 
 
 class Threads:
@@ -516,13 +516,16 @@ class Threads:
         if name not in (*INTEGER_OPERATIONS, *INTEGER_CASTS, "vector.from_elements", "vector.broadcast",
                         "vector.splat"):
             return None
-        operands = [self._rows(operand, sizes) for operand in op.operands]
-        if any(rows is None for rows in operands):
+        found = [self._rows(operand, sizes) for operand in op.operands]
+        operands = [rows for rows in found if rows is not None]
+        if len(operands) != len(found):
             return None
         if name in INTEGER_OPERATIONS and len(operands) == 2:
-            rows = [tuple(_integer(INTEGER_OPERATIONS[name], a, b, bits) for a, b in zip(*pair, strict=True))
-                    for pair in zip(*operands, strict=True)]
-            return None if any(None in row for row in rows) else rows
+            computed = [[_integer(INTEGER_OPERATIONS[name], a, b, bits) for a, b in zip(*pair, strict=True)]
+                        for pair in zip(*operands, strict=True)]
+            rows = [tuple(e for e in row if e is not None) for row in computed]
+            return None if any(len(row) != len(given) for row, given in zip(rows, computed, strict=True)) \
+                else rows
         if name in INTEGER_CASTS and len(operands) == 1 and (source := _bits(op.operands[0].type)):
             return [tuple(_cast(e, source, bits, INTEGER_CASTS[name]) for e in row) for row in operands[0]]
         if name == "vector.from_elements":
