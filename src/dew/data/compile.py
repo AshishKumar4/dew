@@ -861,12 +861,12 @@ def _staged(
 
 
 def _held_passes(train: Pipeline, read: Read) -> int | None:
-    """The source examples a pass of a memory read holds where it would lay them out or make rows of
-    them as it holds them, ahead of their bound's place (`_bounded`), and the read it holds is still cut
-    per share (an objective's filter after them, say): a bound in examples stands before that layout,
-    which the memory read then holds no more of, so the read is bounded to its epochs' passes before it
-    holds anything, as a run bounded in examples is (`_pass_examples` of the source's own records). None
-    for any other read, whose pass is counted once it is prepared (`_staged`)."""
+    """The source examples a pass of a memory read holds where it would make rows of them as it holds
+    them (an objective's expansion among the steps it runs over its whole source, `_EAGER`): a bound in
+    examples stands before that step (`_bounded`), which the memory read then holds no rows of, so the read
+    is bounded to its epochs' passes before it holds anything, as a run bounded in examples is
+    (`_pass_examples` of the source's own records). None for any other read, whose pass is counted once it
+    is prepared (`_staged`), a layout held before its order among them, which no bound can stand before."""
     if read != "memory" or isinstance(train.source, (Mixture, Phases)):
         return None
     eager = next((index for index, stage in enumerate(train.stages)
@@ -874,7 +874,7 @@ def _held_passes(train: Pipeline, read: Read) -> int | None:
     batched = _until(train.stages, (BatchStage, TokenBudget))
     at = next((index for index, stage in enumerate(train.stages[:batched])
                if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
-    if at >= eager or not _analyzed(dataclasses.replace(train, stages=train.stages[eager:]), read).per_share:
+    if at >= eager or not _expands(train.stages[at]):
         return None
     return _pass_examples(train, read)
 
