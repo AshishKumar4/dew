@@ -797,9 +797,10 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
     """A training read bounded to its 12 records, in one order or each share its own, read alone or by
     loading workers, through an objective's step that makes 24 rows of them, a question's each
     (`Questioned`) or a chunk of two tokens each (`text.Chunks`), and one that refuses 4 of those
-    (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are its 12 source examples,
-    counted before the step makes rows of them, and not the rows it delivers again after; its
-    rejections are the rows refused after it (row 1944)."""
+    (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are the source examples whose last
+    rows it delivered, each once (`CONSUMED`), the 12 or, where the 4 whose last row is refused are counted
+    refused (`REFUSED`), the 8 left, and not the rows it delivers; its rejections are the rows refused
+    after it, so the examples it counts as rows or refused are the 12 it read (row 1944)."""
     steps = ((Questioned(), ThirdQuestionRefused()) if expansion == "questions"
              else (text.Chunks(2, fields=("tokens",)),))
     data = compile(_asked(read).batch(2), objective=ObjectiveData(train=steps), read=read,
@@ -810,12 +811,12 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
         counts = data.statistics()
     finally:
         stream.close()
-    assert counts["data/rows/asked"] == 12
     if expansion == "questions":
         assert rows == 24 - 4 == 20
-        assert counts["data/rejected/asked/third question"] == 4
+        assert (counts["data/rows/asked"], counts["data/rejected/asked/third question"]) == (8, 4)
     else:
         assert rows == 24
+        assert counts["data/rows/asked"] == 12
 
 
 def wide_draw(metadata):
