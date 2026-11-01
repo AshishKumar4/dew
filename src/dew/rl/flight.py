@@ -881,16 +881,6 @@ class GateRace:
         self._scene = OuterProgram(jax.vmap(partial(_scene, racing)))
         self._cameras = OuterProgram(jax.vmap(lambda race: (cameras(race, aspect),
                                                        cameras(race, aspect, race.camera.shutter))))
-        self._executables: dict[tuple[OuterProgram, float, float], jax.stages.Compiled] = {}
-
-    def _run(self, program: OuterProgram, *arguments):
-        """`program` over `arguments`, its executable fetched once for each curriculum (`difficulty` and
-        `ramp`, the env's statics) and run with no dispatch key at every step after."""
-        key = (program, self.difficulty, self.ramp)
-        executable = self._executables.get(key)
-        if executable is None:
-            executable = self._executables[key] = program.executable(*arguments)
-        return executable(*arguments)
 
     def _env_now(self) -> FlightEnv:
         return dataclasses.replace(self._env, difficulty=float(self.difficulty), ramp=float(self.ramp))
@@ -901,26 +891,26 @@ class GateRace:
             renderer = self.renderer
             if renderer is None:
                 raise ValueError("a gate race without a renderer shows no image")
-            closed, opened = self._run(self._cameras, self._races)
-            image = received(renderer.render(self._run(self._scene, self._races), closed, opened))
+            closed, opened = self._cameras(self._races)
+            image = received(renderer.render(self._scene(self._races), closed, opened))
             self._key, key = jax.random.split(self._key)
-            shown["image"] = self._run(self._shown, self._races, image, jax.random.split(key, self.count))
+            shown["image"] = self._shown(self._races, image, jax.random.split(key, self.count))
         return {view: shown[view] for view in self.views}
 
     def reset(self, seed: int) -> dict[str, jax.Array]:
         self._key, key = jax.random.split(jax.random.key(seed))
-        self._races, step = self._run(self._started, self._env_now(), key)
+        self._races, step = self._started(self._env_now(), key)
         return self._observed(step.observation)
 
     def restart(self, mask: jax.Array) -> dict[str, jax.Array]:
         mask = jnp.asarray(mask, bool)
         self._key, key = jax.random.split(self._key)
-        fresh, _ = self._run(self._started, self._env_now(), key)
+        fresh, _ = self._started(self._env_now(), key)
         self._races = chosen(mask, fresh, self._races)
-        return self._observed(self._run(self._observe, self._races))
+        return self._observed(self._observe(self._races))
 
     def step(self, action: jax.Array) -> TimeStep:
-        self._races, step = self._run(self._stepped, self._env_now(), self._races, jnp.asarray(action))
+        self._races, step = self._stepped(self._env_now(), self._races, jnp.asarray(action))
         return TimeStep(self._observed(step.observation), step.reward, step.terminated, step.truncated)
 
 

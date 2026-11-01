@@ -142,11 +142,8 @@ def simulator_rollout(simulator: Stepped, policy: Policy, params: Params, carry:
     params, key, memory = jax.device_put((params, carry.key, carry.memory), whole)
     carry = Carry(carry.state, carry.observation, key, memory)
     recorded = []
-    # The policy's step compiled once and run as its executable: the carry keeps its structure and
-    # placements from step to step, so no step builds its dispatch key.
-    acting = _acted.executable(policy, params, carry)
     for _ in range(steps):
-        action, extras, memory, key = acting(params, carry)
+        action, extras, memory, key = _acted(policy, params, carry)
         following = received(simulator.step(action))
         following = TimeStep(following.observation, following.reward, following.terminated.astype(bool),
                              following.truncated.astype(bool))

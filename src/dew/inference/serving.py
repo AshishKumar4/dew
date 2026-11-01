@@ -662,10 +662,6 @@ class Server:
                 self.cache)
             self._states = states
             self._restored, self._captured = state_programs(formats, states)
-            # Each fetched once, at its first call, and run with no dispatch key after: a call's
-            # arguments keep their shapes (`_padded`) and placements.
-            self._restoring: jax.stages.Compiled | None = None
-            self._capturing: jax.stages.Compiled | None = None
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
@@ -997,11 +993,8 @@ class Server:
         admission = self._admit()
         with self._context():
             if self._restores:
-                restoring = (self._resident, self._carried, self._states,
-                             *_padded(self._restores, self.slots, 0))
-                if self._restoring is None:
-                    self._restoring = self._restored.executable(*restoring)
-                self._resident, self._carried = self._restoring(*restoring)
+                self._resident, self._carried = self._restored(
+                    self._resident, self._carried, self._states, *_padded(self._restores, self.slots, 0))
                 self._restores = []
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
@@ -1009,11 +1002,8 @@ class Server:
                 self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar,
                 self.progress)
             if self._captures:
-                capturing = (self._states, self._resident, self._carried,
-                             *_padded(self._captures, self.admission, 1))
-                if self._capturing is None:
-                    self._capturing = self._captured.executable(*capturing)
-                self._states = self._capturing(*capturing)
+                self._states = self._captured(self._states, self._resident, self._carried,
+                                              *_padded(self._captures, self.admission, 1))
                 self._captures = []
         self.steps += self.decode_steps
         self._settle()

@@ -89,8 +89,6 @@ class HyperLuxRenderer:
             placements += [self.renderer.spawn(drone, asset) for asset in layout]
         self._placements = self.renderer.placement_batch(placements)
         self._placed = OuterProgram(jax.vmap(self._poses))
-        self._placing: jax.stages.Compiled | None = None
-        """`_placed`'s executable, fetched at the first render and run with no dispatch key after."""
 
     def _layout(self) -> list[int]:
         """Each placement's asset in a drone's overlay, in `_poses`' order."""
@@ -154,9 +152,7 @@ class HyperLuxRenderer:
     def render(self, scene: Scene, cameras: jax.Array, opened: jax.Array) -> jax.Array:
         import hyperlux
 
-        if self._placing is None:
-            self._placing = self._placed.executable(scene)
-        bases, scales = self._placing(scene)
+        bases, scales = self._placed(scene)
         bases = jax.block_until_ready(bases.reshape(-1, 12))
         scales = jax.block_until_ready(scales.reshape(-1))
         self.renderer.set_pose(self._placements, hyperlux.Pose(bases, scale=scales))
