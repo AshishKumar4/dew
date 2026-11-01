@@ -12,21 +12,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, equations
+from test_algebra import rows, two_sums
 
 from dew import algebra
 from dew.nn.kernels import options
 from dew.nn.kernels.templates import report
-
-
-def rows(seed: int, *shapes) -> tuple[jax.Array, ...]:
-    """Rows of `shapes` drawn from `seed`, in float32."""
-    rng = np.random.default_rng(seed)
-    return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32) for shape in shapes)
-
-
-def two_sums(x, y, a):
-    """Two reductions of one scale's products, which linearity joins into one pass over x + y."""
-    return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
 
 
 def reductions(closed) -> int:
