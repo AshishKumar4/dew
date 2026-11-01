@@ -13,8 +13,8 @@ A txtar archive of four sections, each a contract consumers outside the reposito
 - `records`: each run record type (`dew.telemetry.records.RECORD_TYPES`), its fields as `config`'s, and
   the schema versions the records, generations and kernel reports carry.
 
-An API change moves a line of one section, which check.sh's api-report gate (`--check`) and thresh's published-language
-seams (.thresh/thresh.cue) both see.
+An API change moves a line of one section, which check.sh's api-report gate (`--check`) and thresh's
+published-language seams (.thresh/thresh.cue) both see.
 
     python tools/api_report.py           # print the report
     python tools/api_report.py --write   # write it to docs/api/report.txtar
