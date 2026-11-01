@@ -140,11 +140,16 @@ and the data axis Explicit (`MeshSpec.explicit`) alone and beside fsdp."""
 
 
 def _fixture(name: str) -> dict[str, Any]:
-    """The decoder config Dew builds from a model's Hugging Face config."""
+    """The decoder config Dew builds from a model's Hugging Face config: a decoder's own, or
+    DiffusionGemma's trunk, the causal text tower its assembly builds (`diffusion_gemma.text_config`),
+    which a text-only load does not take (`decoder_config`)."""
+    from dew.interop import diffusion_gemma
     from dew.interop.hf_decoders import decoder_config, translate_config
 
     config = json.loads((REPO / "tests/fixtures/hf" / name / "config.json").read_text())
-    return dict(translate_config(decoder_config(config)))
+    trunk = (diffusion_gemma.text_config(config) if config.get("model_type") == "diffusion_gemma"
+             else decoder_config(config))
+    return dict(translate_config(trunk))
 
 
 def _nemotron_h_moe() -> dict[str, Any]:
