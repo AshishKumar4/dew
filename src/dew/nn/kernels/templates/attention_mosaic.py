@@ -604,6 +604,14 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     return resources.live_registers(family, carried, step, pullback, *added) + statistics + vectors
 
 
+ONE_LAUNCH = False
+"""Whether the derivation takes the backward's one launch (`BackwardTiles.fused`) where it holds: not until
+row 3180's fault is found. On an H100 its dK and dV over the route's own residuals are 1.2 and 0.8 times
+their RMS from XLA's, where the two launches' are 0.2% (ET-3180-PLAIN-h100: a plain causal and a full call,
+1 x 1024, 8 query heads over 2, width 64; the derived one launch's); over a forward's split sums made afresh
+it is on par (ET-3180-ROUTE4-h100). A pinned config still takes it (`tuning.pinned`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
@@ -707,7 +715,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
-        if not deterministic_ops_requested() and self.form != "spans":
+        if ONE_LAUNCH and not deterministic_ops_requested() and self.form != "spans":
             # Legal where the form, the hooks, the widths and the registers allow (`legal`): of the one
             # launch keys first and queries first, the larger query tile (`_derived`'s order).
             found = []
