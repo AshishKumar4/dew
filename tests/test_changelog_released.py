@@ -1,9 +1,9 @@
 """A released version's notes are the ones it shipped: once `## X.Y.Z` is cut, its section's text is frozen,
-its sha256 recorded by the release in tools/changelog_releases.json. The changelog merges by union
-(.gitattributes), and the land queue merges each head onto main as the first parent, so a head queued
-before a release that adds its entry at the head of `## Unreleased` lands below the new version's header
-instead (row 3050: two entries filed under 0.2.0 at train 397); it fails here, and belongs under
-`## Unreleased`."""
+its sha256 recorded by the release in tools/changelog_releases.json. The changelog's merge joins both sides'
+new lines (.gitattributes, tools/changelog_merge.py), and the land queue merges each head onto main as the
+first parent, so a head queued before a release that adds its entry at the head of `## Unreleased` lands
+below the new version's header instead (row 3050: two entries filed under 0.2.0 at train 397); it fails
+here, and belongs under `## Unreleased`."""
 
 import hashlib
 import json
