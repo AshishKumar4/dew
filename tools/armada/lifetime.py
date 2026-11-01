@@ -11,8 +11,8 @@ from the session's end on. A file's record (`recorded`) is everything the proces
 file's last visit, its owner's and any earlier file's alike, as what ran before it may serve it from a
 cache or a module it left, everything `SHARED` did, whenever, and its own children's and `SHARED`'s
 children's records (followed.py). CI gives each test file a process of its own (ci.py's `alone`), so no
-file's record holds another's; a process that runs several, as a local run does, keeps the rule. A process whose log never closed, or one with a start no event follows,
-leaves the files it reached without a key. The standard library alone: it runs before site-packages are
+file's record holds another's; a process that runs several, as a local run does, keeps the rule. A process
+whose log never closed, or one with a start no event follows, leaves the files it reached without a key. The standard library alone: it runs before site-packages are
 on the path."""
 
 import atexit

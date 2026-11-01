@@ -326,24 +326,24 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
 
 
 @pytest.mark.parametrize(("seen", "edit"), [
-    ("import inspect\n    assert inspect.signature(m.unused) and m.unused.__doc__ == 'Less one.'",
-     ('"""Less one."""', '"""Less two."""')),
+    ("assert m.unused.__doc__ == 'Less one.'", ('"""Less one."""', '"""Less two."""')),
+    ("import inspect\n    assert str(inspect.signature(m.unused)) == '(x)'",
+     ("def unused(x):", "def unused(y):")),
     ("import inspect\n    assert inspect.isgeneratorfunction(m.counted)", ("    yield x", "    return x")),
     ("assert 'one' in m.unused.__code__.co_consts", ("    return x, 'one'", "    return x, 'two'")),
     ("namespace = {}\n    exec(m.__spec__.loader.get_source('m'), namespace)\n"
      "    assert namespace['unused'](2) == (2, 'one')", ("    return x, 'one'", "    return x, 'two'")),
     ("pass", ("    return x, 'one'", "    return x, 'one'\n    break")),
-], ids=["a docstring read beside its signature", "a generator's kind", "a function's code",
+], ids=["a bare docstring read", "a signature read", "a generator's kind", "a function's code",
         "a module's text it executed itself",
         "a body that no longer compiles"])
 def test_what_a_run_sees_of_code_it_never_entered_is_its_input(ci, tmp_path, monkeypatch, cache_worker,
                                                                seen, edit):
-    """What a run sees of a function it never entered is its input as the code it ran is: the function
-    value's kind (a generator's), its code object (`__code__`), through which its signature and docstring
-    are read as inspect and the CLI's parser read them, the module's text it compiled itself, and whether the
-    module still compiles, which a body left out would hide. A bare `__doc__` read, which takes no code
-    and no audit sees, is not its input (ledger 3220: a docstring in every importer's key moved 84% of
-    rows on train 395's two docstring edits)."""
+    """What a run sees of a function it never entered is its input as the code it ran is: its docstring,
+    which a bare `__doc__` read takes with no code and no audit seeing it, and its signature, both kept in its
+    module's top level (ci.py's `Hollow`), the function value's kind (a generator's), its code object
+    (`__code__`), the module's text it compiled itself, and whether the module still compiles, which a body
+    left out would hide."""
     # The body's constant a string, which every Python keeps in co_consts (3.14 loads a small int inline).
     module = ('import sys\n\n\ndef unused(x):\n    """Less one."""\n    return x, \'one\'\n\n\n'
               'def counted(x):\n    yield x\n')
@@ -490,22 +490,64 @@ def test_a_file_that_digests_dews_source_keys_on_what_it_ran_not_on_every_source
 
 def test_a_marker_registered_in_pyproject_reruns_the_files_that_use_it_and_its_other_parts_none(
         ci, tmp_path, monkeypatch, cache_worker):
-    """pytest's read of pyproject.toml as it starts is no input of any row (followed.py's `configuring`):
+    """pytest's load of pyproject.toml as it starts is no input of any row (followed.py's `configuring`):
     its pytest settings are every row's (ci.py's `pytest_settings`), a marker's registration the input of the
-    files that use that marker (`marks`), and its other parts no row's that never opened it (ledger 3220:
-    train 416 registered two markers and reran all 3,445 rows)."""
-    project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = [\"tidy: {}\"]\n"
+    files whose tests carry that marker however they came by it, a helper's alias among them (`marks`,
+    executed.py's), and its other parts the input of a test that reads them itself alone (ledger 3220: train
+    416 registered two markers and reran all 3,445 rows)."""
+    project = ("[project]\nname = 'x'\n\n[tool.pytest.ini_options]\naddopts = \"--strict-markers\"\n"
+               "markers = [\"tidy: {}\"]\n")
     (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_marked.py": "import pytest\n@pytest.mark.tidy\ndef test_marked():\n    pass\n",
-        "test_plain.py": "def test_plain():\n    pass\n"}, {})
-    assert reused() == [True, True]
+        # A marker a helper names, which the test file never spells.
+        "helpers_marks.py": "import pytest\ntidy = pytest.mark.tidy\n",
+        "test_aliased.py": "from helpers_marks import tidy\n@tidy\ndef test_aliased():\n    pass\n",
+        "test_plain.py": "def test_plain():\n    pass\n",
+        # A test's own read of the project's table, which pytest's settings read is not.
+        "test_project.py": "import tomllib\ndef test_project():\n"
+                           "    with open('pyproject.toml', 'rb') as project:\n"
+                           "        assert tomllib.load(project)['project']['name'] == 'x'\n"}, {})
+    assert reused() == [True, True, True, True]
     (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
-    assert reused() == [False, True]
+    assert reused() == [False, False, True, False]
     (tmp_path / "pyproject.toml").write_text(project.format("a tidy test").replace("'x'", "'y'"))
-    assert reused() == [True, True]
-    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test") + "addopts = \"-p no:randomly\"\n")
-    assert reused() == [False, False]
+    assert reused() == [True, True, True, False]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test").replace("--strict-markers", "-ra"))
+    assert reused() == [False, False, False, False]
+
+
+def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A file that reads a file another process of its task may have left in the machine's shared scratch
+    or the home directory, outside its own scratch and caches (a literal /tmp path), has no key, as no record
+    names the code that wrote it: one file writes the result its helper builds there, the next asserts on it,
+    and an edit to the helper would leave the second's green row standing (followed.py's `outside`); a file
+    reading back what its own process wrote there keeps its key."""
+    shared = tmp_path.parent / f"{tmp_path.name}-shared.txt"
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "build.py": "def build(): return 1\n",
+        "test_writer.py": f"from build import build\ndef test_writer():\n"
+                          f"    open({str(shared)!r}, 'w').write(str(build()))\n"
+                          f"    assert open({str(shared)!r}).read() == '1'\n",
+        "test_reader.py": f"def test_reader():\n    assert open({str(shared)!r}).read() == '1'\n"}, {})
+    assert reused() == [True, False]
+
+
+def test_a_copy_of_the_interpreter_under_a_tools_name_is_no_tool(ci, tmp_path, monkeypatch, cache_worker):
+    """A program named for a tool that is a copy of the interpreter, or made since the task began, runs code
+    no record follows (followed.py's `tool`): the file that starts one has no key, as one starting the
+    system's own native tool keeps it."""
+    home = tmp_path.parent / f"{tmp_path.name}-home"
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_copied.py": "import os, shutil, subprocess, sys\ndef test_copied():\n"
+                          f"    os.makedirs({str(home)!r}, exist_ok=True)\n"
+                          "    program = shutil.copy(os.path.realpath(sys.executable),\n"
+                          f"                          {str(home / 'git')!r})\n"
+                          "    subprocess.run([program, '-S', '-c', 'pass'], check=False)\n",
+        "test_system.py": "import subprocess\ndef test_system():\n"
+                          "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"}, {})
+    assert reused() == [False, True]
 
 
 def test_each_file_of_a_task_finds_its_cache_and_scratch_directories_empty(ci, tmp_path):

@@ -242,18 +242,21 @@ or "missing" (`contents`)."""
 
 def marks(path: str) -> list[str]:
     """The markers test file `path` names (`pytest.mark.<name>`, `mark.<name>`), each a `MARKER` input of its
-    key: a registration added, changed or removed changes what a run finds for those files alone."""
+    key, beside those its collected tests carry however they came by them (a helper's alias, a conftest's
+    `add_marker`: executed.py records them): a registration added, changed or removed changes what a run finds
+    for those files alone."""
     text = Path(path).read_text(errors="replace") if Path(path).is_file() else ""
     return sorted({f"{MARKER}{name}" for name in re.findall(r"\bmark\.(\w+)", text)})
 
 
 def registered(name: str) -> bytes:
-    """Marker `name`'s registration line in pyproject.toml's pytest settings, or b"missing"."""
+    """Marker `name`'s registration line in pyproject.toml's pytest settings, every line for `*` (a test that
+    read them all: executed.py's `getini` watch), or b"missing"."""
     if not Path("pyproject.toml").is_file():
         return b"missing"
     lines = tomllib.loads(Path("pyproject.toml").read_text()).get("tool", {}).get("pytest", {}).get(
         "ini_options", {}).get("markers", [])
-    found = [line for line in lines if line.split(":")[0].split("(")[0].strip() == name]
+    found = [line for line in lines if name == "*" or line.split(":")[0].split("(")[0].strip() == name]
     return hashlib.sha256("\n".join(found).encode()).digest() if found else b"missing"
 
 
@@ -1512,6 +1515,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # process did, so it keys on the code its tests ran, never a taskmate's collection, tests or caches
     # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
     ran = []
+    # The task's start, before which every program it may run as a tool was made (followed.py's `tool`).
+    environ = {**environ, followed.STARTED_AT: str(time.time())}
     for index, name in enumerate(tests):
         left = deadline - (time.monotonic() - began)
         alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,

@@ -173,16 +173,16 @@ def digesting(frame: types.FrameType | None) -> bool:
     return False
 
 
-CONFIGURATION = os.path.join("_pytest", "config", "")
-"""Where pytest reads its own settings, from pyproject.toml among others: ci.py's `shared` keys the part it
-reads (`pytest_settings`) and each file the markers it uses (`marks`), so its read of the whole file is no
-input."""
+CONFIGURATION = os.path.join("_pytest", "config", "findpaths.py")
+"""Where pytest loads its own settings from pyproject.toml among its candidates (`locate_config`): ci.py's
+`shared` keys the part it reads (`pytest_settings`) and each file the markers its tests carry (`marks`,
+executed.py's), so that read of the whole file is no input. A test's own read, pytest.main beneath it, is."""
 
 
 def configuring(frame: types.FrameType | None) -> bool:
-    """Whether `frame`, or a frame it was called from, is pytest reading its settings (`CONFIGURATION`)."""
+    """Whether `frame`, or a frame it was called from, is pytest loading its settings (`CONFIGURATION`)."""
     while frame is not None:
-        if CONFIGURATION in frame.f_code.co_filename:
+        if frame.f_code.co_filename.endswith(CONFIGURATION):
             return True
         frame = frame.f_back
     return False
@@ -194,8 +194,37 @@ def private() -> bool:
     if not (own := os.environ.get(PRIVATE)):
         return False
     own = os.path.join(os.path.abspath(own), "")
-    return all(os.path.join(os.path.abspath(os.environ.get(name, own)), "").startswith(own)
-               for name in ("XDG_CACHE_HOME", *CACHES))
+    beneath = lambda where: os.path.join(os.path.abspath(where), "").startswith(own)  # noqa: E731
+    # The store JAX writes to now, which `jax.config.update` or `enable_compilation_cache` set whatever the
+    # environment says, and beside which Dew keeps its rungs (`dew.cache.beside_compilation_cache`).
+    jax = sys.modules.get("jax")
+    configured = getattr(getattr(jax, "config", None), "jax_compilation_cache_dir", None) if jax else None
+    return all(beneath(os.environ.get(name, own)) for name in ("XDG_CACHE_HOME", *CACHES)) and (
+        not configured or beneath(configured))
+
+
+OUTSIDE = "outside:"
+"""A file read where another process of the task may have left it (`outside`): its record has no key."""
+SHARED_ROOTS = ("/tmp", "/var/tmp", "/dev/shm")
+"""The machine's scratch every process shares, beside the user's home (`outside`)."""
+CREATED: set[str] = set()
+"""The files this process opened to write: what it reads of them again is its own (`outside`)."""
+
+
+def outside(name: str, root: str) -> bool:
+    """Whether a read of file `name` reads what another process may have left there, which no key holds: an
+    existing file in the machine's shared scratch (`SHARED_ROOTS`) or the user's home, outside the checkout
+    `root`, this file's own scratch and caches (ci.py's `alone`: TMPDIR, `PRIVATE`), the interpreter and its
+    environment, and not one this process wrote (`CREATED`): one file of a task writes /tmp/result and the
+    next reads it, an edit to the first then failing the second, whose record never named the first's code."""
+    import tempfile
+
+    beneath = lambda where: name.startswith(os.path.join(os.path.realpath(where), ""))  # noqa: E731
+    if not any(beneath(shared) for shared in (*SHARED_ROOTS, os.path.expanduser("~"))):
+        return False
+    own = [root, tempfile.gettempdir(), sys.prefix, sys.base_prefix, sys.exec_prefix,
+           *(where for where in (os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR")) if where)]
+    return not any(beneath(where) for where in own) and name not in CREATED and os.path.isfile(name)
 
 
 def read(event: str, args: tuple, root: str) -> str | None:
@@ -213,6 +242,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
         mode, flags = args[1], args[2]
         written = any(letter in mode for letter in "wax+") if mode is not None else (
             flags & os.O_ACCMODE != os.O_RDONLY)
+        if written:
+            CREATED.add(os.path.abspath(os.fsdecode(path)))
         if written or (mode is None and getattr(placing, "relative", False)):
             return None
         # The source loader's read of the module's text on its way to compiling it (its get_code beneath
@@ -231,6 +262,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
                                                 and configuring(sys._getframe(1).f_back)):
         return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
+    if event == "open" and outside(name, root):
+        return f"{OUTSIDE}{name}"
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
     if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
@@ -330,6 +363,24 @@ def programs(event: str, args: tuple) -> list:
     return []
 
 
+STARTED_AT = "DEW_EXECUTED_STARTED"
+"""The epoch second the task began, which ci.py's `alone` sets: a program made since is no tool (`tool`)."""
+
+
+def same_program(first: str, second: str) -> bool:
+    """Whether files `first` and `second` hold the same bytes."""
+    try:
+        if os.stat(first).st_size != os.stat(second).st_size:
+            return False
+        with open(first, "rb") as one, open(second, "rb") as other:
+            while (block := one.read(1 << 20)) == other.read(1 << 20):
+                if not block:
+                    return True
+        return False
+    except OSError:
+        return False
+
+
 def tool(path) -> str | None:
     """The name of the program at `path` as `TOOLS` has it, or None where it is no tool: its file's, but for
     imageio-ffmpeg's binary, which names its platform and version (`ffmpeg-linux-x86_64-v7.0.2`), and only
@@ -344,8 +395,16 @@ def tool(path) -> str | None:
     if found is None:
         return None
     real = os.path.realpath(found)
-    # A tool's name on an interpreter (a link named git to Python) runs any code under it.
-    if os.path.basename(real).startswith("python") or real == os.path.realpath(sys.executable):
+    # A tool's name on an interpreter (a link named git to Python, a copy of it) runs any code under it.
+    if os.path.basename(real).startswith("python") or same_program(real, os.path.realpath(sys.executable)):
+        return None
+    # The environment's and the system's programs predate the task (ci.py's `alone` names its start): one made
+    # since, a copy or a launcher a test wrote wherever it could, is none of theirs.
+    started = os.environ.get(STARTED_AT)
+    try:
+        if started and os.stat(real).st_mtime >= float(started):
+            return None
+    except OSError:
         return None
     inside = lambda directory: real.startswith(os.path.join(os.path.realpath(directory), ""))  # noqa: E731
     checkout = os.environ.get("DEW_EXECUTED_ROOT") or os.getcwd()
@@ -771,9 +830,13 @@ def recorded(path: Path) -> dict[str, dict]:
         child = children.get(file, blank)
         unfollowed = any(item == f"{STARTED}unfollowed" for _, item in before) or \
             f"{STARTED}unfollowed" in shared
-        whole = closed and not unfollowed and child["followed"] and shared_child["followed"]
         inputs = {item for _, item in before if not item.startswith(EVIDENCE)} | {
             item for item in shared if not item.startswith(EVIDENCE)}
+        # A file read where another process of the task may have left it holds what no key names (`outside`).
+        read_outside = any(item.startswith(OUTSIDE)
+                           for item in inputs | child["files"] | shared_child["files"])
+        whole = (closed and not unfollowed and not read_outside and child["followed"]
+                 and shared_child["followed"])
         held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
         out[file] = {
             "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
