@@ -483,8 +483,13 @@ class _KeptWhole:
         return row
 
 
-def _kept_whole(metadata):
-    return _KeptWhole()
+class _KeptWholeBy:
+    """A step configured for its source that binds to `_KeptWhole`."""
+
+    identity = "kept-whole-by@1"
+
+    def __call__(self, metadata):
+        return _KeptWhole()
 
 
 @pytest.mark.parametrize("before", ["configured draw", "cache", "configured map and cache"])
@@ -513,7 +518,7 @@ def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_o
         chain = chain.map(Configured(_jittered, needs=(), scope="run", random=True, one_to_one=True))
     else:
         if before == "configured map and cache":
-            chain = chain.map(Configured(_kept_whole, needs=(), one_to_one=True))
+            chain = chain.map(Configured(_KeptWholeBy(), needs=(), one_to_one=True))
         chain = chain.cache(Cache(f"memory://epochs-{id(chain)}"))
     chain = chain.pack(8, fields=("id",)).shuffle(seed=1, window=4).read("memory").batch(8)
     loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
