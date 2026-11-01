@@ -133,8 +133,8 @@ def _held(column) -> int:
     each rows' once, or a host column whole."""
     if not isinstance(column, jax.Array):
         return int(np.sum(np.asarray(column)))
-    shards = {str(shard.index): shard.data for shard in column.addressable_shards}
-    return int(sum(np.sum(np.asarray(data)) for data in shards.values()))
+    counts = {str(shard.index): shard.data for shard in column.addressable_shards}
+    return int(sum(np.sum(np.asarray(held)) for held in counts.values()))
 
 
 def clocked_rollout(made: Batch, read: Sequence[Batch]) -> Batch:

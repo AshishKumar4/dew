@@ -30,7 +30,10 @@ class CorpusCounts:
     """What one corpus's read counted, under its identity (`name`, which plans and saved positions
     key it by) and the short name its metrics go by (`label`). `accepted` counts the rows it
     delivered and `truncated` those of them cut short, its source examples where an objective makes
-    several rows of each, counted before it does (`FlatMap.examples`); `cut_examples`, `cut_rows` and
+    several rows of each (`FlatMap.examples`): in a run bounded in examples, those whose last rows it
+    delivered, as each row says (`examples`), an example a step refused or made no row of counted as
+    refused; in any other, those it read before the objective's step made rows of them; `cut_examples`,
+    `cut_rows` and
     `cut_removed` count, by what each cut (a decision row's instructions, options, state, or a context it
     did not read), the delivered rows a cut shortened, the rows it shortened of them, and the tokens it
     removed (characters, for a kind that names them: `state_characters`), as the delivered rows report

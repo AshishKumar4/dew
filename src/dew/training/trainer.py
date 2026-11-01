@@ -132,6 +132,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
+from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import (
     DiLoCo,
@@ -469,7 +470,8 @@ class Trainer(Generic[Loss, Effects]):
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
                                  custom_progress=self.step is not None and progress,
-                                 pooled_draws=pooled(examples) and _draws_further(self.rollout))
+                                 pooled_draws=pooled(examples) and self.rollout is not None
+                                 and _draws_further(self.rollout))
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1289,9 +1291,9 @@ class Trainer(Generic[Loss, Effects]):
         epochs: int | None = None,
         tokens: int | None = None,
         examples: int | None = None,
-        log_every: int | str = 100,
-        eval_every: int | str | None = None,
-        checkpoint_every: int | str | datetime.timedelta | None = None,
+        log_every: int | str | Counted = 100,
+        eval_every: int | str | Counted | None = None,
+        checkpoint_every: int | str | Counted | datetime.timedelta | None = None,
         checkpoint_final: bool = True,
         metrics: Sequence[Metric] = (),
         preview: bool = False,
@@ -1354,7 +1356,7 @@ class Trainer(Generic[Loss, Effects]):
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
         self._startup = Startup()
-        loader, held, tokens, steps = run_data(
+        loader, held, tokens, steps, examples = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
@@ -1390,7 +1392,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _plan(self, loader: Loader, held: Mapping[str, Reader | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
-              written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
+              written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
               checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,
               scored_to: str | os.PathLike[str] | None,
               best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None,

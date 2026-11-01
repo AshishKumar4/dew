@@ -6,7 +6,7 @@ delivered row says (`CorpusCounts.examples`): read by workers, after every batch
 import grain.python as pygrain
 import numpy as np
 import pytest
-from examples_clock_worker import Questioned
+from data_support import Fanned, Questioned
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.data import Memory
@@ -48,17 +48,6 @@ def test_a_corpus_counts_its_source_examples_whatever_rows_an_objective_makes_of
     rows, consumed = read_whole(loader, "id")
     assert consumed == 15 and rows > 15
     assert counted(loader) == [15]
-
-
-class Fanned:
-    """An objective's expansion of each record `id` into `id % 4` rows, none for some, each row's two
-    tokens naming it (`id * 10 + question`)."""
-
-    identity = "fanned@1"
-
-    def flat_map(self, element):
-        record = int(element["id"])
-        return tuple({"text": np.full(2, record * 10 + question, np.int32)} for question in range(record % 4))
 
 
 def test_a_corpus_counts_its_source_examples_whatever_windows_a_pack_lays_their_rows_in():

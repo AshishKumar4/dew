@@ -92,7 +92,7 @@ def corpus(first: int, count: int, planted: Mapping[int, str]) -> tuple[list[Exa
 
 
 TRAIN, HELD = corpus(0, 48, {5: "unfit", 17: "options_alike", 29: "unfit", 40: "options_alike"}), \
-    corpus(1000, 16, {3: "unfit", 9: "options_alike"})
+    corpus(1000, 8, {3: "unfit", 5: "options_alike"})
 """The training and held-out examples and the reasons planted in each: none at a split's end, whose
 refusal no later kept row would carry its consumption on (`Rejected.consumed`)."""
 

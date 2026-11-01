@@ -32,6 +32,7 @@ from dew.batch import (
     coordinates,
     flat_field,
     laid_coordinates,
+    probed,
     real_places,
     shifted_span,
     thaw,
@@ -474,7 +475,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         # The run's progress, which the encoder and each denoising pass read where the model does.
         at_progress = progressed(model, self.progress(step))
         encoder_states, mutated = model.apply(
-            {**params, "cache": cache}, tokens, **encoder_kwargs,
+            {**probed(params, "encoder"), "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,
             method=model.encode, train=train, states=True, mutable=["cache", *observed], rngs=rngs,
             capture_intermediates=False, **at_progress)
@@ -482,9 +483,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         if self.stop_gradient_from_denoiser_to_encoder:
             cache = jax.lax.stop_gradient(cache)
 
-        def denoise(sc_logits):
+        def denoise(sc_logits, probes):
             read = model.apply(
-                {**params, "cache": cache}, noisy, self_conditioning_logits=sc_logits,
+                {**probed(params, probes), "cache": cache}, noisy, self_conditioning_logits=sc_logits,
                 train=train, rngs=rngs, positions=positions[:, self.prompt_length:],
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
                 states=True, mutable=observed or False, **at_progress)
@@ -496,11 +497,11 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         # The conditioning pass carries no gradient, so its states stop it before the head and nothing of
         # that pass is kept for the backward. Its maxima still count: it runs the trained projections, so
         # its logits are the trained weights' too, and the clip bounds them with the other passes'.
-        first_states, first_sown = denoise(zero_logits)
+        first_states, first_sown = denoise(zero_logits, None)
         first = jax.lax.stop_gradient(constrain(model_logits(
             model, params, jax.lax.stop_gradient(first_states)), LOGITS))
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
-        states, second_sown = denoise(sc_logits)
+        states, second_sown = denoise(sc_logits, "denoiser")
         qk = None
         if step.qk_stats:
             qk = _observed_maxima(mutated["qk"], first_sown["qk"], second_sown["qk"])
