@@ -41,6 +41,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, mosaic_sm100
+from dew.nn.kernels.templates.axes import named
 from dew.nn.kernels.templates.gemm.mosaic_gpu import GroupInfo, tile_groups
 from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
 
@@ -134,8 +135,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     scratch = (
         stages.scratch(), accumulators.scratch(target),
         tuple(plgpu.SMEM((block_m, tiles.epilogue_n), dtype) for dtype in dtypes),
-        tuple(plgpu.SMEM(tuple(side_extent[axis] for axis in axes), side.dtype)
-              for side, axes in zip(epilogue_operands, epilogue_axes, strict=True)),
+        tuple(plgpu.SMEM(named(side_axes, side_extent), side.dtype)
+              for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True)),
         plgpu.Barrier(num_barriers=max(len(epilogue_operands), 1)),
     )
     outs = TCGEN05.kernel(
@@ -248,9 +249,10 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
 def _epilogue(epilogue, acc, gmems, smems, barriers, axes_of, origins: dict, extent: dict) -> tuple:
     """`epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile at the chunk's rows and
     columns brought to shared memory by TMA first (`mosaic.loaded`)."""
-    mosaic.loaded(tuple((gmem.at[tuple(pl.ds(origins[axis], extent[axis]) for axis in axes)], smem,
-                         barriers.at[index])
-                        for index, (gmem, smem, axes) in enumerate(zip(gmems, smems, axes_of, strict=True))))
+    blocks = {axis: pl.ds(origins[axis], extent[axis]) for axis in origins}
+    sides = zip(gmems, smems, axes_of, strict=True)
+    mosaic.loaded(tuple((gmem.at[named(side_axes, blocks)], smem, barriers.at[index])
+                        for index, (gmem, smem, side_axes) in enumerate(sides)))
     outs = epilogue(acc, *(smem[...] for smem in smems))
     return outs if isinstance(outs, tuple) else (outs,)
 

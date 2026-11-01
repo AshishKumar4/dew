@@ -55,7 +55,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import bundles, mosaic, resources, tail as tail_of
+from dew.nn.kernels.templates import axes, bundles, mosaic, resources, tail as tail_of
 from dew.nn.kernels.templates.gemm import cost, rows_padded
 
 
@@ -365,13 +365,12 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     rhs_block = (block_n, block_k) if transpose_rhs else (block_k, block_n)
     blocks = {'rows': ((block_m, block_k), dtype), 'matrix': (rhs_block, rhs_dtype),
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
-              **{f'side_{i}': (tuple(extent[axis] for axis in prologue_axes[i]), prologue_dtypes[i])
-                 for i in stepped}}
-    sides = mosaic.staging('side', [(tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes),
+              **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
+    sides = mosaic.staging('side', [(axes.named(side_axes, {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
-                                    for axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
-    held = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
-                                     _typed(prologue_dtypes[i])) for i in fixed])
+                                    for side_axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
+    held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
+                                    for i in fixed])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers']), tuple((part, jnp.dtype(out)) for out in dtypes))
 
@@ -385,10 +384,10 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     stepped, _, fixed = _stepped(family, prologue_axes, 'rows')
     extent = {'rows': block_k, 'depth': block_m}
     blocks = {'ring_0': ((block_k, block_m), lhs_dtype), 'ring_1': ((block_k, block_n), rhs_dtype),
-              **{f'ring_{2 + position}': (tuple(extent[axis] for axis in prologue_axes[i]),
-                                          prologue_dtypes[i]) for position, i in enumerate(stepped)}}
-    held = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
-                                     _typed(prologue_dtypes[i])) for i in fixed])
+              **{f'ring_{2 + position}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i])
+                 for position, i in enumerate(stepped)}}
+    held = mosaic.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
+                                    for i in fixed])
     return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'],
                                 mosaic.meeting(tiles.warpgroups)),
                        (((block_m // tiles.warpgroups, block_n), jnp.dtype(out_dtype)),))
@@ -617,8 +616,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     """Dew: a consumer's share of a `gmm` tile, its accumulators whole (`accs`): its epilogue on its side
     tiles (`sides`, each its global ref, axes, staging and barrier), loaded at `origins`, then each output
     stored at `place` (`mosaic.Family.persist`'s `store`)."""
-    family.loaded([(gmem.at[tuple(origins[axis] for axis in axes)], smem.at[wg], barrier.at[wg])
-                   for gmem, axes, smem, barrier in sides])
+    family.loaded([(gmem.at[axes.named(side_axes, origins)], smem.at[wg], barrier.at[wg])
+                   for gmem, side_axes, smem, barrier in sides])
     values = accs if epilogue is None else epilogue(*accs, *(smem[wg] for _, _, smem, _ in sides))
     values = values if isinstance(values, tuple) else (values,)
     for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
@@ -663,10 +662,9 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
                                        block_n=tiles.block_n, transpose_rhs=transpose_rhs),
                        lambda j: rhs_index(first + j)) for name, gmem in matrix_gmems.items()}
     return {'rows': (lhs_gmem.at[rows], lambda j: (0, first + j)), **matrices,
-            **{f'side_{i}': (prologue_gmems[i].at[tuple(rows if axis == 'rows' else slice(None)
-                                                        for axis in axes)],
-                             lambda j, axes=axes: tuple(0 if axis == 'rows' else first + j for axis in axes))
-               for i, axes in axes_of.items()}}
+            **{f'side_{i}': (prologue_gmems[i].at[axes.placed(side_axes, {'rows': rows})],
+                             lambda j, side_axes=side_axes: axes.placed(side_axes, {'rows': 0}, first + j))
+               for i, side_axes in axes_of.items()}}
 
 
 def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,
@@ -694,8 +692,7 @@ def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half
     """Dew: `mine`, this warpgroup's half of a stage, rewritten by the prologue on its side tiles
     (`tiles_of`, by operand) cut to the same half along the `halved` launch axis; its reader publishes
     the writes (`mosaic.Family.published`)."""
-    cut = [tiles_of[i].at[tuple(half if axis == halved else slice(None) for axis in axes)][...]
-           for i, axes in enumerate(axes_of)]
+    cut = [tiles_of[i].at[axes.placed(side_axes, {halved: half})][...] for i, side_axes in enumerate(axes_of)]
     mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
 
 
@@ -898,9 +895,8 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
 
     views = {'ring_0': (lhs_gmem.at[:, depth], row_block), 'ring_1': (rhs_gmem.at[:, columns], row_block),
              **{f'ring_{2 + position}': (
-                 side_gmems[i].at[tuple(slice(None) if axis == 'rows' else depth
-                                        for axis in prologue_axes[i])],
-                 lambda j, axes=prologue_axes[i]: tuple(first + j if axis == 'rows' else 0 for axis in axes))
+                 side_gmems[i].at[axes.placed(prologue_axes[i], {'rows': axes.WHOLE}, depth)],
+                 lambda j, side_axes=prologue_axes[i]: axes.placed(side_axes, {'rows': first + j}, 0))
                 for position, i in enumerate(stepped)}}
     return walks > 0, walks, views, (g_i, depth, columns, steps, start, gathered, index[-1])
 
