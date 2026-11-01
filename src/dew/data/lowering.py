@@ -1640,7 +1640,10 @@ class _Build:
             held = sum(taken for _, taken in places) if places is not None else shards_bounded(
                 shards, partition=partition, seed=self.seed, loading=self.loading,
                 epochs=self.lowering.epochs, examples=examples)
-        rows = self.streamed(shards, pipeline, partition, places)
+        # Shards that state no rows hand out a bound held in examples by example, as a pool deals its shares
+        # theirs (`DataPartition.bounded`), each loading worker reading its own part of it.
+        quota = None if examples is None or held is not None else partition.bounded(examples)
+        rows = self.streamed(shards, pipeline, partition, places, quota)
         if not marked and dropping:
             rows = Accepted(rows, _name(pipeline), _label(pipeline))
         return rows, consumed, None if held is None else (lambda _: held)
@@ -1657,9 +1660,12 @@ class _Build:
     def bound_at(self, pipeline: Pipeline, partition: DataPartition) -> int | None:
         """Where a per-share training read of several shares holds a run's bound in examples, the limit
         before its marks (`examples_bound`), which each share reads its part of (`DataPartition.bounded`);
-        None for a read of one share or in one order, which takes the bound whole before it cuts its
-        shares."""
-        if self.global_order or not self.training or partition.count == 1:
+        None for a read in one order, or of one share read by fewer than two loading workers, which takes
+        the bound whole before it cuts its shares. Each loading worker reads its own slice of its share's
+        root (`dew.data.shards`), a copy of the stages after it, so a bound the workers would each take whole
+        is dealt to their slices as a pool's shares are dealt theirs."""
+        one_reader = partition.count == 1 and _workers(pipeline, self.loading) < 2
+        if self.global_order or not self.training or one_reader:
             return None
         marked = examples_bound(pipeline.stages)
         return None if marked is None else marked - 1
@@ -1690,7 +1696,7 @@ class _Build:
 
     def streamed(
         self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition,
-        places: Sequence[tuple[Shard, int]] | None = None,
+        places: Sequence[tuple[Shard, int]] | None = None, quota: int | None = None,
     ) -> pygrain.IterDataset:
         interleave = None if self.lowering.interleave is None else pipeline.stages[self.lowering.interleave]
         return streamed(
@@ -1702,6 +1708,7 @@ class _Build:
             loading=self.loading,
             epochs=self.lowering.epochs if self.training else 1,
             places=places,
+            quota=quota,
         )
 
     def records(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
