@@ -93,6 +93,7 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
+    Configured,
     Expansion,
     Filter,
     FlatMap,
@@ -2276,31 +2277,43 @@ def _pass_examples(train: Pipeline, build: _Build) -> int | None:
     """The source examples one pass of a training read with no record count holds (`_epoch_records`,
     `Loader.pass_examples`): those reaching where a bound in examples stands (`dew.data.compile._bounded`:
     the first step that packs or windows them or makes several rows of each, else the batch), before any
-    repeat, counted as the lowering builds that prefix in one indexed order, a slice and a limit exactly,
-    a memory read's rows as it holds them; a streamed prefix the rows its shards state; a mixture's, those
-    in which every part it mixes comes round once (`Proportions.covering`). None where a step before that
-    place drops or adds one, or nothing states the count."""
-    if isinstance(train.source, Phases):
+    repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
+    or a streamed source's rows as its shards state them, each slice and limit before that place applied;
+    a mixture's, those in which every part it mixes comes round once (`Proportions.covering`). None where a
+    step before that place drops or adds one, or keeps them by a rule not yet bound, or nothing states
+    the count."""
+    source = train.source
+    if isinstance(source, Phases):
         return None
     batched = _until(train.stages, (BatchStage, TokenBudget))
     at = next((index for index, stage in enumerate(train.stages[:batched])
                if isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)),
               batched)
     prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
-    if any(_drops(stage) or isinstance(stage, Native) for stage in prefix):
+    if any(_drops(stage) or isinstance(stage, Native)
+           or (isinstance(stage, Configured) and not stage.one_to_one) for stage in prefix):
         return None
-    if isinstance(train.source, Mixture):
-        sizes = [_pass_examples(child, build.child(index))
-                 for index, child in enumerate(train.source.pipelines)]
+    if isinstance(source, Mixture):
+        sizes = [_pass_examples(child, build.child(index)) for index, child in enumerate(source.pipelines)]
         known = [size for size in sizes if size is not None]
-        return None if len(known) != len(sizes) else Proportions.of(_weights(train.source)).covering(known)
-    with _closing(build.records(dataclasses.replace(train, stages=prefix), DataPartition())) as rows:
-        if isinstance(rows, pygrain.MapDataset):
-            return len(rows)
-    if build.read != "streamed" or any(isinstance(stage, (Limit, Slice)) for stage in prefix):
-        return None
-    stated = [shard.rows for shard in train.source.manifest().shards]
-    return None if any(count is None for count in stated) else sum(stated)
+        if len(known) != len(sizes):
+            return None
+        count = Proportions.of(_weights(source)).covering(known)
+    elif build.read == "streamed" and not _in_memory(source):
+        stated = [shard.rows for shard in source.manifest().shards]
+        if any(rows is None for rows in stated):
+            return None
+        count = sum(stated)
+    else:
+        records = source.records(build.read)
+        present = _Present.of(records) if _in_memory(source) else None
+        count = len(records) if present is None else len(present.positions)
+    for stage in prefix:
+        if isinstance(stage, Limit):
+            count = min(count, stage.count)
+        elif isinstance(stage, Slice):
+            count = len(range(count)[stage.selection])
+    return count
 
 
 def _order_length(train: Pipeline, build: _Build) -> int | None:

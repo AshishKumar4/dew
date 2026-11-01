@@ -353,3 +353,68 @@ def test_epochs_of_a_memory_read_whose_filter_drops_records_are_passes_over_thos
 
 def _kept(row):
     return int(row["id"]) % 4 != 0
+
+
+class _FourthRefused:
+    """A step that refuses every fourth record."""
+
+    identity = "fourth-refused@1"
+    rejects = True
+
+    def __call__(self, row):
+        from dew.data.pipeline import Rejected
+
+        return Rejected("fourth") if int(row["id"]) % 4 == 0 else row
+
+
+def _fourth_refused(metadata):
+    return _FourthRefused()
+
+
+@pytest.mark.parametrize("prefix", ["configured filter", "take"])
+def test_epochs_count_the_examples_a_pass_reaches_its_rows_with(prefix):
+    """Twelve records through a step configured for the source that refuses every fourth, bound as the
+    read is built, or taken to their first 5, before a shuffle and an objective that makes rows of each:
+    an epoch is a pass over the 9 the step keeps, or the 5 taken, so two epochs bound the read to twice
+    those, no record of a third pass read (row 1902's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.data.pipeline import Configured
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}))
+    chain = (chain.map(Configured(_fourth_refused, needs=())) if prefix == "configured filter"
+             else chain.take(5))
+    loader, _ = fitted(chain.shuffle(seed=3).read("memory").batch(8), None,
+                       objective=_pulled(Questioned()).data(), epochs=2)
+    each = 9 if prefix == "configured filter" else 5
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 2 * each, each)
+
+
+def test_epochs_of_a_memory_read_it_packs_as_it_holds_them_count_its_windows():
+    """Documents a memory read packs as it holds them, before its shuffle, read in one counted order: an
+    epoch is its windows, as before, with no bound in examples (row 1902's review)."""
+    from dew.data.compile import fitted
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    loader, _ = fitted(chain, None, objective=_pulled().data(), epochs=2)
+    assert loader.records is not None and (loader.epochs, loader.examples) == (None, None)
+
+
+def test_epochs_of_a_mixture_whose_objective_makes_rows_are_passes_its_parts_come_round_in():
+    """Two corpora of 6 and 4 records mixed equally, an objective making rows of each after the mix, so its
+    read has no record count: an epoch is the records in which both parts come round once
+    (`Proportions.covering`), two epochs twice that (row 1902's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.data.mixing import Proportions
+
+    first = Pipeline(Memory({"id": np.arange(1, 7, dtype=np.int32)})).named("first")
+    second = Pipeline(Memory({"id": np.arange(11, 15, dtype=np.int32)})).named("second")
+    chain = mix([first, second], weights=(1, 1)).batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    each = Proportions.of((1, 1)).covering([6, 4])
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 2 * each, each)
