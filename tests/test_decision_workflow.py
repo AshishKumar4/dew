@@ -160,14 +160,27 @@ def run_of(cell: Cell, backbone: Path, root: Path) -> DecisionRunConfig:
         data=read(TRAIN[0], "train"), validation=read(HELD[0], "held"))
 
 
+def refused_in(cell: Cell, planted: Mapping[str, str]) -> dict[str, int]:
+    """The examples of `planted` the cell's layout refuses, by reason: a joint row lays its options out in one
+    schema, which no option budget cuts, so it refuses no alike options."""
+    reasons = [reason for reason in planted.values() if reason != "options_alike" or not cell.joint]
+    return {reason: reasons.count(reason) for reason in set(reasons)}
+
+
+def kept(cell: Cell) -> int:
+    """The training examples the cell's layout keeps, which a decision run fits before its bound reads."""
+    return len(TRAIN[0]) - sum(refused_in(cell, TRAIN[1]).values())
+
+
 def trained(cell: Cell, backbone: Path, root: Path) -> Path:
-    """The run directory `dew train` writes for the cell, bounded to every training example (`examples`)
-    or to a share of them (`stop`), its context read through cross-attention where the cell reads one."""
+    """The run directory `dew train` writes for the cell, bounded to every training example its layout keeps
+    (`examples`) or to a share of them (`stop`), its context read through cross-attention where the cell reads
+    one."""
     record, runs = root / "record", root / "runs"
     run_of(cell, backbone, root).save(str(record))
     given = {"trainer.name": cell.name, "trainer.checkpoint_dir": str(runs), "trainer.log_every": "1",
              "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
-             "trainer.compilation_cache_dir": "None", "trainer.examples": str(len(TRAIN[0])),
+             "trainer.compilation_cache_dir": "None", "trainer.examples": str(kept(cell)),
              **({"trainer.stop": f'{{"fraction": {SHARE}}}'} if cell.bound == "share" else {}),
              **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}
     assert main(["train", str(record / "run.json"),
@@ -198,31 +211,29 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
     first = example(0)
     assert len(task.layout.rows(task.tokenizer, task.specials, first.state, first.questions)) == (
         1 if cell.joint else 2)
-    # The bound counts source examples: all of them, or the first step's batch to reach the share's.
+    # The bound counts source examples, the ones the layout keeps, which it fits before the bound reads them:
+    # all of them, one pass, or the first step's batch to reach the share's.
     if cell.bound == "examples":
-        assert consumed == len(TRAIN[0])
+        assert consumed == kept(cell)
     else:
-        wanted = math.ceil(SHARE * len(TRAIN[0]))
+        wanted = math.ceil(SHARE * kept(cell))
         assert wanted <= consumed < wanted + BATCH
-    # Every example read is trained or reported, under the reason the layout refuses it for: all of them
-    # where the bound reads every one; where a share stops the run, its reading ahead holds at least the
-    # examples its steps consumed.
+    # Every training example is trained or reported under the reason the layout refuses it for, never both:
+    # the corpus counts the kept ones its bound consumed (all of them, or as far as a share's reading ahead
+    # went) apart from the refused ones.
     refused = {key.rsplit("/", 1)[1]: int(value) for key, value in last.items()
                if key.startswith("data/rejected/")}
     delivered = sum(int(value) for key, value in last.items() if key.startswith("data/rows/"))
+    assert refused == refused_in(cell, TRAIN[1])
     if cell.bound == "examples":
-        assert delivered + sum(refused.values()) == consumed
+        assert delivered == consumed
+        assert delivered + sum(refused.values()) == len(TRAIN[0])
     else:
-        assert consumed <= delivered + sum(refused.values()) <= len(TRAIN[0])
-    if cell.bound == "examples":
-        trained_planted = {reason: list(TRAIN[1].values()).count(reason) for reason in set(TRAIN[1].values())
-                           if reason != "options_alike" or not cell.joint}
-        assert refused == trained_planted
+        assert consumed <= delivered <= kept(cell)
     # The held-out examples are each evaluated or reported under the reason they are refused for.
     [evaluated] = [int(values["evaluation/counts/val/records"]) for values in logged.values()
                    if "evaluation/counts/val/records" in values]
-    assert evaluated + sum(1 for reason in HELD[1].values()
-                           if reason != "options_alike" or not cell.joint) == len(HELD[0])
+    assert evaluated + sum(refused_in(cell, HELD[1]).values()) == len(HELD[0])
     # The saved task holds each axis the cell sets, and answers over every option its data asks.
     assert isinstance(task.model.head, HEAD_KINDS[cell.head])
     assert (task.context_length is not None) == cell.context

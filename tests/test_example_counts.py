@@ -62,15 +62,17 @@ class Fanned:
 
 def test_a_corpus_counts_its_source_examples_whatever_windows_a_pack_lays_their_rows_in():
     """Twenty-three examples, made 0 to 3 rows of each, packed into windows of up to four rows, bound in
-    examples: the corpus counts the twenty-three, not the windows its pack made, whose counter is the
-    outermost of its read."""
+    examples: the corpus counts the eighteen it made rows of, not the windows its pack made, whose counter is
+    the outermost of its read, and the five it made none of as refused (`empty_expansion`), together the
+    twenty-three its batches consume."""
     chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
     loader = compile(chain.batch(BATCH).select_columns("text"), read="streamed",
                      objective=ObjectiveData(train=(Fanned(),), pack=Pack(9, fields=("text",))), examples=23,
                      loading=Loading(workers=0))
     windows, consumed = read_whole(loader, "text")
     assert consumed == 23 and windows < 23
-    assert counted(loader) == [23]
+    assert counted(loader) == [18]
+    assert counted(loader, "data/rejected/") == [5]
 
 
 def test_a_decision_corpus_counts_its_source_examples():
@@ -94,9 +96,10 @@ def test_a_decision_corpus_counts_its_source_examples():
 
 
 def test_a_decision_corpus_counts_the_examples_it_kept_apart_from_those_its_layout_refused():
-    """Ten decision examples, two of them asking a question no window holds, bound in examples: the corpus
-    counts the eight it kept as `data/rows` and the two its layout refused as unfit, together the ten its
-    batches consume."""
+    """Ten decision examples, two of them asking a question no window holds, bound to eight examples: the
+    layout refuses the two before the bound reads (a decision run fits its examples before it spreads them
+    into rows), so the bound counts the eight it kept, one pass of them, which the corpus counts as
+    `data/rows`, and the two refused under their reason."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
     from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
@@ -111,8 +114,8 @@ def test_a_decision_corpus_counts_the_examples_it_kept_apart_from_those_its_layo
                                    {name: answers[name] for name in (unfit if index in (3, 7) else asked)})}
                for index in range(10)]
     loader = compile(Pipeline(Memory(records)).pipe(decisions).batch(BATCH), read="memory",
-                     objective=objective.data(), examples=10)
-    assert read_whole(loader, "segments")[1] == 10
+                     objective=objective.data(), examples=8)
+    assert read_whole(loader, "segments")[1] == 8
     assert counted(loader) == [8]
     assert counted(loader, "data/rejected/") == [2]
 
