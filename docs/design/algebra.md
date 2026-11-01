@@ -88,10 +88,10 @@ backward bodies, by the site's declared class:
   for 3.6–4.5 times less error), so no compile-time rule undoes them. At dev time the generator searches each
   body's alternatives and proposes one only where its sampled error meets the body's own (§1.5).
 - **Surrogate** (`Objective.with_gradients`' rules, node perturbation, the Gauss-Newton step, the quantized
-  convolution's straight-through backward, `time_shift`'s regular-form derivative, the prologue and held-tile hooks'
-  rules): a declared form, `surrogate(forward, backward)`, whose backward is a rule, not the forward's derivative.
-  The engine optimizes inside each body (`Surrogate`) and never replaces the backward with autodiff's derivative of
-  the forward, nor equates the two.
+  convolution's straight-through backward, `rounded_operand`'s straight-through tangent, among them): a declared
+  form, `surrogate(forward, derivative)` (row 3271), whose derivative is a rule, not the forward's. The engine
+  optimizes inside each body (`Surrogate`) and never replaces the rule with autodiff's derivative of the forward,
+  nor equates the two.
 
 Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `kernel_derivative`,
 `numerics_derivative`, `numerics_tangent`, `surrogate`; §6.10), so the class is read from the site, never
@@ -593,7 +593,9 @@ def marked(kind: Kind, fn: Callable) -> Callable: ...   # fn's inputs and output
 def kernel_derivative(fn, fwd, bwd) -> Callable: ...    # custom_vjp with KernelGlue bodies
 def numerics_derivative(fn, fwd, bwd) -> Callable: ...  # custom_vjp with Protected bodies
 def numerics_tangent(fn, jvp) -> Callable: ...          # custom_jvp with a Protected rule
-def surrogate(forward, backward) -> Callable: ...       # the forward, its gradient the declared backward rule
+def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
+    # row 3271: the value forward's exactly; derivative(primals, tangents, value) the declared output tangent,
+    # linear in the tangents, so reverse mode transposes it and higher orders differentiate it
 ```
 
 - `marked_p` binds on a span's inputs (`side="enter"`) and outputs (`side="exit"`) with one `span` id. Its
@@ -607,9 +609,11 @@ def surrogate(forward, backward) -> Callable: ...       # the forward, its gradi
 - Every custom-derivative site declares itself through one of the four declarations, in place of a bare
   `jax.custom_vjp` or `jax.custom_jvp`; `linear_tangent` declares its bodies `KernelGlue`. A bare custom derivative
   in `src/dew` fails a slop check, so the inventory of §1.3 stays complete.
-- `surrogate(forward, backward)`: the forward runs as written and its gradient is `backward`'s, both bodies
+- `surrogate(forward, derivative)`: the forward runs as written and its tangent is `derivative`'s, both bodies
   `Surrogate`. No rule set holds a rule relating a `Surrogate` span to autodiff's derivative of its forward, so the
   engine optimizes inside each body and never replaces the rule.
+- Row 3271 lands `dew.nn.derivatives` with `surrogate` alone; the marker, its kinds and the other three
+  declarations build on that module.
 
 ### 6.11 The generator
 
