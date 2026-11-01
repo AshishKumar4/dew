@@ -59,6 +59,7 @@ Each `MeshSpec` field sets how many devices one axis gets, and the `data` axis g
 
 | Axis | `MeshSpec` field | Splits |
 |---|---|---|
+| `diloco` | `diloco` | DiLoCo's replica groups (`Trainer(diloco=DiLoCo(every))`): each group trains its own copy of the model on its own batch rows, and the groups average every `every` updates |
 | `data` | (the remainder) | Batch rows; parameters are replicated over it |
 | `expert` | `expert` | The expert dimension of mixture-of-experts layers, and batch rows |
 | `fsdp` | `fsdp` | Parameter dimensions the layout assigns to it, and batch rows |
@@ -75,9 +76,9 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 ```
 
 ```text
-{'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
-{'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
+{'diloco': 1, 'data': 2, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 4, 'fsdp': 2, 'tensor': 1, 'sequence': 1, 'stage': 1}
+{'diloco': 1, 'data': 1, 'expert': 1, 'fsdp': 4, 'tensor': 1, 'sequence': 2, 'stage': 1}
 ```
 
 `MeshSpec` also has `replicas` (host groups the data axis spans; see [Multiple hosts](../guides/multi-node.md)).

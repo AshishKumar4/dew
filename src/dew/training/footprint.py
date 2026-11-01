@@ -589,6 +589,6 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                             lowering=lowering)
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
-        "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
+        "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
                      None if peak is None else peak.bytes, peak is None or peak.exact)

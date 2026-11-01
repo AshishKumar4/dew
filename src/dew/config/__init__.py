@@ -94,6 +94,7 @@ from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages
 from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
+from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
 from dew.training.inspection import Inspection
@@ -651,6 +652,10 @@ class TrainerConfig:
     """What the run watches at its sampled steps (`dew.training.inspection.Inspection`): parameter paths by
     glob, the trees summarized there and every how many steps, `--trainer.inspection.paths '*norm*'
     --trainer.inspection.every 100`; unset, the step compiles unchanged."""
+    diloco: Annotated[DiLoCo, tyro.conf.subcommand("diloco")] | None = None
+    """DiLoCo over the mesh's diloco groups (`--trainer.mesh.diloco`, `dew.training.diloco.DiLoCo`): every
+    `--trainer.diloco.every` windows of updates the groups' copies are averaged into the outer model, by
+    Nesterov SGD at `--trainer.diloco.rate` with `--trainer.diloco.momentum`; unset, one copy trains."""
     links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
         default_factory=dict)
     """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
@@ -1244,7 +1249,8 @@ class RunConfig:
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
                                                    "trainer.inspection": "inspect",
                                                    "trainer.cooldowns": "cooldowns",
-                                                   "trainer.compile-ahead": "ahead"}
+                                                   "trainer.compile-ahead": "ahead",
+                                                   "trainer.diloco": "diloco"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
@@ -2013,7 +2019,7 @@ class RunConfig:
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,
             tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(), inspection=trainer.inspection,
-            **{"links": trainer.links, **resources})
+            diloco=trainer.diloco, **{"links": trainer.links, **resources})
 
     def compute_dtype(self) -> str:
         """The dtype the run's model computes in: the one its record states, else its numerics'
