@@ -1849,11 +1849,10 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "    return yaml\n"), "SLOP019", (5, 17, 22, 37, 54, 81))
 
 
-def test_a_bare_jit_in_a_package_that_compiles_through_dews_compile_point_is_reported(tmp_path):
-    """SLOP025: in a package whose programs compile through `OuterProgram` (RL's, serving's), a bare
-    `jax.jit` as a decorator, a call, within functools.partial or imported by its own name, and a bare
-    `jax.pmap`, are reported; a program that compiles through `OuterProgram` is not, nor a jit in another
-    package."""
+def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
+    """SLOP025: in any package of `src/<package>`, a bare `jax.jit` as a decorator, a call, within
+    functools.partial or imported by its own name, and a bare `jax.pmap`, are reported; a program that
+    compiles through Dew's compile point is not, nor a jit in the tests or the tools."""
     rollout = ("import functools\n"
                "import jax\n"
                "from jax import jit\n"
@@ -1866,10 +1865,32 @@ def test_a_bare_jit_in_a_package_that_compiles_through_dews_compile_point_is_rep
                "@OuterProgram\n"
                "def compiled(x): return x\n"
                "mapped = jax.pmap(acted)\n")
-    for package in ("rl", "objectives/rl", "inference"):
-        assert_reported(tmp_path / package.replace("/", "-"), f"src/sparx/{package}/rollout.py", rollout,
-                        "SLOP025", (5, 7, 8, 9, 12))
-    assert _linted(tmp_path / "other", {"src/sparx/training/step.py": rollout}) == []
+    for package in ("rl", "training", "checkpoints"):
+        assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
+                        (5, 7, 8, 9, 12))
+    assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
+
+
+def test_a_scope_named_apart_compiles_as_many_bare_programs_as_it_names(tmp_path):
+    """SLOP025 in Dew itself: a scope `COMPILED_APART` names compiles as many bare programs as it names
+    and no finding is made of them, one more is reported, and a named scope that holds fewer is reported,
+    so the list never outlives its code."""
+    lint = load("lint_slop")
+    files = {"src/dew/nn/kernels/options.py": ("import jax\n"
+                                               "class OuterProgram:\n"
+                                               "    def _jitted(self, f):\n"
+                                               "        return jax.jit(f)\n"),
+             "src/dew/training/interval.py": ("import jax\n"
+                                              "def bookkeep(f):\n"
+                                              "    return jax.jit(f), jax.jit(f)\n"),
+             "src/dew/nn/flops.py": "def traced_flops(f):\n    return f\n"}
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text)
+    modules = list(lint.collect(["src/dew"], tmp_path, "dew"))
+    found = sorted((finding.path, finding.line, finding.code) for module in modules
+                   for finding in lint.check(module) if finding.code == "SLOP025")
+    assert found == [("src/dew/nn/flops.py", 1, "SLOP025"), ("src/dew/training/interval.py", 3, "SLOP025")]
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):

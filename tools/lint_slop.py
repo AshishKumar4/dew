@@ -57,11 +57,12 @@ Scope is per rule, because the rules are not all about the same thing:
   rounded reciprocal, not correctly rounded (rows 1402, 1403); `precision.
   divided` divides as IEEE does. It reports only an operand it proves is an
   array (`_array`), so a Python number or a name it cannot prove passes.
-- SLOP025 is about the packages of `src/<package>` that own their programs'
-  compiles (`COMPILED_THROUGH`: RL's rollouts and simulators, serving's steps):
-  none compiles by a bare `jax.jit` or `jax.pmap`, by any name it is imported as; each program
-  is a `dew.nn.kernels.options.OuterProgram`, Dew's one compile point, whose
-  every compile admits its communicators and takes the algebra pass.
+- SLOP025 is about `src/<package>`: no program compiles by a bare `jax.jit` or
+  `jax.pmap`, by any name it is imported as, but as many as `COMPILED_APART` names
+  in a scope, with why (the compile point's own jit, a kernel's nested program, a
+  trace, a timing probe, a step's scalar bookkeeping); each other program is
+  compiled through `dew.nn.kernels.options.program`, Dew's one compile point,
+  whose every compile admits its communicators and takes the algebra pass.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1899,25 +1900,89 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
-COMPILED_THROUGH = ("rl", "objectives/rl", "inference")
-"""The packages of `src/<package>` whose every program compiles through `OuterProgram` (SLOP025)."""
+NESTED = "a kernel's own jit, a nested program inside the outer one the compile point admits"
+TRACED = "traces the function's shapes, compiling nothing"
+TIMED = "a timing probe, which measures its candidates' own dispatch"
+BOOKKEEPING = ("a step's bookkeeping on replicated scalars, on the step's hot path: no collective, no math "
+               "the algebra pass reads")
+
+COMPILED_APART = {
+    "nn/kernels/options.py::OuterProgram._jitted": (1, "the compile point's own jit"),
+    "training/trainer.py::Trainer._jitted":
+        (1, "the resident step, which the planner compiles through report.compiled (planning.Candidate)"),
+    "nn/kernels/ragged_dot.py::gmm": (1, NESTED),
+    "nn/kernels/ragged_dot.py::tgmm": (1, NESTED),
+    "nn/kernels/recurrence_algebra.py::_cumulated": (1, NESTED),
+    "nn/kernels/splash.py::_splash": (1, NESTED),
+    "nn/kernels/templates/recurrence/mainloop.py::prefix": (1, NESTED),
+    "nn/precision.py::_traced_once": (1, NESTED),
+    "nn/kernels/tuning.py::lowered_once.decorate.jitted": (1, TIMED),
+    "nn/kernels/tuning.py::_measured": (1, TIMED),
+    "nn/kernels/tuning.py::_measured.compiled": (1, TIMED),
+    "quantization.py::_fp8_faster": (1, TIMED),
+    "nn/flops.py::traced_flops": (1, TRACED),
+    "training/trainer.py::Trainer._model_shapes": (1, TRACED),
+    "training/interval.py::bookkeep": (1, BOOKKEEPING),
+    "training/interval.py::_added_tokens": (1, BOOKKEEPING),
+    "training/interval.py::held": (1, BOOKKEEPING),
+    "training/planning.py::whole_step": (1, BOOKKEEPING),
+}
+"""Each scope of `src/<package>` that compiles apart from the compile point (SLOP025), `path::qualified
+scope` below the package, with how many bare compiles it holds and why."""
 
 BARE_COMPILERS = frozenset({"jax.jit", "jax.pmap"})
-"""JAX's own compiles of a program, which SLOP025 reports in `COMPILED_THROUGH`."""
+"""JAX's own compiles of a program, which SLOP025 reports outside `COMPILED_APART`."""
+
+
+DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+"""The statements that open a named scope (`_qualified_scopes`)."""
+
+
+def _qualified_scopes(tree: ast.Module) -> dict[int, str]:
+    """Each node of `tree` keyed by identity to the qualified name of the function or class it sits in,
+    `<module>` at the top level; a decorator sits in the scope of what it decorates."""
+    where: dict[int, str] = {}
+
+    def walk(node: ast.AST, scope: tuple[str, ...]) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = (*scope, child.name) if isinstance(child, DEFINITIONS) else scope
+            for decorator in child.decorator_list if isinstance(child, DEFINITIONS) else ():
+                for part in ast.walk(decorator):
+                    where[id(part)] = ".".join(inner)
+            where.setdefault(id(child), ".".join(scope) or "<module>")
+            walk(child, inner)
+
+    walk(tree, ())
+    return where
 
 
 def compile_points(module: Module) -> Iterator[Finding]:
     """SLOP025: a bare `jax.jit` or `jax.pmap` (`BARE_COMPILERS`), its name read through the imports of its
-    scope, in a package whose programs compile through Dew's one compile point (`COMPILED_THROUGH`)."""
-    owned = (f"src/{module.package}/{package}/" for package in COMPILED_THROUGH)
-    if not any(module.relative.startswith(prefix) for prefix in owned):
+    scope, in `src/<package>`, but as many as `COMPILED_APART` names in its scope; and a scope
+    `COMPILED_APART` names that holds fewer, so the list never outlives its code."""
+    prefix = f"src/{module.package}/"
+    if not module.relative.startswith(prefix):
         return
+    path = module.relative.removeprefix(prefix)
+    where = _qualified_scopes(module.tree)
+    found: dict[str, list[tuple[ast.AST, str]]] = {}
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         compiler = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
         if compiler in BARE_COMPILERS:
+            found.setdefault(f"{path}::{where[id(node)]}", []).append((node, compiler))
+    for key, nodes in found.items():
+        allowed = COMPILED_APART.get(key, (0, ""))[0]
+        for node, compiler in nodes[allowed:]:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP025",
-                          f"compiles by a bare {compiler}; compile through "
-                          "`dew.nn.kernels.options.OuterProgram`, Dew's one compile point")
+                          f"compiles by a bare {compiler}; compile through `dew.nn.kernels.options.program`, "
+                          "Dew's one compile point, or name the scope in COMPILED_APART with why")
+    if module.package == "dew":
+        for key, (count, _) in COMPILED_APART.items():
+            scope_path, scope = key.split("::")
+            if scope_path == path and len(found.get(key, [])) < count:
+                yield Finding(module.relative, 1, 1, "SLOP025",
+                              f"COMPILED_APART names {count} bare compile(s) in {scope}, which holds "
+                              f"{len(found.get(key, []))}; drop or correct its entry")
 
 
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
