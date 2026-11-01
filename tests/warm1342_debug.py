@@ -40,8 +40,6 @@ if BANKED:
     from dew.inference.banks import HeldBanks
     stored = params
     params = jax.block_until_ready(HeldBanks(stored).place(model))
-    for leaf in jax.tree.leaves(stored):
-        leaf.delete()
     del stored
 record = {"device": jax.devices()[0].device_kind, "layers": LAYERS, "scan": SCAN, "banked": BANKED,
           "init_s": round(time.perf_counter() - began, 1),
