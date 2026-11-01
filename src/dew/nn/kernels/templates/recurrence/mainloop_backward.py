@@ -21,7 +21,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     CHUNK,
     Launch,
     Tiles,
-    Walked,
     Work,
     _addressed,
     _block_stored,
@@ -321,7 +320,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
                 scale, given.dtype, Issuer(call, {"local_dv": [local]}), emit=stored, laid=laid)
             return carry, accumulators
 
-        return Walked(views, step, prologue=None if streamed else lambda: read(None))
+        return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
 
     tiles = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
                       out=((CHUNK, value_width), given))
@@ -761,7 +760,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
             return carry, accumulators
 
         # Without the delta rule the scores' products the first step's alone.
-        return Walked(views, step, steps=group, segments=() if call.delta else (
+        return mosaic.Walk(views, step, steps=group, segments=() if call.delta else (
             (step, 0, 1), (functools.partial(step, scores=False), 1, group)))
 
     tiles, out_type = _query_key_launched(call, vq)
@@ -879,7 +878,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
 
         read = _prefix_reader(family, streamed, vectors, first, span)
         prologue = None if streamed or group > 1 else lambda: read(None)
-        return Walked(views, step, steps=group, prologue=prologue)
+        return mosaic.Walk(views, step, steps=group, prologue=prologue)
 
     tiles = _streamed(queries=((CHUNK, width), given), keys=((CHUNK, width), given),
                       values=((CHUNK, value_width), held), out=((CHUNK, value_width), given))
@@ -947,7 +946,7 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
             held.store(dl_ref, d_l, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             return carry, accumulators
 
-        return Walked(views, step)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(lower=((CHUNK, CHUNK), held), keys=((CHUNK, width), given),
                       values=((CHUNK, value_width), given), w_grads=((CHUNK, width), held),
@@ -998,7 +997,7 @@ def _values_back(a, v, du, beta, taken, call: _Call):
                 emit=stored)
             return carry, accumulators
 
-        return Walked(views, step)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(lower=((CHUNK, CHUNK), held), values=((CHUNK, value_width), given),
                       u_grads=((CHUNK, value_width), held))
@@ -1061,7 +1060,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
             after_ref.at[c, h, span][...] = after
             return carry, accumulators
 
-        return Walked(views, step)
+        return mosaic.Walk(views, step)
 
     tiles = _streamed(lower=((CHUNK, CHUNK), held), keys=((CHUNK, call.block), given),
                       w_grads=((CHUNK, call.block), held), system=((CHUNK, CHUNK), held))

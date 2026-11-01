@@ -398,23 +398,6 @@ def _taken(index: int):
 
 
 @dataclasses.dataclass(frozen=True)
-class Walked:
-    """A program's walk as its launch runs it (`_kernel`): the family's loads of its streams' `views`
-    (`_views`) and its walk of `step` over its `steps` steps (one by default), which stores what the program
-    computes. Where a `prologue` is given, the consumer runs it before its walk waits on the streams' first
-    tiles and its step takes what it returns (`step(index, slots, carry, accumulators, loaded)`): its own
-    loads from global memory (a chunk's prefix and write gates) in flight beside the streams', not after
-    them. Where `segments` `(step, lo, hi)` are given (a launch's own, not a persistent one's), they walk the
-    steps in place of `step`, a step of its own for some of them."""
-
-    views: dict
-    step: Callable
-    steps: int = 1
-    prologue: Callable | None = None
-    segments: tuple = ()
-
-
-@dataclasses.dataclass(frozen=True)
 class Work:
     """A program's work as a launch states it for the cost model: its products' FLOPs, each an operand's
     part's (`_kernel` counts an fp32 call's parts), its exponentials, and the steps its walk takes."""
@@ -648,8 +631,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
     blocks, loaded once, one deep; `Family.opened` takes them with their views), its staging tiles and its
     stores' (`landing`, `_landed`) scoped, named for its launch (`recurrence_solved`, ...). The program
-    returns its walk (`Walked`), which the kernel runs (`_run`), or None where it runs its own roles
-    (`_sequence_walk`'s). `held` is what a consumer thread holds in registers (`_Held`). Where
+    returns its walk (`mosaic.Walk`), which the kernel runs (`Transport.run`), or None where it runs its own
+    roles (`_sequence_walk`'s). `held` is what a consumer thread holds in registers (`_Held`). Where
     `mainloop_backward.planned` collects launches, the launch's record (`Launch`, its `work`) and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
@@ -706,7 +689,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             keys = _landing_keys(landing, family)
             lands = {name: lands[keys[name]] for name in landing}
 
-            def given(at: dict) -> Walked | None:
+            def given(at: dict) -> mosaic.Walk | None:
                 """The tile's walk as its program gives it at its grid indices `at`, or None where the program
                 runs its own roles (`_sequence_walk`'s)."""
                 return program(at, *arrays, streams=streams, staging=tuple(staged), landing=lands)
@@ -714,13 +697,13 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             if not persistent:
                 walked = given({axis: lax.axis_index(axis) for axis in grid_names})
                 if walked is not None:
-                    _run(streams, walked, call)
+                    family.run(streams["walked"], walked, call.interpret)
                 return
 
-            def tile(at: dict) -> Walked:
+            def tile(at: dict) -> mosaic.Walk:
                 """The tile's walk, which a persistent launch's program returns."""
                 walked = given(at)
-                assert walked is not None and not walked.segments, "a persistent tile walks its one step"
+                assert walked is not None, "a persistent launch's program returns its tile's walk"
                 return walked
 
             def schedule(index):
@@ -730,12 +713,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
 
             def consumer(_, at, walk, store, *, active):
                 del store
-                if not active:
-                    return
-                walked = tile(at)
-                step = walked.step if walked.prologue is None else functools.partial(walked.step,
-                                                                                    loaded=walked.prologue())
-                walk(step, None, ())
+                if active:
+                    tile(at).persisted(walk)
 
             family.persist(streams["walked"], (tiles,), schedule, consumer, consumers=1, axis="programs",
                            outputs=(), interpret=call.interpret)
@@ -756,22 +735,6 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
                              name=name, cost=_stated(work, tiles, arrays, out_type))(*arrays)
 
     return launched
-
-
-def _run(streams, walked: Walked, call: _Call) -> None:
-    """A program's walk run on its roles (`Walked`): the family's loads of its views into `streams` (its
-    allocations, opened by name) and its consumer's walk of its step, fed by a producer or, on a layout
-    without one, by the consumer's own loads."""
-    family, steps = call.family, walked.steps
-    streams = family.opened(streams["walked"], walked.views)
-
-    def consumer(wg):
-        loaded = None if walked.prologue is None else walked.prologue()
-        segments = tuple((each if loaded is None else functools.partial(each, loaded=loaded), lo, hi)
-                         for each, lo, hi in (walked.segments or ((walked.step, 0, steps),)))
-        family.walk(family.fed(streams, walked.views, 0, steps, wg), segments, (), (), call.interpret)
-
-    family.roles(1, consumer, lambda: family.stream(streams, walked.views, 0, steps))
 
 
 def _solving(call: _Call) -> mosaic.Family:
@@ -864,7 +827,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True, appli
                            smem=landing["block"])
             return carry, accumulators
 
-        return Walked(views, step, prologue=None if streamed else lambda: read(None))
+        return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
 
     # The keys' products and the inverse's doubling, then the inverse against each key and value block.
     work = Work(2 * CHUNK * CHUNK * width + _inverse_flops() + 2 * CHUNK * CHUNK * (width + value_width))
@@ -976,7 +939,7 @@ def _intra_solve(system, taken, call: _Call):
             held.store(out_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             return carry, accumulators
 
-        return Walked(views, step)
+        return mosaic.Walk(views, step)
 
     return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=_streamed(system=((CHUNK, CHUNK), systems)),
@@ -1057,7 +1020,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                                      smem=landing["system"])
             return carry, accumulators
 
-        return Walked(views, step)
+        return mosaic.Walk(views, step)
 
     blocks = _streamed(queries=((CHUNK, width), call.given), keys=((CHUNK, width), call.given),
                        gates=((CHUNK, width), gates), lows=((CHUNK, width), gates))
@@ -1195,7 +1158,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                                smem=landing["keyed" if call.per_key else "block"])
             return carry, accumulators
 
-        return Walked(views, step, prologue=None if streamed else lambda: read(None))
+        return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
 
     given = {"keys": ((CHUNK, width), call.given)}
     if call.per_key:
@@ -1697,7 +1660,7 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
             family.stored([out.astype(o_ref.dtype)], [view], smem=landing["out"])
             return carry, accumulators
 
-        return Walked(views, step, steps=steps, prologue=None if call.per_key else prologue)
+        return mosaic.Walk(views, step, steps=steps, prologue=None if call.per_key else prologue)
 
     blocks, staging = _output_streams(call, bv)
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
